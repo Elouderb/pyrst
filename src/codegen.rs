@@ -28,6 +28,8 @@ impl<'a> Codegen<'a> {
         self.line("");
         self.line("// ----- pyrst runtime shims -----");
         self.line("fn __pyrst_print<T: ::std::fmt::Display>(x: T) { println!(\"{}\", x); }");
+        self.line("fn __pyrst_range(n: i64) -> ::std::ops::Range<i64> { 0..n }");
+        self.line("fn __pyrst_range2(a: i64, b: i64) -> ::std::ops::Range<i64> { a..b }");
         self.line("");
         self.line("// ----- user code -----");
 
@@ -186,6 +188,14 @@ impl<'a> Codegen<'a> {
                 self.indent -= 1;
                 self.line("}");
             }
+            Stmt::For { target, iter, body, .. } => {
+                let i = self.emit_expr(iter)?;
+                self.line(&format!("for {} in {} {{", target, i));
+                self.indent += 1;
+                for s in body { self.emit_stmt(s)?; }
+                self.indent -= 1;
+                self.line("}");
+            }
             Stmt::Func(_) | Stmt::Class(_) => {
                 // Nested functions/classes — punt.
                 self.line("// TODO: nested function/class");
@@ -202,14 +212,73 @@ impl<'a> Codegen<'a> {
             Expr::None_(_) => "()".to_string(),
             Expr::Str(s, _) => format!("String::from({:?})", s),
             Expr::Ident(n, _) => n.clone(),
-            Expr::Call { callee, args, .. } => {
-                // Rewrite the print builtin to our shim.
+            Expr::Call { callee, args, kwargs, .. } => {
+                // Check if this is a class constructor call.
+                if let Expr::Ident(name, _) = callee.as_ref() {
+                    if let Some(class_def) = self.ctx.classes.get(name.as_str()) {
+                        // Class constructor: emit a Rust struct literal.
+                        // Clone field names/types to avoid borrow conflict.
+                        let field_names: Vec<String> = class_def.fields.iter()
+                            .map(|f| f.name.clone()).collect();
+
+                        if !args.is_empty() && kwargs.is_empty() {
+                            // Positional args to a class constructor.
+                            if args.len() != field_names.len() {
+                                return Err(crate::diag::Error::Codegen(format!(
+                                    "class `{}` has {} fields but {} positional arguments given",
+                                    name, field_names.len(), args.len()
+                                )));
+                            }
+                            let mut parts = Vec::new();
+                            for (field_name, arg) in field_names.iter().zip(args.iter()) {
+                                let v = self.emit_expr(arg)?;
+                                parts.push(format!("{}: {}", field_name, v));
+                            }
+                            return Ok(format!("{} {{ {} }}", name, parts.join(", ")));
+                        }
+
+                        // Keyword-args form.
+                        if !kwargs.is_empty() {
+                            let mut parts = Vec::new();
+                            for (kw, val) in kwargs {
+                                let v = self.emit_expr(val)?;
+                                parts.push(format!("{}: {}", kw, v));
+                            }
+                            return Ok(format!("{} {{ {} }}", name, parts.join(", ")));
+                        }
+
+                        // No args at all: emit default struct literal.
+                        let mut parts = Vec::new();
+                        for f in &class_def.fields {
+                            let ty = Ty::from_type_expr(&f.ty)?;
+                            let default = match ty {
+                                Ty::Int => "0i64",
+                                Ty::Float => "0.0f64",
+                                Ty::Bool => "false",
+                                _ => "Default::default()",
+                            };
+                            parts.push(format!("{}: {}", f.name, default));
+                        }
+                        return Ok(format!("{} {{ {} }}", name, parts.join(", ")));
+                    }
+                }
+
+                // Regular function call (not a class).
                 let callee_s = match callee.as_ref() {
                     Expr::Ident(n, _) if n == "print" => "__pyrst_print".to_string(),
+                    Expr::Ident(n, _) if n == "range" => "__pyrst_range".to_string(),
                     _ => self.emit_expr(callee)?,
                 };
                 let mut parts = Vec::with_capacity(args.len());
                 for a in args { parts.push(self.emit_expr(a)?); }
+
+                // kwargs on a non-class call site are an error in v0.
+                if !kwargs.is_empty() {
+                    return Err(crate::diag::Error::Codegen(
+                        "keyword arguments are only supported for class constructors in v0".into()
+                    ));
+                }
+
                 format!("{}({})", callee_s, parts.join(", "))
             }
             Expr::Attr { obj, name, .. } => {

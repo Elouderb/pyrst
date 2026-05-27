@@ -29,6 +29,7 @@ impl Parser {
 
     fn peek(&self) -> &Tok { &self.toks[self.pos].tok }
     fn peek_span(&self) -> Span { self.toks[self.pos].span }
+    fn peek2(&self) -> Option<&Tok> { self.toks.get(self.pos + 1).map(|t| &t.tok) }
     fn bump(&mut self) -> Token { let t = self.toks[self.pos].clone(); self.pos += 1; t }
 
     fn eat(&mut self, want: &Tok) -> bool {
@@ -68,6 +69,7 @@ impl Parser {
             Tok::Class => self.parse_class().map(Stmt::Class),
             Tok::If => self.parse_if(),
             Tok::While => self.parse_while(),
+            Tok::For => self.parse_for(),
             Tok::Pass => {
                 let span = self.peek_span();
                 self.bump();
@@ -168,6 +170,10 @@ impl Parser {
     fn parse_param(&mut self) -> Result<Param> {
         let span = self.peek_span();
         let name = self.expect_ident("parameter name")?;
+        // `self` parameter has no type annotation in Python — it is always the receiver.
+        if name == "self" {
+            return Ok(Param { name, ty: TypeExpr::Named("Self_".to_string()), default: None, span });
+        }
         self.expect(&Tok::Colon, "parameter — type annotation required")?;
         let ty = self.parse_type()?;
         let default = if self.eat(&Tok::Assign) { Some(self.parse_expr()?) } else { None };
@@ -252,6 +258,17 @@ impl Parser {
         self.expect(&Tok::Colon, "while")?;
         let body = self.parse_block()?;
         Ok(Stmt::While { cond, body, span })
+    }
+
+    fn parse_for(&mut self) -> Result<Stmt> {
+        let span = self.peek_span();
+        self.expect(&Tok::For, "for")?;
+        let target = self.expect_ident("for loop target")?;
+        self.expect(&Tok::In, "for loop")?;
+        let iter = self.parse_expr()?;
+        self.expect(&Tok::Colon, "for loop")?;
+        let body = self.parse_block()?;
+        Ok(Stmt::For { target, iter, body, span })
     }
 
     fn parse_block(&mut self) -> Result<Vec<Stmt>> {
@@ -405,15 +422,32 @@ impl Parser {
             match self.peek() {
                 Tok::LParen => {
                     let span = self.peek_span(); self.bump();
-                    let mut args = Vec::new();
+                    let mut args: Vec<Expr> = Vec::new();
+                    let mut kwargs: Vec<(String, Expr)> = Vec::new();
                     if !matches!(self.peek(), Tok::RParen) {
                         loop {
-                            args.push(self.parse_expr()?);
+                            // Detect keyword argument: Ident followed by `=` (not `==`).
+                            let is_kw = matches!(self.peek(), Tok::Ident(_))
+                                && matches!(self.peek2(), Some(Tok::Assign));
+                            if is_kw {
+                                let kw_name = self.expect_ident("keyword argument name")?;
+                                self.expect(&Tok::Assign, "keyword argument")?;
+                                let val = self.parse_expr()?;
+                                kwargs.push((kw_name, val));
+                            } else {
+                                if !kwargs.is_empty() {
+                                    return Err(Error::Parse {
+                                        span: self.peek_span(),
+                                        msg: "positional argument after keyword argument".into(),
+                                    });
+                                }
+                                args.push(self.parse_expr()?);
+                            }
                             if !self.eat(&Tok::Comma) { break; }
                         }
                     }
                     self.expect(&Tok::RParen, "call args")?;
-                    e = Expr::Call { callee: Box::new(e), args, span };
+                    e = Expr::Call { callee: Box::new(e), args, kwargs, span };
                 }
                 Tok::Dot => {
                     let span = self.peek_span(); self.bump();

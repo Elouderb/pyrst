@@ -413,7 +413,17 @@ impl Parser {
             let e = self.parse_unary()?;
             return Ok(Expr::UnOp { op: UnOp::Neg, expr: Box::new(e), span });
         }
-        self.parse_postfix()
+        self.parse_power()
+    }
+
+    fn parse_power(&mut self) -> Result<Expr> {
+        let mut lhs = self.parse_postfix()?;
+        if matches!(self.peek(), Tok::DoubleStar) {
+            let span = self.peek_span(); self.bump();
+            let rhs = self.parse_unary()?;  // Right-associative
+            lhs = Expr::BinOp { op: BinOp::Pow, lhs: Box::new(lhs), rhs: Box::new(rhs), span };
+        }
+        Ok(lhs)
     }
 
     fn parse_postfix(&mut self) -> Result<Expr> {

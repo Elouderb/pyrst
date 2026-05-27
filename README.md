@@ -14,19 +14,32 @@ target is Rust instead of JS.
 
 ## Status
 
-Pre-alpha. v0 of the compiler implements:
+Pre-alpha. v0 of the compiler (Phase 2):
 
-- [x] Indentation-aware lexer
-- [x] Recursive-descent parser (functions, classes, if/while, expressions)
-- [x] Skeleton type checker (signatures only — bodies are TODO)
+**Implemented:**
+- [x] Indentation-aware lexer (all v0 tokens)
+- [x] Recursive-descent parser (functions, classes, if/while/for, expressions)
+- [x] Full function body type checking with name resolution and arity checking
+- [x] Keyword arguments in function/class constructor calls
+- [x] `self` parameter support (no type annotation required)
+- [x] `for` loop syntax and codegen
+- [x] Class constructor calls → Rust struct literals
 - [x] Rust codegen for the v0 subset
-- [x] `pyrst build` invokes `rustc`
-- [ ] Function body typechecking, name resolution, arity checks
+- [x] `pyrst build`, `emit`, `check` subcommands
+
+**Working example programs:**
+- `examples/hello.py` — print statement
+- `examples/fib.py` — recursive functions, arithmetic, control flow
+- `examples/point.py` — classes, methods, keyword arguments ✨
+- `examples/count.py` — for loops ✨
+
+**Not yet implemented (v0.1+):**
 - [ ] Class inheritance lowering (traits + default methods)
 - [ ] Dunder methods → trait impls (`__add__` → `Add`, `__eq__` → `PartialEq`, …)
-- [ ] `match` / `case` lowering
+- [ ] `match` / `case` pattern matching semantics
 - [ ] Ownership inference pass
-- [ ] Standard library shims (`list`, `dict`, `str` methods)
+- [ ] Standard library methods (`list`, `dict`, `str` methods beyond basics)
+- [ ] Default argument values, variadic args (`*args`, `**kwargs`)
 
 ## Building
 

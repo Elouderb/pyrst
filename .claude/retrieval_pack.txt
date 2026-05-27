@@ -1,0 +1,280 @@
+# pyrst Retrieval Pack for Agents
+
+## Quick Reference
+
+**Project Goal:** A compiled language with Pythonic syntax that targets Rust as intermediate language. Ahead-of-time compilation, static typing, and Python-like ergonomics.
+
+**v0 Scope:** indentation-based blocks, functions, classes, type annotations, basic containers (list, dict, tuple), control flow (if/while/for), and exceptions (minimal).
+
+**Out of v0:** f-strings, async/await, lambdas, decorators with args, metaclasses, reflection, full inheritance, pattern matching (deferred to v0.2), operator overloading (deferred), generators, variadic args, default args.
+
+---
+
+## Core Grammar Rules (from GRAMMAR.md)
+
+### Function Definition
+```
+function_def: "def" NAME "(" parameters ")" [ "->" type_expr ] ":" suite
+parameters: [ parameter { "," parameter } ]
+parameter: NAME ":" type_expr
+```
+
+### Class Definition
+```
+class_def: "class" NAME [ "(" [ dotted_name ] ")" ] ":" suite
+```
+
+### Control Flow
+```
+if_stmt: "if" test ":" suite { "elif" test ":" suite } [ "else" ":" suite ]
+while_stmt: "while" test ":" suite [ "else" ":" suite ]
+for_stmt: "for" exprlist "in" testlist ":" suite [ "else" ":" suite ]
+```
+
+### Type Expressions
+```
+type_expr: union_type
+union_type: intersection_type { "|" intersection_type }
+primary_type: atom_type [ "[" type_args "]" ]
+atom_type: NAME | "None"
+```
+
+---
+
+## Core Type System Rules (from TYPE_SYSTEM.md)
+
+### Scalar Types
+- `int` → `i32` or `i64` (TBD)
+- `float` → `f64` (IEEE 754)
+- `bool` → `bool` (no truthiness coercion in v0)
+- `str` → `String` or `&str` (TBD)
+- `None` → `()` (unit type)
+
+### Container Types
+- `list[T]` → `Vec<T>` (mutable, homogeneous)
+- `dict[K, V]` → `HashMap<K, V>` (mutable, key-value)
+- `tuple[T1, T2, ...]` → `(T1, T2, ...)` (fixed-length, heterogeneous)
+
+### Typing Invariants
+1. **All bindings are typed.** Every variable, parameter, and return must have an explicit or inferred type.
+2. **No implicit `Any` or `Dynamic`.** If type cannot be inferred, it's a compile error.
+3. **Local inference only.** Type inference works inside function bodies; boundaries require explicit types.
+4. **Monomorphization.** Generic functions/classes instantiated per use site; no runtime type info.
+
+### Class Type Rules
+- All instance attributes must have type annotations (no dynamic attribute injection in v0).
+- Methods have implicit `self` parameter (first param, not listed).
+- Single inheritance via composition (multiple inheritance deferred).
+- Constructors via `__init__` method (if not defined, a zero-arg default is generated).
+
+---
+
+## MIR Invariants (from IR_INVARIANTS.md)
+
+### Lowering Rules by Operator
+| Operation | Lowering |
+|---|---|
+| `a + b` | `__add__` impl or operator codegen |
+| `a == b` | `__eq__` impl or operator codegen; returns bool |
+| `a < b` | `__lt__` impl or operator codegen; returns bool |
+| `a and b` | Branch: if false, short-circuit; else eval `b` |
+| `a or b` | Branch: if true, short-circuit; else eval `b` |
+| `a[i]` | `__getitem__` impl or Rust indexing trait |
+| `obj.attr` | Field access (no getters/setters in v0) |
+| `obj.method(args)` | Method call lowered to `impl` block or free function |
+
+### MIR Structure Invariants
+- Every basic block ends with a terminator (Goto, Branch, Return, Raise, or Switch).
+- All variable references use `LocalId` (local slots) or global definitions.
+- SSA-like structure (each local assigned once, reassignments create new temporaries).
+- Type information flows from HIR → MIR → Rust codegen.
+
+### Control Flow Lowering
+- `for` loops: initialized iterator → branch on `next()` → loop body → goto back to branch
+- `while` loops: similar to for (branch condition → body → goto)
+- `if`/`elif`/`else`: conditional branches
+- Loops support `break` (jump to exit block) and `continue` (jump to loop condition)
+
+---
+
+## Runtime ABI (from RUNTIME_ABI.md)
+
+### Object Model
+- **Value types** (int, float, bool, None): Stack-allocated, no indirection.
+- **Reference types** (str, list, dict, class instances): Heap-allocated, moved on assignment.
+- **Class instances**: Flat Rust struct layout with fields in declaration order.
+
+### Calling Convention
+- **Small types**: Pass by value in registers.
+- **Large types**: Pass by reference (`&T` or `&mut T`).
+- **Self parameter**: Implicit in pyrst, explicit `&self` in Rust.
+- **Returns**: By value (moved into caller's frame).
+
+### Standard Library (v0)
+Minimum required:
+- `print(value: str) -> None`
+- `len(container) -> int`
+- `range(start, stop, step) -> range`
+- `int(x)`, `float(x)`, `str(x)` (type conversions)
+
+String methods: `.upper()`, `.lower()`, `.split(sep)`, `.join(items)`, `.strip()`
+
+List methods: `.append(item)`, `.pop()`
+
+---
+
+## Standard Diagnostics
+
+### Error Message Format
+```
+error: <category>
+  <detail line 1>
+  <detail line 2>
+  at <file>:<line>:<column>
+    <line_number> | <source code>
+    |             <pointer to error>
+```
+
+### Diagnostic Categories
+| Category | Example |
+|---|---|
+| Undeclared name | `error: name 'x' is not defined` |
+| Type mismatch | `error: type mismatch: expected int, found str` |
+| Arity mismatch | `error: f() takes 2 args, got 3` |
+| Attribute not found | `error: type 'int' has no attribute 'foo'` |
+| Syntax error | `error: expected ':' after function signature` |
+| Invalid operator | `error: operator '+' not defined for str and int` |
+
+### Diagnostic Expectations
+- All diagnostics must include source location (file, line, column).
+- Code snippet should include surrounding lines for context.
+- Suggestion should be actionable (e.g., "did you mean 'len(x)'?").
+- Error messages should be brief (1-2 sentences) followed by details.
+
+---
+
+## AST and HIR Nodes (from current implementation)
+
+Current AST structure (rough):
+```rust
+enum Stmt {
+    FnDef { name, params, return_type, body },
+    ClassDef { name, base, fields, methods },
+    If { test, then_block, elif_blocks, else_block },
+    While { test, body },
+    For { target, iter, body },
+    Return { value },
+    Raise { exception },
+    Pass,
+    Break,
+    Continue,
+    Expr(expr),
+}
+
+enum Expr {
+    Literal(lit),
+    Var(name),
+    BinOp { op, left, right },
+    UnOp { op, operand },
+    Call { func, args },
+    MethodCall { object, method, args },
+    FieldAccess { object, field },
+    Index { container, index },
+    Assign { target, value },
+    If { test, then_val, else_val },
+    ListLiteral { elements },
+    DictLiteral { items },
+    ListComp { expr, comp_for },
+}
+```
+
+Current module structure:
+- `src/lexer.rs`: Tokenization with indentation tracking
+- `src/parser.rs`: Recursive-descent parser → AST
+- `src/ast.rs`: AST node definitions
+- `src/typeck.rs`: Skeleton type checker (signatures only)
+- `src/codegen.rs`: AST/typed-AST → Rust source code
+- `src/driver.rs`: CLI interface (build, emit, check commands)
+- `src/diag.rs`: Diagnostics infrastructure (stubs)
+
+---
+
+## Common Agent Patterns
+
+### Parser Task Pattern
+1. Update grammar in GRAMMAR.md if needed.
+2. Add token/rule to parser.
+3. Add test cases (positive and negative) in tests/ directory.
+4. Run parser test suite; all tests pass.
+5. Verify spans are correct for error reporting.
+
+### Type Checker Task Pattern
+1. Update TYPE_SYSTEM.md if needed.
+2. Add typing rule to type checker.
+3. Add positive and negative test cases.
+4. Ensure no implicit `Any` fallback.
+5. Run type checker test suite; all tests pass.
+
+### Codegen Task Pattern
+1. Update IR_INVARIANTS.md with lowering rule if needed.
+2. Add MIR node lowering to Rust.
+3. Add test cases (input MIR → expected Rust output).
+4. Generated Rust code must compile without warnings.
+5. Run codegen test suite; all tests pass.
+
+---
+
+## Retrieval: When and What
+
+**When adding a new feature:**
+1. Consult LANGUAGE_SPEC.md: Is it in v0? If not, defer or plan for later.
+2. Check GRAMMAR.md: What syntax is needed?
+3. Check TYPE_SYSTEM.md: What typing rules apply?
+4. Check IR_INVARIANTS.md: What lowering rules?
+5. Check RUNTIME_ABI.md: Any runtime support needed?
+
+**When debugging a type error:**
+1. Check TYPE_SYSTEM.md for typing rules (inference, unification, etc.).
+2. Run the type checker in isolation and report the error location and type.
+
+**When generating code:**
+1. Check IR_INVARIANTS.md for lowering rules.
+2. Check RUNTIME_ABI.md for calling conventions and object model.
+3. Generated Rust code must match Rust edition 2021 (our MSRV).
+
+---
+
+## Files and Their Roles
+
+| File | Purpose | Owner |
+|---|---|---|
+| LANGUAGE_SPEC.md | What features are in v0 and why | Spec Agent |
+| GRAMMAR.md | Syntax rules (CST and AST) | Spec Agent, Frontend Agent |
+| TYPE_SYSTEM.md | Typing rules and inference | Semantic Agent |
+| IR_INVARIANTS.md | HIR/MIR semantics and lowering | Semantic Agent, Backend Agent |
+| RUNTIME_ABI.md | Object model, calling conventions, stdlib | Backend Agent |
+| AGENTS.md | Agent roles and task protocol | User/Spec Agent |
+| src/lexer.rs | Tokenization and indentation tracking | Frontend Agent |
+| src/parser.rs | Grammar parsing → AST | Frontend Agent |
+| src/ast.rs | AST node definitions | Frontend Agent, Semantic Agent |
+| src/typeck.rs | Type checking and inference | Semantic Agent |
+| src/codegen.rs | AST/typed-AST → Rust source | Backend Agent |
+| src/driver.rs | CLI commands (build, emit, check) | Any Agent, Tooling Agent |
+| src/diag.rs | Diagnostic infrastructure | Any Agent |
+| examples/ | Example pyrst programs | Verification Agent |
+| tests/ | Test suite (unit and integration) | Any Agent, Verification Agent |
+
+---
+
+## Next Immediate Actions
+
+After specs are in place:
+
+1. **Expand and test the parser** to fully handle the v0 profile (currently: functions, classes, if/while/for, basic expressions).
+2. **Expand the type checker** from skeleton (signature-only) to full function body type checking.
+3. **Implement ownership inference** so codegen can emit correct Rust.
+4. **Expand codegen** to handle all AST nodes needed for the v0 examples (hello, point, fib).
+5. **Add standard library shims** (print, len, range, type conversions, string/list methods).
+6. **Run end-to-end tests** (hello.py, point.py, fib.py → executable Rust → binary).
+
+Detailed task specs for each will follow once specs are approved.

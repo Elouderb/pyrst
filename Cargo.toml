@@ -1,0 +1,14 @@
+[package]
+name = "pyrst"
+version = "0.0.1"
+edition = "2021"
+description = "A Pythonic language that compiles to Rust"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "pyrst"
+path = "src/main.rs"
+
+[dependencies]
+
+[dev-dependencies]

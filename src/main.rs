@@ -11,6 +11,7 @@ mod diag;
 mod resolver;
 mod formatter;
 mod linter;
+mod repl;
 
 fn print_usage() {
     eprintln!("pyrst {} — Pythonic language that compiles to Rust", env!("CARGO_PKG_VERSION"));
@@ -23,6 +24,7 @@ fn print_usage() {
     eprintln!("  check <file.py>     parse and typecheck only");
     eprintln!("  fmt   <file.py>     format a pyrst source file in-place");
     eprintln!("  lint  <file.py>     check code style and common issues");
+    eprintln!("  repl                start interactive shell");
 }
 
 fn main() -> ExitCode {
@@ -34,6 +36,18 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+
+    // Handle commands that don't need a file path
+    if cmd == "repl" {
+        let result = repl::repl();
+        return match result {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("{}", e);
+                ExitCode::FAILURE
+            }
+        };
+    }
 
     let path = match args.next() {
         Some(p) => PathBuf::from(p),

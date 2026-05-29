@@ -517,7 +517,10 @@ impl<'a> Codegen<'a> {
                 };
                 let i = self.emit_expr(iter)?;
                 let is_range = i.contains("..");
-                let is_iterator = i.contains(".enumerate()") || i.contains(".zip(");
+                let is_iterator = i.contains(".enumerate()") || i.contains(".zip(") ||
+                                 i.contains(".cloned()") || i.contains(".copied()") ||
+                                 i.contains(".keys()") || i.contains(".values()") ||
+                                 i.contains(".items()");
                 // For ranges, use into_iter(); for collections, use iter().cloned() or iter().copied().
                 // If it's already an iterator (enumerate/zip), use directly.
                 let iter_expr = if is_iterator {
@@ -980,15 +983,15 @@ impl<'a> Codegen<'a> {
                         return Ok(format!("{}.contains({}.as_str())", obj_s, parts[0]));
                     }
 
-                    // Dict methods
+                    // Dict methods - return iterators directly (will be wrapped by for loop)
                     if name == "keys" {
-                        return Ok(format!("{}.keys().cloned().collect::<Vec<_>>()", obj_s));
+                        return Ok(format!("{}.keys().cloned()", obj_s));
                     }
                     if name == "values" {
-                        return Ok(format!("{}.values().cloned().collect::<Vec<_>>()", obj_s));
+                        return Ok(format!("{}.values().cloned()", obj_s));
                     }
                     if name == "items" {
-                        return Ok(format!("{}.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<Vec<_>>()", obj_s));
+                        return Ok(format!("{}.iter().map(|(k, v)| (k.clone(), v.clone()))", obj_s));
                     }
 
                     // List methods

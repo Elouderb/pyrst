@@ -1,11 +1,18 @@
 use crate::diag::{Error, Result, Span};
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum FStrPart {
+    Lit(String),
+    Interp(String),  // raw expression source inside {}
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Tok {
     // Literals
     Int(i64),
     Float(f64),
     Str(String),
+    FStr(Vec<FStrPart>),
     True,
     False,
     None_,
@@ -33,6 +40,13 @@ pub enum Tok {
     Or,
     Not,
     Is,
+    Assert,
+    Raise,
+    Try,
+    Except,
+    Finally,
+    With,
+    Del,
 
     // Punctuation
     LParen,
@@ -51,6 +65,12 @@ pub enum Tok {
     MinusAssign,  // -=
     StarAssign,   // *=
     SlashAssign,  // /=
+    PercentAssign,  // %=
+    DoubleSlashAssign,  // //=
+    DoubleStarAssign,   // **=
+    AmpAssign,    // &=
+    PipeAssign,   // |=
+    CaretAssign,  // ^=
     Plus,
     Minus,
     Star,
@@ -68,6 +88,8 @@ pub enum Tok {
     Pipe,
     Caret,
     Tilde,
+    LShift,       // <<
+    RShift,       // >>
     At,           // for decorators
 
     // Layout
@@ -174,6 +196,105 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
             i += 1;
             line += 1;
             line_start = i;
+            continue;
+        }
+
+        // f-String literal
+        if c == b'f' && i + 1 < bytes.len() && (bytes[i + 1] == b'"' || bytes[i + 1] == b'\'') {
+            i += 1; // consume 'f'
+            let quote = bytes[i];
+            i += 1; // consume opening quote
+            let mut parts = Vec::new();
+            let mut current_lit = String::new();
+
+            while i < bytes.len() && bytes[i] != quote {
+                if bytes[i] == b'{' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+                        // {{ → literal {
+                        current_lit.push('{');
+                        i += 2;
+                    } else {
+                        // Start of interpolation
+                        if !current_lit.is_empty() {
+                            parts.push(FStrPart::Lit(current_lit.clone()));
+                            current_lit.clear();
+                        }
+                        i += 1; // consume {
+                        let mut expr = String::new();
+                        let mut brace_depth = 1;
+                        while i < bytes.len() && brace_depth > 0 {
+                            if bytes[i] == b'{' {
+                                brace_depth += 1;
+                            } else if bytes[i] == b'}' {
+                                brace_depth -= 1;
+                                if brace_depth == 0 { break; }
+                            }
+                            expr.push(bytes[i] as char);
+                            i += 1;
+                        }
+                        if i >= bytes.len() {
+                            return Err(Error::Lex {
+                                span: Span::new(start, i, line, col),
+                                msg: "unterminated f-string interpolation".into(),
+                            });
+                        }
+                        parts.push(FStrPart::Interp(expr));
+                        i += 1; // consume closing }
+                    }
+                } else if bytes[i] == b'}' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'}' {
+                        // }} → literal }
+                        current_lit.push('}');
+                        i += 2;
+                    } else {
+                        return Err(Error::Lex {
+                            span: Span::new(i, i + 1, line, col),
+                            msg: "unmatched } in f-string".into(),
+                        });
+                    }
+                } else if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    let esc = bytes[i + 1];
+                    let ch = match esc {
+                        b'n' => '\n',
+                        b't' => '\t',
+                        b'r' => '\r',
+                        b'\\' => '\\',
+                        b'\'' => '\'',
+                        b'"' => '"',
+                        b'0' => '\0',
+                        other => {
+                            return Err(Error::Lex {
+                                span: Span::new(i, i + 2, line, col),
+                                msg: format!("unknown escape '\\{}'", other as char),
+                            });
+                        }
+                    };
+                    current_lit.push(ch);
+                    i += 2;
+                } else if bytes[i] == b'\n' {
+                    return Err(Error::Lex {
+                        span: Span::new(start, i, line, col),
+                        msg: "unterminated f-string".into(),
+                    });
+                } else {
+                    current_lit.push(bytes[i] as char);
+                    i += 1;
+                }
+            }
+            if i >= bytes.len() {
+                return Err(Error::Lex {
+                    span: Span::new(start, i, line, col),
+                    msg: "unterminated f-string".into(),
+                });
+            }
+            if !current_lit.is_empty() {
+                parts.push(FStrPart::Lit(current_lit));
+            }
+            i += 1; // consume closing quote
+            tokens.push(Token {
+                tok: Tok::FStr(parts),
+                span: Span::new(start, i, line, col),
+            });
             continue;
         }
 
@@ -285,6 +406,13 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
                 "or" => Tok::Or,
                 "not" => Tok::Not,
                 "is" => Tok::Is,
+                "assert" => Tok::Assert,
+                "raise" => Tok::Raise,
+                "try" => Tok::Try,
+                "except" => Tok::Except,
+                "finally" => Tok::Finally,
+                "with" => Tok::With,
+                "del" => Tok::Del,
                 "True" => Tok::True,
                 "False" => Tok::False,
                 "None" => Tok::None_,
@@ -295,24 +423,38 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
             continue;
         }
 
-        // Multi-char operators
+        // Multi-char operators (check 3-char first, then 2-char)
+        let three = if i + 2 < bytes.len() {
+            Some((bytes[i], bytes[i + 1], bytes[i + 2]))
+        } else {
+            None
+        };
         let two = if i + 1 < bytes.len() {
             Some((bytes[i], bytes[i + 1]))
         } else {
             None
         };
-        let (tok, len) = match two {
-            Some((b'-', b'>')) => (Tok::Arrow, 2),
-            Some((b'=', b'=')) => (Tok::Eq, 2),
-            Some((b'!', b'=')) => (Tok::Ne, 2),
-            Some((b'<', b'=')) => (Tok::Le, 2),
-            Some((b'>', b'=')) => (Tok::Ge, 2),
-            Some((b'+', b'=')) => (Tok::PlusAssign, 2),
-            Some((b'-', b'=')) => (Tok::MinusAssign, 2),
-            Some((b'*', b'=')) => (Tok::StarAssign, 2),
-            Some((b'/', b'=')) => (Tok::SlashAssign, 2),
-            Some((b'*', b'*')) => (Tok::DoubleStar, 2),
-            Some((b'/', b'/')) => (Tok::DoubleSlash, 2),
+        let (tok, len) = match three {
+            Some((b'*', b'*', b'=')) => (Tok::DoubleStarAssign, 3),
+            Some((b'/', b'/', b'=')) => (Tok::DoubleSlashAssign, 3),
+            _ => match two {
+                Some((b'-', b'>')) => (Tok::Arrow, 2),
+                Some((b'=', b'=')) => (Tok::Eq, 2),
+                Some((b'!', b'=')) => (Tok::Ne, 2),
+                Some((b'<', b'=')) => (Tok::Le, 2),
+                Some((b'>', b'=')) => (Tok::Ge, 2),
+                Some((b'+', b'=')) => (Tok::PlusAssign, 2),
+                Some((b'-', b'=')) => (Tok::MinusAssign, 2),
+                Some((b'*', b'=')) => (Tok::StarAssign, 2),
+                Some((b'/', b'=')) => (Tok::SlashAssign, 2),
+                Some((b'%', b'=')) => (Tok::PercentAssign, 2),
+                Some((b'&', b'=')) => (Tok::AmpAssign, 2),
+                Some((b'|', b'=')) => (Tok::PipeAssign, 2),
+                Some((b'^', b'=')) => (Tok::CaretAssign, 2),
+                Some((b'*', b'*')) => (Tok::DoubleStar, 2),
+                Some((b'/', b'/')) => (Tok::DoubleSlash, 2),
+                Some((b'<', b'<')) => (Tok::LShift, 2),
+                Some((b'>', b'>')) => (Tok::RShift, 2),
             _ => match c {
                 b'(' => { bracket_depth += 1; (Tok::LParen, 1) }
                 b')' => { bracket_depth -= 1; (Tok::RParen, 1) }
@@ -343,6 +485,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
                         msg: format!("unexpected character '{}'", other as char),
                     });
                 }
+            }
             },
         };
         tokens.push(Token { tok, span: Span::new(i, i + len, line, col) });

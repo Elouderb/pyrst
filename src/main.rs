@@ -8,6 +8,7 @@ mod typeck;
 mod codegen;
 mod driver;
 mod diag;
+mod resolver;
 
 fn print_usage() {
     eprintln!("pyrst {} — Pythonic language that compiles to Rust", env!("CARGO_PKG_VERSION"));
@@ -52,7 +53,9 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("{}", e);
+            let source = std::fs::read_to_string(&path).ok();
+            let formatted = e.format_with_source(source.as_deref());
+            eprintln!("{}", formatted);
             ExitCode::FAILURE
         }
     }

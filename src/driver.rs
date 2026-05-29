@@ -4,10 +4,11 @@ use std::process::Command;
 use crate::diag::{Error, Result};
 
 pub fn check(path: &Path) -> Result<()> {
-    let src = std::fs::read_to_string(path)?;
-    let m = crate::parser::parse(&src)?;
-    let _ctx = crate::typeck::check_module(&m)?;
-    eprintln!("ok: {} parses and typechecks", path.display());
+    let prog = crate::resolver::resolve(path)?;
+    for (m, _src) in &prog.modules {
+        crate::typeck::check_bodies(m, &prog.ctx)?;
+    }
+    eprintln!("ok: {} module(s) typecheck", prog.modules.len());
     Ok(())
 }
 
@@ -42,8 +43,9 @@ pub fn build(path: &Path) -> Result<()> {
 }
 
 fn compile_to_rust(path: &Path) -> Result<String> {
-    let src = std::fs::read_to_string(path)?;
-    let m = crate::parser::parse(&src)?;
-    let ctx = crate::typeck::check_module(&m)?;
-    crate::codegen::emit(&m, &ctx)
+    let prog = crate::resolver::resolve(path)?;
+    for (m, _src) in &prog.modules {
+        crate::typeck::check_bodies(m, &prog.ctx)?;
+    }
+    crate::codegen::emit_program(&prog.modules, &prog.ctx)
 }

@@ -60,7 +60,7 @@ impl Parser {
             stmts.push(self.parse_stmt()?);
             while matches!(self.peek(), Tok::Newline) { self.bump(); }
         }
-        Ok(Module { stmts })
+        Ok(Module { stmts, source_path: None })
     }
 
     fn parse_stmt(&mut self) -> Result<Stmt> {
@@ -70,6 +70,8 @@ impl Parser {
             Tok::If => self.parse_if(),
             Tok::While => self.parse_while(),
             Tok::For => self.parse_for(),
+            Tok::Import => self.parse_import(),
+            Tok::From => self.parse_from_import(),
             Tok::Pass => {
                 let span = self.peek_span();
                 self.bump();
@@ -84,12 +86,85 @@ impl Parser {
                 let span = self.peek_span(); self.bump(); self.eat_newline()?;
                 Ok(Stmt::Continue(span))
             }
+            Tok::Assert => {
+                let span = self.peek_span();
+                self.bump(); // consume 'assert'
+                let cond = self.parse_expr()?;
+                let msg = if self.eat(&Tok::Comma) { Some(self.parse_expr()?) } else { None };
+                self.eat_newline()?;
+                Ok(Stmt::Assert { cond, msg, span })
+            }
+            Tok::Raise => {
+                let span = self.peek_span();
+                self.bump(); // consume 'raise'
+                let exc = if matches!(self.peek(), Tok::Newline | Tok::Eof | Tok::Dedent) {
+                    None
+                } else {
+                    Some(self.parse_expr()?)
+                };
+                self.eat_newline()?;
+                Ok(Stmt::Raise { exc, span })
+            }
+            Tok::Try => self.parse_try(),
+            Tok::With => self.parse_with(),
+            Tok::Del => {
+                let span = self.peek_span();
+                self.bump();
+                let target = self.parse_expr()?;
+                self.eat_newline()?;
+                Ok(Stmt::Del { target, span })
+            }
             Tok::Return => {
                 let span = self.peek_span();
                 self.bump();
                 let val = if matches!(self.peek(), Tok::Newline) { None } else { Some(self.parse_expr()?) };
                 self.eat_newline()?;
                 Ok(Stmt::Return(val, span))
+            }
+            Tok::At => {
+                // Collect decorators before def
+                let mut decorators = Vec::new();
+                while matches!(self.peek(), Tok::At) {
+                    self.bump(); // consume '@'
+                    let mut deco_name = String::new();
+                    loop {
+                        if let Tok::Ident(n) = self.peek().clone() {
+                            self.bump();
+                            deco_name.push_str(&n);
+                            if matches!(self.peek(), Tok::Dot) {
+                                self.bump();
+                                deco_name.push('.');
+                            } else {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                    // Skip decorator arguments e.g. @decorator(arg)
+                    if matches!(self.peek(), Tok::LParen) {
+                        let mut depth = 1i32;
+                        self.bump();
+                        while depth > 0 && !matches!(self.peek(), Tok::Eof) {
+                            match self.peek() {
+                                Tok::LParen => { depth += 1; self.bump(); }
+                                Tok::RParen => { depth -= 1; self.bump(); }
+                                _ => { self.bump(); }
+                            }
+                        }
+                    }
+                    while matches!(self.peek(), Tok::Newline) { self.bump(); }
+                    if !deco_name.is_empty() { decorators.push(deco_name); }
+                }
+                while matches!(self.peek(), Tok::Newline) { self.bump(); }
+                match self.peek() {
+                    Tok::Def => {
+                        let mut f = self.parse_def()?;
+                        f.decorators = decorators;
+                        Ok(Stmt::Func(f))
+                    }
+                    _ => self.parse_stmt()
+                }
             }
             _ => self.parse_assign_or_expr(),
         }
@@ -124,6 +199,8 @@ impl Parser {
                 Tok::MinusAssign => Some(BinOp::Sub),
                 Tok::StarAssign => Some(BinOp::Mul),
                 Tok::SlashAssign => Some(BinOp::Div),
+                Tok::PercentAssign => Some(BinOp::Mod),
+                Tok::DoubleSlashAssign => Some(BinOp::FloorDiv),
                 _ => None,
             };
             if let Some(op) = aug {
@@ -135,9 +212,94 @@ impl Parser {
             // Not an assignment — back off and parse as expression.
             self.pos = start;
         }
-        let e = self.parse_expr()?;
+        // General path: parse expr, then check for attr/index assignment or augmented assignment
+        let lhs_expr = self.parse_expr()?;
+
+        // Check for augmented assignment on attributes: self.x += 1
+        let aug = match self.peek() {
+            Tok::PlusAssign => Some(BinOp::Add),
+            Tok::MinusAssign => Some(BinOp::Sub),
+            Tok::StarAssign => Some(BinOp::Mul),
+            Tok::SlashAssign => Some(BinOp::Div),
+            Tok::PercentAssign => Some(BinOp::Mod),
+            Tok::DoubleSlashAssign => Some(BinOp::FloorDiv),
+            _ => None,
+        };
+
+        if let Some(op) = aug {
+            if let Expr::Attr { obj, name, span } = lhs_expr {
+                self.bump(); // consume augop
+                let rhs = self.parse_expr()?;
+                let obj_name = match *obj {
+                    Expr::Ident(n, _) => n,
+                    _ => return Err(Error::Parse {
+                        span,
+                        msg: "only simple `obj.attr += val` assignment is supported".into(),
+                    }),
+                };
+                // Convert x.attr += y to x.attr = x.attr + y
+                let value = Expr::BinOp {
+                    op,
+                    lhs: Box::new(Expr::Attr {
+                        obj: Box::new(Expr::Ident(obj_name.clone(), span)),
+                        name: name.clone(),
+                        span,
+                    }),
+                    rhs: Box::new(rhs),
+                    span,
+                };
+                self.eat_newline()?;
+                return Ok(Stmt::AttrAssign { obj: obj_name, attr: name, value, span });
+            }
+        }
+
+        if matches!(self.peek(), Tok::Assign) {
+            // Check for tuple unpacking upfront
+            if let Expr::Tuple(ref elems, span) = lhs_expr {
+                let all_idents = elems.iter().all(|e| matches!(e, Expr::Ident(_, _)));
+                if all_idents {
+                    let targets: Vec<String> = elems.iter().map(|e| {
+                        if let Expr::Ident(n, _) = e { n.clone() } else { unreachable!() }
+                    }).collect();
+                    self.bump(); // consume '='
+                    let value = self.parse_expr()?;
+                    self.eat_newline()?;
+                    return Ok(Stmt::Unpack { targets, value, span });
+                }
+            }
+
+            match lhs_expr {
+                Expr::Attr { obj, name, span } => {
+                    self.bump(); // consume '='
+                    let value = self.parse_expr()?;
+                    self.eat_newline()?;
+                    let obj_name = match *obj {
+                        Expr::Ident(n, _) => n,
+                        _ => return Err(Error::Parse {
+                            span,
+                            msg: "only simple `obj.attr = val` assignment is supported".into(),
+                        }),
+                    };
+                    return Ok(Stmt::AttrAssign { obj: obj_name, attr: name, value, span });
+                }
+                Expr::Index { obj, idx, span } => {
+                    self.bump(); // consume '='
+                    let value = self.parse_expr()?;
+                    self.eat_newline()?;
+                    let obj_name = match *obj {
+                        Expr::Ident(n, _) => n,
+                        _ => return Err(Error::Parse {
+                            span,
+                            msg: "only simple `obj[idx] = val` assignment is supported".into(),
+                        }),
+                    };
+                    return Ok(Stmt::IndexAssign { obj: obj_name, idx: *idx, value, span });
+                }
+                _ => {}
+            }
+        }
         self.eat_newline()?;
-        Ok(Stmt::Expr(e))
+        Ok(Stmt::Expr(lhs_expr))
     }
 
     fn parse_def(&mut self) -> Result<Func> {
@@ -164,7 +326,7 @@ impl Parser {
         };
         self.expect(&Tok::Colon, "def")?;
         let body = self.parse_block()?;
-        Ok(Func { name, params, ret, body, span, is_method: false })
+        Ok(Func { name, params, ret, body, span, is_method: false, decorators: vec![] })
     }
 
     fn parse_param(&mut self) -> Result<Param> {
@@ -207,6 +369,48 @@ impl Parser {
                     m.is_method = true;
                     methods.push(m);
                 }
+                Tok::At => {
+                    // Decorator in class body
+                    let mut decorators = Vec::new();
+                    while matches!(self.peek(), Tok::At) {
+                        self.bump();
+                        let mut deco_name = String::new();
+                        loop {
+                            if let Tok::Ident(n) = self.peek().clone() {
+                                self.bump();
+                                deco_name.push_str(&n);
+                                if matches!(self.peek(), Tok::Dot) {
+                                    self.bump();
+                                    deco_name.push('.');
+                                } else {
+                                    break;
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+                        if matches!(self.peek(), Tok::LParen) {
+                            let mut depth = 1i32;
+                            self.bump();
+                            while depth > 0 && !matches!(self.peek(), Tok::Eof) {
+                                match self.peek() {
+                                    Tok::LParen => { depth += 1; self.bump(); }
+                                    Tok::RParen => { depth -= 1; self.bump(); }
+                                    _ => { self.bump(); }
+                                }
+                            }
+                        }
+                        while matches!(self.peek(), Tok::Newline) { self.bump(); }
+                        if !deco_name.is_empty() { decorators.push(deco_name); }
+                    }
+                    while matches!(self.peek(), Tok::Newline) { self.bump(); }
+                    if matches!(self.peek(), Tok::Def) {
+                        let mut m = self.parse_def()?;
+                        m.is_method = true;
+                        m.decorators = decorators;
+                        methods.push(m);
+                    }
+                }
                 Tok::Pass => { self.bump(); self.eat_newline()?; }
                 Tok::Ident(_) => {
                     // Class field: name ":" type ["=" default] NEWLINE
@@ -226,6 +430,80 @@ impl Parser {
         }
         self.expect(&Tok::Dedent, "class body")?;
         Ok(ClassDef { name, bases, fields, methods, span })
+    }
+
+    fn parse_try(&mut self) -> Result<Stmt> {
+        let span = self.peek_span();
+        self.bump(); // consume 'try'
+        self.expect(&Tok::Colon, "try block")?;
+        let body = self.parse_block()?;
+
+        let mut handlers = Vec::new();
+        let mut else_ = None;
+        let mut finally_ = None;
+
+        while matches!(self.peek(), Tok::Except) {
+            let h_span = self.peek_span();
+            self.bump(); // consume 'except'
+            let exc_type = if !matches!(self.peek(), Tok::Colon) {
+                if let Tok::Ident(name) = self.peek().clone() {
+                    self.bump();
+                    Some(name)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let exc_name = if matches!(self.peek(), Tok::As) {
+                self.bump();
+                if let Tok::Ident(name) = self.peek().clone() {
+                    self.bump();
+                    Some(name)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            self.expect(&Tok::Colon, "except clause")?;
+            let h_body = self.parse_block()?;
+            handlers.push(ExceptHandler { exc_type, exc_name, body: h_body, span: h_span });
+        }
+
+        if matches!(self.peek(), Tok::Else) {
+            self.bump();
+            self.expect(&Tok::Colon, "else clause")?;
+            else_ = Some(self.parse_block()?);
+        }
+
+        if matches!(self.peek(), Tok::Finally) {
+            self.bump();
+            self.expect(&Tok::Colon, "finally clause")?;
+            finally_ = Some(self.parse_block()?);
+        }
+
+        Ok(Stmt::Try { body, handlers, else_, finally_: finally_, span })
+    }
+
+    fn parse_with(&mut self) -> Result<Stmt> {
+        let span = self.peek_span();
+        self.bump(); // consume 'with'
+        let ctx_expr = self.parse_expr()?;
+        let as_name = if matches!(self.peek(), Tok::As) {
+            self.bump();
+            if let Tok::Ident(name) = self.peek().clone() {
+                self.bump();
+                Some(name)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        self.expect(&Tok::Colon, "with block")?;
+        let body = self.parse_block()?;
+        Ok(Stmt::With { ctx_expr, as_name, body, span })
     }
 
     fn parse_if(&mut self) -> Result<Stmt> {
@@ -263,12 +541,57 @@ impl Parser {
     fn parse_for(&mut self) -> Result<Stmt> {
         let span = self.peek_span();
         self.expect(&Tok::For, "for")?;
-        let target = self.expect_ident("for loop target")?;
+        let mut targets = vec![self.expect_ident("for loop target")?];
+        while self.eat(&Tok::Comma) {
+            targets.push(self.expect_ident("for loop target")?);
+        }
         self.expect(&Tok::In, "for loop")?;
         let iter = self.parse_expr()?;
         self.expect(&Tok::Colon, "for loop")?;
         let body = self.parse_block()?;
-        Ok(Stmt::For { target, iter, body, span })
+        Ok(Stmt::For { targets, iter, body, span })
+    }
+
+    fn parse_import(&mut self) -> Result<Stmt> {
+        let span = self.peek_span();
+        self.expect(&Tok::Import, "import")?;
+        let mut path = vec![self.expect_ident("module name")?];
+        while self.eat(&Tok::Dot) {
+            path.push(self.expect_ident("module name")?);
+        }
+        // Optional `as alias` — consume and discard for v0
+        if self.eat(&Tok::As) { self.expect_ident("alias")?; }
+        self.eat_newline()?;
+        Ok(Stmt::Import { path, names: vec![], span })
+    }
+
+    fn parse_from_import(&mut self) -> Result<Stmt> {
+        let span = self.peek_span();
+        self.expect(&Tok::From, "from")?;
+        let mut path = vec![self.expect_ident("module name")?];
+        while self.eat(&Tok::Dot) { path.push(self.expect_ident("module name")?); }
+        self.expect(&Tok::Import, "import")?;
+        let mut names = Vec::new();
+        if self.eat(&Tok::LParen) {
+            // from module import (A, B, C)
+            loop {
+                let name = self.expect_ident("import name")?;
+                let alias = if self.eat(&Tok::As) { Some(self.expect_ident("alias")?) } else { None };
+                names.push((name, alias));
+                if !self.eat(&Tok::Comma) { break; }
+            }
+            self.expect(&Tok::RParen, "import list")?;
+        } else {
+            // from module import A, B, C  (or just A)
+            loop {
+                let name = self.expect_ident("import name")?;
+                let alias = if self.eat(&Tok::As) { Some(self.expect_ident("alias")?) } else { None };
+                names.push((name, alias));
+                if !self.eat(&Tok::Comma) { break; }
+            }
+        }
+        self.eat_newline()?;
+        Ok(Stmt::Import { path, names, span })
     }
 
     fn parse_block(&mut self) -> Result<Vec<Stmt>> {
@@ -284,21 +607,57 @@ impl Parser {
     }
 
     fn parse_type(&mut self) -> Result<TypeExpr> {
-        if matches!(self.peek(), Tok::None_) { self.bump(); return Ok(TypeExpr::None_); }
-        let name = self.expect_ident("type name")?;
-        if self.eat(&Tok::LBracket) {
-            let mut args = Vec::new();
-            if !matches!(self.peek(), Tok::RBracket) {
-                loop {
-                    args.push(self.parse_type()?);
-                    if !self.eat(&Tok::Comma) { break; }
-                }
-            }
-            self.expect(&Tok::RBracket, "generic type args")?;
-            Ok(TypeExpr::Generic(name, args))
+        let mut ty = if matches!(self.peek(), Tok::None_) {
+            self.bump();
+            TypeExpr::None_
         } else {
-            Ok(TypeExpr::Named(name))
+            let name = self.expect_ident("type name")?;
+            if self.eat(&Tok::LBracket) {
+                let mut args = Vec::new();
+                if !matches!(self.peek(), Tok::RBracket) {
+                    loop {
+                        args.push(self.parse_type()?);
+                        if !self.eat(&Tok::Comma) { break; }
+                    }
+                }
+                self.expect(&Tok::RBracket, "generic type args")?;
+                TypeExpr::Generic(name, args)
+            } else {
+                TypeExpr::Named(name)
+            }
+        };
+
+        // Handle union syntax: T | U
+        while self.eat(&Tok::Pipe) {
+            let rhs = if matches!(self.peek(), Tok::None_) {
+                self.bump();
+                TypeExpr::None_
+            } else {
+                let name = self.expect_ident("type name")?;
+                if self.eat(&Tok::LBracket) {
+                    let mut args = Vec::new();
+                    if !matches!(self.peek(), Tok::RBracket) {
+                        loop {
+                            args.push(self.parse_type()?);
+                            if !self.eat(&Tok::Comma) { break; }
+                        }
+                    }
+                    self.expect(&Tok::RBracket, "generic type args")?;
+                    TypeExpr::Generic(name, args)
+                } else {
+                    TypeExpr::Named(name)
+                }
+            };
+
+            // Fold: T | None → Optional(T); None | T → Optional(T)
+            ty = match (&ty, &rhs) {
+                (_, TypeExpr::None_) => TypeExpr::Generic("Optional".into(), vec![ty]),
+                (TypeExpr::None_, _) => TypeExpr::Generic("Optional".into(), vec![rhs]),
+                _ => TypeExpr::Generic("Union".into(), vec![ty, rhs]),
+            };
         }
+
+        Ok(ty)
     }
 
     fn eat_newline(&mut self) -> Result<()> {
@@ -361,12 +720,93 @@ impl Parser {
     }
 
     fn parse_cmp(&mut self) -> Result<Expr> {
+        let mut lhs = self.parse_bitor()?;
+        loop {
+            match self.peek() {
+                Tok::Is => {
+                    let span = self.peek_span(); self.bump();
+                    let op = if self.eat(&Tok::Not) { BinOp::IsNot } else { BinOp::Is };
+                    let rhs = self.parse_bitor()?;
+                    lhs = Expr::BinOp { op, lhs: Box::new(lhs), rhs: Box::new(rhs), span };
+                }
+                Tok::In => {
+                    let span = self.peek_span(); self.bump();
+                    let rhs = self.parse_bitor()?;
+                    lhs = Expr::BinOp { op: BinOp::In, lhs: Box::new(lhs), rhs: Box::new(rhs), span };
+                }
+                Tok::Not => {
+                    if matches!(self.peek2(), Some(Tok::In)) {
+                        let span = self.peek_span(); self.bump(); self.bump();
+                        let rhs = self.parse_bitor()?;
+                        lhs = Expr::BinOp { op: BinOp::NotIn, lhs: Box::new(lhs), rhs: Box::new(rhs), span };
+                    } else {
+                        break;
+                    }
+                }
+                _ => {
+                    let op = match self.peek() {
+                        Tok::Eq => BinOp::Eq, Tok::Ne => BinOp::Ne,
+                        Tok::Lt => BinOp::Lt, Tok::Le => BinOp::Le,
+                        Tok::Gt => BinOp::Gt, Tok::Ge => BinOp::Ge,
+                        _ => break,
+                    };
+                    let span = self.peek_span(); self.bump();
+                    let rhs = self.parse_bitor()?;
+                    lhs = Expr::BinOp { op, lhs: Box::new(lhs), rhs: Box::new(rhs), span };
+                }
+            }
+        }
+        Ok(lhs)
+    }
+
+    fn parse_bitor(&mut self) -> Result<Expr> {
+        let mut lhs = self.parse_bitxor()?;
+        loop {
+            let op = match self.peek() {
+                Tok::Pipe => BinOp::BitOr,
+                _ => break,
+            };
+            let span = self.peek_span(); self.bump();
+            let rhs = self.parse_bitxor()?;
+            lhs = Expr::BinOp { op, lhs: Box::new(lhs), rhs: Box::new(rhs), span };
+        }
+        Ok(lhs)
+    }
+
+    fn parse_bitxor(&mut self) -> Result<Expr> {
+        let mut lhs = self.parse_bitand()?;
+        loop {
+            let op = match self.peek() {
+                Tok::Caret => BinOp::BitXor,
+                _ => break,
+            };
+            let span = self.peek_span(); self.bump();
+            let rhs = self.parse_bitand()?;
+            lhs = Expr::BinOp { op, lhs: Box::new(lhs), rhs: Box::new(rhs), span };
+        }
+        Ok(lhs)
+    }
+
+    fn parse_bitand(&mut self) -> Result<Expr> {
+        let mut lhs = self.parse_shift()?;
+        loop {
+            let op = match self.peek() {
+                Tok::Amp => BinOp::BitAnd,
+                _ => break,
+            };
+            let span = self.peek_span(); self.bump();
+            let rhs = self.parse_shift()?;
+            lhs = Expr::BinOp { op, lhs: Box::new(lhs), rhs: Box::new(rhs), span };
+        }
+        Ok(lhs)
+    }
+
+    fn parse_shift(&mut self) -> Result<Expr> {
         let mut lhs = self.parse_add()?;
         loop {
             let op = match self.peek() {
-                Tok::Eq => BinOp::Eq, Tok::Ne => BinOp::Ne,
-                Tok::Lt => BinOp::Lt, Tok::Le => BinOp::Le,
-                Tok::Gt => BinOp::Gt, Tok::Ge => BinOp::Ge,
+                Tok::LShift => BinOp::LShift,
+                Tok::RShift => BinOp::RShift,
                 _ => break,
             };
             let span = self.peek_span(); self.bump();
@@ -408,10 +848,18 @@ impl Parser {
     }
 
     fn parse_unary(&mut self) -> Result<Expr> {
-        if matches!(self.peek(), Tok::Minus) {
-            let span = self.peek_span(); self.bump();
-            let e = self.parse_unary()?;
-            return Ok(Expr::UnOp { op: UnOp::Neg, expr: Box::new(e), span });
+        match self.peek() {
+            Tok::Minus => {
+                let span = self.peek_span(); self.bump();
+                let e = self.parse_unary()?;
+                return Ok(Expr::UnOp { op: UnOp::Neg, expr: Box::new(e), span });
+            }
+            Tok::Tilde => {
+                let span = self.peek_span(); self.bump();
+                let e = self.parse_unary()?;
+                return Ok(Expr::UnOp { op: UnOp::BitNot, expr: Box::new(e), span });
+            }
+            _ => {}
         }
         self.parse_power()
     }
@@ -483,14 +931,72 @@ impl Parser {
             Tok::Int(n) => Ok(Expr::Int(n, span)),
             Tok::Float(f) => Ok(Expr::Float(f, span)),
             Tok::Str(s) => Ok(Expr::Str(s, span)),
+            Tok::FStr(parts) => Ok(Expr::FStr(parts, span)),
             Tok::True => Ok(Expr::Bool(true, span)),
             Tok::False => Ok(Expr::Bool(false, span)),
             Tok::None_ => Ok(Expr::None_(span)),
             Tok::Ident(name) => Ok(Expr::Ident(name, span)),
             Tok::LParen => {
-                let e = self.parse_expr()?;
-                self.expect(&Tok::RParen, "parenthesized expression")?;
-                Ok(e)
+                if matches!(self.peek(), Tok::RParen) {
+                    // Empty tuple ()
+                    self.bump();
+                    return Ok(Expr::Tuple(vec![], span));
+                }
+                let first = self.parse_expr()?;
+                if self.eat(&Tok::Comma) {
+                    // Tuple: (e1, e2, ...)
+                    let mut elems = vec![first];
+                    while !matches!(self.peek(), Tok::RParen | Tok::Eof) {
+                        elems.push(self.parse_expr()?);
+                        if !self.eat(&Tok::Comma) { break; }
+                    }
+                    self.expect(&Tok::RParen, "tuple")?;
+                    Ok(Expr::Tuple(elems, span))
+                } else {
+                    // Grouped expression: (e)
+                    self.expect(&Tok::RParen, "grouped expression")?;
+                    Ok(first)
+                }
+            }
+            Tok::LBracket => {
+                if matches!(self.peek(), Tok::RBracket) {
+                    // Empty list []
+                    self.bump();
+                    return Ok(Expr::List(vec![], span));
+                }
+                let first = self.parse_expr()?;
+                if matches!(self.peek(), Tok::For) {
+                    // List comprehension: [elt for target in iter (if cond)?]
+                    self.bump(); // consume 'for'
+                    let target = self.expect_ident("list comp target")?;
+                    self.expect(&Tok::In, "list comp")?;
+                    let iter = self.parse_expr()?;
+                    let cond = if self.eat(&Tok::If) { Some(Box::new(self.parse_expr()?)) } else { None };
+                    self.expect(&Tok::RBracket, "list comp")?;
+                    Ok(Expr::ListComp { elt: Box::new(first), target, iter: Box::new(iter), cond, span })
+                } else {
+                    // Regular list: [e1, e2, ...]
+                    let mut elems = vec![first];
+                    while self.eat(&Tok::Comma) && !matches!(self.peek(), Tok::RBracket) {
+                        elems.push(self.parse_expr()?);
+                    }
+                    self.expect(&Tok::RBracket, "list literal")?;
+                    Ok(Expr::List(elems, span))
+                }
+            }
+            Tok::LBrace => {
+                let mut pairs = Vec::new();
+                if !matches!(self.peek(), Tok::RBrace) {
+                    loop {
+                        let key = self.parse_expr()?;
+                        self.expect(&Tok::Colon, "dict literal")?;
+                        let val = self.parse_expr()?;
+                        pairs.push((key, val));
+                        if !self.eat(&Tok::Comma) { break; }
+                    }
+                }
+                self.expect(&Tok::RBrace, "dict literal")?;
+                Ok(Expr::Dict(pairs, span))
             }
             other => Err(Error::Parse {
                 span,

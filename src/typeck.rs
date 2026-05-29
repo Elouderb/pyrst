@@ -14,6 +14,8 @@ pub enum Ty {
     Unit,            // maps to Rust ()
     List(Box<Ty>),
     Dict(Box<Ty>, Box<Ty>),
+    Tuple(Vec<Ty>),
+    Option(Box<Ty>),
     Class(String),
     Unknown,
 }
@@ -22,21 +24,40 @@ impl Ty {
     pub fn from_type_expr(t: &TypeExpr) -> Result<Ty> {
         Ok(match t {
             TypeExpr::None_ => Ty::Unit,
-            TypeExpr::Named(n) => match n.as_str() {
-                "int" => Ty::Int,
-                "float" => Ty::Float,
-                "bool" => Ty::Bool,
-                "str" => Ty::Str,
-                other => Ty::Class(other.to_string()),
-            },
+            TypeExpr::Named(n) => {
+                let stripped = n.trim_matches('\'').trim_matches('"');
+                match stripped {
+                    "int" => Ty::Int,
+                    "float" => Ty::Float,
+                    "bool" => Ty::Bool,
+                    "str" => Ty::Str,
+                    other => Ty::Class(other.to_string()),
+                }
+            }
             TypeExpr::Generic(n, args) => match (n.as_str(), args.as_slice()) {
                 ("list", [t]) => Ty::List(Box::new(Ty::from_type_expr(t)?)),
                 ("dict", [k, v]) => Ty::Dict(Box::new(Ty::from_type_expr(k)?), Box::new(Ty::from_type_expr(v)?)),
+                ("tuple", args) => Ty::Tuple(args.iter().map(Ty::from_type_expr).collect::<Result<Vec<_>>>()?),
+                ("Optional", [t]) => Ty::Option(Box::new(Ty::from_type_expr(t)?)),
+                ("Union", args) => {
+                    let non_none: Vec<_> = args.iter()
+                        .filter(|a| !matches!(a, TypeExpr::None_))
+                        .collect();
+                    if non_none.len() == 1 {
+                        Ty::Option(Box::new(Ty::from_type_expr(non_none[0])?))
+                    } else {
+                        Ty::Unknown
+                    }
+                }
                 (other, _) => return Err(Error::Type {
                     span: Span::DUMMY,
                     msg: format!("unknown generic type `{}`", other),
                 }),
             },
+            TypeExpr::Tuple(parts) => {
+                let tys = parts.iter().map(Ty::from_type_expr).collect::<Result<Vec<_>>>()?;
+                Ty::Tuple(tys)
+            }
         })
     }
 }
@@ -51,6 +72,7 @@ pub struct TyCtx {
     // global symbol table — function name → signature (params + return type)
     pub funcs: HashMap<String, FuncSig>,
     pub classes: HashMap<String, ClassDef>,
+    pub vars: HashMap<String, Ty>,
 }
 
 impl TyCtx {
@@ -66,7 +88,98 @@ impl TyCtx {
             params: vec![("n".into(), Ty::Int)],
             ret: Ty::Unknown,
         });
-        Self { funcs, classes: HashMap::new() }
+        // Core builtins
+        funcs.insert("len".into(), FuncSig {
+            params: vec![("x".into(), Ty::Unknown)],
+            ret: Ty::Int,
+        });
+        funcs.insert("str".into(), FuncSig {
+            params: vec![("x".into(), Ty::Unknown)],
+            ret: Ty::Str,
+        });
+        funcs.insert("int".into(), FuncSig {
+            params: vec![("x".into(), Ty::Unknown)],
+            ret: Ty::Int,
+        });
+        funcs.insert("float".into(), FuncSig {
+            params: vec![("x".into(), Ty::Unknown)],
+            ret: Ty::Float,
+        });
+        funcs.insert("bool".into(), FuncSig {
+            params: vec![("x".into(), Ty::Unknown)],
+            ret: Ty::Bool,
+        });
+        funcs.insert("enumerate".into(), FuncSig {
+            params: vec![("x".into(), Ty::Unknown)],
+            ret: Ty::Unknown,
+        });
+        funcs.insert("zip".into(), FuncSig {
+            params: vec![("a".into(), Ty::Unknown), ("b".into(), Ty::Unknown)],
+            ret: Ty::Unknown,
+        });
+        funcs.insert("abs".into(), FuncSig { params: vec![("x".into(), Ty::Unknown)], ret: Ty::Int });
+        funcs.insert("min".into(), FuncSig { params: vec![("a".into(), Ty::Unknown), ("b".into(), Ty::Unknown)], ret: Ty::Unknown });
+        funcs.insert("max".into(), FuncSig { params: vec![("a".into(), Ty::Unknown), ("b".into(), Ty::Unknown)], ret: Ty::Unknown });
+        funcs.insert("sorted".into(), FuncSig { params: vec![("x".into(), Ty::Unknown)], ret: Ty::Unknown });
+        funcs.insert("sum".into(), FuncSig { params: vec![("x".into(), Ty::Unknown)], ret: Ty::Int });
+        funcs.insert("input".into(), FuncSig { params: vec![("prompt".into(), Ty::Unknown)], ret: Ty::Str });
+        Self { funcs, classes: HashMap::new(), vars: HashMap::new() }
+    }
+
+    pub fn get_all_fields(&self, class_name: &str) -> Vec<crate::ast::Param> {
+        let mut fields = Vec::new();
+        let mut visited = std::collections::HashSet::new();
+        self.collect_fields(class_name, &mut fields, &mut visited);
+        fields
+    }
+
+    fn collect_fields(&self, class_name: &str, fields: &mut Vec<crate::ast::Param>, visited: &mut std::collections::HashSet<String>) {
+        if visited.contains(class_name) {
+            return;
+        }
+        visited.insert(class_name.to_string());
+
+        if let Some(class_def) = self.classes.get(class_name) {
+            // First collect from parent classes
+            for base in &class_def.bases {
+                self.collect_fields(base, fields, visited);
+            }
+            // Then add this class's fields
+            for field in &class_def.fields {
+                fields.push(field.clone());
+            }
+        }
+    }
+
+    pub fn get_method(&self, class_name: &str, method_name: &str) -> Option<FuncSig> {
+        let mut visited = std::collections::HashSet::new();
+        self.find_method(class_name, method_name, &mut visited)
+    }
+
+    fn find_method(&self, class_name: &str, method_name: &str, visited: &mut std::collections::HashSet<String>) -> Option<FuncSig> {
+        if visited.contains(class_name) {
+            return None;
+        }
+        visited.insert(class_name.to_string());
+
+        if let Some(class_def) = self.classes.get(class_name) {
+            // Check this class's methods
+            if let Some(method) = class_def.methods.iter().find(|m| &m.name == method_name) {
+                let params: Vec<(String, Ty)> = method.params.iter()
+                    .filter(|p| p.name != "self")
+                    .filter_map(|p| Ty::from_type_expr(&p.ty).ok().map(|ty| (p.name.clone(), ty)))
+                    .collect();
+                let ret = Ty::from_type_expr(&method.ret).unwrap_or(Ty::Unknown);
+                return Some(FuncSig { params, ret });
+            }
+            // Check parent classes
+            for base in &class_def.bases {
+                if let Some(sig) = self.find_method(base, method_name, visited) {
+                    return Some(sig);
+                }
+            }
+        }
+        None
     }
 }
 
@@ -88,6 +201,7 @@ impl<'a> FuncEnv<'a> {
 
     fn lookup(&self, name: &str) -> Option<Ty> {
         self.locals.get(name).cloned()
+            .or_else(|| self.ctx.vars.get(name).cloned())
             .or_else(|| self.ctx.funcs.get(name).map(|sig| sig.ret.clone()))
             .or_else(|| {
                 if self.ctx.classes.contains_key(name) {
@@ -102,7 +216,7 @@ impl<'a> FuncEnv<'a> {
 pub fn check_module(m: &Module) -> Result<TyCtx> {
     let mut ctx = TyCtx::new();
 
-    // First pass: collect function signatures and class definitions.
+    // First pass: collect function signatures, class definitions, and module-level variables.
     for s in &m.stmts {
         match s {
             Stmt::Func(f) => {
@@ -127,6 +241,13 @@ pub fn check_module(m: &Module) -> Result<TyCtx> {
                         format!("{}.{}", c.name, m_fn.name),
                         FuncSig { params: params?, ret: Ty::from_type_expr(&m_fn.ret)? },
                     );
+                }
+            }
+            Stmt::Assign { target, ty, .. } => {
+                if let Some(t) = ty {
+                    if let Ok(resolved) = Ty::from_type_expr(t) {
+                        ctx.vars.insert(target.clone(), resolved);
+                    }
                 }
             }
             _ => {}
@@ -165,6 +286,39 @@ pub fn check_module(m: &Module) -> Result<TyCtx> {
     Ok(ctx)
 }
 
+/// Type-check function/class bodies against a pre-built context.
+/// Used for multi-file compilation where the context is merged from all modules.
+pub fn check_bodies(m: &Module, ctx: &TyCtx) -> Result<()> {
+    // Second pass: type-check function bodies.
+    for s in &m.stmts {
+        match s {
+            Stmt::Func(f) => {
+                let params: Vec<(String, Ty)> = f.params.iter()
+                    .filter(|p| p.name != "self")
+                    .map(|p| (p.name.clone(), Ty::from_type_expr(&p.ty).unwrap_or(Ty::Unknown)))
+                    .collect();
+                let ret = Ty::from_type_expr(&f.ret)?;
+                let mut env = FuncEnv::new(ctx, &params, ret);
+                check_body(&f.body, &mut env)?;
+            }
+            Stmt::Class(c) => {
+                for method in &c.methods {
+                    let mut params: Vec<(String, Ty)> = method.params.iter()
+                        .filter(|p| p.name != "self")
+                        .map(|p| (p.name.clone(), Ty::from_type_expr(&p.ty).unwrap_or(Ty::Unknown)))
+                        .collect();
+                    params.insert(0, ("self".into(), Ty::Class(c.name.clone())));
+                    let ret = Ty::from_type_expr(&method.ret)?;
+                    let mut env = FuncEnv::new(ctx, &params, ret);
+                    check_body(&method.body, &mut env)?;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 fn check_body(stmts: &[Stmt], env: &mut FuncEnv) -> Result<()> {
     for s in stmts {
         check_stmt(s, env)?;
@@ -175,6 +329,15 @@ fn check_body(stmts: &[Stmt], env: &mut FuncEnv) -> Result<()> {
 fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
     match s {
         Stmt::Pass(_) | Stmt::Break(_) | Stmt::Continue(_) => Ok(()),
+        Stmt::Assert { cond, msg, .. } => {
+            check_expr(cond, env)?;
+            if let Some(m) = msg { check_expr(m, env)?; }
+            Ok(())
+        }
+        Stmt::Raise { exc, .. } => {
+            if let Some(e) = exc { check_expr(e, env)?; }
+            Ok(())
+        }
         Stmt::Return(None, span) => {
             if env.ret_ty != Ty::Unit {
                 return Err(Error::Type {
@@ -227,6 +390,18 @@ fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             check_expr(value, env)?;
             Ok(())
         }
+        Stmt::Unpack { targets, value, .. } => {
+            let val_ty = check_expr(value, env)?;
+            let elem_tys = match &val_ty {
+                Ty::Tuple(tys) => tys.clone(),
+                _ => vec![Ty::Unknown; targets.len()],
+            };
+            for (i, t) in targets.iter().enumerate() {
+                let ty = elem_tys.get(i).cloned().unwrap_or(Ty::Unknown);
+                env.locals.insert(t.clone(), ty);
+            }
+            Ok(())
+        }
         Stmt::If { cond, then, elifs, else_, .. } => {
             check_expr(cond, env)?;
             check_body(then, env)?;
@@ -243,11 +418,65 @@ fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             check_expr(cond, env)?;
             check_body(body, env)
         }
-        Stmt::For { target, iter, body, .. } => {
-            check_expr(iter, env)?;
-            // Bind the loop variable as Unknown for v0.
-            env.locals.insert(target.clone(), Ty::Unknown);
+        Stmt::For { targets, iter, body, .. } => {
+            let iter_ty = check_expr(iter, env)?;
+            // Determine element type from iterator type
+            let elem_ty = match &iter_ty {
+                Ty::List(inner) => *inner.clone(),
+                _ => Ty::Unknown,
+            };
+            // Bind all targets
+            for target in targets {
+                if targets.len() == 1 {
+                    // Single target gets the full element type
+                    env.locals.insert(target.clone(), elem_ty.clone());
+                } else {
+                    // Multiple targets: if iter is List<Tuple<T1, T2, ...>>, bind accordingly
+                    // For v0, just bind all to Unknown
+                    env.locals.insert(target.clone(), Ty::Unknown);
+                }
+            }
             check_body(body, env)?;
+            Ok(())
+        }
+        Stmt::Import { .. } => Ok(()), // Ignored in v0
+        Stmt::Try { body, handlers, else_, finally_, .. } => {
+            check_body(body, env)?;
+            for h in handlers {
+                if let Some(name) = &h.exc_name {
+                    env.locals.insert(name.clone(), Ty::Unknown);
+                }
+                check_body(&h.body, env)?;
+            }
+            if let Some(b) = else_ { check_body(b, env)?; }
+            if let Some(b) = finally_ { check_body(b, env)?; }
+            Ok(())
+        }
+        Stmt::With { ctx_expr, as_name, body, .. } => {
+            let ctx_ty = check_expr(ctx_expr, env)?;
+            if let Some(name) = as_name {
+                env.locals.insert(name.clone(), ctx_ty);
+            }
+            check_body(body, env)?;
+            Ok(())
+        }
+        Stmt::Del { target, .. } => {
+            check_expr(target, env)?;
+            Ok(())
+        }
+        Stmt::AttrAssign { obj, value, span, .. } => {
+            check_expr(value, env)?;
+            if env.lookup(obj).is_none() {
+                return Err(Error::Type { span: *span, msg: format!("undefined name `{}`", obj) });
+            }
+            Ok(())
+        }
+        Stmt::IndexAssign { obj, idx, value, span } => {
+            check_expr(idx, env)?;
+            check_expr(value, env)?;
+            if env.lookup(obj).is_none() {
+                return Err(Error::Type { span: *span, msg: format!("undefined name `{}`", obj) });
+            }
             Ok(())
         }
         Stmt::Func(_) | Stmt::Class(_) => Ok(()), // Nested — punt in v0.
@@ -259,8 +488,50 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
         Expr::Int(_, _) => Ty::Int,
         Expr::Float(_, _) => Ty::Float,
         Expr::Str(_, _) => Ty::Str,
+        Expr::FStr(_, _) => Ty::Str,
         Expr::Bool(_, _) => Ty::Bool,
+        Expr::Tuple(elems, _) => {
+            let tys = elems.iter().map(|e| check_expr(e, env)).collect::<Result<Vec<_>>>()?;
+            Ty::Tuple(tys)
+        }
+        Expr::ListComp { elt, target, iter, cond, .. } => {
+            let iter_ty = check_expr(iter, env)?;
+            let elem_ty = match &iter_ty {
+                Ty::List(inner) => *inner.clone(),
+                _ => Ty::Int, // ranges and unknown iterables -> Int
+            };
+            // Create a new scope with the loop variable bound
+            let mut inner_env = FuncEnv {
+                ctx: env.ctx,
+                locals: env.locals.clone(),
+                ret_ty: env.ret_ty.clone(),
+            };
+            inner_env.locals.insert(target.clone(), elem_ty);
+            if let Some(c) = cond { check_expr(c, &mut inner_env)?; }
+            let elt_ty = check_expr(elt, &mut inner_env)?;
+            Ty::List(Box::new(elt_ty))
+        }
         Expr::None_(_) => Ty::Unit,
+        Expr::List(elems, _) => {
+            let elem_ty = if elems.is_empty() {
+                Ty::Unknown
+            } else {
+                let first = check_expr(&elems[0], env)?;
+                for e in &elems[1..] { check_expr(e, env)?; }
+                first
+            };
+            Ty::List(Box::new(elem_ty))
+        }
+        Expr::Dict(pairs, _) => {
+            if pairs.is_empty() {
+                Ty::Dict(Box::new(Ty::Unknown), Box::new(Ty::Unknown))
+            } else {
+                let k_ty = check_expr(&pairs[0].0, env)?;
+                let v_ty = check_expr(&pairs[0].1, env)?;
+                for (k, v) in &pairs[1..] { check_expr(k, env)?; check_expr(v, env)?; }
+                Ty::Dict(Box::new(k_ty), Box::new(v_ty))
+            }
+        }
         Expr::Ident(name, span) => {
             env.lookup(name).ok_or_else(|| Error::Type {
                 span: *span,
@@ -271,10 +542,11 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
             // Check if this is a class constructor or function call.
             match callee.as_ref() {
                 Expr::Ident(name, _) => {
-                    if let Some(class_def) = env.ctx.classes.get(name.as_str()) {
-                        // Constructor call: check that kwarg field names are valid.
+                    if let Some(_class_def) = env.ctx.classes.get(name.as_str()) {
+                        // Constructor call: check that kwarg field names are valid (including inherited fields).
+                        let all_fields = env.ctx.get_all_fields(name.as_str());
                         for (kw, val) in kwargs {
-                            if !class_def.fields.iter().any(|f| &f.name == kw) {
+                            if !all_fields.iter().any(|f| &f.name == kw) {
                                 return Err(Error::Type {
                                     span: *span,
                                     msg: format!("class `{}` has no field `{}`", name, kw),
@@ -290,8 +562,11 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                         // Regular function call: check arity (positional only in v0).
                         let expected = sig.params.len();
                         let got = args.len() + kwargs.len();
-                        // print and range are variadic — skip arity check for them.
-                        if name != "print" && name != "range" && got != expected {
+                        // Variadic builtins: skip arity check.
+                        let variadic = matches!(name.as_str(),
+                            "print" | "range" | "len" | "str" | "int" | "float" | "bool" | "enumerate" | "zip"
+                            | "abs" | "min" | "max" | "sorted" | "sum" | "input");
+                        if !variadic && got != expected {
                             return Err(Error::Type {
                                 span: *span,
                                 msg: format!(
@@ -313,25 +588,34 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 }
                 // Method call: e.g., p.magnitude() — callee is Attr
                 _ => {
-                    check_expr(callee, env)?;
-                    for a in args {
-                        check_expr(a, env)?;
+                    if let Expr::Attr { obj, name, .. } = callee.as_ref() {
+                        let obj_ty = check_expr(obj, env)?;
+                        if let Ty::Class(class_name) = &obj_ty {
+                            let key = format!("{}.{}", class_name, name);
+                            if let Some(sig) = env.ctx.funcs.get(&key) {
+                                for a in args { check_expr(a, env)?; }
+                                return Ok(sig.ret.clone());
+                            }
+                        }
                     }
-                    Ty::Unknown // v0: method return types inferred as Unknown
+                    check_expr(callee, env)?;
+                    for a in args { check_expr(a, env)?; }
+                    Ty::Unknown
                 }
             }
         }
         Expr::Attr { obj, name, span } => {
             let obj_ty = check_expr(obj, env)?;
             if let Ty::Class(class_name) = &obj_ty {
-                if let Some(class_def) = env.ctx.classes.get(class_name.as_str()) {
-                    // Check field access.
-                    if let Some(field) = class_def.fields.iter().find(|f| &f.name == name) {
+                if let Some(_class_def) = env.ctx.classes.get(class_name.as_str()) {
+                    // Check field access (including inherited fields).
+                    let all_fields = env.ctx.get_all_fields(class_name.as_str());
+                    if let Some(field) = all_fields.iter().find(|f| &f.name == name) {
                         return Ty::from_type_expr(&field.ty);
                     }
-                    // Check method access.
-                    if class_def.methods.iter().any(|m| &m.name == name) {
-                        return Ok(Ty::Unknown);
+                    // Check method access (including inherited methods).
+                    if let Some(method) = env.ctx.get_method(class_name.as_str(), name) {
+                        return Ok(method.ret.clone());
                     }
                     return Err(Error::Type {
                         span: *span,
@@ -342,17 +626,24 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
             Ty::Unknown
         }
         Expr::Index { obj, idx, .. } => {
-            check_expr(obj, env)?;
+            let obj_ty = check_expr(obj, env)?;
             check_expr(idx, env)?;
-            Ty::Unknown
+            match obj_ty {
+                Ty::List(inner) => *inner,
+                Ty::Dict(_, v) => *v,
+                Ty::Str => Ty::Str,
+                _ => Ty::Unknown,
+            }
         }
         Expr::BinOp { op, lhs, rhs, .. } => {
             let l = check_expr(lhs, env)?;
             let r = check_expr(rhs, env)?;
             match op {
                 BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le
-                | BinOp::Gt | BinOp::Ge | BinOp::And | BinOp::Or => Ty::Bool,
+                | BinOp::Gt | BinOp::Ge | BinOp::And | BinOp::Or
+                | BinOp::Is | BinOp::IsNot | BinOp::In | BinOp::NotIn => Ty::Bool,
                 BinOp::Pow => Ty::Float,
+                BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::LShift | BinOp::RShift => Ty::Int,
                 _ => {
                     // Arithmetic: if both sides match, return that type; else Unknown.
                     if l == r { l } else { Ty::Unknown }
@@ -364,6 +655,7 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
             match op {
                 UnOp::Not => Ty::Bool,
                 UnOp::Neg => t,
+                UnOp::BitNot => Ty::Int,
             }
         }
     })

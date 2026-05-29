@@ -188,15 +188,18 @@ struct FuncEnv<'a> {
     ctx: &'a TyCtx,
     locals: HashMap<String, Ty>,
     ret_ty: Ty,
+    used_vars: std::collections::HashSet<String>,  // Track variable usage for dead code detection
 }
 
 impl<'a> FuncEnv<'a> {
     fn new(ctx: &'a TyCtx, params: &[(String, Ty)], ret_ty: Ty) -> Self {
         let mut locals = HashMap::new();
+        let mut used_vars = std::collections::HashSet::new();
         for (name, ty) in params {
             locals.insert(name.clone(), ty.clone());
+            used_vars.insert(name.clone());  // Parameters are always considered "used"
         }
-        FuncEnv { ctx, locals, ret_ty }
+        FuncEnv { ctx, locals, ret_ty, used_vars }
     }
 
     fn lookup(&self, name: &str) -> Option<Ty> {
@@ -317,6 +320,120 @@ pub fn check_bodies(m: &Module, ctx: &TyCtx) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Analyze which functions are actually called in a module.
+/// Returns a set of function names that are referenced.
+pub fn analyze_called_functions(module: &Module) -> std::collections::HashSet<String> {
+    let mut called = std::collections::HashSet::new();
+
+    for stmt in &module.stmts {
+        collect_calls_from_stmt(stmt, &mut called);
+    }
+
+    called
+}
+
+fn collect_calls_from_stmt(stmt: &Stmt, called: &mut std::collections::HashSet<String>) {
+    match stmt {
+        Stmt::Expr(e) | Stmt::Return(Some(e), _) => collect_calls_from_expr(e, called),
+        Stmt::Assign { value, .. } | Stmt::AugAssign { value, .. } => collect_calls_from_expr(value, called),
+        Stmt::Unpack { value, .. } => collect_calls_from_expr(value, called),
+        Stmt::If { cond, then, elifs, else_, .. } => {
+            collect_calls_from_expr(cond, called);
+            for s in then { collect_calls_from_stmt(s, called); }
+            for (c, b) in elifs {
+                collect_calls_from_expr(c, called);
+                for s in b { collect_calls_from_stmt(s, called); }
+            }
+            if let Some(b) = else_ {
+                for s in b { collect_calls_from_stmt(s, called); }
+            }
+        }
+        Stmt::While { cond, body, .. } => {
+            collect_calls_from_expr(cond, called);
+            for s in body { collect_calls_from_stmt(s, called); }
+        }
+        Stmt::For { iter, body, .. } => {
+            collect_calls_from_expr(iter, called);
+            for s in body { collect_calls_from_stmt(s, called); }
+        }
+        Stmt::Try { body, handlers, else_, finally_, .. } => {
+            for s in body { collect_calls_from_stmt(s, called); }
+            for h in handlers {
+                for s in &h.body { collect_calls_from_stmt(s, called); }
+            }
+            if let Some(b) = else_ {
+                for s in b { collect_calls_from_stmt(s, called); }
+            }
+            if let Some(b) = finally_ {
+                for s in b { collect_calls_from_stmt(s, called); }
+            }
+        }
+        Stmt::With { ctx_expr, body, .. } => {
+            collect_calls_from_expr(ctx_expr, called);
+            for s in body { collect_calls_from_stmt(s, called); }
+        }
+        Stmt::Func(f) => {
+            for s in &f.body { collect_calls_from_stmt(s, called); }
+        }
+        Stmt::Class(c) => {
+            for m in &c.methods {
+                for s in &m.body { collect_calls_from_stmt(s, called); }
+            }
+        }
+        Stmt::AttrAssign { value, .. } | Stmt::IndexAssign { value, .. } => {
+            collect_calls_from_expr(value, called);
+        }
+        _ => {}
+    }
+}
+
+fn collect_calls_from_expr(expr: &Expr, called: &mut std::collections::HashSet<String>) {
+    match expr {
+        Expr::Call { callee, args, .. } => {
+            if let Expr::Ident(name, _) = callee.as_ref() {
+                called.insert(name.clone());
+            }
+            for arg in args { collect_calls_from_expr(arg, called); }
+        }
+        Expr::BinOp { lhs, rhs, .. } => {
+            collect_calls_from_expr(lhs, called);
+            collect_calls_from_expr(rhs, called);
+        }
+        Expr::UnOp { expr: e, .. } => collect_calls_from_expr(e, called),
+        Expr::List(elems, _) => {
+            for e in elems { collect_calls_from_expr(e, called); }
+        }
+        Expr::Tuple(elems, _) => {
+            for e in elems { collect_calls_from_expr(e, called); }
+        }
+        Expr::Dict(pairs, _) => {
+            for (k, v) in pairs {
+                collect_calls_from_expr(k, called);
+                collect_calls_from_expr(v, called);
+            }
+        }
+        Expr::ListComp { elt, iter, cond, .. } => {
+            collect_calls_from_expr(elt, called);
+            collect_calls_from_expr(iter, called);
+            if let Some(c) = cond { collect_calls_from_expr(c, called); }
+        }
+        Expr::Attr { obj, .. } => collect_calls_from_expr(obj, called),
+        Expr::Index { obj, idx, .. } => {
+            collect_calls_from_expr(obj, called);
+            collect_calls_from_expr(idx, called);
+        }
+        Expr::FStr(parts, _) => {
+            for part in parts {
+                if let crate::ast::FStrPart::Interp(src) = part {
+                    // FStr interpolations are stored as strings, not expressions
+                    // Would need to parse them again to analyze - skip for now
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 fn check_body(stmts: &[Stmt], env: &mut FuncEnv) -> Result<()> {
@@ -505,6 +622,7 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 ctx: env.ctx,
                 locals: env.locals.clone(),
                 ret_ty: env.ret_ty.clone(),
+                used_vars: env.used_vars.clone(),
             };
             inner_env.locals.insert(target.clone(), elem_ty);
             if let Some(c) = cond { check_expr(c, &mut inner_env)?; }
@@ -533,6 +651,10 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
             }
         }
         Expr::Ident(name, span) => {
+            // Track variable usage for dead code detection
+            if env.locals.contains_key(name.as_str()) {
+                env.used_vars.insert(name.clone());
+            }
             env.lookup(name).ok_or_else(|| Error::Type {
                 span: *span,
                 msg: format!("undefined name `{}`", name),
@@ -579,6 +701,9 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                             check_expr(a, env)?;
                         }
                         sig.ret.clone()
+                    } else if name == "super" && args.is_empty() && kwargs.is_empty() {
+                        // super() returns Unknown type — the codegen handles super().method() specially
+                        Ty::Unknown
                     } else {
                         return Err(Error::Type {
                             span: *span,

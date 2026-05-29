@@ -5,14 +5,16 @@ class Counter:
         self.count = 0
 
     def increment(self) -> None:
-        self.count += 1
+        self.count = (self.count + 1)
 
     def value(self) -> int:
         return self.count
 
+
 def main() -> None:
-    c: Counter = Counter()
+    c: Counter  = Counter()
     c.increment()
     c.increment()
     c.increment()
     print(c.value())
+

@@ -19,11 +19,17 @@ pub struct Codegen<'a> {
     locals: HashMap<String, Ty>,
     declared: std::collections::HashSet<String>,
     current_class: Option<String>,
+    dead_funcs: std::collections::HashSet<String>,  // Functions that are never called
 }
 
 impl<'a> Codegen<'a> {
     pub fn new(ctx: &'a TyCtx) -> Self {
-        Self { ctx, out: String::new(), indent: 0, locals: HashMap::new(), declared: Default::default(), current_class: None }
+        Self { ctx, out: String::new(), indent: 0, locals: HashMap::new(), declared: Default::default(), current_class: None, dead_funcs: Default::default() }
+    }
+
+    pub fn with_dead_funcs(mut self, dead: std::collections::HashSet<String>) -> Self {
+        self.dead_funcs = dead;
+        self
     }
 
     pub fn emit_module(mut self, m: &Module) -> Result<String> {
@@ -51,7 +57,14 @@ impl<'a> Codegen<'a> {
 
     fn emit_top_stmt(&mut self, s: &Stmt) -> Result<()> {
         match s {
-            Stmt::Func(f) => self.emit_func(f, /*method_of=*/ None),
+            Stmt::Func(f) => {
+                // Skip dead functions (not called anywhere) unless it's main
+                if f.name != "main" && self.dead_funcs.contains(&f.name) {
+                    self.line(&format!("// Dead function removed: {}", f.name));
+                    return Ok(());
+                }
+                self.emit_func(f, /*method_of=*/ None)
+            }
             Stmt::Class(c) => self.emit_class(c),
             other => {
                 // Top-level non-decl statements are not yet supported (would need
@@ -263,11 +276,18 @@ impl<'a> Codegen<'a> {
             let class_name = c.name.clone();
             let mut emitted_methods = std::collections::HashSet::new();
 
-            // First, collect inherited methods from parent classes
+            // Collect own method names first to identify overrides
+            let own_method_names: std::collections::HashSet<String> = c.methods.iter()
+                .map(|m| m.name.clone())
+                .collect();
+
+            // First, collect inherited methods from parent classes (skip if overridden)
             for base in &c.bases {
                 if let Some(base_def) = self.ctx.classes.get(base.as_str()).cloned() {
                     for m in &base_def.methods {
-                        if !dunder_trait_names.contains(&m.name.as_str()) && !emitted_methods.contains(&m.name) {
+                        if !dunder_trait_names.contains(&m.name.as_str())
+                            && !emitted_methods.contains(&m.name)
+                            && !own_method_names.contains(&m.name) {
                             self.emit_func(m, Some(&class_name))?;
                             emitted_methods.insert(m.name.clone());
                         }
@@ -546,7 +566,7 @@ impl<'a> Codegen<'a> {
             Stmt::Import { .. } => {
                 // Silently drop imports in v0
             }
-            Stmt::Try { body, handlers, finally_, .. } => {
+            Stmt::Try { body, handlers, else_, finally_, .. } => {
                 self.line("{");
                 self.indent += 1;
                 self.line("let __try_result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {");
@@ -554,7 +574,8 @@ impl<'a> Codegen<'a> {
                 for s in body { self.emit_stmt(s)?; }
                 self.indent -= 1;
                 self.line("}));");
-                if !handlers.is_empty() {
+
+                if !handlers.is_empty() || else_.is_some() {
                     self.line("if let Err(_) = __try_result {");
                     self.indent += 1;
                     for h in handlers {
@@ -562,7 +583,16 @@ impl<'a> Codegen<'a> {
                     }
                     self.indent -= 1;
                     self.line("}");
+
+                    if let Some(else_body) = else_ {
+                        self.line("if let Ok(_) = __try_result {");
+                        self.indent += 1;
+                        for s in else_body { self.emit_stmt(s)?; }
+                        self.indent -= 1;
+                        self.line("}");
+                    }
                 }
+
                 if let Some(fin) = finally_ {
                     for s in fin { self.emit_stmt(s)?; }
                 }
@@ -919,6 +949,19 @@ impl<'a> Codegen<'a> {
 
                 // Method call with attribute callee — handle method name remapping
                 if let Expr::Attr { obj, name, .. } = callee.as_ref() {
+                    // Check for static method calls: ClassName.method(args)
+                    if let Expr::Ident(class_name, _) = obj.as_ref() {
+                        if let Some(class_def) = self.ctx.classes.get(class_name.as_str()) {
+                            if let Some(method_def) = class_def.methods.iter().find(|m| &m.name == name) {
+                                if method_def.decorators.contains(&"staticmethod".to_string()) {
+                                    let parts: Result<Vec<_>> = args.iter().map(|a| self.emit_expr(a)).collect();
+                                    let parts = parts?;
+                                    return Ok(format!("{}::{}({})", class_name, name, parts.join(", ")));
+                                }
+                            }
+                        }
+                    }
+
                     let obj_s = self.emit_expr(obj)?;
                     let method = match name.as_str() {
                         // String methods
@@ -1078,7 +1121,17 @@ impl<'a> Codegen<'a> {
                     _ => format!("{}[{} as usize]", o, i),
                 }
             }
-            Expr::BinOp { op, lhs, rhs, .. } => {
+            Expr::BinOp { op, lhs, rhs, span } => {
+                // Try constant folding first
+                if let Some(folded) = try_fold_const(&Expr::BinOp {
+                    op: *op,
+                    lhs: lhs.clone(),
+                    rhs: rhs.clone(),
+                    span: *span,
+                }) {
+                    return self.emit_expr(&folded);
+                }
+
                 // Handle `x is None` / `x is not None` → .is_none() / .is_some()
                 if matches!(op, BinOp::Is | BinOp::IsNot) && matches!(rhs.as_ref(), Expr::None_(_)) {
                     let l = self.emit_expr(lhs)?;
@@ -1112,7 +1165,16 @@ impl<'a> Codegen<'a> {
                     }
                 }
             }
-            Expr::UnOp { op, expr, .. } => {
+            Expr::UnOp { op, expr, span } => {
+                // Try constant folding first
+                if let Some(folded) = try_fold_const(&Expr::UnOp {
+                    op: *op,
+                    expr: expr.clone(),
+                    span: *span,
+                }) {
+                    return self.emit_expr(&folded);
+                }
+
                 let e = self.emit_expr(expr)?;
                 match op {
                     UnOp::Neg => format!("(-{})", e),
@@ -1137,6 +1199,58 @@ fn extract_narrowing(cond: &Expr) -> Option<(String, bool)> {
                 return Some((name.clone(), *op == BinOp::IsNot));
             }
         }
+    }
+    None
+}
+
+/// Attempt to evaluate constant expressions at compile time.
+/// Returns the folded expression, or None if constant folding isn't possible.
+fn try_fold_const(expr: &Expr) -> Option<Expr> {
+    match expr {
+        Expr::BinOp { op, lhs, rhs, span } => {
+            // Try to fold both sides first (recursive)
+            let lhs = try_fold_const(lhs).unwrap_or(*lhs.clone());
+            let rhs = try_fold_const(rhs).unwrap_or(*rhs.clone());
+
+            // Arithmetic folding
+            match (&lhs, &rhs) {
+                (Expr::Int(a, _), Expr::Int(b, _)) => {
+                    let result = match op {
+                        BinOp::Add => Some(a + b),
+                        BinOp::Sub => Some(a - b),
+                        BinOp::Mul => Some(a * b),
+                        BinOp::Div if *b != 0 => Some(a / b),
+                        BinOp::FloorDiv if *b != 0 => Some(a / b),
+                        BinOp::Mod if *b != 0 => Some(a % b),
+                        BinOp::Pow if *b >= 0 && *b < 64 => Some(a.pow(*b as u32)),
+                        _ => None,
+                    };
+                    return result.map(|v| Expr::Int(v, *span));
+                }
+                (Expr::Bool(a, _), Expr::Bool(b, _)) => {
+                    let result = match op {
+                        BinOp::And => Some(*a && *b),
+                        BinOp::Or => Some(*a || *b),
+                        BinOp::Eq => Some(a == b),
+                        BinOp::Ne => Some(a != b),
+                        _ => None,
+                    };
+                    return result.map(|v| Expr::Bool(v, *span));
+                }
+                _ => {}
+            }
+        }
+        Expr::UnOp { op, expr: inner, span } => {
+            if let Some(folded) = try_fold_const(inner) {
+                match (&folded, op) {
+                    (Expr::Int(n, _), UnOp::Neg) => return Some(Expr::Int(-n, *span)),
+                    (Expr::Bool(b, _), UnOp::Not) => return Some(Expr::Bool(!b, *span)),
+                    (Expr::Int(n, _), UnOp::BitNot) => return Some(Expr::Int(!n, *span)),
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
     }
     None
 }
@@ -1171,7 +1285,22 @@ pub fn emit(m: &Module, ctx: &TyCtx) -> Result<String> {
 /// Emit Rust code from multiple modules in dependency order.
 /// Used for multi-file compilation.
 pub fn emit_program(modules: &[(Module, String)], ctx: &TyCtx) -> Result<String> {
-    let mut cg = Codegen::new(ctx);
+    // Analyze which functions are actually called
+    let mut called_funcs = std::collections::HashSet::new();
+    for (m, _src) in modules {
+        let calls = crate::typeck::analyze_called_functions(m);
+        called_funcs.extend(calls);
+    }
+
+    // Identify dead functions (defined but not called)
+    let mut dead_funcs = std::collections::HashSet::new();
+    for func_name in ctx.funcs.keys() {
+        if func_name != "main" && !called_funcs.contains(func_name.as_str()) {
+            dead_funcs.insert(func_name.clone());
+        }
+    }
+
+    let mut cg = Codegen::new(ctx).with_dead_funcs(dead_funcs);
 
     // Preamble — written once
     cg.line("#![allow(unused_parens, unused_variables, unused_mut, dead_code)]");

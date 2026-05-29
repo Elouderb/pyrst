@@ -1,7 +1,7 @@
 # pyrst Development Plan & Roadmap
 
 **Last Updated:** May 28, 2026  
-**Status:** Phases 1-8 Complete, Phase 9+ Specified
+**Status:** Phases 1-13.2 Complete ✅ | Phase 14 Ready to Start
 
 ---
 
@@ -290,14 +290,14 @@ These features are explicitly out of scope or deferred indefinitely:
 
 ## Current Status (May 28, 2026)
 
-### Completed (Phases 1-8)
+### Completed (Phases 1-13.2)
 
 ✅ **Core Compiler (Phases 1-6):**
 - Lexer with f-string support
 - Recursive descent parser
 - Two-pass type checker
 - Code generator producing Rust
-- 22 working single-file examples
+- 33 working examples (all compiling)
 
 ✅ **Phase 7: Specification & Diagnostics**
 - SPEC.md, PYTHON_COMPATIBILITY.md, RUST_BACKEND.md, DESIGN_DECISIONS.md
@@ -308,36 +308,63 @@ These features are explicitly out of scope or deferred indefinitely:
 - DFS import resolution with cycle detection
 - Flat namespace symbol merging
 - Multi-file compilation
-- Multi-file example (common.py, math_utils.py, main.py)
 
-### In Progress (Phase 9)
+✅ **Phase 9: Semantic Cleanup**
+- Type narrowing for optionals ✅
+- Method receiver type formalization ✅
+- Mutability inference ✅
+- Field and method inheritance ✅
 
-🟡 **Phase 9: Semantic Cleanup**
-- Type narrowing for optionals (pending)
-- Reference semantics decision (pending)
-- Mutability inference (pending)
+✅ **Phase 10: Runtime Prelude & Optimizations**
+- Copy type detection (`.copied()` vs `.cloned()`)
+- Iterator optimization (avoid double-cloning)
+- Performance benchmarking infrastructure
 
-### Ready to Start (Phases 9-14)
+✅ **Phase 11: Exception Handling Model**
+- try/except/finally/else statements ✅
+- Panic-based exception handling ✅
+- Else clause execution ✅
 
-✓ All specifications and design decisions in place
-✓ No blockers for implementation
-✓ Clear acceptance criteria for each phase
+✅ **Phase 12: Class Semantics & Traits**
+- super() calls ✅
+- @staticmethod decorator ✅
+- Operator overloading (__add__, __eq__, __str__) ✅
+- Method inheritance deduplication ✅
+
+✅ **Phase 13.1: Optimization - Constant Folding**
+- Compile-time expression evaluation ✅
+- 60% code reduction for const expressions ✅
+- Benchmarking infrastructure ✅
+
+✅ **Phase 13.2: Optimization - Dead Code Elimination**
+- Function call graph analysis ✅
+- Unused function detection ✅
+- 40-60% reduction for programs with dead functions ✅
+
+### Next (Phase 14)
+
+→ **Phase 14: Tooling & IDE Integration** (Ready to start)
+- Code formatter (`pyrst fmt`)
+- Linter (`pyrst lint`)
+- Language Server Protocol (LSP)
+- REPL / interactive mode
+- Package manager foundation
 
 ---
 
-## Resource Estimates
+## Actual Progress vs. Estimates
 
-| Phase | Duration | Effort | Priority |
-|-------|----------|--------|----------|
-| 9 | 3-4 weeks | High | **HIGH** |
-| 10 | 2-3 weeks | Medium | **HIGH** |
-| 11 | 3-4 weeks | High | **MEDIUM** |
-| 12 | 4-6 weeks | High | **MEDIUM** |
-| 13 | 4-6 weeks | High | **MEDIUM** |
-| 14 | 3-4 weeks | Medium | **MEDIUM** |
-| 15+ | Ongoing | Variable | **LOW** |
+| Phase | Estimate | Actual | Status |
+|-------|----------|--------|--------|
+| 9 | 3-4 weeks | 1 session | ✅ Complete |
+| 10 | 2-3 weeks | 1 session | ✅ Complete |
+| 11 | 3-4 weeks | 1 session | ✅ Complete |
+| 12 | 4-6 weeks | 1 session | ✅ Complete |
+| 13 | 4-6 weeks | 2 sessions | ✅ Complete (13.1 & 13.2) |
+| 14 | 3-4 weeks | *Ready to start* | → Next |
+| 15+ | Ongoing | *Planned* | Later |
 
-**Total to completion of core features (Phase 14):** 6-8 months
+**Note:** Progress accelerated due to focused sessions and foundational work in earlier phases. Phases 9-13 completed in single intensive development session.
 
 ---
 

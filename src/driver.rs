@@ -42,6 +42,15 @@ pub fn build(path: &Path) -> Result<()> {
     Ok(())
 }
 
+pub fn fmt(path: &Path) -> Result<()> {
+    let source = std::fs::read_to_string(path)?;
+    let module = crate::parser::parse(&source)?;
+    let formatted = crate::formatter::format(&module);
+    std::fs::write(path, formatted)?;
+    eprintln!("formatted: {}", path.display());
+    Ok(())
+}
+
 fn compile_to_rust(path: &Path) -> Result<String> {
     let prog = crate::resolver::resolve(path)?;
     for (m, _src) in &prog.modules {

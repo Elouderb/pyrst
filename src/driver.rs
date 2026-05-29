@@ -51,6 +51,28 @@ pub fn fmt(path: &Path) -> Result<()> {
     Ok(())
 }
 
+pub fn lint(path: &Path) -> Result<()> {
+    let source = std::fs::read_to_string(path)?;
+    let module = crate::parser::parse(&source)?;
+    let lints = crate::linter::lint(&module);
+
+    if lints.is_empty() {
+        eprintln!("ok: no issues found");
+        return Ok(());
+    }
+
+    for lint in lints {
+        let level_str = match lint.level {
+            crate::linter::LintLevel::Error => "error",
+            crate::linter::LintLevel::Warning => "warning",
+            crate::linter::LintLevel::Info => "info",
+        };
+        eprintln!("{}: {} [{}] {}", level_str, lint.code, path.display(), lint.message);
+    }
+
+    Ok(())
+}
+
 fn compile_to_rust(path: &Path) -> Result<String> {
     let prog = crate::resolver::resolve(path)?;
     for (m, _src) in &prog.modules {

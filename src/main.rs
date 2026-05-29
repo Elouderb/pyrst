@@ -10,6 +10,7 @@ mod driver;
 mod diag;
 mod resolver;
 mod formatter;
+mod linter;
 
 fn print_usage() {
     eprintln!("pyrst {} — Pythonic language that compiles to Rust", env!("CARGO_PKG_VERSION"));
@@ -21,6 +22,7 @@ fn print_usage() {
     eprintln!("  emit  <file.py>     emit generated Rust source to stdout (no rustc)");
     eprintln!("  check <file.py>     parse and typecheck only");
     eprintln!("  fmt   <file.py>     format a pyrst source file in-place");
+    eprintln!("  lint  <file.py>     check code style and common issues");
 }
 
 fn main() -> ExitCode {
@@ -46,6 +48,7 @@ fn main() -> ExitCode {
         "emit" => driver::emit(&path),
         "check" => driver::check(&path),
         "fmt" => driver::fmt(&path),
+        "lint" => driver::lint(&path),
         other => {
             eprintln!("error: unknown command '{}'", other);
             print_usage();

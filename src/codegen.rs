@@ -1301,6 +1301,18 @@ impl<'a> Codegen<'a> {
                             };
                             return Ok(format!("String::from(\"{}\")", type_name));
                         }
+                        "hex" => {
+                            let a = self.emit_expr(&args[0])?;
+                            return Ok(format!("format!(\"{{:#x}}\", {})", a));
+                        }
+                        "oct" => {
+                            let a = self.emit_expr(&args[0])?;
+                            return Ok(format!("format!(\"{{:#o}}\", {})", a));
+                        }
+                        "bin" => {
+                            let a = self.emit_expr(&args[0])?;
+                            return Ok(format!("format!(\"{{:#b}}\", {})", a));
+                        }
                         _ => {}
                     }
                 }

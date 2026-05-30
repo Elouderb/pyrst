@@ -1475,6 +1475,26 @@ impl<'a> Codegen<'a> {
                         return Ok(format!("{}.contains({}.as_str())", obj_s, parts[0]));
                     }
 
+                    // String utility methods
+                    if name == "isdigit" {
+                        return Ok(format!("(if {}.chars().all(|c| c.is_numeric()) {{ \"True\" }} else {{ \"False\" }}).to_string()", obj_s));
+                    }
+                    if name == "isalpha" {
+                        return Ok(format!("(if {}.chars().all(|c| c.is_alphabetic()) {{ \"True\" }} else {{ \"False\" }}).to_string()", obj_s));
+                    }
+                    if name == "isupper" {
+                        return Ok(format!("(if {}.chars().filter(|c| c.is_alphabetic()).all(|c| c.is_uppercase()) && {}.chars().any(|c| c.is_alphabetic()) {{ \"True\" }} else {{ \"False\" }}).to_string()", obj_s, obj_s));
+                    }
+                    if name == "islower" {
+                        return Ok(format!("(if {}.chars().filter(|c| c.is_alphabetic()).all(|c| c.is_lowercase()) && {}.chars().any(|c| c.is_alphabetic()) {{ \"True\" }} else {{ \"False\" }}).to_string()", obj_s, obj_s));
+                    }
+                    if name == "isspace" {
+                        return Ok(format!("(if {}.chars().all(|c| c.is_whitespace()) {{ \"True\" }} else {{ \"False\" }}).to_string()", obj_s));
+                    }
+                    if name == "isalnum" {
+                        return Ok(format!("(if {}.chars().all(|c| c.is_alphanumeric()) {{ \"True\" }} else {{ \"False\" }}).to_string()", obj_s));
+                    }
+
                     // Dict methods - return iterators directly (will be wrapped by for loop)
                     if name == "keys" {
                         return Ok(format!("{}.keys().cloned()", obj_s));
@@ -1484,6 +1504,17 @@ impl<'a> Codegen<'a> {
                     }
                     if name == "items" {
                         return Ok(format!("{}.iter().map(|(k, v)| (k.clone(), v.clone()))", obj_s));
+                    }
+                    if name == "pop" {
+                        if parts.is_empty() {
+                            return Err(crate::diag::Error::Codegen("pop requires at least one argument".into()));
+                        } else if parts.len() == 1 {
+                            // pop(key) — panic if not found
+                            return Ok(format!("{{ let mut __d = {}.clone(); __d.remove(&{}).expect(\"KeyError: key not found\") }}", obj_s, parts[0]));
+                        } else {
+                            // pop(key, default) — return default if not found
+                            return Ok(format!("{{ let mut __d = {}.clone(); __d.remove(&{}).unwrap_or({}) }}", obj_s, parts[0], parts[1]));
+                        }
                     }
 
                     // List methods
@@ -1604,8 +1635,20 @@ impl<'a> Codegen<'a> {
                 let i = self.emit_expr(idx)?;
                 match obj_ty.as_ref() {
                     Some(Ty::Dict(..)) => format!("{}.get(&{}).cloned().expect(\"key not found\")", o, i),
-                    Some(Ty::Str) => format!("{{ let __chars: Vec<char> = {}.chars().collect(); __chars[{} as usize].to_string() }}", o, i),
-                    _ => format!("{}[{} as usize]", o, i),
+                    Some(Ty::Str) => {
+                        // String indexing with negative index support
+                        format!(
+                            "{{ let __chars: Vec<char> = {}.chars().collect(); let __idx = if {} < 0 {{ ((__chars.len() as i64) + {}) as usize }} else {{ {} as usize }}; __chars[__idx].to_string() }}",
+                            o, i, i, i
+                        )
+                    }
+                    _ => {
+                        // List indexing with negative index support
+                        format!(
+                            "{{ let __list = {}.clone(); let __idx = if {} < 0 {{ ((__list.len() as i64) + {}) as usize }} else {{ {} as usize }}; __list[__idx].clone() }}",
+                            o, i, i, i
+                        )
+                    }
                 }
             }
             Expr::Slice { obj, start, stop, step, .. } => {
@@ -1614,37 +1657,47 @@ impl<'a> Codegen<'a> {
 
                 match obj_ty {
                     Ty::Str => {
-                        // String slicing
+                        // String slicing with negative index support
                         if step.is_some() {
                             return Err(crate::diag::Error::Codegen("string slicing with step not supported".into()));
                         }
                         let start_expr = start.as_ref().map(|e| self.emit_expr(e)).transpose()?;
-                        let start_val = start_expr.map(|s| format!("({} as usize)", s)).unwrap_or_else(|| "0usize".to_string());
+                        let start_val = start_expr.map(|s| {
+                            format!("(if {} < 0 {{ (({}.len() as i64) + {}) as usize }} else {{ {} as usize }})", s, o, s, s)
+                        }).unwrap_or_else(|| "0usize".to_string());
+
                         let stop_expr = stop.as_ref().map(|e| self.emit_expr(e)).transpose()?;
-                        let stop_val = stop_expr.map(|s| format!("({} as usize)", s)).unwrap_or_else(|| format!("{}.len()", o));
+                        let stop_val = stop_expr.map(|s| {
+                            format!("(if {} < 0 {{ (({}.len() as i64) + {}) as usize }} else {{ {} as usize }})", s, o, s, s)
+                        }).unwrap_or_else(|| format!("{}.len()", o));
+
                         format!("((&{}[{}..{}]).to_string())", o, start_val, stop_val)
                     }
                     Ty::List(_) => {
-                        // List slicing with step support
+                        // List slicing with step support and negative index handling
                         match (start, stop, step) {
                             (Some(s), Some(e), None) => {
                                 // Simple: x[start:stop]
                                 let start_s = self.emit_expr(s)?;
                                 let stop_s = self.emit_expr(e)?;
                                 format!(
-                                    "{{ let __list = {}.clone(); let __start = ({} as usize).min(__list.len()); let __stop = ({} as usize).min(__list.len()); __list[__start..(__start + (__stop - __start))].to_vec() }}",
-                                    o, start_s, stop_s
+                                    "{{ let __list = {}.clone(); let __len = __list.len() as i64; let __start = if {} < 0 {{ ((__len + {}) as usize).min(__list.len()) }} else {{ ({} as usize).min(__list.len()) }}; let __stop = if {} < 0 {{ ((__len + {}) as usize).min(__list.len()) }} else {{ ({} as usize).min(__list.len()) }}; __list[__start..(__start + (__stop - __start))].to_vec() }}",
+                                    o, start_s, start_s, start_s, stop_s, stop_s, stop_s
                                 )
                             }
                             _ => {
-                                // General with step
+                                // General with step and negative index handling
                                 let start_val = start.as_ref().map(|e| self.emit_expr(e)).transpose()?.unwrap_or_else(|| "0i64".to_string());
                                 let stop_val = stop.as_ref().map(|e| self.emit_expr(e)).transpose()?.unwrap_or_else(|| format!("{}.len() as i64", o));
                                 let step_val = step.as_ref().map(|e| self.emit_expr(e)).transpose()?.unwrap_or_else(|| "1i64".to_string());
 
+                                // Wrap values in parens for safety in comparisons
+                                let start_expr = format!("({})", start_val);
+                                let stop_expr = format!("({})", stop_val);
+
                                 format!(
-                                    "{{ let __list = {}.clone(); let mut __result = Vec::new(); let __start = ({} as usize).min(__list.len()); let __stop = ({} as usize).min(__list.len()); let __step = {}; if __step > 0 {{ let mut __i = __start as i64; while __i < __stop as i64 {{ __result.push(__list[__i as usize].clone()); __i += __step; }} }} else if __step < 0 {{ let mut __i = (__stop as i64) - 1; while __i >= __start as i64 {{ __result.push(__list[__i as usize].clone()); __i += __step; }} }} __result }}",
-                                    o, start_val, stop_val, step_val
+                                    "{{ let __list = {}.clone(); let mut __result = Vec::new(); let __len = __list.len() as i64; let __start = (if {} < 0 {{ (__len + {}) as usize }} else {{ {} as usize }}).min(__list.len()); let __stop = (if {} < 0 {{ (__len + {}) as usize }} else {{ {} as usize }}).min(__list.len()); let __step = {}; if __step > 0 {{ let mut __i = __start as i64; while __i < __stop as i64 {{ __result.push(__list[__i as usize].clone()); __i += __step; }} }} else if __step < 0 {{ let mut __i = (__stop as i64) - 1; while __i >= __start as i64 {{ __result.push(__list[__i as usize].clone()); __i += __step; }} }} __result }}",
+                                    o, start_expr, start_val, start_val, stop_expr, stop_val, stop_val, step_val
                                 )
                             }
                         }

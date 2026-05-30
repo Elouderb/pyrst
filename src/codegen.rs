@@ -1532,6 +1532,12 @@ impl<'a> Codegen<'a> {
                             parts[0], obj_s
                         ));
                     }
+                    if name == "swapcase" {
+                        return Ok(format!(
+                            "{{ let __s = {}.clone(); __s.chars().map(|c| if c.is_uppercase() {{ c.to_lowercase().to_string() }} else {{ c.to_uppercase().to_string() }} ).collect::<String>() }}",
+                            obj_s
+                        ));
+                    }
                     if name == "count" && !parts.is_empty() {
                         let obj_ty = self.type_of_expr(obj);
                         match obj_ty {
@@ -1578,7 +1584,6 @@ impl<'a> Codegen<'a> {
                             return Ok(format!("{{ let mut __d = {}.clone(); __d.remove(&{}).unwrap_or({}) }}", obj_s, parts[0], parts[1]));
                         }
                     }
-
                     // List methods
                     if name == "extend" && !parts.is_empty() {
                         return Ok(format!("{}.extend({}.clone())", obj_s, parts[0]));

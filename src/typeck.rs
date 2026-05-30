@@ -144,7 +144,19 @@ impl TyCtx {
         funcs.insert("reversed".into(), FuncSig { params: vec![("x".into(), Ty::Unknown)], ret: Ty::Unknown, param_defaults: vec![] });
         funcs.insert("map".into(), FuncSig { params: vec![("f".into(), Ty::Unknown), ("x".into(), Ty::Unknown)], ret: Ty::Unknown, param_defaults: vec![] });
         funcs.insert("filter".into(), FuncSig { params: vec![("f".into(), Ty::Unknown), ("x".into(), Ty::Unknown)], ret: Ty::Unknown, param_defaults: vec![] });
-        Self { funcs, classes: HashMap::new(), vars: HashMap::new() }
+        funcs.insert("isinstance".into(), FuncSig { params: vec![("obj".into(), Ty::Unknown), ("type_".into(), Ty::Unknown)], ret: Ty::Bool, param_defaults: vec![] });
+
+        // Builtin type names for isinstance checks
+        let mut vars = HashMap::new();
+        vars.insert("int".into(), Ty::Int);
+        vars.insert("str".into(), Ty::Str);
+        vars.insert("float".into(), Ty::Float);
+        vars.insert("bool".into(), Ty::Bool);
+        vars.insert("list".into(), Ty::List(Box::new(Ty::Unknown)));
+        vars.insert("dict".into(), Ty::Dict(Box::new(Ty::Str), Box::new(Ty::Unknown)));
+        vars.insert("set".into(), Ty::Set(Box::new(Ty::Unknown)));
+
+        Self { funcs, classes: HashMap::new(), vars }
     }
 
     pub fn get_all_fields(&self, class_name: &str) -> Vec<crate::ast::Param> {

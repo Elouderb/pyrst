@@ -13,6 +13,7 @@ pub enum Ty {
     Str,
     Unit,            // maps to Rust ()
     List(Box<Ty>),
+    Set(Box<Ty>),
     Dict(Box<Ty>, Box<Ty>),
     Tuple(Vec<Ty>),
     Option(Box<Ty>),
@@ -36,6 +37,7 @@ impl Ty {
             }
             TypeExpr::Generic(n, args) => match (n.as_str(), args.as_slice()) {
                 ("list", [t]) => Ty::List(Box::new(Ty::from_type_expr(t)?)),
+                ("set", [t]) => Ty::Set(Box::new(Ty::from_type_expr(t)?)),
                 ("dict", [k, v]) => Ty::Dict(Box::new(Ty::from_type_expr(k)?), Box::new(Ty::from_type_expr(v)?)),
                 ("tuple", args) => Ty::Tuple(args.iter().map(Ty::from_type_expr).collect::<Result<Vec<_>>>()?),
                 ("Optional", [t]) => Ty::Option(Box::new(Ty::from_type_expr(t)?)),
@@ -66,6 +68,7 @@ impl Ty {
 pub struct FuncSig {
     pub params: Vec<(String, Ty)>,
     pub ret: Ty,
+    pub param_defaults: Vec<Option<Expr>>,  // None = required, Some = has default
 }
 
 pub struct TyCtx {
@@ -82,47 +85,65 @@ impl TyCtx {
         funcs.insert("print".into(), FuncSig {
             params: vec![("x".into(), Ty::Unknown)],
             ret: Ty::Unit,
+            param_defaults: vec![],
         });
         // range(n) returns an iterable; use Unknown for return type since we don't have an iterator type
         funcs.insert("range".into(), FuncSig {
             params: vec![("n".into(), Ty::Int)],
             ret: Ty::Unknown,
+            param_defaults: vec![],
         });
         // Core builtins
         funcs.insert("len".into(), FuncSig {
             params: vec![("x".into(), Ty::Unknown)],
             ret: Ty::Int,
+            param_defaults: vec![],
         });
         funcs.insert("str".into(), FuncSig {
             params: vec![("x".into(), Ty::Unknown)],
             ret: Ty::Str,
+            param_defaults: vec![],
         });
         funcs.insert("int".into(), FuncSig {
             params: vec![("x".into(), Ty::Unknown)],
             ret: Ty::Int,
+            param_defaults: vec![],
         });
         funcs.insert("float".into(), FuncSig {
             params: vec![("x".into(), Ty::Unknown)],
             ret: Ty::Float,
+            param_defaults: vec![],
         });
         funcs.insert("bool".into(), FuncSig {
             params: vec![("x".into(), Ty::Unknown)],
             ret: Ty::Bool,
+            param_defaults: vec![],
         });
         funcs.insert("enumerate".into(), FuncSig {
             params: vec![("x".into(), Ty::Unknown)],
             ret: Ty::Unknown,
+            param_defaults: vec![],
         });
         funcs.insert("zip".into(), FuncSig {
             params: vec![("a".into(), Ty::Unknown), ("b".into(), Ty::Unknown)],
             ret: Ty::Unknown,
+            param_defaults: vec![],
         });
-        funcs.insert("abs".into(), FuncSig { params: vec![("x".into(), Ty::Unknown)], ret: Ty::Int });
-        funcs.insert("min".into(), FuncSig { params: vec![("a".into(), Ty::Unknown), ("b".into(), Ty::Unknown)], ret: Ty::Unknown });
-        funcs.insert("max".into(), FuncSig { params: vec![("a".into(), Ty::Unknown), ("b".into(), Ty::Unknown)], ret: Ty::Unknown });
-        funcs.insert("sorted".into(), FuncSig { params: vec![("x".into(), Ty::Unknown)], ret: Ty::Unknown });
-        funcs.insert("sum".into(), FuncSig { params: vec![("x".into(), Ty::Unknown)], ret: Ty::Int });
-        funcs.insert("input".into(), FuncSig { params: vec![("prompt".into(), Ty::Unknown)], ret: Ty::Str });
+        funcs.insert("abs".into(), FuncSig { params: vec![("x".into(), Ty::Unknown)], ret: Ty::Int, param_defaults: vec![] });
+        funcs.insert("min".into(), FuncSig { params: vec![("a".into(), Ty::Unknown), ("b".into(), Ty::Unknown)], ret: Ty::Unknown, param_defaults: vec![] });
+        funcs.insert("max".into(), FuncSig { params: vec![("a".into(), Ty::Unknown), ("b".into(), Ty::Unknown)], ret: Ty::Unknown, param_defaults: vec![] });
+        funcs.insert("sorted".into(), FuncSig { params: vec![("x".into(), Ty::Unknown)], ret: Ty::Unknown, param_defaults: vec![] });
+        funcs.insert("sum".into(), FuncSig { params: vec![("x".into(), Ty::Unknown)], ret: Ty::Int, param_defaults: vec![] });
+        funcs.insert("input".into(), FuncSig { params: vec![("prompt".into(), Ty::Unknown)], ret: Ty::Str, param_defaults: vec![] });
+        funcs.insert("any".into(), FuncSig { params: vec![("x".into(), Ty::Unknown)], ret: Ty::Bool, param_defaults: vec![] });
+        funcs.insert("all".into(), FuncSig { params: vec![("x".into(), Ty::Unknown)], ret: Ty::Bool, param_defaults: vec![] });
+        funcs.insert("round".into(), FuncSig { params: vec![("x".into(), Ty::Unknown)], ret: Ty::Int, param_defaults: vec![] });
+        funcs.insert("pow".into(), FuncSig { params: vec![("base".into(), Ty::Unknown), ("exp".into(), Ty::Unknown)], ret: Ty::Int, param_defaults: vec![] });
+        funcs.insert("chr".into(), FuncSig { params: vec![("x".into(), Ty::Int)], ret: Ty::Str, param_defaults: vec![] });
+        funcs.insert("ord".into(), FuncSig { params: vec![("x".into(), Ty::Str)], ret: Ty::Int, param_defaults: vec![] });
+        funcs.insert("reversed".into(), FuncSig { params: vec![("x".into(), Ty::Unknown)], ret: Ty::Unknown, param_defaults: vec![] });
+        funcs.insert("map".into(), FuncSig { params: vec![("f".into(), Ty::Unknown), ("x".into(), Ty::Unknown)], ret: Ty::Unknown, param_defaults: vec![] });
+        funcs.insert("filter".into(), FuncSig { params: vec![("f".into(), Ty::Unknown), ("x".into(), Ty::Unknown)], ret: Ty::Unknown, param_defaults: vec![] });
         Self { funcs, classes: HashMap::new(), vars: HashMap::new() }
     }
 
@@ -170,7 +191,11 @@ impl TyCtx {
                     .filter_map(|p| Ty::from_type_expr(&p.ty).ok().map(|ty| (p.name.clone(), ty)))
                     .collect();
                 let ret = Ty::from_type_expr(&method.ret).unwrap_or(Ty::Unknown);
-                return Some(FuncSig { params, ret });
+                let param_defaults = method.params.iter()
+                    .filter(|p| p.name != "self")
+                    .map(|p| p.default.clone())
+                    .collect();
+                return Some(FuncSig { params, ret, param_defaults });
             }
             // Check parent classes
             for base in &class_def.bases {
@@ -227,9 +252,14 @@ pub fn check_module(m: &Module) -> Result<TyCtx> {
                     .filter(|p| p.name != "self")
                     .map(|p| Ok((p.name.clone(), Ty::from_type_expr(&p.ty)?)))
                     .collect();
+                let param_defaults: Vec<Option<Expr>> = f.params.iter()
+                    .filter(|p| p.name != "self")
+                    .map(|p| p.default.clone())
+                    .collect();
                 ctx.funcs.insert(f.name.clone(), FuncSig {
                     params: params?,
                     ret: Ty::from_type_expr(&f.ret)?,
+                    param_defaults,
                 });
             }
             Stmt::Class(c) => {
@@ -240,9 +270,13 @@ pub fn check_module(m: &Module) -> Result<TyCtx> {
                         .filter(|p| p.name != "self")
                         .map(|p| Ok((p.name.clone(), Ty::from_type_expr(&p.ty)?)))
                         .collect();
+                    let param_defaults: Vec<Option<Expr>> = m_fn.params.iter()
+                        .filter(|p| p.name != "self")
+                        .map(|p| p.default.clone())
+                        .collect();
                     ctx.funcs.insert(
                         format!("{}.{}", c.name, m_fn.name),
-                        FuncSig { params: params?, ret: Ty::from_type_expr(&m_fn.ret)? },
+                        FuncSig { params: params?, ret: Ty::from_type_expr(&m_fn.ret)?, param_defaults },
                     );
                 }
             }
@@ -408,6 +442,11 @@ fn collect_calls_from_expr(expr: &Expr, called: &mut std::collections::HashSet<S
         Expr::Tuple(elems, _) => {
             for e in elems { collect_calls_from_expr(e, called); }
         }
+        Expr::Set(elems, _) => {
+            for e in elems {
+                collect_calls_from_expr(e, called);
+            }
+        }
         Expr::Dict(pairs, _) => {
             for (k, v) in pairs {
                 collect_calls_from_expr(k, called);
@@ -426,11 +465,14 @@ fn collect_calls_from_expr(expr: &Expr, called: &mut std::collections::HashSet<S
         }
         Expr::FStr(parts, _) => {
             for part in parts {
-                if let crate::ast::FStrPart::Interp(src) = part {
+                if let crate::ast::FStrPart::Interp(src, _) = part {
                     // FStr interpolations are stored as strings, not expressions
                     // Would need to parse them again to analyze - skip for now
                 }
             }
+        }
+        Expr::Lambda { body, .. } => {
+            collect_calls_from_expr(body, called);
         }
         _ => {}
     }
@@ -581,6 +623,20 @@ fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             check_expr(target, env)?;
             Ok(())
         }
+        Stmt::Match { subject, arms, .. } => {
+            check_expr(subject, env)?;
+            for arm in arms {
+                // Check guard if present
+                if let Some(guard) = &arm.guard {
+                    check_expr(guard, env)?;
+                }
+                // Check body (with capture bindings noted but not applied in our simple impl)
+                for s in &arm.body {
+                    check_stmt(s, env)?;
+                }
+            }
+            Ok(())
+        }
         Stmt::AttrAssign { obj, value, span, .. } => {
             check_expr(value, env)?;
             if env.lookup(obj).is_none() {
@@ -640,6 +696,15 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
             };
             Ty::List(Box::new(elem_ty))
         }
+        Expr::Set(elems, _) => {
+            if elems.is_empty() {
+                Ty::Set(Box::new(Ty::Unknown))
+            } else {
+                let elem_ty = check_expr(&elems[0], env)?;
+                for e in &elems[1..] { check_expr(e, env)?; }
+                Ty::Set(Box::new(elem_ty))
+            }
+        }
         Expr::Dict(pairs, _) => {
             if pairs.is_empty() {
                 Ty::Dict(Box::new(Ty::Unknown), Box::new(Ty::Unknown))
@@ -655,10 +720,15 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
             if env.locals.contains_key(name.as_str()) {
                 env.used_vars.insert(name.clone());
             }
-            env.lookup(name).ok_or_else(|| Error::Type {
-                span: *span,
-                msg: format!("undefined name `{}`", name),
-            })?
+            // Allow standard library modules (math, dataclasses, etc.) to be Ty::Unknown
+            if matches!(name.as_str(), "math" | "dataclasses" | "sys" | "os" | "json" | "re" | "collections" | "itertools") {
+                Ty::Unknown
+            } else {
+                env.lookup(name).ok_or_else(|| Error::Type {
+                    span: *span,
+                    msg: format!("undefined name `{}`", name),
+                })?
+            }
         }
         Expr::Call { callee, args, kwargs, span } => {
             // Check if this is a class constructor or function call.
@@ -688,7 +758,9 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                         let variadic = matches!(name.as_str(),
                             "print" | "range" | "len" | "str" | "int" | "float" | "bool" | "enumerate" | "zip"
                             | "abs" | "min" | "max" | "sorted" | "sum" | "input");
-                        if !variadic && got != expected {
+                        // Count required parameters (those without defaults)
+                        let required = sig.param_defaults.iter().take_while(|d| d.is_none()).count();
+                        if !variadic && (got < required || got > expected) {
                             return Err(Error::Type {
                                 span: *span,
                                 msg: format!(
@@ -703,6 +775,16 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                         sig.ret.clone()
                     } else if name == "super" && args.is_empty() && kwargs.is_empty() {
                         // super() returns Unknown type — the codegen handles super().method() specially
+                        Ty::Unknown
+                    } else if let Some(_local_ty) = env.lookup(name) {
+                        // Variable call: could be a lambda or any callable
+                        // Check arguments but return Unknown for the result type
+                        for a in args {
+                            check_expr(a, env)?;
+                        }
+                        for (_, v) in kwargs {
+                            check_expr(v, env)?;
+                        }
                         Ty::Unknown
                     } else {
                         return Err(Error::Type {
@@ -782,6 +864,20 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 UnOp::Neg => t,
                 UnOp::BitNot => Ty::Int,
             }
+        }
+        Expr::Lambda { params, body, .. } => {
+            let mut lambda_env = FuncEnv {
+                ctx: env.ctx,
+                locals: env.locals.clone(),
+                ret_ty: Ty::Unknown,
+                used_vars: env.used_vars.clone(),
+            };
+            for (param_name, param_ty) in params {
+                let ty = Ty::from_type_expr(param_ty).unwrap_or(Ty::Unknown);
+                lambda_env.locals.insert(param_name.clone(), ty);
+            }
+            check_expr(body, &mut lambda_env)?;
+            Ty::Unknown
         }
     })
 }

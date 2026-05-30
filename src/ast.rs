@@ -42,7 +42,23 @@ pub struct ClassDef {
     pub bases: Vec<String>,
     pub fields: Vec<Param>,
     pub methods: Vec<Func>,
+    pub is_dataclass: bool,
     pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub enum MatchPattern {
+    Literal(Expr),
+    Capture(String),
+    Wildcard,
+    Or(Vec<MatchPattern>),
+}
+
+#[derive(Debug, Clone)]
+pub struct MatchArm {
+    pub pattern: MatchPattern,
+    pub guard: Option<Expr>,
+    pub body: Vec<Stmt>,
 }
 
 #[derive(Debug, Clone)]
@@ -75,6 +91,11 @@ pub enum Stmt {
     },
     Del {
         target: Expr,
+        span: Span,
+    },
+    Match {
+        subject: Expr,
+        arms: Vec<MatchArm>,
         span: Span,
     },
     Func(Func),
@@ -111,21 +132,23 @@ pub enum Expr {
     Tuple(Vec<Expr>, Span),
     ListComp { elt: Box<Expr>, target: String, iter: Box<Expr>, cond: Option<Box<Expr>>, span: Span },
     Dict(Vec<(Expr, Expr)>, Span),
+    Set(Vec<Expr>, Span),
     Call { callee: Box<Expr>, args: Vec<Expr>, kwargs: Vec<(String, Expr)>, span: Span },
     Attr { obj: Box<Expr>, name: String, span: Span },
     Index { obj: Box<Expr>, idx: Box<Expr>, span: Span },
     BinOp { op: BinOp, lhs: Box<Expr>, rhs: Box<Expr>, span: Span },
     UnOp { op: UnOp, expr: Box<Expr>, span: Span },
+    Lambda { params: Vec<(String, TypeExpr)>, body: Box<Expr>, span: Span },
 }
 
 impl Expr {
     pub fn span(&self) -> Span {
         match self {
             Expr::Int(_, s) | Expr::Float(_, s) | Expr::Str(_, s) | Expr::FStr(_, s)
-            | Expr::Bool(_, s) | Expr::None_(s) | Expr::Ident(_, s) | Expr::List(_, s) | Expr::Tuple(_, s) | Expr::Dict(_, s) => *s,
+            | Expr::Bool(_, s) | Expr::None_(s) | Expr::Ident(_, s) | Expr::List(_, s) | Expr::Tuple(_, s) | Expr::Dict(_, s) | Expr::Set(_, s) => *s,
             Expr::Call { span, .. } | Expr::Attr { span, .. }
             | Expr::Index { span, .. } | Expr::BinOp { span, .. }
-            | Expr::UnOp { span, .. } | Expr::ListComp { span, .. } => *span,
+            | Expr::UnOp { span, .. } | Expr::ListComp { span, .. } | Expr::Lambda { span, .. } => *span,
         }
     }
 }

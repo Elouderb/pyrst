@@ -78,6 +78,12 @@ impl Resolver {
             if let Stmt::Import { path, span, .. } = stmt {
                 // Phase 8: only use first component of dotted path (same-directory imports only)
                 let mod_name = &path[0];
+
+                // Skip standard library modules (math, dataclasses, etc.)
+                if matches!(mod_name.as_str(), "math" | "dataclasses" | "sys" | "os" | "json" | "re" | "collections" | "itertools") {
+                    continue;
+                }
+
                 let dep_path = base_dir.join(format!("{}.py", mod_name));
 
                 // Resolve to absolute path
@@ -110,8 +116,15 @@ fn merge_ctx_from_module(m: &Module, ctx: &mut TyCtx, is_root: bool) -> Result<(
                     continue;
                 }
                 ctx.funcs.insert(f.name.clone(), crate::typeck::FuncSig {
-                    params: f.params.iter().map(|p| (p.name.clone(), crate::typeck::Ty::Unknown)).collect(),
-                    ret: crate::typeck::Ty::Unknown,
+                    params: f.params.iter().map(|p| (
+                        p.name.clone(),
+                        crate::typeck::Ty::from_type_expr(&p.ty).unwrap_or(crate::typeck::Ty::Unknown)
+                    )).collect(),
+                    ret: crate::typeck::Ty::from_type_expr(&f.ret).unwrap_or(crate::typeck::Ty::Unknown),
+                    param_defaults: f.params.iter()
+                        .filter(|p| p.name != "self")
+                        .map(|p| p.default.clone())
+                        .collect(),
                 });
             }
             Stmt::Class(c) => {
@@ -120,8 +133,15 @@ fn merge_ctx_from_module(m: &Module, ctx: &mut TyCtx, is_root: bool) -> Result<(
                 for m_fn in &c.methods {
                     let method_name = format!("{}.{}", c.name, m_fn.name);
                     ctx.funcs.insert(method_name, crate::typeck::FuncSig {
-                        params: m_fn.params.iter().map(|p| (p.name.clone(), crate::typeck::Ty::Unknown)).collect(),
-                        ret: crate::typeck::Ty::Unknown,
+                        params: m_fn.params.iter().map(|p| (
+                            p.name.clone(),
+                            crate::typeck::Ty::from_type_expr(&p.ty).unwrap_or(crate::typeck::Ty::Unknown)
+                        )).collect(),
+                        ret: crate::typeck::Ty::from_type_expr(&m_fn.ret).unwrap_or(crate::typeck::Ty::Unknown),
+                        param_defaults: m_fn.params.iter()
+                            .filter(|p| p.name != "self")
+                            .map(|p| p.default.clone())
+                            .collect(),
                     });
                 }
             }

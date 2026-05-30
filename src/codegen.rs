@@ -32,10 +32,94 @@ impl<'a> Codegen<'a> {
         self
     }
 
+    fn is_copy_type(&self, ty: &Ty) -> bool {
+        matches!(ty, Ty::Int | Ty::Float | Ty::Bool | Ty::Unit)
+    }
+
+    fn type_of_expr(&self, e: &Expr) -> Ty {
+        match e {
+            Expr::Float(..) => Ty::Float,
+            Expr::Int(..) => Ty::Int,
+            Expr::Bool(..) => Ty::Bool,
+            Expr::Str(..) | Expr::FStr(..) => Ty::Str,
+            Expr::None_(_) => Ty::Unit,
+            Expr::Ident(n, _) => self.locals.get(n.as_str()).cloned().unwrap_or(Ty::Unknown),
+            Expr::UnOp { op: UnOp::Neg, expr, .. } => self.type_of_expr(expr),
+            Expr::UnOp { op: UnOp::Not, .. } => Ty::Bool,
+            Expr::UnOp { op: UnOp::BitNot, .. } => Ty::Int,
+            Expr::BinOp { lhs, op, rhs, .. } => {
+                let l = self.type_of_expr(lhs);
+                let r = self.type_of_expr(rhs);
+                match op {
+                    BinOp::Div => Ty::Float,
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Mod | BinOp::FloorDiv | BinOp::Pow => {
+                        if l == Ty::Float || r == Ty::Float { Ty::Float } else { Ty::Int }
+                    }
+                    BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+                    | BinOp::And | BinOp::Or | BinOp::Is | BinOp::IsNot | BinOp::In | BinOp::NotIn => Ty::Bool,
+                    _ => Ty::Unknown,
+                }
+            }
+            Expr::Attr { obj, name, .. } => {
+                if let Ty::Class(cls) = self.type_of_expr(obj) {
+                    if let Some(c) = self.ctx.classes.get(cls.as_str()) {
+                        if let Some(f) = c.fields.iter().find(|f| &f.name == name) {
+                            return Ty::from_type_expr(&f.ty).unwrap_or(Ty::Unknown);
+                        }
+                    }
+                }
+                Ty::Unknown
+            }
+            Expr::Call { callee, args, .. } => {
+                if let Expr::Ident(n, _) = callee.as_ref() {
+                    match n.as_str() {
+                        "float" => Ty::Float,
+                        "abs" => {
+                            // abs returns the same type as its argument
+                            if let Some(arg) = args.first() {
+                                self.type_of_expr(arg)
+                            } else {
+                                Ty::Unknown
+                            }
+                        }
+                        "int" | "len" | "ord" | "round" | "pow" | "sum" => Ty::Int,
+                        "bool" | "any" | "all" => Ty::Bool,
+                        "str" | "chr" | "input" => Ty::Str,
+                        n => self.ctx.funcs.get(n).map(|s| s.ret.clone()).unwrap_or(Ty::Unknown),
+                    }
+                } else if let Expr::Attr { obj, name, .. } = callee.as_ref() {
+                    // Math module return types
+                    if let Expr::Ident(modname, _) = obj.as_ref() {
+                        if modname == "math" {
+                            return match name.as_str() {
+                                "isnan" | "isinf" | "isfinite" => Ty::Bool,
+                                _ => Ty::Float,
+                            };
+                        }
+                    }
+                    // Class method dispatch
+                    if let Ty::Class(cls) = self.type_of_expr(obj) {
+                        self.ctx.get_method(&cls, name).map(|s| s.ret.clone()).unwrap_or(Ty::Unknown)
+                    } else { Ty::Unknown }
+                } else {
+                    Ty::Unknown
+                }
+            }
+            _ => Ty::Unknown,
+        }
+    }
+
     pub fn emit_module(mut self, m: &Module) -> Result<String> {
         // Preamble — pyrst stdlib shims live here.
         self.line("#![allow(unused_parens, unused_variables, unused_mut, dead_code)]");
         self.line("use std::io::Write;");
+        self.line("");
+        self.line("fn __py_fmt_float(x: f64) -> String {");
+        self.line("    if x.fract() == 0.0 { format!(\"{:.1}\", x) } else { format!(\"{}\", x) }");
+        self.line("}");
+        self.line("fn __py_fmt_bool(x: bool) -> String {");
+        self.line("    if x { \"True\".to_string() } else { \"False\".to_string() }");
+        self.line("}");
         self.line("");
         self.line("// ----- user code -----");
 
@@ -213,7 +297,18 @@ impl<'a> Codegen<'a> {
             }
         }
 
-        self.line("#[derive(Clone, Debug)]");
+        let all_fields_copy = all_fields.iter().all(|f| {
+            Ty::from_type_expr(&f.ty)
+                .map(|ty| self.is_copy_type(&ty))
+                .unwrap_or(false)
+        });
+
+        let derives = if all_fields_copy {
+            "#[derive(Copy, Clone, Debug, PartialEq)]"
+        } else {
+            "#[derive(Clone, Debug, PartialEq)]"
+        };
+        self.line(derives);
         self.line(&format!("struct {} {{", c.name));
         self.indent += 1;
         for f in &all_fields {
@@ -228,13 +323,15 @@ impl<'a> Codegen<'a> {
 
         // Dunder methods that become Rust trait impls instead of regular methods.
         let dunder_trait_names = ["__str__", "__repr__", "__add__", "__sub__", "__mul__",
-                                   "__eq__", "__len__", "__neg__", "__bool__"];
+                                   "__eq__", "__neg__", "__bool__", "__lt__"];
 
         let has_init = c.methods.iter().any(|m| m.name == "__init__");
+        let has_lt = c.methods.iter().any(|m| m.name == "__lt__");
+        let is_dataclass = c.is_dataclass;
         let has_regular_methods = c.methods.iter().any(|m|
-            m.name != "__init__" && !dunder_trait_names.contains(&m.name.as_str()));
+            m.name != "__init__" && !dunder_trait_names.contains(&m.name.as_str())) || has_lt;
 
-        if has_init || has_regular_methods {
+        if has_init || has_regular_methods || (is_dataclass && !has_init) {
             self.line(&format!("impl {} {{", c.name));
             self.indent += 1;
 
@@ -272,6 +369,24 @@ impl<'a> Codegen<'a> {
                 }
             }
 
+            // Auto-generate constructor for @dataclass without __init__
+            if is_dataclass && !has_init {
+                let param_strs: Result<Vec<_>> = all_fields.iter()
+                    .map(|f| {
+                        let ty = Ty::from_type_expr(&f.ty)?;
+                        Ok(format!("{}: {}", f.name, rust_ty(&ty)))
+                    })
+                    .collect();
+                let param_strs = param_strs?;
+                let field_inits: Vec<_> = all_fields.iter().map(|f| f.name.clone()).collect();
+                self.line(&format!("fn new({}) -> Self {{", param_strs.join(", ")));
+                self.indent += 1;
+                self.line(&format!("{} {{ {} }}", c.name, field_inits.join(", ")));
+                self.indent -= 1;
+                self.line("}");
+                self.line("");
+            }
+
             // Emit all methods except dunder-trait ones (including inherited methods).
             let class_name = c.name.clone();
             let mut emitted_methods = std::collections::HashSet::new();
@@ -295,9 +410,38 @@ impl<'a> Codegen<'a> {
                 }
             }
 
+            // Emit __super_ aliases for methods that are overridden
+            for base in &c.bases {
+                if let Some(base_def) = self.ctx.classes.get(base.as_str()).cloned() {
+                    for m in &base_def.methods {
+                        if !dunder_trait_names.contains(&m.name.as_str()) && own_method_names.contains(&m.name) {
+                            // Child overrides this parent method — emit __super_ alias
+                            let mut super_m = m.clone();
+                            super_m.name = format!("__super_{}", m.name);
+                            self.emit_func(&super_m, Some(&class_name))?;
+                        }
+                    }
+                }
+            }
+
             // Then emit own methods (these override inherited ones)
             for m in &c.methods {
-                if dunder_trait_names.contains(&m.name.as_str()) { continue; }
+                if dunder_trait_names.contains(&m.name.as_str()) {
+                    // Special handling for __lt__: emit as __lt_impl
+                    if m.name == "__lt__" {
+                        self.line(&format!("fn __lt_impl(&self, other: &{}) -> bool {{", c.name));
+                        self.indent += 1;
+                        self.locals.insert("self".into(), Ty::Class(c.name.clone()));
+                        self.locals.insert("other".into(), Ty::Class(c.name.clone()));
+                        for s in &m.body { self.emit_stmt(s)?; }
+                        self.locals.remove("self");
+                        self.locals.remove("other");
+                        self.indent -= 1;
+                        self.line("}");
+                        self.line("");
+                    }
+                    continue;
+                }
                 self.emit_func(m, Some(&class_name))?;
                 emitted_methods.insert(m.name.clone());
             }
@@ -366,6 +510,80 @@ impl<'a> Codegen<'a> {
                     for s in &m.body { self.emit_stmt(s)?; }
                     self.locals.remove("self");
                     self.locals.remove("other");
+                    self.indent -= 1;
+                    self.line("}");
+                    self.indent -= 1;
+                    self.line("}");
+                    self.line("");
+                }
+                "__sub__" => {
+                    let other_param = m.params.iter().find(|p| p.name == "other");
+                    let other_ty = other_param
+                        .map(|p| Ty::from_type_expr(&p.ty).unwrap_or(Ty::Class(c.name.clone())))
+                        .unwrap_or(Ty::Class(c.name.clone()));
+                    let ret_ty = Ty::from_type_expr(&m.ret).unwrap_or(Ty::Class(c.name.clone()));
+                    self.line(&format!("impl ::std::ops::Sub<{}> for {} {{", rust_ty(&other_ty), c.name));
+                    self.indent += 1;
+                    self.line(&format!("type Output = {};", rust_ty(&ret_ty)));
+                    self.line(&format!("fn sub(self, other: {}) -> {} {{", rust_ty(&other_ty), rust_ty(&ret_ty)));
+                    self.indent += 1;
+                    self.locals.insert("self".into(), Ty::Class(c.name.clone()));
+                    self.locals.insert("other".into(), other_ty);
+                    for s in &m.body { self.emit_stmt(s)?; }
+                    self.locals.remove("self");
+                    self.locals.remove("other");
+                    self.indent -= 1;
+                    self.line("}");
+                    self.indent -= 1;
+                    self.line("}");
+                    self.line("");
+                }
+                "__mul__" => {
+                    let other_param = m.params.iter().find(|p| p.name == "other");
+                    let other_ty = other_param
+                        .map(|p| Ty::from_type_expr(&p.ty).unwrap_or(Ty::Class(c.name.clone())))
+                        .unwrap_or(Ty::Class(c.name.clone()));
+                    let ret_ty = Ty::from_type_expr(&m.ret).unwrap_or(Ty::Class(c.name.clone()));
+                    self.line(&format!("impl ::std::ops::Mul<{}> for {} {{", rust_ty(&other_ty), c.name));
+                    self.indent += 1;
+                    self.line(&format!("type Output = {};", rust_ty(&ret_ty)));
+                    self.line(&format!("fn mul(self, other: {}) -> {} {{", rust_ty(&other_ty), rust_ty(&ret_ty)));
+                    self.indent += 1;
+                    self.locals.insert("self".into(), Ty::Class(c.name.clone()));
+                    self.locals.insert("other".into(), other_ty);
+                    for s in &m.body { self.emit_stmt(s)?; }
+                    self.locals.remove("self");
+                    self.locals.remove("other");
+                    self.indent -= 1;
+                    self.line("}");
+                    self.indent -= 1;
+                    self.line("}");
+                    self.line("");
+                }
+                "__neg__" => {
+                    let ret_ty = Ty::from_type_expr(&m.ret).unwrap_or(Ty::Class(c.name.clone()));
+                    self.line(&format!("impl ::std::ops::Neg for {} {{", c.name));
+                    self.indent += 1;
+                    self.line(&format!("type Output = {};", rust_ty(&ret_ty)));
+                    self.line(&format!("fn neg(self) -> {} {{", rust_ty(&ret_ty)));
+                    self.indent += 1;
+                    self.locals.insert("self".into(), Ty::Class(c.name.clone()));
+                    for s in &m.body { self.emit_stmt(s)?; }
+                    self.locals.remove("self");
+                    self.indent -= 1;
+                    self.line("}");
+                    self.indent -= 1;
+                    self.line("}");
+                    self.line("");
+                }
+                "__lt__" => {
+                    self.line(&format!("impl ::std::cmp::PartialOrd for {} {{", c.name));
+                    self.indent += 1;
+                    self.line(&format!("fn partial_cmp(&self, other: &{}) -> Option<::std::cmp::Ordering> {{", c.name));
+                    self.indent += 1;
+                    self.line("if self.__lt_impl(other) { Some(::std::cmp::Ordering::Less) }");
+                    self.line("else if other.__lt_impl(self) { Some(::std::cmp::Ordering::Greater) }");
+                    self.line("else { Some(::std::cmp::Ordering::Equal) }");
                     self.indent -= 1;
                     self.line("}");
                     self.indent -= 1;
@@ -482,12 +700,21 @@ impl<'a> Codegen<'a> {
             }
             Stmt::AugAssign { target, op, value, .. } => {
                 let v = self.emit_expr(value)?;
-                let op_s = match op {
-                    BinOp::Add => "+=", BinOp::Sub => "-=", BinOp::Mul => "*=", BinOp::Div => "/=",
-                    BinOp::Mod => "%=", BinOp::FloorDiv => "/=",
-                    _ => "+=", // fallback for other ops
-                };
-                self.line(&format!("{} {} {};", target, op_s, v));
+                match op {
+                    BinOp::FloorDiv => {
+                        // Python's //= floors toward negative infinity; Rust's /= truncates toward zero
+                        // Use explicit float division + floor cast for correctness
+                        self.line(&format!("{} = ({} as f64 / {} as f64).floor() as i64;", target, target, v));
+                    }
+                    _ => {
+                        let op_s = match op {
+                            BinOp::Add => "+=", BinOp::Sub => "-=", BinOp::Mul => "*=", BinOp::Div => "/=",
+                            BinOp::Mod => "%=",
+                            _ => "+=", // fallback for other ops
+                        };
+                        self.line(&format!("{} {} {};", target, op_s, v));
+                    }
+                }
             }
             Stmt::If { cond, then, elifs, else_, .. } => {
                 let narrowed = extract_narrowing(cond);
@@ -634,6 +861,44 @@ impl<'a> Codegen<'a> {
                     self.line(&format!("{}[{} as usize] = {};", obj, i, v));
                 }
             }
+            Stmt::Match { subject, arms, .. } => {
+                let subj = self.emit_expr(subject)?;
+                let temp_var = "__match_val".to_string();
+                self.line(&format!("let {} = {};", temp_var, subj));
+
+                // Emit as if/else chain
+                let mut first = true;
+                for (idx, arm) in arms.iter().enumerate() {
+                    let is_last = idx == arms.len() - 1;
+                    let is_catchall = matches!(&arm.pattern, crate::ast::MatchPattern::Wildcard | crate::ast::MatchPattern::Capture(_));
+
+                    let cond = self.emit_pattern_cond(&temp_var, &arm.pattern)?;
+                    let guard_str = if let Some(guard) = &arm.guard {
+                        let g = self.emit_expr(guard)?;
+                        format!(" && {}", g)
+                    } else {
+                        String::new()
+                    };
+
+                    if first {
+                        self.line(&format!("if {}{} {{", cond, guard_str));
+                        first = false;
+                    } else if is_last && is_catchall && guard_str.is_empty() {
+                        // Last arm is catchall without guard — emit as plain else
+                        self.line("} else {");
+                    } else {
+                        self.line(&format!("}} else if {}{} {{", cond, guard_str));
+                    }
+                    self.indent += 1;
+                    for s in &arm.body {
+                        self.emit_stmt(s)?;
+                    }
+                    self.indent -= 1;
+                }
+                if !first {
+                    self.line("}");
+                }
+            }
             Stmt::Func(_) | Stmt::Class(_) => {
                 // Nested functions/classes — punt.
                 self.line("// TODO: nested function/class");
@@ -658,8 +923,16 @@ impl<'a> Codegen<'a> {
                             // Escape { and } in the format string
                             fmt_str.push_str(&s.replace('{', "{{").replace('}', "}}"));
                         }
-                        crate::ast::FStrPart::Interp(src) => {
-                            fmt_str.push_str("{}");
+                        crate::ast::FStrPart::Interp(src, spec) => {
+                            let fmt_placeholder = match spec {
+                                None => "{}".to_string(),
+                                Some(s) => {
+                                    // Strip Python type suffix (f, d, s, g, e, %) from spec
+                                    let clean = s.trim_end_matches(|c: char| "fdsge%".contains(c));
+                                    format!("{{:{}}}", clean)
+                                }
+                            };
+                            fmt_str.push_str(&fmt_placeholder);
                             args.push(src.clone());
                         }
                     }
@@ -701,6 +974,18 @@ impl<'a> Codegen<'a> {
                     format!("{}.map(|{}| {}).collect::<Vec<_>>()", chain, target, elt_s)
                 }
             }
+            Expr::Set(elems, _) => {
+                if elems.is_empty() {
+                    return Ok("::std::collections::HashSet::new()".to_string());
+                }
+                let mut items = Vec::new();
+                for e in elems {
+                    let es = self.emit_expr(e)?;
+                    items.push(es);
+                }
+                format!("vec![{}].into_iter().collect::<::std::collections::HashSet<_>>()",
+                    items.join(", "))
+            }
             Expr::Dict(pairs, _) => {
                 if pairs.is_empty() {
                     return Ok("::std::collections::HashMap::new()".to_string());
@@ -722,8 +1007,16 @@ impl<'a> Codegen<'a> {
                         if args.is_empty() {
                             return Ok("println!(\"\")".to_string());
                         }
-                        let parts: Result<Vec<_>> = args.iter().map(|a| self.emit_expr(a)).collect();
-                        let parts = parts?;
+                        let mut parts: Vec<String> = Vec::new();
+                        for arg in args {
+                            let raw = self.emit_expr(arg)?;
+                            let formatted = match self.type_of_expr(arg) {
+                                Ty::Float => format!("__py_fmt_float({})", raw),
+                                Ty::Bool => format!("__py_fmt_bool({})", raw),
+                                _ => raw,
+                            };
+                            parts.push(formatted);
+                        }
                         // Use {} (Display format) for most types; {:?} breaks strings by adding quotes
                         let fmt = (0..parts.len()).map(|_| "{}").collect::<Vec<_>>().join(" ");
                         return Ok(format!("println!(\"{}\" {})", fmt,
@@ -840,6 +1133,45 @@ impl<'a> Codegen<'a> {
                                 return Ok(format!("{{ print!(\"{{}}\" , {}); ::std::io::stdout().flush().ok(); let mut __s = String::new(); ::std::io::stdin().read_line(&mut __s).unwrap(); __s.trim_end().to_string() }}", p));
                             }
                         }
+                        "any" => {
+                            let a = self.emit_expr(&args[0])?;
+                            return Ok(format!("{}.iter().any(|x| *x)", a));
+                        }
+                        "all" => {
+                            let a = self.emit_expr(&args[0])?;
+                            return Ok(format!("{}.iter().all(|x| *x)", a));
+                        }
+                        "round" => {
+                            let a = self.emit_expr(&args[0])?;
+                            return Ok(format!("({} as f64).round() as i64", a));
+                        }
+                        "pow" => {
+                            let base = self.emit_expr(&args[0])?;
+                            let exp = self.emit_expr(&args[1])?;
+                            return Ok(format!("({} as f64).powi({} as i32) as i64", base, exp));
+                        }
+                        "chr" => {
+                            let a = self.emit_expr(&args[0])?;
+                            return Ok(format!("(char::from_u32({} as u32).unwrap()).to_string()", a));
+                        }
+                        "ord" => {
+                            let a = self.emit_expr(&args[0])?;
+                            return Ok(format!("({}.chars().next().unwrap() as i64)", a));
+                        }
+                        "reversed" => {
+                            let a = self.emit_expr(&args[0])?;
+                            return Ok(format!("{{ let mut __r = {}.clone(); __r.reverse(); __r }}", a));
+                        }
+                        "map" => {
+                            let f = self.emit_expr(&args[0])?;
+                            let it = self.emit_expr(&args[1])?;
+                            return Ok(format!("{}.iter().cloned().map({}).collect::<Vec<_>>()", it, f));
+                        }
+                        "filter" => {
+                            let f = self.emit_expr(&args[0])?;
+                            let it = self.emit_expr(&args[1])?;
+                            return Ok(format!("{}.iter().cloned().filter(|__x| ({})((__x).clone())).collect::<Vec<_>>()", it, f));
+                        }
                         _ => {}
                     }
                 }
@@ -933,14 +1265,11 @@ impl<'a> Codegen<'a> {
                     if let Expr::Call { callee: super_ident, args: super_args, .. } = super_call_expr.as_ref() {
                         if let Expr::Ident(n, _) = super_ident.as_ref() {
                             if n == "super" && super_args.is_empty() {
-                                if let Some(class_name) = self.current_class.clone() {
-                                    if let Some(class_def) = self.ctx.classes.get(class_name.as_str()).cloned() {
-                                        if let Some(base) = class_def.bases.first().cloned() {
-                                            let mut call_parts = vec!["self".to_string()];
-                                            for a in args { call_parts.push(self.emit_expr(a)?); }
-                                            return Ok(format!("{}::{}({})", base, method_name, call_parts.join(", ")));
-                                        }
-                                    }
+                                if let Some(_class_name) = self.current_class.clone() {
+                                    // Call __super_ alias method which has parent's body
+                                    let mut arg_parts = Vec::new();
+                                    for a in args { arg_parts.push(self.emit_expr(a)?); }
+                                    return Ok(format!("self.__super_{}({})", method_name, arg_parts.join(", ")));
                                 }
                             }
                         }
@@ -949,6 +1278,42 @@ impl<'a> Codegen<'a> {
 
                 // Method call with attribute callee — handle method name remapping
                 if let Expr::Attr { obj, name, .. } = callee.as_ref() {
+                    // Math module functions
+                    if let Expr::Ident(modname, _) = obj.as_ref() {
+                        if modname == "math" {
+                            let parts: Result<Vec<_>> = args.iter().map(|a| self.emit_expr(a)).collect();
+                            let parts = parts?;
+                            let a0 = parts.get(0).map(|s| s.as_str()).unwrap_or("0.0");
+                            let a1 = parts.get(1).map(|s| s.as_str()).unwrap_or("0.0");
+                            return Ok(match name.as_str() {
+                                "sqrt"     => format!("({} as f64).sqrt()", a0),
+                                "floor"    => format!("({} as f64).floor()", a0),
+                                "ceil"     => format!("({} as f64).ceil()", a0),
+                                "trunc"    => format!("({} as f64).trunc()", a0),
+                                "fabs" | "abs" => format!("({} as f64).abs()", a0),
+                                "exp"      => format!("({} as f64).exp()", a0),
+                                "log"      => if parts.len() == 2 { format!("({} as f64).log({} as f64)", a0, a1) } else { format!("({} as f64).ln()", a0) },
+                                "log2"     => format!("({} as f64).log2()", a0),
+                                "log10"    => format!("({} as f64).log10()", a0),
+                                "sin"      => format!("({} as f64).sin()", a0),
+                                "cos"      => format!("({} as f64).cos()", a0),
+                                "tan"      => format!("({} as f64).tan()", a0),
+                                "asin"     => format!("({} as f64).asin()", a0),
+                                "acos"     => format!("({} as f64).acos()", a0),
+                                "atan"     => format!("({} as f64).atan()", a0),
+                                "atan2"    => format!("({} as f64).atan2({} as f64)", a0, a1),
+                                "pow"      => format!("({} as f64).powf({} as f64)", a0, a1),
+                                "hypot"    => format!("({} as f64).hypot({} as f64)", a0, a1),
+                                "degrees"  => format!("({} as f64).to_degrees()", a0),
+                                "radians"  => format!("({} as f64).to_radians()", a0),
+                                "isnan"    => format!("({} as f64).is_nan()", a0),
+                                "isinf"    => format!("({} as f64).is_infinite()", a0),
+                                "isfinite" => format!("({} as f64).is_finite()", a0),
+                                _ => return Err(crate::diag::Error::Codegen(format!("unknown math function: math.{}", name))),
+                            });
+                        }
+                    }
+
                     // Check for static method calls: ClassName.method(args)
                     if let Expr::Ident(class_name, _) = obj.as_ref() {
                         if let Some(class_def) = self.ctx.classes.get(class_name.as_str()) {
@@ -1071,9 +1436,33 @@ impl<'a> Codegen<'a> {
                 }
 
                 // Regular function call (not a class).
-                let callee_s = self.emit_expr(callee)?;
                 let mut parts = Vec::with_capacity(args.len());
                 for a in args { parts.push(self.emit_expr(a)?); }
+
+                // Inject default arguments for named functions
+                if let Expr::Ident(n, _) = callee.as_ref() {
+                    if let Some(sig) = self.ctx.funcs.get(n.as_str()).cloned() {
+                        let expected = sig.params.len();
+                        if parts.len() < expected && !sig.param_defaults.is_empty() {
+                            let defaults_needed = expected - parts.len();
+                            let defaults_start = sig.param_defaults.len().saturating_sub(defaults_needed);
+                            for def_expr in &sig.param_defaults[defaults_start..] {
+                                match def_expr {
+                                    Some(e) => parts.push(self.emit_expr(e)?),
+                                    None => return Err(crate::diag::Error::Codegen("missing required argument".into())),
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let callee_s = self.emit_expr(callee)?;
+                // Parenthesize lambda expressions when used as callees
+                let callee_s = if matches!(callee.as_ref(), Expr::Lambda { .. }) {
+                    format!("({})", callee_s)
+                } else {
+                    callee_s
+                };
 
                 // kwargs on a non-class call site are an error in v0.
                 if !kwargs.is_empty() {
@@ -1085,6 +1474,20 @@ impl<'a> Codegen<'a> {
                 format!("{}({})", callee_s, parts.join(", "))
             }
             Expr::Attr { obj, name, .. } => {
+                // Math module constants
+                if let Expr::Ident(modname, _) = obj.as_ref() {
+                    if modname == "math" {
+                        return Ok(match name.as_str() {
+                            "pi"  => "::std::f64::consts::PI".to_string(),
+                            "e"   => "::std::f64::consts::E".to_string(),
+                            "tau" => "::std::f64::consts::TAU".to_string(),
+                            "inf" => "f64::INFINITY".to_string(),
+                            "nan" => "f64::NAN".to_string(),
+                            _ => return Err(crate::diag::Error::Codegen(format!("unknown math constant: {}", name))),
+                        });
+                    }
+                }
+
                 let o = self.emit_expr(obj)?;
                 // Check if this is a @property access
                 let is_property = if let Expr::Ident(var, _) = obj.as_ref() {
@@ -1130,6 +1533,27 @@ impl<'a> Codegen<'a> {
                     span: *span,
                 }) {
                     return self.emit_expr(&folded);
+                }
+
+                // Handle sequence repetition: "abc" * 3 and [0] * 5
+                if *op == BinOp::Mul {
+                    let lt = self.type_of_expr(lhs);
+                    let rt = self.type_of_expr(rhs);
+                    if lt == Ty::Str || rt == Ty::Str {
+                        let (str_e, num_e) = if lt == Ty::Str { (lhs, rhs) } else { (rhs, lhs) };
+                        let s = self.emit_expr(str_e)?;
+                        let n = self.emit_expr(num_e)?;
+                        return Ok(format!("{}.repeat({} as usize)", s, n));
+                    }
+                    if matches!(&lt, Ty::List(_)) || matches!(&rt, Ty::List(_)) {
+                        let (lst_e, num_e) = if matches!(&lt, Ty::List(_)) { (lhs, rhs) } else { (rhs, lhs) };
+                        let v = self.emit_expr(lst_e)?;
+                        let n = self.emit_expr(num_e)?;
+                        return Ok(format!(
+                            "{{ let mut __rep: Vec<_> = Vec::new(); for _ in 0..({} as usize) {{ __rep.extend({}.clone().into_iter()); }} __rep }}",
+                            n, v
+                        ));
+                    }
                 }
 
                 // Handle `x is None` / `x is not None` → .is_none() / .is_some()
@@ -1182,7 +1606,45 @@ impl<'a> Codegen<'a> {
                     UnOp::BitNot => format!("(!({}))", e),
                 }
             }
+            Expr::Lambda { params, body, .. } => {
+                let param_strs: Vec<String> = params.iter().map(|(name, _ty)| {
+                    // For now, default to i64 for all lambda parameters since we don't have full type info
+                    format!("{}: i64", name)
+                }).collect();
+                let body_s = self.emit_expr(body)?;
+                format!("|{}| {}", param_strs.join(", "), body_s)
+            }
         })
+    }
+
+    fn emit_pattern_cond(&self, var: &str, pattern: &crate::ast::MatchPattern) -> Result<String> {
+        use crate::ast::MatchPattern;
+        match pattern {
+            MatchPattern::Wildcard => Ok("true".to_string()),
+            MatchPattern::Capture(_) => Ok("true".to_string()),
+            MatchPattern::Literal(Expr::Int(n, _)) => {
+                Ok(format!("{} == {}i64", var, n))
+            }
+            MatchPattern::Literal(Expr::Bool(b, _)) => {
+                Ok(format!("{} == {}", var, b))
+            }
+            MatchPattern::Literal(Expr::Str(s, _)) => {
+                Ok(format!("{} == {:?}", var, s))
+            }
+            MatchPattern::Literal(Expr::None_(_)) => {
+                Ok(format!("{} == None", var))
+            }
+            MatchPattern::Literal(_) => {
+                Ok("true".to_string())
+            }
+            MatchPattern::Or(patterns) => {
+                let conds: Result<Vec<String>> = patterns.iter()
+                    .map(|p| self.emit_pattern_cond(var, p))
+                    .collect();
+                let conds = conds?;
+                Ok(format!("({})", conds.join(" || ")))
+            }
+        }
     }
 
     fn line(&mut self, s: &str) {
@@ -1263,6 +1725,7 @@ fn rust_ty(t: &Ty) -> String {
         Ty::Str => "String".into(),
         Ty::Unit => "()".into(),
         Ty::List(inner) => format!("Vec<{}>", rust_ty(inner)),
+        Ty::Set(inner) => format!("::std::collections::HashSet<{}>", rust_ty(inner)),
         Ty::Dict(k, v) => format!("::std::collections::HashMap<{}, {}>", rust_ty(k), rust_ty(v)),
         Ty::Tuple(parts) => {
             let inner = parts.iter().map(rust_ty).collect::<Vec<_>>().join(", ");
@@ -1305,6 +1768,13 @@ pub fn emit_program(modules: &[(Module, String)], ctx: &TyCtx) -> Result<String>
     // Preamble — written once
     cg.line("#![allow(unused_parens, unused_variables, unused_mut, dead_code)]");
     cg.line("use std::io::Write;");
+    cg.line("");
+    cg.line("fn __py_fmt_float(x: f64) -> String {");
+    cg.line("    if x.fract() == 0.0 { format!(\"{:.1}\", x) } else { format!(\"{}\", x) }");
+    cg.line("}");
+    cg.line("fn __py_fmt_bool(x: bool) -> String {");
+    cg.line("    if x { \"True\".to_string() } else { \"False\".to_string() }");
+    cg.line("}");
     cg.line("");
     cg.line("// ----- user code -----");
 

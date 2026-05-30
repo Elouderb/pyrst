@@ -66,7 +66,11 @@ impl Parser {
     fn parse_stmt(&mut self) -> Result<Stmt> {
         match self.peek() {
             Tok::Def => self.parse_def().map(Stmt::Func),
-            Tok::Class => self.parse_class().map(Stmt::Class),
+            Tok::Class => {
+                let mut c = self.parse_class()?;
+                c.is_dataclass = false;
+                Ok(Stmt::Class(c))
+            }
             Tok::If => self.parse_if(),
             Tok::While => self.parse_while(),
             Tok::For => self.parse_for(),
@@ -114,6 +118,7 @@ impl Parser {
                 self.eat_newline()?;
                 Ok(Stmt::Del { target, span })
             }
+            Tok::Match => self.parse_match(),
             Tok::Return => {
                 let span = self.peek_span();
                 self.bump();
@@ -162,6 +167,11 @@ impl Parser {
                         let mut f = self.parse_def()?;
                         f.decorators = decorators;
                         Ok(Stmt::Func(f))
+                    }
+                    Tok::Class => {
+                        let mut c = self.parse_class()?;
+                        c.is_dataclass = decorators.contains(&"dataclass".to_string());
+                        Ok(Stmt::Class(c))
                     }
                     _ => self.parse_stmt()
                 }
@@ -429,7 +439,7 @@ impl Parser {
             }
         }
         self.expect(&Tok::Dedent, "class body")?;
-        Ok(ClassDef { name, bases, fields, methods, span })
+        Ok(ClassDef { name, bases, fields, methods, is_dataclass: false, span })
     }
 
     fn parse_try(&mut self) -> Result<Stmt> {
@@ -504,6 +514,83 @@ impl Parser {
         self.expect(&Tok::Colon, "with block")?;
         let body = self.parse_block()?;
         Ok(Stmt::With { ctx_expr, as_name, body, span })
+    }
+
+    fn parse_match(&mut self) -> Result<Stmt> {
+        let span = self.peek_span();
+        self.expect(&Tok::Match, "match")?;
+        let subject = self.parse_expr()?;
+        self.expect(&Tok::Colon, "match")?;
+        self.eat_newline()?;
+        self.expect(&Tok::Indent, "match")?;
+
+        let mut arms = Vec::new();
+        while matches!(self.peek(), Tok::Case) {
+            self.bump(); // consume 'case'
+            let pattern = self.parse_pattern()?;
+            let guard = if self.eat(&Tok::If) {
+                Some(self.parse_expr()?)
+            } else {
+                None
+            };
+            self.expect(&Tok::Colon, "case")?;
+            let body = self.parse_block()?;
+
+            arms.push(crate::ast::MatchArm { pattern, guard, body });
+        }
+
+        self.expect(&Tok::Dedent, "match")?;
+        Ok(Stmt::Match { subject, arms, span })
+    }
+
+    fn parse_pattern(&mut self) -> Result<crate::ast::MatchPattern> {
+        use crate::ast::MatchPattern;
+
+        // Parse primary pattern (literal or capture)
+        let primary = if matches!(self.peek(), Tok::Int(_) | Tok::Float(_) | Tok::Str(_) | Tok::True | Tok::False | Tok::None_) {
+            // Literal pattern
+            let expr = self.parse_atom()?;
+            MatchPattern::Literal(expr)
+        } else if let Tok::Ident(name) = self.peek().clone() {
+            self.bump();
+            // Check if it's the wildcard pattern
+            if name == "_" {
+                MatchPattern::Wildcard
+            } else {
+                MatchPattern::Capture(name)
+            }
+        } else {
+            return Err(crate::diag::Error::Parse {
+                msg: "expected pattern (literal or identifier)".into(),
+                span: self.peek_span(),
+            });
+        };
+
+        // Check for OR patterns (pat | pat | ...)
+        if matches!(self.peek(), Tok::Pipe) {
+            let mut patterns = vec![primary];
+            while self.eat(&Tok::Pipe) {
+                let next = if let Tok::Ident(name) = self.peek().clone() {
+                    self.bump();
+                    if name == "_" {
+                        MatchPattern::Wildcard
+                    } else {
+                        MatchPattern::Capture(name)
+                    }
+                } else if matches!(self.peek(), Tok::Int(_) | Tok::Float(_) | Tok::Str(_) | Tok::True | Tok::False | Tok::None_) {
+                    MatchPattern::Literal(self.parse_atom()?)
+                } else {
+                    return Err(crate::diag::Error::Parse {
+                        msg: "expected pattern in OR".into(),
+                        span: self.peek_span(),
+                    });
+                };
+                patterns.push(next);
+            }
+            Ok(MatchPattern::Or(patterns))
+        } else {
+            Ok(primary)
+        }
     }
 
     fn parse_if(&mut self) -> Result<Stmt> {
@@ -687,7 +774,35 @@ impl Parser {
     // ---- Expressions: Pratt parser ----
 
     pub fn parse_expr(&mut self) -> Result<Expr> {
-        self.parse_or()
+        self.parse_lambda()
+    }
+
+    fn parse_lambda(&mut self) -> Result<Expr> {
+        if !matches!(self.peek(), Tok::Lambda) {
+            return self.parse_or();
+        }
+        let span = self.peek_span();
+        self.bump(); // consume 'lambda'
+
+        let mut params = Vec::new();
+        // Parse lambda parameters: `lambda x, y, z: body`
+        // Parameters are separated by commas, with the colon marking the body
+        while !matches!(self.peek(), Tok::Colon | Tok::Eof) {
+            let param_name = self.expect_ident("lambda parameter")?;
+            // Lambda parameters don't have type annotations in v0
+            let ty = TypeExpr::Named("Any".into());
+            params.push((param_name, ty));
+
+            if matches!(self.peek(), Tok::Colon) {
+                break; // End of parameters, start of body
+            }
+            self.expect(&Tok::Comma, "lambda parameter separator")?;
+        }
+
+        self.expect(&Tok::Colon, "lambda body")?;
+        let body = Box::new(self.parse_or()?);
+
+        Ok(Expr::Lambda { params, body, span })
     }
 
     fn parse_or(&mut self) -> Result<Expr> {
@@ -985,18 +1100,34 @@ impl Parser {
                 }
             }
             Tok::LBrace => {
-                let mut pairs = Vec::new();
-                if !matches!(self.peek(), Tok::RBrace) {
-                    loop {
-                        let key = self.parse_expr()?;
-                        self.expect(&Tok::Colon, "dict literal")?;
-                        let val = self.parse_expr()?;
-                        pairs.push((key, val));
-                        if !self.eat(&Tok::Comma) { break; }
-                    }
+                if matches!(self.peek(), Tok::RBrace) {
+                    // Empty braces {} is an empty dict
+                    self.bump();
+                    return Ok(Expr::Dict(vec![], span));
                 }
-                self.expect(&Tok::RBrace, "dict literal")?;
-                Ok(Expr::Dict(pairs, span))
+                let first = self.parse_expr()?;
+                if matches!(self.peek(), Tok::Colon) {
+                    // It's a dict: {key: value, ...}
+                    self.bump(); // consume ':'
+                    let val = self.parse_expr()?;
+                    let mut pairs = vec![(first, val)];
+                    while self.eat(&Tok::Comma) && !matches!(self.peek(), Tok::RBrace) {
+                        let k = self.parse_expr()?;
+                        self.expect(&Tok::Colon, "dict literal")?;
+                        let v = self.parse_expr()?;
+                        pairs.push((k, v));
+                    }
+                    self.expect(&Tok::RBrace, "dict literal")?;
+                    Ok(Expr::Dict(pairs, span))
+                } else {
+                    // It's a set: {elem1, elem2, ...}
+                    let mut elems = vec![first];
+                    while self.eat(&Tok::Comma) && !matches!(self.peek(), Tok::RBrace) {
+                        elems.push(self.parse_expr()?);
+                    }
+                    self.expect(&Tok::RBrace, "set literal")?;
+                    Ok(Expr::Set(elems, span))
+                }
             }
             other => Err(Error::Parse {
                 span,

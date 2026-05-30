@@ -245,6 +245,25 @@ impl Formatter {
             Stmt::Del { target, .. } => {
                 self.writeln(&format!("del {}", self.format_expr(target)));
             }
+            Stmt::Match { subject, arms, .. } => {
+                self.writeln(&format!("match {}:", self.format_expr(subject)));
+                self.indent_level += 1;
+                for arm in arms {
+                    let pat_str = self.format_pattern(&arm.pattern);
+                    let guard_str = if let Some(g) = &arm.guard {
+                        format!(" if {}", self.format_expr(g))
+                    } else {
+                        String::new()
+                    };
+                    self.writeln(&format!("case {}{}:", pat_str, guard_str));
+                    self.indent_level += 1;
+                    for s in &arm.body {
+                        self.format_stmt(s);
+                    }
+                    self.indent_level -= 1;
+                }
+                self.indent_level -= 1;
+            }
             Stmt::AttrAssign { obj, attr, value, .. } => {
                 self.writeln(&format!("{}.{} = {}", obj, attr, self.format_expr(value)));
             }
@@ -269,6 +288,19 @@ impl Formatter {
         }
     }
 
+    fn format_pattern(&self, pattern: &crate::ast::MatchPattern) -> String {
+        use crate::ast::MatchPattern;
+        match pattern {
+            MatchPattern::Wildcard => "_".to_string(),
+            MatchPattern::Capture(name) => name.clone(),
+            MatchPattern::Literal(expr) => self.format_expr(expr),
+            MatchPattern::Or(patterns) => {
+                let parts: Vec<String> = patterns.iter().map(|p| self.format_pattern(p)).collect();
+                parts.join(" | ")
+            }
+        }
+    }
+
     fn format_expr(&self, expr: &Expr) -> String {
         match expr {
             Expr::Int(n, _) => n.to_string(),
@@ -281,9 +313,13 @@ impl Formatter {
                 for part in parts {
                     match part {
                         FStrPart::Lit(s) => result.push_str(&s.replace('\"', "\\\"")),
-                        FStrPart::Interp(expr) => {
+                        FStrPart::Interp(expr, spec) => {
                             result.push('{');
                             result.push_str(expr);
+                            if let Some(s) = spec {
+                                result.push(':');
+                                result.push_str(s);
+                            }
                             result.push('}');
                         }
                     }
@@ -309,6 +345,13 @@ impl Formatter {
                 } else {
                     format!("({})", items)
                 }
+            }
+            Expr::Set(elems, _) => {
+                let items = elems.iter()
+                    .map(|e| self.format_expr(e))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{{{}}}", items)
             }
             Expr::Dict(pairs, _) => {
                 let items = pairs.iter()
@@ -374,6 +417,13 @@ impl Formatter {
                     String::new()
                 };
                 format!("[{} for {} in {}{}]", self.format_expr(elt), target, self.format_expr(iter), cond_str)
+            }
+            Expr::Lambda { params, body, .. } => {
+                let param_strs = params.iter()
+                    .map(|(name, _ty)| name.clone())  // Don't show inferred Any types
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("lambda {}: {}", param_strs, self.format_expr(body))
             }
             _ => "/* complex expr */".to_string(),
         }

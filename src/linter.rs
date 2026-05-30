@@ -304,6 +304,17 @@ impl Linter {
                 }
                 self.check_expr(value);
             }
+            Stmt::Match { subject, arms, .. } => {
+                self.check_expr(subject);
+                for arm in arms {
+                    if let Some(guard) = &arm.guard {
+                        self.check_expr(guard);
+                    }
+                    for stmt in &arm.body {
+                        self.check_stmt(stmt);
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -347,6 +358,11 @@ impl Linter {
                     self.check_expr(e);
                 }
             }
+            Expr::Set(elems, _) => {
+                for e in elems {
+                    self.check_expr(e);
+                }
+            }
             Expr::Dict(pairs, _) => {
                 for (k, v) in pairs {
                     self.check_expr(k);
@@ -362,6 +378,11 @@ impl Linter {
                 }
                 // We don't check elt because it contains the loop variable which is
                 // scoped to the comprehension, but we should check iter
+            }
+            Expr::Lambda { params, body, .. } => {
+                // Lambda parameters are local to the lambda; check the body
+                // Variables referenced in the body that are lambda params aren't errors
+                self.check_expr(body);
             }
             _ => {}
         }

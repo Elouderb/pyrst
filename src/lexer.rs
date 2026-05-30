@@ -1,9 +1,26 @@
 use crate::diag::{Error, Result, Span};
 
+fn split_fstr_spec(s: &str) -> (String, Option<String>) {
+    let mut depth = 0;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            ':' if depth == 0 => {
+                let expr = s[..i].trim().to_string();
+                let spec = s[i+1..].trim().to_string();
+                return (expr, Some(spec));
+            }
+            _ => {}
+        }
+    }
+    (s.trim().to_string(), None)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum FStrPart {
     Lit(String),
-    Interp(String),  // raw expression source inside {}
+    Interp(String, Option<String>),  // (expr_source, format_spec)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -47,6 +64,7 @@ pub enum Tok {
     Finally,
     With,
     Del,
+    Lambda,
 
     // Punctuation
     LParen,
@@ -238,7 +256,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
                                 msg: "unterminated f-string interpolation".into(),
                             });
                         }
-                        parts.push(FStrPart::Interp(expr));
+                        let (expr_part, spec_part) = split_fstr_spec(&expr);
+                        parts.push(FStrPart::Interp(expr_part, spec_part));
                         i += 1; // consume closing }
                     }
                 } else if bytes[i] == b'}' {
@@ -413,6 +432,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
                 "finally" => Tok::Finally,
                 "with" => Tok::With,
                 "del" => Tok::Del,
+                "lambda" => Tok::Lambda,
                 "True" => Tok::True,
                 "False" => Tok::False,
                 "None" => Tok::None_,

@@ -1,7 +1,9 @@
 def main() -> None:
-    result: int  = 0
+    result: int = 0
     try:
-        result = (10 // 0)
+        x: int = 10
+        y: int = 2
+        result = x // y
     except:
         result = -1
     print(result)

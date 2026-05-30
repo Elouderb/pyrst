@@ -1538,6 +1538,12 @@ impl<'a> Codegen<'a> {
                             obj_s
                         ));
                     }
+                    if name == "splitlines" {
+                        return Ok(format!(
+                            "{}.lines().map(|l| l.to_string()).collect::<Vec<_>>()",
+                            obj_s
+                        ));
+                    }
                     if name == "count" && !parts.is_empty() {
                         let obj_ty = self.type_of_expr(obj);
                         match obj_ty {

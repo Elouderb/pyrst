@@ -1495,6 +1495,68 @@ impl<'a> Codegen<'a> {
                         return Ok(format!("(if {}.chars().all(|c| c.is_alphanumeric()) {{ \"True\" }} else {{ \"False\" }}).to_string()", obj_s));
                     }
 
+                    // Additional string methods
+                    if name == "capitalize" {
+                        return Ok(format!(
+                            "{{ let __s = {}.clone(); if __s.is_empty() {{ __s }} else {{ format!(\"{{}}{{}}\" , __s.chars().next().unwrap().to_uppercase(), &__s[1..].to_lowercase()) }} }}",
+                            obj_s
+                        ));
+                    }
+                    if name == "title" {
+                        return Ok(format!(
+                            "{{ let __s = {}.clone(); __s.split_whitespace().map(|w| if w.is_empty() {{ w.to_string() }} else {{ format!(\"{{}}{{}}\" , w.chars().next().unwrap().to_uppercase(), &w[1..].to_lowercase()) }} ).collect::<Vec<_>>().join(\" \") }}",
+                            obj_s
+                        ));
+                    }
+                    if name == "zfill" && !parts.is_empty() {
+                        return Ok(format!(
+                            "{{ let __width = {} as usize; let __s = {}.clone(); if __s.len() >= __width {{ __s }} else {{ format!(\"{{:0>width$}}\" , __s, width = __width) }} }}",
+                            parts[0], obj_s
+                        ));
+                    }
+                    if name == "ljust" && !parts.is_empty() {
+                        return Ok(format!(
+                            "{{ let __width = {} as usize; let __s = {}.clone(); if __s.len() >= __width {{ __s }} else {{ format!(\"{{:<width$}}\" , __s, width = __width) }} }}",
+                            parts[0], obj_s
+                        ));
+                    }
+                    if name == "rjust" && !parts.is_empty() {
+                        return Ok(format!(
+                            "{{ let __width = {} as usize; let __s = {}.clone(); if __s.len() >= __width {{ __s }} else {{ format!(\"{{:>width$}}\" , __s, width = __width) }} }}",
+                            parts[0], obj_s
+                        ));
+                    }
+                    if name == "center" && !parts.is_empty() {
+                        return Ok(format!(
+                            "{{ let __width = {} as usize; let __s = {}.clone(); if __s.len() >= __width {{ __s }} else {{ let __total = __width - __s.len(); let __left = (__total + 1) / 2; let __right = __total / 2; format!(\"{{}}{{}}{{}}\" , \" \".repeat(__left), __s, \" \".repeat(__right)) }} }}",
+                            parts[0], obj_s
+                        ));
+                    }
+                    if name == "count" && !parts.is_empty() {
+                        let obj_ty = self.type_of_expr(obj);
+                        match obj_ty {
+                            Ty::Str => {
+                                return Ok(format!(
+                                    "{{ let __s = {}.clone(); let __sub = {}.clone(); let mut __count = 0i64; let mut __start = 0; while let Some(__pos) = __s.as_str()[__start..].find(__sub.as_str()) {{ __count += 1; __start += __pos + __sub.len(); }} __count }}",
+                                    obj_s, parts[0]
+                                ));
+                            }
+                            _ => {} // Fall through to list count below
+                        }
+                    }
+                    if name == "index" && !parts.is_empty() {
+                        let obj_ty = self.type_of_expr(obj);
+                        match obj_ty {
+                            Ty::Str => {
+                                return Ok(format!(
+                                    "{}.find({}.as_str()).map(|i| i as i64).expect(\"substring not found\")",
+                                    obj_s, parts[0]
+                                ));
+                            }
+                            _ => {} // Fall through to list index below
+                        }
+                    }
+
                     // Dict methods - return iterators directly (will be wrapped by for loop)
                     if name == "keys" {
                         return Ok(format!("{}.keys().cloned()", obj_s));

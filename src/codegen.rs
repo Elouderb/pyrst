@@ -1539,6 +1539,24 @@ impl<'a> Codegen<'a> {
                     if name == "replace" && parts.len() >= 2 {
                         return Ok(format!("{}.replace({}.as_str(), {}.as_str())", obj_s, parts[0], parts[1]));
                     }
+                    if name == "partition" && !parts.is_empty() {
+                        return Ok(format!(
+                            "{{ let __s = {}.clone(); let __sep = {}.clone(); \
+                            if let Some(__idx) = __s.find(__sep.as_str()) {{ \
+                            vec![__s[..__idx].to_string(), __sep.clone(), __s[__idx + __sep.len()..].to_string()] \
+                            }} else {{ vec![__s, String::new(), String::new()] }} }}",
+                            obj_s, parts[0]
+                        ));
+                    }
+                    if name == "rpartition" && !parts.is_empty() {
+                        return Ok(format!(
+                            "{{ let __s = {}.clone(); let __sep = {}.clone(); \
+                            if let Some(__idx) = __s.rfind(__sep.as_str()) {{ \
+                            vec![__s[..__idx].to_string(), __sep.clone(), __s[__idx + __sep.len()..].to_string()] \
+                            }} else {{ vec![String::new(), String::new(), __s] }} }}",
+                            obj_s, parts[0]
+                        ));
+                    }
                     if name == "find" && !parts.is_empty() {
                         return Ok(format!("{}.find({}.as_str()).map(|i| i as i64).unwrap_or(-1i64)", obj_s, parts[0]));
                     }

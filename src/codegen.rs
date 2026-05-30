@@ -1273,7 +1273,7 @@ impl<'a> Codegen<'a> {
                                     "set" => matches!(&obj_type, Ty::Set(_)),
                                     _ => {
                                         // For custom classes, emit runtime check
-                                        let obj = self.emit_expr(&args[0])?;
+                                        let _obj = self.emit_expr(&args[0])?;
                                         return Ok(format!("true")); // Placeholder for custom class check
                                     }
                                 };
@@ -1282,6 +1282,24 @@ impl<'a> Codegen<'a> {
                                 // Dynamic type check (not a literal type name)
                                 return Ok("true".to_string()); // Conservative: assume true for dynamic checks
                             }
+                        }
+                        "type" => {
+                            if args.len() != 1 {
+                                return Err(crate::diag::Error::Codegen("type requires exactly 1 argument".into()));
+                            }
+                            let obj_type = self.type_of_expr(&args[0]);
+                            let type_name = match obj_type {
+                                Ty::Int => "<class 'int'>",
+                                Ty::Str => "<class 'str'>",
+                                Ty::Float => "<class 'float'>",
+                                Ty::Bool => "<class 'bool'>",
+                                Ty::List(_) => "<class 'list'>",
+                                Ty::Dict(_, _) => "<class 'dict'>",
+                                Ty::Set(_) => "<class 'set'>",
+                                Ty::Unit => "<class 'NoneType'>",
+                                _ => "<class 'object'>",
+                            };
+                            return Ok(format!("String::from(\"{}\")", type_name));
                         }
                         _ => {}
                     }

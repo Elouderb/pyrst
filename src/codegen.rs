@@ -1313,6 +1313,20 @@ impl<'a> Codegen<'a> {
                             let a = self.emit_expr(&args[0])?;
                             return Ok(format!("format!(\"{{:#b}}\", {})", a));
                         }
+                        "callable" => {
+                            if args.len() != 1 {
+                                return Err(crate::diag::Error::Codegen("callable requires exactly 1 argument".into()));
+                            }
+                            // Check if the argument is a function name
+                            if let Expr::Ident(name, _) = &args[0] {
+                                let is_callable = self.ctx.funcs.contains_key(name.as_str()) ||
+                                                 self.ctx.classes.contains_key(name.as_str());
+                                return Ok(if is_callable { "true" } else { "false" }.to_string());
+                            } else {
+                                // For non-identifier expressions, conservatively return false
+                                return Ok("false".to_string());
+                            }
+                        }
                         _ => {}
                     }
                 }

@@ -341,6 +341,12 @@ impl Linter {
                 self.check_expr(obj);
                 self.check_expr(idx);
             }
+            Expr::Slice { obj, start, stop, step, .. } => {
+                self.check_expr(obj);
+                if let Some(e) = start { self.check_expr(e); }
+                if let Some(e) = stop { self.check_expr(e); }
+                if let Some(e) = step { self.check_expr(e); }
+            }
             Expr::BinOp { lhs, rhs, .. } => {
                 self.check_expr(lhs);
                 self.check_expr(rhs);

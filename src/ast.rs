@@ -136,6 +136,7 @@ pub enum Expr {
     Call { callee: Box<Expr>, args: Vec<Expr>, kwargs: Vec<(String, Expr)>, span: Span },
     Attr { obj: Box<Expr>, name: String, span: Span },
     Index { obj: Box<Expr>, idx: Box<Expr>, span: Span },
+    Slice { obj: Box<Expr>, start: Option<Box<Expr>>, stop: Option<Box<Expr>>, step: Option<Box<Expr>>, span: Span },
     BinOp { op: BinOp, lhs: Box<Expr>, rhs: Box<Expr>, span: Span },
     UnOp { op: UnOp, expr: Box<Expr>, span: Span },
     Lambda { params: Vec<(String, TypeExpr)>, body: Box<Expr>, span: Span },
@@ -147,7 +148,7 @@ impl Expr {
             Expr::Int(_, s) | Expr::Float(_, s) | Expr::Str(_, s) | Expr::FStr(_, s)
             | Expr::Bool(_, s) | Expr::None_(s) | Expr::Ident(_, s) | Expr::List(_, s) | Expr::Tuple(_, s) | Expr::Dict(_, s) | Expr::Set(_, s) => *s,
             Expr::Call { span, .. } | Expr::Attr { span, .. }
-            | Expr::Index { span, .. } | Expr::BinOp { span, .. }
+            | Expr::Index { span, .. } | Expr::Slice { span, .. } | Expr::BinOp { span, .. }
             | Expr::UnOp { span, .. } | Expr::ListComp { span, .. } | Expr::Lambda { span, .. } => *span,
         }
     }

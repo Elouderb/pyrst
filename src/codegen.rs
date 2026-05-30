@@ -1098,7 +1098,32 @@ impl<'a> Codegen<'a> {
                             return Ok(format!("({}).abs()", a));
                         }
                         "min" => {
-                            if args.len() == 1 {
+                            if let Some((_, key_expr)) = kwargs.iter().find(|(n, _)| n == "key") {
+                                // min with key parameter
+                                let a = self.emit_expr(&args[0])?;
+                                // Check if key_expr is a Lambda to handle it specially
+                                let key_code = if let Expr::Lambda { params, body, .. } = key_expr {
+                                    // Lambda: extract parameter name and body, rename param to __x
+                                    let param_name = params.first().map(|(n, _)| n.clone()).unwrap_or_else(|| "__x".to_string());
+                                    let saved_local = self.locals.get(&param_name).cloned();
+                                    self.locals.insert(param_name.clone(), Ty::Unknown);
+                                    let body_s = self.emit_expr(body)?;
+                                    if let Some(ty) = saved_local {
+                                        self.locals.insert(param_name.clone(), ty);
+                                    } else {
+                                        self.locals.remove(param_name.as_str());
+                                    }
+                                    // Replace param_name with __x in the body
+                                    body_s.replace(param_name.as_str(), "__x")
+                                } else {
+                                    // Regular expression: wrap in closure that calls the key function
+                                    self.emit_expr(key_expr)?
+                                };
+                                return Ok(format!(
+                                    "{{ let __list = {}; __list.iter().min_by_key(|__x| {}).map(|__x| __x.clone()).unwrap_or_default() }}",
+                                    a, key_code
+                                ));
+                            } else if args.len() == 1 {
                                 let a = self.emit_expr(&args[0])?;
                                 return Ok(format!("{}.iter().copied().min().unwrap_or(0)", a));
                             } else {
@@ -1108,7 +1133,32 @@ impl<'a> Codegen<'a> {
                             }
                         }
                         "max" => {
-                            if args.len() == 1 {
+                            if let Some((_, key_expr)) = kwargs.iter().find(|(n, _)| n == "key") {
+                                // max with key parameter
+                                let a = self.emit_expr(&args[0])?;
+                                // Check if key_expr is a Lambda to handle it specially
+                                let key_code = if let Expr::Lambda { params, body, .. } = key_expr {
+                                    // Lambda: extract parameter name and body, rename param to __x
+                                    let param_name = params.first().map(|(n, _)| n.clone()).unwrap_or_else(|| "__x".to_string());
+                                    let saved_local = self.locals.get(&param_name).cloned();
+                                    self.locals.insert(param_name.clone(), Ty::Unknown);
+                                    let body_s = self.emit_expr(body)?;
+                                    if let Some(ty) = saved_local {
+                                        self.locals.insert(param_name.clone(), ty);
+                                    } else {
+                                        self.locals.remove(param_name.as_str());
+                                    }
+                                    // Replace param_name with __x in the body
+                                    body_s.replace(param_name.as_str(), "__x")
+                                } else {
+                                    // Regular expression: wrap in closure that calls the key function
+                                    self.emit_expr(key_expr)?
+                                };
+                                return Ok(format!(
+                                    "{{ let __list = {}; __list.iter().max_by_key(|__x| {}).map(|__x| __x.clone()).unwrap_or_default() }}",
+                                    a, key_code
+                                ));
+                            } else if args.len() == 1 {
                                 let a = self.emit_expr(&args[0])?;
                                 return Ok(format!("{}.iter().copied().max().unwrap_or(0)", a));
                             } else {
@@ -1119,7 +1169,41 @@ impl<'a> Codegen<'a> {
                         }
                         "sorted" => {
                             let a = self.emit_expr(&args[0])?;
-                            return Ok(format!("{{ let mut __sorted = {}.clone(); __sorted.sort(); __sorted }}", a));
+                            if let Some((_, key_expr)) = kwargs.iter().find(|(n, _)| n == "key") {
+                                // sorted with key parameter
+                                // Check if key_expr is a Lambda to handle it specially
+                                let key_code = if let Expr::Lambda { params, body, .. } = key_expr {
+                                    // Lambda: extract parameter name and body, rename param to __x
+                                    let param_name = params.first().map(|(n, _)| n.clone()).unwrap_or_else(|| "__x".to_string());
+                                    let saved_local = self.locals.get(&param_name).cloned();
+                                    self.locals.insert(param_name.clone(), Ty::Unknown);
+                                    let body_s = self.emit_expr(body)?;
+                                    if let Some(ty) = saved_local {
+                                        self.locals.insert(param_name.clone(), ty);
+                                    } else {
+                                        self.locals.remove(param_name.as_str());
+                                    }
+                                    // Replace param_name with __x in the body
+                                    body_s.replace(param_name.as_str(), "__x")
+                                } else {
+                                    // Regular expression: wrap in closure that calls the key function
+                                    self.emit_expr(key_expr)?
+                                };
+                                return Ok(format!(
+                                    "{{ let mut __sorted = {}.clone(); __sorted.sort_by_key(|__x| {}); __sorted }}",
+                                    a, key_code
+                                ));
+                            } else if let Some((_, rev_expr)) = kwargs.iter().find(|(n, _)| n == "reverse") {
+                                // sorted with reverse parameter
+                                let rev_s = self.emit_expr(rev_expr)?;
+                                return Ok(format!(
+                                    "{{ let mut __sorted = {}.clone(); __sorted.sort(); if {} {{ __sorted.reverse(); }} __sorted }}",
+                                    a, rev_s
+                                ));
+                            } else {
+                                // Default sorted
+                                return Ok(format!("{{ let mut __sorted = {}.clone(); __sorted.sort(); __sorted }}", a));
+                            }
                         }
                         "sum" => {
                             let a = self.emit_expr(&args[0])?;
@@ -1522,6 +1606,50 @@ impl<'a> Codegen<'a> {
                     Some(Ty::Dict(..)) => format!("{}.get(&{}).cloned().expect(\"key not found\")", o, i),
                     Some(Ty::Str) => format!("{{ let __chars: Vec<char> = {}.chars().collect(); __chars[{} as usize].to_string() }}", o, i),
                     _ => format!("{}[{} as usize]", o, i),
+                }
+            }
+            Expr::Slice { obj, start, stop, step, .. } => {
+                let obj_ty = self.type_of_expr(obj);
+                let o = self.emit_expr(obj)?;
+
+                match obj_ty {
+                    Ty::Str => {
+                        // String slicing
+                        if step.is_some() {
+                            return Err(crate::diag::Error::Codegen("string slicing with step not supported".into()));
+                        }
+                        let start_expr = start.as_ref().map(|e| self.emit_expr(e)).transpose()?;
+                        let start_val = start_expr.map(|s| format!("({} as usize)", s)).unwrap_or_else(|| "0usize".to_string());
+                        let stop_expr = stop.as_ref().map(|e| self.emit_expr(e)).transpose()?;
+                        let stop_val = stop_expr.map(|s| format!("({} as usize)", s)).unwrap_or_else(|| format!("{}.len()", o));
+                        format!("((&{}[{}..{}]).to_string())", o, start_val, stop_val)
+                    }
+                    Ty::List(_) => {
+                        // List slicing with step support
+                        match (start, stop, step) {
+                            (Some(s), Some(e), None) => {
+                                // Simple: x[start:stop]
+                                let start_s = self.emit_expr(s)?;
+                                let stop_s = self.emit_expr(e)?;
+                                format!(
+                                    "{{ let __list = {}.clone(); let __start = ({} as usize).min(__list.len()); let __stop = ({} as usize).min(__list.len()); __list[__start..(__start + (__stop - __start))].to_vec() }}",
+                                    o, start_s, stop_s
+                                )
+                            }
+                            _ => {
+                                // General with step
+                                let start_val = start.as_ref().map(|e| self.emit_expr(e)).transpose()?.unwrap_or_else(|| "0i64".to_string());
+                                let stop_val = stop.as_ref().map(|e| self.emit_expr(e)).transpose()?.unwrap_or_else(|| format!("{}.len() as i64", o));
+                                let step_val = step.as_ref().map(|e| self.emit_expr(e)).transpose()?.unwrap_or_else(|| "1i64".to_string());
+
+                                format!(
+                                    "{{ let __list = {}.clone(); let mut __result = Vec::new(); let __start = ({} as usize).min(__list.len()); let __stop = ({} as usize).min(__list.len()); let __step = {}; if __step > 0 {{ let mut __i = __start as i64; while __i < __stop as i64 {{ __result.push(__list[__i as usize].clone()); __i += __step; }} }} else if __step < 0 {{ let mut __i = (__stop as i64) - 1; while __i >= __start as i64 {{ __result.push(__list[__i as usize].clone()); __i += __step; }} }} __result }}",
+                                    o, start_val, stop_val, step_val
+                                )
+                            }
+                        }
+                    }
+                    _ => return Err(crate::diag::Error::Codegen(format!("slicing not supported for type {:?}", obj_ty))),
                 }
             }
             Expr::BinOp { op, lhs, rhs, span } => {

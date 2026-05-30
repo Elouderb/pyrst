@@ -373,6 +373,16 @@ impl Formatter {
             Expr::Index { obj, idx, .. } => {
                 format!("{}[{}]", self.format_expr(obj), self.format_expr(idx))
             }
+            Expr::Slice { obj, start, stop, step, .. } => {
+                let start_str = start.as_ref().map(|e| self.format_expr(e)).unwrap_or_default();
+                let stop_str = stop.as_ref().map(|e| self.format_expr(e)).unwrap_or_default();
+                let step_str = step.as_ref().map(|e| self.format_expr(e)).unwrap_or_default();
+                if step.is_some() {
+                    format!("{}[{}:{}:{}]", self.format_expr(obj), start_str, stop_str, step_str)
+                } else {
+                    format!("{}[{}:{}]", self.format_expr(obj), start_str, stop_str)
+                }
+            }
             Expr::BinOp { op, lhs, rhs, .. } => {
                 let op_str = match op {
                     BinOp::Add => "+",

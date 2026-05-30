@@ -463,6 +463,12 @@ fn collect_calls_from_expr(expr: &Expr, called: &mut std::collections::HashSet<S
             collect_calls_from_expr(obj, called);
             collect_calls_from_expr(idx, called);
         }
+        Expr::Slice { obj, start, stop, step, .. } => {
+            collect_calls_from_expr(obj, called);
+            if let Some(e) = start { collect_calls_from_expr(e, called); }
+            if let Some(e) = stop { collect_calls_from_expr(e, called); }
+            if let Some(e) = step { collect_calls_from_expr(e, called); }
+        }
         Expr::FStr(parts, _) => {
             for part in parts {
                 if let crate::ast::FStrPart::Interp(src, _) = part {
@@ -838,6 +844,27 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
             match obj_ty {
                 Ty::List(inner) => *inner,
                 Ty::Dict(_, v) => *v,
+                Ty::Str => Ty::Str,
+                _ => Ty::Unknown,
+            }
+        }
+        Expr::Slice { obj, start, stop, step, .. } => {
+            let obj_ty = check_expr(obj, env)?;
+            // Validate slice indices are integers
+            for e in &[start.as_ref(), stop.as_ref(), step.as_ref()] {
+                if let Some(e) = e {
+                    let ty = check_expr(e, env)?;
+                    if !matches!(ty, Ty::Int | Ty::Unknown) {
+                        return Err(Error::Type {
+                            span: e.span(),
+                            msg: "slice indices must be integers".into(),
+                        });
+                    }
+                }
+            }
+            // Slicing a list/string returns the same type
+            match obj_ty {
+                Ty::List(inner) => Ty::List(inner),
                 Ty::Str => Ty::Str,
                 _ => Ty::Unknown,
             }

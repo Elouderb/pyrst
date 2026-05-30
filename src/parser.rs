@@ -1029,9 +1029,56 @@ impl Parser {
                 }
                 Tok::LBracket => {
                     let span = self.peek_span(); self.bump();
-                    let idx = self.parse_expr()?;
-                    self.expect(&Tok::RBracket, "index")?;
-                    e = Expr::Index { obj: Box::new(e), idx: Box::new(idx), span };
+                    // Check if this is a slice or index
+                    if matches!(self.peek(), Tok::Colon) {
+                        // Slice with no start: [:stop:step]
+                        self.bump(); // consume :
+                        let stop = if !matches!(self.peek(), Tok::Colon | Tok::RBracket) {
+                            Some(Box::new(self.parse_expr()?))
+                        } else {
+                            None
+                        };
+                        let step = if matches!(self.peek(), Tok::Colon) {
+                            self.bump(); // consume second :
+                            if !matches!(self.peek(), Tok::RBracket) {
+                                Some(Box::new(self.parse_expr()?))
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        self.expect(&Tok::RBracket, "slice")?;
+                        e = Expr::Slice { obj: Box::new(e), start: None, stop, step, span };
+                    } else {
+                        // Parse first expression
+                        let first = self.parse_expr()?;
+                        if matches!(self.peek(), Tok::Colon) {
+                            // It's a slice: [start:stop:step]
+                            self.bump(); // consume :
+                            let stop = if !matches!(self.peek(), Tok::Colon | Tok::RBracket) {
+                                Some(Box::new(self.parse_expr()?))
+                            } else {
+                                None
+                            };
+                            let step = if matches!(self.peek(), Tok::Colon) {
+                                self.bump(); // consume second :
+                                if !matches!(self.peek(), Tok::RBracket) {
+                                    Some(Box::new(self.parse_expr()?))
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            };
+                            self.expect(&Tok::RBracket, "slice")?;
+                            e = Expr::Slice { obj: Box::new(e), start: Some(Box::new(first)), stop, step, span };
+                        } else {
+                            // It's an index: [idx]
+                            self.expect(&Tok::RBracket, "index")?;
+                            e = Expr::Index { obj: Box::new(e), idx: Box::new(first), span };
+                        }
+                    }
                 }
                 _ => break,
             }

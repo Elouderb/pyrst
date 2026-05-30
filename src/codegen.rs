@@ -1327,6 +1327,39 @@ impl<'a> Codegen<'a> {
                                 return Ok("false".to_string());
                             }
                         }
+                        "repr" => {
+                            if args.len() != 1 {
+                                return Err(crate::diag::Error::Codegen("repr requires exactly 1 argument".into()));
+                            }
+                            let obj_type = self.type_of_expr(&args[0]);
+                            let a = self.emit_expr(&args[0])?;
+                            let repr_expr = match obj_type {
+                                Ty::Str => format!("format!(\"'{{}}'\", {})", a),
+                                Ty::Bool => format!("format!(\"{{}}\" , if {} {{ \"True\" }} else {{ \"False\" }})", a),
+                                _ => format!("format!(\"{{}}\" , {})", a),
+                            };
+                            return Ok(repr_expr);
+                        }
+                        "ascii" => {
+                            if args.len() != 1 {
+                                return Err(crate::diag::Error::Codegen("ascii requires exactly 1 argument".into()));
+                            }
+                            let obj_type = self.type_of_expr(&args[0]);
+                            let a = self.emit_expr(&args[0])?;
+                            let ascii_expr = match obj_type {
+                                Ty::Str => {
+                                    format!(
+                                        "format!(\"'{{}}'\", {}.escape_default())",
+                                        a
+                                    )
+                                }
+                                Ty::Bool => {
+                                    format!("format!(\"{{}}\" , if {} {{ \"True\" }} else {{ \"False\" }})", a)
+                                }
+                                _ => format!("format!(\"{{}}\" , {})", a),
+                            };
+                            return Ok(ascii_expr);
+                        }
                         _ => {}
                     }
                 }

@@ -207,7 +207,7 @@ impl<'a> Codegen<'a> {
                 // Try to infer the element type, accounting for the loop variable type
                 if let Some(elem_iter_type) = elem_iter_ty {
                     // Infer from the element expression with knowledge of the loop variable type
-                    let inferred = self.infer_comp_elt_type(elt, &elem_iter_type);
+                    let inferred = self.infer_comp_elt_type_with_var(elt, &elem_iter_type, target);
                     if inferred != Ty::Unknown {
                         return Ty::List(Box::new(inferred));
                     }
@@ -298,12 +298,27 @@ impl<'a> Codegen<'a> {
     }
 
     /// Infer the element type of a comprehension element expression
-    /// given the type of the loop variable
-    fn infer_comp_elt_type(&self, elt: &Expr, loop_var_ty: &Ty) -> Ty {
+    /// given the type and name of the loop variable
+    fn infer_comp_elt_type_with_var(&self, elt: &Expr, loop_var_ty: &Ty, loop_var_name: &str) -> Ty {
         match elt {
-            // Case 1: [i.field for i in items]
-            Expr::Attr { name, .. } => {
-                if let Ty::Class(cls) = loop_var_ty {
+            // Case 1: [i.field for i in items] or [i.a.b for i in items]
+            Expr::Attr { obj, name, .. } => {
+                // First, infer the type of the object being accessed
+                let obj_ty = if let Expr::Ident(var_name, _) = obj.as_ref() {
+                    if var_name == loop_var_name {
+                        // Direct reference to loop variable
+                        loop_var_ty.clone()
+                    } else {
+                        // Some other variable - can't infer
+                        Ty::Unknown
+                    }
+                } else {
+                    // Nested attribute access - recursively infer
+                    self.infer_comp_elt_type_with_var(obj, loop_var_ty, loop_var_name)
+                };
+
+                // Now look up the field on the object type
+                if let Ty::Class(cls) = obj_ty {
                     if let Some(c) = self.ctx.classes.get(cls.as_str()) {
                         if let Some(f) = c.fields.iter().find(|f| &f.name == name) {
                             return Ty::from_type_expr(&f.ty).unwrap_or(Ty::Unknown);
@@ -314,8 +329,18 @@ impl<'a> Codegen<'a> {
             }
             // Case 2: [i.method() for i in items]
             Expr::Call { callee, .. } => {
-                if let Expr::Attr { name, .. } = callee.as_ref() {
-                    if let Ty::Class(cls) = loop_var_ty {
+                if let Expr::Attr { obj, name, .. } = callee.as_ref() {
+                    let obj_ty = if let Expr::Ident(var_name, _) = obj.as_ref() {
+                        if var_name == loop_var_name {
+                            loop_var_ty.clone()
+                        } else {
+                            Ty::Unknown
+                        }
+                    } else {
+                        self.infer_comp_elt_type_with_var(obj, loop_var_ty, loop_var_name)
+                    };
+
+                    if let Ty::Class(cls) = obj_ty {
                         if let Some(method_sig) = self.ctx.get_method(cls.as_str(), name) {
                             return method_sig.ret.clone();
                         }
@@ -325,8 +350,8 @@ impl<'a> Codegen<'a> {
             }
             // Case 3: [i.a + i.b for i in items] - infer from BinOp
             Expr::BinOp { lhs, op, rhs, .. } => {
-                let left_ty = self.infer_comp_elt_type(lhs, loop_var_ty);
-                let right_ty = self.infer_comp_elt_type(rhs, loop_var_ty);
+                let left_ty = self.infer_comp_elt_type_with_var(lhs, loop_var_ty, loop_var_name);
+                let right_ty = self.infer_comp_elt_type_with_var(rhs, loop_var_ty, loop_var_name);
                 // For arithmetic operations, use type promotion rules
                 match (left_ty, right_ty) {
                     (Ty::Float, _) | (_, Ty::Float) => Ty::Float,

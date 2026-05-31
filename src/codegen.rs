@@ -594,7 +594,7 @@ impl<'a> Codegen<'a> {
         let derives = if all_fields_copy {
             "#[derive(Copy, Clone, Debug, PartialEq)]"
         } else {
-            "#[derive(Clone, Debug, PartialEq)]"
+            "#[derive(Clone, Debug, PartialEq, Default)]"
         };
         self.line(derives);
         self.line(&format!("struct {} {{", c.name));
@@ -1077,7 +1077,27 @@ impl<'a> Codegen<'a> {
                 };
                 self.line(&format!("for {} in {} {{", pat, iter_expr));
                 self.indent += 1;
-                for s in body { self.emit_stmt(s)?; }
+
+                // Register loop variables with their types for type checking
+                let iter_ty = self.type_of_expr(iter);
+                if targets.len() == 1 {
+                    if let Ty::List(inner) | Ty::Set(inner) = iter_ty {
+                        let saved = self.locals.get(&targets[0]).cloned();
+                        self.locals.insert(targets[0].clone(), *inner);
+                        for s in body { self.emit_stmt(s)?; }
+                        if let Some(ty) = saved {
+                            self.locals.insert(targets[0].clone(), ty);
+                        } else {
+                            self.locals.remove(targets[0].as_str());
+                        }
+                    } else {
+                        for s in body { self.emit_stmt(s)?; }
+                    }
+                } else {
+                    // Multiple targets (tuple unpacking) - skip type registration for now
+                    for s in body { self.emit_stmt(s)?; }
+                }
+
                 self.indent -= 1;
                 self.line("}");
             }

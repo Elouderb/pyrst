@@ -199,38 +199,21 @@ impl<'a> Codegen<'a> {
             Expr::ListComp { elt, target, iter, .. } => {
                 // Infer element type from the iterable and element expression
                 let iter_ty = self.type_of_expr(iter);
+                let elem_iter_ty = match &iter_ty {
+                    Ty::List(inner) | Ty::Set(inner) => Some(inner.as_ref().clone()),
+                    _ => None,
+                };
 
-                // If the iterable is a list/set of classes, we can check field/method access
-                if let Ty::List(ref inner) | Ty::Set(ref inner) = iter_ty {
-                    match elt.as_ref() {
-                        // Case 1: [i.field for i in items] where items is List[Class]
-                        Expr::Attr { name, .. } => {
-                            if let Ty::Class(cls) = inner.as_ref() {
-                                if let Some(c) = self.ctx.classes.get(cls.as_str()) {
-                                    if let Some(f) = c.fields.iter().find(|f| &f.name == name) {
-                                        if let Ok(ty) = Ty::from_type_expr(&f.ty) {
-                                            return Ty::List(Box::new(ty));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        // Case 2: [i.method() for i in items] where items is List[Class]
-                        Expr::Call { callee, .. } => {
-                            if let Expr::Attr { name, .. } = callee.as_ref() {
-                                if let Ty::Class(cls) = inner.as_ref() {
-                                    // Look up the method's return type
-                                    if let Some(method_sig) = self.ctx.get_method(cls.as_str(), name) {
-                                        return Ty::List(Box::new(method_sig.ret.clone()));
-                                    }
-                                }
-                            }
-                        }
-                        _ => {}
+                // Try to infer the element type, accounting for the loop variable type
+                if let Some(elem_iter_type) = elem_iter_ty {
+                    // Infer from the element expression with knowledge of the loop variable type
+                    let inferred = self.infer_comp_elt_type(elt, &elem_iter_type);
+                    if inferred != Ty::Unknown {
+                        return Ty::List(Box::new(inferred));
                     }
                 }
 
-                // Default: preserve the iterable's element type
+                // Fallback: use the iterable's element type
                 match iter_ty {
                     Ty::List(inner) => Ty::List(inner),
                     Ty::Set(inner) => Ty::List(inner),
@@ -315,24 +298,60 @@ impl<'a> Codegen<'a> {
     }
 
     /// Infer the element type of a comprehension element expression
-    /// This helps determine the type of [expr for x in iter] even when we can't type-check expr directly
-    fn infer_comp_element_type(&self, elt: &Expr) -> Ty {
+    /// given the type of the loop variable
+    fn infer_comp_elt_type(&self, elt: &Expr, loop_var_ty: &Ty) -> Ty {
         match elt {
-            // For attribute access, check if it's accessing a class field
+            // Case 1: [i.field for i in items]
             Expr::Attr { name, .. } => {
-                // This would need context about the loop variable type, which we don't have here
-                // Return Unknown - the caller will handle it
+                if let Ty::Class(cls) = loop_var_ty {
+                    if let Some(c) = self.ctx.classes.get(cls.as_str()) {
+                        if let Some(f) = c.fields.iter().find(|f| &f.name == name) {
+                            return Ty::from_type_expr(&f.ty).unwrap_or(Ty::Unknown);
+                        }
+                    }
+                }
                 Ty::Unknown
             }
-            // For method calls, check the return type
+            // Case 2: [i.method() for i in items]
             Expr::Call { callee, .. } => {
-                if let Expr::Attr { obj, name, .. } = callee.as_ref() {
-                    // This is a method call like i.get_value()
-                    // We need to know the type of obj (the loop variable), which we don't have
-                    // But we can check if it's a known method
-                    // For now, return Unknown
-                    Ty::Unknown
-                } else if let Expr::Ident(n, _) = callee.as_ref() {
+                if let Expr::Attr { name, .. } = callee.as_ref() {
+                    if let Ty::Class(cls) = loop_var_ty {
+                        if let Some(method_sig) = self.ctx.get_method(cls.as_str(), name) {
+                            return method_sig.ret.clone();
+                        }
+                    }
+                }
+                Ty::Unknown
+            }
+            // Case 3: [i.a + i.b for i in items] - infer from BinOp
+            Expr::BinOp { lhs, op, rhs, .. } => {
+                let left_ty = self.infer_comp_elt_type(lhs, loop_var_ty);
+                let right_ty = self.infer_comp_elt_type(rhs, loop_var_ty);
+                // For arithmetic operations, use type promotion rules
+                match (left_ty, right_ty) {
+                    (Ty::Float, _) | (_, Ty::Float) => Ty::Float,
+                    (Ty::Int, Ty::Int) => {
+                        // Division always returns float in Python
+                        if *op == BinOp::Div {
+                            Ty::Float
+                        } else {
+                            Ty::Int
+                        }
+                    }
+                    _ => Ty::Unknown,
+                }
+            }
+            _ => Ty::Unknown,
+        }
+    }
+
+    /// Infer the element type of a comprehension element expression
+    /// This helps determine the type of [expr for x in iter] when we can't type-check directly
+    fn infer_comp_element_type(&self, elt: &Expr) -> Ty {
+        // Fallback method for when we don't have loop variable type
+        match elt {
+            Expr::Call { callee, .. } => {
+                if let Expr::Ident(n, _) = callee.as_ref() {
                     // Built-in function call
                     match n.as_str() {
                         "float" => Ty::Float,
@@ -345,8 +364,7 @@ impl<'a> Codegen<'a> {
                     Ty::Unknown
                 }
             }
-            // For other expressions, try to infer directly
-            _ => self.type_of_expr(elt),
+            _ => Ty::Unknown,
         }
     }
 

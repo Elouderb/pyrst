@@ -34,7 +34,7 @@ def main() -> None:
 
     # Word length analysis
     word_lengths: list[int] = [len(w) for w in words]
-    avg_length: int = sum(word_lengths) / len(word_lengths)
+    avg_length: float = sum(word_lengths) / len(word_lengths)
 
     print(avg_length)
     print(min(word_lengths))

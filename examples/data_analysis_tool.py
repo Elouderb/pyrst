@@ -31,7 +31,7 @@ def main() -> None:
     print(stats["range"])
 
     # Find above-average months
-    avg: int = stats["sum"] / stats["count"]
+    avg: float = stats["sum"] / stats["count"]
     above_avg: list[int] = [x for x in sales_data if x > avg]
     print(len(above_avg))
 
@@ -55,7 +55,7 @@ def main() -> None:
         growth_rates.append(growth)
 
     total_growth: int = sum(growth_rates)
-    avg_growth: int = total_growth / len(growth_rates)
+    avg_growth: float = total_growth / len(growth_rates)
 
     print(total_growth)
     print(avg_growth)

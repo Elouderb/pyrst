@@ -25,7 +25,19 @@ pub fn build(path: &Path) -> Result<()> {
     let bin_path = std::env::current_dir()?.join(stem);
     std::fs::write(&rs_path, rust)?;
 
-    let status = Command::new("rustc")
+    // Try to find rustc in standard locations
+    let rustc_path = if let Ok(home) = std::env::var("HOME") {
+        let cargo_rustc = Path::new(&home).join(".cargo/bin/rustc");
+        if cargo_rustc.exists() {
+            cargo_rustc
+        } else {
+            Path::new("rustc").to_path_buf()
+        }
+    } else {
+        Path::new("rustc").to_path_buf()
+    };
+
+    let status = Command::new(&rustc_path)
         .arg(&rs_path)
         .arg("-o")
         .arg(&bin_path)

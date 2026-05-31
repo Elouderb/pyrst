@@ -97,7 +97,14 @@ impl<'a> Codegen<'a> {
                 match op {
                     BinOp::Div => Ty::Float,
                     BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Mod | BinOp::FloorDiv | BinOp::Pow => {
-                        if l == Ty::Float || r == Ty::Float { Ty::Float } else { Ty::Int }
+                        // String concatenation for Add
+                        if *op == BinOp::Add && (l == Ty::Str || r == Ty::Str) {
+                            Ty::Str
+                        } else if l == Ty::Float || r == Ty::Float {
+                            Ty::Float
+                        } else {
+                            Ty::Int
+                        }
                     }
                     BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
                     | BinOp::And | BinOp::Or | BinOp::Is | BinOp::IsNot | BinOp::In | BinOp::NotIn => Ty::Bool,
@@ -292,6 +299,15 @@ impl<'a> Codegen<'a> {
                 };
 
                 Ty::Dict(Box::new(key_ty), Box::new(val_ty))
+            }
+            Expr::Index { obj, .. } => {
+                // Type of dict[key] is the value type of the dict
+                let obj_ty = self.type_of_expr(obj);
+                match obj_ty {
+                    Ty::Dict(_, val_ty) => *val_ty,
+                    Ty::List(elem_ty) => *elem_ty,
+                    _ => Ty::Unknown,
+                }
             }
             _ => Ty::Unknown,
         }
@@ -2095,6 +2111,11 @@ impl<'a> Codegen<'a> {
                     let parts: Result<Vec<_>> = args.iter().map(|a| self.emit_expr(a)).collect();
                     let parts = parts?;
 
+                    // Special handling for string methods that return &str and need to be converted to String
+                    if matches!(name.as_str(), "strip" | "lstrip" | "rstrip") {
+                        return Ok(format!("{}.{}().to_string()", obj_s, method));
+                    }
+
                     // Special case: split()
                     if name == "split" {
                         return if args.is_empty() {
@@ -2612,8 +2633,8 @@ impl<'a> Codegen<'a> {
                     if lt == Ty::Str || rt == Ty::Str {
                         let l = self.emit_expr(lhs)?;
                         let r = self.emit_expr(rhs)?;
-                        // Convert RHS to &str since Rust's String + operator requires &str
-                        return Ok(format!("({} + {}.as_str())", l, r));
+                        // Use format! for robust string concatenation
+                        return Ok(format!(r#"format!("{{}}{{}}", {}, {})"#, l, r));
                     }
                 }
 
@@ -2635,8 +2656,26 @@ impl<'a> Codegen<'a> {
 
                 match op {
                     BinOp::Pow => return Ok(format!("(({} as f64).powf({} as f64))", l, r)),
-                    BinOp::In => return Ok(format!("{}.contains(&{})", r, l)),
-                    BinOp::NotIn => return Ok(format!("!{}.contains(&{})", r, l)),
+                    BinOp::In => {
+                        // Use contains_key for dicts, contains for lists/sets
+                        let contains_method = match rt {
+                            Ty::Dict(_, _) => format!("{}.contains_key(&{})", r, l),
+                            Ty::List(_) => format!("{}.iter().any(|__x| __x == &{})", r, l),
+                            Ty::Set(_) => format!("{}.contains(&{})", r, l),
+                            _ => format!("{}.contains(&{})", r, l),
+                        };
+                        return Ok(contains_method);
+                    }
+                    BinOp::NotIn => {
+                        // Use !contains_key for dicts, !contains for lists/sets
+                        let contains_method = match rt {
+                            Ty::Dict(_, _) => format!("!{}.contains_key(&{})", r, l),
+                            Ty::List(_) => format!("!{}.iter().any(|__x| __x == &{})", r, l),
+                            Ty::Set(_) => format!("!{}.contains(&{})", r, l),
+                            _ => format!("!{}.contains(&{})", r, l),
+                        };
+                        return Ok(contains_method);
+                    }
                     _ => {
                         let op_s = match op {
                             BinOp::Add => "+", BinOp::Sub => "-", BinOp::Mul => "*",

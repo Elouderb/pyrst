@@ -670,6 +670,28 @@ fn check_body(stmts: &[Stmt], env: &mut FuncEnv) -> Result<()> {
     Ok(())
 }
 
+/// Check if two types are compatible for assignment.
+/// Collections with Unknown element types are considered compatible with any collection of the same kind.
+fn types_compatible(val_ty: &Ty, declared_ty: &Ty) -> bool {
+    match (val_ty, declared_ty) {
+        // Exact match
+        (a, b) if a == b => true,
+        // Unknown is compatible with anything
+        (Ty::Unknown, _) | (_, Ty::Unknown) => true,
+        // List with Unknown elements compatible with any List
+        (Ty::List(inner), Ty::List(_)) if **inner == Ty::Unknown => true,
+        (Ty::List(_), Ty::List(inner)) if **inner == Ty::Unknown => true,
+        // Set with Unknown elements compatible with any Set
+        (Ty::Set(inner), Ty::Set(_)) if **inner == Ty::Unknown => true,
+        (Ty::Set(_), Ty::Set(inner)) if **inner == Ty::Unknown => true,
+        // Dict with Unknown key/value compatible with any Dict
+        (Ty::Dict(k, v), Ty::Dict(_, _)) if **k == Ty::Unknown && **v == Ty::Unknown => true,
+        (Ty::Dict(_, _), Ty::Dict(k, v)) if **k == Ty::Unknown && **v == Ty::Unknown => true,
+        // Otherwise not compatible
+        _ => false,
+    }
+}
+
 fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
     match s {
         Stmt::Pass(_) | Stmt::Break(_) | Stmt::Continue(_) => Ok(()),
@@ -693,8 +715,7 @@ fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
         }
         Stmt::Return(Some(e), span) => {
             let ty = check_expr(e, env)?;
-            // Lenient check: Unknown is compatible with any type, and vice versa.
-            if ty != env.ret_ty && ty != Ty::Unknown && env.ret_ty != Ty::Unknown {
+            if !types_compatible(&ty, &env.ret_ty) {
                 return Err(Error::Type {
                     span: *span,
                     msg: format!("return type mismatch: expected {:?}, found {:?}", env.ret_ty, ty),
@@ -714,7 +735,7 @@ fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             };
             if let Some(t) = ty {
                 let explicit = Ty::from_type_expr(t)?;
-                if val_ty != explicit && val_ty != Ty::Unknown && explicit != Ty::Unknown {
+                if !types_compatible(&val_ty, &explicit) {
                     return Err(Error::Type {
                         span: *span,
                         msg: format!("type mismatch in assignment: declared {:?}, got {:?}", explicit, val_ty),

@@ -7,7 +7,7 @@ def calculate_median(numbers: list[int]) -> float:
     if n % 2 == 0:
         return (sorted_nums[n // 2 - 1] + sorted_nums[n // 2]) / 2
     else:
-        return sorted_nums[n // 2]
+        return float(sorted_nums[n // 2])
 
 def main() -> None:
     # Dataset: test scores

@@ -131,6 +131,8 @@ pub enum Expr {
     List(Vec<Expr>, Span),
     Tuple(Vec<Expr>, Span),
     ListComp { elt: Box<Expr>, target: String, iter: Box<Expr>, cond: Option<Box<Expr>>, span: Span },
+    SetComp { elt: Box<Expr>, target: String, iter: Box<Expr>, cond: Option<Box<Expr>>, span: Span },
+    DictComp { key: Box<Expr>, val: Box<Expr>, target: String, iter: Box<Expr>, cond: Option<Box<Expr>>, span: Span },
     Dict(Vec<(Expr, Expr)>, Span),
     Set(Vec<Expr>, Span),
     Call { callee: Box<Expr>, args: Vec<Expr>, kwargs: Vec<(String, Expr)>, span: Span },
@@ -149,7 +151,7 @@ impl Expr {
             | Expr::Bool(_, s) | Expr::None_(s) | Expr::Ident(_, s) | Expr::List(_, s) | Expr::Tuple(_, s) | Expr::Dict(_, s) | Expr::Set(_, s) => *s,
             Expr::Call { span, .. } | Expr::Attr { span, .. }
             | Expr::Index { span, .. } | Expr::Slice { span, .. } | Expr::BinOp { span, .. }
-            | Expr::UnOp { span, .. } | Expr::ListComp { span, .. } | Expr::Lambda { span, .. } => *span,
+            | Expr::UnOp { span, .. } | Expr::ListComp { span, .. } | Expr::SetComp { span, .. } | Expr::DictComp { span, .. } | Expr::Lambda { span, .. } => *span,
         }
     }
 }

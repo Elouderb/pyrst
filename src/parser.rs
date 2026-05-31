@@ -1154,18 +1154,39 @@ impl Parser {
                 }
                 let first = self.parse_expr()?;
                 if matches!(self.peek(), Tok::Colon) {
-                    // It's a dict: {key: value, ...}
+                    // It's a dict: {key: value, ...} or dict comp: {key: value for target in iter}
                     self.bump(); // consume ':'
                     let val = self.parse_expr()?;
-                    let mut pairs = vec![(first, val)];
-                    while self.eat(&Tok::Comma) && !matches!(self.peek(), Tok::RBrace) {
-                        let k = self.parse_expr()?;
-                        self.expect(&Tok::Colon, "dict literal")?;
-                        let v = self.parse_expr()?;
-                        pairs.push((k, v));
+                    if matches!(self.peek(), Tok::For) {
+                        // Dict comprehension: {key: value for target in iter (if cond)?}
+                        self.bump(); // consume 'for'
+                        let target = self.expect_ident("dict comp target")?;
+                        self.expect(&Tok::In, "dict comp")?;
+                        let iter = self.parse_expr()?;
+                        let cond = if self.eat(&Tok::If) { Some(Box::new(self.parse_expr()?)) } else { None };
+                        self.expect(&Tok::RBrace, "dict comp")?;
+                        Ok(Expr::DictComp { key: Box::new(first), val: Box::new(val), target, iter: Box::new(iter), cond, span })
+                    } else {
+                        // Regular dict: {key: value, ...}
+                        let mut pairs = vec![(first, val)];
+                        while self.eat(&Tok::Comma) && !matches!(self.peek(), Tok::RBrace) {
+                            let k = self.parse_expr()?;
+                            self.expect(&Tok::Colon, "dict literal")?;
+                            let v = self.parse_expr()?;
+                            pairs.push((k, v));
+                        }
+                        self.expect(&Tok::RBrace, "dict literal")?;
+                        Ok(Expr::Dict(pairs, span))
                     }
-                    self.expect(&Tok::RBrace, "dict literal")?;
-                    Ok(Expr::Dict(pairs, span))
+                } else if matches!(self.peek(), Tok::For) {
+                    // Set comprehension: {elem for target in iter (if cond)?}
+                    self.bump(); // consume 'for'
+                    let target = self.expect_ident("set comp target")?;
+                    self.expect(&Tok::In, "set comp")?;
+                    let iter = self.parse_expr()?;
+                    let cond = if self.eat(&Tok::If) { Some(Box::new(self.parse_expr()?)) } else { None };
+                    self.expect(&Tok::RBrace, "set comp")?;
+                    Ok(Expr::SetComp { elt: Box::new(first), target, iter: Box::new(iter), cond, span })
                 } else {
                     // It's a set: {elem1, elem2, ...}
                     let mut elems = vec![first];

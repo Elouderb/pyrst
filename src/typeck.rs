@@ -152,6 +152,13 @@ impl TyCtx {
         funcs.insert("callable".into(), FuncSig { params: vec![("obj".into(), Ty::Unknown)], ret: Ty::Bool, param_defaults: vec![] });
         funcs.insert("repr".into(), FuncSig { params: vec![("obj".into(), Ty::Unknown)], ret: Ty::Str, param_defaults: vec![] });
         funcs.insert("ascii".into(), FuncSig { params: vec![("obj".into(), Ty::Unknown)], ret: Ty::Str, param_defaults: vec![] });
+        funcs.insert("list".into(), FuncSig { params: vec![("x".into(), Ty::Unknown)], ret: Ty::Unknown, param_defaults: vec![] });
+        funcs.insert("dict".into(), FuncSig { params: vec![], ret: Ty::Unknown, param_defaults: vec![] });
+        funcs.insert("tuple".into(), FuncSig { params: vec![("x".into(), Ty::Unknown)], ret: Ty::Unknown, param_defaults: vec![] });
+        funcs.insert("getattr".into(), FuncSig { params: vec![("obj".into(), Ty::Unknown), ("name".into(), Ty::Str)], ret: Ty::Unknown, param_defaults: vec![] });
+        funcs.insert("setattr".into(), FuncSig { params: vec![("obj".into(), Ty::Unknown), ("name".into(), Ty::Str), ("value".into(), Ty::Unknown)], ret: Ty::Unit, param_defaults: vec![] });
+        funcs.insert("hasattr".into(), FuncSig { params: vec![("obj".into(), Ty::Unknown), ("name".into(), Ty::Str)], ret: Ty::Bool, param_defaults: vec![] });
+        funcs.insert("set".into(), FuncSig { params: vec![("x".into(), Ty::Unknown)], ret: Ty::Unknown, param_defaults: vec![] });
 
         // Builtin type names for isinstance checks
         let mut vars = HashMap::new();
@@ -227,6 +234,146 @@ impl TyCtx {
     }
 }
 
+// Extract field assignments from __init__ method
+pub fn extract_init_fields(class_def: &mut ClassDef) {
+    let mut discovered_fields: std::collections::HashMap<String, TypeExpr> = std::collections::HashMap::new();
+
+    // Find the __init__ method
+    for method in &class_def.methods {
+        if method.name == "__init__" {
+            // Build a map of parameters for type lookups
+            let param_types: std::collections::HashMap<String, TypeExpr> = method.params.iter()
+                .map(|p| (p.name.clone(), p.ty.clone()))
+                .collect();
+
+            // Scan the body for self.attr assignments
+            for stmt in &method.body {
+                match stmt {
+                    Stmt::AttrAssign { obj, attr, value, .. } => {
+                        if obj == "self" && !class_def.fields.iter().any(|f| &f.name == attr) {
+                            let inferred_ty = infer_expr_type(value, &param_types);
+                            discovered_fields.insert(attr.clone(), inferred_ty);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            break;  // Only process __init__
+        }
+    }
+
+    // For fields with generic/collection types, try to infer element types from method usage
+    let mut updated_fields = std::collections::HashMap::new();
+    for (field_name, field_type) in &discovered_fields {
+        let updated_type = if let TypeExpr::Generic(coll_type, generic_args) = field_type {
+            if coll_type == "list" && generic_args.len() > 0 && generic_args[0] == TypeExpr::Named("int".to_string()) {
+                // This was a default inference for an empty list
+                // Try to find what type is actually used
+                if let Some(inferred) = infer_list_element_type(class_def, field_name) {
+                    TypeExpr::Generic("list".to_string(), vec![TypeExpr::Named(inferred)])
+                } else {
+                    field_type.clone()
+                }
+            } else {
+                field_type.clone()
+            }
+        } else {
+            field_type.clone()
+        };
+        updated_fields.insert(field_name.clone(), updated_type);
+    }
+
+    // Add all discovered fields to the class
+    for (attr_name, attr_type) in updated_fields {
+        class_def.fields.push(Param {
+            name: attr_name,
+            ty: attr_type,
+            default: None,
+            span: Span::DUMMY,
+        });
+    }
+}
+
+// Try to infer the element type of a list field from method calls
+fn infer_list_element_type(class_def: &ClassDef, field_name: &str) -> Option<String> {
+    // Build a map of parameter names to their types for all methods
+    let mut param_types: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for method in &class_def.methods {
+        for param in &method.params {
+            if param.name != "self" {
+                // Extract the type name from the TypeExpr
+                if let TypeExpr::Named(name) = &param.ty {
+                    param_types.insert(param.name.clone(), name.clone());
+                }
+            }
+        }
+    }
+
+    // Look for method calls that push/append to this field
+    for method in &class_def.methods {
+        if method.name == "__init__" {
+            continue;
+        }
+        for stmt in &method.body {
+            if let Stmt::Expr(expr) = stmt {
+                // Look for self.field.method(arg) patterns
+                if let Expr::Call { callee, args, .. } = expr {
+                    if let Expr::Attr { obj, name, .. } = callee.as_ref() {
+                        if let Expr::Attr { obj: obj2, name: field, .. } = obj.as_ref() {
+                            if let Expr::Ident(self_name, _) = obj2.as_ref() {
+                                if self_name == "self" && field == field_name {
+                                    // This is self.field.method(args)
+                                    if (name == "append" || name == "push") && !args.is_empty() {
+                                        // Look at the type of the argument
+                                        if let Expr::Ident(arg_name, _) = &args[0] {
+                                            if let Some(arg_type) = param_types.get(arg_name) {
+                                                return Some(arg_type.clone());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+// Infer type of an expression for field discovery
+fn infer_expr_type(expr: &Expr, params: &std::collections::HashMap<String, TypeExpr>) -> TypeExpr {
+    match expr {
+        Expr::Int(..) => TypeExpr::Named("int".to_string()),
+        Expr::Float(..) => TypeExpr::Named("float".to_string()),
+        Expr::Bool(..) => TypeExpr::Named("bool".to_string()),
+        Expr::Str(..) => TypeExpr::Named("str".to_string()),
+        Expr::Ident(name, _) => {
+            // Look up parameter type if available
+            params.get(name).cloned().unwrap_or_else(|| TypeExpr::Named("Unknown".to_string()))
+        }
+        // For collections without more info, use generic with flexible types
+        // Empty lists default to list[int] as a reasonable default
+        Expr::List(..) => TypeExpr::Generic("list".to_string(), vec![TypeExpr::Named("int".to_string())]),
+        Expr::Dict(..) => TypeExpr::Generic("dict".to_string(), vec![
+            TypeExpr::Named("str".to_string()),
+            TypeExpr::Named("int".to_string()),
+        ]),
+        Expr::Set(..) => TypeExpr::Generic("set".to_string(), vec![TypeExpr::Named("int".to_string())]),
+        Expr::Tuple(..) => TypeExpr::Named("tuple".to_string()),
+        Expr::None_(..) => TypeExpr::None_,
+        Expr::Call { callee, .. } => {
+            if let Expr::Ident(name, _) = callee.as_ref() {
+                TypeExpr::Named(name.clone())
+            } else {
+                TypeExpr::Named("Unknown".to_string())
+            }
+        }
+        _ => TypeExpr::Named("Unknown".to_string()),
+    }
+}
+
 // Local scope during function body type checking.
 struct FuncEnv<'a> {
     ctx: &'a TyCtx,
@@ -282,6 +429,8 @@ pub fn check_module(m: &Module) -> Result<TyCtx> {
                 });
             }
             Stmt::Class(c) => {
+                let mut c = c.clone();
+                extract_init_fields(&mut c);
                 ctx.classes.insert(c.name.clone(), c.clone());
                 // Register each method as a function under "ClassName.method".
                 for m_fn in &c.methods {
@@ -474,6 +623,17 @@ fn collect_calls_from_expr(expr: &Expr, called: &mut std::collections::HashSet<S
         }
         Expr::ListComp { elt, iter, cond, .. } => {
             collect_calls_from_expr(elt, called);
+            collect_calls_from_expr(iter, called);
+            if let Some(c) = cond { collect_calls_from_expr(c, called); }
+        }
+        Expr::SetComp { elt, iter, cond, .. } => {
+            collect_calls_from_expr(elt, called);
+            collect_calls_from_expr(iter, called);
+            if let Some(c) = cond { collect_calls_from_expr(c, called); }
+        }
+        Expr::DictComp { key, val, iter, cond, .. } => {
+            collect_calls_from_expr(key, called);
+            collect_calls_from_expr(val, called);
             collect_calls_from_expr(iter, called);
             if let Some(c) = cond { collect_calls_from_expr(c, called); }
         }
@@ -710,6 +870,41 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
             let elt_ty = check_expr(elt, &mut inner_env)?;
             Ty::List(Box::new(elt_ty))
         }
+        Expr::SetComp { elt, target, iter, cond, .. } => {
+            let iter_ty = check_expr(iter, env)?;
+            let elem_ty = match &iter_ty {
+                Ty::List(inner) => *inner.clone(),
+                _ => Ty::Int,
+            };
+            let mut inner_env = FuncEnv {
+                ctx: env.ctx,
+                locals: env.locals.clone(),
+                ret_ty: env.ret_ty.clone(),
+                used_vars: env.used_vars.clone(),
+            };
+            inner_env.locals.insert(target.clone(), elem_ty);
+            if let Some(c) = cond { check_expr(c, &mut inner_env)?; }
+            let elt_ty = check_expr(elt, &mut inner_env)?;
+            Ty::Set(Box::new(elt_ty))
+        }
+        Expr::DictComp { key, val, target, iter, cond, .. } => {
+            let iter_ty = check_expr(iter, env)?;
+            let elem_ty = match &iter_ty {
+                Ty::List(inner) => *inner.clone(),
+                _ => Ty::Int,
+            };
+            let mut inner_env = FuncEnv {
+                ctx: env.ctx,
+                locals: env.locals.clone(),
+                ret_ty: env.ret_ty.clone(),
+                used_vars: env.used_vars.clone(),
+            };
+            inner_env.locals.insert(target.clone(), elem_ty);
+            if let Some(c) = cond { check_expr(c, &mut inner_env)?; }
+            let key_ty = check_expr(key, &mut inner_env)?;
+            let val_ty = check_expr(val, &mut inner_env)?;
+            Ty::Dict(Box::new(key_ty), Box::new(val_ty))
+        }
         Expr::None_(_) => Ty::Unit,
         Expr::List(elems, _) => {
             let elem_ty = if elems.is_empty() {
@@ -782,7 +977,8 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                         // Variadic builtins: skip arity check.
                         let variadic = matches!(name.as_str(),
                             "print" | "range" | "len" | "str" | "int" | "float" | "bool" | "enumerate" | "zip"
-                            | "abs" | "min" | "max" | "sorted" | "sum" | "input");
+                            | "abs" | "min" | "max" | "sorted" | "sum" | "input" | "list" | "dict" | "tuple" | "set"
+                            | "getattr" | "setattr" | "hasattr");
                         // Count required parameters (those without defaults)
                         let required = sig.param_defaults.iter().take_while(|d| d.is_none()).count();
                         if !variadic && (got < required || got > expected) {
@@ -895,11 +1091,22 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le
                 | BinOp::Gt | BinOp::Ge | BinOp::And | BinOp::Or
                 | BinOp::Is | BinOp::IsNot | BinOp::In | BinOp::NotIn => Ty::Bool,
-                BinOp::Pow => Ty::Float,
+                BinOp::Pow | BinOp::Div => Ty::Float,  // Division always returns float in Python
                 BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::LShift | BinOp::RShift => Ty::Int,
                 _ => {
-                    // Arithmetic: if both sides match, return that type; else Unknown.
-                    if l == r { l } else { Ty::Unknown }
+                    // Arithmetic: apply numeric type promotion rules
+                    match (&l, &r) {
+                        // Same type: return that type
+                        (a, b) if a == b => l,
+                        // Mixed numeric types: promote to float
+                        (Ty::Int, Ty::Float) | (Ty::Float, Ty::Int) => Ty::Float,
+                        // String + String = String (for concatenation)
+                        (Ty::Str, Ty::Str) => Ty::Str,
+                        // List + List = List (for concatenation)
+                        (Ty::List(inner_l), Ty::List(inner_r)) if inner_l == inner_r => Ty::List(inner_l.clone()),
+                        // Otherwise unknown
+                        _ => Ty::Unknown,
+                    }
                 }
             }
         }

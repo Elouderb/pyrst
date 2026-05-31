@@ -128,6 +128,8 @@ fn merge_ctx_from_module(m: &Module, ctx: &mut TyCtx, is_root: bool) -> Result<(
                 });
             }
             Stmt::Class(c) => {
+                let mut c = c.clone();
+                crate::typeck::extract_init_fields(&mut c);
                 ctx.classes.insert(c.name.clone(), c.clone());
                 // Register method signatures
                 for m_fn in &c.methods {

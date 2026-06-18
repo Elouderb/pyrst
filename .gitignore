@@ -1,4 +1,16 @@
+# Rust build output
 /target
-Cargo.lock
 *.swp
 .DS_Store
+
+# pyrst build outputs: compiled ELF binaries and transpiler output emitted at
+# the repo root by `pyrst build`. These are regenerable artifacts and must
+# never be committed.
+/main
+/dict_methods
+/final_intertype_test
+/verify_init
+/test_*
+# ...but keep the test harness and recorded results (these are not binaries)
+!/test_all.sh
+!/test_results.txt

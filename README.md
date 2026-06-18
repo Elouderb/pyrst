@@ -13,15 +13,14 @@ A statically typed Python-like language that compiles to efficient Rust. Combine
 
 ## Status
 
-**Phases 1-8 Complete** — Full compiler with multi-file module system. 22+ examples passing.
+**Phase 38 (in development)** — Full compiler pipeline (lexer → parser → resolver → type checker → Rust codegen → `rustc`). **96 of 105 single-file examples (~91%) transpile and run successfully.**
 
-**Core compiler stable** with Phases 9-14 formally specified and ready for implementation. Focus shifted to semantic clarity and compiler maturity (from Phase 7 forward).
+The core pipeline is working end-to-end, including multi-file imports, classes with single inheritance and dunder methods, comprehensions, and a broad set of string/list/dict methods. Lambdas are implemented (see `examples/lambda_demo.py`, `examples/lambda_closure.py`).
 
-Recent completion (May 28, 2026):
-- Phase 7: Formal specifications (SPEC.md, PYTHON_COMPATIBILITY.md, DESIGN_DECISIONS.md)
-- Phase 7: Improved diagnostics with source code snippets
-- Phase 8: Multi-file imports with DFS resolution and cycle detection
-- Phase 8: `examples/multi_file_demo/` — 3-file example with shared utilities
+**Known limitations (honest status):**
+- The static type checker is **best-effort, not yet sound**: many expressions infer to an `Unknown` type that is permissively compatible with everything, so some type/ownership errors are surfaced by the downstream `rustc` invocation against generated Rust rather than by pyrst itself. The 9 currently-failing examples all fail this way.
+- `try`/`except` does not yet match on exception type or bind the exception.
+- f-string interpolations are emitted as raw source rather than fully compiled expressions (works only for the subset that is coincidentally valid Rust).
 
 ## Documentation Structure
 
@@ -84,11 +83,9 @@ pyrst build examples/fib.py
 See [PYTHON_COMPATIBILITY.md](PYTHON_COMPATIBILITY.md) for a complete matrix.
 
 Notable omissions (by design):
-- Exception handling recovery (`try`/`except`/`finally` — planned Phase 11)
-- Type narrowing for optionals (planned Phase 9)
-- Reference semantics for classes (planned Phase 9)
+- Exception handling with type matching / binding (`except E as e`) — `try`/`except` exists but runs handlers unconditionally
+- Type narrowing for optionals
 - Generators and `yield`
-- Lambda expressions
 - Multiple inheritance
 - Metaclasses and dynamic attribute access
 - `eval`/`exec` and reflection
@@ -133,22 +130,19 @@ See [DESIGN_DECISIONS.md](DESIGN_DECISIONS.md) for key tradeoffs.
 ## Status Summary
 
 **Strengths:**
-- Full compiler pipeline working end-to-end (Phases 1-8)
-- 22+ passing examples covering core features and multi-file programs
+- Full compiler pipeline working end-to-end (lexer → parser → resolver → type checker → codegen → `rustc`)
+- 96/105 single-file examples passing, covering core features and multi-file programs
 - Clear separation of lexer, parser, type checker, code generator
 - Readable generated Rust code
-- Formal specifications for language, backend, and design decisions
-- Improved error messages with source code context
-
-**Recent Completion (Phases 7-8):**
-- ✅ Formal language specification and compatibility matrix
-- ✅ Improved diagnostics with source code snippets
-- ✅ Multi-file module system with DFS import resolution
-- ✅ Circular import detection and error reporting
-- ✅ Development plan and roadmap through Phase 15
+- Error messages with source code context
 
 **Current Status:**
-Ready for Phase 9 (Semantic Cleanup). All specifications written; no blockers.
+Phase 38, in active development. The pipeline is functional; the type checker's
+soundness and several codegen corner cases (f-strings, `try`/`except`,
+int/float promotion, collection mutation) are the main areas of ongoing work.
+Some documentation files (per-phase completion notes, `IR_INVARIANTS.md`,
+`RUNTIME_ABI.md`) describe earlier plans or an aspirational architecture and
+are stale relative to the current implementation.
 
 ## Contributing
 

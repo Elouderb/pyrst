@@ -384,7 +384,10 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
             }
             let text = std::str::from_utf8(&bytes[i..j]).unwrap();
             let tok = if is_float {
-                Tok::Float(text.parse().unwrap())
+                Tok::Float(text.parse().map_err(|_| Error::Lex {
+                    span: Span::new(i, j, line, col),
+                    msg: "invalid float literal".into(),
+                })?)
             } else {
                 Tok::Int(text.parse().map_err(|_| Error::Lex {
                     span: Span::new(i, j, line, col),
@@ -477,11 +480,11 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
                 Some((b'>', b'>')) => (Tok::RShift, 2),
             _ => match c {
                 b'(' => { bracket_depth += 1; (Tok::LParen, 1) }
-                b')' => { bracket_depth -= 1; (Tok::RParen, 1) }
+                b')' => { bracket_depth = (bracket_depth - 1).max(0); (Tok::RParen, 1) }
                 b'[' => { bracket_depth += 1; (Tok::LBracket, 1) }
-                b']' => { bracket_depth -= 1; (Tok::RBracket, 1) }
+                b']' => { bracket_depth = (bracket_depth - 1).max(0); (Tok::RBracket, 1) }
                 b'{' => { bracket_depth += 1; (Tok::LBrace, 1) }
-                b'}' => { bracket_depth -= 1; (Tok::RBrace, 1) }
+                b'}' => { bracket_depth = (bracket_depth - 1).max(0); (Tok::RBrace, 1) }
                 b',' => (Tok::Comma, 1),
                 b':' => (Tok::Colon, 1),
                 b';' => (Tok::Semicolon, 1),

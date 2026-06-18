@@ -565,7 +565,10 @@ impl<'a> Codegen<'a> {
         for p in f.params.iter().filter(|p| p.name != "self") {
             if !first { sig.push_str(", "); }
             first = false;
-            let _ = write!(sig, "{}: {}", p.name, rust_ty(&Ty::from_type_expr(&p.ty)?));
+            // Value params are bound `mut` so functions may mutate them or their
+            // fields in place (Python passes mutable objects by reference);
+            // unused-mut is allowed in the generated crate.
+            let _ = write!(sig, "mut {}: {}", p.name, rust_ty(&Ty::from_type_expr(&p.ty)?));
         }
         let ret = Ty::from_type_expr(&f.ret)?;
         let ret_s = rust_ty(&ret);
@@ -927,6 +930,31 @@ impl<'a> Codegen<'a> {
         Ok(())
     }
 
+    /// True for types that are move-only (non-`Copy`) in the generated Rust.
+    fn is_owned_ty(t: &Ty) -> bool {
+        matches!(t,
+            Ty::Str | Ty::List(_) | Ty::Set(_) | Ty::Dict(_, _) | Ty::Tuple(_) | Ty::Class(_))
+    }
+
+    /// Emit an expression in a position that takes ownership of the value
+    /// (function argument, container store). A bare identifier of an owned
+    /// (non-`Copy`) type is `.clone()`d so the original binding stays usable.
+    /// pyrst follows Python value semantics and performs no move/borrow
+    /// analysis, so cloning here is the conservative, always-compiling choice.
+    fn emit_owned(&mut self, e: &Expr) -> Result<String> {
+        let s = self.emit_expr(e)?;
+        if let Expr::Ident(name, _) = e {
+            let owned = self.locals.get(name)
+                .or_else(|| self.ctx.vars.get(name))
+                .map(Self::is_owned_ty)
+                .unwrap_or(false);
+            if owned {
+                return Ok(format!("{}.clone()", s));
+            }
+        }
+        Ok(s)
+    }
+
     fn emit_stmt(&mut self, s: &Stmt) -> Result<()> {
         match s {
             Stmt::Pass(_) => self.line("// pass"),
@@ -1196,12 +1224,12 @@ impl<'a> Codegen<'a> {
                 self.line(&format!("drop({});", t));
             }
             Stmt::AttrAssign { obj, attr, value, .. } => {
-                let v = self.emit_expr(value)?;
+                let v = self.emit_owned(value)?;
                 self.line(&format!("{}.{} = {};", obj, attr, v));
             }
             Stmt::IndexAssign { obj, idx, value, .. } => {
                 let i = self.emit_expr(idx)?;
-                let v = self.emit_expr(value)?;
+                let v = self.emit_owned(value)?;
                 // Check if obj is a dict or list based on type info
                 let is_dict = self.locals.get(obj)
                     .or_else(|| self.ctx.vars.get(obj))
@@ -1314,6 +1342,9 @@ impl<'a> Codegen<'a> {
                 let is_range = iter_s.contains("..");
                 let chain = if is_range {
                     format!("({}).into_iter()", iter_s)
+                } else if matches!(self.type_of_expr(iter), Ty::Str) {
+                    // Iterating a str yields 1-character strings (Python semantics)
+                    format!("{}.chars().map(|__c| __c.to_string())", iter_s)
                 } else {
                     format!("{}.iter().cloned()", iter_s)
                 };
@@ -1331,6 +1362,8 @@ impl<'a> Codegen<'a> {
                 let is_range = iter_s.contains("..");
                 let chain = if is_range {
                     format!("({}).into_iter()", iter_s)
+                } else if matches!(self.type_of_expr(iter), Ty::Str) {
+                    format!("{}.chars().map(|__c| __c.to_string())", iter_s)
                 } else {
                     format!("{}.iter().cloned()", iter_s)
                 };
@@ -1348,6 +1381,8 @@ impl<'a> Codegen<'a> {
                 let is_range = iter_s.contains("..");
                 let chain = if is_range {
                     format!("({}).into_iter()", iter_s)
+                } else if matches!(self.type_of_expr(iter), Ty::Str) {
+                    format!("{}.chars().map(|__c| __c.to_string())", iter_s)
                 } else {
                     format!("{}.iter().cloned()", iter_s)
                 };
@@ -2218,38 +2253,38 @@ impl<'a> Codegen<'a> {
 
                     // String utility methods
                     if name == "isdigit" {
-                        return Ok(format!("(if !{}.is_empty() && {}.chars().all(|c| c.is_numeric()) {{ \"True\" }} else {{ \"False\" }}).to_string()", obj_s, obj_s));
+                        return Ok(format!("(!{}.is_empty() && {}.chars().all(|c| c.is_numeric()))", obj_s, obj_s));
                     }
                     if name == "isalpha" {
-                        return Ok(format!("(if !{}.is_empty() && {}.chars().all(|c| c.is_alphabetic()) {{ \"True\" }} else {{ \"False\" }}).to_string()", obj_s, obj_s));
+                        return Ok(format!("(!{}.is_empty() && {}.chars().all(|c| c.is_alphabetic()))", obj_s, obj_s));
                     }
                     if name == "isupper" {
-                        return Ok(format!("(if !{}.is_empty() && {}.chars().filter(|c| c.is_alphabetic()).all(|c| c.is_uppercase()) && {}.chars().any(|c| c.is_alphabetic()) {{ \"True\" }} else {{ \"False\" }}).to_string()", obj_s, obj_s, obj_s));
+                        return Ok(format!("(!{}.is_empty() && {}.chars().filter(|c| c.is_alphabetic()).all(|c| c.is_uppercase()) && {}.chars().any(|c| c.is_alphabetic()))", obj_s, obj_s, obj_s));
                     }
                     if name == "islower" {
-                        return Ok(format!("(if !{}.is_empty() && {}.chars().filter(|c| c.is_alphabetic()).all(|c| c.is_lowercase()) && {}.chars().any(|c| c.is_alphabetic()) {{ \"True\" }} else {{ \"False\" }}).to_string()", obj_s, obj_s, obj_s));
+                        return Ok(format!("(!{}.is_empty() && {}.chars().filter(|c| c.is_alphabetic()).all(|c| c.is_lowercase()) && {}.chars().any(|c| c.is_alphabetic()))", obj_s, obj_s, obj_s));
                     }
                     if name == "isspace" {
-                        return Ok(format!("(if !{}.is_empty() && {}.chars().all(|c| c.is_whitespace()) {{ \"True\" }} else {{ \"False\" }}).to_string()", obj_s, obj_s));
+                        return Ok(format!("(!{}.is_empty() && {}.chars().all(|c| c.is_whitespace()))", obj_s, obj_s));
                     }
                     if name == "isalnum" {
-                        return Ok(format!("(if !{}.is_empty() && {}.chars().all(|c| c.is_alphanumeric()) {{ \"True\" }} else {{ \"False\" }}).to_string()", obj_s, obj_s));
+                        return Ok(format!("(!{}.is_empty() && {}.chars().all(|c| c.is_alphanumeric()))", obj_s, obj_s));
                     }
                     if name == "isidentifier" {
                         return Ok(format!(
-                            "(if !{}.is_empty() && ({}.chars().next().unwrap().is_alphabetic() || {}.chars().next().unwrap() == '_') && {}.chars().all(|c| c.is_alphanumeric() || c == '_') {{ \"True\" }} else {{ \"False\" }}).to_string()",
+                            "(!{}.is_empty() && ({}.chars().next().unwrap().is_alphabetic() || {}.chars().next().unwrap() == '_') && {}.chars().all(|c| c.is_alphanumeric() || c == '_'))",
                             obj_s, obj_s, obj_s, obj_s
                         ));
                     }
                     if name == "isnumeric" {
-                        return Ok(format!("(if !{}.is_empty() && {}.chars().all(|c| c.is_numeric()) {{ \"True\" }} else {{ \"False\" }}).to_string()", obj_s, obj_s));
+                        return Ok(format!("(!{}.is_empty() && {}.chars().all(|c| c.is_numeric()))", obj_s, obj_s));
                     }
                     if name == "isprintable" {
-                        return Ok(format!("(if {}.chars().all(|c| !c.is_control()) {{ \"True\" }} else {{ \"False\" }}).to_string()", obj_s));
+                        return Ok(format!("({}.chars().all(|c| !c.is_control()))", obj_s));
                     }
                     if name == "istitle" {
                         return Ok(format!(
-                            "(if !{}.is_empty() && {}.split_whitespace().all(|word| if word.is_empty() {{ true }} else {{ word.chars().next().unwrap().is_uppercase() && word[1..].chars().all(|c| !c.is_alphabetic() || c.is_lowercase()) }}) {{ \"True\" }} else {{ \"False\" }}).to_string()",
+                            "(!{}.is_empty() && {}.split_whitespace().all(|word| if word.is_empty() {{ true }} else {{ word.chars().next().unwrap().is_uppercase() && word[1..].chars().all(|c| !c.is_alphabetic() || c.is_lowercase()) }}))",
                             obj_s, obj_s
                         ));
                     }
@@ -2342,11 +2377,11 @@ impl<'a> Codegen<'a> {
                         if parts.is_empty() {
                             return Err(crate::diag::Error::Codegen("pop requires at least one argument".into()));
                         } else if parts.len() == 1 {
-                            // pop(key) — panic if not found
-                            return Ok(format!("{{ let mut __d = {}.clone(); __d.remove(&{}).expect(\"KeyError: key not found\") }}", obj_s, parts[0]));
+                            // pop(key) — remove from the receiver and return the value (panic if absent)
+                            return Ok(format!("{}.remove(&{}).expect(\"KeyError: key not found\")", obj_s, parts[0]));
                         } else {
-                            // pop(key, default) — return default if not found
-                            return Ok(format!("{{ let mut __d = {}.clone(); __d.remove(&{}).unwrap_or({}) }}", obj_s, parts[0], parts[1]));
+                            // pop(key, default) — remove from the receiver; default if absent
+                            return Ok(format!("{}.remove(&{}).unwrap_or({})", obj_s, parts[0], parts[1]));
                         }
                     }
                     // List methods
@@ -2384,7 +2419,7 @@ impl<'a> Codegen<'a> {
 
                 // Regular function call (not a class).
                 let mut parts = Vec::with_capacity(args.len());
-                for a in args { parts.push(self.emit_expr(a)?); }
+                for a in args { parts.push(self.emit_owned(a)?); }
 
                 // Inject default arguments for named functions
                 if let Expr::Ident(n, _) = callee.as_ref() {
@@ -2655,7 +2690,14 @@ impl<'a> Codegen<'a> {
                 let rt = self.type_of_expr(rhs);
 
                 match op {
-                    BinOp::Pow => return Ok(format!("(({} as f64).powf({} as f64))", l, r)),
+                    BinOp::Pow => {
+                        // int ** int -> integer power (matches type_of_expr inferring Int);
+                        // any float operand -> float power.
+                        if matches!(lt, Ty::Int) && matches!(rt, Ty::Int) {
+                            return Ok(format!("(({}).pow({} as u32))", l, r));
+                        }
+                        return Ok(format!("(({} as f64).powf({} as f64))", l, r));
+                    }
                     BinOp::In => {
                         // Use contains_key for dicts, contains for lists/sets
                         let contains_method = match rt {

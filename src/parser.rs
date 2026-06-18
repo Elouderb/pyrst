@@ -1,17 +1,20 @@
-//! Pratt-style parser for the pyrst v0 subset.
+//! Pratt-style recursive-descent parser for pyrst.
 //!
-//! v0 grammar (informal):
+//! Grammar (informal):
 //!   module    := stmt*
 //!   stmt      := simple NEWLINE | compound
-//!   simple    := pass | break | continue | return [expr]
+//!   simple    := pass | break | continue | return [expr] | raise | assert | del
+//!              | import | from-import
 //!              | ident (":" type)? "=" expr
-//!              | ident augop expr
+//!              | (ident | attr | index) augop expr
+//!              | unpack-target "=" expr
 //!              | expr
-//!   compound  := if | while | def | class
+//!   compound  := if | while | for | def | class | match | with | try
 //!   block     := NEWLINE INDENT stmt+ DEDENT
 //!
-//! v0 deliberately omits: for, match, decorators, multi-target assignment,
-//! unpacking, comprehensions, lambdas, with, try/except, async.
+//! Implemented beyond the early v0 subset: for, match, decorators,
+//! multi-target/unpack assignment, comprehensions (list/set/dict), lambdas,
+//! with, and try/except. Not yet supported: generators/`yield`, `async`.
 
 use crate::ast::*;
 use crate::diag::{Error, Result, Span};
@@ -260,6 +263,30 @@ impl Parser {
                 };
                 self.eat_newline()?;
                 return Ok(Stmt::AttrAssign { obj: obj_name, attr: name, value, span });
+            }
+            if let Expr::Index { obj, idx, span } = lhs_expr {
+                self.bump(); // consume augop
+                let rhs = self.parse_expr()?;
+                let obj_name = match *obj {
+                    Expr::Ident(n, _) => n,
+                    _ => return Err(Error::Parse {
+                        span,
+                        msg: "only simple `obj[idx] += val` assignment is supported".into(),
+                    }),
+                };
+                // Convert a[i] += y to a[i] = a[i] + y
+                let value = Expr::BinOp {
+                    op,
+                    lhs: Box::new(Expr::Index {
+                        obj: Box::new(Expr::Ident(obj_name.clone(), span)),
+                        idx: idx.clone(),
+                        span,
+                    }),
+                    rhs: Box::new(rhs),
+                    span,
+                };
+                self.eat_newline()?;
+                return Ok(Stmt::IndexAssign { obj: obj_name, idx: *idx, value, span });
             }
         }
 
@@ -835,43 +862,67 @@ impl Parser {
     }
 
     fn parse_cmp(&mut self) -> Result<Expr> {
-        let mut lhs = self.parse_bitor()?;
+        let first = self.parse_bitor()?;
+        // Collect a chain of comparisons: `a < b < c` is Python-desugared to
+        // `(a < b) and (b < c)`, NOT left-folded to `(a < b) < c`.
+        let mut chain: Vec<(BinOp, Span, Expr)> = Vec::new();
         loop {
-            match self.peek() {
+            let (op, span) = match self.peek() {
                 Tok::Is => {
                     let span = self.peek_span(); self.bump();
                     let op = if self.eat(&Tok::Not) { BinOp::IsNot } else { BinOp::Is };
-                    let rhs = self.parse_bitor()?;
-                    lhs = Expr::BinOp { op, lhs: Box::new(lhs), rhs: Box::new(rhs), span };
+                    (op, span)
                 }
                 Tok::In => {
                     let span = self.peek_span(); self.bump();
-                    let rhs = self.parse_bitor()?;
-                    lhs = Expr::BinOp { op: BinOp::In, lhs: Box::new(lhs), rhs: Box::new(rhs), span };
+                    (BinOp::In, span)
                 }
-                Tok::Not => {
-                    if matches!(self.peek2(), Some(Tok::In)) {
-                        let span = self.peek_span(); self.bump(); self.bump();
-                        let rhs = self.parse_bitor()?;
-                        lhs = Expr::BinOp { op: BinOp::NotIn, lhs: Box::new(lhs), rhs: Box::new(rhs), span };
-                    } else {
-                        break;
-                    }
+                Tok::Not if matches!(self.peek2(), Some(Tok::In)) => {
+                    let span = self.peek_span(); self.bump(); self.bump();
+                    (BinOp::NotIn, span)
                 }
-                _ => {
-                    let op = match self.peek() {
-                        Tok::Eq => BinOp::Eq, Tok::Ne => BinOp::Ne,
-                        Tok::Lt => BinOp::Lt, Tok::Le => BinOp::Le,
-                        Tok::Gt => BinOp::Gt, Tok::Ge => BinOp::Ge,
-                        _ => break,
-                    };
-                    let span = self.peek_span(); self.bump();
-                    let rhs = self.parse_bitor()?;
-                    lhs = Expr::BinOp { op, lhs: Box::new(lhs), rhs: Box::new(rhs), span };
-                }
-            }
+                Tok::Eq => { let s = self.peek_span(); self.bump(); (BinOp::Eq, s) }
+                Tok::Ne => { let s = self.peek_span(); self.bump(); (BinOp::Ne, s) }
+                Tok::Lt => { let s = self.peek_span(); self.bump(); (BinOp::Lt, s) }
+                Tok::Le => { let s = self.peek_span(); self.bump(); (BinOp::Le, s) }
+                Tok::Gt => { let s = self.peek_span(); self.bump(); (BinOp::Gt, s) }
+                Tok::Ge => { let s = self.peek_span(); self.bump(); (BinOp::Ge, s) }
+                _ => break,
+            };
+            let rhs = self.parse_bitor()?;
+            chain.push((op, span, rhs));
         }
-        Ok(lhs)
+        if chain.is_empty() {
+            return Ok(first);
+        }
+        if chain.len() == 1 {
+            let (op, span, rhs) = chain.into_iter().next().unwrap();
+            return Ok(Expr::BinOp { op, lhs: Box::new(first), rhs: Box::new(rhs), span });
+        }
+        // Two or more comparisons: build `(o0 OP o1) and (o1 OP o2) and ...`.
+        // Middle operands are cloned (each appears in two comparisons); this is
+        // acceptable since chained operands in practice are simple expressions.
+        let mut prev = first;
+        let mut result: Option<Expr> = None;
+        for (op, span, rhs) in chain {
+            let cmp = Expr::BinOp {
+                op,
+                lhs: Box::new(prev),
+                rhs: Box::new(rhs.clone()),
+                span,
+            };
+            result = Some(match result {
+                None => cmp,
+                Some(acc) => Expr::BinOp {
+                    op: BinOp::And,
+                    lhs: Box::new(acc),
+                    rhs: Box::new(cmp),
+                    span,
+                },
+            });
+            prev = rhs;
+        }
+        Ok(result.unwrap())
     }
 
     fn parse_bitor(&mut self) -> Result<Expr> {

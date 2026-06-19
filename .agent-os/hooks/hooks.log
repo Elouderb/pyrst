@@ -1,0 +1,169 @@
+2026-06-18T23:16:49-0700 Graphify semantic extraction skipped (prompt-submit): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:17:22-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-18T23:17:22-0700 Graphify semantic extraction skipped (tool-batch): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:17:27-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-18T23:17:28-0700 Graphify semantic extraction skipped (tool-batch): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:17:51-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-18T23:17:51-0700 Graphify semantic extraction skipped (tool-batch): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:17:56-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-18T23:17:56-0700 Graphify semantic extraction skipped (tool-batch): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:18:49-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-18T23:18:50-0700 Graphify semantic extraction skipped (tool-batch): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:19:07-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-18T23:19:07-0700 Graphify semantic extraction skipped (tool-batch): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:20:55-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-18T23:20:56-0700 Graphify semantic extraction skipped (tool-batch): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:21:01-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-18T23:21:02-0700 Graphify semantic extraction skipped (tool-batch): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:21:09-0700 marked dirty: Git/worktree state changed before turn-stop
+2026-06-18T23:21:09-0700 Graphify semantic extraction skipped (turn-stop): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:21:12-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-18T23:21:13-0700 Graphify semantic extraction skipped (tool-batch): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:21:23-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-18T23:21:23-0700 Graphify semantic extraction skipped (tool-batch): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:21:37-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-18T23:21:37-0700 Graphify semantic extraction skipped (tool-batch): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:21:42-0700 marked dirty: Git/worktree state changed before subagent-stop
+2026-06-18T23:21:42-0700 Graphify semantic extraction skipped (subagent-stop): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:21:44-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-18T23:21:44-0700 Graphify semantic extraction skipped (tool-batch): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:21:57-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-18T23:21:57-0700 Graphify semantic extraction skipped (tool-batch): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:22:05-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-18T23:22:06-0700 Graphify semantic extraction skipped (tool-batch): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:22:13-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-18T23:22:13-0700 Graphify semantic extraction skipped (tool-batch): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:22:24-0700 marked dirty: Git/worktree state changed before subagent-stop
+2026-06-18T23:22:25-0700 Graphify semantic extraction skipped (subagent-stop): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:22:28-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-18T23:22:29-0700 Graphify semantic extraction skipped (tool-batch): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:22:32-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-18T23:22:32-0700 Graphify semantic extraction skipped (tool-batch): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:22:41-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-18T23:22:41-0700 Graphify semantic extraction skipped (tool-batch): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:22:49-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-18T23:22:49-0700 Graphify semantic extraction skipped (tool-batch): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:23:00-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-18T23:23:00-0700 Graphify semantic extraction skipped (tool-batch): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:23:02-0700 marked dirty: Git/worktree state changed before subagent-stop
+2026-06-18T23:23:02-0700 Graphify semantic extraction skipped (subagent-stop): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:23:04-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-18T23:23:04-0700 Graphify semantic extraction skipped (tool-batch): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:23:08-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-18T23:23:09-0700 Graphify semantic extraction skipped (tool-batch): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:23:13-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-18T23:23:14-0700 Graphify semantic extraction skipped (tool-batch): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:23:18-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-18T23:23:18-0700 Graphify semantic extraction skipped (tool-batch): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:23:20-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-18T23:23:20-0700 Graphify semantic extraction skipped (tool-batch): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:23:26-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-18T23:23:26-0700 Graphify semantic extraction skipped (tool-batch): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:23:30-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-18T23:23:31-0700 Graphify semantic extraction skipped (tool-batch): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:23:32-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-18T23:23:33-0700 Graphify semantic extraction skipped (tool-batch): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:23:37-0700 marked dirty: Git/worktree state changed before subagent-stop
+2026-06-18T23:23:38-0700 Graphify semantic extraction skipped (subagent-stop): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:23:43-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-18T23:23:43-0700 Graphify semantic extraction skipped (tool-batch): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:23:56-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-18T23:23:56-0700 Graphify semantic extraction skipped (tool-batch): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:24:00-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-18T23:24:01-0700 Graphify semantic extraction skipped (tool-batch): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:24:08-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-18T23:24:08-0700 Graphify semantic extraction skipped (tool-batch): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:24:11-0700 marked dirty: Git/worktree state changed before subagent-stop
+2026-06-18T23:24:11-0700 Graphify semantic extraction skipped (subagent-stop): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:24:19-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-18T23:24:20-0700 Graphify semantic extraction skipped (tool-batch): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:24:24-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-18T23:24:24-0700 Graphify semantic extraction skipped (tool-batch): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:24:35-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-18T23:24:35-0700 Graphify semantic extraction skipped (tool-batch): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:24:45-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-18T23:24:46-0700 Graphify semantic extraction skipped (tool-batch): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:24:56-0700 marked dirty: Git/worktree state changed before subagent-stop
+2026-06-18T23:24:57-0700 Graphify semantic extraction skipped (subagent-stop): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:25:03-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-18T23:25:03-0700 Graphify semantic extraction skipped (tool-batch): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:25:14-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-18T23:25:14-0700 Graphify semantic extraction skipped (tool-batch): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:25:21-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-18T23:25:21-0700 Graphify semantic extraction skipped (tool-batch): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:25:28-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-18T23:25:28-0700 Graphify semantic extraction skipped (tool-batch): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:25:33-0700 marked dirty: Git/worktree state changed before subagent-stop
+2026-06-18T23:25:34-0700 Graphify semantic extraction skipped (subagent-stop): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:25:38-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-18T23:25:38-0700 Graphify semantic extraction skipped (tool-batch): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:26:11-0700 marked dirty: Git/worktree state changed before subagent-stop
+2026-06-18T23:26:11-0700 Graphify semantic extraction skipped (subagent-stop): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:26:50-0700 marked dirty: Git/worktree state changed before subagent-stop
+2026-06-18T23:26:51-0700 Graphify semantic extraction skipped (subagent-stop): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:27:03-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-18T23:27:03-0700 Graphify semantic extraction skipped (tool-batch): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:27:27-0700 marked dirty: Git/worktree state changed before subagent-stop
+2026-06-18T23:27:28-0700 Graphify semantic extraction skipped (subagent-stop): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:27:36-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-18T23:27:36-0700 Graphify semantic extraction skipped (tool-batch): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:28:03-0700 marked dirty: Git/worktree state changed before subagent-stop
+2026-06-18T23:28:04-0700 Graphify semantic extraction skipped (subagent-stop): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:28:57-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-18T23:28:57-0700 Graphify semantic extraction skipped (tool-batch): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:29:11-0700 marked dirty: Git/worktree state changed before subagent-stop
+2026-06-18T23:29:12-0700 Graphify semantic extraction skipped (subagent-stop): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:31:03-0700 marked dirty: Git/worktree state changed before subagent-stop
+2026-06-18T23:31:04-0700 Graphify semantic extraction skipped (subagent-stop): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:31:04-0700 marked dirty: Git/worktree state changed before session-start
+2026-06-18T23:31:05-0700 Graphify semantic extraction skipped (session-start): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:31:18-0700 marked dirty: Git/worktree state changed before subagent-stop
+2026-06-18T23:31:18-0700 Graphify semantic extraction skipped (subagent-stop): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:31:42-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-18T23:31:43-0700 Graphify semantic extraction skipped (tool-batch): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:31:52-0700 marked dirty: Git/worktree state changed before subagent-stop
+2026-06-18T23:31:52-0700 Graphify semantic extraction skipped (subagent-stop): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:32:26-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-18T23:32:26-0700 Graphify semantic extraction skipped (tool-batch): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-18T23:32:49-0700 marked dirty: Git/worktree state changed before subagent-stop
+2026-06-18T23:32:50-0700 marked dirty: Git/worktree state changed before prompt-submit
+2026-06-18T23:32:50-0700 Graphify semantic extraction skipped (subagent-stop): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-19T13:37:58-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-19T13:37:58-0700 Graphify semantic extraction skipped (tool-batch): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-19T13:38:22-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-19T13:38:23-0700 Graphify semantic extraction skipped (tool-batch): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-19T13:38:39-0700 marked dirty: Claude modified src/typeck.rs
+2026-06-19T13:38:41-0700 marked dirty: Claude modified src/typeck.rs
+2026-06-19T13:38:43-0700 marked dirty: Claude modified src/typeck.rs
+2026-06-19T13:38:45-0700 marked dirty: Claude modified src/typeck.rs
+2026-06-19T13:38:47-0700 marked dirty: Claude modified src/typeck.rs
+2026-06-19T13:38:47-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-19T13:38:48-0700 Graphify semantic extraction skipped (tool-batch): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-19T13:39:39-0700 marked dirty: Git/worktree state changed before bash-tool
+2026-06-19T13:39:39-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-19T13:39:39-0700 Graphify semantic extraction skipped (bash-tool): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-19T13:39:51-0700 marked dirty: Claude modified examples/fail_range_not_a_list.py
+2026-06-19T13:39:53-0700 marked dirty: Claude modified examples/fail_sorted_as_wrong_type.py
+2026-06-19T13:39:53-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-19T13:39:54-0700 Graphify semantic extraction skipped (tool-batch): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-19T13:40:23-0700 marked dirty: Git/worktree state changed before bash-tool
+2026-06-19T13:40:23-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-19T13:40:23-0700 Graphify semantic extraction skipped (bash-tool): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-19T13:40:47-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-19T13:40:47-0700 Graphify semantic extraction skipped (tool-batch): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-19T13:41:06-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-19T13:41:07-0700 Graphify semantic extraction skipped (bash-tool): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-19T13:41:10-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-19T13:41:10-0700 Graphify semantic extraction skipped (tool-batch): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-19T13:41:16-0700 marked dirty: Claude modified src/typeck.rs
+2026-06-19T13:41:16-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-19T13:41:17-0700 Graphify semantic extraction skipped (tool-batch): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-19T13:41:21-0700 marked dirty: Claude modified examples/fail_set_loop_wrong_type.py
+2026-06-19T13:41:22-0700 marked dirty: Claude modified examples/fail_str_loop_wrong_type.py
+2026-06-19T13:41:23-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-19T13:41:23-0700 Graphify semantic extraction skipped (tool-batch): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-19T13:42:34-0700 marked dirty: Git/worktree state changed before bash-tool
+2026-06-19T13:42:34-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-19T13:42:34-0700 Graphify semantic extraction skipped (bash-tool): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.
+2026-06-19T13:42:46-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-19T13:42:47-0700 Graphify semantic extraction skipped (tool-batch): no LLM API key configured. Set an API key or AGENT_OS_GRAPHIFY_ARGS to enable.

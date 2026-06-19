@@ -123,6 +123,14 @@ pub struct Token {
     pub span: Span,
 }
 
+/// Decode the full UTF-8 codepoint starting at byte offset `i` of `src`
+/// (a valid `&str`). Returns the char, or None if `i` is not a char boundary
+/// or is out of range — so callers never panic and never split a multi-byte
+/// character into Latin-1 bytes.
+fn char_at(src: &str, i: usize) -> Option<char> {
+    src.get(i..).and_then(|rest| rest.chars().next())
+}
+
 pub fn lex(src: &str) -> Result<Vec<Token>> {
     let bytes = src.as_bytes();
     let mut tokens: Vec<Token> = Vec::new();
@@ -247,8 +255,13 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
                                 brace_depth -= 1;
                                 if brace_depth == 0 { break; }
                             }
-                            expr.push(bytes[i] as char);
-                            i += 1;
+                            match char_at(src, i) {
+                                Some(ch) => { expr.push(ch); i += ch.len_utf8(); }
+                                None => return Err(Error::Lex {
+                                    span: Span::new(i, i + 1, line, col),
+                                    msg: "invalid UTF-8 byte in f-string interpolation".into(),
+                                }),
+                            }
                         }
                         if i >= bytes.len() {
                             return Err(Error::Lex {
@@ -296,8 +309,13 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
                         msg: "unterminated f-string".into(),
                     });
                 } else {
-                    current_lit.push(bytes[i] as char);
-                    i += 1;
+                    match char_at(src, i) {
+                        Some(ch) => { current_lit.push(ch); i += ch.len_utf8(); }
+                        None => return Err(Error::Lex {
+                            span: Span::new(i, i + 1, line, col),
+                            msg: "invalid UTF-8 byte in f-string".into(),
+                        }),
+                    }
                 }
             }
             if i >= bytes.len() {
@@ -348,8 +366,13 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
                         msg: "unterminated string".into(),
                     });
                 } else {
-                    s.push(bytes[i] as char);
-                    i += 1;
+                    match char_at(src, i) {
+                        Some(ch) => { s.push(ch); i += ch.len_utf8(); }
+                        None => return Err(Error::Lex {
+                            span: Span::new(i, i + 1, line, col),
+                            msg: "invalid UTF-8 byte in string literal".into(),
+                        }),
+                    }
                 }
             }
             if i >= bytes.len() {

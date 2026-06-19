@@ -87,7 +87,11 @@ impl TyCtx {
             ret: Ty::Unit,
             param_defaults: vec![],
         });
-        // range(n) yields ints; model as a list of ints so loop vars/usages are typed.
+        // range(n) yields ints; model as a list of ints so loop vars/usages are
+        // typed. NOTE: codegen emits range as a Rust range expr (0..n), not a
+        // Vec, so `r: list[int] = range(5)` type-checks here but is rejected by
+        // rustc at build. No example relies on that; the model is a pragmatic
+        // approximation that buys correct element typing for `for i in range(..)`.
         funcs.insert("range".into(), FuncSig {
             params: vec![("n".into(), Ty::Int)],
             ret: Ty::List(Box::new(Ty::Int)),
@@ -906,6 +910,8 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
             let iter_ty = check_expr(iter, env)?;
             let elem_ty = match &iter_ty {
                 Ty::List(inner) => *inner.clone(),
+                Ty::Set(inner) => *inner.clone(),
+                Ty::Str => Ty::Str, // iterating a string yields 1-char strings
                 _ => Ty::Int, // ranges and unknown iterables -> Int
             };
             // Create a new scope with the loop variable bound
@@ -924,6 +930,8 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
             let iter_ty = check_expr(iter, env)?;
             let elem_ty = match &iter_ty {
                 Ty::List(inner) => *inner.clone(),
+                Ty::Set(inner) => *inner.clone(),
+                Ty::Str => Ty::Str, // iterating a string yields 1-char strings
                 _ => Ty::Int,
             };
             let mut inner_env = FuncEnv {
@@ -941,6 +949,8 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
             let iter_ty = check_expr(iter, env)?;
             let elem_ty = match &iter_ty {
                 Ty::List(inner) => *inner.clone(),
+                Ty::Set(inner) => *inner.clone(),
+                Ty::Str => Ty::Str, // iterating a string yields 1-char strings
                 _ => Ty::Int,
             };
             let mut inner_env = FuncEnv {

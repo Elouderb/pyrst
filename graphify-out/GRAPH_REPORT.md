@@ -1,16 +1,16 @@
 # Graph Report - pyrst  (2026-06-19)
 
 ## Corpus Check
-- 164 files · ~80,513 words
+- 164 files · ~80,619 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 1457 nodes · 1981 edges · 196 communities (145 shown, 51 thin omitted)
+- 1458 nodes · 1983 edges · 196 communities (145 shown, 51 thin omitted)
 - Extraction: 100% EXTRACTED · 0% INFERRED · 0% AMBIGUOUS · INFERRED: 4 edges (avg confidence: 0.8)
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `c165c5d4`
+- Built from commit: `e84da763`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -531,7 +531,7 @@ Cohesion: 0.67
 Nodes (3): Example: Full Program Compilation, Generated Rust, pyrst Source
 
 ## Knowledge Gaps
-- **634 isolated node(s):** `MyClass`, `FStrPart`, `BinOp`, `UnOp`, `PathBuf` (+629 more)
+- **633 isolated node(s):** `MyClass`, `FStrPart`, `BinOp`, `UnOp`, `PathBuf` (+628 more)
   These have ≤1 connection - possible missing edges or undocumented components.
 - **51 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
 
@@ -540,12 +540,12 @@ _Questions this graph is uniquely positioned to answer:_
 
 - **Why does `pyrst Language Specification (v0.1)` connect `Community 38` to `Community 66`, `Community 67`, `Community 68`, `Community 102`, `Community 103`, `Community 104`, `Community 105`, `Community 42`, `Community 47`, `Community 48`, `Community 59`, `Community 60`, `Community 61`?**
   _High betweenness centrality (0.004) - this node is a cross-community bridge._
-- **Why does `pyrst Project Status — May 29, 2026 (Phase 14.3 Complete)` connect `Community 44` to `Community 64`, `Community 96`, `Community 131`, `Community 132`, `Community 133`, `Community 134`, `Community 30`, `Community 92`, `Community 93`, `Community 94`, `Community 95`?**
-  _High betweenness centrality (0.002) - this node is a cross-community bridge._
 - **Why does `pyrst Rust Backend Mapping` connect `Community 31` to `Community 97`, `Community 65`, `Community 99`, `Community 100`, `Community 101`, `Community 98`, `Community 135`, `Community 41`, `Community 45`, `Community 46`, `Community 58`?**
   _High betweenness centrality (0.002) - this node is a cross-community bridge._
+- **Why does `5. Functions` connect `Community 42` to `Community 38`?**
+  _High betweenness centrality (0.001) - this node is a cross-community bridge._
 - **What connects `MyClass`, `FStrPart`, `BinOp` to the rest of the system?**
-  _634 weakly-connected nodes found - possible documentation gaps or missing edges._
+  _633 weakly-connected nodes found - possible documentation gaps or missing edges._
 - **Should `Community 1` be split into smaller, more focused modules?**
   _Cohesion score 0.04081632653061224 - nodes in this community are weakly interconnected._
 - **Should `Community 2` be split into smaller, more focused modules?**

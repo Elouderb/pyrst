@@ -29,3 +29,25 @@ for f in examples/*fail*.py; do
   rm -f "$base" "$base.rs"
 done
 echo "NEGATIVES REJECTED: $neg_ok / $neg_count"
+
+# Output assertions: a handful of examples whose stdout must match exactly, so
+# silent corruption (e.g. a UTF-8 lexer regression that still exits 0) is caught.
+out_ok=0
+out_count=0
+assert_output() {
+  local base="$1"; local expected="$2"
+  out_count=$((out_count + 1))
+  if timeout 30 $BIN build "examples/$base.py" >/dev/null 2>&1; then
+    local got; got=$(timeout 5 ./"$base" 2>/dev/null)
+    if [[ "$got" == "$expected" ]]; then
+      out_ok=$((out_ok + 1))
+    else
+      echo "OUTPUT MISMATCH: $base"
+    fi
+  else
+    echo "OUTPUT BUILD FAIL: $base"
+  fi
+  rm -f "$base" "$base.rs"
+}
+assert_output unicode_strings "$(printf 'café déjà vu\n日本語 世界\nrocket 🚀 star ✨\nf-string with naïve and 日本語\ncafé déjà vu — 日本語 世界\n20')"
+echo "OUTPUT ASSERTIONS: $out_ok / $out_count"

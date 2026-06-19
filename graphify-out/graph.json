@@ -6802,6 +6802,20 @@
       "norm_label": "test_all.sh script"
     },
     {
+      "label": "assert_output()",
+      "file_type": "code",
+      "source_file": "test_all.sh",
+      "source_location": "L37",
+      "metadata": {
+        "language": "bash",
+        "kind": "bash_function"
+      },
+      "_origin": "ast",
+      "id": "test_all_assert_output",
+      "community": 194,
+      "norm_label": "assert_output()"
+    },
+    {
       "label": "AGENTS.md",
       "file_type": "document",
       "source_file": "AGENTS.md",
@@ -18328,9 +18342,9 @@
       "source_file": "examples/unicode_strings.py",
       "source_location": "L3",
       "weight": 1.0,
+      "confidence_score": 1.0,
       "source": "examples_unicode_strings",
-      "target": "examples_unicode_strings_main",
-      "confidence_score": 1.0
+      "target": "examples_unicode_strings_main"
     },
     {
       "relation": "contains",
@@ -27654,6 +27668,27 @@
       "target": "home_ethos_coding_pyrst_test_all_sh__entry"
     },
     {
+      "relation": "defines",
+      "confidence": "EXTRACTED",
+      "source_file": "test_all.sh",
+      "source_location": "L37",
+      "weight": 1.0,
+      "source": "test_all",
+      "target": "test_all_assert_output",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "calls",
+      "confidence": "EXTRACTED",
+      "source_file": "test_all.sh",
+      "source_location": "L52",
+      "weight": 1.0,
+      "context": "call",
+      "source": "home_ethos_coding_pyrst_test_all_sh__entry",
+      "target": "test_all_assert_output",
+      "confidence_score": 1.0
+    },
+    {
       "relation": "contains",
       "confidence": "EXTRACTED",
       "source_file": "AGENTS.md",
@@ -35185,5 +35220,5 @@
     }
   ],
   "hyperedges": [],
-  "built_at_commit": "c165c5d408722decd9ba51aecf95261808d93c03"
+  "built_at_commit": "e84da76339f124465c231369508fe294d556cdf0"
 }

@@ -13,14 +13,13 @@ A statically typed Python-like language that compiles to efficient Rust. Combine
 
 ## Status
 
-**Phase 38 (in development)** — Full compiler pipeline (lexer → parser → resolver → type checker → Rust codegen → `rustc`). **96 of 105 single-file examples (~91%) transpile and run successfully.**
+**Phase 38 (in development)** — Full compiler pipeline (lexer → parser → resolver → type checker → Rust codegen → `rustc`). **All 106 single-file examples transpile and run successfully** (`./test_all.sh`: 106/106 positives, 16/16 negatives rejected, 1/1 output assertion).
 
 The core pipeline is working end-to-end, including multi-file imports, classes with single inheritance and dunder methods, comprehensions, and a broad set of string/list/dict methods. Lambdas are implemented (see `examples/lambda_demo.py`, `examples/lambda_closure.py`).
 
 **Known limitations (honest status):**
-- The static type checker is **best-effort, not yet sound**: many expressions infer to an `Unknown` type that is permissively compatible with everything, so some type/ownership errors are surfaced by the downstream `rustc` invocation against generated Rust rather than by pyrst itself. The 9 currently-failing examples all fail this way.
-- `try`/`except` does not yet match on exception type or bind the exception.
-- f-string interpolations are emitted as raw source rather than fully compiled expressions (works only for the subset that is coincidentally valid Rust).
+- The static type checker is **best-effort, not yet fully sound**: some expressions still infer to an `Unknown` type that is permissively compatible with everything, so a few type/ownership errors are surfaced by the downstream `rustc` invocation against generated Rust rather than by pyrst itself. Recent work (type-inference soundness pass) has narrowed this escape hatch substantially; the remaining gaps are tracked as deferred items.
+- `try`/`except` matches on exception type and binds `except E as e` (the bound value is the exception message string). Remaining limitations: there is no exception class hierarchy (catching a base type does not catch a more specific one), and a caught exception still prints Rust's panic message to stderr before the handler runs (cosmetic; stdout and exit code are correct).
 
 ## Documentation Structure
 
@@ -129,15 +128,16 @@ See [DESIGN_DECISIONS.md](DESIGN_DECISIONS.md) for key tradeoffs.
 
 **Strengths:**
 - Full compiler pipeline working end-to-end (lexer → parser → resolver → type checker → codegen → `rustc`)
-- 96/105 single-file examples passing, covering core features and multi-file programs
+- 106/106 single-file examples passing, covering core features and multi-file programs
 - Clear separation of lexer, parser, type checker, code generator
 - Readable generated Rust code
 - Error messages with source code context
 
 **Current Status:**
 Phase 38, in active development. The pipeline is functional; the type checker's
-soundness and several codegen corner cases (f-strings, `try`/`except`,
-int/float promotion, collection mutation) are the main areas of ongoing work.
+remaining soundness gaps and several codegen corner cases (int/float promotion,
+collection mutation, exception-class hierarchy) are the main areas of ongoing
+work.
 
 ## Contributing
 

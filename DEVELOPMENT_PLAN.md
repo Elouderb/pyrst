@@ -1,7 +1,15 @@
 # pyrst Development Plan & Roadmap
 
-**Last Updated:** May 29, 2026  
-**Status:** Phases 1-14.3 Complete ✅ | Phase 15 Ready to Start
+**Last Updated:** June 19, 2026  
+**Status:** Phase 38 — active development ✅ | 108/108 examples passing
+
+> **Note on phase history:** This roadmap was authored around Phase 14 and its
+> per-phase estimates below are historical. Phases 15–38 were delivered
+> incrementally (advanced language features, a broad string/list/dict/set method
+> surface, set comprehensions, a type-inference soundness pass, UTF-8 lexer
+> correctness, and try/except type matching with `except E as e` binding). For
+> the authoritative current state see `README.md`, the project cards, and git
+> history rather than the per-phase tables in this document.
 
 ---
 
@@ -288,7 +296,12 @@ These features are explicitly out of scope or deferred indefinitely:
 
 ---
 
-## Current Status (May 29, 2026)
+## Current Status (June 19, 2026)
+
+> The detailed list below reflects the Phase 1–14 milestones as originally
+> written. Phases 15–38 (advanced features, expanded method coverage, the
+> type-inference soundness pass, UTF-8 lexer fixes, and try/except type
+> matching) landed afterward and are tracked in the cards and git history.
 
 ### Completed (Phases 1-14.3)
 
@@ -442,5 +455,5 @@ Success is measured not by "how many Python features," but by "how well does pyr
 
 ---
 
-*Development Plan updated: May 29, 2026*  
-*Phases 1-14.3 Complete — Ready for Phase 15+*
+*Development Plan updated: June 19, 2026*  
+*Phase 38 — active development; 108/108 examples passing*

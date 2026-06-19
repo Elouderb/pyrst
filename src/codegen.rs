@@ -1059,8 +1059,18 @@ impl<'a> Codegen<'a> {
                 Stmt::While { body, .. } | Stmt::For { body, .. } | Stmt::With { body, .. } => {
                     self.prescan_types(body);
                 }
-                Stmt::Try { body, else_, finally_, .. } => {
+                Stmt::Try { body, handlers, else_, finally_, .. } => {
                     self.prescan_types(body);
+                    for h in handlers {
+                        // Bind exc_name as Str before scanning the handler body so
+                        // that `len(e)` on a handler-bound exception yields char-count
+                        // (Ty::Str path) rather than byte-count (Ty::Unknown path).
+                        // Mirrors typeck.rs line 748-750.
+                        if let Some(name) = &h.exc_name {
+                            self.locals.insert(name.clone(), Ty::Str);
+                        }
+                        self.prescan_types(&h.body);
+                    }
                     if let Some(b) = else_ { self.prescan_types(b); }
                     if let Some(b) = finally_ { self.prescan_types(b); }
                 }
@@ -1320,16 +1330,38 @@ impl<'a> Codegen<'a> {
                 //   raise Foo("m")  -> "Foo panic: m"
                 //   raise Foo       -> "Foo panic: "   (empty message)
                 //   raise           -> "explicit raise"
+                //
+                // Suppress the default panic hook while the try body runs so that a
+                // *caught* exception produces no stderr noise.  The hook is saved and
+                // restored immediately after catch_unwind so that an *uncaught*
+                // exception (re-raised via resume_unwind below) still goes through the
+                // caller's hook and the Rust runtime prints a useful message + aborts
+                // with a non-zero exit code.
+                self.line("let __prev_hook = ::std::panic::take_hook();");
+                self.line("::std::panic::set_hook(::std::boxed::Box::new(|_| {}));");
                 self.line("let __try_result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {");
                 self.indent += 1;
                 for s in body { self.emit_stmt(s)?; }
                 self.indent -= 1;
                 self.line("}));");
+                self.line("::std::panic::set_hook(__prev_hook); // restore before any re-raise");
 
                 // Whether any handler can catch every exception type.
                 let has_catch_all = handlers.iter().any(|h| {
                     h.exc_type.is_none() || h.exc_type.as_deref() == Some("Exception")
                 });
+
+                // Accumulate the panic message string in case we need to print it to
+                // stderr on an unmatched re-raise (the payload Box is moved into
+                // resume_unwind, so we must capture the string before that). It is
+                // only reassigned on a re-raise path; a catch-all try never re-raises,
+                // so emit a non-`mut` binding there to avoid an unused-mut warning.
+                let reraise_possible = handlers.is_empty() || !has_catch_all;
+                let reraise_binding = if reraise_possible { "let mut" } else { "let" };
+                self.line(&format!(
+                    "{} __reraise_msg: ::std::option::Option<String> = ::std::option::Option::None;",
+                    reraise_binding
+                ));
 
                 // __reraise holds the original panic payload when no handler
                 // matched, so it can be re-raised after the finally block.
@@ -1367,6 +1399,7 @@ impl<'a> Codegen<'a> {
 
                 if handlers.is_empty() {
                     // No handlers at all: always re-raise.
+                    self.line("__reraise_msg = ::std::option::Option::Some(__exc_str.clone());");
                     self.line("::std::option::Option::Some(__payload)");
                 } else {
                     let mut first = true;
@@ -1414,7 +1447,7 @@ impl<'a> Codegen<'a> {
                     if has_catch_all {
                         self.line("} else { ::std::option::Option::None }");
                     } else {
-                        self.line("} else { ::std::option::Option::Some(__payload) }");
+                        self.line("} else { __reraise_msg = ::std::option::Option::Some(__exc_str.clone()); ::std::option::Option::Some(__payload) }");
                     }
                 }
                 self.indent -= 1;
@@ -1429,7 +1462,9 @@ impl<'a> Codegen<'a> {
                 }
 
                 // Re-raise an unmatched exception (after finally).
-                self.line("if let ::std::option::Option::Some(__p) = __reraise { ::std::panic::resume_unwind(__p); }");
+                // Print the exception message to stderr first so the user sees a
+                // useful error; resume_unwind then aborts with a non-zero exit code.
+                self.line("if let ::std::option::Option::Some(__p) = __reraise { if let ::std::option::Option::Some(ref __msg) = __reraise_msg { eprintln!(\"{}\", __msg); } ::std::panic::resume_unwind(__p); }");
 
                 self.indent -= 1;
                 self.line("}");

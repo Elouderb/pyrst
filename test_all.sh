@@ -53,4 +53,7 @@ assert_output unicode_strings "$(printf 'café déjà vu\n日本語 世界\nrock
 assert_output except_type_match "$(printf 'caught ValueError: bad value\ncaught KeyError: missing key\ndone')"
 assert_output except_as_binding "$(printf 'caught: something broke\nlength: 15\nrecovered')"
 assert_output except_hierarchy "$(printf 'caught LookupError (was KeyError): missing key\nnarrow KeyError caught first: missing key\ncaught ArithmeticError (was ZeroDivisionError): division by zero\ndone')"
+assert_output except_bound_len "$(printf '4')"
+assert_output except_multi_handler "$(printf 'value handler: v\nkey handler: k\nruntime handler: r\ndone')"
+assert_output except_finally_always "$(printf 'caught: boom\nfinally after catch\nno error\nfinally after success\ndone')"
 echo "OUTPUT ASSERTIONS: $out_ok / $out_count"

@@ -147,8 +147,13 @@ fn merge_ctx_from_module(m: &Module, ctx: &mut TyCtx, is_root: bool) -> Result<(
                     });
                 }
             }
-            Stmt::Assign { target, ty: Some(_), .. } => {
-                ctx.vars.insert(target.clone(), crate::typeck::Ty::Unknown);
+            Stmt::Assign { target, ty: Some(t), .. } => {
+                // Register module-level annotated globals with their concrete type
+                // (ported from typeck::check_module). Fall back to Unknown only if
+                // the annotation cannot be resolved.
+                let resolved = crate::typeck::Ty::from_type_expr(t)
+                    .unwrap_or(crate::typeck::Ty::Unknown);
+                ctx.vars.insert(target.clone(), resolved);
             }
             Stmt::Import { .. } => {}
             _ => {}

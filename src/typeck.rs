@@ -407,90 +407,6 @@ impl<'a> FuncEnv<'a> {
     }
 }
 
-pub fn check_module(m: &Module) -> Result<TyCtx> {
-    let mut ctx = TyCtx::new();
-
-    // First pass: collect function signatures, class definitions, and module-level variables.
-    for s in &m.stmts {
-        match s {
-            Stmt::Func(f) => {
-                let params: Result<Vec<(String, Ty)>> = f.params.iter()
-                    .filter(|p| p.name != "self")
-                    .map(|p| Ok((p.name.clone(), Ty::from_type_expr(&p.ty)?)))
-                    .collect();
-                let param_defaults: Vec<Option<Expr>> = f.params.iter()
-                    .filter(|p| p.name != "self")
-                    .map(|p| p.default.clone())
-                    .collect();
-                ctx.funcs.insert(f.name.clone(), FuncSig {
-                    params: params?,
-                    ret: Ty::from_type_expr(&f.ret)?,
-                    param_defaults,
-                });
-            }
-            Stmt::Class(c) => {
-                let mut c = c.clone();
-                extract_init_fields(&mut c);
-                ctx.classes.insert(c.name.clone(), c.clone());
-                // Register each method as a function under "ClassName.method".
-                for m_fn in &c.methods {
-                    let params: Result<Vec<(String, Ty)>> = m_fn.params.iter()
-                        .filter(|p| p.name != "self")
-                        .map(|p| Ok((p.name.clone(), Ty::from_type_expr(&p.ty)?)))
-                        .collect();
-                    let param_defaults: Vec<Option<Expr>> = m_fn.params.iter()
-                        .filter(|p| p.name != "self")
-                        .map(|p| p.default.clone())
-                        .collect();
-                    ctx.funcs.insert(
-                        format!("{}.{}", c.name, m_fn.name),
-                        FuncSig { params: params?, ret: Ty::from_type_expr(&m_fn.ret)?, param_defaults },
-                    );
-                }
-            }
-            Stmt::Assign { target, ty, .. } => {
-                if let Some(t) = ty {
-                    if let Ok(resolved) = Ty::from_type_expr(t) {
-                        ctx.vars.insert(target.clone(), resolved);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    // Second pass: type-check function bodies.
-    for s in &m.stmts {
-        match s {
-            Stmt::Func(f) => {
-                let params: Vec<(String, Ty)> = f.params.iter()
-                    .filter(|p| p.name != "self")
-                    .map(|p| (p.name.clone(), Ty::from_type_expr(&p.ty).unwrap_or(Ty::Unknown)))
-                    .collect();
-                let ret = Ty::from_type_expr(&f.ret)?;
-                let mut env = FuncEnv::new(&ctx, &params, ret);
-                check_body(&f.body, &mut env)?;
-            }
-            Stmt::Class(c) => {
-                for method in &c.methods {
-                    let mut params: Vec<(String, Ty)> = method.params.iter()
-                        .filter(|p| p.name != "self")
-                        .map(|p| (p.name.clone(), Ty::from_type_expr(&p.ty).unwrap_or(Ty::Unknown)))
-                        .collect();
-                    // Add `self` as the class type.
-                    params.insert(0, ("self".into(), Ty::Class(c.name.clone())));
-                    let ret = Ty::from_type_expr(&method.ret)?;
-                    let mut env = FuncEnv::new(&ctx, &params, ret);
-                    check_body(&method.body, &mut env)?;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    Ok(ctx)
-}
-
 /// Type-check function/class bodies against a pre-built context.
 /// Used for multi-file compilation where the context is merged from all modules.
 pub fn check_bodies(m: &Module, ctx: &TyCtx) -> Result<()> {
@@ -752,6 +668,11 @@ fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
                     });
                 }
             }
+            // NOTE: bare reassignment to a different concrete type is intentionally
+            // allowed — codegen emits a shadowing `let`, so pyrst supports Python's
+            // type-changing rebind (e.g. an int accumulator later assigned a float,
+            // or a name reused for a different value). Rejecting it here would
+            // contradict that feature.
             env.locals.insert(target.clone(), declared);
             Ok(())
         }
@@ -1021,10 +942,34 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                                 ),
                             });
                         }
-                        for a in args {
-                            check_expr(a, env)?;
+                        let sig_params = sig.params.clone();
+                        let sig_ret = sig.ret.clone();
+                        for (i, a) in args.iter().enumerate() {
+                            let arg_ty = check_expr(a, env)?;
+                            // Concrete-only positional arg-type check (skip variadic builtins).
+                            // Only fires when BOTH param and arg types are concrete and
+                            // incompatible. Int->Float is explicitly allowed (Python coercion).
+                            if !variadic {
+                                if let Some((_, param_ty)) = sig_params.get(i) {
+                                    let int_to_float =
+                                        matches!(arg_ty, Ty::Int) && matches!(param_ty, Ty::Float);
+                                    if !int_to_float
+                                        && !matches!(arg_ty, Ty::Unknown)
+                                        && !matches!(param_ty, Ty::Unknown)
+                                        && !types_compatible(&arg_ty, param_ty)
+                                    {
+                                        return Err(Error::Type {
+                                            span: *span,
+                                            msg: format!(
+                                                "argument {} to `{}`: expected {:?}, found {:?}",
+                                                i + 1, name, param_ty, arg_ty
+                                            ),
+                                        });
+                                    }
+                                }
+                            }
                         }
-                        sig.ret.clone()
+                        sig_ret
                     } else if name == "super" && args.is_empty() && kwargs.is_empty() {
                         // super() returns Unknown type — the codegen handles super().method() specially
                         Ty::Unknown

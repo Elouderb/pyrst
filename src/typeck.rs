@@ -844,6 +844,53 @@ fn elem_arg_check_ty(recv: &Ty, method: &str) -> Option<Ty> {
     }
 }
 
+/// Concrete return type for a builtin method on a given receiver, or Unknown.
+/// Card C covers `str` methods; other receivers fall through to Unknown.
+/// Note: pyrst models str.partition/rpartition as list[str] (not a tuple),
+/// matching codegen and the example fixtures.
+fn builtin_method_ret(recv: &Ty, method: &str) -> Ty {
+    match recv {
+        Ty::Str => match method {
+            "upper" | "lower" | "strip" | "lstrip" | "rstrip" | "replace"
+            | "capitalize" | "title" | "swapcase" | "casefold" | "format" | "zfill"
+            | "ljust" | "rjust" | "center" | "removeprefix" | "removesuffix"
+            | "expandtabs" | "join" => Ty::Str,
+            "split" | "rsplit" | "splitlines" | "partition" | "rpartition" => {
+                Ty::List(Box::new(Ty::Str))
+            }
+            "find" | "rfind" | "index" | "rindex" | "count" => Ty::Int,
+            "startswith" | "endswith" | "isdigit" | "isalpha" | "isupper" | "islower"
+            | "isspace" | "isalnum" | "isidentifier" | "isnumeric" | "isprintable"
+            | "istitle" | "isdecimal" => Ty::Bool,
+            _ => Ty::Unknown,
+        },
+        // Card D (safe subset): concrete element/collection returns only.
+        // Deliberately left as Unknown (higher regression risk): Unit-returning
+        // mutators (sort/append/add/...), dict.get (Option), dict.items (Tuple).
+        Ty::List(elem) => match method {
+            "pop" => (**elem).clone(),
+            "copy" => Ty::List(elem.clone()),
+            "index" | "count" => Ty::Int,
+            _ => Ty::Unknown,
+        },
+        Ty::Set(elem) => match method {
+            "union" | "intersection" | "difference" | "symmetric_difference" | "copy" => {
+                Ty::Set(elem.clone())
+            }
+            "pop" => (**elem).clone(),
+            "issubset" | "issuperset" | "isdisjoint" => Ty::Bool,
+            _ => Ty::Unknown,
+        },
+        Ty::Dict(key, val) => match method {
+            "keys" => Ty::List(key.clone()),
+            "values" => Ty::List(val.clone()),
+            "copy" => Ty::Dict(key.clone(), val.clone()),
+            _ => Ty::Unknown,
+        },
+        _ => Ty::Unknown,
+    }
+}
+
 fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
     Ok(match e {
         Expr::Int(_, _) => Ty::Int,
@@ -1083,7 +1130,7 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                                 }
                             }
                             for a in args { check_expr(a, env)?; }
-                            return Ok(Ty::Unknown);
+                            return Ok(builtin_method_ret(&obj_ty, name.as_str()));
                         }
                     }
                     check_expr(callee, env)?;

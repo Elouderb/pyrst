@@ -215,31 +215,50 @@ def add(a: int, b: int) -> int:
 
 ---
 
-## 11. Error Handling: Panic-Based (Temporary)
+## 11. Error Handling: Panic-Based with `catch_unwind`
 
-**Decision:** `raise` statements map to Rust `panic!` macro. Full exception handling deferred.
+**Decision:** Exceptions are modeled on Rust's panic/unwind machinery rather than
+`Result<T, E>`. `raise` compiles to `panic!` with a structured-string payload, and
+`try`/`except` is lowered to `std::panic::catch_unwind` + handler dispatch on the
+payload. The lower-risk evolution of the original panic-based placeholder was chosen
+over a ground-up `Result` rewrite (see card `be3c6353`).
+
+**Payload format.** Every pyrst `raise` panics with the string `"<Type> panic: <msg>"`:
 
 ```python
-raise ValueError("message")
+raise ValueError("message")   # -> panic!("{} panic: {}", "ValueError", "message")
+raise ValueError              # -> panic!("{} panic: ", "ValueError")  (empty message)
 ```
 
-Compiles to:
+The uniform `"<Type> panic: <msg>"` shape lets the handler dispatch recover the
+exception type. (A bare `raise` with no active exception emits `"explicit raise"`.)
 
-```rust
-panic!("ValueError: message");
-```
+**`try`/`except` lowering** (see RUST_BACKEND.md for the generated Rust):
+- The `try` body runs inside `catch_unwind`. On `Err`, the payload string is split
+  on `" panic: "` via `split_once` into `(__exc_type, __exc_msg)`.
+- Handlers are an `if`/`else if` chain matching on `__exc_type`; **first match wins**.
+- **Exception-class hierarchy (builtin):** a base type catches its subclasses — e.g.
+  `except LookupError:` catches `KeyError`/`IndexError`, `except ArithmeticError:`
+  catches `ZeroDivisionError`/`OverflowError`/`FloatingPointError`. The condition
+  OR-expands over the transitive builtin subclass set. `Exception` and a bare `except`
+  are the catch-all (`true`) arm.
+- **`except E as e` binding:** `e` is bound to the exception **message string**
+  (`Ty::Str`), usable in the handler body.
+- **`finally`** always runs (success, caught, and unmatched paths), before any re-raise.
+- An **unmatched** exception is re-raised via `resume_unwind` after `finally`.
+- **stderr hygiene:** the default panic hook is suppressed (`take_hook`/`set_hook`)
+  around the `catch_unwind`'d body, so a *caught* exception prints no stderr noise; an
+  *uncaught* exception still surfaces a message and a non-zero exit code.
 
-**Rationale:**
-- Simple mapping, no control flow complexity
-- Rust `panic!` provides stack unwinding
-- Full `try`/`except`/`Result` integration is complex
-- Defers harder design decision
+**Status:** ✅ Confirmed / implemented (cards `be3c6353`, `286ac79`, `8789297`,
+`15e4263`).
 
-**Tradeoff:** No exception catching; all raises are fatal.
-
-**Status:** ⚠️ Placeholder. Will need proper exception/Result design in Phase 11.
-
-**Future Work:** Design how `try`/`except` maps to Rust `Result<T, E>`.
+**Known limitations:**
+- Only the **builtin** exception hierarchy is modeled; user-defined exception classes
+  match by exact type name (no user-defined subclass catching).
+- The payload carries only a **message string**, not a structured exception object.
+- `take_hook`/`set_hook` run per `try` execution (allocates + global `RwLock`); a
+  single global hook + thread-local suppress flag is a possible future optimization.
 
 ---
 
@@ -422,11 +441,13 @@ Preserve Python's *ergonomics* and *common patterns*, not necessarily its *dynam
 ## Unresolved Decisions (Need Resolution Before Phase 8+)
 
 1. **Class Reference Semantics** — Should classes use Rc<RefCell<T>> for Python-like semantics?
-2. **Exception Handling** — Full design for try/except/Result mapping?
-3. **Module System** — Cross-file imports, circular dependencies, visibility rules?
-4. **Dynamic Behavior** — Is `Any` type supported? What about reflection?
-5. **Type Narrowing** — When does the type system narrow types (e.g., in `if x is not None:`)?
-6. **Borrowing Rules** — When do function arguments borrow vs move vs clone?
+2. **Dynamic Behavior** — Is `Any` type supported? What about reflection?
+3. **Type Narrowing** — When does the type system narrow types (e.g., in `if x is not None:`)?
+4. **Borrowing Rules** — When do function arguments borrow vs move vs clone?
+
+*Resolved:* **Exception Handling** — panic + `catch_unwind` model with builtin
+exception-class hierarchy and `except E as e` binding (see §11). **Module System** —
+cross-file imports are implemented.
 
 See SPEC.md section 15 ("Semantics Not Yet Fully Defined") for details.
 

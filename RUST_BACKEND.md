@@ -632,6 +632,80 @@ Compiles to:
 panic!("{} panic: {}", "ValueError", "message");
 ```
 
+The payload is always the string `"<Type> panic: <msg>"` so that `try`/`except`
+can recover the exception type at the catch site.
+
+### Try / Except / Finally
+
+`try`/`except` is lowered onto `std::panic::catch_unwind` + handler dispatch on the
+panic payload (see DESIGN_DECISIONS.md §11). A `base` exception catches its builtin
+subclasses, `except E as e` binds `e` to the message string, `finally` always runs,
+and an unmatched exception is re-raised after `finally`.
+
+```pyrst
+try:
+    raise ValueError("bad")
+except KeyError as e:
+    print("key: " + e)
+except LookupError as e:          # base type: also catches IndexError / KeyError
+    print("lookup: " + e)
+finally:
+    print("cleanup")
+```
+
+Compiles to (shape; some boilerplate elided):
+
+```rust
+{
+    // Suppress the default panic hook so a *caught* panic prints no stderr noise.
+    let __prev_hook = ::std::panic::take_hook();
+    ::std::panic::set_hook(::std::boxed::Box::new(|_| {}));
+    let __try_result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
+        panic!("{} panic: {}", "ValueError", "bad");
+    }));
+    ::std::panic::set_hook(__prev_hook);            // restore before any re-raise
+
+    let mut __reraise_msg: ::std::option::Option<String> = ::std::option::Option::None;
+    let __reraise = match __try_result {
+        ::std::result::Result::Ok(__ok) => { let _ = __ok; ::std::option::Option::None }
+        ::std::result::Result::Err(__payload) => {
+            let __exc_str: String = /* downcast payload to String / &str */;
+            // Recover "<Type> panic: <msg>".
+            let (__exc_type, __exc_msg) = match __exc_str.split_once(" panic: ") {
+                Some((t, m)) => (t.to_string(), m.to_string()),
+                None => (__exc_str.clone(), __exc_str.clone()),
+            };
+            if (__exc_type == "KeyError") {
+                let e = __exc_msg.clone();          // `except KeyError as e`
+                println!("{}", format!("key: {}", e));
+                ::std::option::Option::None
+            } else if (__exc_type == "LookupError"  // base OR-expands over subclasses
+                   || __exc_type == "IndexError"
+                   || __exc_type == "KeyError") {
+                let e = __exc_msg.clone();
+                println!("{}", format!("lookup: {}", e));
+                ::std::option::Option::None
+            } else {
+                __reraise_msg = ::std::option::Option::Some(__exc_str.clone());
+                ::std::option::Option::Some(__payload)   // no handler matched
+            }
+        }
+    };
+
+    // `finally` runs on every path, before any re-raise.
+    println!("cleanup");
+
+    // Unmatched: print the message (so uncaught exceptions stay visible) and re-raise.
+    if let ::std::option::Option::Some(__p) = __reraise {
+        if let ::std::option::Option::Some(ref __msg) = __reraise_msg { eprintln!("{}", __msg); }
+        ::std::panic::resume_unwind(__p);
+    }
+}
+```
+
+`Exception` and a bare `except` compile to the catch-all (`true`) arm; in that case
+the trailing `else` is `{ None }` and `__reraise_msg` is bound without `mut`.
+
 ---
 
 ## Compilation Strategy

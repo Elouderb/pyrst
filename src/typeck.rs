@@ -793,6 +793,55 @@ fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
     }
 }
 
+// --- Builtin method tables (S4 soundness check) ---
+// Superset of every method codegen handles (special-cased or valid Rust
+// passthrough) and every method the example suite calls on a concrete receiver.
+const STR_METHODS: &[&str] = &[
+    "upper", "lower", "strip", "lstrip", "rstrip", "split", "rsplit",
+    "splitlines", "join", "startswith", "endswith", "replace", "removeprefix",
+    "removesuffix", "expandtabs", "partition", "rpartition", "find", "rfind",
+    "index", "rindex", "count", "contains", "isdigit", "isalpha", "isupper",
+    "islower", "isspace", "isalnum", "isidentifier", "isnumeric", "isprintable",
+    "istitle", "isdecimal", "capitalize", "title", "zfill", "ljust", "rjust",
+    "center", "swapcase", "format", "encode", "casefold", "len",
+];
+const LIST_METHODS: &[&str] = &[
+    "append", "extend", "insert", "remove", "pop", "index", "count",
+    "reverse", "sort", "clear", "copy", "len", "contains",
+];
+const SET_METHODS: &[&str] = &[
+    "add", "discard", "remove", "clear", "copy", "pop", "len", "union",
+    "intersection", "difference", "symmetric_difference", "issubset",
+    "issuperset", "isdisjoint", "update", "contains",
+];
+const DICT_METHODS: &[&str] = &[
+    "get", "keys", "values", "items", "pop", "clear", "copy", "update",
+    "setdefault", "len", "contains", "popitem",
+];
+
+/// Returns (type-name, method-table) for a concrete builtin receiver, or None
+/// for Unknown/Class/numeric receivers (the check must not run on those).
+fn builtin_method_table(ty: &Ty) -> Option<(&'static str, &'static [&'static str])> {
+    match ty {
+        Ty::Str => Some(("str", STR_METHODS)),
+        Ty::List(_) => Some(("list", LIST_METHODS)),
+        Ty::Set(_) => Some(("set", SET_METHODS)),
+        Ty::Dict(_, _) => Some(("dict", DICT_METHODS)),
+        _ => None,
+    }
+}
+
+/// Mutators whose single argument must be assignable to the receiver's element
+/// type. Restricted to set mutators (list `.append` excluded: empty-list field
+/// inference defaults to list[int] and would risk false rejections). Returns the
+/// element type to check the argument against.
+fn elem_arg_check_ty(recv: &Ty, method: &str) -> Option<Ty> {
+    match recv {
+        Ty::Set(elem) if matches!(method, "add" | "discard" | "remove") => Some((**elem).clone()),
+        _ => None,
+    }
+}
+
 fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
     Ok(match e {
         Expr::Int(_, _) => Ty::Int,
@@ -1000,6 +1049,39 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                                 for a in args { check_expr(a, env)?; }
                                 return Ok(sig.ret.clone());
                             }
+                        }
+                        // (a) Builtin method existence — only on concrete Str/List/Set/Dict.
+                        // Skipped for Unknown (unprovable) and Class (handled above).
+                        if let Some((type_name, table)) = builtin_method_table(&obj_ty) {
+                            if !table.contains(&name.as_str()) {
+                                return Err(Error::Type {
+                                    span: *span,
+                                    msg: format!("type `{}` has no method `{}`", type_name, name),
+                                });
+                            }
+                            // (b) Element-type argument check for set mutators only.
+                            if let Some(elem_ty) = elem_arg_check_ty(&obj_ty, name) {
+                                if let Some(arg0) = args.first() {
+                                    let arg_ty = check_expr(arg0, env)?;
+                                    let int_to_float =
+                                        matches!(arg_ty, Ty::Int) && matches!(elem_ty, Ty::Float);
+                                    if !int_to_float
+                                        && !matches!(arg_ty, Ty::Unknown)
+                                        && !matches!(elem_ty, Ty::Unknown)
+                                        && !types_compatible(&arg_ty, &elem_ty)
+                                    {
+                                        return Err(Error::Type {
+                                            span: *span,
+                                            msg: format!(
+                                                "argument to `{}.{}`: expected element type {:?}, found {:?}",
+                                                type_name, name, elem_ty, arg_ty
+                                            ),
+                                        });
+                                    }
+                                }
+                            }
+                            for a in args { check_expr(a, env)?; }
+                            return Ok(Ty::Unknown);
                         }
                     }
                     check_expr(callee, env)?;

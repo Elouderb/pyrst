@@ -746,7 +746,8 @@ fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             check_body(body, env)?;
             for h in handlers {
                 if let Some(name) = &h.exc_name {
-                    env.locals.insert(name.clone(), Ty::Unknown);
+                    // The bound exception value is the panic message string.
+                    env.locals.insert(name.clone(), Ty::Str);
                 }
                 check_body(&h.body, env)?;
             }

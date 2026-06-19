@@ -1099,7 +1099,9 @@ impl<'a> Codegen<'a> {
                             let msg = self.emit_expr(first_arg)?;
                             self.line(&format!("panic!(\"{{}} panic: {{}}\", \"{}\", {});", exc_type, msg));
                         } else {
-                            self.line(&format!("panic!(\"raised {}\");", exc_type));
+                            // No message: still use the "<Type> panic: <msg>" payload
+                            // format so `except <Type>:` type-matching can parse it.
+                            self.line(&format!("panic!(\"{{}} panic: \", \"{}\");", exc_type));
                         }
                     }
                     Some(other) => {
@@ -1316,7 +1318,7 @@ impl<'a> Codegen<'a> {
                 // Run the try body inside catch_unwind. pyrst's `raise` compiles
                 // to a panic whose payload is a formatted string (see Stmt::Raise):
                 //   raise Foo("m")  -> "Foo panic: m"
-                //   raise Foo       -> "raised Foo"
+                //   raise Foo       -> "Foo panic: "   (empty message)
                 //   raise           -> "explicit raise"
                 self.line("let __try_result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {");
                 self.indent += 1;

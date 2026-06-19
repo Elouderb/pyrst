@@ -49,7 +49,7 @@ assert_output() {
   fi
   rm -f "$base" "$base.rs"
 }
-assert_output unicode_strings "$(printf 'café déjà vu\n日本語 世界\nrocket 🚀 star ✨\nf-string with naïve and 日本語\ncafé déjà vu — 日本語 世界\n20')"
+assert_output unicode_strings "$(printf 'café déjà vu\n日本語 世界\nrocket 🚀 star ✨\nf-string with naïve and 日本語\ncafé déjà vu — 日本語 世界\n15')"
 assert_output except_type_match "$(printf 'caught ValueError: bad value\ncaught KeyError: missing key\ndone')"
 assert_output except_as_binding "$(printf 'caught: something broke\nlength: 15\nrecovered')"
 echo "OUTPUT ASSERTIONS: $out_ok / $out_count"

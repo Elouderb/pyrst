@@ -1720,6 +1720,11 @@ impl<'a> Codegen<'a> {
                     match n.as_str() {
                         "len" => {
                             let a = self.emit_expr(&args[0])?;
+                            // Python len() of a str is the CHARACTER count, not the
+                            // UTF-8 byte count. Collections keep .len().
+                            if matches!(self.type_of_expr(&args[0]), Ty::Str) {
+                                return Ok(format!("{}.chars().count() as i64", a));
+                            }
                             return Ok(format!("{}.len() as i64", a));
                         }
                         "str" => {
@@ -2391,6 +2396,10 @@ impl<'a> Codegen<'a> {
 
                     // Special case: len() as method
                     if name == "len" {
+                        // str length is character count, not UTF-8 byte count.
+                        if matches!(self.type_of_expr(obj.as_ref()), Ty::Str) {
+                            return Ok(format!("{}.chars().count() as i64", obj_s));
+                        }
                         return Ok(format!("{}.len() as i64", obj_s));
                     }
 

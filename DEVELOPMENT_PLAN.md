@@ -406,8 +406,6 @@ These features are explicitly out of scope or deferred indefinitely:
 - `ERRORS.md` — Error diagnostics philosophy
 - `GRAMMAR.md` — Language grammar
 - `TYPE_SYSTEM.md` — Type system specification
-- `IR_INVARIANTS.md` — Compiler IR constraints
-- `RUNTIME_ABI.md` — Runtime ABI specification
 
 ---
 

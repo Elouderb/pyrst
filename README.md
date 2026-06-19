@@ -24,21 +24,19 @@ The core pipeline is working end-to-end, including multi-file imports, classes w
 
 ## Documentation Structure
 
-**Start here:**
-
-1. **[PHASES_7_8_COMPLETION.md](PHASES_7_8_COMPLETION.md)** — What was completed in Phases 7 & 8 (specifications, module system, diagnostics)
-2. **[DEVELOPMENT_PLAN.md](DEVELOPMENT_PLAN.md)** — Strategic vision and complete roadmap (Phases 9-15+)
-
 **Understand the language:**
 
-3. **[SPEC.md](SPEC.md)** — Formal language specification (what's supported, what's not)
+1. **[SPEC.md](SPEC.md)** — Formal language specification (what's supported, what's not)
+2. **[GRAMMAR.md](GRAMMAR.md)** — Formal grammar for the parser
+3. **[TYPE_SYSTEM.md](TYPE_SYSTEM.md)** — Type system and inference
 4. **[PYTHON_COMPATIBILITY.md](PYTHON_COMPATIBILITY.md)** — Compatibility matrix (honest comparison)
+
+**Design & implementation:**
+
 5. **[DESIGN_DECISIONS.md](DESIGN_DECISIONS.md)** — Key design choices and tradeoffs
-
-**Implement features:**
-
 6. **[RUST_BACKEND.md](RUST_BACKEND.md)** — How pyrst constructs map to Rust
-7. **[DEVELOPMENT_PLAN.md](DEVELOPMENT_PLAN.md#strategic-design-decisions)** — Design principles for new features
+7. **[ERRORS.md](ERRORS.md)** — Diagnostics and error-message philosophy
+8. **[DEVELOPMENT_PLAN.md](DEVELOPMENT_PLAN.md)** — Roadmap and design principles
 
 ## Quick Example
 
@@ -140,9 +138,6 @@ See [DESIGN_DECISIONS.md](DESIGN_DECISIONS.md) for key tradeoffs.
 Phase 38, in active development. The pipeline is functional; the type checker's
 soundness and several codegen corner cases (f-strings, `try`/`except`,
 int/float promotion, collection mutation) are the main areas of ongoing work.
-Some documentation files (per-phase completion notes, `IR_INVARIANTS.md`,
-`RUNTIME_ABI.md`) describe earlier plans or an aspirational architecture and
-are stale relative to the current implementation.
 
 ## Contributing
 

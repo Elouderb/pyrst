@@ -1,5 +1,13 @@
 use crate::diag::Span;
-pub use crate::lexer::FStrPart;
+
+/// A parsed f-string part. Interpolations carry a fully-parsed [`Expr`]
+/// (so every pyrst construct works inside f-strings) plus an optional
+/// Python format spec (e.g. ".2f", "08d", ">8").
+#[derive(Debug, Clone)]
+pub enum FStrPart {
+    Lit(String),
+    Interp(Expr, Option<String>),
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypeExpr {

@@ -1144,7 +1144,41 @@ impl Parser {
             Tok::Int(n) => Ok(Expr::Int(n, span)),
             Tok::Float(f) => Ok(Expr::Float(f, span)),
             Tok::Str(s) => Ok(Expr::Str(s, span)),
-            Tok::FStr(parts) => Ok(Expr::FStr(parts, span)),
+            Tok::FStr(raw_parts) => {
+                let mut parts = Vec::with_capacity(raw_parts.len());
+                for rp in raw_parts {
+                    match rp {
+                        crate::lexer::RawFStrPart::Lit(s) => {
+                            parts.push(FStrPart::Lit(s));
+                        }
+                        crate::lexer::RawFStrPart::Interp(src, spec) => {
+                            // Sub-parse the interpolation body so every pyrst
+                            // expression construct works inside f-strings.
+                            let sub_toks = crate::lexer::lex(&src)?;
+                            let mut sub = Parser::new(sub_toks);
+                            let inner = sub.parse_expr().map_err(|e| match e {
+                                Error::Parse { msg, .. } => Error::Parse {
+                                    span,
+                                    msg: format!("in f-string interpolation `{}`: {}", src, msg),
+                                },
+                                other => other,
+                            })?;
+                            // Ensure the whole interpolation was consumed.
+                            if !matches!(sub.peek(), Tok::Newline | Tok::Eof) {
+                                return Err(Error::Parse {
+                                    span,
+                                    msg: format!(
+                                        "unexpected trailing tokens in f-string interpolation `{}`",
+                                        src
+                                    ),
+                                });
+                            }
+                            parts.push(FStrPart::Interp(inner, spec));
+                        }
+                    }
+                }
+                Ok(Expr::FStr(parts, span))
+            }
             Tok::True => Ok(Expr::Bool(true, span)),
             Tok::False => Ok(Expr::Bool(false, span)),
             Tok::None_ => Ok(Expr::None_(span)),

@@ -3,7 +3,7 @@
 //! Provides AST-based formatting with consistent indentation, spacing, and line wrapping.
 
 use crate::ast::*;
-use crate::lexer::FStrPart;
+use crate::ast::FStrPart;
 use std::fmt::Write;
 
 pub struct Formatter {
@@ -313,9 +313,9 @@ impl Formatter {
                 for part in parts {
                     match part {
                         FStrPart::Lit(s) => result.push_str(&s.replace('\"', "\\\"")),
-                        FStrPart::Interp(expr, spec) => {
+                        FStrPart::Interp(inner, spec) => {
                             result.push('{');
-                            result.push_str(expr);
+                            result.push_str(&self.format_expr(inner));
                             if let Some(s) = spec {
                                 result.push(':');
                                 result.push_str(s);

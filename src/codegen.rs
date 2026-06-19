@@ -1312,33 +1312,107 @@ impl<'a> Codegen<'a> {
             Stmt::Try { body, handlers, else_, finally_, .. } => {
                 self.line("{");
                 self.indent += 1;
+
+                // Run the try body inside catch_unwind. pyrst's `raise` compiles
+                // to a panic whose payload is a formatted string (see Stmt::Raise):
+                //   raise Foo("m")  -> "Foo panic: m"
+                //   raise Foo       -> "raised Foo"
+                //   raise           -> "explicit raise"
                 self.line("let __try_result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {");
                 self.indent += 1;
                 for s in body { self.emit_stmt(s)?; }
                 self.indent -= 1;
                 self.line("}));");
 
-                if !handlers.is_empty() || else_.is_some() {
-                    self.line("if let Err(_) = __try_result {");
-                    self.indent += 1;
-                    for h in handlers {
-                        for s in &h.body { self.emit_stmt(s)?; }
-                    }
-                    self.indent -= 1;
-                    self.line("}");
+                // Whether any handler can catch every exception type.
+                let has_catch_all = handlers.iter().any(|h| {
+                    h.exc_type.is_none() || h.exc_type.as_deref() == Some("Exception")
+                });
 
-                    if let Some(else_body) = else_ {
-                        self.line("if let Ok(_) = __try_result {");
+                // __reraise holds the original panic payload when no handler
+                // matched, so it can be re-raised after the finally block.
+                self.line("let __reraise: ::std::option::Option<::std::boxed::Box<dyn ::std::any::Any + ::std::marker::Send>> = match __try_result {");
+                self.indent += 1;
+
+                // Success path: run the `else` body (if any), then no re-raise.
+                self.line("::std::result::Result::Ok(__ok) => {");
+                self.indent += 1;
+                self.line("let _ = __ok;");
+                if let Some(else_body) = else_ {
+                    for s in else_body { self.emit_stmt(s)?; }
+                }
+                self.line("::std::option::Option::None");
+                self.indent -= 1;
+                self.line("}");
+
+                // Error path: recover the payload string, parse out the type, and
+                // dispatch to the matching handler.
+                self.line("::std::result::Result::Err(__payload) => {");
+                self.indent += 1;
+                self.line("let __exc_str: String = if let Some(s) = __payload.downcast_ref::<&str>() {");
+                self.line("    (*s).to_string()");
+                self.line("} else if let Some(s) = __payload.downcast_ref::<String>() {");
+                self.line("    s.clone()");
+                self.line("} else {");
+                self.line("    String::from(\"unknown panic\")");
+                self.line("};");
+                // Split "<Type> panic: <msg>"; otherwise type == msg == whole string.
+                self.line("let (__exc_type, __exc_msg): (String, String) = match __exc_str.split_once(\" panic: \") {");
+                self.line("    Some((t, m)) => (t.to_string(), m.to_string()),");
+                self.line("    None => (__exc_str.clone(), __exc_str.clone()),");
+                self.line("};");
+                self.line("let _ = &__exc_type; let _ = &__exc_msg;");
+
+                if handlers.is_empty() {
+                    // No handlers at all: always re-raise.
+                    self.line("::std::option::Option::Some(__payload)");
+                } else {
+                    let mut first = true;
+                    for h in handlers {
+                        let is_catch_all =
+                            h.exc_type.is_none() || h.exc_type.as_deref() == Some("Exception");
+                        let cond = if is_catch_all {
+                            "true".to_string()
+                        } else {
+                            // Safe: exc_type came from an identifier token.
+                            format!("__exc_type == {:?}", h.exc_type.as_deref().unwrap())
+                        };
+                        if first {
+                            self.line(&format!("if {} {{", cond));
+                            first = false;
+                        } else {
+                            self.line(&format!("}} else if {} {{", cond));
+                        }
                         self.indent += 1;
-                        for s in else_body { self.emit_stmt(s)?; }
+                        if let Some(name) = &h.exc_name {
+                            self.line(&format!("let {} = __exc_msg.clone();", name));
+                            self.line(&format!("let _ = &{};", name));
+                        }
+                        for s in &h.body { self.emit_stmt(s)?; }
+                        self.line("::std::option::Option::None");
                         self.indent -= 1;
-                        self.line("}");
+                    }
+                    // Trailing else: if no catch-all handler exists, propagate.
+                    if has_catch_all {
+                        self.line("} else { ::std::option::Option::None }");
+                    } else {
+                        self.line("} else { ::std::option::Option::Some(__payload) }");
                     }
                 }
+                self.indent -= 1;
+                self.line("}");
 
+                self.indent -= 1;
+                self.line("};");
+
+                // finally: runs on every path, before any re-raise.
                 if let Some(fin) = finally_ {
                     for s in fin { self.emit_stmt(s)?; }
                 }
+
+                // Re-raise an unmatched exception (after finally).
+                self.line("if let ::std::option::Option::Some(__p) = __reraise { ::std::panic::resume_unwind(__p); }");
+
                 self.indent -= 1;
                 self.line("}");
             }
@@ -1439,17 +1513,28 @@ impl<'a> Codegen<'a> {
                             // Escape { and } in the format string
                             fmt_str.push_str(&s.replace('{', "{{").replace('}', "}}"));
                         }
-                        crate::ast::FStrPart::Interp(src, spec) => {
-                            let fmt_placeholder = match spec {
-                                None => "{}".to_string(),
-                                Some(s) => {
-                                    // Strip Python type suffix (f, d, s, g, e, %) from spec
-                                    let clean = s.trim_end_matches(|c: char| "fdsge%".contains(c));
-                                    format!("{{:{}}}", clean)
+                        crate::ast::FStrPart::Interp(expr, spec) => {
+                            match spec {
+                                None => {
+                                    // No spec: match print()'s Python-style Display
+                                    // so bare floats/bools render as `1.0` / `True`.
+                                    fmt_str.push_str("{}");
+                                    let raw = self.emit_expr(expr)?;
+                                    let arg = match self.type_of_expr(expr) {
+                                        Ty::Float => format!("__py_fmt_float({})", raw),
+                                        Ty::Bool => format!("__py_fmt_bool({})", raw),
+                                        _ => raw,
+                                    };
+                                    args.push(arg);
                                 }
-                            };
-                            fmt_str.push_str(&fmt_placeholder);
-                            args.push(src.clone());
+                                Some(s) => {
+                                    // Explicit spec: emit a Rust format spec and pass the
+                                    // raw value (the spec drives formatting, e.g. {:.2}).
+                                    let clean = s.trim_end_matches(|c: char| "fdsge%".contains(c));
+                                    fmt_str.push_str(&format!("{{:{}}}", clean));
+                                    args.push(self.emit_expr(expr)?);
+                                }
+                            }
                         }
                     }
                 }

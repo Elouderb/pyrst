@@ -650,9 +650,8 @@ fn collect_calls_from_expr(expr: &Expr, called: &mut std::collections::HashSet<S
         }
         Expr::FStr(parts, _) => {
             for part in parts {
-                if let crate::ast::FStrPart::Interp(src, _) = part {
-                    // FStr interpolations are stored as strings, not expressions
-                    // Would need to parse them again to analyze - skip for now
+                if let crate::ast::FStrPart::Interp(inner, _) = part {
+                    collect_calls_from_expr(inner, called);
                 }
             }
         }
@@ -701,8 +700,19 @@ fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             Ok(())
         }
         Stmt::Raise { exc, .. } => {
-            if let Some(e) = exc { check_expr(e, env)?; }
-            Ok(())
+            // The raised value names an exception type (e.g. `ValueError("msg")`
+            // or bare `ValueError`). Exception types are not user-defined
+            // functions/classes, so don't validate the type name as a callee —
+            // only type-check the message arguments.
+            match exc {
+                Some(Expr::Call { callee, args, .. }) if matches!(callee.as_ref(), Expr::Ident(..)) => {
+                    for a in args { check_expr(a, env)?; }
+                    Ok(())
+                }
+                Some(Expr::Ident(..)) => Ok(()),
+                Some(e) => { check_expr(e, env)?; Ok(()) }
+                None => Ok(()),
+            }
         }
         Stmt::Return(None, span) => {
             if env.ret_ty != Ty::Unit {

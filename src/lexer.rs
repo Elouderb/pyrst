@@ -18,7 +18,7 @@ fn split_fstr_spec(s: &str) -> (String, Option<String>) {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum FStrPart {
+pub enum RawFStrPart {
     Lit(String),
     Interp(String, Option<String>),  // (expr_source, format_spec)
 }
@@ -29,7 +29,7 @@ pub enum Tok {
     Int(i64),
     Float(f64),
     Str(String),
-    FStr(Vec<FStrPart>),
+    FStr(Vec<RawFStrPart>),
     True,
     False,
     None_,
@@ -234,7 +234,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
                     } else {
                         // Start of interpolation
                         if !current_lit.is_empty() {
-                            parts.push(FStrPart::Lit(current_lit.clone()));
+                            parts.push(RawFStrPart::Lit(current_lit.clone()));
                             current_lit.clear();
                         }
                         i += 1; // consume {
@@ -257,7 +257,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
                             });
                         }
                         let (expr_part, spec_part) = split_fstr_spec(&expr);
-                        parts.push(FStrPart::Interp(expr_part, spec_part));
+                        parts.push(RawFStrPart::Interp(expr_part, spec_part));
                         i += 1; // consume closing }
                     }
                 } else if bytes[i] == b'}' {
@@ -307,7 +307,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
                 });
             }
             if !current_lit.is_empty() {
-                parts.push(FStrPart::Lit(current_lit));
+                parts.push(RawFStrPart::Lit(current_lit));
             }
             i += 1; // consume closing quote
             tokens.push(Token {

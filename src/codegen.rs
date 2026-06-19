@@ -1376,8 +1376,24 @@ impl<'a> Codegen<'a> {
                         let cond = if is_catch_all {
                             "true".to_string()
                         } else {
-                            // Safe: exc_type came from an identifier token.
-                            format!("__exc_type == {:?}", h.exc_type.as_deref().unwrap())
+                            // Build an OR-expansion over the transitive descendant set of
+                            // the handler's exception type so that, e.g., `except LookupError`
+                            // matches both KeyError and IndexError.  For unknown/user-defined
+                            // types exc_descendants returns an empty vec and we fall through to
+                            // the plain exact-match path.
+                            let exc_name = h.exc_type.as_deref().unwrap();
+                            let descendants = exc_descendants(exc_name);
+                            if descendants.is_empty() {
+                                // Unknown / user-defined type: exact match only (original behaviour).
+                                format!("__exc_type == {:?}", exc_name)
+                            } else {
+                                // OR-expand over base + all transitive subclasses.
+                                let clauses: Vec<String> = descendants
+                                    .iter()
+                                    .map(|d| format!("__exc_type == {:?}", d))
+                                    .collect();
+                                format!("({})", clauses.join(" || "))
+                            }
                         };
                         if first {
                             self.line(&format!("if {} {{", cond));
@@ -3046,6 +3062,32 @@ impl<'a> Codegen<'a> {
         for _ in 0..self.indent { self.out.push_str("    "); }
         self.out.push_str(s);
         self.out.push('\n');
+    }
+}
+
+/// Return the set of builtin exception type names that `base` covers (i.e.
+/// `base` itself plus all transitive subclasses in the builtin hierarchy).
+/// The caller OR-expands this set into the handler match condition, so
+/// `except LookupError` matches a raised `KeyError`/`IndexError`.
+///
+/// Returns an empty vec for leaves, unknown/user-defined types, and
+/// `Exception` — in every one of those cases the caller falls back to an
+/// exact-match condition (`Exception` never reaches here: it is handled
+/// upstream as the catch-all `true` arm). The builtin hierarchy is only two
+/// levels deep, so each base's transitive closure is written out directly.
+fn exc_descendants(base: &str) -> Vec<&'static str> {
+    match base {
+        "ArithmeticError" => vec![
+            "ArithmeticError", "ZeroDivisionError", "OverflowError", "FloatingPointError",
+        ],
+        "LookupError" => vec!["LookupError", "IndexError", "KeyError"],
+        "RuntimeError" => vec!["RuntimeError", "RecursionError", "NotImplementedError"],
+        "NameError" => vec!["NameError", "UnboundLocalError"],
+        "OSError" => vec![
+            "OSError", "FileNotFoundError", "PermissionError", "IsADirectoryError",
+        ],
+        // Leaves and unknown/custom types: caller uses an exact-match condition.
+        _ => vec![],
     }
 }
 

@@ -148,6 +148,18 @@ impl<'a> Codegen<'a> {
                         "int" | "len" | "ord" | "round" | "pow" => Ty::Int,
                         "bool" | "any" | "all" => Ty::Bool,
                         "str" | "chr" | "input" => Ty::Str,
+                        "sorted" | "list" | "reversed" => {
+                            // These return a list; preserve the element type.
+                            if let Some(arg) = args.first() {
+                                match self.type_of_expr(arg) {
+                                    Ty::List(e) | Ty::Set(e) => Ty::List(e),
+                                    Ty::Str => Ty::List(Box::new(Ty::Str)),
+                                    _ => Ty::List(Box::new(Ty::Unknown)),
+                                }
+                            } else {
+                                Ty::List(Box::new(Ty::Unknown))
+                            }
+                        }
                         n => {
                             // Check if it's a class constructor
                             if self.ctx.classes.contains_key(n) {
@@ -589,14 +601,11 @@ impl<'a> Codegen<'a> {
             }
         }
 
-        // First pass: collect assignments to populate locals
-        for s in &f.body {
-            if let Stmt::Assign { target, ty: Some(type_expr), .. } = s {
-                if let Ok(ty) = Ty::from_type_expr(type_expr) {
-                    self.locals.insert(target.clone(), ty);
-                }
-            }
-        }
+        // First pass: forward type inference over the whole body (including
+        // nested blocks) so un-annotated locals are typed from their value and
+        // refined by later uses (e.g. `d = {}` then `d[k] = some_str`, or an
+        // `acc = 0` accumulator later assigned a float).
+        self.prescan_types(&f.body);
 
         for s in &f.body {
             self.emit_stmt(s)?;
@@ -955,6 +964,111 @@ impl<'a> Codegen<'a> {
         Ok(s)
     }
 
+    /// Combine two inferred types into the more specific / wider one.
+    /// `Unknown` yields to anything concrete; `Int` widens to `Float`;
+    /// matching collections unify element-wise. Otherwise the first wins.
+    fn unify_ty(a: Ty, b: Ty) -> Ty {
+        match (a, b) {
+            (Ty::Unknown, x) | (x, Ty::Unknown) => x,
+            (Ty::Int, Ty::Float) | (Ty::Float, Ty::Int) => Ty::Float,
+            (Ty::Dict(k1, v1), Ty::Dict(k2, v2)) => Ty::Dict(
+                Box::new(Self::unify_ty(*k1, *k2)),
+                Box::new(Self::unify_ty(*v1, *v2)),
+            ),
+            (Ty::List(e1), Ty::List(e2)) => Ty::List(Box::new(Self::unify_ty(*e1, *e2))),
+            (Ty::Set(e1), Ty::Set(e2)) => Ty::Set(Box::new(Self::unify_ty(*e1, *e2))),
+            (a, _) => a,
+        }
+    }
+
+    /// Whether reassigning a `b`-typed value to an `a`-typed binding is a
+    /// genuine type change (Python allows it; single-`let` Rust does not).
+    /// `Unknown` and numeric int/float mixes are not conflicts.
+    fn types_conflict(a: &Ty, b: &Ty) -> bool {
+        use Ty::*;
+        if matches!(a, Unknown) || matches!(b, Unknown) {
+            return false;
+        }
+        if matches!((a, b), (Int, Float) | (Float, Int)) {
+            return false;
+        }
+        std::mem::discriminant(a) != std::mem::discriminant(b)
+    }
+
+    /// Forward type-inference pre-pass over a statement list (recursing into
+    /// nested blocks). Records inferred types for un-annotated locals in
+    /// `self.locals` and refines empty-collection element types from later
+    /// `obj[k] = v` stores and `obj.append(v)` calls. Runs in source order so
+    /// earlier inferences inform later `type_of_expr` lookups.
+    fn prescan_types(&mut self, stmts: &[Stmt]) {
+        for s in stmts {
+            match s {
+                Stmt::Assign { target, ty: Some(te), .. } => {
+                    if let Ok(t) = Ty::from_type_expr(te) {
+                        self.locals.insert(target.clone(), t);
+                    }
+                }
+                Stmt::Assign { target, ty: None, value, .. } => {
+                    let vt = self.type_of_expr(value);
+                    let merged = match self.locals.get(target) {
+                        Some(existing) => Self::unify_ty(existing.clone(), vt),
+                        None => vt,
+                    };
+                    self.locals.insert(target.clone(), merged);
+                }
+                Stmt::IndexAssign { obj, value, .. } => {
+                    let vt = self.type_of_expr(value);
+                    if !matches!(vt, Ty::Unknown) {
+                        if let Some(existing) = self.locals.get(obj).cloned() {
+                            let refined = match existing {
+                                Ty::Dict(k, v) if matches!(*v, Ty::Unknown) => {
+                                    Ty::Dict(k, Box::new(vt))
+                                }
+                                Ty::List(e) if matches!(*e, Ty::Unknown) => {
+                                    Ty::List(Box::new(vt))
+                                }
+                                other => other,
+                            };
+                            self.locals.insert(obj.clone(), refined);
+                        }
+                    }
+                }
+                Stmt::Expr(Expr::Call { callee, args, .. }) => {
+                    if let Expr::Attr { obj, name, .. } = callee.as_ref() {
+                        if name == "append" {
+                            if let Expr::Ident(objn, _) = obj.as_ref() {
+                                if let Some(arg) = args.first() {
+                                    let at = self.type_of_expr(arg);
+                                    if !matches!(at, Ty::Unknown) {
+                                        if let Some(Ty::List(e)) = self.locals.get(objn).cloned() {
+                                            if matches!(*e, Ty::Unknown) {
+                                                self.locals.insert(objn.clone(), Ty::List(Box::new(at)));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Stmt::If { then, elifs, else_, .. } => {
+                    self.prescan_types(then);
+                    for (_, body) in elifs { self.prescan_types(body); }
+                    if let Some(body) = else_ { self.prescan_types(body); }
+                }
+                Stmt::While { body, .. } | Stmt::For { body, .. } | Stmt::With { body, .. } => {
+                    self.prescan_types(body);
+                }
+                Stmt::Try { body, else_, finally_, .. } => {
+                    self.prescan_types(body);
+                    if let Some(b) = else_ { self.prescan_types(b); }
+                    if let Some(b) = finally_ { self.prescan_types(b); }
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn emit_stmt(&mut self, s: &Stmt) -> Result<()> {
         match s {
             Stmt::Pass(_) => self.line("// pass"),
@@ -1044,14 +1158,36 @@ impl<'a> Codegen<'a> {
                             self.line(&format!("let mut {}: {} = {};", target, rust_ty(&ty_obj), v));
                         }
                         None => {
-                            // Infer type from the value expression even without explicit annotation
-                            let inferred_ty = self.type_of_expr(value);
-                            self.locals.insert(target.clone(), inferred_ty);
-                            self.line(&format!("let mut {} = {};", target, v));
+                            // Infer type from the value expression, but prefer a
+                            // richer type discovered by the forward pre-pass
+                            // (e.g. an `acc = 0` later assigned floats).
+                            let value_ty = self.type_of_expr(value);
+                            let decl_ty = match self.locals.get(target) {
+                                Some(pre) => Self::unify_ty(pre.clone(), value_ty.clone()),
+                                None => value_ty.clone(),
+                            };
+                            self.locals.insert(target.clone(), decl_ty.clone());
+                            // If the variable is later widened from int to float,
+                            // declare it as f64 and cast the integer initializer.
+                            if matches!(decl_ty, Ty::Float) && matches!(value_ty, Ty::Int) {
+                                self.line(&format!("let mut {}: f64 = {} as f64;", target, v));
+                            } else {
+                                self.line(&format!("let mut {} = {};", target, v));
+                            }
                         }
                     }
                 } else {
-                    self.line(&format!("{} = {};", target, v));
+                    // Python permits rebinding a name to a value of a different
+                    // type. When that happens, emit a shadowing `let` (which
+                    // always type-checks) instead of a plain reassignment.
+                    let value_ty = self.type_of_expr(value);
+                    let cur = self.locals.get(target).cloned().unwrap_or(Ty::Unknown);
+                    if Self::types_conflict(&cur, &value_ty) {
+                        self.locals.insert(target.clone(), value_ty);
+                        self.line(&format!("let mut {} = {};", target, v));
+                    } else {
+                        self.line(&format!("{} = {};", target, v));
+                    }
                 }
             }
             Stmt::Unpack { targets, value, .. } => {
@@ -1325,11 +1461,11 @@ impl<'a> Codegen<'a> {
             }
             Expr::List(elems, _) => {
                 let mut parts = Vec::new();
-                for e in elems { parts.push(self.emit_expr(e)?); }
+                for e in elems { parts.push(self.emit_owned(e)?); }
                 format!("vec![{}]", parts.join(", "))
             }
             Expr::Tuple(elems, _) => {
-                let parts: Result<Vec<_>> = elems.iter().map(|e| self.emit_expr(e)).collect();
+                let parts: Result<Vec<_>> = elems.iter().map(|e| self.emit_owned(e)).collect();
                 let parts = parts?;
                 match parts.len() {
                     0 => "()".to_string(),
@@ -1402,7 +1538,7 @@ impl<'a> Codegen<'a> {
                 }
                 let mut items = Vec::new();
                 for e in elems {
-                    let es = self.emit_expr(e)?;
+                    let es = self.emit_owned(e)?;
                     items.push(es);
                 }
                 format!("vec![{}].into_iter().collect::<::std::collections::HashSet<_>>()",
@@ -1414,8 +1550,8 @@ impl<'a> Codegen<'a> {
                 }
                 let mut inserts = Vec::new();
                 for (k, v) in pairs {
-                    let ks = self.emit_expr(k)?;
-                    let vs = self.emit_expr(v)?;
+                    let ks = self.emit_owned(k)?;
+                    let vs = self.emit_owned(v)?;
                     inserts.push(format!("({}, {})", ks, vs));
                 }
                 format!("vec![{}].into_iter().collect::<::std::collections::HashMap<_,_>>()",

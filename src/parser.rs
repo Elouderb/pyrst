@@ -816,7 +816,7 @@ impl Parser {
         }
         let body = self.parse_or()?;
         if matches!(self.peek(), Tok::If) {
-            let span = self.peek_span();
+            let span = body.span(); // underline the whole expression, not just `if`
             self.bump(); // consume 'if'
             let test = self.parse_or()?;
             self.expect(&Tok::Else, "conditional expression")?;

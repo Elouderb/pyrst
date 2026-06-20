@@ -3,6 +3,9 @@ def classify(n: int) -> str:
     # Right-associative nesting: a if p else (b if q else c).
     return "negative" if n < 0 else "zero" if n == 0 else "positive"
 
+def greet() -> str:
+    return "hi"
+
 def main() -> None:
     x: int = 5
     print("big" if x > 3 else "small")
@@ -16,3 +19,8 @@ def main() -> None:
     print(parities[0])
     print(parities[1])
     print(parities[2])
+    # A function called ONLY inside a ternary must not be pruned as dead.
+    print(greet() if x > 0 else "skip")
+    # An empty-collection branch unifies with a concrete collection.
+    nums: list[int] = [] if x < 0 else [7, 8, 9]
+    print(len(nums))

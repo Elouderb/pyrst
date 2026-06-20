@@ -578,6 +578,11 @@ fn collect_calls_from_expr(expr: &Expr, called: &mut std::collections::HashSet<S
         Expr::Lambda { body, .. } => {
             collect_calls_from_expr(body, called);
         }
+        Expr::IfExp { test, body, orelse, .. } => {
+            collect_calls_from_expr(test, called);
+            collect_calls_from_expr(body, called);
+            collect_calls_from_expr(orelse, called);
+        }
         _ => {}
     }
 }
@@ -609,6 +614,24 @@ fn types_compatible(val_ty: &Ty, declared_ty: &Ty) -> bool {
         // Otherwise not compatible
         _ => false,
     }
+}
+
+/// Unify the two branch types of a conditional expression. Returns the more
+/// concrete type when the branches are compatible (an `Unknown`, or a
+/// collection with `Unknown` elements, absorbs the concrete side), or `None`
+/// when they are genuinely incompatible.
+fn unify_branch_types(a: Ty, b: Ty) -> Option<Ty> {
+    if !types_compatible(&a, &b) {
+        return None;
+    }
+    Some(match (&a, &b) {
+        (Ty::Unknown, _) => b,
+        (Ty::List(i), Ty::List(_)) if **i == Ty::Unknown => b,
+        (Ty::Set(i), Ty::Set(_)) if **i == Ty::Unknown => b,
+        (Ty::Dict(k, v), Ty::Dict(_, _)) if **k == Ty::Unknown && **v == Ty::Unknown => b,
+        // `a` is the concrete side (or both equal) -> keep it.
+        _ => a,
+    })
 }
 
 fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
@@ -923,19 +946,15 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
             check_expr(test, env)?;
             let bt = check_expr(body, env)?;
             let ot = check_expr(orelse, env)?;
-            // Both arms must agree (Unknown absorbs the concrete side).
-            match (&bt, &ot) {
-                (Ty::Unknown, _) => ot,
-                (_, Ty::Unknown) => bt,
-                _ if bt == ot => bt,
-                _ => return Err(Error::Type {
-                    span: *span,
-                    msg: format!(
-                        "conditional expression branches have incompatible types: `{:?}` vs `{:?}`",
-                        bt, ot
-                    ),
-                }),
-            }
+            // Both arms must agree; the more concrete side wins so a branch like
+            // `[]` (List(Unknown)) unifies with `[1, 2, 3]` (List(Int)).
+            unify_branch_types(bt.clone(), ot.clone()).ok_or_else(|| Error::Type {
+                span: *span,
+                msg: format!(
+                    "conditional expression branches have incompatible types: `{:?}` vs `{:?}`",
+                    bt, ot
+                ),
+            })?
         }
         Expr::ListComp { elt, target, iter, cond, .. } => {
             let iter_ty = check_expr(iter, env)?;

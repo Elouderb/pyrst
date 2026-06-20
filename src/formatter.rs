@@ -435,6 +435,9 @@ impl Formatter {
                     .join(", ");
                 format!("lambda {}: {}", param_strs, self.format_expr(body))
             }
+            Expr::IfExp { test, body, orelse, .. } => {
+                format!("{} if {} else {}", self.format_expr(body), self.format_expr(test), self.format_expr(orelse))
+            }
             _ => "/* complex expr */".to_string(),
         }
     }

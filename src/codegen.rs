@@ -459,6 +459,7 @@ impl<'a> Codegen<'a> {
         self.line("fn __py_fmt_bool(x: bool) -> String {");
         self.line("    if x { \"True\".to_string() } else { \"False\".to_string() }");
         self.line("}");
+        self.line(REPR_PRELUDE);
         self.line("");
         self.line("// ----- user code -----");
 
@@ -1603,6 +1604,8 @@ impl<'a> Codegen<'a> {
                                     let arg = match self.type_of_expr(expr) {
                                         Ty::Float => format!("__py_fmt_float({})", raw),
                                         Ty::Bool => format!("__py_fmt_bool({})", raw),
+                                        Ty::List(_) | Ty::Set(_) | Ty::Dict(_, _) | Ty::Tuple(_) =>
+                                            format!("({}).py_repr()", raw),
                                         _ => raw,
                                     };
                                     args.push(arg);
@@ -1736,6 +1739,8 @@ impl<'a> Codegen<'a> {
                             let formatted = match self.type_of_expr(arg) {
                                 Ty::Float => format!("__py_fmt_float({})", raw),
                                 Ty::Bool => format!("__py_fmt_bool({})", raw),
+                                Ty::List(_) | Ty::Set(_) | Ty::Dict(_, _) | Ty::Tuple(_) =>
+                                    format!("({}).py_repr()", raw),
                                 _ => raw,
                             };
                             parts.push(formatted);
@@ -1807,7 +1812,11 @@ impl<'a> Codegen<'a> {
                         }
                         "str" => {
                             let a = self.emit_expr(&args[0])?;
-                            return Ok(format!("format!(\"{{}}\" , {})", a));
+                            match self.type_of_expr(&args[0]) {
+                                Ty::List(_) | Ty::Set(_) | Ty::Dict(_, _) | Ty::Tuple(_) =>
+                                    return Ok(format!("({}).py_repr()", a)),
+                                _ => return Ok(format!("format!(\"{{}}\" , {})", a)),
+                            }
                         }
                         "int" => {
                             let a = self.emit_expr(&args[0])?;
@@ -3299,6 +3308,44 @@ fn rust_ty(t: &Ty) -> String {
     }
 }
 
+/// Prelude implementing CPython-style `repr` for collections, used by
+/// print()/str()/f-strings so `print([1, 2, 3])` yields `[1, 2, 3]` — str
+/// elements quoted, bools as True/False, floats via __py_fmt_float, nested
+/// collections recursing. Set/dict entries are emitted in a stable
+/// sorted-by-repr order (HashSet/HashMap have no insertion order), which may
+/// differ from Python's order. Depends on __py_fmt_float/__py_fmt_bool being
+/// declared earlier in the prelude.
+const REPR_PRELUDE: &str = r#"trait PyRepr { fn py_repr(&self) -> String; }
+impl PyRepr for i64 { fn py_repr(&self) -> String { format!("{}", self) } }
+impl PyRepr for f64 { fn py_repr(&self) -> String { __py_fmt_float(*self) } }
+impl PyRepr for bool { fn py_repr(&self) -> String { __py_fmt_bool(*self) } }
+impl PyRepr for String { fn py_repr(&self) -> String { format!("'{}'", self) } }
+impl<T: PyRepr> PyRepr for Vec<T> {
+    fn py_repr(&self) -> String {
+        let xs: Vec<String> = self.iter().map(|x| x.py_repr()).collect();
+        format!("[{}]", xs.join(", "))
+    }
+}
+impl<T: PyRepr> PyRepr for std::collections::HashSet<T> {
+    fn py_repr(&self) -> String {
+        let mut xs: Vec<String> = self.iter().map(|x| x.py_repr()).collect();
+        xs.sort();
+        format!("{{{}}}", xs.join(", "))
+    }
+}
+impl<K: PyRepr, V: PyRepr> PyRepr for std::collections::HashMap<K, V> {
+    fn py_repr(&self) -> String {
+        let mut xs: Vec<String> = self.iter().map(|(k, v)| format!("{}: {}", k.py_repr(), v.py_repr())).collect();
+        xs.sort();
+        format!("{{{}}}", xs.join(", "))
+    }
+}
+impl<A: PyRepr> PyRepr for (A,) { fn py_repr(&self) -> String { format!("({},)", self.0.py_repr()) } }
+impl<A: PyRepr, B: PyRepr> PyRepr for (A, B) { fn py_repr(&self) -> String { format!("({}, {})", self.0.py_repr(), self.1.py_repr()) } }
+impl<A: PyRepr, B: PyRepr, C: PyRepr> PyRepr for (A, B, C) { fn py_repr(&self) -> String { format!("({}, {}, {})", self.0.py_repr(), self.1.py_repr(), self.2.py_repr()) } }
+impl<A: PyRepr, B: PyRepr, C: PyRepr, D: PyRepr> PyRepr for (A, B, C, D) { fn py_repr(&self) -> String { format!("({}, {}, {}, {})", self.0.py_repr(), self.1.py_repr(), self.2.py_repr(), self.3.py_repr()) } }
+"#;
+
 pub fn emit(m: &Module, ctx: &TyCtx) -> Result<String> {
     Codegen::new(ctx).emit_module(m)
 }
@@ -3333,6 +3380,7 @@ pub fn emit_program(modules: &[(Module, String)], ctx: &TyCtx) -> Result<String>
     cg.line("fn __py_fmt_bool(x: bool) -> String {");
     cg.line("    if x { \"True\".to_string() } else { \"False\".to_string() }");
     cg.line("}");
+    cg.line(REPR_PRELUDE);
     cg.line("");
     cg.line("// ----- user code -----");
 

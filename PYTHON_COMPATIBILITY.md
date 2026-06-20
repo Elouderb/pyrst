@@ -128,12 +128,12 @@ This document clarifies which Python features are supported, partially supported
 
 | Function | Status | Notes |
 |----------|--------|-------|
-| `print()` | ✅ Supported | Scalars and strings; **not** raw collections (see limitations) |
+| `print()` | ✅ Supported | Scalars, strings, and collections (CPython-style repr) |
 | `len()` | ✅ Supported | Sequences/mappings; char count for `str` |
 | `range()` | ✅ Supported | `range(n)`, `range(a, b)`, `range(a, b, step)` |
 | `enumerate()` | ✅ Supported | Yields `(index, value)` tuples |
 | `zip()` | ✅ Supported | Zips two iterables |
-| `int()`, `float()`, `str()`, `bool()` | ✅ Supported | Type conversions (`str()` on collections unsupported) |
+| `int()`, `float()`, `str()`, `bool()` | ✅ Supported | Type conversions; `str()` of a collection yields its repr |
 | `list()`, `dict()`, `set()`, `tuple()` | ✅ Supported | Constructors |
 | `sorted()` | ✅ Supported | Returns a new list |
 | `min()`, `max()`, `sum()`, `abs()` | ✅ Supported | Numeric builtins |
@@ -275,7 +275,7 @@ See `DESIGN_DECISIONS.md` §11 and `RUST_BACKEND.md` for the `catch_unwind` lowe
 
 ## Notable Limitations
 
-- **Printing collections:** `print([...])`, `print({...})`, and `str([...])` are unsupported — the backing `Vec`/`HashMap`/`HashSet` is not `Display`. Print elements individually, or build a string with `", ".join(...)`.
+- **Printing collections:** `print([...])`, `print({...})`, `str([...])`, and f-string interpolation render lists/tuples/sets/dicts in CPython `repr` form (str elements quoted, bools as `True`/`False`, nested collections recursing). Because the backing `HashSet`/`HashMap` have no insertion order, **set and dict entries are emitted in a stable sorted-by-`repr` order**, which may differ from Python's insertion order.
 - **No first-class function values to builtins:** e.g. `map(str, xs)` does not work; use a comprehension.
 - **`@classmethod`:** the `cls` parameter cannot be cleanly annotated, so classmethods are effectively unsupported (use `@staticmethod` or a module function).
 - **Caught exceptions** print no stderr noise; uncaught ones still surface a message and a non-zero exit code.

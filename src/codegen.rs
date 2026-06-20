@@ -1486,16 +1486,26 @@ impl<'a> Codegen<'a> {
                 let ctx_s = self.emit_expr(ctx_expr)?;
                 self.line("{");
                 self.indent += 1;
-                if let Some(name) = as_name {
+                // The bound name is block-scoped in the generated Rust, so save and
+                // restore the outer locals entry around the body (mirrors for-loop).
+                let saved = if let Some(name) = as_name {
                     // Register the bound type (e.g. open() -> File) so method calls
                     // on it (f.write/read) resolve to the right emission.
-                    let bound_ty = self.type_of_expr(ctx_expr);
-                    self.locals.insert(name.clone(), bound_ty);
+                    let prev = self.locals.get(name).cloned();
+                    self.locals.insert(name.clone(), self.type_of_expr(ctx_expr));
                     self.line(&format!("let mut {} = {};", name, ctx_s));
+                    Some((name.clone(), prev))
                 } else {
                     self.line(&format!("let _ = {};", ctx_s));
-                }
+                    None
+                };
                 for s in body { self.emit_stmt(s)?; }
+                if let Some((name, prev)) = saved {
+                    match prev {
+                        Some(ty) => { self.locals.insert(name, ty); }
+                        None => { self.locals.remove(name.as_str()); }
+                    }
+                }
                 self.indent -= 1;
                 self.line("}");
             }
@@ -2684,7 +2694,8 @@ impl<'a> Codegen<'a> {
                     // &str, so borrow the argument.
                     if let Ty::File = self.type_of_expr(obj) {
                         match name.as_str() {
-                            "write" => return Ok(format!("{}.write(&{})", obj_s, parts.first().cloned().unwrap_or_default())),
+                            "write" if !parts.is_empty() => return Ok(format!("{}.write(&{})", obj_s, parts[0])),
+                            "write" => return Err(crate::diag::Error::Codegen("file write() requires one argument".into())),
                             "read" | "readlines" | "close" =>
                                 return Ok(format!("{}.{}()", obj_s, name)),
                             _ => {}

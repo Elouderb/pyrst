@@ -784,10 +784,19 @@ fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
         }
         Stmt::With { ctx_expr, as_name, body, .. } => {
             let ctx_ty = check_expr(ctx_expr, env)?;
+            // Bound name is block-scoped in codegen; save/restore so a stale type
+            // does not leak past the block (mirrors the for-loop handling).
+            let saved = as_name.as_ref().map(|n| (n.clone(), env.locals.get(n).cloned()));
             if let Some(name) = as_name {
                 env.locals.insert(name.clone(), ctx_ty);
             }
             check_body(body, env)?;
+            if let Some((name, prev)) = saved {
+                match prev {
+                    Some(ty) => { env.locals.insert(name, ty); }
+                    None => { env.locals.remove(name.as_str()); }
+                }
+            }
             Ok(())
         }
         Stmt::Del { target, .. } => {

@@ -18,6 +18,7 @@ pub enum Ty {
     Tuple(Vec<Ty>),
     Option(Box<Ty>),
     Class(String),
+    File,            // an open file handle (open() / `with open(...) as f`)
     Unknown,
 }
 
@@ -142,6 +143,9 @@ impl TyCtx {
         funcs.insert("any".into(), FuncSig { params: vec![("x".into(), Ty::Unknown)], ret: Ty::Bool, param_defaults: vec![] });
         funcs.insert("all".into(), FuncSig { params: vec![("x".into(), Ty::Unknown)], ret: Ty::Bool, param_defaults: vec![] });
         funcs.insert("round".into(), FuncSig { params: vec![("x".into(), Ty::Unknown)], ret: Ty::Int, param_defaults: vec![] });
+        // open(path) / open(path, mode) -> file handle. Arity is not checked
+        // (added to the variadic skip list) so the optional mode arg works.
+        funcs.insert("open".into(), FuncSig { params: vec![("path".into(), Ty::Str), ("mode".into(), Ty::Str)], ret: Ty::File, param_defaults: vec![] });
         funcs.insert("pow".into(), FuncSig { params: vec![("base".into(), Ty::Unknown), ("exp".into(), Ty::Unknown)], ret: Ty::Int, param_defaults: vec![] });
         funcs.insert("chr".into(), FuncSig { params: vec![("x".into(), Ty::Int)], ret: Ty::Str, param_defaults: vec![] });
         funcs.insert("ord".into(), FuncSig { params: vec![("x".into(), Ty::Str)], ret: Ty::Int, param_defaults: vec![] });
@@ -848,6 +852,7 @@ const DICT_METHODS: &[&str] = &[
     "get", "keys", "values", "items", "pop", "clear", "copy", "update",
     "setdefault", "len", "contains", "popitem",
 ];
+const FILE_METHODS: &[&str] = &["read", "readlines", "write", "close"];
 
 /// Returns (type-name, method-table) for a concrete builtin receiver, or None
 /// for Unknown/Class/numeric receivers (the check must not run on those).
@@ -857,6 +862,7 @@ fn builtin_method_table(ty: &Ty) -> Option<(&'static str, &'static [&'static str
         Ty::List(_) => Some(("list", LIST_METHODS)),
         Ty::Set(_) => Some(("set", SET_METHODS)),
         Ty::Dict(_, _) => Some(("dict", DICT_METHODS)),
+        Ty::File => Some(("file", FILE_METHODS)),
         _ => None,
     }
 }
@@ -926,6 +932,12 @@ pub fn builtin_method_ret(recv: &Ty, method: &str) -> Ty {
             // In-place mutators return None. (get/setdefault return V/Optional and
             // are deliberately left Unknown — they need arg-count-aware typing.)
             "update" | "clear" => Ty::Unit,
+            _ => Ty::Unknown,
+        },
+        Ty::File => match method {
+            "read" => Ty::Str,
+            "readlines" => Ty::List(Box::new(Ty::Str)),
+            "write" | "close" => Ty::Unit,
             _ => Ty::Unknown,
         },
         _ => Ty::Unknown,
@@ -1089,7 +1101,7 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                         let variadic = matches!(name.as_str(),
                             "print" | "range" | "len" | "str" | "int" | "float" | "bool" | "enumerate" | "zip"
                             | "abs" | "min" | "max" | "sorted" | "sum" | "input" | "list" | "dict" | "tuple" | "set"
-                            | "getattr" | "setattr" | "hasattr");
+                            | "getattr" | "setattr" | "hasattr" | "open");
                         // Count required parameters (those without defaults)
                         let required = sig.param_defaults.iter().take_while(|d| d.is_none()).count();
                         if !variadic && (got < required || got > expected) {

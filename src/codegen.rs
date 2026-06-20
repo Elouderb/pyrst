@@ -445,6 +445,7 @@ impl<'a> Codegen<'a> {
         self.line("    if x { \"True\".to_string() } else { \"False\".to_string() }");
         self.line("}");
         self.line(REPR_PRELUDE);
+        self.line(FILE_PRELUDE);
         self.line("");
         self.line("// ----- user code -----");
 
@@ -1486,6 +1487,10 @@ impl<'a> Codegen<'a> {
                 self.line("{");
                 self.indent += 1;
                 if let Some(name) = as_name {
+                    // Register the bound type (e.g. open() -> File) so method calls
+                    // on it (f.write/read) resolve to the right emission.
+                    let bound_ty = self.type_of_expr(ctx_expr);
+                    self.locals.insert(name.clone(), bound_ty);
                     self.line(&format!("let mut {} = {};", name, ctx_s));
                 } else {
                     self.line(&format!("let _ = {};", ctx_s));
@@ -1801,6 +1806,15 @@ impl<'a> Codegen<'a> {
                                     return Ok(format!("({}).py_repr()", a)),
                                 _ => return Ok(format!("format!(\"{{}}\" , {})", a)),
                             }
+                        }
+                        "open" => {
+                            let path = self.emit_expr(&args[0])?;
+                            let mode = if args.len() >= 2 {
+                                self.emit_expr(&args[1])?
+                            } else {
+                                "\"r\".to_string()".to_string()
+                            };
+                            return Ok(format!("__py_open(&{}, &{})", path, mode));
                         }
                         "int" => {
                             let a = self.emit_expr(&args[0])?;
@@ -2666,6 +2680,17 @@ impl<'a> Codegen<'a> {
                         }
                     }
 
+                    // File methods (PyFile; gated on a File receiver). write takes
+                    // &str, so borrow the argument.
+                    if let Ty::File = self.type_of_expr(obj) {
+                        match name.as_str() {
+                            "write" => return Ok(format!("{}.write(&{})", obj_s, parts.first().cloned().unwrap_or_default())),
+                            "read" | "readlines" | "close" =>
+                                return Ok(format!("{}.{}()", obj_s, name)),
+                            _ => {}
+                        }
+                    }
+
                     // Dict views - materialize into a Vec so they work both in a
                     // for-loop and as a value (e.g. print(d.keys()), len(d.values())),
                     // matching their List(K)/List(V) static type.
@@ -3290,6 +3315,7 @@ fn rust_ty(t: &Ty) -> String {
         }
         Ty::Option(inner) => format!("Option<{}>", rust_ty(inner)),
         Ty::Class(n) => n.clone(),
+        Ty::File => "PyFile".into(),
         Ty::Unknown => "()".into(),
     }
 }
@@ -3351,6 +3377,38 @@ impl<A: PyRepr, B: PyRepr, C: PyRepr, D: PyRepr, E: PyRepr> PyRepr for (A, B, C,
 impl<A: PyRepr, B: PyRepr, C: PyRepr, D: PyRepr, E: PyRepr, F: PyRepr> PyRepr for (A, B, C, D, E, F) { fn py_repr(&self) -> String { format!("({}, {}, {}, {}, {}, {})", self.0.py_repr(), self.1.py_repr(), self.2.py_repr(), self.3.py_repr(), self.4.py_repr(), self.5.py_repr()) } }
 "#;
 
+/// Prelude implementing the minimal file-object model: `open()` -> PyFile, with
+/// read/readlines/write/close. The PyFile owns a std::fs::File, so a `with
+/// open(...) as f:` block closes it via RAII when the Rust scope ends. I/O
+/// errors panic (matching pyrst's raise->panic model). readlines() strips line
+/// endings (a documented deviation from CPython, which keeps them).
+const FILE_PRELUDE: &str = r#"struct PyFile { inner: std::fs::File }
+impl PyFile {
+    fn read(&mut self) -> String {
+        use std::io::Read;
+        let mut s = String::new();
+        self.inner.read_to_string(&mut s).expect("read failed");
+        s
+    }
+    fn readlines(&mut self) -> Vec<String> {
+        self.read().lines().map(|l| l.to_string()).collect()
+    }
+    fn write(&mut self, s: &str) {
+        use std::io::Write;
+        self.inner.write_all(s.as_bytes()).expect("write failed");
+    }
+    fn close(&mut self) {}
+}
+fn __py_open(path: &str, mode: &str) -> PyFile {
+    let f = match mode {
+        "w" => std::fs::File::create(path).expect("open failed"),
+        "a" => std::fs::OpenOptions::new().create(true).append(true).open(path).expect("open failed"),
+        _ => std::fs::File::open(path).expect("open failed"),
+    };
+    PyFile { inner: f }
+}
+"#;
+
 pub fn emit(m: &Module, ctx: &TyCtx) -> Result<String> {
     Codegen::new(ctx).emit_module(m)
 }
@@ -3386,6 +3444,7 @@ pub fn emit_program(modules: &[(Module, String)], ctx: &TyCtx) -> Result<String>
     cg.line("    if x { \"True\".to_string() } else { \"False\".to_string() }");
     cg.line("}");
     cg.line(REPR_PRELUDE);
+    cg.line(FILE_PRELUDE);
     cg.line("");
     cg.line("// ----- user code -----");
 

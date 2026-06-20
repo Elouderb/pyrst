@@ -143,7 +143,7 @@ This document clarifies which Python features are supported, partially supported
 | `hasattr()` | ❌ Not Supported | No dynamic attribute checking |
 | `getattr()` / `setattr()` | ❌ Not Supported | No dynamic attribute access |
 | `eval()` / `exec()` | ❌ Not Supported | No dynamic code execution |
-| `open()` / file I/O | ❌ Not Supported | No file I/O yet |
+| `open()` / file I/O | ⚠️ MVP | `open(path[, mode])` with `with`; `read()`/`readlines()`/`write()`/`close()`; modes `r`/`w`/`a`. No `for line in f`, seek/tell, binary, or encoding; I/O errors panic |
 | `map()`, `filter()`, `reduce()` | ❌ Not Supported | First-class function values unsupported; use comprehensions |
 
 ---

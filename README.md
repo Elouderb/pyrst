@@ -13,7 +13,7 @@ A statically typed Python-like language that compiles to efficient Rust. Combine
 
 ## Status
 
-**Phase 38 (in development)** — Full compiler pipeline (lexer → parser → resolver → type checker → Rust codegen → `rustc`). **All 106 single-file examples transpile and run successfully** (`./test_all.sh`: 106/106 positives, 16/16 negatives rejected, 1/1 output assertion).
+**Phase 38 (in development)** — Full compiler pipeline (lexer → parser → resolver → type checker → Rust codegen → `rustc`). **All 129 single-file examples transpile and run successfully** (`./test_all.sh`: 129/129 positives, 21/21 negatives rejected, 24/24 output assertions).
 
 The core pipeline is working end-to-end, including multi-file imports, classes with single inheritance and dunder methods, comprehensions, and a broad set of string/list/dict methods. Lambdas are implemented (see `examples/lambda_demo.py`, `examples/lambda_closure.py`).
 

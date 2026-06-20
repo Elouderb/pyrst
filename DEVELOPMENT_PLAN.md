@@ -1,7 +1,7 @@
 # pyrst Development Plan & Roadmap
 
-**Last Updated:** June 19, 2026  
-**Status:** Phase 38 — active development ✅ | 108/108 examples passing
+**Last Updated:** June 20, 2026  
+**Status:** Phase 38 — active development ✅ | 129/129 positives, 21/21 negatives, 24/24 output assertions
 
 > **Note on phase history:** This roadmap was authored around Phase 14 and its
 > per-phase estimates below are historical. Phases 15–38 were delivered
@@ -437,7 +437,7 @@ These features are explicitly out of scope or deferred indefinitely:
 
 pyrst has evolved from a compiler concept to a **complete developer toolkit**. The project now includes:
 
-✅ **Feature-complete compiler** with 25 working examples  
+✅ **Feature-complete compiler** with 129 working examples  
 ✅ **Advanced type system** with inference and checking  
 ✅ **Professional optimizations** reducing code bloat by 60-70%  
 ✅ **Developer tooling** for formatting, linting, and exploration  
@@ -455,5 +455,5 @@ Success is measured not by "how many Python features," but by "how well does pyr
 
 ---
 
-*Development Plan updated: June 19, 2026*  
-*Phase 38 — active development; 108/108 examples passing*
+*Development Plan updated: June 20, 2026*  
+*Phase 38 — active development; 129/129 positives, 21/21 negatives, 24/24 output assertions*

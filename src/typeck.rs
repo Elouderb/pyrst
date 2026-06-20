@@ -919,6 +919,24 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
             let tys = elems.iter().map(|e| check_expr(e, env)).collect::<Result<Vec<_>>>()?;
             Ty::Tuple(tys)
         }
+        Expr::IfExp { test, body, orelse, span } => {
+            check_expr(test, env)?;
+            let bt = check_expr(body, env)?;
+            let ot = check_expr(orelse, env)?;
+            // Both arms must agree (Unknown absorbs the concrete side).
+            match (&bt, &ot) {
+                (Ty::Unknown, _) => ot,
+                (_, Ty::Unknown) => bt,
+                _ if bt == ot => bt,
+                _ => return Err(Error::Type {
+                    span: *span,
+                    msg: format!(
+                        "conditional expression branches have incompatible types: `{:?}` vs `{:?}`",
+                        bt, ot
+                    ),
+                }),
+            }
+        }
         Expr::ListComp { elt, target, iter, cond, .. } => {
             let iter_ty = check_expr(iter, env)?;
             let elem_ty = match &iter_ty {

@@ -89,7 +89,7 @@ This document clarifies which Python features are supported, partially supported
 | Feature | Status | Notes |
 |---------|--------|-------|
 | `if`/`elif`/`else` | ✅ Supported | Full support |
-| Ternary operator (`a if c else b`) | ❌ Not Supported | Use `if`/`else` statements |
+| Ternary operator (`a if c else b`) | ✅ Supported | Conditional expression; both branches must share a type; right-associative |
 | `while` loops | ✅ Supported | Full support |
 | `for` loops | ✅ Supported | Over list/set/dict/str/`range`; supports tuple unpacking |
 | `for`/`else` | ❌ Not Supported | `else` block not supported |
@@ -276,7 +276,6 @@ See `DESIGN_DECISIONS.md` §11 and `RUST_BACKEND.md` for the `catch_unwind` lowe
 ## Notable Limitations
 
 - **Printing collections:** `print([...])`, `print({...})`, and `str([...])` are unsupported — the backing `Vec`/`HashMap`/`HashSet` is not `Display`. Print elements individually, or build a string with `", ".join(...)`.
-- **No ternary expression:** use an `if`/`else` statement.
 - **No first-class function values to builtins:** e.g. `map(str, xs)` does not work; use a comprehension.
 - **`@classmethod`:** the `cls` parameter cannot be cleanly annotated, so classmethods are effectively unsupported (use `@staticmethod` or a module function).
 - **Caught exceptions** print no stderr noise; uncaught ones still surface a message and a non-zero exit code.

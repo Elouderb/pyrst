@@ -390,6 +390,11 @@ impl Linter {
                 // Variables referenced in the body that are lambda params aren't errors
                 self.check_expr(body);
             }
+            Expr::IfExp { test, body, orelse, .. } => {
+                self.check_expr(test);
+                self.check_expr(body);
+                self.check_expr(orelse);
+            }
             _ => {}
         }
     }

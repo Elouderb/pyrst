@@ -801,7 +801,34 @@ impl Parser {
     // ---- Expressions: Pratt parser ----
 
     pub fn parse_expr(&mut self) -> Result<Expr> {
-        self.parse_lambda()
+        self.parse_ternary()
+    }
+
+    // Conditional expression: `body if test else orelse`. Sits just above the
+    // or-test level (Python: `test: or_test ['if' or_test 'else' test] | lambdef`),
+    // so a `lambda` at this position is a full lambda, and the else-branch is
+    // itself a `test` (right-associative, so `a if p else b if q else c` nests
+    // to the right). The condition is only an or_test, which is why comprehension
+    // iterables (also parsed as or_test) leave their trailing `if` for the filter.
+    fn parse_ternary(&mut self) -> Result<Expr> {
+        if matches!(self.peek(), Tok::Lambda) {
+            return self.parse_lambda();
+        }
+        let body = self.parse_or()?;
+        if matches!(self.peek(), Tok::If) {
+            let span = self.peek_span();
+            self.bump(); // consume 'if'
+            let test = self.parse_or()?;
+            self.expect(&Tok::Else, "conditional expression")?;
+            let orelse = self.parse_ternary()?;
+            return Ok(Expr::IfExp {
+                test: Box::new(test),
+                body: Box::new(body),
+                orelse: Box::new(orelse),
+                span,
+            });
+        }
+        Ok(body)
     }
 
     fn parse_lambda(&mut self) -> Result<Expr> {
@@ -827,7 +854,7 @@ impl Parser {
         }
 
         self.expect(&Tok::Colon, "lambda body")?;
-        let body = Box::new(self.parse_or()?);
+        let body = Box::new(self.parse_ternary()?);
 
         Ok(Expr::Lambda { params, body, span })
     }
@@ -1217,7 +1244,7 @@ impl Parser {
                     self.bump(); // consume 'for'
                     let target = self.expect_ident("list comp target")?;
                     self.expect(&Tok::In, "list comp")?;
-                    let iter = self.parse_expr()?;
+                    let iter = self.parse_or()?; // or_test: leaves a trailing `if` for the comp filter
                     let cond = if self.eat(&Tok::If) { Some(Box::new(self.parse_expr()?)) } else { None };
                     self.expect(&Tok::RBracket, "list comp")?;
                     Ok(Expr::ListComp { elt: Box::new(first), target, iter: Box::new(iter), cond, span })
@@ -1247,7 +1274,7 @@ impl Parser {
                         self.bump(); // consume 'for'
                         let target = self.expect_ident("dict comp target")?;
                         self.expect(&Tok::In, "dict comp")?;
-                        let iter = self.parse_expr()?;
+                        let iter = self.parse_or()?; // or_test: leaves a trailing `if` for the comp filter
                         let cond = if self.eat(&Tok::If) { Some(Box::new(self.parse_expr()?)) } else { None };
                         self.expect(&Tok::RBrace, "dict comp")?;
                         Ok(Expr::DictComp { key: Box::new(first), val: Box::new(val), target, iter: Box::new(iter), cond, span })
@@ -1268,7 +1295,7 @@ impl Parser {
                     self.bump(); // consume 'for'
                     let target = self.expect_ident("set comp target")?;
                     self.expect(&Tok::In, "set comp")?;
-                    let iter = self.parse_expr()?;
+                    let iter = self.parse_or()?; // or_test: leaves a trailing `if` for the comp filter
                     let cond = if self.eat(&Tok::If) { Some(Box::new(self.parse_expr()?)) } else { None };
                     self.expect(&Tok::RBrace, "set comp")?;
                     Ok(Expr::SetComp { elt: Box::new(first), target, iter: Box::new(iter), cond, span })

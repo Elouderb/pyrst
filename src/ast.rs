@@ -150,6 +150,8 @@ pub enum Expr {
     BinOp { op: BinOp, lhs: Box<Expr>, rhs: Box<Expr>, span: Span },
     UnOp { op: UnOp, expr: Box<Expr>, span: Span },
     Lambda { params: Vec<(String, TypeExpr)>, body: Box<Expr>, span: Span },
+    // Conditional expression: `body if test else orelse` (Python's ternary).
+    IfExp { test: Box<Expr>, body: Box<Expr>, orelse: Box<Expr>, span: Span },
 }
 
 impl Expr {
@@ -159,7 +161,7 @@ impl Expr {
             | Expr::Bool(_, s) | Expr::None_(s) | Expr::Ident(_, s) | Expr::List(_, s) | Expr::Tuple(_, s) | Expr::Dict(_, s) | Expr::Set(_, s) => *s,
             Expr::Call { span, .. } | Expr::Attr { span, .. }
             | Expr::Index { span, .. } | Expr::Slice { span, .. } | Expr::BinOp { span, .. }
-            | Expr::UnOp { span, .. } | Expr::ListComp { span, .. } | Expr::SetComp { span, .. } | Expr::DictComp { span, .. } | Expr::Lambda { span, .. } => *span,
+            | Expr::UnOp { span, .. } | Expr::ListComp { span, .. } | Expr::SetComp { span, .. } | Expr::DictComp { span, .. } | Expr::Lambda { span, .. } | Expr::IfExp { span, .. } => *span,
         }
     }
 }

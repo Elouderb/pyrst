@@ -87,6 +87,11 @@ impl<'a> Codegen<'a> {
             Expr::Bool(..) => Ty::Bool,
             Expr::Str(..) | Expr::FStr(..) => Ty::Str,
             Expr::None_(_) => Ty::Unit,
+            Expr::IfExp { body, orelse, .. } => {
+                // Both branches unify in typeck; prefer the concrete one.
+                let b = self.type_of_expr(body);
+                if b == Ty::Unknown { self.type_of_expr(orelse) } else { b }
+            }
             Expr::Ident(n, _) => self.locals.get(n.as_str()).cloned().unwrap_or(Ty::Unknown),
             Expr::UnOp { op: UnOp::Neg, expr, .. } => self.type_of_expr(expr),
             Expr::UnOp { op: UnOp::Not, .. } => Ty::Bool,
@@ -3133,6 +3138,13 @@ impl<'a> Codegen<'a> {
                 }).collect();
                 let body_s = self.emit_expr(body)?;
                 format!("|{}| {}", param_strs.join(", "), body_s)
+            }
+            Expr::IfExp { test, body, orelse, .. } => {
+                // Python's `body if test else orelse` -> Rust's if-expression.
+                let t = self.emit_expr(test)?;
+                let b = self.emit_expr(body)?;
+                let o = self.emit_expr(orelse)?;
+                format!("(if {} {{ {} }} else {{ {} }})", t, b, o)
             }
         })
     }

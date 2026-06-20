@@ -92,7 +92,9 @@ impl<'a> Codegen<'a> {
                 let b = self.type_of_expr(body);
                 if b == Ty::Unknown { self.type_of_expr(orelse) } else { b }
             }
-            Expr::Ident(n, _) => self.locals.get(n.as_str()).cloned().unwrap_or(Ty::Unknown),
+            Expr::Ident(n, _) => self.locals.get(n.as_str())
+                .or_else(|| self.ctx.vars.get(n.as_str()))
+                .cloned().unwrap_or(Ty::Unknown),
             Expr::UnOp { op: UnOp::Neg, expr, .. } => self.type_of_expr(expr),
             Expr::UnOp { op: UnOp::Not, .. } => Ty::Bool,
             Expr::UnOp { op: UnOp::BitNot, .. } => Ty::Int,
@@ -2903,9 +2905,9 @@ impl<'a> Codegen<'a> {
                     }
                 }
                 let i = self.emit_expr(idx)?;
-                match Some(&obj_ty) {
-                    Some(Ty::Dict(..)) => format!("{}.get(&{}).cloned().expect(\"key not found\")", o, i),
-                    Some(Ty::Str) => {
+                match &obj_ty {
+                    Ty::Dict(..) => format!("{}.get(&{}).cloned().expect(\"key not found\")", o, i),
+                    Ty::Str => {
                         // String indexing with negative index support
                         format!(
                             "{{ let __chars: Vec<char> = {}.chars().collect(); let __idx = if {} < 0 {{ ((__chars.len() as i64) + {}) as usize }} else {{ {} as usize }}; __chars[__idx].to_string() }}",

@@ -1358,3 +1358,964 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
         }
     })
 }
+
+// =============================================================================
+// UNIT TESTS
+// Architecture: one in-file #[cfg(test)] block at the bottom of the module so
+// private items (types_compatible, check_expr, check_stmt, FuncEnv) are
+// accessible without pub-widening any production code.
+//
+// Four categories:
+//   A. types_compatible matrix         (~19 cases)
+//   B. builtin_method_ret              (~20 cases)
+//   C. inference via check_expr/stmt   (~24 cases)
+//   D. error-firing                    (~13 cases)
+//
+// CHARACTERIZATION philosophy: each test asserts the code's ACTUAL current
+// behaviour. Where behaviour is a known limitation or design choice, a comment
+// marks it (BUG 1, BUG 2, BUG 3).
+// =============================================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ast::{BinOp, Expr, Stmt, TypeExpr, UnOp};
+    use crate::diag::Span;
+
+    // -------------------------------------------------------------------------
+    // Helpers
+    // -------------------------------------------------------------------------
+
+    /// Build a minimal FuncEnv backed by a fresh TyCtx, returning Unit.
+    fn make_env(ctx: &TyCtx) -> FuncEnv<'_> {
+        FuncEnv::new(ctx, &[], Ty::Unit)
+    }
+
+    /// Build a FuncEnv with a declared return type.
+    fn make_env_ret(ctx: &TyCtx, ret: Ty) -> FuncEnv<'_> {
+        FuncEnv::new(ctx, &[], ret)
+    }
+
+    /// Construct a Call expr: callee is an Ident, no kwargs.
+    fn call_fn(name: &str, args: Vec<Expr>) -> Expr {
+        Expr::Call {
+            callee: Box::new(Expr::Ident(name.to_string(), Span::DUMMY)),
+            args,
+            kwargs: vec![],
+            span: Span::DUMMY,
+        }
+    }
+
+    /// Construct a method-call expr: obj.method(args).
+    fn method_call(obj: Expr, method: &str, args: Vec<Expr>) -> Expr {
+        Expr::Call {
+            callee: Box::new(Expr::Attr {
+                obj: Box::new(obj),
+                name: method.to_string(),
+                span: Span::DUMMY,
+            }),
+            args,
+            kwargs: vec![],
+            span: Span::DUMMY,
+        }
+    }
+
+    /// Ident shorthand.
+    fn ident(name: &str) -> Expr {
+        Expr::Ident(name.to_string(), Span::DUMMY)
+    }
+
+    /// Int literal shorthand.
+    fn int_lit(v: i64) -> Expr { Expr::Int(v, Span::DUMMY) }
+
+    /// Float literal shorthand.
+    fn float_lit(v: f64) -> Expr { Expr::Float(v, Span::DUMMY) }
+
+    /// Str literal shorthand.
+    fn str_lit(s: &str) -> Expr { Expr::Str(s.to_string(), Span::DUMMY) }
+
+    /// Bool literal shorthand.
+    fn bool_lit(v: bool) -> Expr { Expr::Bool(v, Span::DUMMY) }
+
+    /// Assert that a Result<Ty> is a Type error whose message contains `fragment`.
+    fn assert_type_err(r: Result<Ty>, fragment: &str) {
+        match r {
+            Err(Error::Type { msg, .. }) => {
+                assert!(
+                    msg.contains(fragment),
+                    "expected error containing {:?}, got msg: {:?}",
+                    fragment, msg
+                );
+            }
+            Err(other) => panic!("expected Type error, got {:?}", other),
+            Ok(ty) => panic!("expected Type error, got Ok({:?})", ty),
+        }
+    }
+
+    /// Same but for Result<()> (check_stmt).
+    fn assert_stmt_type_err(r: Result<()>, fragment: &str) {
+        match r {
+            Err(Error::Type { msg, .. }) => {
+                assert!(
+                    msg.contains(fragment),
+                    "expected error containing {:?}, got msg: {:?}",
+                    fragment, msg
+                );
+            }
+            Err(other) => panic!("expected Type error, got {:?}", other),
+            Ok(()) => panic!("expected Type error, got Ok(())"),
+        }
+    }
+
+    // =========================================================================
+    // Category A — types_compatible matrix
+    // =========================================================================
+
+    #[test]
+    fn compat_exact_int() {
+        assert!(types_compatible(&Ty::Int, &Ty::Int));
+    }
+
+    #[test]
+    fn compat_exact_str() {
+        assert!(types_compatible(&Ty::Str, &Ty::Str));
+    }
+
+    #[test]
+    fn compat_exact_list_int() {
+        assert!(types_compatible(
+            &Ty::List(Box::new(Ty::Int)),
+            &Ty::List(Box::new(Ty::Int))
+        ));
+    }
+
+    #[test]
+    fn compat_int_vs_str_false() {
+        assert!(!types_compatible(&Ty::Int, &Ty::Str));
+    }
+
+    #[test]
+    fn compat_int_vs_float_false() {
+        // No implicit widening in types_compatible itself; caller handles Int→Float.
+        assert!(!types_compatible(&Ty::Int, &Ty::Float));
+    }
+
+    #[test]
+    fn compat_unknown_lhs() {
+        assert!(types_compatible(&Ty::Unknown, &Ty::Int));
+    }
+
+    #[test]
+    fn compat_unknown_rhs() {
+        assert!(types_compatible(&Ty::Int, &Ty::Unknown));
+    }
+
+    #[test]
+    fn compat_both_unknown() {
+        assert!(types_compatible(&Ty::Unknown, &Ty::Unknown));
+    }
+
+    #[test]
+    fn compat_list_unknown_elem_lhs() {
+        // List(Unknown) is compatible with List(Int): wildcard-from-left arm.
+        assert!(types_compatible(
+            &Ty::List(Box::new(Ty::Unknown)),
+            &Ty::List(Box::new(Ty::Int))
+        ));
+    }
+
+    #[test]
+    fn compat_list_unknown_elem_rhs() {
+        // List(Int) compatible with List(Unknown): wildcard-from-right arm.
+        assert!(types_compatible(
+            &Ty::List(Box::new(Ty::Int)),
+            &Ty::List(Box::new(Ty::Unknown))
+        ));
+    }
+
+    #[test]
+    fn compat_list_concrete_mismatch() {
+        // List(Int) vs List(Str): neither side has Unknown inner → false.
+        assert!(!types_compatible(
+            &Ty::List(Box::new(Ty::Int)),
+            &Ty::List(Box::new(Ty::Str))
+        ));
+    }
+
+    #[test]
+    fn compat_set_unknown_elem_lhs() {
+        assert!(types_compatible(
+            &Ty::Set(Box::new(Ty::Unknown)),
+            &Ty::Set(Box::new(Ty::Bool))
+        ));
+    }
+
+    #[test]
+    fn compat_set_unknown_elem_rhs() {
+        assert!(types_compatible(
+            &Ty::Set(Box::new(Ty::Bool)),
+            &Ty::Set(Box::new(Ty::Unknown))
+        ));
+    }
+
+    #[test]
+    fn compat_dict_both_unknown_lhs() {
+        // Dict(Unknown,Unknown) vs Dict(Str,Int) → true.
+        assert!(types_compatible(
+            &Ty::Dict(Box::new(Ty::Unknown), Box::new(Ty::Unknown)),
+            &Ty::Dict(Box::new(Ty::Str), Box::new(Ty::Int))
+        ));
+    }
+
+    #[test]
+    fn compat_dict_both_unknown_rhs() {
+        // Dict(Str,Int) vs Dict(Unknown,Unknown) → true.
+        assert!(types_compatible(
+            &Ty::Dict(Box::new(Ty::Str), Box::new(Ty::Int)),
+            &Ty::Dict(Box::new(Ty::Unknown), Box::new(Ty::Unknown))
+        ));
+    }
+
+    #[test]
+    fn compat_dict_partial_unknown_false() {
+        // BUG 2 (design choice): Dict wildcard requires BOTH k AND v = Unknown.
+        // Dict(Unknown, Int) vs Dict(Str, Int) → false because only k is Unknown.
+        assert!(!types_compatible(
+            &Ty::Dict(Box::new(Ty::Unknown), Box::new(Ty::Int)),
+            &Ty::Dict(Box::new(Ty::Str), Box::new(Ty::Int))
+        ));
+    }
+
+    #[test]
+    fn compat_dict_concrete_mismatch() {
+        assert!(!types_compatible(
+            &Ty::Dict(Box::new(Ty::Str), Box::new(Ty::Int)),
+            &Ty::Dict(Box::new(Ty::Int), Box::new(Ty::Str))
+        ));
+    }
+
+    #[test]
+    fn compat_class_same() {
+        assert!(types_compatible(
+            &Ty::Class("Foo".into()),
+            &Ty::Class("Foo".into())
+        ));
+    }
+
+    #[test]
+    fn compat_class_different_false() {
+        assert!(!types_compatible(
+            &Ty::Class("Foo".into()),
+            &Ty::Class("Bar".into())
+        ));
+    }
+
+    // =========================================================================
+    // Category B — builtin_method_ret
+    // =========================================================================
+
+    #[test]
+    fn method_ret_str_upper() {
+        assert_eq!(builtin_method_ret(&Ty::Str, "upper"), Ty::Str);
+    }
+
+    #[test]
+    fn method_ret_str_lower() {
+        assert_eq!(builtin_method_ret(&Ty::Str, "lower"), Ty::Str);
+    }
+
+    #[test]
+    fn method_ret_str_join() {
+        assert_eq!(builtin_method_ret(&Ty::Str, "join"), Ty::Str);
+    }
+
+    #[test]
+    fn method_ret_str_split() {
+        assert_eq!(
+            builtin_method_ret(&Ty::Str, "split"),
+            Ty::List(Box::new(Ty::Str))
+        );
+    }
+
+    #[test]
+    fn method_ret_str_partition() {
+        // partition is modelled as list[str] (not a tuple), per the source comment.
+        assert_eq!(
+            builtin_method_ret(&Ty::Str, "partition"),
+            Ty::List(Box::new(Ty::Str))
+        );
+    }
+
+    #[test]
+    fn method_ret_str_rpartition() {
+        assert_eq!(
+            builtin_method_ret(&Ty::Str, "rpartition"),
+            Ty::List(Box::new(Ty::Str))
+        );
+    }
+
+    #[test]
+    fn method_ret_str_find() {
+        assert_eq!(builtin_method_ret(&Ty::Str, "find"), Ty::Int);
+    }
+
+    #[test]
+    fn method_ret_str_count() {
+        assert_eq!(builtin_method_ret(&Ty::Str, "count"), Ty::Int);
+    }
+
+    #[test]
+    fn method_ret_str_startswith() {
+        assert_eq!(builtin_method_ret(&Ty::Str, "startswith"), Ty::Bool);
+    }
+
+    #[test]
+    fn method_ret_str_isdigit() {
+        assert_eq!(builtin_method_ret(&Ty::Str, "isdigit"), Ty::Bool);
+    }
+
+    #[test]
+    fn method_ret_str_unknown_method() {
+        assert_eq!(builtin_method_ret(&Ty::Str, "no_such_method"), Ty::Unknown);
+    }
+
+    #[test]
+    fn method_ret_list_pop() {
+        let list_int = Ty::List(Box::new(Ty::Int));
+        assert_eq!(builtin_method_ret(&list_int, "pop"), Ty::Int);
+    }
+
+    #[test]
+    fn method_ret_list_copy() {
+        let list_str = Ty::List(Box::new(Ty::Str));
+        assert_eq!(
+            builtin_method_ret(&list_str, "copy"),
+            Ty::List(Box::new(Ty::Str))
+        );
+    }
+
+    #[test]
+    fn method_ret_list_append_is_unit() {
+        let list_int = Ty::List(Box::new(Ty::Int));
+        assert_eq!(builtin_method_ret(&list_int, "append"), Ty::Unit);
+    }
+
+    #[test]
+    fn method_ret_list_index() {
+        let list_int = Ty::List(Box::new(Ty::Int));
+        assert_eq!(builtin_method_ret(&list_int, "index"), Ty::Int);
+    }
+
+    #[test]
+    fn method_ret_set_pop() {
+        let set_str = Ty::Set(Box::new(Ty::Str));
+        assert_eq!(builtin_method_ret(&set_str, "pop"), Ty::Str);
+    }
+
+    #[test]
+    fn method_ret_set_union() {
+        let set_int = Ty::Set(Box::new(Ty::Int));
+        assert_eq!(
+            builtin_method_ret(&set_int, "union"),
+            Ty::Set(Box::new(Ty::Int))
+        );
+    }
+
+    #[test]
+    fn method_ret_set_issubset() {
+        let set_int = Ty::Set(Box::new(Ty::Int));
+        assert_eq!(builtin_method_ret(&set_int, "issubset"), Ty::Bool);
+    }
+
+    #[test]
+    fn method_ret_dict_keys() {
+        let dict = Ty::Dict(Box::new(Ty::Str), Box::new(Ty::Int));
+        assert_eq!(
+            builtin_method_ret(&dict, "keys"),
+            Ty::List(Box::new(Ty::Str))
+        );
+    }
+
+    #[test]
+    fn method_ret_dict_values() {
+        let dict = Ty::Dict(Box::new(Ty::Str), Box::new(Ty::Int));
+        assert_eq!(
+            builtin_method_ret(&dict, "values"),
+            Ty::List(Box::new(Ty::Int))
+        );
+    }
+
+    #[test]
+    fn method_ret_dict_items() {
+        let dict = Ty::Dict(Box::new(Ty::Str), Box::new(Ty::Int));
+        assert_eq!(
+            builtin_method_ret(&dict, "items"),
+            Ty::List(Box::new(Ty::Tuple(vec![Ty::Str, Ty::Int])))
+        );
+    }
+
+    #[test]
+    fn method_ret_dict_pop() {
+        let dict = Ty::Dict(Box::new(Ty::Str), Box::new(Ty::Bool));
+        assert_eq!(builtin_method_ret(&dict, "pop"), Ty::Bool);
+    }
+
+    #[test]
+    fn method_ret_dict_copy() {
+        let dict = Ty::Dict(Box::new(Ty::Str), Box::new(Ty::Int));
+        assert_eq!(
+            builtin_method_ret(&dict, "copy"),
+            Ty::Dict(Box::new(Ty::Str), Box::new(Ty::Int))
+        );
+    }
+
+    #[test]
+    fn method_ret_file_read() {
+        assert_eq!(builtin_method_ret(&Ty::File, "read"), Ty::Str);
+    }
+
+    #[test]
+    fn method_ret_file_readlines() {
+        assert_eq!(
+            builtin_method_ret(&Ty::File, "readlines"),
+            Ty::List(Box::new(Ty::Str))
+        );
+    }
+
+    #[test]
+    fn method_ret_file_write_is_unit() {
+        assert_eq!(builtin_method_ret(&Ty::File, "write"), Ty::Unit);
+    }
+
+    // =========================================================================
+    // Category C — inference via check_expr / check_stmt
+    // =========================================================================
+
+    #[test]
+    fn infer_int_literal() {
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        assert_eq!(check_expr(&int_lit(42), &mut env).unwrap(), Ty::Int);
+    }
+
+    #[test]
+    fn infer_float_literal() {
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        assert_eq!(check_expr(&float_lit(3.14), &mut env).unwrap(), Ty::Float);
+    }
+
+    #[test]
+    fn infer_str_literal() {
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        assert_eq!(check_expr(&str_lit("hi"), &mut env).unwrap(), Ty::Str);
+    }
+
+    #[test]
+    fn infer_bool_literal() {
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        assert_eq!(check_expr(&bool_lit(true), &mut env).unwrap(), Ty::Bool);
+    }
+
+    #[test]
+    fn infer_none_literal() {
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        assert_eq!(check_expr(&Expr::None_(Span::DUMMY), &mut env).unwrap(), Ty::Unit);
+    }
+
+    #[test]
+    fn infer_list_of_ints() {
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        let e = Expr::List(vec![int_lit(1), int_lit(2), int_lit(3)], Span::DUMMY);
+        assert_eq!(
+            check_expr(&e, &mut env).unwrap(),
+            Ty::List(Box::new(Ty::Int))
+        );
+    }
+
+    #[test]
+    fn infer_empty_list_is_unknown() {
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        let e = Expr::List(vec![], Span::DUMMY);
+        assert_eq!(
+            check_expr(&e, &mut env).unwrap(),
+            Ty::List(Box::new(Ty::Unknown))
+        );
+    }
+
+    #[test]
+    fn infer_list_first_elem_wins_bug1() {
+        // BUG 1: heterogeneous list — only the FIRST element determines the type.
+        // Second element (Str) is evaluated for side effects but its type is ignored.
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        let e = Expr::List(vec![int_lit(1), str_lit("oops")], Span::DUMMY);
+        assert_eq!(
+            check_expr(&e, &mut env).unwrap(),
+            Ty::List(Box::new(Ty::Int))
+        );
+    }
+
+    #[test]
+    fn infer_empty_dict_is_unknown_unknown() {
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        let e = Expr::Dict(vec![], Span::DUMMY);
+        assert_eq!(
+            check_expr(&e, &mut env).unwrap(),
+            Ty::Dict(Box::new(Ty::Unknown), Box::new(Ty::Unknown))
+        );
+    }
+
+    #[test]
+    fn infer_dict_from_first_pair() {
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        let e = Expr::Dict(vec![(str_lit("k"), int_lit(1))], Span::DUMMY);
+        assert_eq!(
+            check_expr(&e, &mut env).unwrap(),
+            Ty::Dict(Box::new(Ty::Str), Box::new(Ty::Int))
+        );
+    }
+
+    #[test]
+    fn infer_tuple_types_all_elems() {
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        let e = Expr::Tuple(vec![int_lit(1), str_lit("a"), bool_lit(true)], Span::DUMMY);
+        assert_eq!(
+            check_expr(&e, &mut env).unwrap(),
+            Ty::Tuple(vec![Ty::Int, Ty::Str, Ty::Bool])
+        );
+    }
+
+    #[test]
+    fn infer_binop_add_int_int() {
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        let e = Expr::BinOp {
+            op: BinOp::Add,
+            lhs: Box::new(int_lit(1)),
+            rhs: Box::new(int_lit(2)),
+            span: Span::DUMMY,
+        };
+        assert_eq!(check_expr(&e, &mut env).unwrap(), Ty::Int);
+    }
+
+    #[test]
+    fn infer_binop_div_always_float() {
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        let e = Expr::BinOp {
+            op: BinOp::Div,
+            lhs: Box::new(int_lit(4)),
+            rhs: Box::new(int_lit(2)),
+            span: Span::DUMMY,
+        };
+        // Division always returns Float in Python.
+        assert_eq!(check_expr(&e, &mut env).unwrap(), Ty::Float);
+    }
+
+    #[test]
+    fn infer_binop_eq_returns_bool() {
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        let e = Expr::BinOp {
+            op: BinOp::Eq,
+            lhs: Box::new(int_lit(1)),
+            rhs: Box::new(int_lit(1)),
+            span: Span::DUMMY,
+        };
+        assert_eq!(check_expr(&e, &mut env).unwrap(), Ty::Bool);
+    }
+
+    #[test]
+    fn infer_unop_not_returns_bool() {
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        let e = Expr::UnOp {
+            op: UnOp::Not,
+            expr: Box::new(bool_lit(false)),
+            span: Span::DUMMY,
+        };
+        assert_eq!(check_expr(&e, &mut env).unwrap(), Ty::Bool);
+    }
+
+    #[test]
+    fn infer_unop_neg_preserves_type() {
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        let e = Expr::UnOp {
+            op: UnOp::Neg,
+            expr: Box::new(int_lit(5)),
+            span: Span::DUMMY,
+        };
+        assert_eq!(check_expr(&e, &mut env).unwrap(), Ty::Int);
+    }
+
+    #[test]
+    fn infer_range_returns_list_int() {
+        // range is registered in TyCtx::new() with ret = List(Int).
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        let e = call_fn("range", vec![int_lit(10)]);
+        assert_eq!(
+            check_expr(&e, &mut env).unwrap(),
+            Ty::List(Box::new(Ty::Int))
+        );
+    }
+
+    #[test]
+    fn infer_min_one_arg_list_int() {
+        // min([...]) with 1 arg → element type of the list.
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        let list_expr = Expr::List(vec![int_lit(3), int_lit(1)], Span::DUMMY);
+        let e = call_fn("min", vec![list_expr]);
+        assert_eq!(check_expr(&e, &mut env).unwrap(), Ty::Int);
+    }
+
+    #[test]
+    fn infer_max_one_arg_set_str() {
+        // max(set[str]) with 1 arg → Str (element type of the set).
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        let set_expr = Expr::Set(vec![str_lit("a"), str_lit("b")], Span::DUMMY);
+        let e = call_fn("max", vec![set_expr]);
+        assert_eq!(check_expr(&e, &mut env).unwrap(), Ty::Str);
+    }
+
+    #[test]
+    fn infer_min_two_args_is_unknown_bug3() {
+        // BUG 3 (design choice): 2-arg min/max falls through to the generic path.
+        // ctx.funcs["min"] has ret=Unknown, so the result is Unknown.
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        let e = call_fn("min", vec![int_lit(1), int_lit(2)]);
+        assert_eq!(check_expr(&e, &mut env).unwrap(), Ty::Unknown);
+    }
+
+    #[test]
+    fn infer_ident_after_assign_stmt() {
+        // After `x = 5` the env knows x: Int.
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        let stmt = Stmt::Assign {
+            target: "x".into(),
+            ty: None,
+            value: int_lit(5),
+            span: Span::DUMMY,
+        };
+        check_stmt(&stmt, &mut env).unwrap();
+        assert_eq!(
+            check_expr(&ident("x"), &mut env).unwrap(),
+            Ty::Int
+        );
+    }
+
+    #[test]
+    fn infer_for_loop_binds_elem_type() {
+        // for x in [1,2]: env["x"] = Int.
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        let iter = Expr::List(vec![int_lit(1), int_lit(2)], Span::DUMMY);
+        let stmt = Stmt::For {
+            targets: vec!["x".into()],
+            iter,
+            body: vec![],
+            span: Span::DUMMY,
+        };
+        check_stmt(&stmt, &mut env).unwrap();
+        assert_eq!(env.locals.get("x").cloned(), Some(Ty::Int));
+    }
+
+    #[test]
+    fn infer_for_loop_over_str_yields_str() {
+        // for c in "hello": env["c"] = Str.
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        let stmt = Stmt::For {
+            targets: vec!["c".into()],
+            iter: str_lit("hello"),
+            body: vec![],
+            span: Span::DUMMY,
+        };
+        check_stmt(&stmt, &mut env).unwrap();
+        assert_eq!(env.locals.get("c").cloned(), Some(Ty::Str));
+    }
+
+    #[test]
+    fn infer_unpack_tuple() {
+        // a, b = (1, "hello") → a: Int, b: Str.
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        let value = Expr::Tuple(vec![int_lit(1), str_lit("hello")], Span::DUMMY);
+        let stmt = Stmt::Unpack {
+            targets: vec!["a".into(), "b".into()],
+            value,
+            span: Span::DUMMY,
+        };
+        check_stmt(&stmt, &mut env).unwrap();
+        assert_eq!(env.locals.get("a").cloned(), Some(Ty::Int));
+        assert_eq!(env.locals.get("b").cloned(), Some(Ty::Str));
+    }
+
+    #[test]
+    fn infer_index_list() {
+        // xs[0] where xs: list[int] → Int.
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        env.locals.insert("xs".into(), Ty::List(Box::new(Ty::Int)));
+        let e = Expr::Index {
+            obj: Box::new(ident("xs")),
+            idx: Box::new(int_lit(0)),
+            span: Span::DUMMY,
+        };
+        assert_eq!(check_expr(&e, &mut env).unwrap(), Ty::Int);
+    }
+
+    #[test]
+    fn infer_index_dict_returns_val_type() {
+        // d["k"] where d: dict[str,bool] → Bool.
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        env.locals.insert(
+            "d".into(),
+            Ty::Dict(Box::new(Ty::Str), Box::new(Ty::Bool)),
+        );
+        let e = Expr::Index {
+            obj: Box::new(ident("d")),
+            idx: Box::new(str_lit("k")),
+            span: Span::DUMMY,
+        };
+        assert_eq!(check_expr(&e, &mut env).unwrap(), Ty::Bool);
+    }
+
+    #[test]
+    fn infer_str_method_call_upper() {
+        // "hi".upper() → Str.
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        let e = method_call(str_lit("hi"), "upper", vec![]);
+        assert_eq!(check_expr(&e, &mut env).unwrap(), Ty::Str);
+    }
+
+    #[test]
+    fn infer_list_method_pop() {
+        // xs.pop() where xs: list[float] → Float.
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        env.locals.insert("xs".into(), Ty::List(Box::new(Ty::Float)));
+        let e = method_call(ident("xs"), "pop", vec![]);
+        assert_eq!(check_expr(&e, &mut env).unwrap(), Ty::Float);
+    }
+
+    #[test]
+    fn infer_return_unit_in_unit_fn() {
+        // bare return in unit-returning fn → ok.
+        let ctx = TyCtx::new();
+        let mut env = make_env_ret(&ctx, Ty::Unit);
+        let stmt = Stmt::Return(None, Span::DUMMY);
+        assert!(check_stmt(&stmt, &mut env).is_ok());
+    }
+
+    #[test]
+    fn infer_return_int_in_int_fn() {
+        // return 42 in Int-returning fn → ok.
+        let ctx = TyCtx::new();
+        let mut env = make_env_ret(&ctx, Ty::Int);
+        let stmt = Stmt::Return(Some(int_lit(42)), Span::DUMMY);
+        assert!(check_stmt(&stmt, &mut env).is_ok());
+    }
+
+    #[test]
+    fn infer_assign_typed_ok() {
+        // x: int = 5 → ok, x: Int in locals.
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        let stmt = Stmt::Assign {
+            target: "x".into(),
+            ty: Some(TypeExpr::Named("int".into())),
+            value: int_lit(5),
+            span: Span::DUMMY,
+        };
+        assert!(check_stmt(&stmt, &mut env).is_ok());
+        assert_eq!(env.locals.get("x").cloned(), Some(Ty::Int));
+    }
+
+    #[test]
+    fn infer_empty_set_is_unknown() {
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        let e = Expr::Set(vec![], Span::DUMMY);
+        assert_eq!(
+            check_expr(&e, &mut env).unwrap(),
+            Ty::Set(Box::new(Ty::Unknown))
+        );
+    }
+
+    // =========================================================================
+    // Category D — error-firing
+    // =========================================================================
+
+    #[test]
+    fn error_undefined_name() {
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        let r = check_expr(&ident("no_such_var"), &mut env);
+        assert_type_err(r, "undefined name");
+    }
+
+    #[test]
+    fn error_undefined_function() {
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        let r = check_expr(&call_fn("no_such_fn", vec![]), &mut env);
+        assert_type_err(r, "undefined function");
+    }
+
+    #[test]
+    fn error_return_type_mismatch() {
+        let ctx = TyCtx::new();
+        let mut env = make_env_ret(&ctx, Ty::Int);
+        // Returning a Str from an Int-returning function.
+        let stmt = Stmt::Return(Some(str_lit("oops")), Span::DUMMY);
+        assert_stmt_type_err(check_stmt(&stmt, &mut env), "return type mismatch");
+    }
+
+    #[test]
+    fn error_bare_return_in_typed_fn() {
+        let ctx = TyCtx::new();
+        let mut env = make_env_ret(&ctx, Ty::Int);
+        let stmt = Stmt::Return(None, Span::DUMMY);
+        assert_stmt_type_err(check_stmt(&stmt, &mut env), "bare return");
+    }
+
+    #[test]
+    fn error_assign_type_mismatch() {
+        // x: int = "wrong" → type mismatch in assignment.
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        let stmt = Stmt::Assign {
+            target: "x".into(),
+            ty: Some(TypeExpr::Named("int".into())),
+            value: str_lit("wrong"),
+            span: Span::DUMMY,
+        };
+        assert_stmt_type_err(check_stmt(&stmt, &mut env), "type mismatch");
+    }
+
+    #[test]
+    fn error_augassign_undefined_var() {
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        let stmt = Stmt::AugAssign {
+            target: "missing".into(),
+            op: BinOp::Add,
+            value: int_lit(1),
+            span: Span::DUMMY,
+        };
+        assert_stmt_type_err(check_stmt(&stmt, &mut env), "undefined variable");
+    }
+
+    #[test]
+    fn no_error_augassign_when_var_exists() {
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        env.locals.insert("x".into(), Ty::Int);
+        let stmt = Stmt::AugAssign {
+            target: "x".into(),
+            op: BinOp::Add,
+            value: int_lit(1),
+            span: Span::DUMMY,
+        };
+        assert!(check_stmt(&stmt, &mut env).is_ok());
+    }
+
+    #[test]
+    fn error_unknown_method_on_str() {
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        let e = method_call(str_lit("hello"), "no_such_method", vec![]);
+        assert_type_err(check_expr(&e, &mut env), "has no method");
+    }
+
+    #[test]
+    fn error_unknown_method_on_list() {
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        env.locals.insert("xs".into(), Ty::List(Box::new(Ty::Int)));
+        let e = method_call(ident("xs"), "nonexistent", vec![]);
+        assert_type_err(check_expr(&e, &mut env), "has no method");
+    }
+
+    #[test]
+    fn error_arity_mismatch_too_many() {
+        // Register a 1-param function, call it with 2 args.
+        let mut ctx = TyCtx::new();
+        ctx.funcs.insert("myfn".into(), FuncSig {
+            params: vec![("x".into(), Ty::Int)],
+            param_defaults: vec![None],
+            ret: Ty::Int,
+        });
+        let mut env = make_env(&ctx);
+        let r = check_expr(&call_fn("myfn", vec![int_lit(1), int_lit(2)]), &mut env);
+        assert_type_err(r, "argument(s)");
+    }
+
+    #[test]
+    fn error_arity_mismatch_too_few() {
+        // Register a 2-param function (both required), call it with 0 args.
+        let mut ctx = TyCtx::new();
+        ctx.funcs.insert("twoarg".into(), FuncSig {
+            params: vec![("a".into(), Ty::Int), ("b".into(), Ty::Str)],
+            param_defaults: vec![None, None],
+            ret: Ty::Bool,
+        });
+        let mut env = make_env(&ctx);
+        let r = check_expr(&call_fn("twoarg", vec![]), &mut env);
+        assert_type_err(r, "argument(s)");
+    }
+
+    #[test]
+    fn error_arg_type_mismatch() {
+        // Register a function taking Int; pass Str.
+        let mut ctx = TyCtx::new();
+        ctx.funcs.insert("takes_int".into(), FuncSig {
+            params: vec![("n".into(), Ty::Int)],
+            param_defaults: vec![None],
+            ret: Ty::Unit,
+        });
+        let mut env = make_env(&ctx);
+        let r = check_expr(&call_fn("takes_int", vec![str_lit("oops")]), &mut env);
+        assert_type_err(r, "argument 1 to");
+    }
+
+    #[test]
+    fn error_set_add_wrong_elem_type() {
+        // s.add("x") where s: set[int] → element type mismatch.
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        env.locals.insert("s".into(), Ty::Set(Box::new(Ty::Int)));
+        let e = method_call(ident("s"), "add", vec![str_lit("oops")]);
+        assert_type_err(check_expr(&e, &mut env), "expected element type");
+    }
+
+    #[test]
+    fn no_error_int_to_float_param() {
+        // Int passed to a Float param → allowed (Python numeric coercion).
+        let mut ctx = TyCtx::new();
+        ctx.funcs.insert("takes_float".into(), FuncSig {
+            params: vec![("f".into(), Ty::Float)],
+            param_defaults: vec![None],
+            ret: Ty::Unit,
+        });
+        let mut env = make_env(&ctx);
+        let r = check_expr(&call_fn("takes_float", vec![int_lit(3)]), &mut env);
+        assert!(r.is_ok(), "Int→Float coercion should be allowed, got {:?}", r);
+    }
+}

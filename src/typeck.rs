@@ -162,7 +162,7 @@ impl TyCtx {
         funcs.insert("ascii".into(), FuncSig { params: vec![("obj".into(), Ty::Unknown)], ret: Ty::Str, param_defaults: vec![] });
         funcs.insert("list".into(), FuncSig { params: vec![("x".into(), Ty::Unknown)], ret: Ty::List(Box::new(Ty::Unknown)), param_defaults: vec![] });
         funcs.insert("dict".into(), FuncSig { params: vec![], ret: Ty::Dict(Box::new(Ty::Unknown), Box::new(Ty::Unknown)), param_defaults: vec![] });
-        funcs.insert("tuple".into(), FuncSig { params: vec![("x".into(), Ty::Unknown)], ret: Ty::Unknown, param_defaults: vec![] });
+        funcs.insert("tuple".into(), FuncSig { params: vec![("x".into(), Ty::Unknown)], ret: Ty::Tuple(vec![]), param_defaults: vec![] });
         funcs.insert("getattr".into(), FuncSig { params: vec![("obj".into(), Ty::Unknown), ("name".into(), Ty::Str)], ret: Ty::Unknown, param_defaults: vec![] });
         funcs.insert("setattr".into(), FuncSig { params: vec![("obj".into(), Ty::Unknown), ("name".into(), Ty::Str), ("value".into(), Ty::Unknown)], ret: Ty::Unit, param_defaults: vec![] });
         funcs.insert("hasattr".into(), FuncSig { params: vec![("obj".into(), Ty::Unknown), ("name".into(), Ty::Str)], ret: Ty::Bool, param_defaults: vec![] });
@@ -755,14 +755,21 @@ fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
                 _ => Ty::Unknown,
             };
             // Bind all targets
-            for target in targets {
-                if targets.len() == 1 {
-                    // Single target gets the full element type
-                    env.locals.insert(target.clone(), elem_ty.clone());
-                } else {
-                    // Multiple targets: if iter is List<Tuple<T1, T2, ...>>, bind accordingly
-                    // For v0, just bind all to Unknown
-                    env.locals.insert(target.clone(), Ty::Unknown);
+            if targets.len() == 1 {
+                // Single target gets the full element type
+                env.locals.insert(targets[0].clone(), elem_ty.clone());
+            } else {
+                // Multiple targets: if the element type is a tuple of matching
+                // arity (e.g. iterating dict.items() -> List[Tuple[K, V]]), bind
+                // each target to its component type. Otherwise fall back to
+                // Unknown (mirrors the Stmt::Unpack destructuring above).
+                let elem_tys = match &elem_ty {
+                    Ty::Tuple(tys) if tys.len() == targets.len() => tys.clone(),
+                    _ => vec![Ty::Unknown; targets.len()],
+                };
+                for (i, target) in targets.iter().enumerate() {
+                    let ty = elem_tys.get(i).cloned().unwrap_or(Ty::Unknown);
+                    env.locals.insert(target.clone(), ty);
                 }
             }
             check_body(body, env)?;
@@ -1102,6 +1109,21 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                             check_expr(a, env)?;
                         }
                         Ty::Class(name.clone())
+                    } else if (name == "min" || name == "max") && args.len() == 1 {
+                        // Single-iterable min/max: the result is the element type
+                        // of the list/set argument. A `key=`/other kwarg may also
+                        // be present (e.g. `min(words, key=len)`) — the lone
+                        // positional arg is still the iterable. The 2-arg form
+                        // `min(a, b)` falls through to the generic path below and
+                        // stays Unknown (Rust's std::cmp::min already resolves it).
+                        let arg_ty = check_expr(&args[0], env)?;
+                        for (_, v) in kwargs {
+                            check_expr(v, env)?;
+                        }
+                        match arg_ty {
+                            Ty::List(elem) | Ty::Set(elem) => *elem,
+                            _ => Ty::Unknown,
+                        }
                     } else if let Some(sig) = env.ctx.funcs.get(name.as_str()) {
                         // Regular function call: check arity (positional only in v0).
                         let expected = sig.params.len();

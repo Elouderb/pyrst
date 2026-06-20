@@ -743,20 +743,14 @@ impl<'a> Codegen<'a> {
     }
 
     fn emit_class(&mut self, c: &ClassDef) -> Result<()> {
-        // Collect fields: inherited first, then own fields (no duplicates).
+        // Full transitive field set (ancestors first, then own; deduped by name),
+        // sourced from typeck's get_all_fields so the struct layout, Copy/Default
+        // derivation, and default_val agree even for multi-level inheritance
+        // (a manual one-level walk dropped grandparent fields).
         let mut all_fields: Vec<Param> = Vec::new();
-        for base in &c.bases {
-            if let Some(base_def) = self.ctx.classes.get(base.as_str()).cloned() {
-                for f in &base_def.fields {
-                    if !all_fields.iter().any(|ef: &Param| ef.name == f.name) {
-                        all_fields.push(f.clone());
-                    }
-                }
-            }
-        }
-        for f in &c.fields {
+        for f in self.ctx.get_all_fields(&c.name) {
             if !all_fields.iter().any(|ef: &Param| ef.name == f.name) {
-                all_fields.push(f.clone());
+                all_fields.push(f);
             }
         }
 

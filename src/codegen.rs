@@ -3319,7 +3319,23 @@ const REPR_PRELUDE: &str = r#"trait PyRepr { fn py_repr(&self) -> String; }
 impl PyRepr for i64 { fn py_repr(&self) -> String { format!("{}", self) } }
 impl PyRepr for f64 { fn py_repr(&self) -> String { __py_fmt_float(*self) } }
 impl PyRepr for bool { fn py_repr(&self) -> String { __py_fmt_bool(*self) } }
-impl PyRepr for String { fn py_repr(&self) -> String { format!("'{}'", self) } }
+impl PyRepr for String {
+    fn py_repr(&self) -> String {
+        let mut s = String::from("'");
+        for c in self.chars() {
+            match c {
+                '\\' => s.push_str("\\\\"),
+                '\'' => s.push_str("\\'"),
+                '\n' => s.push_str("\\n"),
+                '\t' => s.push_str("\\t"),
+                '\r' => s.push_str("\\r"),
+                _ => s.push(c),
+            }
+        }
+        s.push('\'');
+        s
+    }
+}
 impl<T: PyRepr> PyRepr for Vec<T> {
     fn py_repr(&self) -> String {
         let xs: Vec<String> = self.iter().map(|x| x.py_repr()).collect();
@@ -3328,6 +3344,7 @@ impl<T: PyRepr> PyRepr for Vec<T> {
 }
 impl<T: PyRepr> PyRepr for std::collections::HashSet<T> {
     fn py_repr(&self) -> String {
+        if self.is_empty() { return "set()".to_string(); }
         let mut xs: Vec<String> = self.iter().map(|x| x.py_repr()).collect();
         xs.sort();
         format!("{{{}}}", xs.join(", "))
@@ -3344,6 +3361,8 @@ impl<A: PyRepr> PyRepr for (A,) { fn py_repr(&self) -> String { format!("({},)",
 impl<A: PyRepr, B: PyRepr> PyRepr for (A, B) { fn py_repr(&self) -> String { format!("({}, {})", self.0.py_repr(), self.1.py_repr()) } }
 impl<A: PyRepr, B: PyRepr, C: PyRepr> PyRepr for (A, B, C) { fn py_repr(&self) -> String { format!("({}, {}, {})", self.0.py_repr(), self.1.py_repr(), self.2.py_repr()) } }
 impl<A: PyRepr, B: PyRepr, C: PyRepr, D: PyRepr> PyRepr for (A, B, C, D) { fn py_repr(&self) -> String { format!("({}, {}, {}, {})", self.0.py_repr(), self.1.py_repr(), self.2.py_repr(), self.3.py_repr()) } }
+impl<A: PyRepr, B: PyRepr, C: PyRepr, D: PyRepr, E: PyRepr> PyRepr for (A, B, C, D, E) { fn py_repr(&self) -> String { format!("({}, {}, {}, {}, {})", self.0.py_repr(), self.1.py_repr(), self.2.py_repr(), self.3.py_repr(), self.4.py_repr()) } }
+impl<A: PyRepr, B: PyRepr, C: PyRepr, D: PyRepr, E: PyRepr, F: PyRepr> PyRepr for (A, B, C, D, E, F) { fn py_repr(&self) -> String { format!("({}, {}, {}, {}, {}, {})", self.0.py_repr(), self.1.py_repr(), self.2.py_repr(), self.3.py_repr(), self.4.py_repr(), self.5.py_repr()) } }
 "#;
 
 pub fn emit(m: &Module, ctx: &TyCtx) -> Result<String> {

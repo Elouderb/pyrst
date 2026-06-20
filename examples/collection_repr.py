@@ -18,3 +18,10 @@ def main() -> None:
     print(f"data: {nums}")
     label: str = str([7, 8, 9])
     print(label)
+    # str elements with a quote are escaped (valid repr).
+    print(["it's", "ok"])
+    # empty collections: set() vs [] vs {}.
+    e_set: set[int] = set()
+    print(e_set)
+    e_list: list[int] = []
+    print(e_list)

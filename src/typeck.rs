@@ -876,7 +876,7 @@ fn elem_arg_check_ty(recv: &Ty, method: &str) -> Option<Ty> {
 /// Card C covers `str` methods; other receivers fall through to Unknown.
 /// Note: pyrst models str.partition/rpartition as list[str] (not a tuple),
 /// matching codegen and the example fixtures.
-fn builtin_method_ret(recv: &Ty, method: &str) -> Ty {
+pub fn builtin_method_ret(recv: &Ty, method: &str) -> Ty {
     match recv {
         Ty::Str => match method {
             "upper" | "lower" | "strip" | "lstrip" | "rstrip" | "replace"

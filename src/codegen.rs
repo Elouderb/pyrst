@@ -184,31 +184,16 @@ impl<'a> Codegen<'a> {
                             };
                         }
                     }
-                    // Builtin method returns by receiver type (mirrors typeck's
-                    // builtin_method_ret) so chained calls resolve — e.g.
-                    // `s.lower().startswith(x)` types as Bool. Class methods use
-                    // their declared return; everything else Unknown.
-                    match self.type_of_expr(obj) {
-                        Ty::Str => match name.as_str() {
-                            "upper" | "lower" | "strip" | "lstrip" | "rstrip"
-                            | "replace" | "capitalize" | "title" | "swapcase"
-                            | "casefold" | "format" | "zfill" | "ljust" | "rjust"
-                            | "center" | "removeprefix" | "removesuffix"
-                            | "expandtabs" | "join" => Ty::Str,
-                            "split" | "rsplit" | "splitlines" | "partition"
-                            | "rpartition" => Ty::List(Box::new(Ty::Str)),
-                            "find" | "rfind" | "index" | "rindex" | "count" => Ty::Int,
-                            "startswith" | "endswith" | "isdigit" | "isalpha"
-                            | "isupper" | "islower" | "isspace" | "isalnum"
-                            | "isidentifier" | "isnumeric" | "isprintable"
-                            | "istitle" | "isdecimal" => Ty::Bool,
-                            _ => Ty::Unknown,
-                        },
-                        Ty::Set(_) if matches!(name.as_str(),
-                            "issubset" | "issuperset" | "isdisjoint") => Ty::Bool,
-                        Ty::Class(cls) => self.ctx.get_method(&cls, name)
-                            .map(|s| s.ret.clone()).unwrap_or(Ty::Unknown),
-                        _ => Ty::Unknown,
+                    // Class methods use their declared return (codegen-specific
+                    // dispatch); for builtin receivers (str/list/set/dict) delegate
+                    // to typeck's single source of truth so the two never drift and
+                    // chained calls resolve — e.g. `s.lower().startswith(x)` -> Bool,
+                    // `d.items()` -> List(Tuple(K, V)).
+                    let recv = self.type_of_expr(obj);
+                    if let Ty::Class(cls) = &recv {
+                        self.ctx.get_method(cls, name).map(|s| s.ret.clone()).unwrap_or(Ty::Unknown)
+                    } else {
+                        crate::typeck::builtin_method_ret(&recv, name)
                     }
                 } else {
                     Ty::Unknown
@@ -2682,12 +2667,14 @@ impl<'a> Codegen<'a> {
                         }
                     }
 
-                    // Dict methods - return iterators directly (will be wrapped by for loop)
+                    // Dict views - materialize into a Vec so they work both in a
+                    // for-loop and as a value (e.g. print(d.keys()), len(d.values())),
+                    // matching their List(K)/List(V) static type.
                     if name == "keys" {
-                        return Ok(format!("{}.keys().cloned()", obj_s));
+                        return Ok(format!("{}.keys().cloned().collect::<Vec<_>>()", obj_s));
                     }
                     if name == "values" {
-                        return Ok(format!("{}.values().cloned()", obj_s));
+                        return Ok(format!("{}.values().cloned().collect::<Vec<_>>()", obj_s));
                     }
                     if name == "items" {
                         // Collect into a Vec<(K, V)> so the for-loop lowering treats it

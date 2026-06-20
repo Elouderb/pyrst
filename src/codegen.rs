@@ -1275,7 +1275,7 @@ impl<'a> Codegen<'a> {
                 let is_iterator = i.contains(".enumerate()") || i.contains(".zip(") ||
                                  i.contains(".cloned()") || i.contains(".copied()") ||
                                  i.contains(".keys()") || i.contains(".values()") ||
-                                 i.contains(".items()");
+                                 i.contains(".items()") || i.contains(".collect::<Vec<_>>()");
                 // For ranges, use into_iter(); for collections, use iter().cloned() or iter().copied().
                 // If it's already an iterator (enumerate/zip), use directly.
                 let iter_expr = if is_iterator {
@@ -2654,9 +2654,56 @@ impl<'a> Codegen<'a> {
                         return Ok(format!("{}.values().cloned()", obj_s));
                     }
                     if name == "items" {
-                        return Ok(format!("{}.iter().map(|(k, v)| (k.clone(), v.clone()))", obj_s));
+                        // Collect into a Vec<(K, V)> so the for-loop lowering treats it
+                        // as a normal collection (it wraps the iterable in .iter().cloned()).
+                        return Ok(format!("{}.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<Vec<_>>()", obj_s));
                     }
+
+                    // Set methods (gated on receiver type — many names overlap with
+                    // list/dict, so disambiguate by the static type of the receiver).
+                    if let Ty::Set(_) = self.type_of_expr(obj) {
+                        match name.as_str() {
+                            "add" if !parts.is_empty() =>
+                                return Ok(format!("{{ {}.insert({}); }}", obj_s, parts[0])),
+                            // NB: unlike Python, neither discard nor remove raises on an
+                            // absent element here (Rust's HashSet::remove returns an ignored bool).
+                            "discard" | "remove" if !parts.is_empty() =>
+                                return Ok(format!("{{ {}.remove(&{}); }}", obj_s, parts[0])),
+                            "update" if !parts.is_empty() =>
+                                return Ok(format!("{{ {}.extend({}.iter().cloned()); }}", obj_s, parts[0])),
+                            "union" if !parts.is_empty() =>
+                                return Ok(format!("{}.union(&{}).cloned().collect::<std::collections::HashSet<_>>()", obj_s, parts[0])),
+                            "intersection" if !parts.is_empty() =>
+                                return Ok(format!("{}.intersection(&{}).cloned().collect::<std::collections::HashSet<_>>()", obj_s, parts[0])),
+                            "difference" if !parts.is_empty() =>
+                                return Ok(format!("{}.difference(&{}).cloned().collect::<std::collections::HashSet<_>>()", obj_s, parts[0])),
+                            "symmetric_difference" if !parts.is_empty() =>
+                                return Ok(format!("{}.symmetric_difference(&{}).cloned().collect::<std::collections::HashSet<_>>()", obj_s, parts[0])),
+                            "issubset" if !parts.is_empty() =>
+                                return Ok(format!("{}.is_subset(&{})", obj_s, parts[0])),
+                            "issuperset" if !parts.is_empty() =>
+                                return Ok(format!("{}.is_superset(&{})", obj_s, parts[0])),
+                            "isdisjoint" if !parts.is_empty() =>
+                                return Ok(format!("{}.is_disjoint(&{})", obj_s, parts[0])),
+                            _ => {}
+                        }
+                    }
+
+                    // dict.update(other) — merge another mapping in place.
+                    if name == "update" && !parts.is_empty() {
+                        return Ok(format!("{{ {}.extend({}.clone()); }}", obj_s, parts[0]));
+                    }
+
                     if name == "pop" {
+                        // list.pop(): remove and return the last element (or pop(i) -> remove index).
+                        if let Ty::List(_) = self.type_of_expr(obj) {
+                            return Ok(if parts.is_empty() {
+                                format!("{}.pop().expect(\"pop from empty list\")", obj_s)
+                            } else {
+                                format!("{}.remove({} as usize)", obj_s, parts[0])
+                            });
+                        }
+                        // dict.pop(key[, default])
                         if parts.is_empty() {
                             return Err(crate::diag::Error::Codegen("pop requires at least one argument".into()));
                         } else if parts.len() == 1 {

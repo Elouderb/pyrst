@@ -179,10 +179,20 @@ impl<'a> Codegen<'a> {
                             };
                         }
                     }
-                    // Class method dispatch
-                    if let Ty::Class(cls) = self.type_of_expr(obj) {
-                        self.ctx.get_method(&cls, name).map(|s| s.ret.clone()).unwrap_or(Ty::Unknown)
-                    } else { Ty::Unknown }
+                    // Builtin predicate methods (str/set) return bool; class
+                    // methods use their declared return; everything else Unknown.
+                    match self.type_of_expr(obj) {
+                        Ty::Str if matches!(name.as_str(),
+                            "startswith" | "endswith" | "isdigit" | "isalpha"
+                            | "isupper" | "islower" | "isspace" | "isalnum"
+                            | "isidentifier" | "isnumeric" | "isprintable"
+                            | "istitle" | "isdecimal") => Ty::Bool,
+                        Ty::Set(_) if matches!(name.as_str(),
+                            "issubset" | "issuperset" | "isdisjoint") => Ty::Bool,
+                        Ty::Class(cls) => self.ctx.get_method(&cls, name)
+                            .map(|s| s.ret.clone()).unwrap_or(Ty::Unknown),
+                        _ => Ty::Unknown,
+                    }
                 } else {
                     Ty::Unknown
                 }

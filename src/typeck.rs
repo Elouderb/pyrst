@@ -638,6 +638,23 @@ fn unify_branch_types(a: Ty, b: Ty) -> Option<Ty> {
     })
 }
 
+/// Unify the element types of a homogeneous collection literal (list/set).
+///
+/// Returns the unified element type when the two element types can coexist in
+/// one Rust collection, or `None` when they are genuinely heterogeneous and the
+/// literal should be rejected. Stays permissive on `Unknown` (and collections
+/// with an `Unknown` inner) via the shared `unify_branch_types` arms; only
+/// both-concrete, non-`Unknown`, incompatible pairs return `None`.
+///
+/// Note: Int/Float numeric mixing is intentionally NOT widened here. codegen
+/// emits each literal with its own type (`vec![(1i64), (2.0f64)]`), so accepting
+/// `[1, 2.0]` would pass typeck but fail rustc. Promoting mixed numeric literals
+/// to a homogeneous float collection requires a matching codegen cast and is
+/// tracked separately (card 5c2f31d8).
+fn unify_elem_types(a: Ty, b: Ty) -> Option<Ty> {
+    unify_branch_types(a, b)
+}
+
 fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
     match s {
         Stmt::Pass(_) | Stmt::Break(_) | Stmt::Continue(_) => Ok(()),
@@ -1045,24 +1062,50 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
             Ty::Dict(Box::new(key_ty), Box::new(val_ty))
         }
         Expr::None_(_) => Ty::Unit,
-        Expr::List(elems, _) => {
+        Expr::List(elems, span) => {
             let elem_ty = if elems.is_empty() {
                 Ty::Unknown
             } else {
-                let first = check_expr(&elems[0], env)?;
-                for e in &elems[1..] { check_expr(e, env)?; }
-                first
+                // Unify all element types: every element is checked (for its own
+                // errors), and their types are folded together. A genuinely
+                // heterogeneous literal (two both-concrete, non-Unknown,
+                // non-numeric-mixable types) is rejected here instead of being
+                // silently typed as `List(first-element-type)` and deferred to
+                // rustc. Int/Float mixing and Unknown elements stay permissive.
+                let mut acc = check_expr(&elems[0], env)?;
+                for e in &elems[1..] {
+                    let next = check_expr(e, env)?;
+                    acc = unify_elem_types(acc.clone(), next.clone()).ok_or_else(|| Error::Type {
+                        span: *span,
+                        msg: format!(
+                            "list elements have incompatible types: {:?} vs {:?}",
+                            acc, next
+                        ),
+                    })?;
+                }
+                acc
             };
             Ty::List(Box::new(elem_ty))
         }
-        Expr::Set(elems, _) => {
-            if elems.is_empty() {
-                Ty::Set(Box::new(Ty::Unknown))
+        Expr::Set(elems, span) => {
+            let elem_ty = if elems.is_empty() {
+                Ty::Unknown
             } else {
-                let elem_ty = check_expr(&elems[0], env)?;
-                for e in &elems[1..] { check_expr(e, env)?; }
-                Ty::Set(Box::new(elem_ty))
-            }
+                // Same element-type unification as list literals above.
+                let mut acc = check_expr(&elems[0], env)?;
+                for e in &elems[1..] {
+                    let next = check_expr(e, env)?;
+                    acc = unify_elem_types(acc.clone(), next.clone()).ok_or_else(|| Error::Type {
+                        span: *span,
+                        msg: format!(
+                            "set elements have incompatible types: {:?} vs {:?}",
+                            acc, next
+                        ),
+                    })?;
+                }
+                acc
+            };
+            Ty::Set(Box::new(elem_ty))
         }
         Expr::Dict(pairs, _) => {
             if pairs.is_empty() {
@@ -1848,16 +1891,38 @@ mod tests {
     }
 
     #[test]
-    fn infer_list_first_elem_wins_bug1() {
-        // BUG 1: heterogeneous list — only the FIRST element determines the type.
-        // Second element (Str) is evaluated for side effects but its type is ignored.
+    fn error_heterogeneous_list_rejected() {
+        // A list mixing two genuinely-incompatible concrete types (Int vs Str)
+        // is rejected at the type checker rather than silently typed as the
+        // first element's type and deferred to rustc.
         let ctx = TyCtx::new();
         let mut env = make_env(&ctx);
         let e = Expr::List(vec![int_lit(1), str_lit("oops")], Span::DUMMY);
-        assert_eq!(
-            check_expr(&e, &mut env).unwrap(),
-            Ty::List(Box::new(Ty::Int))
-        );
+        let err = check_expr(&e, &mut env).unwrap_err();
+        match err {
+            Error::Type { msg, .. } => {
+                assert!(
+                    msg.contains("incompatible types"),
+                    "expected incompatible-types message, got: {msg}"
+                );
+            }
+            other => panic!("expected Error::Type, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_list_int_float_rejected() {
+        // `[1, 2.0]` is rejected at typeck: codegen emits each literal with its
+        // own type (`vec![(1i64), (2.0f64)]`), which rustc rejects, so typeck
+        // must not accept it. Python-style numeric promotion to list[float]
+        // (typeck unify + codegen int->f64 cast) is tracked in card 5c2f31d8.
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        let e = Expr::List(vec![int_lit(1), float_lit(2.0)], Span::DUMMY);
+        assert!(matches!(check_expr(&e, &mut env), Err(Error::Type { .. })));
+        // Order-independent: Float first then Int is also rejected.
+        let e2 = Expr::List(vec![float_lit(1.5), int_lit(2)], Span::DUMMY);
+        assert!(matches!(check_expr(&e2, &mut env), Err(Error::Type { .. })));
     }
 
     #[test]

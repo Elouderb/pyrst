@@ -872,8 +872,9 @@ fn elem_arg_check_ty(recv: &Ty, method: &str) -> Option<Ty> {
     }
 }
 
-/// Concrete return type for a builtin method on a given receiver, or Unknown.
-/// Card C covers `str` methods; other receivers fall through to Unknown.
+/// Concrete return type of a builtin method call on a known builtin receiver
+/// (str/list/set/dict); unrecognized methods or receivers return Unknown.
+/// This is the single source of truth — codegen's type_of_expr delegates here.
 /// Note: pyrst models str.partition/rpartition as list[str] (not a tuple),
 /// matching codegen and the example fixtures.
 pub fn builtin_method_ret(recv: &Ty, method: &str) -> Ty {

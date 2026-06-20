@@ -1287,8 +1287,7 @@ impl<'a> Codegen<'a> {
                 let is_range = i.contains("..");
                 let is_iterator = i.contains(".enumerate()") || i.contains(".zip(") ||
                                  i.contains(".cloned()") || i.contains(".copied()") ||
-                                 i.contains(".keys()") || i.contains(".values()") ||
-                                 i.contains(".items()") || i.contains(".collect::<Vec<_>>()");
+                                 i.contains(".collect::<Vec<_>>()");
                 // For ranges, use into_iter(); for collections, use iter().cloned() or iter().copied().
                 // If it's already an iterator (enumerate/zip), use directly.
                 let iter_expr = if is_iterator {

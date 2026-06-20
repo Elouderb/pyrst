@@ -1518,7 +1518,6 @@ impl<'a> Codegen<'a> {
                 self.line(&format!("{}.{} = {};", obj, attr, v));
             }
             Stmt::IndexAssign { obj, idx, value, .. } => {
-                let i = self.emit_expr(idx)?;
                 let v = self.emit_owned(value)?;
                 // Check if obj is a dict or list based on type info
                 let is_dict = self.locals.get(obj)
@@ -1526,8 +1525,12 @@ impl<'a> Codegen<'a> {
                     .map(|t| matches!(t, Ty::Dict(..)))
                     .unwrap_or(false);
                 if is_dict {
-                    self.line(&format!("{}.insert({}, {});", obj, i, v));
+                    // HashMap::insert takes ownership of the key, so emit it owned
+                    // (a String key var becomes `k.clone()`; Copy keys are unchanged).
+                    let k = self.emit_owned(idx)?;
+                    self.line(&format!("{}.insert({}, {});", obj, k, v));
                 } else {
+                    let i = self.emit_expr(idx)?;
                     self.line(&format!("{}[{} as usize] = {};", obj, i, v));
                 }
             }
@@ -2721,8 +2724,10 @@ impl<'a> Codegen<'a> {
                     // list/dict, so disambiguate by the static type of the receiver).
                     if let Ty::Set(_) = self.type_of_expr(obj) {
                         match name.as_str() {
+                            // insert takes ownership, so emit the element owned
+                            // (a String var becomes `x.clone()`).
                             "add" if !parts.is_empty() =>
-                                return Ok(format!("{{ {}.insert({}); }}", obj_s, parts[0])),
+                                return Ok(format!("{{ {}.insert({}); }}", obj_s, self.emit_owned(&args[0])?)),
                             // NB: unlike Python, neither discard nor remove raises on an
                             // absent element here (Rust's HashSet::remove returns an ignored bool).
                             "discard" | "remove" if !parts.is_empty() =>
@@ -2886,14 +2891,19 @@ impl<'a> Codegen<'a> {
                 }
             }
             Expr::Index { obj, idx, .. } => {
-                let obj_ty = if let Expr::Ident(name, _) = obj.as_ref() {
-                    self.locals.get(name.as_str()).or_else(|| self.ctx.vars.get(name.as_str())).cloned()
-                } else {
-                    None
-                };
+                // type_of_expr (not just an Ident lookup) so nested/chained
+                // receivers resolve — e.g. grid["row"]["x"] sees the inner Dict.
+                let obj_ty = self.type_of_expr(obj);
                 let o = self.emit_expr(obj)?;
+                // Tuple subscript with a literal index -> Rust field access (t.N),
+                // cloned so the element can be used without moving out of the tuple.
+                if let Ty::Tuple(_) = obj_ty {
+                    if let Expr::Int(n, _) = idx.as_ref() {
+                        return Ok(format!("({}).{}.clone()", o, n));
+                    }
+                }
                 let i = self.emit_expr(idx)?;
-                match obj_ty.as_ref() {
+                match Some(&obj_ty) {
                     Some(Ty::Dict(..)) => format!("{}.get(&{}).cloned().expect(\"key not found\")", o, i),
                     Some(Ty::Str) => {
                         // String indexing with negative index support

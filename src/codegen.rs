@@ -36,6 +36,79 @@ impl<'a> Codegen<'a> {
         matches!(ty, Ty::Int | Ty::Float | Ty::Bool | Ty::Unit)
     }
 
+    /// True if a type has no `Unknown` anywhere — only then is it safe to hoist
+    /// (an `Unknown` element would render as `()` and mismatch a real value).
+    fn fully_concrete(ty: &Ty) -> bool {
+        match ty {
+            Ty::Unknown => false,
+            Ty::List(e) | Ty::Set(e) | Ty::Option(e) => Self::fully_concrete(e),
+            Ty::Dict(k, v) => Self::fully_concrete(k) && Self::fully_concrete(v),
+            Ty::Tuple(ts) => ts.iter().all(Self::fully_concrete),
+            _ => true,
+        }
+    }
+
+    /// A safe Rust default initializer for hoisting a local, or None for types
+    /// with no usable default (Copy class without `Default`, Tuple, Unit,
+    /// Unknown, File) — those names are not hoisted and keep their in-place let.
+    fn default_val(&self, ty: &Ty) -> Option<String> {
+        if !Self::fully_concrete(ty) { return None; }
+        Some(match ty {
+            Ty::Int => "0i64".to_string(),
+            Ty::Float => "0.0f64".to_string(),
+            Ty::Bool => "false".to_string(),
+            Ty::Str => "String::new()".to_string(),
+            Ty::List(_) => "Vec::new()".to_string(),
+            Ty::Set(_) => "::std::collections::HashSet::new()".to_string(),
+            Ty::Dict(_, _) => "::std::collections::HashMap::new()".to_string(),
+            Ty::Option(_) => "None".to_string(),
+            Ty::Class(n) => {
+                // Only non-Copy structs derive Default (mirrors emit_class).
+                let all_copy = self.ctx.get_all_fields(n).iter().all(|f| {
+                    Ty::from_type_expr(&f.ty).map(|t| self.is_copy_type(&t)).unwrap_or(false)
+                });
+                if all_copy { return None; }
+                "Default::default()".to_string()
+            }
+            _ => return None,
+        })
+    }
+
+    /// Collect names first-assigned inside a nested block (depth > 0) and all
+    /// unpack targets (never hoistable). Recurses through every block but not
+    /// into nested function/class definitions (those have their own scope).
+    fn collect_hoistable(
+        stmts: &[Stmt],
+        depth: usize,
+        block_assigned: &mut std::collections::HashSet<String>,
+        unpack: &mut std::collections::HashSet<String>,
+    ) {
+        for s in stmts {
+            match s {
+                Stmt::Assign { target, .. } => { if depth > 0 { block_assigned.insert(target.clone()); } }
+                Stmt::Unpack { targets, .. } => { for t in targets { unpack.insert(t.clone()); } }
+                Stmt::If { then, elifs, else_, .. } => {
+                    Self::collect_hoistable(then, depth + 1, block_assigned, unpack);
+                    for (_, b) in elifs { Self::collect_hoistable(b, depth + 1, block_assigned, unpack); }
+                    if let Some(b) = else_ { Self::collect_hoistable(b, depth + 1, block_assigned, unpack); }
+                }
+                Stmt::While { body, .. } | Stmt::For { body, .. } | Stmt::With { body, .. } => {
+                    Self::collect_hoistable(body, depth + 1, block_assigned, unpack);
+                }
+                Stmt::Try { body, handlers, else_, finally_, .. } => {
+                    Self::collect_hoistable(body, depth + 1, block_assigned, unpack);
+                    for h in handlers { Self::collect_hoistable(&h.body, depth + 1, block_assigned, unpack); }
+                    if let Some(b) = else_ { Self::collect_hoistable(b, depth + 1, block_assigned, unpack); }
+                    if let Some(b) = finally_ { Self::collect_hoistable(b, depth + 1, block_assigned, unpack); }
+                }
+                Stmt::Match { arms, .. } => {
+                    for a in arms { Self::collect_hoistable(&a.body, depth + 1, block_assigned, unpack); }
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// Replace identifier `old_name` with `new_name` in code, respecting word boundaries
     /// to avoid corrupting field names like "price" when replacing "i"
     fn replace_identifier(code: &str, old_name: &str, new_name: &str) -> String {
@@ -635,6 +708,27 @@ impl<'a> Codegen<'a> {
         // `acc = 0` accumulator later assigned a float).
         self.prescan_types(&f.body);
 
+        // Python has function scope, but pyrst emits if/for/while/with/try bodies
+        // as Rust `{}` blocks. Hoist locals first-assigned inside a block to
+        // function scope (with a safe default) so they stay visible after the
+        // block. Params, unpack targets, and names whose type has no usable
+        // default keep their in-place `let` (and the prior block-scope limit).
+        let mut block_assigned = std::collections::HashSet::new();
+        let mut unpack_targets = std::collections::HashSet::new();
+        Self::collect_hoistable(&f.body, 0, &mut block_assigned, &mut unpack_targets);
+        let params: std::collections::HashSet<&str> = f.params.iter().map(|p| p.name.as_str()).collect();
+        let mut hoist: Vec<String> = block_assigned.into_iter()
+            .filter(|n| !unpack_targets.contains(n) && !params.contains(n.as_str()) && !self.declared.contains(n))
+            .collect();
+        hoist.sort();
+        for name in hoist {
+            let ty = self.locals.get(&name).cloned().unwrap_or(Ty::Unknown);
+            if let Some(def) = self.default_val(&ty) {
+                self.line(&format!("let mut {}: {} = {};", name, rust_ty(&ty), def));
+                self.declared.insert(name);
+            }
+        }
+
         for s in &f.body {
             self.emit_stmt(s)?;
         }
@@ -1088,7 +1182,20 @@ impl<'a> Codegen<'a> {
                     for (_, body) in elifs { self.prescan_types(body); }
                     if let Some(body) = else_ { self.prescan_types(body); }
                 }
-                Stmt::While { body, .. } | Stmt::For { body, .. } | Stmt::With { body, .. } => {
+                Stmt::For { targets, iter, body, .. } => {
+                    // Register the loop variable's type so the body sees it (e.g.
+                    // a `Temp` element's float fields aren't mistyped as Int).
+                    if targets.len() == 1 {
+                        let elem = match self.type_of_expr(iter) {
+                            Ty::List(inner) | Ty::Set(inner) => *inner,
+                            Ty::Str => Ty::Str,
+                            _ => Ty::Int, // range / unknown iterables yield ints
+                        };
+                        self.locals.entry(targets[0].clone()).or_insert(elem);
+                    }
+                    self.prescan_types(body);
+                }
+                Stmt::While { body, .. } | Stmt::With { body, .. } => {
                     self.prescan_types(body);
                 }
                 Stmt::Try { body, handlers, else_, finally_, .. } => {
@@ -1229,6 +1336,9 @@ impl<'a> Codegen<'a> {
                     if Self::types_conflict(&cur, &value_ty) {
                         self.locals.insert(target.clone(), value_ty);
                         self.line(&format!("let mut {} = {};", target, v));
+                    } else if matches!(cur, Ty::Float) && matches!(value_ty, Ty::Int) {
+                        // Reassigning an int into a float-typed (e.g. hoisted) var.
+                        self.line(&format!("{} = {} as f64;", target, v));
                     } else {
                         self.line(&format!("{} = {};", target, v));
                     }

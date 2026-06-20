@@ -104,6 +104,18 @@ impl<'a> Codegen<'a> {
                 match op {
                     BinOp::Div => Ty::Float,
                     BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Mod | BinOp::FloorDiv | BinOp::Pow => {
+                        // Operator overloading: a class lhs uses its dunder return type.
+                        if let Ty::Class(cls) = &l {
+                            let dunder = match op {
+                                BinOp::Add => Some("__add__"),
+                                BinOp::Sub => Some("__sub__"),
+                                BinOp::Mul => Some("__mul__"),
+                                _ => None,
+                            };
+                            if let Some(ret) = dunder.and_then(|d| self.ctx.get_method(cls, d)).map(|s| s.ret.clone()) {
+                                return ret;
+                            }
+                        }
                         // String concatenation for Add
                         if *op == BinOp::Add && (l == Ty::Str || r == Ty::Str) {
                             Ty::Str
@@ -660,12 +672,16 @@ impl<'a> Codegen<'a> {
                 .unwrap_or(false)
         });
 
+        // A user-defined __eq__ emits a manual `impl PartialEq`, so don't ALSO
+        // derive it (that would be a conflicting-impl error, E0119).
+        let has_eq = c.methods.iter().any(|m| m.name == "__eq__");
+        let pe = if has_eq { "" } else { ", PartialEq" };
         let derives = if all_fields_copy {
-            "#[derive(Copy, Clone, Debug, PartialEq)]"
+            format!("#[derive(Copy, Clone, Debug{})]", pe)
         } else {
-            "#[derive(Clone, Debug, PartialEq, Default)]"
+            format!("#[derive(Clone, Debug{}, Default)]", pe)
         };
-        self.line(derives);
+        self.line(&derives);
         self.line(&format!("struct {} {{", c.name));
         self.indent += 1;
         for f in &all_fields {

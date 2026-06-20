@@ -64,6 +64,8 @@ assert_output set_methods "$(printf '4\n3\n2\n4\n1\n1\n3\nFalse\nTrue\nTrue\n3')
 assert_output dict_update_items "$(printf '3\n6')"
 assert_output dict_views_repr "$(printf "['x']\n[10]\n[('x', 10)]\n{1, 2, 3}\n[5, 6, 7]")"
 assert_output file_io "$(printf '3\nalpha\nbeta\ngamma\n17')"
+assert_output inference_edges_ternary_and_nested "$(printf '2\n1\n5\n1\n4')"
+assert_output strings_fstring_formatting "$(printf "Price: \$19.99\nTotal: \$99.95\n      Item | 00042\nInput: [  Hello WORLD  ]\nCleaned: [hello world]\nCount of 'the': 3\nPosition of 'cat': 4\nrevenue: 1234.57 (87.3%%)\nReplaced: apple; banana; cherry\nParts count: 3\nFirst: apple")"
 assert_output wordfreq "$(printf '4\n2\n8\n4\nmany')"
 assert_output rpn "$(printf '7\n14\n6')"
 assert_output accounts "$(printf '150\n220\n150')"

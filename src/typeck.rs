@@ -1285,6 +1285,19 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 _ => {
                     // Arithmetic: apply numeric type promotion rules
                     match (&l, &r) {
+                        // Operator overloading: a class lhs dispatches to the
+                        // declared return type of its dunder (__add__/__sub__/__mul__).
+                        (Ty::Class(cls), _) => {
+                            let dunder = match op {
+                                BinOp::Add => Some("__add__"),
+                                BinOp::Sub => Some("__sub__"),
+                                BinOp::Mul => Some("__mul__"),
+                                _ => None,
+                            };
+                            dunder.and_then(|d| env.ctx.get_method(cls, d))
+                                .map(|s| s.ret.clone())
+                                .unwrap_or_else(|| l.clone())
+                        }
                         // Same type: return that type
                         (a, b) if a == b => l,
                         // Mixed numeric types: promote to float

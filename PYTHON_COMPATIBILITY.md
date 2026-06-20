@@ -178,7 +178,7 @@ A broad surface is supported. Representative coverage:
 | `.sort()` / `.reverse()` | ✅ Supported | In-place reordering |
 | `.index()` / `.count()` | ✅ Supported | Returns `int` |
 | `.copy()` | ✅ Supported | Shallow copy |
-| `.pop()` | ❌ Not Supported | Neither `pop()` nor `pop(i)` currently compiles |
+| `.pop()` / `.pop(i)` | ✅ Supported | `pop()` removes/returns the last element; `pop(i)` removes by index |
 | `list[i]` / `list[i] = val` | ✅ Supported | Index access / assignment |
 | List slicing (`list[1:3]`) | ✅ Supported | Returns a new list |
 
@@ -193,22 +193,20 @@ A broad surface is supported. Representative coverage:
 | `.get(key, default)` | ✅ Supported | Safe key lookup |
 | `.keys()` / `.values()` | ✅ Supported | Iterable in a `for` loop |
 | `.pop(key)` / `.clear()` / `.copy()` | ✅ Supported | `pop` takes an explicit key |
-| `.items()` | ❌ Not Supported | Iterating `for k, v in d.items()` does not compile |
-| `.update()` | ❌ Not Supported | Does not compile |
+| `.items()` | ✅ Supported | `for k, v in d.items()` iterates key/value pairs |
+| `.update()` | ✅ Supported | Merges another mapping in place |
 
 ---
 
 ## Set Methods
 
-Sets work as typed **literals**, **comprehensions**, **membership tests** (`x in s`), and **iteration**. The mutation and algebra *methods*, however, are not currently lowered by codegen:
-
 | Method | Status | Notes |
 |--------|--------|-------|
-| `.add()` / `.discard()` / `.remove()` / `.clear()` | ❌ Not Supported | Codegen gap — does not compile |
-| `.union()` / `.intersection()` / `.difference()` / `.symmetric_difference()` | ❌ Not Supported | Codegen gap — does not compile |
-| `.issubset()` / `.issuperset()` / `.isdisjoint()` | ❌ Not Supported | Codegen gap |
-
-> These methods type-check but fail at the Rust stage — a case where the formal checker is currently ahead of codegen.
+| `.add()` / `.clear()` | ✅ Supported | In-place mutation |
+| `.discard()` / `.remove()` | ⚠️ Supported | In-place removal — but neither raises `KeyError` on an absent element (unlike Python) |
+| `.update()` | ✅ Supported | Adds all elements of another set |
+| `.union()` / `.intersection()` / `.difference()` / `.symmetric_difference()` | ✅ Supported | Returns a new set |
+| `.issubset()` / `.issuperset()` / `.isdisjoint()` | ✅ Supported | Returns `bool` |
 
 ---
 
@@ -280,7 +278,6 @@ See `DESIGN_DECISIONS.md` §11 and `RUST_BACKEND.md` for the `catch_unwind` lowe
 - **Printing collections:** `print([...])`, `print({...})`, and `str([...])` are unsupported — the backing `Vec`/`HashMap`/`HashSet` is not `Display`. Print elements individually, or build a string with `", ".join(...)`.
 - **No ternary expression:** use an `if`/`else` statement.
 - **No first-class function values to builtins:** e.g. `map(str, xs)` does not work; use a comprehension.
-- **Partial method surface / checker ahead of codegen:** some collection methods type-check but do not yet lower to Rust — notably all `set` mutation/algebra methods, `dict.update()`, `dict.items()` iteration, and `list.pop()`. These fail at the Rust stage rather than at `pyrst check`.
 - **`@classmethod`:** the `cls` parameter cannot be cleanly annotated, so classmethods are effectively unsupported (use `@staticmethod` or a module function).
 - **Caught exceptions** print no stderr noise; uncaught ones still surface a message and a non-zero exit code.
 

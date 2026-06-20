@@ -10,16 +10,16 @@ pub struct Formatter {
     output: String,
     indent_level: usize,
     indent_width: usize,  // spaces per indent
-    line_length: usize,   // target line length (soft limit)
 }
 
 impl Formatter {
-    pub fn new(indent_width: usize, line_length: usize) -> Self {
+    // `_line_length` (soft wrap limit) is accepted for signature stability but
+    // not yet honored by the formatter; the dead field has been removed.
+    pub fn new(indent_width: usize, _line_length: usize) -> Self {
         Self {
             output: String::new(),
             indent_level: 0,
             indent_width,
-            line_length,
         }
     }
 

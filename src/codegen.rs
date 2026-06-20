@@ -120,7 +120,6 @@ impl<'a> Codegen<'a> {
         // Simple approach: split on word boundaries and reconstruct
         let mut result = String::new();
         let mut chars = code.chars().peekable();
-        let old_chars: Vec<char> = old_name.chars().collect();
 
         while let Some(ch) = chars.next() {
             // Check if we're at the start of an identifier that matches old_name
@@ -338,7 +337,7 @@ impl<'a> Codegen<'a> {
                     _ => Ty::List(Box::new(Ty::Unknown))
                 }
             }
-            Expr::SetComp { elt, target, iter, .. } => {
+            Expr::SetComp { elt, target: _, iter, .. } => {
                 // Similar to ListComp
                 let iter_ty = self.type_of_expr(iter);
                 if let Ty::List(ref inner) | Ty::Set(ref inner) = iter_ty {
@@ -370,7 +369,7 @@ impl<'a> Codegen<'a> {
                     Ty::Set(Box::new(Ty::Unknown))
                 }
             }
-            Expr::DictComp { key, val, target, iter, .. } => {
+            Expr::DictComp { key, val, target: _, iter, .. } => {
                 // For dict comprehension, infer key and value types
                 let iter_ty = self.type_of_expr(iter);
                 let key_ty = if let Expr::Attr { name, .. } = key.as_ref() {
@@ -495,61 +494,6 @@ impl<'a> Codegen<'a> {
             }
             _ => Ty::Unknown,
         }
-    }
-
-    /// Infer the element type of a comprehension element expression
-    /// This helps determine the type of [expr for x in iter] when we can't type-check directly
-    fn infer_comp_element_type(&self, elt: &Expr) -> Ty {
-        // Fallback method for when we don't have loop variable type
-        match elt {
-            Expr::Call { callee, .. } => {
-                if let Expr::Ident(n, _) = callee.as_ref() {
-                    // Built-in function call
-                    match n.as_str() {
-                        "float" => Ty::Float,
-                        "int" => Ty::Int,
-                        "str" => Ty::Str,
-                        "bool" => Ty::Bool,
-                        _ => Ty::Unknown,
-                    }
-                } else {
-                    Ty::Unknown
-                }
-            }
-            _ => Ty::Unknown,
-        }
-    }
-
-    pub fn emit_module(mut self, m: &Module) -> Result<String> {
-        // Preamble — pyrst stdlib shims live here.
-        self.line("#![allow(unused_parens, unused_variables, unused_mut, dead_code)]");
-        self.line("use std::io::Write;");
-        self.line("");
-        self.line("fn __py_fmt_float(x: f64) -> String {");
-        self.line("    if x.fract() == 0.0 { format!(\"{:.1}\", x) } else { format!(\"{}\", x) }");
-        self.line("}");
-        self.line("fn __py_fmt_bool(x: bool) -> String {");
-        self.line("    if x { \"True\".to_string() } else { \"False\".to_string() }");
-        self.line("}");
-        self.line(REPR_PRELUDE);
-        self.line(FILE_PRELUDE);
-        self.line("");
-        self.line("// ----- user code -----");
-
-        for s in &m.stmts {
-            self.emit_top_stmt(s)?;
-        }
-
-        // Synthetic entry point: dispatch to user's `main()` if present.
-        if self.ctx.funcs.contains_key("main") {
-            self.line("");
-            self.line("fn main() { user_main(); }");
-        } else {
-            self.line("");
-            self.line("fn main() {}");
-        }
-
-        Ok(self.out)
     }
 
     fn emit_top_stmt(&mut self, s: &Stmt) -> Result<()> {
@@ -2070,7 +2014,7 @@ impl<'a> Codegen<'a> {
                             if let Some((_, key_expr)) = kwargs.iter().find(|(n, _)| n == "key") {
                                 // sorted with key parameter
                                 // Determine the return type of the key expression
-                                let key_ret_ty = if let Expr::Lambda { params, body, .. } = key_expr {
+                                let key_ret_ty = if let Expr::Lambda { params: _, body, .. } = key_expr {
                                     // For lambdas, infer from the body expression
                                     // We need to temporarily register the parameter to type-check the body
                                     // But since type_of_expr is &self, we can't do that easily
@@ -2376,7 +2320,7 @@ impl<'a> Codegen<'a> {
                             if args.len() < 2 || args.len() > 3 {
                                 return Err(crate::diag::Error::Codegen("getattr requires 2 or 3 arguments".into()));
                             }
-                            let obj = self.emit_expr(&args[0])?;
+                            let _obj = self.emit_expr(&args[0])?;
                             let attr_name = self.emit_expr(&args[1])?;
 
                             // For now, just access the field directly (works for simple cases)
@@ -3551,10 +3495,6 @@ fn __py_open(path: &str, mode: &str) -> PyFile {
     PyFile { inner: f }
 }
 "#;
-
-pub fn emit(m: &Module, ctx: &TyCtx) -> Result<String> {
-    Codegen::new(ctx).emit_module(m)
-}
 
 /// Emit Rust code from multiple modules in dependency order.
 /// Used for multi-file compilation.

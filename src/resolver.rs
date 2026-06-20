@@ -48,7 +48,7 @@ impl Resolver {
         if self.in_flight.contains(&abs_path) {
             // Reconstruct cycle path
             let cycle_start = self.dfs_stack.iter().position(|p| p == &abs_path).unwrap_or(0);
-            let mut cycle: Vec<String> = self.dfs_stack[cycle_start..]
+            let cycle: Vec<String> = self.dfs_stack[cycle_start..]
                 .iter()
                 .chain(&[abs_path.clone()])
                 .map(|p| p.file_stem().unwrap_or_default().to_string_lossy().to_string())

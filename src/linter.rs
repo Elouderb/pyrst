@@ -7,13 +7,21 @@ use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone)]
 pub struct Lint {
+    // Diagnostic position pair, parallel to `code`/`message`. Construction sites
+    // populate these (currently always 0) but no reader consumes them yet; kept
+    // for when the linter reports source positions.
+    #[allow(dead_code)]
     pub line: usize,
+    #[allow(dead_code)]
     pub col: usize,
     pub level: LintLevel,
     pub code: String,
     pub message: String,
 }
 
+// The linter currently only emits `Warning`, but `driver.rs` matches on the
+// full level taxonomy; preserve all three rather than narrowing the enum.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LintLevel {
     Error,
@@ -27,7 +35,6 @@ pub struct Linter {
     used_names: HashSet<String>,
     defined_names: HashMap<String, usize>,
     imported_at: HashMap<String, usize>,
-    comments: Vec<String>,
     in_function: bool,
     local_vars: HashSet<String>,
     local_used_vars: HashSet<String>,
@@ -41,7 +48,6 @@ impl Linter {
             used_names: HashSet::new(),
             defined_names: HashMap::new(),
             imported_at: HashMap::new(),
-            comments: Vec::new(),
             in_function: false,
             local_vars: HashSet::new(),
             local_used_vars: HashSet::new(),
@@ -375,7 +381,7 @@ impl Linter {
                     self.check_expr(v);
                 }
             }
-            Expr::ListComp { elt, iter, cond, .. } => {
+            Expr::ListComp { elt: _, iter, cond, .. } => {
                 // Track usage of the iterator expression
                 self.check_expr(iter);
                 // Note: elt and cond use the loop variable which is local to the comprehension
@@ -385,7 +391,7 @@ impl Linter {
                 // We don't check elt because it contains the loop variable which is
                 // scoped to the comprehension, but we should check iter
             }
-            Expr::Lambda { params, body, .. } => {
+            Expr::Lambda { params: _, body, .. } => {
                 // Lambda parameters are local to the lambda; check the body
                 // Variables referenced in the body that are lambda params aren't errors
                 self.check_expr(body);

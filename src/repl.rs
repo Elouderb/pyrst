@@ -78,7 +78,7 @@ impl ReplSession {
     fn execute(&mut self, line: &str) -> Result<Option<String>> {
         // Try to parse the line
         match crate::parser::parse(line) {
-            Ok(module) => {
+            Ok(_module) => {
                 // Successfully parsed as a complete statement/expression
                 if is_expr_only(line) {
                     // Expression - try to evaluate

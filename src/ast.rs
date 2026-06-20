@@ -1,3 +1,11 @@
+// AST span/payload fields are the source-location backbone of the tree: the
+// parser populates them for diagnostics and tooling even where no reader
+// consumes them yet. Likewise `TypeExpr::Tuple` is matched on by typeck and the
+// formatter but is currently produced via the generic-`tuple` path, so it reads
+// as never-constructed. Both are intentionally retained; a module-level allow
+// keeps the build warning-free without deleting that infrastructure.
+#![allow(dead_code)]
+
 use crate::diag::Span;
 
 /// A parsed f-string part. Interpolations carry a fully-parsed [`Expr`]

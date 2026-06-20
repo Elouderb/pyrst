@@ -131,6 +131,18 @@ fn char_at(src: &str, i: usize) -> Option<char> {
     src.get(i..).and_then(|rest| rest.chars().next())
 }
 
+/// Format a single byte for use in a diagnostic error message.
+/// ASCII-printable bytes (0x21–0x7e) are shown as the character itself;
+/// all others (non-ASCII, control chars) are shown as a `\xNN` hex escape
+/// to avoid Latin-1 mojibake in error output.
+fn fmt_byte(b: u8) -> String {
+    if b.is_ascii_graphic() {
+        format!("{}", b as char)
+    } else {
+        format!("\\x{:02x}", b)
+    }
+}
+
 pub fn lex(src: &str) -> Result<Vec<Token>> {
     let bytes = src.as_bytes();
     let mut tokens: Vec<Token> = Vec::new();
@@ -297,7 +309,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
                         other => {
                             return Err(Error::Lex {
                                 span: Span::new(i, i + 2, line, col),
-                                msg: format!("unknown escape '\\{}'", other as char),
+                                msg: format!("unknown escape '\\{}'", fmt_byte(other)),
                             });
                         }
                     };
@@ -354,7 +366,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
                         other => {
                             return Err(Error::Lex {
                                 span: Span::new(i, i + 2, line, col),
-                                msg: format!("unknown escape '\\{}'", other as char),
+                                msg: format!("unknown escape '\\{}'", fmt_byte(other)),
                             });
                         }
                     };
@@ -528,7 +540,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
                 other => {
                     return Err(Error::Lex {
                         span: Span::new(i, i + 1, line, col),
-                        msg: format!("unexpected character '{}'", other as char),
+                        msg: format!("unexpected character '{}'", fmt_byte(other)),
                     });
                 }
             }

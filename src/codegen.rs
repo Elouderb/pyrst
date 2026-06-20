@@ -2710,7 +2710,12 @@ impl<'a> Codegen<'a> {
                             return Ok(if parts.is_empty() {
                                 format!("{}.pop().expect(\"pop from empty list\")", obj_s)
                             } else {
-                                format!("{}.remove({} as usize)", obj_s, parts[0])
+                                // Honor Python negative indices: pop(-1) is the last element.
+                                format!(
+                                    "{{ let __n = {obj}.len() as i64; let __i = {idx}; \
+                                     {obj}.remove((if __i < 0 {{ __n + __i }} else {{ __i }}) as usize) }}",
+                                    obj = obj_s, idx = parts[0]
+                                )
                             });
                         }
                         // dict.pop(key[, default])

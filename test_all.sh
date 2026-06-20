@@ -59,4 +59,5 @@ assert_output except_finally_always "$(printf 'caught: boom\nfinally after catch
 assert_output set_methods "$(printf '4\n3\n2\n4\n1\n1\n3\nFalse\nTrue\nTrue\n3')"
 assert_output dict_update_items "$(printf '3\n6')"
 assert_output list_pop "$(printf '30\n2\n10\n1\n20')"
+assert_output list_pop_negative "$(printf '40\n3\n20\n2\n10\n30')"
 echo "OUTPUT ASSERTIONS: $out_ok / $out_count"

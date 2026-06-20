@@ -56,6 +56,7 @@ assert_output except_hierarchy "$(printf 'caught LookupError (was KeyError): mis
 assert_output except_bound_len "$(printf '4')"
 assert_output except_multi_handler "$(printf 'value handler: v\nkey handler: k\nruntime handler: r\ndone')"
 assert_output except_finally_always "$(printf 'caught: boom\nfinally after catch\nno error\nfinally after success\ndone')"
+assert_output bool_print "$(printf 'True\nFalse\nTrue\nFalse\nTrue\nTrue')"
 assert_output set_methods "$(printf '4\n3\n2\n4\n1\n1\n3\nFalse\nTrue\nTrue\n3')"
 assert_output dict_update_items "$(printf '3\n6')"
 assert_output list_pop "$(printf '30\n2\n10\n1\n20')"

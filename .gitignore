@@ -17,3 +17,5 @@
 
 # graphify generated knowledge-graph output (regenerated on demand)
 /graphify-out/
+/p
+*.long-type-*.txt

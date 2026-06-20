@@ -179,14 +179,26 @@ impl<'a> Codegen<'a> {
                             };
                         }
                     }
-                    // Builtin predicate methods (str/set) return bool; class
-                    // methods use their declared return; everything else Unknown.
+                    // Builtin method returns by receiver type (mirrors typeck's
+                    // builtin_method_ret) so chained calls resolve — e.g.
+                    // `s.lower().startswith(x)` types as Bool. Class methods use
+                    // their declared return; everything else Unknown.
                     match self.type_of_expr(obj) {
-                        Ty::Str if matches!(name.as_str(),
+                        Ty::Str => match name.as_str() {
+                            "upper" | "lower" | "strip" | "lstrip" | "rstrip"
+                            | "replace" | "capitalize" | "title" | "swapcase"
+                            | "casefold" | "format" | "zfill" | "ljust" | "rjust"
+                            | "center" | "removeprefix" | "removesuffix"
+                            | "expandtabs" | "join" => Ty::Str,
+                            "split" | "rsplit" | "splitlines" | "partition"
+                            | "rpartition" => Ty::List(Box::new(Ty::Str)),
+                            "find" | "rfind" | "index" | "rindex" | "count" => Ty::Int,
                             "startswith" | "endswith" | "isdigit" | "isalpha"
                             | "isupper" | "islower" | "isspace" | "isalnum"
                             | "isidentifier" | "isnumeric" | "isprintable"
-                            | "istitle" | "isdecimal") => Ty::Bool,
+                            | "istitle" | "isdecimal" => Ty::Bool,
+                            _ => Ty::Unknown,
+                        },
                         Ty::Set(_) if matches!(name.as_str(),
                             "issubset" | "issuperset" | "isdisjoint") => Ty::Bool,
                         Ty::Class(cls) => self.ctx.get_method(&cls, name)

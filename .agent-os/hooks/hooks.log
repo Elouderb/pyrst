@@ -562,3 +562,227 @@
 2026-06-19T14:30:16-0700 marked dirty: Git/worktree state changed before bash-tool
 2026-06-19T14:30:16-0700 marked dirty: Git/worktree state changed before tool-batch
 2026-06-19T14:30:19-0700 Graphify baseline graph updated (bash-tool)
+2026-06-20T01:37:30-0700 marked dirty: Git/worktree state changed before bash-tool
+2026-06-20T01:37:30-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:37:33-0700 Graphify baseline graph updated (bash-tool)
+2026-06-20T01:37:48-0700 marked dirty: Git/worktree state changed before bash-tool
+2026-06-20T01:37:48-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:37:51-0700 Graphify baseline graph updated (bash-tool)
+2026-06-20T01:38:05-0700 marked dirty: Git/worktree state changed before bash-tool
+2026-06-20T01:38:05-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:38:08-0700 Graphify baseline graph updated (bash-tool)
+2026-06-20T01:38:16-0700 marked dirty: Git/worktree state changed before turn-stop
+2026-06-20T01:38:19-0700 Graphify baseline graph updated (turn-stop)
+2026-06-20T01:38:37-0700 marked dirty: Git/worktree state changed before session-end
+2026-06-20T01:38:39-0700 marked dirty: Git/worktree state changed before session-start
+2026-06-20T01:41:58-0700 Graphify baseline graph updated (bash-tool)
+2026-06-20T01:42:43-0700 marked dirty: Git/worktree state changed before bash-tool
+2026-06-20T01:42:43-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:42:46-0700 Graphify baseline graph updated (bash-tool)
+2026-06-20T01:42:52-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:42:52-0700 marked dirty: Git/worktree state changed before bash-tool
+2026-06-20T01:42:55-0700 Graphify baseline graph updated (tool-batch)
+2026-06-20T01:43:01-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:43:05-0700 Graphify baseline graph updated (tool-batch)
+2026-06-20T01:43:13-0700 marked dirty: Git/worktree state changed before bash-tool
+2026-06-20T01:43:13-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:43:16-0700 Graphify baseline graph updated (bash-tool)
+2026-06-20T01:43:21-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:43:24-0700 Graphify baseline graph updated (tool-batch)
+2026-06-20T01:43:32-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:43:35-0700 Graphify baseline graph updated (tool-batch)
+2026-06-20T01:43:38-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:43:41-0700 Graphify baseline graph updated (tool-batch)
+2026-06-20T01:43:42-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:43:45-0700 Graphify baseline graph updated (tool-batch)
+2026-06-20T01:44:15-0700 marked dirty: Git/worktree state changed before turn-stop
+2026-06-20T01:44:18-0700 marked dirty: Git/worktree state changed before subagent-stop
+2026-06-20T01:44:19-0700 Graphify baseline graph updated (turn-stop)
+2026-06-20T01:47:47-0700 marked dirty: Git/worktree state changed before prompt-submit
+2026-06-20T01:47:50-0700 Graphify baseline graph updated (prompt-submit)
+2026-06-20T01:48:27-0700 marked dirty: Git/worktree state changed before bash-tool
+2026-06-20T01:48:28-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:48:31-0700 Graphify baseline graph updated (bash-tool)
+2026-06-20T01:49:27-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:49:30-0700 Graphify baseline graph updated (tool-batch)
+2026-06-20T01:49:40-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:49:43-0700 Graphify baseline graph updated (tool-batch)
+2026-06-20T01:49:56-0700 marked dirty: Claude modified README.md
+2026-06-20T01:49:57-0700 marked dirty: Claude modified DEVELOPMENT_PLAN.md
+2026-06-20T01:49:58-0700 marked dirty: Claude modified DEVELOPMENT_PLAN.md
+2026-06-20T01:50:00-0700 marked dirty: Claude modified DEVELOPMENT_PLAN.md
+2026-06-20T01:50:00-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:50:03-0700 Graphify baseline graph updated (tool-batch)
+2026-06-20T01:50:08-0700 marked dirty: Git/worktree state changed before bash-tool
+2026-06-20T01:50:12-0700 Graphify baseline graph updated (bash-tool)
+2026-06-20T01:50:54-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:50:57-0700 Graphify baseline graph updated (tool-batch)
+2026-06-20T01:51:30-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:51:34-0700 Graphify baseline graph updated (tool-batch)
+2026-06-20T01:51:47-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:51:50-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:51:50-0700 Graphify baseline graph updated (tool-batch)
+2026-06-20T01:51:54-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:51:57-0700 Graphify baseline graph updated (tool-batch)
+2026-06-20T01:52:04-0700 marked dirty: Git/worktree state changed before turn-stop
+2026-06-20T01:52:06-0700 marked dirty: Git/worktree state changed before subagent-stop
+2026-06-20T01:52:07-0700 Graphify baseline graph updated (turn-stop)
+2026-06-20T01:52:07-0700 marked dirty: Git/worktree state changed before bash-tool
+2026-06-20T01:52:07-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:52:10-0700 Graphify baseline graph updated (bash-tool)
+2026-06-20T01:52:13-0700 marked dirty: Git/worktree state changed before bash-tool
+2026-06-20T01:52:13-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:52:16-0700 Graphify baseline graph updated (bash-tool)
+2026-06-20T01:52:17-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:52:20-0700 Graphify baseline graph updated (tool-batch)
+2026-06-20T01:52:23-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:52:24-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:52:26-0700 Graphify baseline graph updated (tool-batch)
+2026-06-20T01:52:28-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:52:31-0700 Graphify baseline graph updated (tool-batch)
+2026-06-20T01:52:36-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:52:39-0700 Graphify baseline graph updated (tool-batch)
+2026-06-20T01:52:42-0700 marked dirty: Git/worktree state changed before bash-tool
+2026-06-20T01:52:42-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:52:45-0700 Graphify baseline graph updated (bash-tool)
+2026-06-20T01:52:47-0700 marked dirty: Git/worktree state changed before bash-tool
+2026-06-20T01:52:47-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:52:50-0700 Graphify baseline graph updated (bash-tool)
+2026-06-20T01:52:53-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:52:54-0700 marked dirty: Git/worktree state changed before prompt-submit
+2026-06-20T01:52:56-0700 Graphify baseline graph updated (tool-batch)
+2026-06-20T01:52:58-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:53:00-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:53:01-0700 Graphify baseline graph updated (tool-batch)
+2026-06-20T01:53:06-0700 marked dirty: Git/worktree state changed before bash-tool
+2026-06-20T01:53:06-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:53:09-0700 Graphify baseline graph updated (bash-tool)
+2026-06-20T01:53:17-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:53:20-0700 Graphify baseline graph updated (tool-batch)
+2026-06-20T01:53:23-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:53:26-0700 Graphify baseline graph updated (tool-batch)
+2026-06-20T01:53:26-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:53:29-0700 Graphify baseline graph updated (tool-batch)
+2026-06-20T01:53:30-0700 marked dirty: Git/worktree state changed before subagent-stop
+2026-06-20T01:53:33-0700 marked dirty: Git/worktree state changed before bash-tool
+2026-06-20T01:53:34-0700 Graphify baseline graph updated (subagent-stop)
+2026-06-20T01:53:38-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:53:41-0700 Graphify baseline graph updated (tool-batch)
+2026-06-20T01:53:43-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:53:46-0700 Graphify baseline graph updated (tool-batch)
+2026-06-20T01:53:48-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:53:51-0700 Graphify baseline graph updated (tool-batch)
+2026-06-20T01:53:56-0700 marked dirty: Git/worktree state changed before bash-tool
+2026-06-20T01:53:56-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:53:59-0700 Graphify baseline graph updated (bash-tool)
+2026-06-20T01:54:03-0700 marked dirty: Git/worktree state changed before subagent-stop
+2026-06-20T01:54:06-0700 Graphify baseline graph updated (subagent-stop)
+2026-06-20T01:54:07-0700 marked dirty: Git/worktree state changed before bash-tool
+2026-06-20T01:54:07-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:54:10-0700 Graphify baseline graph updated (bash-tool)
+2026-06-20T01:54:21-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:54:23-0700 marked dirty: Git/worktree state changed before bash-tool
+2026-06-20T01:54:24-0700 Graphify baseline graph updated (tool-batch)
+2026-06-20T01:54:26-0700 marked dirty: Claude modified src/ast.rs
+2026-06-20T01:54:27-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:54:31-0700 Graphify baseline graph updated (tool-batch)
+2026-06-20T01:54:31-0700 marked dirty: Claude modified src/codegen.rs
+2026-06-20T01:54:33-0700 marked dirty: Claude modified src/codegen.rs
+2026-06-20T01:54:34-0700 marked dirty: Claude modified src/codegen.rs
+2026-06-20T01:54:35-0700 marked dirty: Claude modified src/codegen.rs
+2026-06-20T01:54:37-0700 marked dirty: Claude modified src/codegen.rs
+2026-06-20T01:54:37-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:54:41-0700 Graphify baseline graph updated (tool-batch)
+2026-06-20T01:54:41-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:54:44-0700 Graphify baseline graph updated (tool-batch)
+2026-06-20T01:54:48-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:54:48-0700 marked dirty: Git/worktree state changed before bash-tool
+2026-06-20T01:54:51-0700 Graphify baseline graph updated (tool-batch)
+2026-06-20T01:54:51-0700 marked dirty: Claude modified src/codegen.rs
+2026-06-20T01:54:51-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:54:55-0700 Graphify baseline graph updated (tool-batch)
+2026-06-20T01:55:07-0700 marked dirty: Claude modified src/codegen.rs
+2026-06-20T01:55:07-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:55:11-0700 Graphify baseline graph updated (tool-batch)
+2026-06-20T01:55:12-0700 marked dirty: Claude modified src/resolver.rs
+2026-06-20T01:55:12-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:55:15-0700 Graphify baseline graph updated (tool-batch)
+2026-06-20T01:55:16-0700 marked dirty: Claude modified src/repl.rs
+2026-06-20T01:55:16-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:55:16-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:55:19-0700 Graphify baseline graph updated (tool-batch)
+2026-06-20T01:55:22-0700 marked dirty: Claude modified src/linter.rs
+2026-06-20T01:55:23-0700 marked dirty: Claude modified src/linter.rs
+2026-06-20T01:55:23-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:55:26-0700 Graphify baseline graph updated (tool-batch)
+2026-06-20T01:55:33-0700 marked dirty: Claude modified src/linter.rs
+2026-06-20T01:55:34-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:55:37-0700 Graphify baseline graph updated (tool-batch)
+2026-06-20T01:55:39-0700 marked dirty: Claude modified src/linter.rs
+2026-06-20T01:55:41-0700 marked dirty: Claude modified src/linter.rs
+2026-06-20T01:55:41-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:55:42-0700 marked dirty: Git/worktree state changed before turn-stop
+2026-06-20T01:55:45-0700 Graphify baseline graph updated (tool-batch)
+2026-06-20T01:55:48-0700 marked dirty: Claude modified src/formatter.rs
+2026-06-20T01:55:48-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:55:52-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:55:52-0700 Graphify baseline graph updated (tool-batch)
+2026-06-20T01:56:21-0700 marked dirty: Git/worktree state changed before bash-tool
+2026-06-20T01:56:21-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:56:24-0700 Graphify baseline graph updated (bash-tool)
+2026-06-20T01:56:26-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:56:26-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:56:29-0700 Graphify baseline graph updated (tool-batch)
+2026-06-20T01:56:30-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:56:33-0700 Graphify baseline graph updated (tool-batch)
+2026-06-20T01:56:38-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:56:38-0700 marked dirty: Git/worktree state changed before bash-tool
+2026-06-20T01:56:41-0700 Graphify baseline graph updated (tool-batch)
+2026-06-20T01:56:45-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:56:48-0700 Graphify baseline graph updated (tool-batch)
+2026-06-20T01:56:50-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:56:53-0700 Graphify baseline graph updated (tool-batch)
+2026-06-20T01:56:57-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:56:57-0700 marked dirty: Git/worktree state changed before bash-tool
+2026-06-20T01:57:00-0700 Graphify baseline graph updated (tool-batch)
+2026-06-20T01:57:29-0700 marked dirty: Git/worktree state changed before subagent-stop
+2026-06-20T01:57:32-0700 Graphify baseline graph updated (subagent-stop)
+2026-06-20T01:57:55-0700 marked dirty: Git/worktree state changed before bash-tool
+2026-06-20T01:57:55-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:57:58-0700 Graphify baseline graph updated (bash-tool)
+2026-06-20T01:57:59-0700 marked dirty: Git/worktree state changed before bash-tool
+2026-06-20T01:57:59-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:58:02-0700 Graphify baseline graph updated (bash-tool)
+2026-06-20T01:58:17-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:58:20-0700 Graphify baseline graph updated (tool-batch)
+2026-06-20T01:58:21-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:58:24-0700 Graphify baseline graph updated (tool-batch)
+2026-06-20T01:58:44-0700 marked dirty: Git/worktree state changed before subagent-stop
+2026-06-20T01:58:44-0700 marked dirty: Git/worktree state changed before prompt-submit
+2026-06-20T01:58:47-0700 Graphify baseline graph updated (subagent-stop)
+2026-06-20T01:59:09-0700 marked dirty: Git/worktree state changed before bash-tool
+2026-06-20T01:59:10-0700 marked dirty: Git/worktree state changed before bash-tool
+2026-06-20T01:59:12-0700 Graphify baseline graph updated (bash-tool)
+2026-06-20T01:59:18-0700 marked dirty: Git/worktree state changed before bash-tool
+2026-06-20T01:59:18-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T01:59:21-0700 Graphify baseline graph updated (bash-tool)
+2026-06-20T02:00:17-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T02:00:20-0700 Graphify baseline graph updated (tool-batch)
+2026-06-20T02:00:43-0700 marked dirty: Git/worktree state changed before turn-stop
+2026-06-20T02:00:46-0700 Graphify baseline graph updated (turn-stop)
+2026-06-20T02:02:54-0700 marked dirty: Git/worktree state changed before prompt-submit
+2026-06-20T02:02:57-0700 Graphify baseline graph updated (prompt-submit)
+2026-06-20T02:03:19-0700 marked dirty: Git/worktree state changed before bash-tool
+2026-06-20T02:03:19-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T02:03:22-0700 Graphify baseline graph updated (bash-tool)
+2026-06-20T02:04:51-0700 marked dirty: Git/worktree state changed before bash-tool
+2026-06-20T02:04:55-0700 Graphify baseline graph updated (tool-batch)
+2026-06-20T02:04:57-0700 marked dirty: Git/worktree state changed before bash-tool
+2026-06-20T02:04:57-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T02:05:00-0700 Graphify baseline graph updated (bash-tool)
+2026-06-20T02:05:03-0700 marked dirty: Git/worktree state changed before bash-tool
+2026-06-20T02:05:03-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T02:05:06-0700 Graphify baseline graph updated (bash-tool)
+2026-06-20T02:05:52-0700 marked dirty: Git/worktree state changed before bash-tool
+2026-06-20T02:05:52-0700 marked dirty: Git/worktree state changed before tool-batch
+2026-06-20T02:05:55-0700 Graphify baseline graph updated (bash-tool)

@@ -157,7 +157,7 @@ impl TyCtx {
         funcs.insert("repr".into(), FuncSig { params: vec![("obj".into(), Ty::Unknown)], ret: Ty::Str, param_defaults: vec![] });
         funcs.insert("ascii".into(), FuncSig { params: vec![("obj".into(), Ty::Unknown)], ret: Ty::Str, param_defaults: vec![] });
         funcs.insert("list".into(), FuncSig { params: vec![("x".into(), Ty::Unknown)], ret: Ty::List(Box::new(Ty::Unknown)), param_defaults: vec![] });
-        funcs.insert("dict".into(), FuncSig { params: vec![], ret: Ty::Unknown, param_defaults: vec![] });
+        funcs.insert("dict".into(), FuncSig { params: vec![], ret: Ty::Dict(Box::new(Ty::Unknown), Box::new(Ty::Unknown)), param_defaults: vec![] });
         funcs.insert("tuple".into(), FuncSig { params: vec![("x".into(), Ty::Unknown)], ret: Ty::Unknown, param_defaults: vec![] });
         funcs.insert("getattr".into(), FuncSig { params: vec![("obj".into(), Ty::Unknown), ("name".into(), Ty::Str)], ret: Ty::Unknown, param_defaults: vec![] });
         funcs.insert("setattr".into(), FuncSig { params: vec![("obj".into(), Ty::Unknown), ("name".into(), Ty::Str), ("value".into(), Ty::Unknown)], ret: Ty::Unit, param_defaults: vec![] });
@@ -869,13 +869,17 @@ fn builtin_method_ret(recv: &Ty, method: &str) -> Ty {
             | "istitle" | "isdecimal" => Ty::Bool,
             _ => Ty::Unknown,
         },
-        // Card D (safe subset): concrete element/collection returns only.
-        // Deliberately left as Unknown (higher regression risk): Unit-returning
-        // mutators (sort/append/add/...), dict.get (Option), dict.items (Tuple).
+        // Concrete element/collection returns, plus in-place mutators typed as
+        // Unit (card 2b3bf7f5; audited: no example assigns/chains a mutator
+        // result). Deliberately still Unknown: dict.get / dict.setdefault, which
+        // need arg-count-aware typing (the 2-arg `get(k, default)` returns V,
+        // not Optional[V]).
         Ty::List(elem) => match method {
             "pop" => (**elem).clone(),
             "copy" => Ty::List(elem.clone()),
             "index" | "count" => Ty::Int,
+            // In-place mutators return None (audited: no example assigns/chains them).
+            "append" | "extend" | "insert" | "remove" | "sort" | "reverse" | "clear" => Ty::Unit,
             _ => Ty::Unknown,
         },
         Ty::Set(elem) => match method {
@@ -884,12 +888,20 @@ fn builtin_method_ret(recv: &Ty, method: &str) -> Ty {
             }
             "pop" => (**elem).clone(),
             "issubset" | "issuperset" | "isdisjoint" => Ty::Bool,
+            // In-place mutators return None.
+            "add" | "discard" | "remove" | "update" | "intersection_update"
+            | "difference_update" | "symmetric_difference_update" | "clear" => Ty::Unit,
             _ => Ty::Unknown,
         },
         Ty::Dict(key, val) => match method {
             "keys" => Ty::List(key.clone()),
             "values" => Ty::List(val.clone()),
             "copy" => Ty::Dict(key.clone(), val.clone()),
+            "items" => Ty::List(Box::new(Ty::Tuple(vec![(**key).clone(), (**val).clone()]))),
+            "pop" => (**val).clone(),
+            // In-place mutators return None. (get/setdefault return V/Optional and
+            // are deliberately left Unknown — they need arg-count-aware typing.)
+            "update" | "clear" => Ty::Unit,
             _ => Ty::Unknown,
         },
         _ => Ty::Unknown,

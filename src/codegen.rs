@@ -286,13 +286,11 @@ impl<'a> Codegen<'a> {
                 }
             }
             Expr::List(elems, _) => {
-                // Infer list element type from the first element if available
-                if let Some(first_elem) = elems.first() {
-                    let elem_ty = self.type_of_expr(first_elem);
-                    Ty::List(Box::new(elem_ty))
-                } else {
-                    Ty::List(Box::new(Ty::Unknown))
-                }
+                // Unify all element types (not first-element-wins) so a mixed
+                // numeric literal like `[1, 2.0]` is typed `List(Float)`,
+                // matching typeck's `unify_elem_types`. This lets the emission
+                // path below cast the int elements to f64 (card 5c2f31d8).
+                Ty::List(Box::new(self.list_elem_ty(elems)))
             }
             Expr::Dict(pairs, _) => {
                 // Infer dict key/value types from the first pair if available
@@ -305,13 +303,9 @@ impl<'a> Codegen<'a> {
                 }
             }
             Expr::Set(elems, _) => {
-                // Infer set element type from the first element if available
-                if let Some(first_elem) = elems.first() {
-                    let elem_ty = self.type_of_expr(first_elem);
-                    Ty::Set(Box::new(elem_ty))
-                } else {
-                    Ty::Set(Box::new(Ty::Unknown))
-                }
+                // Unify all element types (mirrors the list case above); a mixed
+                // numeric set literal unifies to `Set(Float)`.
+                Ty::Set(Box::new(self.list_elem_ty(elems)))
             }
             Expr::ListComp { elt, target, iter, .. } => {
                 // Infer element type from the iterable and element expression
@@ -1028,6 +1022,21 @@ impl<'a> Codegen<'a> {
         Ok(s)
     }
 
+    /// Emit a list/set element, promoting int-typed elements to `f64` when the
+    /// collection's unified element type is `Float` (`widen == true`). Reuses
+    /// the same `as f64` cast convention as the assignment int->float coercion
+    /// (see `Stmt::Assign` emission) so `[1, 2.0]` becomes a homogeneous
+    /// `Vec<f64>` instead of the rustc-rejected `vec![(1i64), (2.0f64)]`
+    /// (card 5c2f31d8). Float (and non-int) elements are emitted unchanged.
+    fn emit_collection_elem(&mut self, e: &Expr, widen: bool) -> Result<String> {
+        let s = self.emit_owned(e)?;
+        if widen && matches!(self.type_of_expr(e), Ty::Int) {
+            Ok(format!("({}) as f64", s))
+        } else {
+            Ok(s)
+        }
+    }
+
     /// Combine two inferred types into the more specific / wider one.
     /// `Unknown` yields to anything concrete; `Int` widens to `Float`;
     /// matching collections unify element-wise. Otherwise the first wins.
@@ -1042,6 +1051,20 @@ impl<'a> Codegen<'a> {
             (Ty::List(e1), Ty::List(e2)) => Ty::List(Box::new(Self::unify_ty(*e1, *e2))),
             (Ty::Set(e1), Ty::Set(e2)) => Ty::Set(Box::new(Self::unify_ty(*e1, *e2))),
             (a, _) => a,
+        }
+    }
+
+    /// Unified element type of a list/set literal's elements. Folds every
+    /// element's type with `unify_ty` (rather than first-element-wins) so a
+    /// mixed numeric literal like `[1, 2.0]` is typed `Float` — matching
+    /// typeck's `unify_elem_types`. An empty literal is `Unknown`.
+    fn list_elem_ty(&self, elems: &[Expr]) -> Ty {
+        let mut iter = elems.iter();
+        match iter.next() {
+            None => Ty::Unknown,
+            Some(first) => iter.fold(self.type_of_expr(first), |acc, e| {
+                Self::unify_ty(acc, self.type_of_expr(e))
+            }),
         }
     }
 
@@ -1696,8 +1719,12 @@ impl<'a> Codegen<'a> {
                 }
             }
             Expr::List(elems, _) => {
+                // When the literal's unified element type is Float but some
+                // elements are int literals (`[1, 2.0]`), cast the int elements
+                // to f64 so the vec is a homogeneous `Vec<f64>` (card 5c2f31d8).
+                let widen = matches!(self.list_elem_ty(elems), Ty::Float);
                 let mut parts = Vec::new();
-                for e in elems { parts.push(self.emit_owned(e)?); }
+                for e in elems { parts.push(self.emit_collection_elem(e, widen)?); }
                 format!("vec![{}]", parts.join(", "))
             }
             Expr::Tuple(elems, _) => {
@@ -1772,10 +1799,16 @@ impl<'a> Codegen<'a> {
                 if elems.is_empty() {
                     return Ok("::std::collections::HashSet::new()".to_string());
                 }
+                // Mirror the list case: cast int elements to f64 when the set's
+                // unified element type is Float. NOTE: a Float-element set
+                // (`HashSet<f64>`) does not compile (f64 is not Eq/Hash) and is
+                // unsupported in pyrst today — this widening only keeps the
+                // emission consistent with the list path; it does not make a
+                // numeric set literal compilable (card 5c2f31d8).
+                let widen = matches!(self.list_elem_ty(elems), Ty::Float);
                 let mut items = Vec::new();
                 for e in elems {
-                    let es = self.emit_owned(e)?;
-                    items.push(es);
+                    items.push(self.emit_collection_elem(e, widen)?);
                 }
                 format!("vec![{}].into_iter().collect::<::std::collections::HashSet<_>>()",
                     items.join(", "))

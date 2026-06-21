@@ -638,21 +638,28 @@ fn unify_branch_types(a: Ty, b: Ty) -> Option<Ty> {
     })
 }
 
-/// Unify the element types of a homogeneous collection literal (list/set).
+/// Unify the element types of a homogeneous collection literal.
 ///
-/// Returns the unified element type when the two element types can coexist in
-/// one Rust collection, or `None` when they are genuinely heterogeneous and the
-/// literal should be rejected. Stays permissive on `Unknown` (and collections
-/// with an `Unknown` inner) via the shared `unify_branch_types` arms; only
-/// both-concrete, non-`Unknown`, incompatible pairs return `None`.
+/// Returns the unified element type when the two types can coexist in one Rust
+/// collection, or `None` when they are genuinely heterogeneous and the literal
+/// should be rejected. Stays permissive on `Unknown` (and collections with an
+/// `Unknown` inner) via the shared `unify_branch_types` arms; only both-concrete,
+/// non-`Unknown`, incompatible pairs (e.g. Int/Str) return `None`.
 ///
-/// Note: Int/Float numeric mixing is intentionally NOT widened here. codegen
-/// emits each literal with its own type (`vec![(1i64), (2.0f64)]`), so accepting
-/// `[1, 2.0]` would pass typeck but fail rustc. Promoting mixed numeric literals
-/// to a homogeneous float collection requires a matching codegen cast and is
-/// tracked separately (card 5c2f31d8).
-fn unify_elem_types(a: Ty, b: Ty) -> Option<Ty> {
-    unify_branch_types(a, b)
+/// `widen_numeric` controls Int/Float promotion, which is only SOUND where the
+/// element type may be `Float`. A `list[float]` (`Vec<f64>`) is representable, so
+/// LIST literals pass `true` and `[1, 2.0]` widens to `List(Float)` (codegen
+/// casts the int elements to f64 — see `Codegen::emit_collection_elem`). It is
+/// UNSOUND in hashable positions: a `set[float]` (`HashSet<f64>`) does not
+/// compile (f64 is not `Eq`/`Hash`), so SET literals pass `false` and `{1, 2.0}`
+/// is rejected. (Dict keys are hashable -> `false`; dict values -> `true`.)
+/// The broader `set[float]` gap is tracked separately.
+fn unify_elem_types(a: Ty, b: Ty, widen_numeric: bool) -> Option<Ty> {
+    match (&a, &b) {
+        // Numeric promotion to Float — only where a Float element is representable.
+        (Ty::Int, Ty::Float) | (Ty::Float, Ty::Int) if widen_numeric => Some(Ty::Float),
+        _ => unify_branch_types(a, b),
+    }
 }
 
 fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
@@ -1075,7 +1082,8 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 let mut acc = check_expr(&elems[0], env)?;
                 for e in &elems[1..] {
                     let next = check_expr(e, env)?;
-                    acc = unify_elem_types(acc.clone(), next.clone()).ok_or_else(|| Error::Type {
+                    // Lists may hold floats, so int/float elements widen to Float.
+                    acc = unify_elem_types(acc.clone(), next.clone(), true).ok_or_else(|| Error::Type {
                         span: *span,
                         msg: format!(
                             "list elements have incompatible types: {:?} vs {:?}",
@@ -1091,11 +1099,14 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
             let elem_ty = if elems.is_empty() {
                 Ty::Unknown
             } else {
-                // Same element-type unification as list literals above.
+                // Same element-type unification as list literals above, but
+                // WITHOUT Int/Float widening: a set's element type must be
+                // hashable and `set[float]` (`HashSet<f64>`) is not representable
+                // in Rust, so `{1, 2.0}` is rejected rather than typed Set(Float).
                 let mut acc = check_expr(&elems[0], env)?;
                 for e in &elems[1..] {
                     let next = check_expr(e, env)?;
-                    acc = unify_elem_types(acc.clone(), next.clone()).ok_or_else(|| Error::Type {
+                    acc = unify_elem_types(acc.clone(), next.clone(), false).ok_or_else(|| Error::Type {
                         span: *span,
                         msg: format!(
                             "set elements have incompatible types: {:?} vs {:?}",
@@ -1107,13 +1118,38 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
             };
             Ty::Set(Box::new(elem_ty))
         }
-        Expr::Dict(pairs, _) => {
+        Expr::Dict(pairs, span) => {
             if pairs.is_empty() {
                 Ty::Dict(Box::new(Ty::Unknown), Box::new(Ty::Unknown))
             } else {
-                let k_ty = check_expr(&pairs[0].0, env)?;
-                let v_ty = check_expr(&pairs[0].1, env)?;
-                for (k, v) in &pairs[1..] { check_expr(k, env)?; check_expr(v, env)?; }
+                // Unify all key types and all value types independently via a
+                // left-to-right fold. Genuinely heterogeneous dicts (two
+                // both-concrete incompatible key or value types) are rejected
+                // here instead of silently using first-pair types and deferring
+                // the error to rustc. widen_numeric=false for both: float dict
+                // keys are non-hashable (HashMap<f64,_> doesn't compile), and
+                // there is no codegen value-cast for dict values, so mixed
+                // Int/Float values would also fail at rustc.
+                let mut k_ty = check_expr(&pairs[0].0, env)?;
+                let mut v_ty = check_expr(&pairs[0].1, env)?;
+                for (k, v) in &pairs[1..] {
+                    let kt = check_expr(k, env)?;
+                    let vt = check_expr(v, env)?;
+                    k_ty = unify_elem_types(k_ty.clone(), kt.clone(), false).ok_or_else(|| Error::Type {
+                        span: *span,
+                        msg: format!(
+                            "dict keys have incompatible types: {:?} vs {:?}",
+                            k_ty, kt
+                        ),
+                    })?;
+                    v_ty = unify_elem_types(v_ty.clone(), vt.clone(), false).ok_or_else(|| Error::Type {
+                        span: *span,
+                        msg: format!(
+                            "dict values have incompatible types: {:?} vs {:?}",
+                            v_ty, vt
+                        ),
+                    })?;
+                }
                 Ty::Dict(Box::new(k_ty), Box::new(v_ty))
             }
         }
@@ -1911,18 +1947,40 @@ mod tests {
     }
 
     #[test]
-    fn error_list_int_float_rejected() {
-        // `[1, 2.0]` is rejected at typeck: codegen emits each literal with its
-        // own type (`vec![(1i64), (2.0f64)]`), which rustc rejects, so typeck
-        // must not accept it. Python-style numeric promotion to list[float]
-        // (typeck unify + codegen int->f64 cast) is tracked in card 5c2f31d8.
+    fn infer_list_int_float_unifies_to_float() {
+        // `[1, 2.0]` is accepted and widens to `List(Float)`: typeck unifies the
+        // numeric elements and codegen casts the int elements to f64 so the
+        // emitted `Vec<f64>` is homogeneous and compiles (card 5c2f31d8).
         let ctx = TyCtx::new();
         let mut env = make_env(&ctx);
         let e = Expr::List(vec![int_lit(1), float_lit(2.0)], Span::DUMMY);
-        assert!(matches!(check_expr(&e, &mut env), Err(Error::Type { .. })));
-        // Order-independent: Float first then Int is also rejected.
+        assert_eq!(
+            check_expr(&e, &mut env).unwrap(),
+            Ty::List(Box::new(Ty::Float))
+        );
+        // Order-independent: Float first then Int also unifies to Float.
         let e2 = Expr::List(vec![float_lit(1.5), int_lit(2)], Span::DUMMY);
-        assert!(matches!(check_expr(&e2, &mut env), Err(Error::Type { .. })));
+        assert_eq!(
+            check_expr(&e2, &mut env).unwrap(),
+            Ty::List(Box::new(Ty::Float))
+        );
+        // Three elements with a trailing int still widen to Float.
+        let e3 = Expr::List(vec![int_lit(1), float_lit(2.0), int_lit(3)], Span::DUMMY);
+        assert_eq!(
+            check_expr(&e3, &mut env).unwrap(),
+            Ty::List(Box::new(Ty::Float))
+        );
+    }
+
+    #[test]
+    fn error_set_int_float_rejected() {
+        // Numeric widening is list-only: a set's element type must be hashable,
+        // but `set[float]` (`HashSet<f64>`) is not representable in Rust, so
+        // `{1, 2.0}` is rejected rather than typed Set(Float) (card 5c2f31d8).
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        let e = Expr::Set(vec![int_lit(1), float_lit(2.0)], Span::DUMMY);
+        assert!(matches!(check_expr(&e, &mut env), Err(Error::Type { .. })));
     }
 
     #[test]
@@ -1941,6 +1999,55 @@ mod tests {
         let ctx = TyCtx::new();
         let mut env = make_env(&ctx);
         let e = Expr::Dict(vec![(str_lit("k"), int_lit(1))], Span::DUMMY);
+        assert_eq!(
+            check_expr(&e, &mut env).unwrap(),
+            Ty::Dict(Box::new(Ty::Str), Box::new(Ty::Int))
+        );
+    }
+
+    #[test]
+    fn error_dict_hetero_values() {
+        // {"a": 1, "b": "x"} — values Int vs Str — must be rejected.
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        let e = Expr::Dict(
+            vec![
+                (str_lit("a"), int_lit(1)),
+                (str_lit("b"), str_lit("x")),
+            ],
+            Span::DUMMY,
+        );
+        assert!(matches!(check_expr(&e, &mut env), Err(Error::Type { .. })));
+    }
+
+    #[test]
+    fn error_dict_hetero_keys() {
+        // {1: "a", "two": "a"} — keys Int vs Str — must be rejected.
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        let e = Expr::Dict(
+            vec![
+                (int_lit(1), str_lit("a")),
+                (str_lit("two"), str_lit("a")),
+            ],
+            Span::DUMMY,
+        );
+        assert!(matches!(check_expr(&e, &mut env), Err(Error::Type { .. })));
+    }
+
+    #[test]
+    fn infer_dict_homogeneous() {
+        // {"a": 1, "b": 2, "c": 3} — 3-pair homogeneous dict — must fold to Dict(Str, Int).
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        let e = Expr::Dict(
+            vec![
+                (str_lit("a"), int_lit(1)),
+                (str_lit("b"), int_lit(2)),
+                (str_lit("c"), int_lit(3)),
+            ],
+            Span::DUMMY,
+        );
         assert_eq!(
             check_expr(&e, &mut env).unwrap(),
             Ty::Dict(Box::new(Ty::Str), Box::new(Ty::Int))

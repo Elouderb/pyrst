@@ -149,11 +149,11 @@ impl TyCtx {
             ret: Ty::Unknown,
             param_defaults: vec![],
         });
-        funcs.insert("abs".into(), FuncSig { params: vec![("x".into(), Ty::Unknown)], ret: Ty::Int, param_defaults: vec![] });
+        funcs.insert("abs".into(), FuncSig { params: vec![("x".into(), Ty::Unknown)], ret: Ty::Unknown, param_defaults: vec![] });
         funcs.insert("min".into(), FuncSig { params: vec![("a".into(), Ty::Unknown), ("b".into(), Ty::Unknown)], ret: Ty::Unknown, param_defaults: vec![] });
         funcs.insert("max".into(), FuncSig { params: vec![("a".into(), Ty::Unknown), ("b".into(), Ty::Unknown)], ret: Ty::Unknown, param_defaults: vec![] });
         funcs.insert("sorted".into(), FuncSig { params: vec![("x".into(), Ty::Unknown)], ret: Ty::List(Box::new(Ty::Unknown)), param_defaults: vec![] });
-        funcs.insert("sum".into(), FuncSig { params: vec![("x".into(), Ty::Unknown)], ret: Ty::Int, param_defaults: vec![] });
+        funcs.insert("sum".into(), FuncSig { params: vec![("x".into(), Ty::Unknown)], ret: Ty::Unknown, param_defaults: vec![] });
         funcs.insert("input".into(), FuncSig { params: vec![("prompt".into(), Ty::Unknown)], ret: Ty::Str, param_defaults: vec![] });
         funcs.insert("any".into(), FuncSig { params: vec![("x".into(), Ty::Unknown)], ret: Ty::Bool, param_defaults: vec![] });
         funcs.insert("all".into(), FuncSig { params: vec![("x".into(), Ty::Unknown)], ret: Ty::Bool, param_defaults: vec![] });
@@ -276,7 +276,7 @@ pub fn extract_init_fields(class_def: &mut ClassDef) {
                         // Only a direct `self.<attr> = ...` declares a field.
                         let is_self = matches!(obj.as_ref(), Expr::Ident(n, _) if n == "self");
                         if is_self && !class_def.fields.iter().any(|f| &f.name == attr) {
-                            let inferred_ty = infer_expr_type(value, &param_types);
+                            let inferred_ty = guess_field_type(value, &param_types);
                             discovered_fields.insert(attr.clone(), inferred_ty);
                         }
                     }
@@ -367,8 +367,13 @@ fn infer_list_element_type(class_def: &ClassDef, field_name: &str) -> Option<Str
     None
 }
 
-// Infer type of an expression for field discovery
-fn infer_expr_type(expr: &Expr, params: &std::collections::HashMap<String, TypeExpr>) -> TypeExpr {
+/// Structural guess for the TypeExpr of an untyped `__init__` field assignment.
+/// Returns hardcoded TypeExpr approximations based on the literal or parameter
+/// kind of `expr`. This is NOT the inference oracle — it does not resolve
+/// bindings, call sites, or return types. The real inference oracle is
+/// `infer_expr_ty`. Use this only inside `extract_init_fields` where we need a
+/// quick TypeExpr (not a Ty) for field-discovery purposes.
+fn guess_field_type(expr: &Expr, params: &std::collections::HashMap<String, TypeExpr>) -> TypeExpr {
     match expr {
         Expr::Int(..) => TypeExpr::Named("int".to_string()),
         Expr::Float(..) => TypeExpr::Named("float".to_string()),
@@ -1624,8 +1629,8 @@ fn infer_expr_ty_bound(
             let l = infer_expr_ty_bound(lhs, param, elem, locals, ctx);
             let r = infer_expr_ty_bound(rhs, param, elem, locals, ctx);
             match op {
-                BinOp::Div => Ty::Float,
-                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Mod | BinOp::FloorDiv | BinOp::Pow => {
+                BinOp::Div | BinOp::Pow => Ty::Float,
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Mod | BinOp::FloorDiv => {
                     if *op == BinOp::Add && (l == Ty::Str || r == Ty::Str) {
                         Ty::Str
                     } else if l == Ty::Float || r == Ty::Float {
@@ -1705,7 +1710,7 @@ fn infer_comp_elt_type_with_var(
             match (left_ty, right_ty) {
                 (Ty::Float, _) | (_, Ty::Float) => Ty::Float,
                 (Ty::Int, Ty::Int) => {
-                    if *op == BinOp::Div {
+                    if *op == BinOp::Div || *op == BinOp::Pow {
                         Ty::Float
                     } else {
                         Ty::Int

@@ -12,6 +12,16 @@ use crate::ast::*;
 use crate::diag::Result;
 use crate::typeck::{Ty, TyCtx};
 
+/// Canonical list of collection methods that mutate the receiver in-place.
+/// Consulted by both `method_modifies_self` (to infer `&mut self` on the
+/// enclosing method) and the emission site (to pick `emit_place` for
+/// subscripted receivers so the mutation lands on the real element).
+const MUTATING_METHODS: &[&str] = &[
+    "append", "extend", "insert", "remove", "pop", "clear",
+    "sort", "reverse", "update", "add", "discard",
+    "setdefault", "popitem",
+];
+
 pub struct Codegen<'a> {
     pub ctx: &'a TyCtx,
     out: String,
@@ -662,7 +672,7 @@ impl<'a> Codegen<'a> {
                 // chain roots at `self`.
                 Stmt::Expr(Expr::Call { callee, .. }) => {
                     if let Expr::Attr { obj, name, .. } = callee.as_ref() {
-                        if matches!(name.as_str(), "append" | "extend" | "insert" | "remove" | "pop" | "clear" | "sort" | "reverse" | "update") {
+                        if MUTATING_METHODS.contains(&name.as_str()) {
                             if Self::expr_roots_at_self(obj) {
                                 return true;
                             }
@@ -2771,11 +2781,7 @@ impl<'a> Codegen<'a> {
                     // Use emit_place for those so the in-place mutation lands on
                     // the real element. Bare-name and `self.field` receivers are
                     // already place expressions under emit_expr.
-                    const MUTATING_METHODS: &[&str] = &[
-                        "append", "extend", "insert", "remove", "pop", "clear",
-                        "sort", "reverse", "update", "add", "discard",
-                        "setdefault", "popitem",
-                    ];
+                    // MUTATING_METHODS is the module-level const above.
                     let obj_s = if matches!(obj.as_ref(), Expr::Index { .. })
                         && MUTATING_METHODS.contains(&name.as_str())
                     {

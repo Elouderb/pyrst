@@ -1261,6 +1261,469 @@ pub fn builtin_method_ret(recv: &Ty, method: &str) -> Ty {
     }
 }
 
+/// Pure inference oracle — the single source of truth for expression types.
+///
+/// A side-effect-free port of codegen's `type_of_expr` (codegen.rs:264-548) with
+/// the SAME contract: it never errors and never mutates; on any ambiguity it
+/// falls to `Ty::Unknown` (preserving the `types_compatible` `(Unknown, _) => true`
+/// escape hatch). Inputs are exactly what both call sites already hold — typeck's
+/// `env.locals`/`env.ctx` and codegen's `self.locals`/`self.ctx` are identical
+/// types — so E.2 can route both through here.
+///
+/// It bakes in the CORRECT side of every documented divergence
+/// (docs/design/inference-oracle.md §A.4): D1 str-index → Str; D3 abs(x) → arg
+/// type; D4 sum(xs) → element type; D5 `**` → Float; D6 dict literal folds ALL
+/// pairs; D7 attribute access is inheritance-aware (`get_all_fields`).
+#[allow(dead_code)] // removed in E.2 (wired into codegen + check_expr)
+pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> Ty {
+    match expr {
+        Expr::Float(..) => Ty::Float,
+        Expr::Int(..) => Ty::Int,
+        Expr::Bool(..) => Ty::Bool,
+        Expr::Str(..) | Expr::FStr(..) => Ty::Str,
+        Expr::None_(_) => Ty::Unit,
+        Expr::IfExp { body, orelse, .. } => {
+            // Both branches unify in typeck; prefer the concrete one.
+            let b = infer_expr_ty(body, locals, ctx);
+            if b == Ty::Unknown {
+                infer_expr_ty(orelse, locals, ctx)
+            } else {
+                b
+            }
+        }
+        Expr::Ident(n, _) => locals
+            .get(n.as_str())
+            .or_else(|| ctx.vars.get(n.as_str()))
+            .cloned()
+            .unwrap_or(Ty::Unknown),
+        Expr::UnOp { op: UnOp::Neg, expr, .. } => infer_expr_ty(expr, locals, ctx),
+        Expr::UnOp { op: UnOp::Not, .. } => Ty::Bool,
+        Expr::UnOp { op: UnOp::BitNot, .. } => Ty::Int,
+        Expr::BinOp { lhs, op, rhs, .. } => {
+            let l = infer_expr_ty(lhs, locals, ctx);
+            let r = infer_expr_ty(rhs, locals, ctx);
+            match op {
+                // D5: Python `**` always yields a float (split out of the
+                // int-biased arithmetic arm below — codegen's bug).
+                BinOp::Pow => Ty::Float,
+                BinOp::Div => Ty::Float,
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Mod | BinOp::FloorDiv => {
+                    // Operator overloading: a class lhs uses its dunder return type.
+                    if let Ty::Class(cls) = &l {
+                        let dunder = match op {
+                            BinOp::Add => Some("__add__"),
+                            BinOp::Sub => Some("__sub__"),
+                            BinOp::Mul => Some("__mul__"),
+                            _ => None,
+                        };
+                        if let Some(ret) =
+                            dunder.and_then(|d| ctx.get_method(cls, d)).map(|s| s.ret.clone())
+                        {
+                            return ret;
+                        }
+                    }
+                    // String concatenation for Add.
+                    if *op == BinOp::Add && (l == Ty::Str || r == Ty::Str) {
+                        Ty::Str
+                    } else if l == Ty::Float || r == Ty::Float {
+                        Ty::Float
+                    } else {
+                        Ty::Int
+                    }
+                }
+                BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+                | BinOp::And | BinOp::Or | BinOp::Is | BinOp::IsNot | BinOp::In | BinOp::NotIn => {
+                    Ty::Bool
+                }
+                _ => Ty::Unknown,
+            }
+        }
+        Expr::Attr { obj, name, .. } => {
+            // D7: resolve the field inheritance-aware via `get_all_fields`
+            // (codegen reads `c.fields` directly and misses inherited fields).
+            if let Ty::Class(cls) = infer_expr_ty(obj, locals, ctx) {
+                let all_fields = ctx.get_all_fields(cls.as_str());
+                if let Some(f) = all_fields.iter().find(|f| f.name == *name) {
+                    return Ty::from_type_expr(&f.ty).unwrap_or(Ty::Unknown);
+                }
+            }
+            Ty::Unknown
+        }
+        Expr::Call { callee, args, .. } => {
+            if let Expr::Ident(n, _) = callee.as_ref() {
+                match n.as_str() {
+                    "float" => Ty::Float,
+                    "abs" => {
+                        // D3: abs returns the same type as its argument.
+                        if let Some(arg) = args.first() {
+                            infer_expr_ty(arg, locals, ctx)
+                        } else {
+                            Ty::Unknown
+                        }
+                    }
+                    "sum" => {
+                        // D4: sum() returns the type of the iterable's elements.
+                        if let Some(arg) = args.first() {
+                            match infer_expr_ty(arg, locals, ctx) {
+                                Ty::List(inner) => *inner,
+                                Ty::Set(inner) => *inner,
+                                _ => Ty::Int, // Default to int for other iterables.
+                            }
+                        } else {
+                            Ty::Int
+                        }
+                    }
+                    "int" | "len" | "ord" | "round" | "pow" => Ty::Int,
+                    "bool" | "any" | "all" => Ty::Bool,
+                    "str" | "chr" | "input" => Ty::Str,
+                    "map" if args.len() == 2 => {
+                        // map(f, iterable) -> List(applied return type of f).
+                        // Only a List iterable yields a concrete List result;
+                        // Set/Str/unknown stay Unknown (permissive).
+                        match infer_expr_ty(&args[1], locals, ctx) {
+                            Ty::List(e) => {
+                                let body_ty = lambda_applied_ty(&args[0], &e, locals, ctx);
+                                Ty::List(Box::new(body_ty))
+                            }
+                            _ => Ty::Unknown,
+                        }
+                    }
+                    "filter" if args.len() == 2 => {
+                        // filter(pred, iterable) -> the iterable's list type
+                        // unchanged. Only List yields a concrete type.
+                        match infer_expr_ty(&args[1], locals, ctx) {
+                            Ty::List(e) => Ty::List(e),
+                            _ => Ty::Unknown,
+                        }
+                    }
+                    "sorted" | "list" | "reversed" => {
+                        // These return a list; preserve the element type.
+                        if let Some(arg) = args.first() {
+                            match infer_expr_ty(arg, locals, ctx) {
+                                Ty::List(e) | Ty::Set(e) => Ty::List(e),
+                                Ty::Str => Ty::List(Box::new(Ty::Str)),
+                                _ => Ty::List(Box::new(Ty::Unknown)),
+                            }
+                        } else {
+                            Ty::List(Box::new(Ty::Unknown))
+                        }
+                    }
+                    n => {
+                        // A class constructor yields an instance; otherwise look
+                        // up the user function's declared return type.
+                        if ctx.classes.contains_key(n) {
+                            Ty::Class(n.to_string())
+                        } else {
+                            ctx.funcs.get(n).map(|s| s.ret.clone()).unwrap_or(Ty::Unknown)
+                        }
+                    }
+                }
+            } else if let Expr::Attr { obj, name, .. } = callee.as_ref() {
+                // Math module return types.
+                if let Expr::Ident(modname, _) = obj.as_ref() {
+                    if modname == "math" {
+                        return match name.as_str() {
+                            "isnan" | "isinf" | "isfinite" => Ty::Bool,
+                            _ => Ty::Float,
+                        };
+                    }
+                }
+                // Class methods use their declared return; builtin receivers
+                // (str/list/set/dict/file) delegate to the shared
+                // `builtin_method_ret` so the two never drift and chained calls
+                // resolve.
+                let recv = infer_expr_ty(obj, locals, ctx);
+                if let Ty::Class(cls) = &recv {
+                    ctx.get_method(cls, name).map(|s| s.ret.clone()).unwrap_or(Ty::Unknown)
+                } else {
+                    builtin_method_ret(&recv, name)
+                }
+            } else {
+                Ty::Unknown
+            }
+        }
+        Expr::List(elems, _) => {
+            // Unify all element types (not first-element-wins) so a mixed numeric
+            // literal like `[1, 2.0]` is typed `List(Float)`.
+            Ty::List(Box::new(infer_list_elem_ty(elems, locals, ctx)))
+        }
+        Expr::Dict(pairs, _) => {
+            // D6: fold ALL pairs, unifying key types and value types
+            // independently (codegen uses the first pair only). On a both-concrete
+            // conflict, degrade THAT position to Unknown — never error (the pure
+            // contract; check_expr rejects, this oracle stays permissive).
+            if pairs.is_empty() {
+                Ty::Dict(Box::new(Ty::Unknown), Box::new(Ty::Unknown))
+            } else {
+                let mut k_ty = infer_expr_ty(&pairs[0].0, locals, ctx);
+                let mut v_ty = infer_expr_ty(&pairs[0].1, locals, ctx);
+                for (k, v) in &pairs[1..] {
+                    let kt = infer_expr_ty(k, locals, ctx);
+                    let vt = infer_expr_ty(v, locals, ctx);
+                    // widen_numeric=false: float dict keys are non-hashable and
+                    // dict values have no codegen cast, matching check_expr.
+                    k_ty = unify_elem_types(k_ty.clone(), kt, false).unwrap_or(Ty::Unknown);
+                    v_ty = unify_elem_types(v_ty.clone(), vt, false).unwrap_or(Ty::Unknown);
+                }
+                Ty::Dict(Box::new(k_ty), Box::new(v_ty))
+            }
+        }
+        Expr::Set(elems, _) => {
+            // Unify all element types (mirrors the list case).
+            Ty::Set(Box::new(infer_list_elem_ty(elems, locals, ctx)))
+        }
+        Expr::ListComp { elt, target, iter, .. } => {
+            // Infer element type from the iterable and element expression.
+            let iter_ty = infer_expr_ty(iter, locals, ctx);
+            let elem_iter_ty = match &iter_ty {
+                Ty::List(inner) | Ty::Set(inner) => Some(inner.as_ref().clone()),
+                _ => None,
+            };
+            if let Some(elem_iter_type) = elem_iter_ty {
+                let inferred =
+                    infer_comp_elt_type_with_var(elt, &elem_iter_type, target, ctx);
+                if inferred != Ty::Unknown {
+                    return Ty::List(Box::new(inferred));
+                }
+            }
+            // Fallback: use the iterable's element type.
+            match iter_ty {
+                Ty::List(inner) => Ty::List(inner),
+                Ty::Set(inner) => Ty::List(inner),
+                _ => Ty::List(Box::new(Ty::Unknown)),
+            }
+        }
+        Expr::SetComp { elt, target: _, iter, .. } => {
+            let iter_ty = infer_expr_ty(iter, locals, ctx);
+            if let Ty::List(ref inner) | Ty::Set(ref inner) = iter_ty {
+                match elt.as_ref() {
+                    Expr::Attr { name, .. } => {
+                        if let Ty::Class(cls) = inner.as_ref() {
+                            if let Some(c) = ctx.classes.get(cls.as_str()) {
+                                if let Some(f) = c.fields.iter().find(|f| f.name == *name) {
+                                    if let Ok(ty) = Ty::from_type_expr(&f.ty) {
+                                        return Ty::Set(Box::new(ty));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Expr::Call { callee, .. } => {
+                        if let Expr::Attr { name, .. } = callee.as_ref() {
+                            if let Ty::Class(cls) = inner.as_ref() {
+                                if let Some(method_sig) = ctx.get_method(cls.as_str(), name) {
+                                    return Ty::Set(Box::new(method_sig.ret.clone()));
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                Ty::Set(inner.clone())
+            } else {
+                Ty::Set(Box::new(Ty::Unknown))
+            }
+        }
+        Expr::DictComp { key, val, target: _, iter, .. } => {
+            let iter_ty = infer_expr_ty(iter, locals, ctx);
+            let field_ty = |e: &Expr| -> Ty {
+                if let Expr::Attr { name, .. } = e {
+                    if let Ty::Class(ref cls) = iter_ty {
+                        if let Some(c) = ctx.classes.get(cls.as_str()) {
+                            if let Some(f) = c.fields.iter().find(|f| f.name == *name) {
+                                return Ty::from_type_expr(&f.ty).unwrap_or(Ty::Unknown);
+                            }
+                        }
+                    }
+                }
+                Ty::Unknown
+            };
+            Ty::Dict(Box::new(field_ty(key)), Box::new(field_ty(val)))
+        }
+        Expr::Index { obj, .. } => {
+            // D1: a Str receiver yields Str (codegen lacks this arm). Dict[k] is
+            // the value type; List[i] is the element type.
+            match infer_expr_ty(obj, locals, ctx) {
+                Ty::Dict(_, val_ty) => *val_ty,
+                Ty::List(elem_ty) => *elem_ty,
+                Ty::Str => Ty::Str,
+                _ => Ty::Unknown,
+            }
+        }
+        _ => Ty::Unknown,
+    }
+}
+
+/// Unified element type of a list/set literal's elements, for `infer_expr_ty`.
+/// Folds every element's type with `unify_oracle_ty` (not first-element-wins) so
+/// a mixed numeric literal like `[1, 2.0]` is typed `Float`. Empty -> `Unknown`.
+/// Pure port of codegen's `list_elem_ty`/`unify_ty`.
+#[allow(dead_code)] // removed in E.2 (helper of infer_expr_ty)
+fn infer_list_elem_ty(elems: &[Expr], locals: &HashMap<String, Ty>, ctx: &TyCtx) -> Ty {
+    let mut iter = elems.iter();
+    match iter.next() {
+        None => Ty::Unknown,
+        Some(first) => iter.fold(infer_expr_ty(first, locals, ctx), |acc, e| {
+            unify_oracle_ty(acc, infer_expr_ty(e, locals, ctx))
+        }),
+    }
+}
+
+/// Structural element-type unification for collection literals (pure port of
+/// codegen's `unify_ty`). Int/Float widen to Float; nested collections recurse;
+/// `Unknown` is absorbed; otherwise the left (concrete) side wins.
+#[allow(dead_code)] // removed in E.2 (helper of infer_expr_ty)
+fn unify_oracle_ty(a: Ty, b: Ty) -> Ty {
+    match (a, b) {
+        (Ty::Unknown, x) | (x, Ty::Unknown) => x,
+        (Ty::Int, Ty::Float) | (Ty::Float, Ty::Int) => Ty::Float,
+        (Ty::Dict(k1, v1), Ty::Dict(k2, v2)) => Ty::Dict(
+            Box::new(unify_oracle_ty(*k1, *k2)),
+            Box::new(unify_oracle_ty(*v1, *v2)),
+        ),
+        (Ty::List(e1), Ty::List(e2)) => Ty::List(Box::new(unify_oracle_ty(*e1, *e2))),
+        (Ty::Set(e1), Ty::Set(e2)) => Ty::Set(Box::new(unify_oracle_ty(*e1, *e2))),
+        (a, _) => a,
+    }
+}
+
+/// Infer the applied return type of a `map`'s callable over an element of type
+/// `elem`, for `infer_expr_ty`'s `map` arm. Pure port of codegen's
+/// `lambda_applied_ty` -> `type_of_expr_bound`.
+#[allow(dead_code)] // removed in E.2 (helper of infer_expr_ty)
+fn lambda_applied_ty(callable: &Expr, elem: &Ty, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> Ty {
+    if let Expr::Lambda { params, body, .. } = callable {
+        if let Some((param, _)) = params.first() {
+            return infer_expr_ty_bound(body, param, elem, locals, ctx);
+        }
+    }
+    Ty::Unknown
+}
+
+/// Like `infer_expr_ty`, but the single identifier `param` resolves to `elem`
+/// (the bound lambda parameter). Recurses through the compound forms that appear
+/// in map lambda bodies; for everything else it delegates to `infer_expr_ty`.
+/// Pure port of codegen's `type_of_expr_bound`.
+#[allow(dead_code)] // removed in E.2 (helper of infer_expr_ty)
+fn infer_expr_ty_bound(
+    e: &Expr,
+    param: &str,
+    elem: &Ty,
+    locals: &HashMap<String, Ty>,
+    ctx: &TyCtx,
+) -> Ty {
+    match e {
+        Expr::Ident(n, _) if n == param => elem.clone(),
+        Expr::UnOp { op: UnOp::Neg, expr, .. } => {
+            infer_expr_ty_bound(expr, param, elem, locals, ctx)
+        }
+        Expr::IfExp { body, orelse, .. } => {
+            let b = infer_expr_ty_bound(body, param, elem, locals, ctx);
+            if b == Ty::Unknown {
+                infer_expr_ty_bound(orelse, param, elem, locals, ctx)
+            } else {
+                b
+            }
+        }
+        Expr::BinOp { lhs, op, rhs, .. } => {
+            let l = infer_expr_ty_bound(lhs, param, elem, locals, ctx);
+            let r = infer_expr_ty_bound(rhs, param, elem, locals, ctx);
+            match op {
+                BinOp::Div => Ty::Float,
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Mod | BinOp::FloorDiv | BinOp::Pow => {
+                    if *op == BinOp::Add && (l == Ty::Str || r == Ty::Str) {
+                        Ty::Str
+                    } else if l == Ty::Float || r == Ty::Float {
+                        Ty::Float
+                    } else if l == Ty::Int || r == Ty::Int {
+                        Ty::Int
+                    } else {
+                        Ty::Unknown
+                    }
+                }
+                BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+                | BinOp::And | BinOp::Or | BinOp::Is | BinOp::IsNot | BinOp::In | BinOp::NotIn => {
+                    Ty::Bool
+                }
+                _ => Ty::Unknown,
+            }
+        }
+        // Other forms do not depend on `param` for their result type — delegate.
+        _ => infer_expr_ty(e, locals, ctx),
+    }
+}
+
+/// Infer a comprehension element expression's type given the loop variable's
+/// type and name, for `infer_expr_ty`'s comprehension arms. Pure port of
+/// codegen's `infer_comp_elt_type_with_var`.
+#[allow(dead_code)] // removed in E.2 (helper of infer_expr_ty)
+fn infer_comp_elt_type_with_var(
+    elt: &Expr,
+    loop_var_ty: &Ty,
+    loop_var_name: &str,
+    ctx: &TyCtx,
+) -> Ty {
+    match elt {
+        // [i.field for i in items] or [i.a.b for i in items]
+        Expr::Attr { obj, name, .. } => {
+            let obj_ty = if let Expr::Ident(var_name, _) = obj.as_ref() {
+                if var_name == loop_var_name {
+                    loop_var_ty.clone()
+                } else {
+                    Ty::Unknown
+                }
+            } else {
+                infer_comp_elt_type_with_var(obj, loop_var_ty, loop_var_name, ctx)
+            };
+            if let Ty::Class(cls) = obj_ty {
+                if let Some(c) = ctx.classes.get(cls.as_str()) {
+                    if let Some(f) = c.fields.iter().find(|f| f.name == *name) {
+                        return Ty::from_type_expr(&f.ty).unwrap_or(Ty::Unknown);
+                    }
+                }
+            }
+            Ty::Unknown
+        }
+        // [i.method() for i in items]
+        Expr::Call { callee, .. } => {
+            if let Expr::Attr { obj, name, .. } = callee.as_ref() {
+                let obj_ty = if let Expr::Ident(var_name, _) = obj.as_ref() {
+                    if var_name == loop_var_name {
+                        loop_var_ty.clone()
+                    } else {
+                        Ty::Unknown
+                    }
+                } else {
+                    infer_comp_elt_type_with_var(obj, loop_var_ty, loop_var_name, ctx)
+                };
+                if let Ty::Class(cls) = obj_ty {
+                    if let Some(method_sig) = ctx.get_method(cls.as_str(), name) {
+                        return method_sig.ret.clone();
+                    }
+                }
+            }
+            Ty::Unknown
+        }
+        // [i.a + i.b for i in items] - infer from BinOp.
+        Expr::BinOp { lhs, op, rhs, .. } => {
+            let left_ty = infer_comp_elt_type_with_var(lhs, loop_var_ty, loop_var_name, ctx);
+            let right_ty = infer_comp_elt_type_with_var(rhs, loop_var_ty, loop_var_name, ctx);
+            match (left_ty, right_ty) {
+                (Ty::Float, _) | (_, Ty::Float) => Ty::Float,
+                (Ty::Int, Ty::Int) => {
+                    if *op == BinOp::Div {
+                        Ty::Float
+                    } else {
+                        Ty::Int
+                    }
+                }
+                _ => Ty::Unknown,
+            }
+        }
+        _ => Ty::Unknown,
+    }
+}
+
 /// Resolve a lambda parameter's annotation to a `Ty`. Lambda params are
 /// untyped in the surface syntax; the parser records the placeholder
 /// `TypeExpr::Named("Any")`. That sentinel must resolve to `Ty::Unknown` (not

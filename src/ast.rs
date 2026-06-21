@@ -117,8 +117,13 @@ pub enum Stmt {
     Func(Func),
     Class(ClassDef),
     Import { path: Vec<String>, names: Vec<(String, Option<String>)>, span: Span },
-    AttrAssign { obj: String, attr: String, value: Expr, span: Span },
-    IndexAssign { obj: String, idx: Expr, value: Expr, span: Span },
+    // Assignment targets carry an arbitrary lvalue *base* as a boxed Expr
+    // (e.g. `self`, `self.dict`, `rooms[i]`, `a.b`) rather than a bare name, so
+    // chained targets like `self.dict[k] = v`, `rooms[i].field = v`, and
+    // `a.b.c = v` parse and lower as in-place mutations. `attr`/`idx` are the
+    // final field/subscript applied to that base.
+    AttrAssign { obj: Box<Expr>, attr: String, value: Expr, span: Span },
+    IndexAssign { obj: Box<Expr>, idx: Expr, value: Expr, span: Span },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

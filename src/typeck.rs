@@ -273,7 +273,9 @@ pub fn extract_init_fields(class_def: &mut ClassDef) {
             for stmt in &method.body {
                 match stmt {
                     Stmt::AttrAssign { obj, attr, value, .. } => {
-                        if obj == "self" && !class_def.fields.iter().any(|f| &f.name == attr) {
+                        // Only a direct `self.<attr> = ...` declares a field.
+                        let is_self = matches!(obj.as_ref(), Expr::Ident(n, _) if n == "self");
+                        if is_self && !class_def.fields.iter().any(|f| &f.name == attr) {
                             let inferred_ty = infer_expr_type(value, &param_types);
                             discovered_fields.insert(attr.clone(), inferred_ty);
                         }
@@ -523,7 +525,13 @@ fn collect_calls_from_stmt(stmt: &Stmt, called: &mut std::collections::HashSet<S
                 for s in &m.body { collect_calls_from_stmt(s, called); }
             }
         }
-        Stmt::AttrAssign { value, .. } | Stmt::IndexAssign { value, .. } => {
+        Stmt::AttrAssign { obj, value, .. } => {
+            collect_calls_from_expr(obj, called);
+            collect_calls_from_expr(value, called);
+        }
+        Stmt::IndexAssign { obj, idx, value, .. } => {
+            collect_calls_from_expr(obj, called);
+            collect_calls_from_expr(idx, called);
             collect_calls_from_expr(value, called);
         }
         _ => {}
@@ -887,19 +895,33 @@ fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             }
             Ok(())
         }
-        Stmt::AttrAssign { obj, value, span, .. } => {
+        Stmt::AttrAssign { obj, attr, value, span } => {
+            // Validate the target base chain (the base expr must type-check;
+            // unknown names / bad nested attributes are rejected by check_expr).
+            let obj_ty = check_expr(obj, env)?;
             check_expr(value, env)?;
-            if env.lookup(obj).is_none() {
-                return Err(Error::Type { span: *span, msg: format!("undefined name `{}`", obj) });
+            // If the base is a known user class, the assigned field must exist on
+            // it (including inherited fields) — `a.b.c = v` with no field `c` is a
+            // type error, not a deferred-to-rustc one.
+            if let Ty::Class(class_name) = &obj_ty {
+                if env.ctx.classes.contains_key(class_name.as_str()) {
+                    let has_field = env.ctx.get_all_fields(class_name.as_str())
+                        .iter().any(|f| &f.name == attr);
+                    if !has_field {
+                        return Err(Error::Type {
+                            span: *span,
+                            msg: format!("class `{}` has no attribute `{}`", class_name, attr),
+                        });
+                    }
+                }
             }
             Ok(())
         }
-        Stmt::IndexAssign { obj, idx, value, span } => {
+        Stmt::IndexAssign { obj, idx, value, span: _ } => {
+            // Validate the target base chain, the subscript, and the value.
+            check_expr(obj, env)?;
             check_expr(idx, env)?;
             check_expr(value, env)?;
-            if env.lookup(obj).is_none() {
-                return Err(Error::Type { span: *span, msg: format!("undefined name `{}`", obj) });
-            }
             Ok(())
         }
         Stmt::Func(_) | Stmt::Class(_) => Ok(()), // Nested — punt in v0.

@@ -281,13 +281,15 @@ impl Formatter {
                 self.indent_level -= 1;
             }
             Stmt::AttrAssign { obj, attr, value, .. } => {
+                let obj_str = self.format_expr(obj)?;
                 let value_str = self.format_expr(value)?;
-                self.writeln(&format!("{}.{} = {}", obj, attr, value_str));
+                self.writeln(&format!("{}.{} = {}", obj_str, attr, value_str));
             }
             Stmt::IndexAssign { obj, idx, value, .. } => {
+                let obj_str = self.format_expr(obj)?;
                 let idx_str = self.format_expr(idx)?;
                 let value_str = self.format_expr(value)?;
-                self.writeln(&format!("{}[{}] = {}", obj, idx_str, value_str));
+                self.writeln(&format!("{}[{}] = {}", obj_str, idx_str, value_str));
             }
             Stmt::AugAssign { target, op, value, .. } => {
                 let op_str = match op {

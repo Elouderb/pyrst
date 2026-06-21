@@ -243,18 +243,12 @@ impl Parser {
             if let Expr::Attr { obj, name, span } = lhs_expr {
                 self.bump(); // consume augop
                 let rhs = self.parse_expr()?;
-                let obj_name = match *obj {
-                    Expr::Ident(n, _) => n,
-                    _ => return Err(Error::Parse {
-                        span,
-                        msg: "only simple `obj.attr += val` assignment is supported".into(),
-                    }),
-                };
-                // Convert x.attr += y to x.attr = x.attr + y
+                // Convert `place.attr += y` to `place.attr = place.attr + y`,
+                // reusing the full lvalue base (`place` may be any expr chain).
                 let value = Expr::BinOp {
                     op,
                     lhs: Box::new(Expr::Attr {
-                        obj: Box::new(Expr::Ident(obj_name.clone(), span)),
+                        obj: obj.clone(),
                         name: name.clone(),
                         span,
                     }),
@@ -262,23 +256,17 @@ impl Parser {
                     span,
                 };
                 self.eat_newline()?;
-                return Ok(Stmt::AttrAssign { obj: obj_name, attr: name, value, span });
+                return Ok(Stmt::AttrAssign { obj, attr: name, value, span });
             }
             if let Expr::Index { obj, idx, span } = lhs_expr {
                 self.bump(); // consume augop
                 let rhs = self.parse_expr()?;
-                let obj_name = match *obj {
-                    Expr::Ident(n, _) => n,
-                    _ => return Err(Error::Parse {
-                        span,
-                        msg: "only simple `obj[idx] += val` assignment is supported".into(),
-                    }),
-                };
-                // Convert a[i] += y to a[i] = a[i] + y
+                // Convert `place[i] += y` to `place[i] = place[i] + y`,
+                // reusing the full lvalue base and index expression.
                 let value = Expr::BinOp {
                     op,
                     lhs: Box::new(Expr::Index {
-                        obj: Box::new(Expr::Ident(obj_name.clone(), span)),
+                        obj: obj.clone(),
                         idx: idx.clone(),
                         span,
                     }),
@@ -286,7 +274,7 @@ impl Parser {
                     span,
                 };
                 self.eat_newline()?;
-                return Ok(Stmt::IndexAssign { obj: obj_name, idx: *idx, value, span });
+                return Ok(Stmt::IndexAssign { obj, idx: *idx, value, span });
             }
         }
 
@@ -306,31 +294,21 @@ impl Parser {
             }
 
             match lhs_expr {
+                // Attribute target on an arbitrary lvalue base: `place.attr = v`
+                // where `place` is any expr chain (`self`, `a.b`, `rooms[i]`, ...).
                 Expr::Attr { obj, name, span } => {
                     self.bump(); // consume '='
                     let value = self.parse_expr()?;
                     self.eat_newline()?;
-                    let obj_name = match *obj {
-                        Expr::Ident(n, _) => n,
-                        _ => return Err(Error::Parse {
-                            span,
-                            msg: "only simple `obj.attr = val` assignment is supported".into(),
-                        }),
-                    };
-                    return Ok(Stmt::AttrAssign { obj: obj_name, attr: name, value, span });
+                    return Ok(Stmt::AttrAssign { obj, attr: name, value, span });
                 }
+                // Subscript target on an arbitrary lvalue base: `place[idx] = v`
+                // (`self.dict[k] = v`, `grid[r][c] = v`, ...).
                 Expr::Index { obj, idx, span } => {
                     self.bump(); // consume '='
                     let value = self.parse_expr()?;
                     self.eat_newline()?;
-                    let obj_name = match *obj {
-                        Expr::Ident(n, _) => n,
-                        _ => return Err(Error::Parse {
-                            span,
-                            msg: "only simple `obj[idx] = val` assignment is supported".into(),
-                        }),
-                    };
-                    return Ok(Stmt::IndexAssign { obj: obj_name, idx: *idx, value, span });
+                    return Ok(Stmt::IndexAssign { obj, idx: *idx, value, span });
                 }
                 _ => {}
             }

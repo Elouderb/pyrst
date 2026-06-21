@@ -292,12 +292,14 @@ impl Linter {
                     }
                 }
             }
-            Stmt::AttrAssign { value, .. } => {
-                // Track usage of variables in attribute assignment
+            Stmt::AttrAssign { obj, value, .. } => {
+                // Track usage of variables in the target base and the value.
+                self.check_expr(obj);
                 self.check_expr(value);
             }
-            Stmt::IndexAssign { idx, value, .. } => {
-                // Track usage of variables in index assignment
+            Stmt::IndexAssign { obj, idx, value, .. } => {
+                // Track usage of variables in the target base, index, and value.
+                self.check_expr(obj);
                 self.check_expr(idx);
                 self.check_expr(value);
             }

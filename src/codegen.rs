@@ -589,30 +589,37 @@ impl<'a> Codegen<'a> {
         }
     }
 
+    /// Whether an lvalue / receiver chain bottoms out at the `self` receiver —
+    /// i.e. walking through `Attr`/`Index` bases reaches `Expr::Ident("self")`.
+    /// Used to decide a method needs `&mut self` when it mutates anything rooted
+    /// at self (`self.x`, `self.dict[k]`, `self.rooms[i].field`, ...).
+    fn expr_roots_at_self(e: &Expr) -> bool {
+        match e {
+            Expr::Ident(n, _) => n == "self",
+            Expr::Attr { obj, .. } | Expr::Index { obj, .. } => Self::expr_roots_at_self(obj),
+            _ => false,
+        }
+    }
+
     fn method_modifies_self(&self, body: &[Stmt]) -> bool {
         for stmt in body {
             match stmt {
-                Stmt::AttrAssign { obj, .. } => {
-                    if obj == "self" {
+                // Any assignment whose target base chain roots at `self` mutates
+                // it: `self.x = v`, `self.dict[k] = v`, `self.a.b = v`,
+                // `self.rooms[i].field = v`.
+                Stmt::AttrAssign { obj, .. } | Stmt::IndexAssign { obj, .. } => {
+                    if Self::expr_roots_at_self(obj) {
                         return true;
                     }
                 }
-                // Check for method calls that mutate (like self.items.append())
+                // Check for method calls that mutate (like self.items.append()
+                // or self.rooms[i].append()) — any mutating call whose receiver
+                // chain roots at `self`.
                 Stmt::Expr(Expr::Call { callee, .. }) => {
                     if let Expr::Attr { obj, name, .. } = callee.as_ref() {
-                        // Check if this is a method call on self or self.attr that mutates
                         if matches!(name.as_str(), "append" | "extend" | "insert" | "remove" | "pop" | "clear" | "sort" | "reverse" | "update") {
-                            // Check if the object is self or self.something
-                            if let Expr::Ident(var, _) = obj.as_ref() {
-                                if var == "self" {
-                                    return true;
-                                }
-                            } else if let Expr::Attr { obj: inner_obj, .. } = obj.as_ref() {
-                                if let Expr::Ident(var, _) = inner_obj.as_ref() {
-                                    if var == "self" {
-                                        return true;
-                                    }
-                                }
+                            if Self::expr_roots_at_self(obj) {
+                                return true;
                             }
                         }
                     }
@@ -1097,6 +1104,47 @@ impl<'a> Codegen<'a> {
         Ok(s)
     }
 
+    /// Emit an lvalue *place* expression (one assignable / mutable in Rust) for
+    /// an assignment-target base — as opposed to `emit_expr`, which produces a
+    /// clone-based *rvalue* for `Index`/`Attr` (e.g. `{ let __list = x.clone();
+    /// __list[i].clone() }`) that cannot be stored into. Used by AttrAssign /
+    /// IndexAssign so chained targets (`self.dict[k]=v`, `rooms[i].field=v`,
+    /// `a.b.c=v`) lower to in-place mutation. Struct fields are bare
+    /// HashMap/Vec/struct values (no Rc/RefCell), so `place.field`,
+    /// `place[i as usize]`, and `*place.get_mut(&k)` are valid places.
+    fn emit_place(&mut self, e: &Expr) -> Result<String> {
+        match e {
+            // A bare name (`self`, a local, a `mut` param) is already a place.
+            Expr::Ident(n, _) => Ok(n.clone()),
+            // Field access: the base recursively as a place, then `.field`.
+            // (No @property handling: a property getter is not an lvalue.)
+            Expr::Attr { obj, name, .. } => {
+                let base = self.emit_place(obj)?;
+                Ok(format!("{}.{}", base, name))
+            }
+            // Subscript in a *base* position (we are descending further into the
+            // target, e.g. `grid[r][c]` or `self.dict[k].field`): produce a place
+            // that mutably borrows the element. Dict -> deref of get_mut; list ->
+            // direct index. Negative indices in nested lvalue position are not
+            // supported yet (a place cannot contain a `let`); the common
+            // non-negative cases lower directly.
+            Expr::Index { obj, idx, .. } => {
+                let base = self.emit_place(obj)?;
+                if matches!(self.type_of_expr(obj), Ty::Dict(..)) {
+                    let k = self.emit_expr(idx)?;
+                    Ok(format!("(*{}.get_mut(&{}).expect(\"key not found\"))", base, k))
+                } else {
+                    let i = self.emit_expr(idx)?;
+                    Ok(format!("{}[{} as usize]", base, i))
+                }
+            }
+            // Any other base (a parenthesized/computed expr) — fall back to the
+            // normal emission; in practice the parser only yields Ident/Attr/Index
+            // chains as assignment-target bases.
+            _ => self.emit_expr(e),
+        }
+    }
+
     /// Emit a list/set element, promoting int-typed elements to `f64` when the
     /// collection's unified element type is `Float` (`widen == true`). Reuses
     /// the same `as f64` cast convention as the assignment int->float coercion
@@ -1179,19 +1227,24 @@ impl<'a> Codegen<'a> {
                     self.locals.insert(target.clone(), merged);
                 }
                 Stmt::IndexAssign { obj, value, .. } => {
-                    let vt = self.type_of_expr(value);
-                    if !matches!(vt, Ty::Unknown) {
-                        if let Some(existing) = self.locals.get(obj).cloned() {
-                            let refined = match existing {
-                                Ty::Dict(k, v) if matches!(*v, Ty::Unknown) => {
-                                    Ty::Dict(k, Box::new(vt))
-                                }
-                                Ty::List(e) if matches!(*e, Ty::Unknown) => {
-                                    Ty::List(Box::new(vt))
-                                }
-                                other => other,
-                            };
-                            self.locals.insert(obj.clone(), refined);
+                    // Refine an empty-collection element type from `name[k] = v`
+                    // — only for a bare local base (`Expr::Ident`); chained bases
+                    // (self.dict[k], grid[r][c]) refine via their declared types.
+                    if let Expr::Ident(name, _) = obj.as_ref() {
+                        let vt = self.type_of_expr(value);
+                        if !matches!(vt, Ty::Unknown) {
+                            if let Some(existing) = self.locals.get(name).cloned() {
+                                let refined = match existing {
+                                    Ty::Dict(k, v) if matches!(*v, Ty::Unknown) => {
+                                        Ty::Dict(k, Box::new(vt))
+                                    }
+                                    Ty::List(e) if matches!(*e, Ty::Unknown) => {
+                                        Ty::List(Box::new(vt))
+                                    }
+                                    other => other,
+                                };
+                                self.locals.insert(name.clone(), refined);
+                            }
                         }
                     }
                 }
@@ -1705,23 +1758,26 @@ impl<'a> Codegen<'a> {
             }
             Stmt::AttrAssign { obj, attr, value, .. } => {
                 let v = self.emit_owned(value)?;
-                self.line(&format!("{}.{} = {};", obj, attr, v));
+                // The base must be emitted as a *place* (lvalue), not the
+                // clone-based rvalue emit_expr produces for Attr/Index.
+                let place = self.emit_place(obj)?;
+                self.line(&format!("{}.{} = {};", place, attr, v));
             }
             Stmt::IndexAssign { obj, idx, value, .. } => {
                 let v = self.emit_owned(value)?;
-                // Check if obj is a dict or list based on type info
-                let is_dict = self.locals.get(obj)
-                    .or_else(|| self.ctx.vars.get(obj))
-                    .map(|t| matches!(t, Ty::Dict(..)))
-                    .unwrap_or(false);
+                let place = self.emit_place(obj)?;
+                // Dispatch on the base's collection kind (dict -> HashMap::insert,
+                // list -> indexed store). type_of_expr resolves chained bases
+                // (self.dict, grid[r], ...), not just bare locals.
+                let is_dict = matches!(self.type_of_expr(obj), Ty::Dict(..));
                 if is_dict {
                     // HashMap::insert takes ownership of the key, so emit it owned
                     // (a String key var becomes `k.clone()`; Copy keys are unchanged).
                     let k = self.emit_owned(idx)?;
-                    self.line(&format!("{}.insert({}, {});", obj, k, v));
+                    self.line(&format!("{}.insert({}, {});", place, k, v));
                 } else {
                     let i = self.emit_expr(idx)?;
-                    self.line(&format!("{}[{} as usize] = {};", obj, i, v));
+                    self.line(&format!("{}[{} as usize] = {};", place, i, v));
                 }
             }
             Stmt::Match { subject, arms, .. } => {
@@ -2655,7 +2711,25 @@ impl<'a> Codegen<'a> {
                         }
                     }
 
-                    let obj_s = self.emit_expr(obj)?;
+                    // Mutating list/set/dict methods need an lvalue receiver. For
+                    // a *subscripted* receiver (`self.rows[i].append(x)`,
+                    // `grid[r].sort()`) emit_expr would produce a clone-based
+                    // rvalue, so the mutation would hit (and drop) a temporary.
+                    // Use emit_place for those so the in-place mutation lands on
+                    // the real element. Bare-name and `self.field` receivers are
+                    // already place expressions under emit_expr.
+                    const MUTATING_METHODS: &[&str] = &[
+                        "append", "extend", "insert", "remove", "pop", "clear",
+                        "sort", "reverse", "update", "add", "discard",
+                        "setdefault", "popitem",
+                    ];
+                    let obj_s = if matches!(obj.as_ref(), Expr::Index { .. })
+                        && MUTATING_METHODS.contains(&name.as_str())
+                    {
+                        self.emit_place(obj)?
+                    } else {
+                        self.emit_expr(obj)?
+                    };
                     let method = match name.as_str() {
                         // String methods
                         "upper"      => "to_uppercase",

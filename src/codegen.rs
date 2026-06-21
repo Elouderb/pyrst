@@ -36,6 +36,51 @@ impl<'a> Codegen<'a> {
         matches!(ty, Ty::Int | Ty::Float | Ty::Bool | Ty::Unit)
     }
 
+    /// Returns true when `ty` implements the `Default` trait in the emitted Rust.
+    /// Copy classes (all-primitive fields) don't derive Default, so they return false.
+    fn type_has_default(&self, ty: &Ty) -> bool {
+        match ty {
+            Ty::Int | Ty::Float | Ty::Bool | Ty::Str | Ty::Unit => true,
+            Ty::List(_) | Ty::Set(_) | Ty::Dict(_, _) | Ty::Option(_) => true,
+            Ty::Class(n) => {
+                // Copy classes don't get #[derive(Default)] (see emit_class).
+                let all_copy = self.ctx.get_all_fields(n).iter().all(|f| {
+                    Ty::from_type_expr(&f.ty).map(|t| self.is_copy_type(&t)).unwrap_or(false)
+                });
+                !all_copy
+            }
+            _ => false,
+        }
+    }
+
+    /// Returns a zero-value Rust initializer for any type, including Copy classes
+    /// whose primitive fields are zeroed recursively.  Used in `new()` bodies
+    /// where `Default::default()` is unavailable for Copy-only structs.
+    fn zeroed_default(&self, ty: &Ty) -> String {
+        match ty {
+            Ty::Int => "0i64".to_string(),
+            Ty::Float => "0.0f64".to_string(),
+            Ty::Bool => "false".to_string(),
+            Ty::Str => "String::new()".to_string(),
+            Ty::Class(n) => {
+                let all_copy = self.ctx.get_all_fields(n).iter().all(|f| {
+                    Ty::from_type_expr(&f.ty).map(|t| self.is_copy_type(&t)).unwrap_or(false)
+                });
+                if all_copy {
+                    // Build a struct literal with zeroed primitive fields.
+                    let fields: Vec<String> = self.ctx.get_all_fields(n).iter().map(|f| {
+                        let inner_ty = Ty::from_type_expr(&f.ty).unwrap_or(Ty::Int);
+                        format!("{}: {}", f.name, self.zeroed_default(&inner_ty))
+                    }).collect();
+                    format!("{} {{ {} }}", n, fields.join(", "))
+                } else {
+                    "Default::default()".to_string()
+                }
+            }
+            _ => "Default::default()".to_string(),
+        }
+    }
+
     /// True if a type has no `Unknown` anywhere — only then is it safe to hoist
     /// (an `Unknown` element would render as `()` and mismatch a real value).
     fn fully_concrete(ty: &Ty) -> bool {
@@ -63,12 +108,12 @@ impl<'a> Codegen<'a> {
             Ty::Dict(_, _) => "::std::collections::HashMap::new()".to_string(),
             Ty::Option(_) => "None".to_string(),
             Ty::Class(n) => {
-                // Only non-Copy structs derive Default (mirrors emit_class).
-                let all_copy = self.ctx.get_all_fields(n).iter().all(|f| {
-                    Ty::from_type_expr(&f.ty).map(|t| self.is_copy_type(&t)).unwrap_or(false)
-                });
-                if all_copy { return None; }
-                "Default::default()".to_string()
+                // Only derive Default when all fields support it (mirrors emit_class).
+                if self.type_has_default(&Ty::Class(n.clone())) {
+                    "Default::default()".to_string()
+                } else {
+                    return None;  // Not hoistable — no Default impl available.
+                }
             }
             _ => return None,
         })
@@ -784,10 +829,20 @@ impl<'a> Codegen<'a> {
         // derive it (that would be a conflicting-impl error, E0119).
         let has_eq = c.methods.iter().any(|m| m.name == "__eq__");
         let pe = if has_eq { "" } else { ", PartialEq" };
+        // Only derive Default when every field actually implements Default.
+        // Copy classes (all-primitive fields) don't derive Default, so an outer
+        // struct holding one must NOT include Default in its own derive list.
+        let all_fields_default = all_fields.iter().all(|f| {
+            Ty::from_type_expr(&f.ty)
+                .map(|ty| self.type_has_default(&ty))
+                .unwrap_or(false)
+        });
         let derives = if all_fields_copy {
             format!("#[derive(Copy, Clone, Debug{})]", pe)
-        } else {
+        } else if all_fields_default {
             format!("#[derive(Clone, Debug{}, Default)]", pe)
+        } else {
+            format!("#[derive(Clone, Debug{})]", pe)
         };
         self.line(&derives);
         self.line(&format!("struct {} {{", c.name));
@@ -830,13 +885,9 @@ impl<'a> Codegen<'a> {
                     let param_names: Vec<_> = non_self.iter().map(|p| p.name.clone()).collect();
                     let defaults: Vec<String> = all_fields.iter().map(|f| {
                         let ty = Ty::from_type_expr(&f.ty).unwrap_or(Ty::Unknown);
-                        let dv = match &ty {
-                            Ty::Int => "0i64".to_string(),
-                            Ty::Float => "0.0f64".to_string(),
-                            Ty::Bool => "false".to_string(),
-                            Ty::Str => "String::new()".to_string(),
-                            _ => "Default::default()".to_string(),
-                        };
+                        // Use zeroed_default which handles Copy classes that don't
+                        // implement Default (unlike a plain Default::default() call).
+                        let dv = self.zeroed_default(&ty);
                         format!("{}: {}", f.name, dv)
                     }).collect();
                     self.line(&format!("fn new({}) -> Self {{", param_strs.join(", ")));
@@ -2566,8 +2617,10 @@ impl<'a> Codegen<'a> {
                     if let Some(class_def) = self.ctx.classes.get(name.as_str()).cloned() {
                         let has_init = class_def.methods.iter().any(|m| m.name == "__init__");
 
-                        // Use ::new() constructor when __init__ is defined and args provided.
-                        if has_init && (!args.is_empty() || !kwargs.is_empty()) {
+                        // Use ::new() constructor whenever __init__ is defined —
+                        // including the zero-arg case so that __init__ side-effects
+                        // (field assignments, etc.) always run.
+                        if has_init {
                             let mut call_parts = Vec::new();
                             for a in args { call_parts.push(self.emit_expr(a)?); }
                             for (_, v) in kwargs { call_parts.push(self.emit_expr(v)?); }
@@ -2630,12 +2683,7 @@ impl<'a> Codegen<'a> {
                                 });
                             let default = if let Some(f) = field {
                                 let ty = Ty::from_type_expr(&f.ty)?;
-                                match ty {
-                                    Ty::Int => "0i64".to_string(),
-                                    Ty::Float => "0.0f64".to_string(),
-                                    Ty::Bool => "false".to_string(),
-                                    _ => "Default::default()".to_string(),
-                                }
+                                self.zeroed_default(&ty)
                             } else {
                                 "Default::default()".to_string()
                             };

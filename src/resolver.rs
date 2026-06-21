@@ -115,12 +115,12 @@ fn merge_ctx_from_module(m: &Module, ctx: &mut TyCtx, is_root: bool) -> Result<(
                 if f.name == "main" && !is_root {
                     continue;
                 }
+                let params: Vec<(String, crate::typeck::Ty)> = f.params.iter()
+                    .map(|p| crate::typeck::Ty::from_type_expr(&p.ty).map(|ty| (p.name.clone(), ty)))
+                    .collect::<crate::diag::Result<Vec<_>>>()?;
                 ctx.funcs.insert(f.name.clone(), crate::typeck::FuncSig {
-                    params: f.params.iter().map(|p| (
-                        p.name.clone(),
-                        crate::typeck::Ty::from_type_expr(&p.ty).unwrap_or(crate::typeck::Ty::Unknown)
-                    )).collect(),
-                    ret: crate::typeck::Ty::from_type_expr(&f.ret).unwrap_or(crate::typeck::Ty::Unknown),
+                    params,
+                    ret: crate::typeck::Ty::from_type_expr(&f.ret)?,
                     param_defaults: f.params.iter()
                         .filter(|p| p.name != "self")
                         .map(|p| p.default.clone())
@@ -134,12 +134,12 @@ fn merge_ctx_from_module(m: &Module, ctx: &mut TyCtx, is_root: bool) -> Result<(
                 // Register method signatures
                 for m_fn in &c.methods {
                     let method_name = format!("{}.{}", c.name, m_fn.name);
+                    let method_params: Vec<(String, crate::typeck::Ty)> = m_fn.params.iter()
+                        .map(|p| crate::typeck::Ty::from_type_expr(&p.ty).map(|ty| (p.name.clone(), ty)))
+                        .collect::<crate::diag::Result<Vec<_>>>()?;
                     ctx.funcs.insert(method_name, crate::typeck::FuncSig {
-                        params: m_fn.params.iter().map(|p| (
-                            p.name.clone(),
-                            crate::typeck::Ty::from_type_expr(&p.ty).unwrap_or(crate::typeck::Ty::Unknown)
-                        )).collect(),
-                        ret: crate::typeck::Ty::from_type_expr(&m_fn.ret).unwrap_or(crate::typeck::Ty::Unknown),
+                        params: method_params,
+                        ret: crate::typeck::Ty::from_type_expr(&m_fn.ret)?,
                         param_defaults: m_fn.params.iter()
                             .filter(|p| p.name != "self")
                             .map(|p| p.default.clone())
@@ -149,10 +149,9 @@ fn merge_ctx_from_module(m: &Module, ctx: &mut TyCtx, is_root: bool) -> Result<(
             }
             Stmt::Assign { target, ty: Some(t), .. } => {
                 // Register module-level annotated globals with their concrete type
-                // (ported from typeck::check_module). Fall back to Unknown only if
-                // the annotation cannot be resolved.
-                let resolved = crate::typeck::Ty::from_type_expr(t)
-                    .unwrap_or(crate::typeck::Ty::Unknown);
+                // (ported from typeck::check_module). Propagate errors so that
+                // invalid annotations (e.g. set[float]) are rejected at typeck.
+                let resolved = crate::typeck::Ty::from_type_expr(t)?;
                 ctx.vars.insert(target.clone(), resolved);
             }
             Stmt::Import { .. } => {}

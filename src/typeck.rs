@@ -473,8 +473,8 @@ pub fn check_bodies(m: &Module, ctx: &TyCtx) -> Result<()> {
 
                 let params: Vec<(String, Ty)> = f.params.iter()
                     .filter(|p| p.name != "self")
-                    .map(|p| (p.name.clone(), Ty::from_type_expr(&p.ty).unwrap_or(Ty::Unknown)))
-                    .collect();
+                    .map(|p| Ty::from_type_expr(&p.ty).map(|ty| (p.name.clone(), ty)))
+                    .collect::<Result<Vec<_>>>()?;
                 let ret = Ty::from_type_expr(&f.ret)?;
                 let mut env = FuncEnv::new(ctx, &params, ret);
                 collect_returned_param_idents(&f.body, &env.params, &mut env.returned_params);
@@ -495,8 +495,8 @@ pub fn check_bodies(m: &Module, ctx: &TyCtx) -> Result<()> {
 
                     let mut params: Vec<(String, Ty)> = method.params.iter()
                         .filter(|p| p.name != "self")
-                        .map(|p| (p.name.clone(), Ty::from_type_expr(&p.ty).unwrap_or(Ty::Unknown)))
-                        .collect();
+                        .map(|p| Ty::from_type_expr(&p.ty).map(|ty| (p.name.clone(), ty)))
+                        .collect::<Result<Vec<_>>>()?;
                     params.insert(0, ("self".into(), Ty::Class(c.name.clone())));
                     let ret = Ty::from_type_expr(&method.ret)?;
                     let mut env = FuncEnv::new(ctx, &params, ret);

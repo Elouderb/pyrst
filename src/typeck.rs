@@ -1141,13 +1141,15 @@ fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
 // Superset of every method codegen handles (special-cased or valid Rust
 // passthrough) and every method the example suite calls on a concrete receiver.
 const STR_METHODS: &[&str] = &[
-    "upper", "lower", "strip", "lstrip", "rstrip", "split", "rsplit",
+    "upper", "lower", "strip", "lstrip", "rstrip", "split",
     "splitlines", "join", "startswith", "endswith", "replace", "removeprefix",
     "removesuffix", "expandtabs", "partition", "rpartition", "find", "rfind",
     "index", "rindex", "count", "contains", "isdigit", "isalpha", "isupper",
     "islower", "isspace", "isalnum", "isidentifier", "isnumeric", "isprintable",
-    "istitle", "isdecimal", "capitalize", "title", "zfill", "ljust", "rjust",
-    "center", "swapcase", "format", "encode", "casefold", "len",
+    "istitle", "capitalize", "title", "zfill", "ljust", "rjust",
+    "center", "swapcase", "len",
+    // NOTE: casefold/encode/isdecimal/rsplit/format removed — codegen cannot
+    // emit them and they are absent from the example corpus (card 36f66dd2).
 ];
 const LIST_METHODS: &[&str] = &[
     "append", "extend", "insert", "remove", "pop", "index", "count",
@@ -1160,7 +1162,9 @@ const SET_METHODS: &[&str] = &[
 ];
 const DICT_METHODS: &[&str] = &[
     "get", "keys", "values", "items", "pop", "clear", "copy", "update",
-    "setdefault", "len", "contains", "popitem",
+    "len", "contains",
+    // NOTE: setdefault/popitem removed — codegen cannot emit them and they are
+    // absent from the example corpus (card 36f66dd2).
 ];
 const FILE_METHODS: &[&str] = &["read", "readlines", "write", "close"];
 
@@ -1197,16 +1201,19 @@ pub fn builtin_method_ret(recv: &Ty, method: &str) -> Ty {
     match recv {
         Ty::Str => match method {
             "upper" | "lower" | "strip" | "lstrip" | "rstrip" | "replace"
-            | "capitalize" | "title" | "swapcase" | "casefold" | "format" | "zfill"
+            | "capitalize" | "title" | "swapcase" | "zfill"
             | "ljust" | "rjust" | "center" | "removeprefix" | "removesuffix"
             | "expandtabs" | "join" => Ty::Str,
-            "split" | "rsplit" | "splitlines" | "partition" | "rpartition" => {
+            // NOTE: casefold/encode/format/rsplit removed from str arms —
+            // codegen cannot emit them (card 36f66dd2 stopgap).
+            "split" | "splitlines" | "partition" | "rpartition" => {
                 Ty::List(Box::new(Ty::Str))
             }
             "find" | "rfind" | "index" | "rindex" | "count" => Ty::Int,
             "startswith" | "endswith" | "isdigit" | "isalpha" | "isupper" | "islower"
             | "isspace" | "isalnum" | "isidentifier" | "isnumeric" | "isprintable"
-            | "istitle" | "isdecimal" => Ty::Bool,
+            | "istitle" => Ty::Bool,
+            // NOTE: isdecimal removed — codegen cannot emit it (card 36f66dd2).
             _ => Ty::Unknown,
         },
         // Concrete element/collection returns, plus in-place mutators typed as
@@ -3374,5 +3381,65 @@ mod tests {
         let call = call_fn("takes_str", vec![ident("i")]);
         let r = check_expr(&call, &mut env);
         assert_type_err(r, "expected");
+    }
+
+    // -------------------------------------------------------------------------
+    // E. Drift guard — removed unemittable methods must stay absent (card 36f66dd2)
+    // -------------------------------------------------------------------------
+
+    /// Ensure that the str/dict methods codegen cannot emit are permanently
+    /// absent from STR_METHODS / DICT_METHODS.  If a future implementer adds
+    /// them back here without wiring codegen they will hit this test first.
+    #[test]
+    fn removed_unemittable_methods_absent_from_str_table() {
+        let unemittable = ["casefold", "encode", "isdecimal", "rsplit", "format"];
+        for m in &unemittable {
+            assert!(
+                !STR_METHODS.contains(m),
+                "STR_METHODS contains `{m}` but codegen cannot emit it \
+                 (card 36f66dd2 drift guard)"
+            );
+        }
+    }
+
+    #[test]
+    fn removed_unemittable_methods_absent_from_dict_table() {
+        let unemittable = ["setdefault", "popitem"];
+        for m in &unemittable {
+            assert!(
+                !DICT_METHODS.contains(m),
+                "DICT_METHODS contains `{m}` but codegen cannot emit it \
+                 (card 36f66dd2 drift guard)"
+            );
+        }
+    }
+
+    /// Confirm that `builtin_method_ret` returns Unknown (not a concrete type)
+    /// for every method removed from the acceptance tables — the method-existence
+    /// check runs before builtin_method_ret, so Unknown is the right sentinel.
+    #[test]
+    fn removed_str_methods_return_unknown_from_builtin_method_ret() {
+        let unemittable = ["casefold", "encode", "isdecimal", "rsplit", "format"];
+        for m in &unemittable {
+            assert_eq!(
+                builtin_method_ret(&Ty::Str, m),
+                Ty::Unknown,
+                "builtin_method_ret returned a concrete type for removed str method `{m}` \
+                 (card 36f66dd2 drift guard)"
+            );
+        }
+    }
+
+    #[test]
+    fn removed_dict_methods_return_unknown_from_builtin_method_ret() {
+        let unemittable = ["setdefault", "popitem"];
+        for m in &unemittable {
+            assert_eq!(
+                builtin_method_ret(&Ty::Dict(Box::new(Ty::Str), Box::new(Ty::Int)), m),
+                Ty::Unknown,
+                "builtin_method_ret returned a concrete type for removed dict method `{m}` \
+                 (card 36f66dd2 drift guard)"
+            );
+        }
     }
 }

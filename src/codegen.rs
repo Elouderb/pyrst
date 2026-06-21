@@ -2142,7 +2142,9 @@ impl<'a> Codegen<'a> {
                             let arg_type = self.type_of_expr(&args[0]);
                             match arg_type {
                                 Ty::Str => {
-                                    return Ok(format!("({}.parse::<i64>().unwrap())", a));
+                                    // Use helper so a bad string panics with "ValueError panic: ..."
+                                    // which the try/except dispatcher can match on ValueError.
+                                    return Ok(format!("(__py_int_from_str(&{}))", a));
                                 }
                                 _ => return Ok(format!("({} as i64)", a)),
                             }
@@ -2152,7 +2154,9 @@ impl<'a> Codegen<'a> {
                             let arg_type = self.type_of_expr(&args[0]);
                             match arg_type {
                                 Ty::Str => {
-                                    return Ok(format!("({}.parse::<f64>().unwrap())", a));
+                                    // Use helper so a bad string panics with "ValueError panic: ..."
+                                    // which the try/except dispatcher can match on ValueError.
+                                    return Ok(format!("(__py_float_from_str(&{}))", a));
                                 }
                                 _ => return Ok(format!("({} as f64)", a)),
                             }
@@ -3227,18 +3231,26 @@ impl<'a> Codegen<'a> {
                 }
                 let i = self.emit_expr(idx)?;
                 match &obj_ty {
-                    Ty::Dict(..) => format!("{}.get(&{}).cloned().expect(\"key not found\")", o, i),
+                    Ty::Dict(..) => {
+                        // .expect() produces a Rust message without " panic: " delimiter;
+                        // unwrap_or_else lets us emit a matchable "KeyError panic: ..." payload.
+                        format!("({}.get(&{}).cloned().unwrap_or_else(|| panic!(\"KeyError panic: {{:?}}\", &{})))", o, i, i)
+                    }
                     Ty::Str => {
-                        // String indexing with negative index support
+                        // String indexing with negative index support.
+                        // Explicit bounds check emits "IndexError panic: ..." so the
+                        // try/except dispatcher can catch it as IndexError.
                         format!(
-                            "{{ let __chars: Vec<char> = {}.chars().collect(); let __idx = if {} < 0 {{ ((__chars.len() as i64) + {}) as usize }} else {{ {} as usize }}; __chars[__idx].to_string() }}",
+                            "{{ let __chars: Vec<char> = {}.chars().collect(); let __idx = if {} < 0 {{ ((__chars.len() as i64) + {}) as usize }} else {{ {} as usize }}; if __idx >= __chars.len() {{ panic!(\"IndexError panic: string index out of range\") }}; __chars[__idx].to_string() }}",
                             o, i, i, i
                         )
                     }
                     _ => {
-                        // List indexing with negative index support
+                        // List indexing with negative index support.
+                        // Explicit bounds check emits "IndexError panic: ..." so the
+                        // try/except dispatcher can catch it as IndexError.
                         format!(
-                            "{{ let __list = {}.clone(); let __idx = if {} < 0 {{ ((__list.len() as i64) + {}) as usize }} else {{ {} as usize }}; __list[__idx].clone() }}",
+                            "{{ let __list = {}.clone(); let __idx = if {} < 0 {{ ((__list.len() as i64) + {}) as usize }} else {{ {} as usize }}; if __idx >= __list.len() {{ panic!(\"IndexError panic: list index out of range\") }}; __list[__idx].clone() }}",
                             o, i, i, i
                         )
                     }
@@ -3846,6 +3858,15 @@ pub fn emit_program(modules: &[(Module, String)], ctx: &TyCtx) -> Result<String>
     cg.line("    if b == 0 { panic!(\"ZeroDivisionError panic: integer division or modulo by zero\"); }");
     cg.line("    let q = a / b;");
     cg.line("    if (a % b != 0) && ((a % b < 0) != (b < 0)) { q - 1 } else { q }");
+    cg.line("}");
+    // int() from str: panics with catchable "ValueError panic: ..." payload
+    // instead of Rust's generic unwrap message.
+    cg.line("fn __py_int_from_str(s: &str) -> i64 {");
+    cg.line("    s.trim().parse::<i64>().unwrap_or_else(|_| panic!(\"ValueError panic: invalid literal for int() with base 10: '{}'\", s.trim()))");
+    cg.line("}");
+    // float() from str: panics with catchable "ValueError panic: ..." payload.
+    cg.line("fn __py_float_from_str(s: &str) -> f64 {");
+    cg.line("    s.trim().parse::<f64>().unwrap_or_else(|_| panic!(\"ValueError panic: could not convert string to float: '{}'\", s.trim()))");
     cg.line("}");
     // Python integer exponentiation. A negative exponent yields a float in
     // Python, which cannot be represented in an i64 result, so panic with a

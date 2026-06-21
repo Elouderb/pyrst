@@ -247,9 +247,11 @@ impl<'a> Codegen<'a> {
                 self.emit_func(f, /*method_of=*/ None)
             }
             Stmt::Class(c) => {
-                let mut c = c.clone();
-                crate::typeck::extract_init_fields(&mut c);
-                self.emit_class(&c)
+                // extract_init_fields is already called by resolver.rs:132 when
+                // building TyCtx, so ctx.classes already holds the populated
+                // ClassDef.  emit_class reads fields via ctx.get_all_fields, not
+                // from c.fields directly, so no clone+mutate is needed here.
+                self.emit_class(c)
             }
             other => {
                 // Top-level non-decl statements are not yet supported (would need

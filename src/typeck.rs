@@ -1274,7 +1274,6 @@ pub fn builtin_method_ret(recv: &Ty, method: &str) -> Ty {
 /// (docs/design/inference-oracle.md §A.4): D1 str-index → Str; D3 abs(x) → arg
 /// type; D4 sum(xs) → element type; D5 `**` → Float; D6 dict literal folds ALL
 /// pairs; D7 attribute access is inheritance-aware (`get_all_fields`).
-#[allow(dead_code)] // removed in E.2 (wired into codegen + check_expr)
 pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> Ty {
     match expr {
         Expr::Float(..) => Ty::Float,
@@ -1558,7 +1557,6 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
 /// Folds every element's type with `unify_oracle_ty` (not first-element-wins) so
 /// a mixed numeric literal like `[1, 2.0]` is typed `Float`. Empty -> `Unknown`.
 /// Pure port of codegen's `list_elem_ty`/`unify_ty`.
-#[allow(dead_code)] // removed in E.2 (helper of infer_expr_ty)
 fn infer_list_elem_ty(elems: &[Expr], locals: &HashMap<String, Ty>, ctx: &TyCtx) -> Ty {
     let mut iter = elems.iter();
     match iter.next() {
@@ -1572,7 +1570,6 @@ fn infer_list_elem_ty(elems: &[Expr], locals: &HashMap<String, Ty>, ctx: &TyCtx)
 /// Structural element-type unification for collection literals (pure port of
 /// codegen's `unify_ty`). Int/Float widen to Float; nested collections recurse;
 /// `Unknown` is absorbed; otherwise the left (concrete) side wins.
-#[allow(dead_code)] // removed in E.2 (helper of infer_expr_ty)
 fn unify_oracle_ty(a: Ty, b: Ty) -> Ty {
     match (a, b) {
         (Ty::Unknown, x) | (x, Ty::Unknown) => x,
@@ -1590,7 +1587,6 @@ fn unify_oracle_ty(a: Ty, b: Ty) -> Ty {
 /// Infer the applied return type of a `map`'s callable over an element of type
 /// `elem`, for `infer_expr_ty`'s `map` arm. Pure port of codegen's
 /// `lambda_applied_ty` -> `type_of_expr_bound`.
-#[allow(dead_code)] // removed in E.2 (helper of infer_expr_ty)
 fn lambda_applied_ty(callable: &Expr, elem: &Ty, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> Ty {
     if let Expr::Lambda { params, body, .. } = callable {
         if let Some((param, _)) = params.first() {
@@ -1604,7 +1600,6 @@ fn lambda_applied_ty(callable: &Expr, elem: &Ty, locals: &HashMap<String, Ty>, c
 /// (the bound lambda parameter). Recurses through the compound forms that appear
 /// in map lambda bodies; for everything else it delegates to `infer_expr_ty`.
 /// Pure port of codegen's `type_of_expr_bound`.
-#[allow(dead_code)] // removed in E.2 (helper of infer_expr_ty)
 fn infer_expr_ty_bound(
     e: &Expr,
     param: &str,
@@ -1656,7 +1651,6 @@ fn infer_expr_ty_bound(
 /// Infer a comprehension element expression's type given the loop variable's
 /// type and name, for `infer_expr_ty`'s comprehension arms. Pure port of
 /// codegen's `infer_comp_elt_type_with_var`.
-#[allow(dead_code)] // removed in E.2 (helper of infer_expr_ty)
 fn infer_comp_elt_type_with_var(
     elt: &Expr,
     loop_var_ty: &Ty,

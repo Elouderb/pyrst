@@ -1041,6 +1041,8 @@ impl<'a> Codegen<'a> {
                     if targets.len() == 1 {
                         let elem = match self.type_of_expr(iter) {
                             Ty::List(inner) | Ty::Set(inner) => *inner,
+                            // Iterating a dict yields its KEYS (Python semantics).
+                            Ty::Dict(key, _) => *key,
                             Ty::Str => Ty::Str,
                             _ => Ty::Int, // range / unknown iterables yield ints
                         };
@@ -1342,6 +1344,10 @@ impl<'a> Codegen<'a> {
                 } else {
                     false
                 };
+                // Resolve the iterable's static type up front so the iteration
+                // lowering matches the Python semantics for each container:
+                //   dict -> iterate KEYS; str -> iterate characters.
+                let for_iter_ty = self.type_of_expr(iter);
                 let i = self.emit_expr(iter)?;
                 let is_range = i.contains("..");
                 let is_iterator = i.contains(".enumerate()") || i.contains(".zip(") ||
@@ -1353,6 +1359,19 @@ impl<'a> Codegen<'a> {
                     i
                 } else if is_range {
                     format!("({}).into_iter()", i)
+                } else if matches!(for_iter_ty, Ty::Str) {
+                    // Iterating a str yields 1-character strings (Python semantics).
+                    // Mirrors the comprehension lowering.
+                    format!("{}.chars().map(|__c| __c.to_string())", i)
+                } else if matches!(for_iter_ty, Ty::Dict(_, _)) {
+                    // Iterating a dict yields its KEYS (Python semantics).
+                    // Materialize a sorted Vec of the keys so the iteration order
+                    // is deterministic — matching the sort-for-stability convention
+                    // used by `PyRepr` for HashMap display.
+                    format!(
+                        "{{ let mut __keys: Vec<_> = {}.keys().cloned().collect(); __keys.sort(); __keys }}.into_iter()",
+                        i
+                    )
                 } else if is_copy_elem {
                     format!("{}.iter().copied()", i)
                 } else {
@@ -1366,12 +1385,19 @@ impl<'a> Codegen<'a> {
                 self.line(&format!("for {} in {} {{", pat, iter_expr));
                 self.indent += 1;
 
-                // Register loop variables with their types for type checking
-                let iter_ty = self.type_of_expr(iter);
+                // Register the loop variable's type so the body sees it. Reuse the
+                // iterable type resolved above: list/set yield the element type, a
+                // dict yields its KEY type, and a str yields 1-char strings (Str).
+                let loop_elem_ty = match &for_iter_ty {
+                    Ty::List(inner) | Ty::Set(inner) => Some((**inner).clone()),
+                    Ty::Dict(key, _) => Some((**key).clone()),
+                    Ty::Str => Some(Ty::Str),
+                    _ => None,
+                };
                 if targets.len() == 1 {
-                    if let Ty::List(inner) | Ty::Set(inner) = iter_ty {
+                    if let Some(elem) = loop_elem_ty {
                         let saved = self.locals.get(&targets[0]).cloned();
-                        self.locals.insert(targets[0].clone(), *inner);
+                        self.locals.insert(targets[0].clone(), elem);
                         for s in body { self.emit_stmt(s)?; }
                         if let Some(ty) = saved {
                             self.locals.insert(targets[0].clone(), ty);
@@ -2115,16 +2141,26 @@ impl<'a> Codegen<'a> {
                                     ".sort()".to_string()
                                 };
 
+                                // `sorted` operates on a Vec. A list arg is cloned
+                                // directly; a set is materialized from its elements
+                                // and a dict from its KEYS (Python semantics — both
+                                // HashMap/HashSet lack `.sort()`).
+                                let base = match &list_ty {
+                                    Ty::Set(_) => format!("{}.iter().cloned().collect::<Vec<_>>()", a),
+                                    Ty::Dict(_, _) => format!("{}.keys().cloned().collect::<Vec<_>>()", a),
+                                    _ => format!("{}.clone()", a),
+                                };
+
                                 if let Some((_, rev_expr)) = kwargs.iter().find(|(n, _)| n == "reverse") {
                                     // sorted with reverse parameter
                                     let rev_s = self.emit_expr(rev_expr)?;
                                     return Ok(format!(
-                                        "{{ let mut __sorted = {}.clone(); __sorted{}; if {} {{ __sorted.reverse(); }} __sorted }}",
-                                        a, sort_code, rev_s
+                                        "{{ let mut __sorted = {}; __sorted{}; if {} {{ __sorted.reverse(); }} __sorted }}",
+                                        base, sort_code, rev_s
                                     ));
                                 } else {
                                     // Default sorted
-                                    return Ok(format!("{{ let mut __sorted = {}.clone(); __sorted{}; __sorted }}", a, sort_code));
+                                    return Ok(format!("{{ let mut __sorted = {}; __sorted{}; __sorted }}", base, sort_code));
                                 }
                             }
                         }
@@ -2303,6 +2339,15 @@ impl<'a> Codegen<'a> {
                                 // If the argument is already a list, just return it. Otherwise collect the iterator.
                                 match arg_type {
                                     Ty::List(_) => return Ok(a),
+                                    // A set/dict is a concrete container, not an
+                                    // iterator: take an owned Vec of its elements
+                                    // (dict -> its KEYS, Python semantics).
+                                    Ty::Set(_) => {
+                                        return Ok(format!("{}.iter().cloned().collect::<Vec<_>>()", a));
+                                    }
+                                    Ty::Dict(_, _) => {
+                                        return Ok(format!("{}.keys().cloned().collect::<Vec<_>>()", a));
+                                    }
                                     _ => {
                                         // Check if the expression looks like it returns a Vec (contains reverse, sort, etc.)
                                         if a.contains("reverse") || a.contains("sort") || a.contains("clone()") {
@@ -2590,14 +2635,19 @@ impl<'a> Codegen<'a> {
                         return Ok(format!("{}.len() as i64", obj_s));
                     }
 
-                    // Special case: get() for dicts
+                    // Special case: get() for dicts. Arg-count-aware, mirroring
+                    // the static typing in `typeck::dict_get_ret`:
+                    //   d.get(k)           -> Option<V>  (None when absent), so a
+                    //                         caller can narrow it with `is None`.
+                    //   d.get(k, default)  -> V          (the supplied fallback).
                     if name == "get" {
-                        let default = if parts.len() > 1 {
-                            parts[1].clone()
-                        } else {
-                            "Default::default()".to_string()
-                        };
-                        return Ok(format!("{}.get(&{}).cloned().unwrap_or({})", obj_s, parts[0], default));
+                        if parts.len() > 1 {
+                            return Ok(format!(
+                                "{}.get(&{}).cloned().unwrap_or({})",
+                                obj_s, parts[0], parts[1]
+                            ));
+                        }
+                        return Ok(format!("{}.get(&{}).cloned()", obj_s, parts[0]));
                     }
 
                     // String methods

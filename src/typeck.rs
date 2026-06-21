@@ -1079,6 +1079,8 @@ fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             let elem_ty = match &iter_ty {
                 Ty::List(inner) => *inner.clone(),
                 Ty::Set(inner) => *inner.clone(),
+                // Iterating a dict yields its KEYS (Python semantics).
+                Ty::Dict(key, _) => *key.clone(),
                 Ty::Str => Ty::Str, // iterating a string yields 1-char strings
                 _ => Ty::Unknown,
             };
@@ -1350,6 +1352,29 @@ pub fn builtin_method_ret(recv: &Ty, method: &str) -> Ty {
     }
 }
 
+/// Arg-count-aware return type for `dict.get`, which `builtin_method_ret` cannot
+/// express (it has no view of the call's arguments). Python's `d.get(k)` returns
+/// `Optional[V]` (None when absent), while `d.get(k, default)` returns `V`. Both
+/// the inference oracle (`infer_expr_ty`) and the error-producing checker
+/// (`check_expr`) route dict.get through here so the two never drift. For any
+/// non-dict receiver (or a non-`get` method) it returns None, leaving the caller
+/// to fall back to `builtin_method_ret`.
+pub fn dict_get_ret(recv: &Ty, method: &str, argc: usize) -> Option<Ty> {
+    if method != "get" {
+        return None;
+    }
+    if let Ty::Dict(_key, val) = recv {
+        // 1-arg get -> Optional[V]; 2-arg get(k, default) -> V.
+        if argc <= 1 {
+            Some(Ty::Option(val.clone()))
+        } else {
+            Some((**val).clone())
+        }
+    } else {
+        None
+    }
+}
+
 /// Pure inference oracle — the single source of truth for expression types.
 ///
 /// A side-effect-free port of codegen's `type_of_expr` (codegen.rs:264-548) with
@@ -1486,9 +1511,12 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
                     }
                     "sorted" | "list" | "reversed" => {
                         // These return a list; preserve the element type.
+                        // Over a dict they operate on its KEYS (Python semantics),
+                        // so the result element type is the dict's key type.
                         if let Some(arg) = args.first() {
                             match infer_expr_ty(arg, locals, ctx) {
                                 Ty::List(e) | Ty::Set(e) => Ty::List(e),
+                                Ty::Dict(k, _) => Ty::List(k),
                                 Ty::Str => Ty::List(Box::new(Ty::Str)),
                                 _ => Ty::List(Box::new(Ty::Unknown)),
                             }
@@ -1523,6 +1551,10 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
                 let recv = infer_expr_ty(obj, locals, ctx);
                 if let Ty::Class(cls) = &recv {
                     ctx.get_method(cls, name).map(|s| s.ret.clone()).unwrap_or(Ty::Unknown)
+                } else if let Some(t) = dict_get_ret(&recv, name, args.len()) {
+                    // dict.get is arg-count-aware: get(k) -> Optional[V],
+                    // get(k, default) -> V (see dict_get_ret).
+                    t
                 } else {
                     builtin_method_ret(&recv, name)
                 }
@@ -2335,6 +2367,13 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                                 }
                             }
                             for a in args { check_expr(a, env)?; }
+                            // dict.get is arg-count-aware: get(k) -> Optional[V],
+                            // get(k, default) -> V. Route through the shared helper
+                            // so the checker and the inference oracle agree; fall
+                            // back to builtin_method_ret for every other method.
+                            if let Some(t) = dict_get_ret(&obj_ty, name.as_str(), args.len()) {
+                                return Ok(t);
+                            }
                             return Ok(builtin_method_ret(&obj_ty, name.as_str()));
                         }
                     }

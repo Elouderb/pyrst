@@ -444,6 +444,23 @@ impl<'a> FuncEnv<'a> {
     }
 }
 
+/// Validate that every decorator name in `decorators` is in the supported whitelist.
+/// Returns an error pointing at `span` for the first unsupported decorator found.
+fn validate_decorators(decorators: &[String], span: Span) -> Result<()> {
+    for dec in decorators {
+        match dec.as_str() {
+            "staticmethod" | "property" | "dataclass" => {}
+            _ => {
+                return Err(Error::Type {
+                    span,
+                    msg: format!("decorator `@{}` is not supported", dec),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Type-check function/class bodies against a pre-built context.
 /// Used for multi-file compilation where the context is merged from all modules.
 pub fn check_bodies(m: &Module, ctx: &TyCtx) -> Result<()> {
@@ -451,6 +468,9 @@ pub fn check_bodies(m: &Module, ctx: &TyCtx) -> Result<()> {
     for s in &m.stmts {
         match s {
             Stmt::Func(f) => {
+                // Reject unsupported decorators on top-level functions.
+                validate_decorators(&f.decorators, f.span)?;
+
                 let params: Vec<(String, Ty)> = f.params.iter()
                     .filter(|p| p.name != "self")
                     .map(|p| (p.name.clone(), Ty::from_type_expr(&p.ty).unwrap_or(Ty::Unknown)))
@@ -461,7 +481,18 @@ pub fn check_bodies(m: &Module, ctx: &TyCtx) -> Result<()> {
                 check_body(&f.body, &mut env)?;
             }
             Stmt::Class(c) => {
+                // Reject multiple inheritance.
+                if c.bases.len() > 1 {
+                    return Err(Error::Type {
+                        span: c.span,
+                        msg: "multiple inheritance is not supported".to_string(),
+                    });
+                }
+
                 for method in &c.methods {
+                    // Reject unsupported decorators on class methods.
+                    validate_decorators(&method.decorators, method.span)?;
+
                     let mut params: Vec<(String, Ty)> = method.params.iter()
                         .filter(|p| p.name != "self")
                         .map(|p| (p.name.clone(), Ty::from_type_expr(&p.ty).unwrap_or(Ty::Unknown)))

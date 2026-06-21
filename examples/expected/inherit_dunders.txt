@@ -1,0 +1,8 @@
+Mid(5)
+base-kind
+Mid(3)
+base-kind
+a ne b
+a eq three
+a lt b
+b not lt a

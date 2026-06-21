@@ -435,6 +435,49 @@ impl<'a> Codegen<'a> {
         Ok(())
     }
 
+    /// Resolve the full set of methods visible on `class_name` across its entire
+    /// base chain (transitive), with the nearest-defining class winning — the
+    /// same MRO walk TyCtx::get_method / get_all_fields use, but returning the
+    /// actual `Func` (with body) so an inherited method or dunder can be emitted
+    /// onto the subclass's own value-struct.
+    ///
+    /// Ordering: own methods first (in source order), then each inherited name
+    /// the first time it is reached walking bases depth-first. A name already
+    /// resolved (by the class itself or a nearer ancestor) is never overwritten,
+    /// so overrides shadow inherited definitions exactly like Python's MRO.
+    fn resolved_methods(&self, class_name: &str) -> Vec<Func> {
+        let mut out: Vec<Func> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+        self.collect_resolved_methods(class_name, &mut out, &mut seen, &mut visited);
+        out
+    }
+
+    fn collect_resolved_methods(
+        &self,
+        class_name: &str,
+        out: &mut Vec<Func>,
+        seen: &mut std::collections::HashSet<String>,
+        visited: &mut std::collections::HashSet<String>,
+    ) {
+        if visited.contains(class_name) {
+            return;
+        }
+        visited.insert(class_name.to_string());
+        if let Some(cd) = self.ctx.classes.get(class_name) {
+            // This class's own methods take precedence over anything inherited.
+            for m in &cd.methods {
+                if seen.insert(m.name.clone()) {
+                    out.push(m.clone());
+                }
+            }
+            // Then inherited methods, nearer bases before farther ones.
+            for base in &cd.bases {
+                self.collect_resolved_methods(base, out, seen, visited);
+            }
+        }
+    }
+
     fn emit_class(&mut self, c: &ClassDef) -> Result<()> {
         // Full transitive field set (ancestors first, then own; deduped by name),
         // sourced from typeck's get_all_fields so the struct layout, Copy/Default
@@ -447,15 +490,24 @@ impl<'a> Codegen<'a> {
             }
         }
 
+        // Full transitive method set (own methods win, then inherited via MRO),
+        // so a subclass that INHERITS a dunder or a grandparent method emits it
+        // onto its own value-struct. Dunder trait impls, the `__lt_impl` helper,
+        // and the inherited-method emission all key off this set rather than
+        // `c.methods` (which is the defining class only).
+        let resolved_methods = self.resolved_methods(&c.name);
+
         let all_fields_copy = all_fields.iter().all(|f| {
             Ty::from_type_expr(&f.ty)
                 .map(|ty| self.is_copy_type(&ty))
                 .unwrap_or(false)
         });
 
-        // A user-defined __eq__ emits a manual `impl PartialEq`, so don't ALSO
-        // derive it (that would be a conflicting-impl error, E0119).
-        let has_eq = c.methods.iter().any(|m| m.name == "__eq__");
+        // A user-defined __eq__ (own OR inherited) emits a manual `impl PartialEq`,
+        // so don't ALSO derive it (that would be a conflicting-impl error, E0119)
+        // and don't fall back to a field-wise derived eq that ignores the
+        // inherited custom semantics.
+        let has_eq = resolved_methods.iter().any(|m| m.name == "__eq__");
         let pe = if has_eq { "" } else { ", PartialEq" };
         // Only derive Default when every field actually implements Default.
         // Copy classes (all-primitive fields) don't derive Default, so an outer
@@ -489,10 +541,15 @@ impl<'a> Codegen<'a> {
         let dunder_trait_names = ["__str__", "__repr__", "__add__", "__sub__", "__mul__",
                                    "__eq__", "__neg__", "__bool__", "__lt__"];
 
+        // Constructor emission keys off the OWN __init__ (the existing model:
+        // every subclass in scope defines its own __init__). The inherent-impl
+        // block, however, must also open when the class only INHERITS methods
+        // (a regular method or __lt__ pulled from an ancestor), so those flags
+        // read from the resolved (transitive) set.
         let has_init = c.methods.iter().any(|m| m.name == "__init__");
-        let has_lt = c.methods.iter().any(|m| m.name == "__lt__");
+        let has_lt = resolved_methods.iter().any(|m| m.name == "__lt__");
         let is_dataclass = c.is_dataclass;
-        let has_regular_methods = c.methods.iter().any(|m|
+        let has_regular_methods = resolved_methods.iter().any(|m|
             m.name != "__init__" && !dunder_trait_names.contains(&m.name.as_str())) || has_lt;
 
         if has_init || has_regular_methods || (is_dataclass && !has_init) {
@@ -547,30 +604,20 @@ impl<'a> Codegen<'a> {
                 self.line("");
             }
 
-            // Emit all methods except dunder-trait ones (including inherited methods).
+            // Emit all methods except dunder-trait ones, drawn from the resolved
+            // (transitive) set so inherited and grandparent methods land on this
+            // class's value-struct. `resolved_methods` already applies MRO (own
+            // wins, then nearer bases), so each name appears once.
             let class_name = c.name.clone();
-            let mut emitted_methods = std::collections::HashSet::new();
 
-            // Collect own method names first to identify overrides
+            // Own method names identify overrides (those still get a __super_
+            // alias so `super().m()` can reach the immediate parent body).
             let own_method_names: std::collections::HashSet<String> = c.methods.iter()
                 .map(|m| m.name.clone())
                 .collect();
 
-            // First, collect inherited methods from parent classes (skip if overridden)
-            for base in &c.bases {
-                if let Some(base_def) = self.ctx.classes.get(base.as_str()).cloned() {
-                    for m in &base_def.methods {
-                        if !dunder_trait_names.contains(&m.name.as_str())
-                            && !emitted_methods.contains(&m.name)
-                            && !own_method_names.contains(&m.name) {
-                            self.emit_func(m, Some(&class_name))?;
-                            emitted_methods.insert(m.name.clone());
-                        }
-                    }
-                }
-            }
-
-            // Emit __super_ aliases for methods that are overridden
+            // Emit __super_ aliases for OWN methods that override an immediate
+            // parent method (one-level, unchanged: super() targets the parent).
             for base in &c.bases {
                 if let Some(base_def) = self.ctx.classes.get(base.as_str()).cloned() {
                     for m in &base_def.methods {
@@ -584,10 +631,14 @@ impl<'a> Codegen<'a> {
                 }
             }
 
-            // Then emit own methods (these override inherited ones)
-            for m in &c.methods {
+            // Emit every resolved regular method (own + transitively inherited),
+            // including __init__ itself (the constructor's new() calls
+            // self.__init__(...), so it must exist as an inherent method).
+            // Dunder-trait methods become trait impls below, except __lt__ which
+            // also needs a __lt_impl helper that PartialOrd::partial_cmp calls.
+            for m in &resolved_methods {
                 if dunder_trait_names.contains(&m.name.as_str()) {
-                    // Special handling for __lt__: emit as __lt_impl
+                    // Special handling for __lt__: emit as __lt_impl (own or inherited).
                     if m.name == "__lt__" {
                         self.line(&format!("fn __lt_impl(&self, other: &{}) -> bool {{", c.name));
                         self.indent += 1;
@@ -603,7 +654,6 @@ impl<'a> Codegen<'a> {
                     continue;
                 }
                 self.emit_func(m, Some(&class_name))?;
-                emitted_methods.insert(m.name.clone());
             }
 
             self.indent -= 1;
@@ -611,8 +661,12 @@ impl<'a> Codegen<'a> {
             self.line("");
         }
 
-        // Emit trait implementations for dunder methods.
-        let c_methods = c.methods.clone();
+        // Emit trait implementations for dunder methods, drawn from the resolved
+        // (transitive) set so an inherited __str__/__eq__/__lt__/etc. produces the
+        // matching Display/PartialEq/PartialOrd impl on THIS class's value-struct
+        // (the impl body is the ancestor's, but every reference is to c.name and
+        // to fields that get_all_fields guarantees exist on the subclass).
+        let c_methods = resolved_methods.clone();
         for m in &c_methods {
             match m.name.as_str() {
                 "__str__" | "__repr__" => {

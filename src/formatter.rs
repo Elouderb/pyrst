@@ -4,6 +4,7 @@
 
 use crate::ast::*;
 use crate::ast::FStrPart;
+use crate::diag::{Error, Result};
 use std::fmt::Write;
 
 pub struct Formatter {
@@ -23,9 +24,9 @@ impl Formatter {
         }
     }
 
-    pub fn format_module(&mut self, m: &Module) -> String {
+    pub fn format_module(&mut self, m: &Module) -> Result<String> {
         for (i, stmt) in m.stmts.iter().enumerate() {
-            self.format_stmt(stmt);
+            self.format_stmt(stmt)?;
 
             // Add blank line between top-level statements (except imports)
             if i < m.stmts.len() - 1 && !matches!(stmt, Stmt::Import { .. }) {
@@ -38,21 +39,22 @@ impl Formatter {
             self.output.push('\n');
         }
 
-        self.output.clone()
+        Ok(self.output.clone())
     }
 
-    fn format_stmt(&mut self, stmt: &Stmt) {
+    fn format_stmt(&mut self, stmt: &Stmt) -> Result<()> {
         match stmt {
             Stmt::Func(f) => {
+                let params = self.format_params(&f.params)?;
                 self.writeln(&format!("def {}({}){} -> {}:",
                     f.name,
-                    self.format_params(&f.params),
+                    params,
                     "",  // decorators handled separately
                     self.format_type(&f.ret)
                 ));
                 self.indent_level += 1;
                 for s in &f.body {
-                    self.format_stmt(s);
+                    self.format_stmt(s)?;
                 }
                 self.indent_level -= 1;
                 self.output.push('\n');
@@ -77,15 +79,16 @@ impl Formatter {
 
                 // Format methods
                 for m in &c.methods {
+                    let params = self.format_params(&m.params)?;
                     self.writeln(&format!("def {}({}){} -> {}:",
                         m.name,
-                        self.format_params(&m.params),
+                        params,
                         "",
                         self.format_type(&m.ret)
                     ));
                     self.indent_level += 1;
                     for s in &m.body {
-                        self.format_stmt(s);
+                        self.format_stmt(s)?;
                     }
                     self.indent_level -= 1;
                     self.output.push('\n');
@@ -116,21 +119,24 @@ impl Formatter {
                 } else {
                     String::new()
                 };
-                self.writeln(&format!("{}{} = {}", target, type_str, self.format_expr(value)));
+                let value_str = self.format_expr(value)?;
+                self.writeln(&format!("{}{} = {}", target, type_str, value_str));
             }
             Stmt::If { cond, then, elifs, else_, .. } => {
-                self.writeln(&format!("if {}:", self.format_expr(cond)));
+                let cond_str = self.format_expr(cond)?;
+                self.writeln(&format!("if {}:", cond_str));
                 self.indent_level += 1;
                 for s in then {
-                    self.format_stmt(s);
+                    self.format_stmt(s)?;
                 }
                 self.indent_level -= 1;
 
                 for (c, b) in elifs {
-                    self.writeln(&format!("elif {}:", self.format_expr(c)));
+                    let c_str = self.format_expr(c)?;
+                    self.writeln(&format!("elif {}:", c_str));
                     self.indent_level += 1;
                     for s in b {
-                        self.format_stmt(s);
+                        self.format_stmt(s)?;
                     }
                     self.indent_level -= 1;
                 }
@@ -139,30 +145,33 @@ impl Formatter {
                     self.writeln("else:");
                     self.indent_level += 1;
                     for s in b {
-                        self.format_stmt(s);
+                        self.format_stmt(s)?;
                     }
                     self.indent_level -= 1;
                 }
             }
             Stmt::While { cond, body, .. } => {
-                self.writeln(&format!("while {}:", self.format_expr(cond)));
+                let cond_str = self.format_expr(cond)?;
+                self.writeln(&format!("while {}:", cond_str));
                 self.indent_level += 1;
                 for s in body {
-                    self.format_stmt(s);
+                    self.format_stmt(s)?;
                 }
                 self.indent_level -= 1;
             }
             Stmt::For { targets, iter, body, .. } => {
-                self.writeln(&format!("for {} in {}:", targets.join(", "), self.format_expr(iter)));
+                let iter_str = self.format_expr(iter)?;
+                self.writeln(&format!("for {} in {}:", targets.join(", "), iter_str));
                 self.indent_level += 1;
                 for s in body {
-                    self.format_stmt(s);
+                    self.format_stmt(s)?;
                 }
                 self.indent_level -= 1;
             }
             Stmt::Return(expr, _) => {
                 if let Some(e) = expr {
-                    self.writeln(&format!("return {}", self.format_expr(e)));
+                    let e_str = self.format_expr(e)?;
+                    self.writeln(&format!("return {}", e_str));
                 } else {
                     self.writeln("return");
                 }
@@ -171,27 +180,31 @@ impl Formatter {
             Stmt::Break(_) => self.writeln("break"),
             Stmt::Continue(_) => self.writeln("continue"),
             Stmt::Assert { cond, msg, .. } => {
+                let cond_str = self.format_expr(cond)?;
                 if let Some(m) = msg {
-                    self.writeln(&format!("assert {}, {}", self.format_expr(cond), self.format_expr(m)));
+                    let m_str = self.format_expr(m)?;
+                    self.writeln(&format!("assert {}, {}", cond_str, m_str));
                 } else {
-                    self.writeln(&format!("assert {}", self.format_expr(cond)));
+                    self.writeln(&format!("assert {}", cond_str));
                 }
             }
             Stmt::Raise { exc, .. } => {
                 if let Some(e) = exc {
-                    self.writeln(&format!("raise {}", self.format_expr(e)));
+                    let e_str = self.format_expr(e)?;
+                    self.writeln(&format!("raise {}", e_str));
                 } else {
                     self.writeln("raise");
                 }
             }
             Stmt::Expr(expr) => {
-                self.writeln(&self.format_expr(expr));
+                let expr_str = self.format_expr(expr)?;
+                self.writeln(&expr_str);
             }
             Stmt::Try { body, handlers, else_, finally_, .. } => {
                 self.writeln("try:");
                 self.indent_level += 1;
                 for s in body {
-                    self.format_stmt(s);
+                    self.format_stmt(s)?;
                 }
                 self.indent_level -= 1;
 
@@ -207,7 +220,7 @@ impl Formatter {
                     }
                     self.indent_level += 1;
                     for s in &h.body {
-                        self.format_stmt(s);
+                        self.format_stmt(s)?;
                     }
                     self.indent_level -= 1;
                 }
@@ -216,7 +229,7 @@ impl Formatter {
                     self.writeln("else:");
                     self.indent_level += 1;
                     for s in b {
-                        self.format_stmt(s);
+                        self.format_stmt(s)?;
                     }
                     self.indent_level -= 1;
                 }
@@ -225,50 +238,56 @@ impl Formatter {
                     self.writeln("finally:");
                     self.indent_level += 1;
                     for s in b {
-                        self.format_stmt(s);
+                        self.format_stmt(s)?;
                     }
                     self.indent_level -= 1;
                 }
             }
             Stmt::With { ctx_expr, as_name, body, .. } => {
+                let ctx_str = self.format_expr(ctx_expr)?;
                 if let Some(n) = as_name {
-                    self.writeln(&format!("with {} as {}:", self.format_expr(ctx_expr), n));
+                    self.writeln(&format!("with {} as {}:", ctx_str, n));
                 } else {
-                    self.writeln(&format!("with {}:", self.format_expr(ctx_expr)));
+                    self.writeln(&format!("with {}:", ctx_str));
                 }
                 self.indent_level += 1;
                 for s in body {
-                    self.format_stmt(s);
+                    self.format_stmt(s)?;
                 }
                 self.indent_level -= 1;
             }
             Stmt::Del { target, .. } => {
-                self.writeln(&format!("del {}", self.format_expr(target)));
+                let target_str = self.format_expr(target)?;
+                self.writeln(&format!("del {}", target_str));
             }
             Stmt::Match { subject, arms, .. } => {
-                self.writeln(&format!("match {}:", self.format_expr(subject)));
+                let subject_str = self.format_expr(subject)?;
+                self.writeln(&format!("match {}:", subject_str));
                 self.indent_level += 1;
                 for arm in arms {
-                    let pat_str = self.format_pattern(&arm.pattern);
+                    let pat_str = self.format_pattern(&arm.pattern)?;
                     let guard_str = if let Some(g) = &arm.guard {
-                        format!(" if {}", self.format_expr(g))
+                        format!(" if {}", self.format_expr(g)?)
                     } else {
                         String::new()
                     };
                     self.writeln(&format!("case {}{}:", pat_str, guard_str));
                     self.indent_level += 1;
                     for s in &arm.body {
-                        self.format_stmt(s);
+                        self.format_stmt(s)?;
                     }
                     self.indent_level -= 1;
                 }
                 self.indent_level -= 1;
             }
             Stmt::AttrAssign { obj, attr, value, .. } => {
-                self.writeln(&format!("{}.{} = {}", obj, attr, self.format_expr(value)));
+                let value_str = self.format_expr(value)?;
+                self.writeln(&format!("{}.{} = {}", obj, attr, value_str));
             }
             Stmt::IndexAssign { obj, idx, value, .. } => {
-                self.writeln(&format!("{}[{}] = {}", obj, self.format_expr(idx), self.format_expr(value)));
+                let idx_str = self.format_expr(idx)?;
+                let value_str = self.format_expr(value)?;
+                self.writeln(&format!("{}[{}] = {}", obj, idx_str, value_str));
             }
             Stmt::AugAssign { target, op, value, .. } => {
                 let op_str = match op {
@@ -280,29 +299,36 @@ impl Formatter {
                     BinOp::FloorDiv => "//=",
                     _ => "+=",
                 };
-                self.writeln(&format!("{} {} {}", target, op_str, self.format_expr(value)));
+                let value_str = self.format_expr(value)?;
+                self.writeln(&format!("{} {} {}", target, op_str, value_str));
             }
             Stmt::Unpack { targets, value, .. } => {
-                self.writeln(&format!("({}) = {}", targets.join(", "), self.format_expr(value)));
+                let value_str = self.format_expr(value)?;
+                self.writeln(&format!("({}) = {}", targets.join(", "), value_str));
             }
         }
+        Ok(())
     }
 
-    fn format_pattern(&self, pattern: &crate::ast::MatchPattern) -> String {
+    fn format_pattern(&self, pattern: &crate::ast::MatchPattern) -> Result<String> {
         use crate::ast::MatchPattern;
-        match pattern {
+        let s = match pattern {
             MatchPattern::Wildcard => "_".to_string(),
             MatchPattern::Capture(name) => name.clone(),
-            MatchPattern::Literal(expr) => self.format_expr(expr),
+            MatchPattern::Literal(expr) => self.format_expr(expr)?,
             MatchPattern::Or(patterns) => {
-                let parts: Vec<String> = patterns.iter().map(|p| self.format_pattern(p)).collect();
+                let mut parts: Vec<String> = Vec::with_capacity(patterns.len());
+                for p in patterns {
+                    parts.push(self.format_pattern(p)?);
+                }
                 parts.join(" | ")
             }
-        }
+        };
+        Ok(s)
     }
 
-    fn format_expr(&self, expr: &Expr) -> String {
-        match expr {
+    fn format_expr(&self, expr: &Expr) -> Result<String> {
+        let s = match expr {
             Expr::Int(n, _) => n.to_string(),
             Expr::Float(f, _) => f.to_string(),
             Expr::Bool(b, _) => b.to_string(),
@@ -315,7 +341,7 @@ impl Formatter {
                         FStrPart::Lit(s) => result.push_str(&s.replace('\"', "\\\"")),
                         FStrPart::Interp(inner, spec) => {
                             result.push('{');
-                            result.push_str(&self.format_expr(inner));
+                            result.push_str(&self.format_expr(inner)?);
                             if let Some(s) = spec {
                                 result.push(':');
                                 result.push_str(s);
@@ -329,17 +355,11 @@ impl Formatter {
             }
             Expr::Ident(n, _) => n.clone(),
             Expr::List(elems, _) => {
-                let items = elems.iter()
-                    .map(|e| self.format_expr(e))
-                    .collect::<Vec<_>>()
-                    .join(", ");
+                let items = self.format_expr_list(elems)?;
                 format!("[{}]", items)
             }
             Expr::Tuple(elems, _) => {
-                let items = elems.iter()
-                    .map(|e| self.format_expr(e))
-                    .collect::<Vec<_>>()
-                    .join(", ");
+                let items = self.format_expr_list(elems)?;
                 if elems.len() == 1 {
                     format!("({},)", items)
                 } else {
@@ -347,40 +367,36 @@ impl Formatter {
                 }
             }
             Expr::Set(elems, _) => {
-                let items = elems.iter()
-                    .map(|e| self.format_expr(e))
-                    .collect::<Vec<_>>()
-                    .join(", ");
+                let items = self.format_expr_list(elems)?;
                 format!("{{{}}}", items)
             }
             Expr::Dict(pairs, _) => {
-                let items = pairs.iter()
-                    .map(|(k, v)| format!("{}: {}", self.format_expr(k), self.format_expr(v)))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("{{{}}}", items)
+                let mut parts: Vec<String> = Vec::with_capacity(pairs.len());
+                for (k, v) in pairs {
+                    parts.push(format!("{}: {}", self.format_expr(k)?, self.format_expr(v)?));
+                }
+                format!("{{{}}}", parts.join(", "))
             }
             Expr::Call { callee, args, .. } => {
-                let arg_strs = args.iter()
-                    .map(|a| self.format_expr(a))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("{}({})", self.format_expr(callee), arg_strs)
+                let callee_str = self.format_expr(callee)?;
+                let arg_strs = self.format_expr_list(args)?;
+                format!("{}({})", callee_str, arg_strs)
             }
             Expr::Attr { obj, name, .. } => {
-                format!("{}.{}", self.format_expr(obj), name)
+                format!("{}.{}", self.format_expr(obj)?, name)
             }
             Expr::Index { obj, idx, .. } => {
-                format!("{}[{}]", self.format_expr(obj), self.format_expr(idx))
+                format!("{}[{}]", self.format_expr(obj)?, self.format_expr(idx)?)
             }
             Expr::Slice { obj, start, stop, step, .. } => {
-                let start_str = start.as_ref().map(|e| self.format_expr(e)).unwrap_or_default();
-                let stop_str = stop.as_ref().map(|e| self.format_expr(e)).unwrap_or_default();
-                let step_str = step.as_ref().map(|e| self.format_expr(e)).unwrap_or_default();
+                let obj_str = self.format_expr(obj)?;
+                let start_str = match start { Some(e) => self.format_expr(e)?, None => String::new() };
+                let stop_str = match stop { Some(e) => self.format_expr(e)?, None => String::new() };
+                let step_str = match step { Some(e) => self.format_expr(e)?, None => String::new() };
                 if step.is_some() {
-                    format!("{}[{}:{}:{}]", self.format_expr(obj), start_str, stop_str, step_str)
+                    format!("{}[{}:{}:{}]", obj_str, start_str, stop_str, step_str)
                 } else {
-                    format!("{}[{}:{}]", self.format_expr(obj), start_str, stop_str)
+                    format!("{}[{}:{}]", obj_str, start_str, stop_str)
                 }
             }
             Expr::BinOp { op, lhs, rhs, .. } => {
@@ -410,7 +426,7 @@ impl Formatter {
                     BinOp::LShift => "<<",
                     BinOp::RShift => ">>",
                 };
-                format!("({} {} {})", self.format_expr(lhs), op_str, self.format_expr(rhs))
+                format!("({} {} {})", self.format_expr(lhs)?, op_str, self.format_expr(rhs)?)
             }
             Expr::UnOp { op, expr, .. } => {
                 let op_str = match op {
@@ -418,45 +434,78 @@ impl Formatter {
                     UnOp::Not => "not ",
                     UnOp::BitNot => "~",
                 };
-                format!("{}{}", op_str, self.format_expr(expr))
+                format!("{}{}", op_str, self.format_expr(expr)?)
             }
             Expr::ListComp { elt, target, iter, cond, .. } => {
-                let cond_str = if let Some(c) = cond {
-                    format!(" if {}", self.format_expr(c))
-                } else {
-                    String::new()
+                let cond_str = match cond {
+                    Some(c) => format!(" if {}", self.format_expr(c)?),
+                    None => String::new(),
                 };
-                format!("[{} for {} in {}{}]", self.format_expr(elt), target, self.format_expr(iter), cond_str)
+                format!("[{} for {} in {}{}]", self.format_expr(elt)?, target, self.format_expr(iter)?, cond_str)
+            }
+            Expr::SetComp { elt, target, iter, cond, .. } => {
+                let cond_str = match cond {
+                    Some(c) => format!(" if {}", self.format_expr(c)?),
+                    None => String::new(),
+                };
+                format!("{{{} for {} in {}{}}}", self.format_expr(elt)?, target, self.format_expr(iter)?, cond_str)
+            }
+            Expr::DictComp { key, val, target, iter, cond, .. } => {
+                let cond_str = match cond {
+                    Some(c) => format!(" if {}", self.format_expr(c)?),
+                    None => String::new(),
+                };
+                format!("{{{}: {} for {} in {}{}}}", self.format_expr(key)?, self.format_expr(val)?, target, self.format_expr(iter)?, cond_str)
             }
             Expr::Lambda { params, body, .. } => {
                 let param_strs = params.iter()
                     .map(|(name, _ty)| name.clone())  // Don't show inferred Any types
                     .collect::<Vec<_>>()
                     .join(", ");
-                format!("lambda {}: {}", param_strs, self.format_expr(body))
+                format!("lambda {}: {}", param_strs, self.format_expr(body)?)
             }
             Expr::IfExp { test, body, orelse, .. } => {
-                format!("{} if {} else {}", self.format_expr(body), self.format_expr(test), self.format_expr(orelse))
+                format!("{} if {} else {}", self.format_expr(body)?, self.format_expr(test)?, self.format_expr(orelse)?)
             }
-            _ => "/* complex expr */".to_string(),
-        }
+            // No catch-all placeholder: if a future AST node is not handled
+            // above, abort instead of emitting `/* complex expr */` and
+            // corrupting the user's source.
+            #[allow(unreachable_patterns)]
+            other => {
+                return Err(Error::Codegen(format!(
+                    "pyrst fmt: cannot format expression ({:?}); formatting aborted to avoid corrupting source",
+                    std::mem::discriminant(other)
+                )));
+            }
+        };
+        Ok(s)
     }
 
-    fn format_params(&self, params: &[Param]) -> String {
-        params.iter()
-            .map(|p| {
-                // Special case: 'self' parameter shouldn't have type annotation
-                if p.name == "self" {
-                    return "self".to_string();
-                }
-                if let Some(default) = &p.default {
-                    format!("{}: {} = {}", p.name, self.format_type(&p.ty), self.format_expr(default))
-                } else {
-                    format!("{}: {}", p.name, self.format_type(&p.ty))
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(", ")
+    /// Format a comma-separated list of expressions, aborting on the first
+    /// expression that cannot be rendered.
+    fn format_expr_list(&self, exprs: &[Expr]) -> Result<String> {
+        let mut parts: Vec<String> = Vec::with_capacity(exprs.len());
+        for e in exprs {
+            parts.push(self.format_expr(e)?);
+        }
+        Ok(parts.join(", "))
+    }
+
+    fn format_params(&self, params: &[Param]) -> Result<String> {
+        let mut parts: Vec<String> = Vec::with_capacity(params.len());
+        for p in params {
+            // Special case: 'self' parameter shouldn't have type annotation
+            if p.name == "self" {
+                parts.push("self".to_string());
+                continue;
+            }
+            if let Some(default) = &p.default {
+                parts.push(format!("{}: {} = {}", p.name, self.format_type(&p.ty), self.format_expr(default)?));
+            } else {
+                parts.push(format!("{}: {}", p.name, self.format_type(&p.ty)));
+            }
+        }
+        Ok(parts.join(", "))
     }
 
     fn format_type(&self, ty: &TypeExpr) -> String {
@@ -489,7 +538,95 @@ impl Formatter {
 }
 
 /// Format a pyrst module with consistent style.
-pub fn format(m: &Module) -> String {
+///
+/// Returns an error (and never a placeholder) for any AST node the formatter
+/// cannot faithfully render, so that `pyrst fmt` can abort rather than corrupt
+/// the user's source.
+pub fn format(m: &Module) -> Result<String> {
     let mut formatter = Formatter::new(4, 100);  // 4-space indent, 100 char line length
     formatter.format_module(m)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Format `src`, asserting it round-trips: it parses, formats without
+    /// error, and the formatted output itself parses. Returns the formatted
+    /// string for further assertions.
+    fn format_src(src: &str) -> String {
+        let module = crate::parser::parse(src).expect("source should parse");
+        let formatted = format(&module).expect("formatter should not abort on supported nodes");
+        // Round-trip: the formatted output must itself parse.
+        crate::parser::parse(&formatted).expect("formatted output should re-parse");
+        formatted
+    }
+
+    /// Card 8d63b3af acceptance: a set comprehension must round-trip and the
+    /// formatter must NEVER emit the old `/* complex expr */` placeholder.
+    #[test]
+    fn set_comprehension_round_trips_no_placeholder() {
+        let src = "def main() -> None:\n    s: set[int] = {x*2 for x in range(5)}\n";
+        let formatted = format_src(src);
+        assert!(
+            !formatted.contains("/* complex expr */"),
+            "formatter must never emit a placeholder, got:\n{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("{(x * 2) for x in range(5)}"),
+            "set comprehension should be rendered as a set comp, got:\n{}",
+            formatted
+        );
+    }
+
+    /// Set comprehension with a condition round-trips.
+    #[test]
+    fn set_comprehension_with_cond_round_trips() {
+        let src = "def main() -> None:\n    s: set[int] = {x for x in range(10) if (x % 2) == 0}\n";
+        let formatted = format_src(src);
+        assert!(!formatted.contains("/* complex expr */"));
+        assert!(
+            formatted.contains("{x for x in range(10) if"),
+            "got:\n{}",
+            formatted
+        );
+    }
+
+    /// Card 8d63b3af acceptance: a dict comprehension must round-trip and never
+    /// produce a placeholder.
+    #[test]
+    fn dict_comprehension_round_trips_no_placeholder() {
+        let src = "def main() -> None:\n    d: dict[int, int] = {x: x*x for x in range(5)}\n";
+        let formatted = format_src(src);
+        assert!(
+            !formatted.contains("/* complex expr */"),
+            "formatter must never emit a placeholder, got:\n{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("{x: (x * x) for x in range(5)}"),
+            "dict comprehension should be rendered as a dict comp, got:\n{}",
+            formatted
+        );
+    }
+
+    /// Dict comprehension with a condition round-trips.
+    #[test]
+    fn dict_comprehension_with_cond_round_trips() {
+        let src = "def main() -> None:\n    d: dict[int, int] = {x: x*2 for x in range(6) if (x % 2) == 0}\n";
+        let formatted = format_src(src);
+        assert!(!formatted.contains("/* complex expr */"));
+        assert!(formatted.contains("{x: (x * 2) for x in range(6) if"), "got:\n{}", formatted);
+    }
+
+    /// A list comprehension (pre-existing support) still round-trips, guarding
+    /// against regressions from the Result refactor.
+    #[test]
+    fn list_comprehension_still_round_trips() {
+        let src = "def main() -> None:\n    xs: list[int] = [x*2 for x in range(5)]\n";
+        let formatted = format_src(src);
+        assert!(!formatted.contains("/* complex expr */"));
+        assert!(formatted.contains("[(x * 2) for x in range(5)]"), "got:\n{}", formatted);
+    }
 }

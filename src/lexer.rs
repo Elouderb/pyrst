@@ -572,12 +572,95 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
     Ok(tokens)
 }
 
+/// Return `true` if `src` contains a `#` comment that the lexer would discard.
+///
+/// The lexer (and codegen) silently drop comments, so `pyrst fmt` cannot yet
+/// preserve them. This scanner mirrors the lexer's literal handling — the only
+/// string forms are single-line `'...'` / `"..."` strings and `f'...'` /
+/// `f"..."` f-strings (no triple-quoted or raw strings) — so a `#` reached
+/// outside any literal is exactly a comment the lexer would throw away. This
+/// lets `pyrst fmt` refuse to format such a file rather than delete comments.
+pub fn has_comment(src: &str) -> bool {
+    let bytes = src.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let c = bytes[i];
+        // f-string prefix: treat `f"`/`f'` as the start of an f-string literal.
+        if c == b'f' && i + 1 < bytes.len() && (bytes[i + 1] == b'"' || bytes[i + 1] == b'\'') {
+            i += 1; // consume 'f'; fall through to string scan below
+            i = skip_string_literal(bytes, i);
+            continue;
+        }
+        // String literal: skip to the matching closing quote, honoring `\`.
+        if c == b'"' || c == b'\'' {
+            i = skip_string_literal(bytes, i);
+            continue;
+        }
+        // A bare `#` outside any literal is a comment.
+        if c == b'#' {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Advance past a string/f-string literal starting at the opening quote
+/// (`bytes[start]` is `'` or `"`). Returns the index just past the closing
+/// quote, or `bytes.len()` if the literal is unterminated. `\`-escapes are
+/// honored so an escaped quote does not end the literal. For f-strings this
+/// intentionally treats interpolations as ordinary characters: we only need to
+/// avoid mistaking a `#` inside the literal for a comment, and `#` cannot
+/// terminate a string either way.
+fn skip_string_literal(bytes: &[u8], start: usize) -> usize {
+    let quote = bytes[start];
+    let mut i = start + 1;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\\' && i + 1 < bytes.len() {
+            i += 2; // skip escaped char
+            continue;
+        }
+        if b == quote {
+            return i + 1; // past closing quote
+        }
+        if b == b'\n' {
+            // Unterminated single-line string; stop so we don't run away. The
+            // lexer would reject this, but for comment detection we just bail.
+            return i + 1;
+        }
+        i += 1;
+    }
+    i
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn kinds(src: &str) -> Vec<Tok> {
         lex(src).unwrap().into_iter().map(|t| t.tok).collect()
+    }
+
+    #[test]
+    fn has_comment_detects_real_comments() {
+        assert!(has_comment("x = 1  # trailing comment\n"));
+        assert!(has_comment("# leading comment\nx = 1\n"));
+        assert!(has_comment("    # indented comment\n"));
+    }
+
+    #[test]
+    fn has_comment_ignores_hash_in_strings() {
+        // `#` inside string / f-string literals must NOT be treated as a comment.
+        assert!(!has_comment("x = \"#not a comment\"\n"));
+        assert!(!has_comment("x = '#also not'\n"));
+        assert!(!has_comment("x = f\"value #{n}\"\n"));
+        assert!(!has_comment("x = \"a\\\"# still in string\"\n"));
+    }
+
+    #[test]
+    fn has_comment_false_when_absent() {
+        assert!(!has_comment("def main() -> None:\n    x: int = 1\n"));
     }
 
     #[test]

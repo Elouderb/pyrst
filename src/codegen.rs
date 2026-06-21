@@ -29,12 +29,16 @@ pub struct Codegen<'a> {
     locals: HashMap<String, Ty>,
     declared: std::collections::HashSet<String>,
     current_class: Option<String>,
+    /// (EPIC-5) Declared return type of the function currently being emitted.
+    /// Lets `return` decide whether to wrap a bare value in `Some(..)` / emit
+    /// `None` (when the function returns `Option<T>`) vs. a bare `return;` (Unit).
+    current_ret_ty: Ty,
     dead_funcs: std::collections::HashSet<String>,  // Functions that are never called
 }
 
 impl<'a> Codegen<'a> {
     pub fn new(ctx: &'a TyCtx) -> Self {
-        Self { ctx, out: String::new(), indent: 0, locals: HashMap::new(), declared: Default::default(), current_class: None, dead_funcs: Default::default() }
+        Self { ctx, out: String::new(), indent: 0, locals: HashMap::new(), declared: Default::default(), current_class: None, current_ret_ty: Ty::Unit, dead_funcs: Default::default() }
     }
 
     pub fn with_dead_funcs(mut self, dead: std::collections::HashSet<String>) -> Self {
@@ -211,6 +215,30 @@ impl<'a> Codegen<'a> {
         crate::typeck::infer_expr_ty(e, &self.locals, self.ctx)
     }
 
+    /// (EPIC-5) Coerce an already-emitted expression `s` (for source expr `e`)
+    /// into the Rust representation expected by `target` when `target` is
+    /// `Option<T>`:
+    ///   - a `None` literal  -> `None`
+    ///   - a value already typed `Option<_>` (e.g. an Optional var, or a call
+    ///     returning Optional) -> passed through unchanged
+    ///   - any other bare value -> `Some(s)`  (the auto-Some that mirrors
+    ///     typeck's `T ~ Optional[T]` compatibility arm)
+    /// When `target` is not an Option, `s` is returned unchanged. This is the
+    /// single wrapping point shared by assignment, return, and argument sites so
+    /// the three never drift.
+    fn coerce_to_option(&self, s: String, e: &Expr, target: &Ty) -> String {
+        if !matches!(target, Ty::Option(_)) {
+            return s;
+        }
+        if matches!(e, Expr::None_(_)) {
+            return "None".to_string();
+        }
+        if matches!(self.type_of_expr(e), Ty::Option(_)) {
+            return s;
+        }
+        format!("Some({})", s)
+    }
+
     /// True when `e` emits an integer-valued (`i64`) Rust expression whose
     /// *logical* type (per the inference oracle) is nonetheless `Float`.
     ///
@@ -381,6 +409,8 @@ impl<'a> Codegen<'a> {
         let _ = write!(sig, ") -> {} {{", ret_s);
         self.line(&sig);
         self.indent += 1;
+        // (EPIC-5) Track the active return type for Some/None wrapping in `return`.
+        let saved_ret_ty = std::mem::replace(&mut self.current_ret_ty, ret.clone());
 
         // Populate locals from parameters
         // Register self with its class type if this is a method
@@ -432,6 +462,7 @@ impl<'a> Codegen<'a> {
         // Clear locals and declared for next function
         self.locals.clear();
         self.declared.clear();
+        self.current_ret_ty = saved_ret_ty;
         Ok(())
     }
 
@@ -1083,7 +1114,14 @@ impl<'a> Codegen<'a> {
             }
             Stmt::Return(None, _) => self.line("return;"),
             Stmt::Return(Some(e), _) => {
-                if matches!(e, Expr::None_(_)) {
+                // (EPIC-5) In an Option-returning function, wrap the value:
+                // `None` -> `return None;`, a bare T -> `return Some(T);`, an
+                // already-Optional value -> pass through.
+                if matches!(self.current_ret_ty, Ty::Option(_)) {
+                    let s = self.emit_expr(e)?;
+                    let wrapped = self.coerce_to_option(s, e, &self.current_ret_ty);
+                    self.line(&format!("return {};", wrapped));
+                } else if matches!(e, Expr::None_(_)) {
                     self.line("return;");
                 } else {
                     let s = self.emit_expr(e)?;
@@ -1128,6 +1166,11 @@ impl<'a> Codegen<'a> {
                         Some(t) => {
                             let ty_obj = Ty::from_type_expr(t)?;
                             self.locals.insert(target.clone(), ty_obj.clone());
+                            // (EPIC-5) An Optional-annotated binding wraps a bare
+                            // value in `Some(..)` (or emits `None` for the None
+                            // literal); an already-Optional initializer passes
+                            // through. Shared with return/argument sites.
+                            let v = self.coerce_to_option(v, value, &ty_obj);
                             // A float-annotated binding may receive an integer-typed
                             // value (e.g. `x: float = 2 ** 3`, where `**` constant-folds
                             // to an int and int**int otherwise emits i64). Cast to f64 so
@@ -1224,16 +1267,35 @@ impl<'a> Codegen<'a> {
                 }
             }
             Stmt::If { cond, then, elifs, else_, .. } => {
-                let narrowed = extract_narrowing(cond);
+                // (EPIC-5) None-guard narrowing must agree with typeck
+                // (check_stmt's If arm): for `x is not None` the THEN branch sees
+                // the unwrapped payload; for `x is None` the ELSE branch (when
+                // there are no elifs) sees it. The unwrap shadows the Option
+                // binding inside the block, so it never leaks past the `if`. Only
+                // a local actually typed `Option<_>` is narrowed.
+                // `narrowed` = the Option local and its inner type when the
+                // condition is a None-guard on a local typed `Option<_>`.
+                let narrowed: Option<(String, bool, Ty)> = extract_narrowing(cond)
+                    .and_then(|(var, is_not_none)| match self.locals.get(var.as_str()) {
+                        Some(Ty::Option(inner)) => Some((var, is_not_none, (**inner).clone())),
+                        _ => None,
+                    });
                 let c = self.emit_expr(cond)?;
                 self.line(&format!("if {} {{", c));
                 self.indent += 1;
-                if let Some((var, is_some)) = &narrowed {
-                    if *is_some {
-                        self.line(&format!("let {} = {}.unwrap();", var, var));
-                    }
-                }
+                // THEN branch is the non-None case for `x is not None`. Emit the
+                // unwrap and retype the local so type-dispatched emission inside
+                // the block (e.g. `str(x)`) sees the inner type; restore after.
+                let then_narrow = narrowed.as_ref().filter(|(_, is_not_none, _)| *is_not_none);
+                let then_saved = then_narrow.map(|(var, _, inner)| {
+                    self.line(&format!("let {} = {}.unwrap();", var, var));
+                    let prev = self.locals.insert(var.clone(), inner.clone());
+                    (var.clone(), prev)
+                });
                 for s in then { self.emit_stmt(s)?; }
+                if let Some((var, prev)) = then_saved {
+                    match prev { Some(t) => { self.locals.insert(var, t); } None => { self.locals.remove(var.as_str()); } }
+                }
                 self.indent -= 1;
                 for (c, b) in elifs {
                     let cs = self.emit_expr(c)?;
@@ -1245,7 +1307,18 @@ impl<'a> Codegen<'a> {
                 if let Some(b) = else_ {
                     self.line("} else {");
                     self.indent += 1;
+                    // ELSE is the non-None case only for `x is None` with no elifs.
+                    let else_narrow = narrowed.as_ref()
+                        .filter(|(_, is_not_none, _)| !*is_not_none && elifs.is_empty());
+                    let else_saved = else_narrow.map(|(var, _, inner)| {
+                        self.line(&format!("let {} = {}.unwrap();", var, var));
+                        let prev = self.locals.insert(var.clone(), inner.clone());
+                        (var.clone(), prev)
+                    });
                     for s in b { self.emit_stmt(s)?; }
+                    if let Some((var, prev)) = else_saved {
+                        match prev { Some(t) => { self.locals.insert(var, t); } None => { self.locals.remove(var.as_str()); } }
+                    }
                     self.indent -= 1;
                 }
                 self.line("}");
@@ -2154,7 +2227,10 @@ impl<'a> Codegen<'a> {
                                 Ty::List(_) => "<class 'list'>",
                                 Ty::Dict(_, _) => "<class 'dict'>",
                                 Ty::Set(_) => "<class 'set'>",
-                                Ty::Unit => "<class 'NoneType'>",
+                                // Both the `None` literal (NoneVal) and a void
+                                // result (Unit) report Python's NoneType, matching
+                                // the pre-NoneVal behavior of `type(None)`.
+                                Ty::Unit | Ty::NoneVal => "<class 'NoneType'>",
                                 _ => "<class 'object'>",
                             };
                             return Ok(format!("String::from(\"{}\")", type_name));
@@ -2829,8 +2905,27 @@ impl<'a> Codegen<'a> {
                 }
 
                 // Regular function call (not a class).
+                // (EPIC-5) Look up the callee signature so an argument flowing
+                // into an `Optional[T]` parameter is wrapped (`Some(..)` for a
+                // bare value, `None` for the None literal, pass-through for an
+                // already-Optional value) — the same coercion as assignment and
+                // return. Methods / unknown callees keep the bare emission.
+                let param_tys: Vec<Ty> = if let Expr::Ident(n, _) = callee.as_ref() {
+                    self.ctx.funcs.get(n.as_str())
+                        .map(|sig| sig.params.iter().map(|(_, t)| t.clone()).collect())
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
                 let mut parts = Vec::with_capacity(args.len());
-                for a in args { parts.push(self.emit_owned(a)?); }
+                for (i, a) in args.iter().enumerate() {
+                    let s = self.emit_owned(a)?;
+                    let s = match param_tys.get(i) {
+                        Some(pt) => self.coerce_to_option(s, a, pt),
+                        None => s,
+                    };
+                    parts.push(s);
+                }
 
                 // Inject default arguments for named functions
                 if let Expr::Ident(n, _) = callee.as_ref() {
@@ -3392,6 +3487,11 @@ fn rust_ty(t: &Ty) -> String {
         Ty::Bool => "bool".into(),
         Ty::Str => "String".into(),
         Ty::Unit => "()".into(),
+        // The `None` literal's type. It never appears as a real binding
+        // annotation (annotations come from `from_type_expr`, which yields
+        // `Unit`/`Option`, never `NoneVal`); this arm exists for exhaustiveness
+        // and mirrors `Unit` (`None` as a bare value is an upstream type error).
+        Ty::NoneVal => "()".into(),
         Ty::List(inner) => format!("Vec<{}>", rust_ty(inner)),
         Ty::Set(inner) => format!("::std::collections::HashSet<{}>", rust_ty(inner)),
         Ty::Dict(k, v) => format!("::std::collections::HashMap<{}, {}>", rust_ty(k), rust_ty(v)),

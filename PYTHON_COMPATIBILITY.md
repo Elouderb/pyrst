@@ -273,6 +273,86 @@ See `DESIGN_DECISIONS.md` §11 and `RUST_BACKEND.md` for the `catch_unwind` lowe
 
 ---
 
+## Optional / None Semantics
+
+`Optional[T]` and the equivalent `T | None` annotation both lower to Rust
+`Option<T>`; the bare `None` literal lowers to `Option::None`. The model is
+deliberately explicit (no implicit `Option`-to-`T` coercion) so a missing value
+can never be read as if it were present.
+
+**What is accepted (auto-wrapping at the boundary):**
+
+| Pattern | Example | Lowers to |
+|---------|---------|-----------|
+| `None` into an Optional slot | `x: Optional[int] = None` | `let x: Option<i64> = None;` |
+| bare `T` into an Optional slot (auto-`Some`) | `x: Optional[int] = 5` | `let x: Option<i64> = Some(5);` |
+| `Optional[T]` into an `Optional[T]` slot | `y: Optional[int] = f()` | passed through unchanged |
+| `return None` / `return 5` in an `-> Optional[int]` fn | | `return None;` / `return Some(5);` |
+| bare `T` / `None` as an `Optional[T]` **function** argument | `f(5)`, `f(None)` | `f(Some(5))`, `f(None)` |
+
+The auto-`Some` / `None` wrapping happens at the **consuming site** (annotated
+assignment, `return` in an Optional-returning function, and arguments to a
+**named function** whose parameter is `Optional[T]`). Method parameters and
+class-constructor fields do not yet auto-wrap — pass an explicit `Optional`
+value there.
+
+**Narrowing — the only way to use the inner value.** A value of type
+`Optional[T]` supports exactly two operations directly: testing it with
+`x is None` / `x is not None` (and `==`/`!=` against `None`). To use the inner
+`T` you must narrow with a None-guard; inside the narrowed branch the name has
+type `T` and lowers to `x.unwrap()`:
+
+```python
+def double_or_zero(x: Optional[int]) -> int:
+    if x is not None:
+        return x * 2        # x is `int` here
+    return 0
+
+def describe(x: Optional[int]) -> str:
+    if x is None:
+        return "none"
+    else:
+        return "value " + str(x)   # x is `int` in the else branch
+```
+
+`if x is not None:` narrows in the *then* branch; `if x is None:` narrows in the
+*else* branch (when there is no intervening `elif`). The narrowing is scoped to
+that branch only and does not leak past the `if`.
+
+**Honest rejection (chosen semantics).** Using an `Optional[T]` as a bare `T`
+**without narrowing** is a hard typeck error — it is never silently miscompiled.
+Any operator other than the None-identity tests above (`is`/`is not`/`==`/`!=`)
+applied to a raw Optional operand is rejected:
+
+```python
+def add_one(x: Optional[int]) -> int:
+    return x + 1        # ERROR: operator on an Optional value requires
+                        # narrowing first — use `if x is not None:`
+```
+
+This is the deliberate trade-off: pyrst will refuse the program rather than
+emit code that could dereference a `None`. Narrow first.
+
+The literal `None` is the *only* thing that fills an Optional slot on its own.
+The **result of a void function** (a `def f() -> None` call, or a built-in like
+`print(...)` / `list.append(...)`) is *not* a value and is rejected when used as
+an `Optional[T]`:
+
+```python
+def sink() -> None:
+    print("hi")
+
+def use() -> None:
+    x: int | None = sink()   # ERROR: declared Option(Int), got Unit —
+                             # a void result is not `None` and not a value
+```
+
+The type checker keeps the `None` *literal* and a *void return* as separate
+types precisely so this case is caught at `pyrst check`, not deferred to the Rust
+compiler (which would otherwise reject the emitted `Some(sink())` as `Option<()>`).
+
+---
+
 ## Notable Limitations
 
 - **Printing collections:** `print([...])`, `print({...})`, `str([...])`, and f-string interpolation render lists/tuples/sets/dicts in CPython `repr` form (str elements quoted, bools as `True`/`False`, nested collections recursing). Because the backing `HashSet`/`HashMap` have no insertion order, **set and dict entries are emitted in a stable sorted-by-`repr` order**, which may differ from Python's insertion order. Empty collections render as `[]`, `set()`, and `{}`; str elements are quoted with single quotes and escaped. Tuples up to 6 elements are covered. Dict views (`keys()`/`values()`/`items()`) and set/list method results (`union()`, `copy()`, …) carry their collection type and render via the same repr path; multi-key dict-view order is unspecified.

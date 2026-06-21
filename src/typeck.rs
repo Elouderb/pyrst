@@ -11,7 +11,8 @@ pub enum Ty {
     Float,
     Bool,
     Str,
-    Unit,            // maps to Rust ()
+    Unit,            // a void function's `-> None` return; maps to Rust ()
+    NoneVal,         // the type of the `None` LITERAL only (distinct from Unit)
     List(Box<Ty>),
     Set(Box<Ty>),
     Dict(Box<Ty>, Box<Ty>),
@@ -688,9 +689,59 @@ fn types_compatible(val_ty: &Ty, declared_ty: &Ty) -> bool {
         // Dict with Unknown key/value compatible with any Dict
         (Ty::Dict(k, v), Ty::Dict(_, _)) if **k == Ty::Unknown && **v == Ty::Unknown => true,
         (Ty::Dict(_, _), Ty::Dict(k, v)) if **k == Ty::Unknown && **v == Ty::Unknown => true,
+        // ── Optional / None ──────────────────────────────────────────────────
+        // (EPIC-5) `types_compatible(val_ty, declared_ty)` is directional: it asks
+        // whether a value of `val_ty` may flow into a slot of `declared_ty`. The
+        // Option arms below are written so a value may FILL an Optional slot, but
+        // an Optional value may NOT silently fill a bare slot — using an
+        // `Optional[T]` as a bare `T` without narrowing stays an honest error.
+        //
+        // The `None` LITERAL has its own type `Ty::NoneVal`, kept strictly
+        // separate from `Ty::Unit` (a *void function's* `-> None` return). This
+        // separation is load-bearing: were they the same, a void call result
+        // (`Ty::Unit`) would wrongly satisfy an Optional slot and codegen would
+        // emit `Some(void_call())` -> `Option<()>` — a silent miscompile. So a
+        // void result is NOT compatible with Optional; only the literal `None` is.
+        //
+        // 1a. The `None` literal fills any Optional slot regardless of inner type
+        //     (`None` is a valid `Optional[Class]`). Placed before the bare-value
+        //     arm so it never recurses into the (incompatible) inner type.
+        (Ty::NoneVal, Ty::Option(_)) => true,
+        // 1b. The `None` literal also satisfies a `-> None` (void) return — this
+        //     is what makes `return None` typecheck in a void function (the
+        //     Return path compares the value type against the declared Unit ret).
+        (Ty::NoneVal, Ty::Unit) => true,
+        // 1c. Two `None` literals are mutually compatible (e.g. branch unification
+        //     of `None`/`None`, or `x = None` re-checked against itself).
+        (Ty::NoneVal, Ty::NoneVal) => true,
+        // 2. Optional[A] fills Optional[B] when the inner types are compatible
+        //    (covers Optional[Unknown] permissively, and Optional[T]~Optional[T]).
+        (Ty::Option(a), Ty::Option(b)) => types_compatible(a, b),
+        // 3. A bare value of type A fills Optional[B] when A fits B (auto-Some).
+        //    Checked AFTER the Option/Option arm so an Optional value never takes
+        //    this path. `NoneVal` is excluded (it is handled by 1a above, never by
+        //    recursing into the inner type). Codegen wraps the bare value in
+        //    `Some(...)` at the site.
+        (a, Ty::Option(b)) if !matches!(a, Ty::Option(_) | Ty::NoneVal) => types_compatible(a, b),
         // Otherwise not compatible
         _ => false,
     }
+}
+
+/// (EPIC-5) Recognize a None-guard condition of the form `x is None` /
+/// `x is not None` on a plain local name. Returns `(name, is_not_none)` where
+/// `is_not_none` is true for `is not None` (the branch in which `x` is the
+/// non-None payload). Mirrors codegen's `extract_narrowing` so the two layers
+/// agree on which guards narrow.
+fn extract_none_guard(cond: &Expr) -> Option<(String, bool)> {
+    if let Expr::BinOp { op, lhs, rhs, .. } = cond {
+        if matches!(op, BinOp::Is | BinOp::IsNot) && matches!(rhs.as_ref(), Expr::None_(_)) {
+            if let Expr::Ident(name, _) = lhs.as_ref() {
+                return Some((name.clone(), *op == BinOp::IsNot));
+            }
+        }
+    }
+    None
 }
 
 /// Unify the two branch types of a conditional expression. Returns the more
@@ -975,13 +1026,46 @@ fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
         }
         Stmt::If { cond, then, elifs, else_, .. } => {
             check_expr(cond, env)?;
-            check_body(then, env)?;
+            // (EPIC-5) None-guard narrowing. For `if x is not None:` the THEN
+            // branch sees `x: T` (the non-None payload); for `if x is None:` the
+            // ELSE branch sees `x: T`. `x` must be a local typed `Option(T)`.
+            // We narrow only the directly-guarded branch and save/restore the
+            // local's type so the narrowing never leaks past the `if`.
+            let guard = extract_none_guard(cond)
+                .and_then(|(name, is_not_none)| match env.locals.get(name.as_str()) {
+                    Some(Ty::Option(inner)) => Some((name, is_not_none, (**inner).clone())),
+                    _ => None,
+                });
+            // THEN branch: narrowed iff the guard is `is not None`.
+            {
+                let restore = guard.as_ref().filter(|(_, is_not_none, _)| *is_not_none)
+                    .map(|(name, _, inner)| {
+                        let prev = env.locals.insert(name.clone(), inner.clone());
+                        (name.clone(), prev)
+                    });
+                check_body(then, env)?;
+                if let Some((name, prev)) = restore {
+                    match prev { Some(t) => { env.locals.insert(name, t); } None => { env.locals.remove(name.as_str()); } }
+                }
+            }
             for (c, b) in elifs {
                 check_expr(c, env)?;
                 check_body(b, env)?;
             }
+            // ELSE branch: narrowed iff the guard is `is None` (so the else is the
+            // non-None case). Skipped when there are elifs, since the else then
+            // belongs to a different condition.
             if let Some(b) = else_ {
+                let restore = guard.as_ref()
+                    .filter(|(_, is_not_none, _)| !*is_not_none && elifs.is_empty())
+                    .map(|(name, _, inner)| {
+                        let prev = env.locals.insert(name.clone(), inner.clone());
+                        (name.clone(), prev)
+                    });
                 check_body(b, env)?;
+                if let Some((name, prev)) = restore {
+                    match prev { Some(t) => { env.locals.insert(name, t); } None => { env.locals.remove(name.as_str()); } }
+                }
             }
             Ok(())
         }
@@ -1285,7 +1369,7 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
         Expr::Int(..) => Ty::Int,
         Expr::Bool(..) => Ty::Bool,
         Expr::Str(..) | Expr::FStr(..) => Ty::Str,
-        Expr::None_(_) => Ty::Unit,
+        Expr::None_(_) => Ty::NoneVal,
         Expr::IfExp { body, orelse, .. } => {
             // Both branches unify in typeck; prefer the concrete one.
             let b = infer_expr_ty(body, locals, ctx);
@@ -1885,7 +1969,7 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
             require_hashable(&key_ty, *span, "dict key")?;
             Ty::Dict(Box::new(key_ty), Box::new(val_ty))
         }
-        Expr::None_(_) => Ty::Unit,
+        Expr::None_(_) => Ty::NoneVal,
         Expr::List(elems, span) => {
             let elem_ty = if elems.is_empty() {
                 Ty::Unknown
@@ -2323,9 +2407,28 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 _ => Ty::Unknown,
             }
         }
-        Expr::BinOp { op, lhs, rhs, .. } => {
+        Expr::BinOp { op, lhs, rhs, span } => {
             let l = check_expr(lhs, env)?;
             let r = check_expr(rhs, env)?;
+            // (EPIC-5) Reject using a raw `Optional[T]` operand without narrowing.
+            // An Option only supports identity/equality testing against `None`
+            // (`is` / `is not` / `==` / `!=`); any other operator (arithmetic,
+            // ordering, membership, boolean) on an un-narrowed Optional is an
+            // honest error — the value must be narrowed via `is None` /
+            // `is not None` first (see PYTHON_COMPATIBILITY.md, Optional section).
+            // Without this, `x + 1` on an `Optional[int]` would infer `Unknown`
+            // and silently slip through, then miscompile.
+            let nullary_ok = matches!(op, BinOp::Is | BinOp::IsNot | BinOp::Eq | BinOp::Ne);
+            if !nullary_ok && (matches!(l, Ty::Option(_)) || matches!(r, Ty::Option(_))) {
+                return Err(Error::Type {
+                    span: *span,
+                    msg: format!(
+                        "operator on an Optional value requires narrowing first: \
+                         use `if x is not None:` to obtain the inner value before applying `{:?}`",
+                        op
+                    ),
+                });
+            }
             match op {
                 BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le
                 | BinOp::Gt | BinOp::Ge | BinOp::And | BinOp::Or
@@ -2574,6 +2677,157 @@ mod tests {
             &Ty::List(Box::new(Ty::Int)),
             &Ty::List(Box::new(Ty::Str))
         ));
+    }
+
+    // ── EPIC-5: Optional / None compatibility ─────────────────────────────────
+
+    #[test]
+    fn compat_none_fills_option() {
+        // The `None` literal (typed `NoneVal`) fills any Optional slot, including
+        // `Optional[Class]` (inner type need not be compatible with NoneVal).
+        assert!(types_compatible(&Ty::NoneVal, &Ty::Option(Box::new(Ty::Int))));
+        assert!(types_compatible(
+            &Ty::NoneVal,
+            &Ty::Option(Box::new(Ty::Class("Point".into())))
+        ));
+    }
+
+    #[test]
+    fn compat_void_does_not_fill_option() {
+        // SOUNDNESS BACKSTOP (EPIC-5 review blocker): a *void* result (`Ty::Unit`,
+        // the `-> None` return of e.g. `print(...)` or any `def f() -> None`) is
+        // NOT compatible with an Optional slot. Only the `None` literal (NoneVal)
+        // is. Were this true, codegen would emit `Some(void_call())` -> `Option<()>`
+        // — a silent miscompile caught only by rustc. This must stay FALSE.
+        assert!(!types_compatible(&Ty::Unit, &Ty::Option(Box::new(Ty::Int))));
+        assert!(!types_compatible(
+            &Ty::Unit,
+            &Ty::Option(Box::new(Ty::Class("Point".into())))
+        ));
+    }
+
+    #[test]
+    fn compat_none_literal_satisfies_void_return() {
+        // `return None` in a `-> None` (void) function must still typecheck: the
+        // Return path compares NoneVal against the declared Unit return type.
+        assert!(types_compatible(&Ty::NoneVal, &Ty::Unit));
+    }
+
+    #[test]
+    fn compat_bare_t_fills_option() {
+        // A bare T auto-wraps into Optional[T].
+        assert!(types_compatible(&Ty::Int, &Ty::Option(Box::new(Ty::Int))));
+        assert!(types_compatible(
+            &Ty::Class("Point".into()),
+            &Ty::Option(Box::new(Ty::Class("Point".into())))
+        ));
+    }
+
+    #[test]
+    fn compat_option_fills_option_inner() {
+        // Optional[T] ~ Optional[T], and Optional[Unknown] is permissive.
+        assert!(types_compatible(
+            &Ty::Option(Box::new(Ty::Int)),
+            &Ty::Option(Box::new(Ty::Int))
+        ));
+        assert!(types_compatible(
+            &Ty::Option(Box::new(Ty::Unknown)),
+            &Ty::Option(Box::new(Ty::Int))
+        ));
+    }
+
+    #[test]
+    fn compat_bare_t_fills_option_inner_mismatch_false() {
+        // A bare Str does NOT fit Optional[int].
+        assert!(!types_compatible(&Ty::Str, &Ty::Option(Box::new(Ty::Int))));
+    }
+
+    #[test]
+    fn compat_option_does_not_fill_bare_slot() {
+        // The directional guard: an Optional value may NOT silently fill a bare
+        // slot. Using Optional[int] where int is required is rejected — the
+        // honest-rejection backstop that keeps `x + 1` on an un-narrowed Optional
+        // an error rather than a silent miscompile.
+        assert!(!types_compatible(&Ty::Option(Box::new(Ty::Int)), &Ty::Int));
+    }
+
+    #[test]
+    fn optional_arithmetic_without_narrowing_rejected() {
+        // `x + 1` where x: Optional[int] is an honest error — narrow first.
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        env.locals.insert("x".into(), Ty::Option(Box::new(Ty::Int)));
+        let add = Expr::BinOp {
+            op: BinOp::Add,
+            lhs: Box::new(ident("x")),
+            rhs: Box::new(int_lit(1)),
+            span: Span::DUMMY,
+        };
+        assert_type_err(check_expr(&add, &mut env), "requires narrowing");
+    }
+
+    #[test]
+    fn optional_is_none_comparison_allowed() {
+        // `x is None` / `x is not None` are the sanctioned tests on a raw Optional.
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        env.locals.insert("x".into(), Ty::Option(Box::new(Ty::Int)));
+        for op in [BinOp::Is, BinOp::IsNot] {
+            let cmp = Expr::BinOp {
+                op,
+                lhs: Box::new(ident("x")),
+                rhs: Box::new(Expr::None_(Span::DUMMY)),
+                span: Span::DUMMY,
+            };
+            assert_eq!(check_expr(&cmp, &mut env).unwrap(), Ty::Bool);
+        }
+    }
+
+    #[test]
+    fn optional_not_none_narrows_then_branch() {
+        // `if x is not None: y = x + 1` type-checks because x narrows to int in
+        // the then branch; the local is restored to Option afterwards.
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        env.locals.insert("x".into(), Ty::Option(Box::new(Ty::Int)));
+        let cond = Expr::BinOp {
+            op: BinOp::IsNot,
+            lhs: Box::new(ident("x")),
+            rhs: Box::new(Expr::None_(Span::DUMMY)),
+            span: Span::DUMMY,
+        };
+        let body_assign = Stmt::Assign {
+            target: "y".into(),
+            ty: None,
+            value: Expr::BinOp {
+                op: BinOp::Add,
+                lhs: Box::new(ident("x")),
+                rhs: Box::new(int_lit(1)),
+                span: Span::DUMMY,
+            },
+            span: Span::DUMMY,
+        };
+        let if_stmt = Stmt::If {
+            cond,
+            then: vec![body_assign],
+            elifs: vec![],
+            else_: None,
+            span: Span::DUMMY,
+        };
+        check_stmt(&if_stmt, &mut env).unwrap();
+        // The narrowing must not leak: x is Option again after the if.
+        assert_eq!(env.locals.get("x"), Some(&Ty::Option(Box::new(Ty::Int))));
+    }
+
+    #[test]
+    fn return_none_in_optional_fn_typechecks() {
+        // `return None` and `return <bare int>` both satisfy an Optional[int] ret.
+        let ctx = TyCtx::new();
+        let mut env = make_env_ret(&ctx, Ty::Option(Box::new(Ty::Int)));
+        let ret_none = Stmt::Return(Some(Expr::None_(Span::DUMMY)), Span::DUMMY);
+        check_stmt(&ret_none, &mut env).unwrap();
+        let ret_int = Stmt::Return(Some(int_lit(7)), Span::DUMMY);
+        check_stmt(&ret_int, &mut env).unwrap();
     }
 
     #[test]
@@ -2855,9 +3109,11 @@ mod tests {
 
     #[test]
     fn infer_none_literal() {
+        // The `None` literal types as `NoneVal` (distinct from a void function's
+        // `Unit` return) so that void results never satisfy an Optional slot.
         let ctx = TyCtx::new();
         let mut env = make_env(&ctx);
-        assert_eq!(check_expr(&Expr::None_(Span::DUMMY), &mut env).unwrap(), Ty::Unit);
+        assert_eq!(check_expr(&Expr::None_(Span::DUMMY), &mut env).unwrap(), Ty::NoneVal);
     }
 
     #[test]

@@ -347,53 +347,116 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
             continue;
         }
 
-        // String literal
+        // String literal (single-line or triple-quoted)
         if c == b'"' || c == b'\'' {
             let quote = c;
-            i += 1;
+            // Detect triple-quoted opener: """...""" or '''...'''
+            let triple = i + 2 < bytes.len() && bytes[i + 1] == quote && bytes[i + 2] == quote;
             let mut s = String::new();
-            while i < bytes.len() && bytes[i] != quote {
-                if bytes[i] == b'\\' && i + 1 < bytes.len() {
-                    let esc = bytes[i + 1];
-                    let ch = match esc {
-                        b'n' => '\n',
-                        b't' => '\t',
-                        b'r' => '\r',
-                        b'\\' => '\\',
-                        b'\'' => '\'',
-                        b'"' => '"',
-                        b'0' => '\0',
-                        other => {
-                            return Err(Error::Lex {
-                                span: Span::new(i, i + 2, line, col),
-                                msg: format!("unknown escape '\\{}'", fmt_byte(other)),
-                            });
+            if triple {
+                i += 3; // consume the three opening quotes
+                loop {
+                    if i >= bytes.len() {
+                        return Err(Error::Lex {
+                            span: Span::new(start, i, line, col),
+                            msg: "unterminated triple-quoted string".into(),
+                        });
+                    }
+                    // Check for closing triple quote
+                    if bytes[i] == quote
+                        && i + 1 < bytes.len() && bytes[i + 1] == quote
+                        && i + 2 < bytes.len() && bytes[i + 2] == quote
+                    {
+                        i += 3; // consume the three closing quotes
+                        break;
+                    }
+                    if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                        let esc = bytes[i + 1];
+                        let ch = match esc {
+                            b'n' => '\n',
+                            b't' => '\t',
+                            b'r' => '\r',
+                            b'\\' => '\\',
+                            b'\'' => '\'',
+                            b'"' => '"',
+                            b'0' => '\0',
+                            b'\n' => {
+                                // Backslash-newline: line continuation inside triple string
+                                i += 2;
+                                line += 1;
+                                line_start = i;
+                                continue;
+                            }
+                            other => {
+                                return Err(Error::Lex {
+                                    span: Span::new(i, i + 2, line, col),
+                                    msg: format!("unknown escape '\\{}'", fmt_byte(other)),
+                                });
+                            }
+                        };
+                        s.push(ch);
+                        i += 2;
+                    } else if bytes[i] == b'\n' {
+                        // Embedded newline: include it verbatim and track line/col
+                        s.push('\n');
+                        i += 1;
+                        line += 1;
+                        line_start = i;
+                    } else {
+                        match char_at(src, i) {
+                            Some(ch) => { s.push(ch); i += ch.len_utf8(); }
+                            None => return Err(Error::Lex {
+                                span: Span::new(i, i + 1, line, col),
+                                msg: "invalid UTF-8 byte in string literal".into(),
+                            }),
                         }
-                    };
-                    s.push(ch);
-                    i += 2;
-                } else if bytes[i] == b'\n' {
+                    }
+                }
+            } else {
+                i += 1; // consume opening single quote
+                while i < bytes.len() && bytes[i] != quote {
+                    if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                        let esc = bytes[i + 1];
+                        let ch = match esc {
+                            b'n' => '\n',
+                            b't' => '\t',
+                            b'r' => '\r',
+                            b'\\' => '\\',
+                            b'\'' => '\'',
+                            b'"' => '"',
+                            b'0' => '\0',
+                            other => {
+                                return Err(Error::Lex {
+                                    span: Span::new(i, i + 2, line, col),
+                                    msg: format!("unknown escape '\\{}'", fmt_byte(other)),
+                                });
+                            }
+                        };
+                        s.push(ch);
+                        i += 2;
+                    } else if bytes[i] == b'\n' {
+                        return Err(Error::Lex {
+                            span: Span::new(start, i, line, col),
+                            msg: "unterminated string".into(),
+                        });
+                    } else {
+                        match char_at(src, i) {
+                            Some(ch) => { s.push(ch); i += ch.len_utf8(); }
+                            None => return Err(Error::Lex {
+                                span: Span::new(i, i + 1, line, col),
+                                msg: "invalid UTF-8 byte in string literal".into(),
+                            }),
+                        }
+                    }
+                }
+                if i >= bytes.len() {
                     return Err(Error::Lex {
                         span: Span::new(start, i, line, col),
                         msg: "unterminated string".into(),
                     });
-                } else {
-                    match char_at(src, i) {
-                        Some(ch) => { s.push(ch); i += ch.len_utf8(); }
-                        None => return Err(Error::Lex {
-                            span: Span::new(i, i + 1, line, col),
-                            msg: "invalid UTF-8 byte in string literal".into(),
-                        }),
-                    }
                 }
+                i += 1; // consume closing single quote
             }
-            if i >= bytes.len() {
-                return Err(Error::Lex {
-                    span: Span::new(start, i, line, col),
-                    msg: "unterminated string".into(),
-                });
-            }
-            i += 1;
             tokens.push(Token {
                 tok: Tok::Str(s),
                 span: Span::new(start, i, line, col),
@@ -608,28 +671,45 @@ pub fn has_comment(src: &str) -> bool {
 /// Advance past a string/f-string literal starting at the opening quote
 /// (`bytes[start]` is `'` or `"`). Returns the index just past the closing
 /// quote, or `bytes.len()` if the literal is unterminated. `\`-escapes are
-/// honored so an escaped quote does not end the literal. For f-strings this
-/// intentionally treats interpolations as ordinary characters: we only need to
-/// avoid mistaking a `#` inside the literal for a comment, and `#` cannot
-/// terminate a string either way.
+/// honored so an escaped quote does not end the literal. Triple-quoted strings
+/// (`"""..."""` or `'''...'''`) are handled: they consume embedded newlines and
+/// single/double quotes until the matching 3-quote closer is found. For
+/// f-strings this intentionally treats interpolations as ordinary characters:
+/// we only need to avoid mistaking a `#` inside the literal for a comment.
 fn skip_string_literal(bytes: &[u8], start: usize) -> usize {
     let quote = bytes[start];
-    let mut i = start + 1;
+    // Detect triple-quoted opener
+    let triple = start + 2 < bytes.len()
+        && bytes[start + 1] == quote
+        && bytes[start + 2] == quote;
+    let mut i = if triple { start + 3 } else { start + 1 };
     while i < bytes.len() {
         let b = bytes[i];
         if b == b'\\' && i + 1 < bytes.len() {
             i += 2; // skip escaped char
             continue;
         }
-        if b == quote {
-            return i + 1; // past closing quote
+        if triple {
+            // Look for closing triple quote
+            if b == quote
+                && i + 1 < bytes.len() && bytes[i + 1] == quote
+                && i + 2 < bytes.len() && bytes[i + 2] == quote
+            {
+                return i + 3; // past closing triple quote
+            }
+            // Embedded newlines and single quotes are allowed; just advance.
+            i += 1;
+        } else {
+            if b == quote {
+                return i + 1; // past closing quote
+            }
+            if b == b'\n' {
+                // Unterminated single-line string; stop so we don't run away.
+                // The lexer would reject this, but for comment detection we bail.
+                return i + 1;
+            }
+            i += 1;
         }
-        if b == b'\n' {
-            // Unterminated single-line string; stop so we don't run away. The
-            // lexer would reject this, but for comment detection we just bail.
-            return i + 1;
-        }
-        i += 1;
     }
     i
 }

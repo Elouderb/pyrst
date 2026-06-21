@@ -1,0 +1,11 @@
+Price: $19.99
+Total: $99.95
+      Item | 00042
+Input: [  Hello WORLD  ]
+Cleaned: [hello world]
+Count of 'the': 3
+Position of 'cat': 4
+revenue: 1234.57 (87.3%)
+Replaced: apple; banana; cherry
+Parts count: 3
+First: apple

@@ -1,0 +1,28 @@
+=== Text Processing ===
+The quick brown fox jumps over the lazy dog
+THE QUICK BROWN FOX JUMPS OVER THE LAZY DOG
+the quick brown fox jumps over the lazy dog
+god yzal eht revo spmuj xof nworb kciuq ehT
+=== Word Analysis ===
+9
+3.888888888888889
+3
+5
+3
+6
+43
+8
+35
+1
+34
+4
+3
+False
+False
+False
+The quick brown cat jumps over the lazy dog
+35
+4
+35
+True
+True

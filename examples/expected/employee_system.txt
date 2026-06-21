@@ -1,0 +1,41 @@
+=== Employee System ===
+5
+43000.0
+8600.0
+2
+1
+2
+400000.0
+90000
+70000
+80000.0
+3
+2
+=== Employee Details ===
+Alice
+80000.0
+7
+8700.0
+Bob
+75000.0
+3
+7800.0
+Charlie
+85000.0
+10
+9500.0
+Diana
+70000.0
+2
+7200.0
+Eve
+90000.0
+8
+9800.0
+=== Sorted by Salary ===
+Diana
+Bob
+Alice
+Charlie
+Eve
+443000.0

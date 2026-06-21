@@ -1,0 +1,44 @@
+=== Project Tracker ===
+5
+76.0
+34.0
+42.0
+44.73684210526316
+3
+2
+40.0
+4.0
+15.2
+52.0
+16.0
+8.0
+=== Task Details ===
+Design
+8.0
+1.0
+1.0
+Development
+40.0
+1.0
+0.5
+Testing
+16.0
+2.0
+0.0
+Documentation
+8.0
+3.0
+0.75
+Deployment
+4.0
+1.0
+0.0
+=== Hours by Priority ===
+0.0
+20.0
+16.0
+2.0
+4.0
+1
+2
+2

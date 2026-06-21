@@ -1,79 +1,231 @@
-#!/bin/bash
-# Positive examples: must transpile AND run successfully.
-# Negative examples (*fail*): must be REJECTED by `pyrst build` (at the type
-# checker or by rustc); a negative that builds is a soundness regression.
-BIN="$HOME/.cargo/bin/cargo run --release --quiet --"
+#!/usr/bin/env bash
+# test_all.sh — pyrst integration harness
+#
+# Sections:
+#   1. Positive build+run loop   — exit code + stdout diff against expected/
+#   2. Negative build loop       — *fail* examples must be rejected by `pyrst build`
+#   3. Negative typeck-check loop — *fail* examples must be rejected by `pyrst check`
+#   4. Multi-file demo           — pinned stdout assertion
+#
+# Exit code: 0 only when all sections pass.
+# No set -e: failures are counted and reported at the end.
 
-count=0
-passed=0
-for f in examples/*.py; do
-  base=$(basename "$f" .py)
-  [[ "$base" == *fail* ]] && continue
-  count=$((count + 1))
-  timeout 30 $BIN build "$f" 2>/dev/null && timeout 5 ./"$base" >/dev/null 2>&1 && passed=$((passed + 1)) || echo "FAIL: $base"
-  rm -f "$base" "$base.rs"
+BIN="$(cd "$(dirname "$0")" && pwd)/target/release/pyrst"
+EXAMPLES="$(cd "$(dirname "$0")" && pwd)/examples"
+EXPECTED="$EXAMPLES/expected"
+
+# Names owned by a sibling card — skip if expected file is absent
+SIBLING_EXCLUSIONS="floor_div_neg mod_neg pow_float"
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+is_sibling_exclusion() {
+    local name="$1"
+    for ex in $SIBLING_EXCLUSIONS; do
+        [[ "$name" == "$ex" ]] && return 0
+    done
+    return 1
+}
+
+# ── 1. POSITIVE LOOP ─────────────────────────────────────────────────────────
+
+pos_count=0
+pos_passed=0
+pos_failures=()
+
+for f in "$EXAMPLES"/*.py; do
+    base=$(basename "$f" .py)
+    # Skip negative examples (name contains "fail")
+    [[ "$base" == *fail* ]] && continue
+
+    pos_count=$((pos_count + 1))
+
+    # Build
+    stderr_out=$(timeout 30 "$BIN" build "$f" 2>&1 >/dev/null)
+    build_exit=$?
+
+    if [[ $build_exit -eq 124 ]]; then
+        echo "FAIL [build timeout]: $base"
+        pos_failures+=("$base")
+        rm -f "$base" "$base.rs"
+        continue
+    fi
+    if [[ $build_exit -eq 101 ]]; then
+        echo "FAIL [ICE/panic build exit 101]: $base"
+        pos_failures+=("$base")
+        rm -f "$base" "$base.rs"
+        continue
+    fi
+    if [[ $build_exit -ne 0 ]]; then
+        echo "FAIL [build exit $build_exit]: $base"
+        pos_failures+=("$base")
+        rm -f "$base" "$base.rs"
+        continue
+    fi
+
+    # Run and capture stdout
+    got=$(timeout 5 ./"$base" 2>/dev/null)
+    run_exit=$?
+    rm -f "$base" "$base.rs"
+
+    if [[ $run_exit -eq 124 ]]; then
+        echo "FAIL [run timeout]: $base"
+        pos_failures+=("$base")
+        continue
+    fi
+    if [[ $run_exit -ne 0 ]]; then
+        echo "FAIL [run exit $run_exit]: $base"
+        pos_failures+=("$base")
+        continue
+    fi
+
+    # Check expected file
+    expected_file="$EXPECTED/$base.txt"
+    if [[ ! -f "$expected_file" ]]; then
+        if is_sibling_exclusion "$base"; then
+            # Sibling card owns this; skip stdout check but count the build+run pass
+            pos_passed=$((pos_passed + 1))
+        else
+            echo "FAIL [missing expected file]: $base"
+            pos_failures+=("$base")
+        fi
+        continue
+    fi
+
+    expected=$(cat "$expected_file")
+    if [[ "$got" == "$expected" ]]; then
+        pos_passed=$((pos_passed + 1))
+    else
+        echo "FAIL [stdout mismatch]: $base"
+        diff <(printf '%s\n' "$expected") <(printf '%s\n' "$got") | head -20
+        pos_failures+=("$base")
+    fi
 done
-echo "PASSED: $passed / $count"
+
+echo ""
+echo "POSITIVES: $pos_passed / $pos_count passed"
+
+# ── 2. NEGATIVE BUILD LOOP ───────────────────────────────────────────────────
 
 neg_count=0
 neg_ok=0
-for f in examples/*fail*.py; do
-  [[ -e "$f" ]] || continue
-  base=$(basename "$f" .py)
-  neg_count=$((neg_count + 1))
-  if timeout 30 $BIN build "$f" >/dev/null 2>&1; then
-    echo "LEAK (negative wrongly accepted): $base"
-  else
-    neg_ok=$((neg_ok + 1))
-  fi
-  rm -f "$base" "$base.rs"
-done
-echo "NEGATIVES REJECTED: $neg_ok / $neg_count"
+neg_build_failures=()
 
-# Output assertions: a handful of examples whose stdout must match exactly, so
-# silent corruption (e.g. a UTF-8 lexer regression that still exits 0) is caught.
-out_ok=0
-out_count=0
-assert_output() {
-  local base="$1"; local expected="$2"
-  out_count=$((out_count + 1))
-  if timeout 30 $BIN build "examples/$base.py" >/dev/null 2>&1; then
-    local got; got=$(timeout 5 ./"$base" 2>/dev/null)
-    if [[ "$got" == "$expected" ]]; then
-      out_ok=$((out_ok + 1))
+for f in "$EXAMPLES"/*fail*.py; do
+    [[ -e "$f" ]] || continue
+    base=$(basename "$f" .py)
+    neg_count=$((neg_count + 1))
+
+    build_exit=0
+    stderr_out=$(timeout 30 "$BIN" build "$f" 2>&1 >/dev/null)
+    build_exit=$?
+    rm -f "$base" "$base.rs"
+
+    if [[ $build_exit -eq 0 ]]; then
+        echo "LEAK [negative wrongly accepted by build]: $base"
+        neg_build_failures+=("$base")
+    elif [[ $build_exit -eq 101 ]]; then
+        echo "WARN [ICE/panic on negative build]: $base (counts as rejection)"
+        neg_ok=$((neg_ok + 1))
+    elif [[ $build_exit -eq 124 ]]; then
+        echo "WARN [timeout on negative build]: $base (counts as rejection)"
+        neg_ok=$((neg_ok + 1))
     else
-      echo "OUTPUT MISMATCH: $base"
+        neg_ok=$((neg_ok + 1))
     fi
-  else
-    echo "OUTPUT BUILD FAIL: $base"
-  fi
-  rm -f "$base" "$base.rs"
-}
-assert_output unicode_strings "$(printf 'café déjà vu\n日本語 世界\nrocket 🚀 star ✨\nf-string with naïve and 日本語\ncafé déjà vu — 日本語 世界\n15')"
-assert_output except_type_match "$(printf 'caught ValueError: bad value\ncaught KeyError: missing key\ndone')"
-assert_output except_as_binding "$(printf 'caught: something broke\nlength: 15\nrecovered')"
-assert_output except_hierarchy "$(printf 'caught LookupError (was KeyError): missing key\nnarrow KeyError caught first: missing key\ncaught ArithmeticError (was ZeroDivisionError): division by zero\ndone')"
-assert_output except_bound_len "$(printf '4')"
-assert_output except_multi_handler "$(printf 'value handler: v\nkey handler: k\nruntime handler: r\ndone')"
-assert_output except_finally_always "$(printf 'caught: boom\nfinally after catch\nno error\nfinally after success\ndone')"
-assert_output ternary "$(printf 'big\n100\nnegative\nzero\npositive\n5 is odd\neven\nodd\neven\nhi\n3')"
-assert_output block_scoping "$(printf 'A\nB\nC\n30\n16\n4.0')"
-assert_output collection_repr "$(printf "[1, 2, 3]\n['a', 'b', 'c']\n[True, False]\n[1.5, 2.0]\n[[1, 2], [3, 4]]\n[10, 20, 30]\n(1, 'x', True)\n{'apple', 'banana', 'cherry'}\n{'a': 1, 'b': 2}\ndata: [10, 20, 30]\n[7, 8, 9]\n['it\\\\'s', 'ok']\nset()\n[]")"
-assert_output bool_print "$(printf 'True\nFalse\nTrue\nFalse\nTrue\nTrue')"
-assert_output chained_predicate "$(printf 'True\nFalse\nTrue\n4')"
-assert_output set_methods "$(printf '4\n3\n2\n4\n1\n1\n3\nFalse\nTrue\nTrue\n3')"
-assert_output dict_update_items "$(printf '3\n6')"
-assert_output dict_views_repr "$(printf "['x']\n[10]\n[('x', 10)]\n{1, 2, 3}\n[5, 6, 7]")"
-assert_output file_io "$(printf '3\nalpha\nbeta\ngamma\n17')"
-assert_output inference_edges_ternary_and_nested "$(printf '2\n1\n5\n1\n4')"
-assert_output strings_fstring_formatting "$(printf "Price: \$19.99\nTotal: \$99.95\n      Item | 00042\nInput: [  Hello WORLD  ]\nCleaned: [hello world]\nCount of 'the': 3\nPosition of 'cat': 4\nrevenue: 1234.57 (87.3%%)\nReplaced: apple; banana; cherry\nParts count: 3\nFirst: apple")"
-assert_output wordfreq "$(printf '4\n2\n8\n4\nmany')"
-assert_output rpn "$(printf '7\n14\n6')"
-assert_output accounts "$(printf '150\n220\n150')"
-assert_output csv_parse "$(printf '2\nalice\n25\n55')"
-assert_output list_pop "$(printf '30\n2\n10\n1\n20')"
-assert_output list_pop_negative "$(printf '40\n3\n20\n2\n10\n30')"
-assert_output numeric_list "$(printf '[1.0, 2.0, 3.0]\n3\n6.0\n[1.5, 2.0, 4.0]\n7.5')"
-assert_output dict_homogeneous_three "$(printf '3\n1\n2\n3')"
-assert_output map_filter_demo "$(printf '[2, 4, 6, 8, 10]\n30\n[2, 4]\n2')"
-echo "OUTPUT ASSERTIONS: $out_ok / $out_count"
+done
+
+echo ""
+echo "NEGATIVES REJECTED (build): $neg_ok / $neg_count"
+
+# ── 3. NEGATIVE TYPECK-CHECK LOOP ────────────────────────────────────────────
+# Run `pyrst check` (parse+typeck only, no rustc) against every fail_* file.
+# These files must be rejected at the typeck level — not deferred to rustc.
+
+typeck_count=0
+typeck_ok=0
+typeck_failures=()
+
+for f in "$EXAMPLES"/*fail*.py; do
+    [[ -e "$f" ]] || continue
+    base=$(basename "$f" .py)
+    typeck_count=$((typeck_count + 1))
+
+    check_exit=0
+    timeout 10 "$BIN" check "$f" >/dev/null 2>&1
+    check_exit=$?
+
+    if [[ $check_exit -eq 0 ]]; then
+        echo "TYPECK LEAK [check accepted negative]: $base"
+        typeck_failures+=("$base")
+    elif [[ $check_exit -eq 101 ]]; then
+        echo "WARN [ICE/panic on check]: $base (counts as rejection)"
+        typeck_ok=$((typeck_ok + 1))
+    elif [[ $check_exit -eq 124 ]]; then
+        echo "WARN [timeout on check]: $base (counts as rejection)"
+        typeck_ok=$((typeck_ok + 1))
+    else
+        typeck_ok=$((typeck_ok + 1))
+    fi
+done
+
+echo ""
+echo "NEGATIVES REJECTED (typeck check): $typeck_ok / $typeck_count"
+
+# ── 4. MULTI-FILE DEMO ───────────────────────────────────────────────────────
+
+multi_ok=0
+multi_failures=()
+
+MULTI_EXPECTED="$(printf '100\n5\n1000')"
+
+stderr_out=$(timeout 30 "$BIN" build "$EXAMPLES/multi_file_demo/main.py" 2>&1 >/dev/null)
+multi_build_exit=$?
+if [[ $multi_build_exit -eq 0 ]]; then
+    multi_got=$(timeout 5 ./main 2>/dev/null)
+    multi_run_exit=$?
+    rm -f main main.rs
+    if [[ $multi_run_exit -eq 0 ]] && [[ "$multi_got" == "$MULTI_EXPECTED" ]]; then
+        multi_ok=1
+        echo ""
+        echo "MULTI_FILE_DEMO: PASS"
+    else
+        echo ""
+        echo "MULTI_FILE_DEMO: FAIL [stdout mismatch or run error]"
+        echo "  expected: $(printf '%s' "$MULTI_EXPECTED" | head -5)"
+        echo "  got:      $(printf '%s' "$multi_got" | head -5)"
+        multi_failures+=("multi_file_demo")
+    fi
+else
+    rm -f main main.rs
+    echo ""
+    echo "MULTI_FILE_DEMO: FAIL [build exit $multi_build_exit]"
+    multi_failures+=("multi_file_demo")
+fi
+
+# ── SUMMARY ──────────────────────────────────────────────────────────────────
+
+echo ""
+echo "══════════════════════════════════════════════"
+echo "POSITIVES:              $pos_passed / $pos_count"
+echo "NEGATIVES (build):      $neg_ok / $neg_count"
+echo "NEGATIVES (typeck):     $typeck_ok / $typeck_count"
+echo "MULTI_FILE_DEMO:        $multi_ok / 1"
+echo "══════════════════════════════════════════════"
+
+total_failures=$(( ${#pos_failures[@]} + ${#neg_build_failures[@]} + ${#typeck_failures[@]} + ${#multi_failures[@]} ))
+
+if [[ $total_failures -gt 0 ]]; then
+    echo ""
+    echo "FAILURES ($total_failures):"
+    for name in "${pos_failures[@]}"; do echo "  [positive] $name"; done
+    for name in "${neg_build_failures[@]}"; do echo "  [neg-build-leak] $name"; done
+    for name in "${typeck_failures[@]}"; do echo "  [typeck-leak] $name"; done
+    for name in "${multi_failures[@]}"; do echo "  [multi-file] $name"; done
+    echo ""
+    exit 1
+fi
+
+echo ""
+echo "ALL TESTS PASSED"
+exit 0

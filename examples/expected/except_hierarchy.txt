@@ -1,0 +1,4 @@
+caught LookupError (was KeyError): missing key
+narrow KeyError caught first: missing key
+caught ArithmeticError (was ZeroDivisionError): division by zero
+done

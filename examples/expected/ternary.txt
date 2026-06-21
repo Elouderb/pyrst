@@ -1,0 +1,11 @@
+big
+100
+negative
+zero
+positive
+5 is odd
+even
+odd
+even
+hi
+3

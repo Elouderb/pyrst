@@ -1,0 +1,49 @@
+=== Library Management ===
+6
+4
+4
+2
+2
+1
+=== Sorted Titles ===
+Advanced Python
+Cloud Computing
+Data Science
+Machine Learning
+Python Basics
+Web Development
+=== Book Inventory ===
+Python Basics
+John Smith
+2020
+Available
+Data Science
+Jane Doe
+2021
+Checked Out
+Web Development
+Bob Johnson
+2019
+Available
+Machine Learning
+Alice Brown
+2022
+Available
+Advanced Python
+Charlie Wilson
+2023
+Checked Out
+Cloud Computing
+Diana Lee
+2021
+Available
+2
+66.66666666666667
+Web Development
+2019
+Advanced Python
+2023
+12.0
+44
+6
+6

@@ -1,0 +1,18 @@
+=== Configuration Parser ===
+8
+8
+localhost
+8080
+True
+False
+30
+100
+postgres
+INFO
+True
+8
+8
+host=localhost port=8080 database=postgres
+False
+False
+True

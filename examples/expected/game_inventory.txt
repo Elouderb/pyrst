@@ -1,0 +1,46 @@
+=== Inventory Summary ===
+6
+2700
+2
+1
+1
+2
+250
+1800
+1000
+50
+3
+=== Sorted Items ===
+Amulet
+Potion
+Ring
+Scroll
+Shield
+Sword
+=== Item Details ===
+Sword
+rare
+500
+Shield
+common
+200
+Potion
+common
+50
+Ring
+epic
+1000
+Scroll
+uncommon
+150
+Amulet
+epic
+800
+False
+14
+20
+5
+3
+4
+525.0
+2

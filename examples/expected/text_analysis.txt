@@ -1,0 +1,48 @@
+=== Text Analysis ===
+4
+23
+6
+4
+5.0
+0
+2
+Hello world from Python
+23
+23
+6
+0
+20
+4
+23
+=== Text Analysis ===
+9
+43
+5
+3
+3.888888888888889
+0
+8
+The quick brown fox jumps over THE lazy dog
+43
+43
+-1
+0
+35
+9
+43
+=== Text Analysis ===
+3
+17
+7
+2
+5.0
+0
+0
+PyThOn Is AwEsOmE
+17
+17
+-1
+0
+15
+3
+17

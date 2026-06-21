@@ -1,0 +1,40 @@
+=== Book Library ===
+5
+2000.0
+500.0
+300.0
+400.0
+10103.0
+2022.0
+2019.0
+2020.6
+3
+2
+=== Details ===
+Python Basics
+Smith
+300.0
+2020.0
+Data Science
+Johnson
+450.0
+2021.0
+Web Dev
+Williams
+350.0
+2019.0
+AI Guide
+Brown
+500.0
+2022.0
+Cloud Systems
+Davis
+400.0
+2021.0
+=== Analysis ===
+1350.0
+650.0
+=== Summary ===
+2000.0
+3
+2

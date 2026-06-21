@@ -1342,7 +1342,16 @@ impl<'a> Codegen<'a> {
                         Some(t) => {
                             let ty_obj = Ty::from_type_expr(t)?;
                             self.locals.insert(target.clone(), ty_obj.clone());
-                            self.line(&format!("let mut {}: {} = {};", target, rust_ty(&ty_obj), v));
+                            // A float-annotated binding may receive an integer-typed
+                            // value (e.g. `x: float = 2 ** 3`, where `**` constant-folds
+                            // to an int and int**int otherwise emits i64). Cast to f64 so
+                            // the declared type matches the initializer (avoids E0308).
+                            let value_ty = self.type_of_expr(value);
+                            if matches!(ty_obj, Ty::Float) && matches!(value_ty, Ty::Int) {
+                                self.line(&format!("let mut {}: {} = {} as f64;", target, rust_ty(&ty_obj), v));
+                            } else {
+                                self.line(&format!("let mut {}: {} = {};", target, rust_ty(&ty_obj), v));
+                            }
                         }
                         None => {
                             // Infer type from the value expression, but prefer a
@@ -1386,16 +1395,33 @@ impl<'a> Codegen<'a> {
             }
             Stmt::AugAssign { target, op, value, .. } => {
                 let v = self.emit_expr(value)?;
+                let target_ty = self.locals.get(target.as_str()).cloned().unwrap_or(Ty::Unknown);
                 match op {
                     BinOp::FloorDiv => {
                         // Python's //= floors toward negative infinity; Rust's /= truncates toward zero
-                        // Use explicit float division + floor cast for correctness
-                        self.line(&format!("{} = ({} as f64 / {} as f64).floor() as i64;", target, target, v));
+                        // Use explicit float division + floor cast for correctness.
+                        // A float target keeps its f64 type; an int target floors back to i64.
+                        if matches!(target_ty, Ty::Float) {
+                            self.line(&format!("{} = ({} as f64 / {} as f64).floor();", target, target, v));
+                        } else {
+                            self.line(&format!("{} = ({} as f64 / {} as f64).floor() as i64;", target, target, v));
+                        }
+                    }
+                    BinOp::Mod => {
+                        // Python's %= takes the sign of the divisor; Rust's %= takes the
+                        // sign of the dividend. Mirror the BinOp lowering.
+                        if matches!(target_ty, Ty::Float) {
+                            self.line(&format!(
+                                "{{ let __b = ({} as f64); {} = ((({} as f64) % __b) + __b) % __b; }}",
+                                v, target, target
+                            ));
+                        } else {
+                            self.line(&format!("{} = __py_mod(({}), ({}));", target, target, v));
+                        }
                     }
                     _ => {
                         let op_s = match op {
                             BinOp::Add => "+=", BinOp::Sub => "-=", BinOp::Mul => "*=", BinOp::Div => "/=",
-                            BinOp::Mod => "%=",
                             _ => "+=", // fallback for other ops
                         };
                         self.line(&format!("{} {} {};", target, op_s, v));
@@ -3269,9 +3295,11 @@ impl<'a> Codegen<'a> {
                 match op {
                     BinOp::Pow => {
                         // int ** int -> integer power (matches type_of_expr inferring Int);
-                        // any float operand -> float power.
+                        // any float operand -> float power. Use the __py_ipow helper for
+                        // the integer case so a negative exponent panics with a clear
+                        // message instead of silently wrapping `as u32` to a huge value.
                         if matches!(lt, Ty::Int) && matches!(rt, Ty::Int) {
-                            return Ok(format!("(({}).pow({} as u32))", l, r));
+                            return Ok(format!("__py_ipow(({}), ({}))", l, r));
                         }
                         return Ok(format!("(({} as f64).powf({} as f64))", l, r));
                     }
@@ -3295,10 +3323,34 @@ impl<'a> Codegen<'a> {
                         };
                         return Ok(contains_method);
                     }
+                    BinOp::FloorDiv => {
+                        // Python `//` floors toward negative infinity; Rust integer `/`
+                        // truncates toward zero and Rust float `/` does not floor at all.
+                        // Compute the true floored quotient in f64. Result type follows
+                        // type_of_expr: int unless either operand is float.
+                        let is_float = matches!(lt, Ty::Float) || matches!(rt, Ty::Float);
+                        if is_float {
+                            return Ok(format!("((({} as f64) / ({} as f64)).floor())", l, r));
+                        }
+                        return Ok(format!("((({} as f64) / ({} as f64)).floor() as i64)", l, r));
+                    }
+                    BinOp::Mod => {
+                        // Python `%` returns a result with the sign of the divisor; Rust
+                        // `%` returns the sign of the dividend. Use the divisor-signed
+                        // helper for ints (single evaluation), rem_euclid-style for floats.
+                        let is_float = matches!(lt, Ty::Float) || matches!(rt, Ty::Float);
+                        if is_float {
+                            return Ok(format!(
+                                "{{ let __a = ({} as f64); let __b = ({} as f64); (((__a % __b) + __b) % __b) }}",
+                                l, r
+                            ));
+                        }
+                        return Ok(format!("__py_mod(({}), ({}))", l, r));
+                    }
                     _ => {
                         let op_s = match op {
                             BinOp::Add => "+", BinOp::Sub => "-", BinOp::Mul => "*",
-                            BinOp::Div => "/", BinOp::FloorDiv => "/", BinOp::Mod => "%",
+                            BinOp::Div => "/",
                             BinOp::Eq => "==", BinOp::Ne => "!=",
                             BinOp::Lt => "<", BinOp::Le => "<=",
                             BinOp::Gt => ">", BinOp::Ge => ">=",
@@ -3308,6 +3360,7 @@ impl<'a> Codegen<'a> {
                             BinOp::LShift => "<<", BinOp::RShift => ">>",
                             BinOp::In | BinOp::NotIn => unreachable!(), // handled above
                             BinOp::Pow => unreachable!(), // handled above
+                            BinOp::FloorDiv | BinOp::Mod => unreachable!(), // handled above
                         };
 
                         // Handle numeric type promotion: int op float -> convert to float
@@ -3460,8 +3513,21 @@ fn try_fold_const(expr: &Expr) -> Option<Expr> {
                         BinOp::Sub => Some(a - b),
                         BinOp::Mul => Some(a * b),
                         BinOp::Div => None, // Division always returns float, don't fold
-                        BinOp::FloorDiv if *b != 0 => Some(a / b),
-                        BinOp::Mod if *b != 0 => Some(a % b),
+                        // Python `//` floors toward negative infinity. Rust `/` truncates
+                        // toward zero, so adjust the quotient down by one when the
+                        // truncated remainder is non-zero and its sign differs from the
+                        // divisor's (do NOT use div_euclid — wrong for negative divisors).
+                        BinOp::FloorDiv if *b != 0 => {
+                            let q = a / b;
+                            let r = a % b;
+                            if r != 0 && ((r < 0) != (*b < 0)) { Some(q - 1) } else { Some(q) }
+                        }
+                        // Python `%` takes the sign of the divisor. Adjust Rust's
+                        // dividend-signed remainder into the divisor's sign.
+                        BinOp::Mod if *b != 0 => {
+                            let m = a % b;
+                            if m != 0 && ((m < 0) != (*b < 0)) { Some(m + b) } else { Some(m) }
+                        }
                         BinOp::Pow if *b >= 0 && *b < 64 => Some(a.pow(*b as u32)),
                         _ => None,
                     };
@@ -3638,6 +3704,19 @@ pub fn emit_program(modules: &[(Module, String)], ctx: &TyCtx) -> Result<String>
     cg.line("}");
     cg.line("fn __py_fmt_bool(x: bool) -> String {");
     cg.line("    if x { \"True\".to_string() } else { \"False\".to_string() }");
+    cg.line("}");
+    // Python integer modulo: the result takes the sign of the divisor (Rust's
+    // `%` takes the sign of the dividend). Single-evaluation helper.
+    cg.line("fn __py_mod(a: i64, b: i64) -> i64 {");
+    cg.line("    let m = a % b;");
+    cg.line("    if m != 0 && ((m < 0) != (b < 0)) { m + b } else { m }");
+    cg.line("}");
+    // Python integer exponentiation. A negative exponent yields a float in
+    // Python, which cannot be represented in an i64 result, so panic with a
+    // clear message rather than silently wrapping the `as u32` cast.
+    cg.line("fn __py_ipow(base: i64, exp: i64) -> i64 {");
+    cg.line("    if exp < 0 { panic!(\"negative exponent for integer ** integer\"); }");
+    cg.line("    base.pow(exp as u32)");
     cg.line("}");
     cg.line(REPR_PRELUDE);
     cg.line(FILE_PRELUDE);

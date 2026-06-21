@@ -38,8 +38,23 @@ impl Ty {
             }
             TypeExpr::Generic(n, args) => match (n.as_str(), args.as_slice()) {
                 ("list", [t]) => Ty::List(Box::new(Ty::from_type_expr(t)?)),
-                ("set", [t]) => Ty::Set(Box::new(Ty::from_type_expr(t)?)),
-                ("dict", [k, v]) => Ty::Dict(Box::new(Ty::from_type_expr(k)?), Box::new(Ty::from_type_expr(v)?)),
+                ("set", [t]) => {
+                    // A declared `set[float]` resolves to Set(Float), which
+                    // codegen would emit as the uncompilable `HashSet<f64>`.
+                    // Reject it at the resolver so vars, params, and returns are
+                    // covered uniformly — even when initialized with `set()`.
+                    let elem = Ty::from_type_expr(t)?;
+                    require_hashable(&elem, Span::DUMMY, "set element")?;
+                    Ty::Set(Box::new(elem))
+                }
+                ("dict", [k, v]) => {
+                    // A declared `dict[float, _]` resolves to Dict(Float, _) ->
+                    // uncompilable `HashMap<f64, _>`. Reject the KEY only; float
+                    // values are fine.
+                    let key = Ty::from_type_expr(k)?;
+                    require_hashable(&key, Span::DUMMY, "dict key")?;
+                    Ty::Dict(Box::new(key), Box::new(Ty::from_type_expr(v)?))
+                }
                 ("tuple", args) => Ty::Tuple(args.iter().map(Ty::from_type_expr).collect::<Result<Vec<_>>>()?),
                 ("Optional", [t]) => Ty::Option(Box::new(Ty::from_type_expr(t)?)),
                 ("Union", args) => {
@@ -662,6 +677,30 @@ fn unify_elem_types(a: Ty, b: Ty, widen_numeric: bool) -> Option<Ty> {
     }
 }
 
+/// Reject a `Float` type in a hashable position (set element, dict key).
+///
+/// `HashSet<f64>` / `HashMap<f64, _>` do not compile because `f64` is not
+/// `Eq`/`Hash`; codegen's `rust_ty` would emit exactly those forms. To keep
+/// typeck and codegen in agreement (the soundness rule), forbid a concretely
+/// `Float` element/key here — whether it arises from a literal, a comprehension,
+/// or a declared `set[float]` / `dict[float, _]` annotation.
+///
+/// Stays permissive on `Unknown` (e.g. `set()` / `{}` with no concrete inner):
+/// only a concrete `Ty::Float` is rejected, never `Unknown`.
+fn require_hashable(ty: &Ty, span: Span, position: &str) -> Result<()> {
+    if matches!(ty, Ty::Float) {
+        return Err(Error::Type {
+            span,
+            msg: format!(
+                "{} type must be hashable; float is not supported here \
+                 (f64 is not Eq/Hash, so HashSet<f64>/HashMap<f64, _> won't compile)",
+                position
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
     match s {
         Stmt::Pass(_) | Stmt::Break(_) | Stmt::Continue(_) => Ok(()),
@@ -984,6 +1023,66 @@ pub fn builtin_method_ret(recv: &Ty, method: &str) -> Ty {
     }
 }
 
+/// Resolve a lambda parameter's annotation to a `Ty`. Lambda params are
+/// untyped in the surface syntax; the parser records the placeholder
+/// `TypeExpr::Named("Any")`. That sentinel must resolve to `Ty::Unknown` (not
+/// the bogus `Ty::Class("Any")` the generic resolver would produce), so a
+/// param-dependent lambda body stays permissive instead of spuriously typing as
+/// a nonexistent class.
+fn lambda_param_ty(param_ty: &TypeExpr) -> Ty {
+    if let TypeExpr::Named(n) = param_ty {
+        if n == "Any" {
+            return Ty::Unknown;
+        }
+    }
+    Ty::from_type_expr(param_ty).unwrap_or(Ty::Unknown)
+}
+
+/// Infer the return type of a callable applied to a single element of type
+/// `elem`, for the `map`/`filter` special cases.
+///
+/// When `callable` is an inline `lambda` with at least one parameter, its first
+/// param is bound to `elem` (or `Unknown` when the iterable element type is
+/// unknown) in a temporary env, the body is type-checked, and its inferred type
+/// is returned as `Some(body_ty)`. For any other callable (a named function,
+/// `def`-bound variable, etc.) or a parameterless lambda, the expression is
+/// still type-checked for its own errors and `None` is returned so the caller
+/// stays permissive (yields `Ty::Unknown`). This never narrows
+/// `types_compatible`; it only widens positive inference.
+fn lambda_ret_with_elem(
+    callable: &Expr,
+    elem: Option<&Ty>,
+    env: &mut FuncEnv,
+) -> Result<Option<Ty>> {
+    if let Expr::Lambda { params, body, .. } = callable {
+        if !params.is_empty() {
+            let mut lambda_env = FuncEnv {
+                ctx: env.ctx,
+                locals: env.locals.clone(),
+                ret_ty: Ty::Unknown,
+                used_vars: env.used_vars.clone(),
+            };
+            // Bind every param: the first to the iterable element type, the
+            // rest to their declared type or Unknown (map/filter pass a single
+            // element, so only the first param is meaningfully constrained).
+            for (i, (param_name, param_ty)) in params.iter().enumerate() {
+                let ty = if i == 0 {
+                    elem.cloned().unwrap_or(Ty::Unknown)
+                } else {
+                    lambda_param_ty(param_ty)
+                };
+                lambda_env.locals.insert(param_name.clone(), ty);
+            }
+            let body_ty = check_expr(body, &mut lambda_env)?;
+            return Ok(Some(body_ty));
+        }
+    }
+    // Non-lambda callable (or zero-param lambda): still check it for its own
+    // errors, but we cannot infer an applied return type here.
+    check_expr(callable, env)?;
+    Ok(None)
+}
+
 fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
     Ok(match e {
         Expr::Int(_, _) => Ty::Int,
@@ -1029,7 +1128,7 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
             let elt_ty = check_expr(elt, &mut inner_env)?;
             Ty::List(Box::new(elt_ty))
         }
-        Expr::SetComp { elt, target, iter, cond, .. } => {
+        Expr::SetComp { elt, target, iter, cond, span } => {
             let iter_ty = check_expr(iter, env)?;
             let elem_ty = match &iter_ty {
                 Ty::List(inner) => *inner.clone(),
@@ -1046,9 +1145,12 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
             inner_env.locals.insert(target.clone(), elem_ty);
             if let Some(c) = cond { check_expr(c, &mut inner_env)?; }
             let elt_ty = check_expr(elt, &mut inner_env)?;
+            // Same hashability rule as set literals: a Float element produces
+            // the uncompilable `HashSet<f64>`, so reject it here too.
+            require_hashable(&elt_ty, *span, "set element")?;
             Ty::Set(Box::new(elt_ty))
         }
-        Expr::DictComp { key, val, target, iter, cond, .. } => {
+        Expr::DictComp { key, val, target, iter, cond, span } => {
             let iter_ty = check_expr(iter, env)?;
             let elem_ty = match &iter_ty {
                 Ty::List(inner) => *inner.clone(),
@@ -1066,6 +1168,9 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
             if let Some(c) = cond { check_expr(c, &mut inner_env)?; }
             let key_ty = check_expr(key, &mut inner_env)?;
             let val_ty = check_expr(val, &mut inner_env)?;
+            // Same hashability rule as dict literals: a Float KEY produces the
+            // uncompilable `HashMap<f64, _>`. Values may be Float.
+            require_hashable(&key_ty, *span, "dict key")?;
             Ty::Dict(Box::new(key_ty), Box::new(val_ty))
         }
         Expr::None_(_) => Ty::Unit,
@@ -1116,6 +1221,12 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 }
                 acc
             };
+            // A pure-float set literal (`{1.0, 2.0}`) folds to Set(Float), which
+            // codegen would emit as the uncompilable `HashSet<f64>`. Reject it
+            // here so typeck and codegen agree. (`{1, 2.0}` is already rejected
+            // by the widen_numeric=false fold above; this closes the all-float
+            // case.) Unknown element types (`set()`) stay permissive.
+            require_hashable(&elem_ty, *span, "set element")?;
             Ty::Set(Box::new(elem_ty))
         }
         Expr::Dict(pairs, span) => {
@@ -1150,6 +1261,11 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                         ),
                     })?;
                 }
+                // A float-keyed dict literal (`{1.0: "a"}`) folds to Dict(Float, _),
+                // which codegen would emit as the uncompilable `HashMap<f64, _>`.
+                // Reject the KEY only — float VALUES are fine (`HashMap<_, f64>`
+                // compiles), so v_ty is left untouched.
+                require_hashable(&k_ty, *span, "dict key")?;
                 Ty::Dict(Box::new(k_ty), Box::new(v_ty))
             }
         }
@@ -1201,6 +1317,91 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                         }
                         match arg_ty {
                             Ty::List(elem) | Ty::Set(elem) => *elem,
+                            _ => Ty::Unknown,
+                        }
+                    } else if name == "enumerate" && !args.is_empty() {
+                        // enumerate(iterable[, start]) -> List(Tuple(Int, elem))
+                        // Check all args/kwargs for their own errors first.
+                        let arg0_ty = check_expr(&args[0], env)?;
+                        for a in &args[1..] {
+                            check_expr(a, env)?;
+                        }
+                        for (_, v) in kwargs {
+                            check_expr(v, env)?;
+                        }
+                        let elem = match arg0_ty {
+                            Ty::List(inner) | Ty::Set(inner) => *inner,
+                            Ty::Str => Ty::Str,
+                            _ => Ty::Unknown,
+                        };
+                        if matches!(elem, Ty::Unknown) {
+                            Ty::Unknown
+                        } else {
+                            Ty::List(Box::new(Ty::Tuple(vec![Ty::Int, elem])))
+                        }
+                    } else if name == "zip" {
+                        // zip(a, b, ...) -> List(Tuple(elem_a, elem_b, ...))
+                        // Check all args/kwargs for their own errors first.
+                        let mut elem_tys: Vec<Ty> = Vec::new();
+                        let mut any_unknown = false;
+                        for a in args {
+                            let ty = check_expr(a, env)?;
+                            match ty {
+                                Ty::List(inner) | Ty::Set(inner) => elem_tys.push(*inner),
+                                Ty::Str => elem_tys.push(Ty::Str),
+                                _ => any_unknown = true,
+                            }
+                        }
+                        for (_, v) in kwargs {
+                            check_expr(v, env)?;
+                        }
+                        if any_unknown || elem_tys.is_empty() {
+                            Ty::Unknown
+                        } else {
+                            Ty::List(Box::new(Ty::Tuple(elem_tys)))
+                        }
+                    } else if name == "map" && args.len() == 2 {
+                        // map(f, iterable) -> List(return type of f applied to the
+                        // iterable's element type). Only a List iterable yields a
+                        // concrete result: codegen's `.iter().cloned().map(..)`
+                        // compiles for a Vec, but a String has no `.iter()` and
+                        // map-over-set is unverified, so Set/Str/unknown stay
+                        // permissive (Unknown), matching the filter arm below. The
+                        // lambda body is still checked for its own errors, and we
+                        // never narrow types_compatible.
+                        let iter_ty = check_expr(&args[1], env)?;
+                        let elem = match &iter_ty {
+                            Ty::List(inner) => Some((**inner).clone()),
+                            _ => None,
+                        };
+                        for (_, v) in kwargs {
+                            check_expr(v, env)?;
+                        }
+                        let body_ty = lambda_ret_with_elem(&args[0], elem.as_ref(), env)?;
+                        match (&iter_ty, body_ty) {
+                            (Ty::List(_), Some(t)) if !matches!(t, Ty::Unknown) => {
+                                Ty::List(Box::new(t))
+                            }
+                            _ => Ty::Unknown,
+                        }
+                    } else if name == "filter" && args.len() == 2 {
+                        // filter(pred, iterable) -> the iterable's list type
+                        // unchanged (filter preserves elements). The predicate body
+                        // is still checked (binding its first param to the element
+                        // type) so a malformed predicate is caught; its return type
+                        // is irrelevant to the result element type.
+                        let iter_ty = check_expr(&args[1], env)?;
+                        let elem = match &iter_ty {
+                            Ty::List(inner) | Ty::Set(inner) => Some((**inner).clone()),
+                            Ty::Str => Some(Ty::Str),
+                            _ => None,
+                        };
+                        for (_, v) in kwargs {
+                            check_expr(v, env)?;
+                        }
+                        let _ = lambda_ret_with_elem(&args[0], elem.as_ref(), env)?;
+                        match iter_ty {
+                            Ty::List(_) => iter_ty,
                             _ => Ty::Unknown,
                         }
                     } else if let Some(sig) = env.ctx.funcs.get(name.as_str()) {
@@ -1316,9 +1517,20 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                             return Ok(builtin_method_ret(&obj_ty, name.as_str()));
                         }
                     }
-                    check_expr(callee, env)?;
+                    // Inline lambda call `(lambda x: body)(args)`: the call's
+                    // value type is the lambda body type. The Lambda arm now
+                    // returns that body type (instead of Unknown), so for an
+                    // immediately-invoked lambda we surface it to the caller
+                    // rather than degrading to Unknown. Other callees (e.g. a
+                    // variable holding a value) remain Unknown — this only widens
+                    // inference and never narrows types_compatible.
+                    let callee_ty = check_expr(callee, env)?;
                     for a in args { check_expr(a, env)?; }
-                    Ty::Unknown
+                    if matches!(callee.as_ref(), Expr::Lambda { .. }) {
+                        callee_ty
+                    } else {
+                        Ty::Unknown
+                    }
                 }
             }
         }
@@ -1429,11 +1641,15 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 used_vars: env.used_vars.clone(),
             };
             for (param_name, param_ty) in params {
-                let ty = Ty::from_type_expr(param_ty).unwrap_or(Ty::Unknown);
+                let ty = lambda_param_ty(param_ty);
                 lambda_env.locals.insert(param_name.clone(), ty);
             }
-            check_expr(body, &mut lambda_env)?;
-            Ty::Unknown
+            // The lambda's value type is its body type. For an inline call
+            // `(lambda x: x + 1)(5)` this lets the caller see a concrete type
+            // instead of Unknown. Lambda params are untyped here (no annotation
+            // syntax), so a param-dependent body still yields Unknown — which is
+            // sound and never narrows types_compatible.
+            check_expr(body, &mut lambda_env)?
         }
     })
 }
@@ -1984,6 +2200,106 @@ mod tests {
     }
 
     #[test]
+    fn error_pure_float_set_rejected() {
+        // A pure-float set literal `{1.0, 2.0}` folds to Set(Float), which
+        // codegen would emit as the uncompilable `HashSet<f64>` (f64 is not
+        // Eq/Hash). Reject it at typeck so typeck and codegen agree (card
+        // 3c0243de). Distinct from the int/float mix above: every element is
+        // Float, so the fold succeeds but the resulting element type is not
+        // hashable.
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        let e = Expr::Set(vec![float_lit(1.0), float_lit(2.0)], Span::DUMMY);
+        let err = check_expr(&e, &mut env).unwrap_err();
+        match err {
+            Error::Type { msg, .. } => assert!(
+                msg.contains("hashable"),
+                "expected hashability message, got: {msg}"
+            ),
+            other => panic!("expected Error::Type, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_float_keyed_dict_rejected() {
+        // `{1.0: "a"}` folds to Dict(Float, _) -> uncompilable `HashMap<f64, _>`.
+        // Reject the float KEY at typeck (card 3c0243de).
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        let e = Expr::Dict(vec![(float_lit(1.0), str_lit("a"))], Span::DUMMY);
+        let err = check_expr(&e, &mut env).unwrap_err();
+        match err {
+            Error::Type { msg, .. } => assert!(
+                msg.contains("hashable"),
+                "expected hashability message, got: {msg}"
+            ),
+            other => panic!("expected Error::Type, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ok_float_valued_dict_accepted() {
+        // A float VALUE is fine: `{"a": 1.0}` -> Dict(Str, Float) ->
+        // `HashMap<String, f64>` compiles. Only float KEYS are rejected.
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        let e = Expr::Dict(vec![(str_lit("a"), float_lit(1.0))], Span::DUMMY);
+        assert_eq!(
+            check_expr(&e, &mut env).unwrap(),
+            Ty::Dict(Box::new(Ty::Str), Box::new(Ty::Float))
+        );
+    }
+
+    #[test]
+    fn error_declared_set_float_rejected() {
+        // A declared `set[float]` annotation resolves to Set(Float), rejected at
+        // the TypeExpr->Ty resolver so vars, params, and returns are covered
+        // uniformly — even with an empty/`set()` initializer (card 3c0243de).
+        let t = TypeExpr::Generic(
+            "set".to_string(),
+            vec![TypeExpr::Named("float".to_string())],
+        );
+        let err = Ty::from_type_expr(&t).unwrap_err();
+        match err {
+            Error::Type { msg, .. } => assert!(
+                msg.contains("hashable"),
+                "expected hashability message, got: {msg}"
+            ),
+            other => panic!("expected Error::Type, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_declared_dict_float_key_rejected() {
+        // A declared `dict[float, str]` resolves to Dict(Float, Str), rejected
+        // for the float KEY (card 3c0243de).
+        let t = TypeExpr::Generic(
+            "dict".to_string(),
+            vec![
+                TypeExpr::Named("float".to_string()),
+                TypeExpr::Named("str".to_string()),
+            ],
+        );
+        assert!(matches!(Ty::from_type_expr(&t), Err(Error::Type { .. })));
+    }
+
+    #[test]
+    fn ok_declared_dict_float_value_accepted() {
+        // `dict[str, float]` -> Dict(Str, Float) is fine (float VALUE).
+        let t = TypeExpr::Generic(
+            "dict".to_string(),
+            vec![
+                TypeExpr::Named("str".to_string()),
+                TypeExpr::Named("float".to_string()),
+            ],
+        );
+        assert_eq!(
+            Ty::from_type_expr(&t).unwrap(),
+            Ty::Dict(Box::new(Ty::Str), Box::new(Ty::Float))
+        );
+    }
+
+    #[test]
     fn infer_empty_dict_is_unknown_unknown() {
         let ctx = TyCtx::new();
         let mut env = make_env(&ctx);
@@ -2489,5 +2805,303 @@ mod tests {
         let mut env = make_env(&ctx);
         let r = check_expr(&call_fn("takes_float", vec![int_lit(3)]), &mut env);
         assert!(r.is_ok(), "Int→Float coercion should be allowed, got {:?}", r);
+    }
+
+    // =========================================================================
+    // Category C — enumerate/zip inference (card 7ccffd5a)
+    // =========================================================================
+
+    #[test]
+    fn infer_enumerate_list_str() {
+        // enumerate(xs: list[str]) -> List(Tuple(Int, Str))
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        env.locals.insert("xs".into(), Ty::List(Box::new(Ty::Str)));
+        let call = call_fn("enumerate", vec![ident("xs")]);
+        let ty = check_expr(&call, &mut env).unwrap();
+        assert_eq!(
+            ty,
+            Ty::List(Box::new(Ty::Tuple(vec![Ty::Int, Ty::Str])))
+        );
+    }
+
+    #[test]
+    fn infer_enumerate_list_int() {
+        // enumerate(ys: list[int]) -> List(Tuple(Int, Int))
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        env.locals.insert("ys".into(), Ty::List(Box::new(Ty::Int)));
+        let call = call_fn("enumerate", vec![ident("ys")]);
+        let ty = check_expr(&call, &mut env).unwrap();
+        assert_eq!(
+            ty,
+            Ty::List(Box::new(Ty::Tuple(vec![Ty::Int, Ty::Int])))
+        );
+    }
+
+    #[test]
+    fn infer_enumerate_str_iterable() {
+        // enumerate("hello") -> List(Tuple(Int, Str))
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        let call = call_fn("enumerate", vec![str_lit("hello")]);
+        let ty = check_expr(&call, &mut env).unwrap();
+        assert_eq!(
+            ty,
+            Ty::List(Box::new(Ty::Tuple(vec![Ty::Int, Ty::Str])))
+        );
+    }
+
+    #[test]
+    fn infer_enumerate_unknown_arg_stays_unknown() {
+        // enumerate(42) — non-iterable arg → Unknown (stay permissive).
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        let call = call_fn("enumerate", vec![int_lit(42)]);
+        let ty = check_expr(&call, &mut env).unwrap();
+        assert_eq!(ty, Ty::Unknown);
+    }
+
+    #[test]
+    fn infer_zip_two_lists() {
+        // zip(xs: list[str], ys: list[int]) -> List(Tuple(Str, Int))
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        env.locals.insert("xs".into(), Ty::List(Box::new(Ty::Str)));
+        env.locals.insert("ys".into(), Ty::List(Box::new(Ty::Int)));
+        let call = call_fn("zip", vec![ident("xs"), ident("ys")]);
+        let ty = check_expr(&call, &mut env).unwrap();
+        assert_eq!(
+            ty,
+            Ty::List(Box::new(Ty::Tuple(vec![Ty::Str, Ty::Int])))
+        );
+    }
+
+    #[test]
+    fn infer_zip_unknown_arg_stays_unknown() {
+        // zip(xs: list[str], 42) — non-iterable arg → Unknown.
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        env.locals.insert("xs".into(), Ty::List(Box::new(Ty::Str)));
+        let call = call_fn("zip", vec![ident("xs"), int_lit(42)]);
+        let ty = check_expr(&call, &mut env).unwrap();
+        assert_eq!(ty, Ty::Unknown);
+    }
+
+    #[test]
+    fn infer_for_enumerate_binds_int_and_elem() {
+        // for i, x in enumerate(xs: list[str]): → i: Int, x: Str
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        env.locals.insert("xs".into(), Ty::List(Box::new(Ty::Str)));
+        let iter = call_fn("enumerate", vec![ident("xs")]);
+        let stmt = Stmt::For {
+            targets: vec!["i".into(), "x".into()],
+            iter,
+            body: vec![],
+            span: Span::DUMMY,
+        };
+        check_stmt(&stmt, &mut env).unwrap();
+        assert_eq!(env.locals.get("i").cloned(), Some(Ty::Int));
+        assert_eq!(env.locals.get("x").cloned(), Some(Ty::Str));
+    }
+
+    // =========================================================================
+    // Category C2 — lambda / map / filter return-type inference (card 21424502)
+    // =========================================================================
+
+    /// Single-param lambda `lambda <param>: <body>` (param is untyped, as the
+    /// parser emits — `TypeExpr::Named("Any")`).
+    fn lambda1(param: &str, body: Expr) -> Expr {
+        Expr::Lambda {
+            params: vec![(param.to_string(), TypeExpr::Named("Any".into()))],
+            body: Box::new(body),
+            span: Span::DUMMY,
+        }
+    }
+
+    /// `lhs <op> rhs` binary op.
+    fn binop(op: BinOp, lhs: Expr, rhs: Expr) -> Expr {
+        Expr::BinOp { op, lhs: Box::new(lhs), rhs: Box::new(rhs), span: Span::DUMMY }
+    }
+
+    #[test]
+    fn infer_lambda_body_return_type_identity() {
+        // (lambda x: x)(5) — the Lambda arm now returns the body type; with x
+        // bound to the call arg's path it would be Int. Here we check the inline
+        // call: the param is untyped (Unknown) so an identity lambda yields the
+        // body's resolved type, which for a bare untyped param is Unknown — but
+        // a literal body resolves concretely.
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        // (lambda x: 5)(99) — body is a literal Int, independent of the param.
+        let lam = lambda1("x", int_lit(5));
+        let call = Expr::Call {
+            callee: Box::new(lam),
+            args: vec![int_lit(99)],
+            kwargs: vec![],
+            span: Span::DUMMY,
+        };
+        let ty = check_expr(&call, &mut env).unwrap();
+        assert_eq!(ty, Ty::Int);
+    }
+
+    #[test]
+    fn infer_lambda_body_str_literal() {
+        // (lambda x: "hi")(0) -> Str (body type propagates instead of Unknown).
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        let lam = lambda1("x", str_lit("hi"));
+        let call = Expr::Call {
+            callee: Box::new(lam),
+            args: vec![int_lit(0)],
+            kwargs: vec![],
+            span: Span::DUMMY,
+        };
+        let ty = check_expr(&call, &mut env).unwrap();
+        assert_eq!(ty, Ty::Str);
+    }
+
+    #[test]
+    fn infer_map_over_list_int_returns_list_int() {
+        // map(lambda x: x + 1, xs: list[int]) -> List(Int)
+        // The element type Int is bound to the lambda param, so `x + 1` resolves
+        // to Int and the result is List(Int).
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        env.locals.insert("xs".into(), Ty::List(Box::new(Ty::Int)));
+        let lam = lambda1("x", binop(BinOp::Add, ident("x"), int_lit(1)));
+        let call = call_fn("map", vec![lam, ident("xs")]);
+        let ty = check_expr(&call, &mut env).unwrap();
+        assert_eq!(ty, Ty::List(Box::new(Ty::Int)));
+    }
+
+    #[test]
+    fn infer_map_over_str_is_unknown() {
+        // map over a non-list iterable (here a str) stays Unknown: codegen can't
+        // compile `.iter()` over a String, so typeck must not assert a concrete
+        // List type. Scoped to List iterables only, matching the filter arm.
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        let lam = lambda1("c", ident("c"));
+        let call = call_fn("map", vec![lam, str_lit("hello")]);
+        let ty = check_expr(&call, &mut env).unwrap();
+        assert_eq!(ty, Ty::Unknown);
+    }
+
+    #[test]
+    fn infer_map_str_body_returns_list_str() {
+        // map(lambda x: str(x), xs: list[int]) -> List(Str) — the body type
+        // (str()'s return) drives the result element type, not the input.
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        env.locals.insert("xs".into(), Ty::List(Box::new(Ty::Int)));
+        let lam = lambda1("x", call_fn("str", vec![ident("x")]));
+        let call = call_fn("map", vec![lam, ident("xs")]);
+        let ty = check_expr(&call, &mut env).unwrap();
+        assert_eq!(ty, Ty::List(Box::new(Ty::Str)));
+    }
+
+    #[test]
+    fn infer_filter_over_list_int_returns_list_int() {
+        // filter(lambda x: x % 2 == 0, xs: list[int]) -> List(Int)
+        // filter preserves the element type regardless of the predicate body.
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        env.locals.insert("xs".into(), Ty::List(Box::new(Ty::Int)));
+        let pred = lambda1(
+            "x",
+            binop(BinOp::Eq, binop(BinOp::Mod, ident("x"), int_lit(2)), int_lit(0)),
+        );
+        let call = call_fn("filter", vec![pred, ident("xs")]);
+        let ty = check_expr(&call, &mut env).unwrap();
+        assert_eq!(ty, Ty::List(Box::new(Ty::Int)));
+    }
+
+    #[test]
+    fn infer_filter_over_list_str_returns_list_str() {
+        // filter(pred, xs: list[str]) -> List(Str) (element type preserved).
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        env.locals.insert("xs".into(), Ty::List(Box::new(Ty::Str)));
+        let pred = lambda1("x", bool_lit(true));
+        let call = call_fn("filter", vec![pred, ident("xs")]);
+        let ty = check_expr(&call, &mut env).unwrap();
+        assert_eq!(ty, Ty::List(Box::new(Ty::Str)));
+    }
+
+    #[test]
+    fn infer_map_unknown_iterable_stays_unknown() {
+        // map(lambda x: x + 1, 42) — non-list iterable → Unknown (permissive),
+        // never narrowing types_compatible.
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        let lam = lambda1("x", binop(BinOp::Add, ident("x"), int_lit(1)));
+        let call = call_fn("map", vec![lam, int_lit(42)]);
+        let ty = check_expr(&call, &mut env).unwrap();
+        assert_eq!(ty, Ty::Unknown);
+    }
+
+    #[test]
+    fn infer_filter_unknown_iterable_stays_unknown() {
+        // filter(pred, 42) — non-list iterable → Unknown.
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        let pred = lambda1("x", bool_lit(true));
+        let call = call_fn("filter", vec![pred, int_lit(42)]);
+        let ty = check_expr(&call, &mut env).unwrap();
+        assert_eq!(ty, Ty::Unknown);
+    }
+
+    #[test]
+    fn error_map_wrong_declared_type() {
+        // result: list[int] = map(lambda x: str(x), xs: list[int])
+        // map yields List(Str); the list[int] annotation must be rejected.
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        env.locals.insert("xs".into(), Ty::List(Box::new(Ty::Int)));
+        let lam = lambda1("x", call_fn("str", vec![ident("x")]));
+        let call = call_fn("map", vec![lam, ident("xs")]);
+        let stmt = Stmt::Assign {
+            target: "result".into(),
+            ty: Some(TypeExpr::Generic("list".into(), vec![TypeExpr::Named("int".into())])),
+            value: call,
+            span: Span::DUMMY,
+        };
+        assert_stmt_type_err(check_stmt(&stmt, &mut env), "type mismatch");
+    }
+
+    // =========================================================================
+    // Category D — enumerate/zip error cases (card 7ccffd5a)
+    // =========================================================================
+
+    #[test]
+    fn error_enumerate_index_passed_as_str() {
+        // fn takes_str(s: str) -> None; for i, x in enumerate(xs: list[str]): takes_str(i)
+        // i is Int; passing it to takes_str should be a type error.
+        let mut ctx = TyCtx::new();
+        ctx.funcs.insert("takes_str".into(), FuncSig {
+            params: vec![("s".into(), Ty::Str)],
+            param_defaults: vec![None],
+            ret: Ty::Unit,
+        });
+        let mut env = make_env(&ctx);
+        env.locals.insert("xs".into(), Ty::List(Box::new(Ty::Str)));
+
+        // First bind i:Int, x:Str via the for loop.
+        let iter = call_fn("enumerate", vec![ident("xs")]);
+        let for_stmt = Stmt::For {
+            targets: vec!["i".into(), "x".into()],
+            iter,
+            body: vec![],
+            span: Span::DUMMY,
+        };
+        check_stmt(&for_stmt, &mut env).unwrap();
+        assert_eq!(env.locals.get("i").cloned(), Some(Ty::Int));
+
+        // Now call takes_str(i) — i is Int, param expects Str → error.
+        let call = call_fn("takes_str", vec![ident("i")]);
+        let r = check_expr(&call, &mut env);
+        assert_type_err(r, "expected");
     }
 }

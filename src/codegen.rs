@@ -152,6 +152,60 @@ impl<'a> Codegen<'a> {
         result
     }
 
+    /// Type of a callable applied to a single element of type `elem`, for the
+    /// `map`/`filter` branches of `type_of_expr`. When `callable` is an inline
+    /// lambda, its first param is bound to `elem` and the body is typed (mirrors
+    /// typeck's `lambda_ret_with_elem`). For any other callable, returns
+    /// `Ty::Unknown` so the caller stays permissive. This is inference-only and
+    /// never narrows compatibility.
+    fn lambda_applied_ty(&self, callable: &Expr, elem: &Ty) -> Ty {
+        if let Expr::Lambda { params, body, .. } = callable {
+            if let Some((param, _)) = params.first() {
+                return self.type_of_expr_bound(body, param, elem);
+            }
+        }
+        Ty::Unknown
+    }
+
+    /// Like `type_of_expr`, but the single identifier `param` resolves to `elem`
+    /// (the bound lambda parameter). Recurses through the compound forms that
+    /// appear in map/filter lambda bodies; for everything else it delegates to
+    /// `type_of_expr` (where `param` is unknown). Inference-only.
+    fn type_of_expr_bound(&self, e: &Expr, param: &str, elem: &Ty) -> Ty {
+        match e {
+            Expr::Ident(n, _) if n == param => elem.clone(),
+            Expr::UnOp { op: UnOp::Neg, expr, .. } => self.type_of_expr_bound(expr, param, elem),
+            Expr::IfExp { body, orelse, .. } => {
+                let b = self.type_of_expr_bound(body, param, elem);
+                if b == Ty::Unknown { self.type_of_expr_bound(orelse, param, elem) } else { b }
+            }
+            Expr::BinOp { lhs, op, rhs, .. } => {
+                let l = self.type_of_expr_bound(lhs, param, elem);
+                let r = self.type_of_expr_bound(rhs, param, elem);
+                match op {
+                    BinOp::Div => Ty::Float,
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Mod | BinOp::FloorDiv | BinOp::Pow => {
+                        if *op == BinOp::Add && (l == Ty::Str || r == Ty::Str) {
+                            Ty::Str
+                        } else if l == Ty::Float || r == Ty::Float {
+                            Ty::Float
+                        } else if l == Ty::Int || r == Ty::Int {
+                            Ty::Int
+                        } else {
+                            Ty::Unknown
+                        }
+                    }
+                    BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+                    | BinOp::And | BinOp::Or | BinOp::Is | BinOp::IsNot | BinOp::In | BinOp::NotIn => Ty::Bool,
+                    _ => Ty::Unknown,
+                }
+            }
+            // Other forms (calls like str(x)/len(x), literals, attrs) do not
+            // depend on `param` for their result type, so delegate.
+            _ => self.type_of_expr(e),
+        }
+    }
+
     fn type_of_expr(&self, e: &Expr) -> Ty {
         match e {
             Expr::Float(..) => Ty::Float,
@@ -239,6 +293,27 @@ impl<'a> Codegen<'a> {
                         "int" | "len" | "ord" | "round" | "pow" => Ty::Int,
                         "bool" | "any" | "all" => Ty::Bool,
                         "str" | "chr" | "input" => Ty::Str,
+                        "map" if args.len() == 2 => {
+                            // map(f, iterable) -> List(applied return type of f).
+                            // Mirror typeck: only a List iterable yields a concrete
+                            // List result; Set/Str/unknown stay Unknown (permissive).
+                            match self.type_of_expr(&args[1]) {
+                                Ty::List(e) => {
+                                    let body_ty = self.lambda_applied_ty(&args[0], &e);
+                                    Ty::List(Box::new(body_ty))
+                                }
+                                _ => Ty::Unknown,
+                            }
+                        }
+                        "filter" if args.len() == 2 => {
+                            // filter(pred, iterable) -> the iterable's list type
+                            // unchanged. Mirror typeck: only List yields a concrete
+                            // type; Set/Str/unknown stay Unknown (permissive).
+                            match self.type_of_expr(&args[1]) {
+                                Ty::List(e) => Ty::List(e),
+                                _ => Ty::Unknown,
+                            }
+                        }
                         "sorted" | "list" | "reversed" => {
                             // These return a list; preserve the element type.
                             if let Some(arg) = args.first() {
@@ -3272,10 +3347,15 @@ impl<'a> Codegen<'a> {
                 }
             }
             Expr::Lambda { params, body, .. } => {
-                let param_strs: Vec<String> = params.iter().map(|(name, _ty)| {
-                    // For now, default to i64 for all lambda parameters since we don't have full type info
-                    format!("{}: i64", name)
-                }).collect();
+                // Emit closure params WITHOUT a type annotation and let Rust infer
+                // each param's type from the use site: the call-site argument for
+                // an inline-invoked lambda `(lambda x: ...)(5)`, or the iterator
+                // element type for a lambda passed to map()/filter(). Hardcoding
+                // `: i64` was only correct for int iterables and broke e.g.
+                // `map(lambda w: len(w), words)` over a list[str].
+                let param_strs: Vec<String> = params.iter()
+                    .map(|(name, _ty)| name.clone())
+                    .collect();
                 let body_s = self.emit_expr(body)?;
                 format!("|{}| {}", param_strs.join(", "), body_s)
             }

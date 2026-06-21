@@ -405,17 +405,29 @@ struct FuncEnv<'a> {
     locals: HashMap<String, Ty>,
     ret_ty: Ty,
     used_vars: std::collections::HashSet<String>,  // Track variable usage for dead code detection
+    /// Names that were original function/method parameters (never changes after construction).
+    params: std::collections::HashSet<String>,
+    /// Subset of `params` that have been unconditionally reassigned via `Stmt::Assign`.
+    /// A param in this set is no longer the original by-value binding.
+    reassigned_params: std::collections::HashSet<String>,
+    /// Subset of `params` whose name appears (as an Ident) in at least one `return` expression
+    /// anywhere in the function body. Mutating and returning a by-value param is the valid
+    /// functional pattern — the callee works on its own copy and returns the result; the caller
+    /// captures the new value. We suppress the by-value-param-mutation error for these params.
+    returned_params: std::collections::HashSet<String>,
 }
 
 impl<'a> FuncEnv<'a> {
     fn new(ctx: &'a TyCtx, params: &[(String, Ty)], ret_ty: Ty) -> Self {
         let mut locals = HashMap::new();
         let mut used_vars = std::collections::HashSet::new();
+        let mut param_set = std::collections::HashSet::new();
         for (name, ty) in params {
             locals.insert(name.clone(), ty.clone());
             used_vars.insert(name.clone());  // Parameters are always considered "used"
+            param_set.insert(name.clone());
         }
-        FuncEnv { ctx, locals, ret_ty, used_vars }
+        FuncEnv { ctx, locals, ret_ty, used_vars, params: param_set, reassigned_params: std::collections::HashSet::new(), returned_params: std::collections::HashSet::new() }
     }
 
     fn lookup(&self, name: &str) -> Option<Ty> {
@@ -445,6 +457,7 @@ pub fn check_bodies(m: &Module, ctx: &TyCtx) -> Result<()> {
                     .collect();
                 let ret = Ty::from_type_expr(&f.ret)?;
                 let mut env = FuncEnv::new(ctx, &params, ret);
+                collect_returned_param_idents(&f.body, &env.params, &mut env.returned_params);
                 check_body(&f.body, &mut env)?;
             }
             Stmt::Class(c) => {
@@ -456,6 +469,7 @@ pub fn check_bodies(m: &Module, ctx: &TyCtx) -> Result<()> {
                     params.insert(0, ("self".into(), Ty::Class(c.name.clone())));
                     let ret = Ty::from_type_expr(&method.ret)?;
                     let mut env = FuncEnv::new(ctx, &params, ret);
+                    collect_returned_param_idents(&method.body, &env.params, &mut env.returned_params);
                     check_body(&method.body, &mut env)?;
                 }
             }
@@ -709,6 +723,124 @@ fn require_hashable(ty: &Ty, span: Span, position: &str) -> Result<()> {
     Ok(())
 }
 
+// ── By-value parameter mutation detection helpers ─────────────────────────────
+
+/// Walk `Attr { obj }` and `Index { obj }` chains to find the innermost `Ident`.
+/// Returns the identifier name if the expression is rooted at a plain name.
+fn root_ident(e: &Expr) -> Option<&str> {
+    match e {
+        Expr::Ident(name, _) => Some(name.as_str()),
+        Expr::Attr { obj, .. } => root_ident(obj),
+        Expr::Index { obj, .. } => root_ident(obj),
+        _ => None,
+    }
+}
+
+/// Returns `true` for types that are NOT Copy in Rust — i.e. by-value passing
+/// gives the callee a clone whose mutations cannot propagate back to the caller.
+fn is_non_copy(ty: &Ty) -> bool {
+    matches!(ty, Ty::Class(_) | Ty::List(_) | Ty::Set(_) | Ty::Dict(_, _) | Ty::Str)
+}
+
+/// In-place mutating methods that callers may call on a List, Set, or Dict
+/// parameter — calling any of these on a by-value non-Copy param is a bug.
+const PARAM_MUTATING_METHODS: &[&str] = &[
+    // List mutators
+    "append", "extend", "insert", "remove", "sort", "reverse", "clear",
+    // Set mutators
+    "add", "discard",
+    // Dict mutators
+    "update", "pop", "setdefault", "popitem",
+];
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Pre-scan a function body and collect the names of parameters that appear as
+/// identifiers in any `return <expr>` statement (including nested blocks).
+///
+/// A param that is mutated then returned is the valid functional pattern:
+///   `xs.append(99); return xs`
+/// The callee operates on its own copy and returns the updated value; the
+/// caller captures it.  We suppress the by-value-param-mutation error for
+/// any param that flows to at least one return — conservative (favour avoiding
+/// false positives over false negatives).
+fn collect_returned_param_idents(
+    stmts: &[Stmt],
+    params: &std::collections::HashSet<String>,
+    out: &mut std::collections::HashSet<String>,
+) {
+    for s in stmts {
+        collect_returned_param_idents_stmt(s, params, out);
+    }
+}
+
+fn collect_returned_param_idents_stmt(
+    s: &Stmt,
+    params: &std::collections::HashSet<String>,
+    out: &mut std::collections::HashSet<String>,
+) {
+    match s {
+        Stmt::Return(Some(e), _) => {
+            collect_returned_param_idents_expr(e, params, out);
+        }
+        // Recurse into all nested statement blocks.
+        Stmt::If { then, elifs, else_, .. } => {
+            collect_returned_param_idents(then, params, out);
+            for (_, b) in elifs { collect_returned_param_idents(b, params, out); }
+            if let Some(b) = else_ { collect_returned_param_idents(b, params, out); }
+        }
+        Stmt::While { body, .. } => collect_returned_param_idents(body, params, out),
+        Stmt::For { body, .. } => collect_returned_param_idents(body, params, out),
+        Stmt::Try { body, handlers, else_, finally_, .. } => {
+            collect_returned_param_idents(body, params, out);
+            for h in handlers { collect_returned_param_idents(&h.body, params, out); }
+            if let Some(b) = else_ { collect_returned_param_idents(b, params, out); }
+            if let Some(b) = finally_ { collect_returned_param_idents(b, params, out); }
+        }
+        Stmt::With { body, .. } => collect_returned_param_idents(body, params, out),
+        // Match arms
+        Stmt::Match { arms, .. } => {
+            for arm in arms { collect_returned_param_idents(&arm.body, params, out); }
+        }
+        // Nested defs / classes — do NOT descend; their returns belong to a
+        // different function scope.
+        Stmt::Func(_) | Stmt::Class(_) => {}
+        _ => {}
+    }
+}
+
+/// Walk an expression and collect any top-level Ident that is a known param.
+/// We stay shallow (just check the expression itself and direct sub-expressions
+/// of Tuple/IfExp) to avoid spurious suppression from `return [xs]` or similar.
+fn collect_returned_param_idents_expr(
+    e: &Expr,
+    params: &std::collections::HashSet<String>,
+    out: &mut std::collections::HashSet<String>,
+) {
+    match e {
+        Expr::Ident(name, _) => {
+            if params.contains(name.as_str()) {
+                out.insert(name.clone());
+            }
+        }
+        // `return (a, b)` — both parts count.
+        Expr::Tuple(elems, _) => {
+            for elem in elems {
+                collect_returned_param_idents_expr(elem, params, out);
+            }
+        }
+        // `return x if cond else y` — both branches count.
+        Expr::IfExp { body, orelse, .. } => {
+            collect_returned_param_idents_expr(body, params, out);
+            collect_returned_param_idents_expr(orelse, params, out);
+        }
+        // Any other expression shape — do not descend. Being conservative here
+        // is deliberate: we only suppress the error when the param flows
+        // *directly* to the return, not via an arbitrary computation.
+        _ => {}
+    }
+}
+
 fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
     match s {
         Stmt::Pass(_) | Stmt::Break(_) | Stmt::Continue(_) => Ok(()),
@@ -775,6 +907,11 @@ fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             // type-changing rebind (e.g. an int accumulator later assigned a float,
             // or a name reused for a different value). Rejecting it here would
             // contradict that feature.
+            // Track when an original parameter is rebound so that subsequent mutations
+            // on the new local value are NOT flagged as by-value param mutations.
+            if env.params.contains(target.as_str()) {
+                env.reassigned_params.insert(target.clone());
+            }
             env.locals.insert(target.clone(), declared);
             Ok(())
         }
@@ -900,6 +1037,28 @@ fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             // unknown names / bad nested attributes are rejected by check_expr).
             let obj_ty = check_expr(obj, env)?;
             check_expr(value, env)?;
+            // Detect mutation of a by-value non-Copy parameter.
+            // `param.field = v` where `param` is still the original binding is a
+            // silent wrong-output bug — the caller's value is never updated.
+            // Exception: if the param is returned by the function, the mutation
+            // is the caller's own copy that gets handed back — a valid pattern.
+            if let Some(root) = root_ident(obj) {
+                if root != "self"
+                    && env.params.contains(root)
+                    && !env.reassigned_params.contains(root)
+                    && !env.returned_params.contains(root)
+                    && is_non_copy(&obj_ty)
+                {
+                    return Err(Error::Type {
+                        span: *span,
+                        msg: format!(
+                            "mutation of by-value parameter `{}` is not visible to the caller; \
+                             mutate via a method on it or return the updated value",
+                            root
+                        ),
+                    });
+                }
+            }
             // If the base is a known user class, the assigned field must exist on
             // it (including inherited fields) — `a.b.c = v` with no field `c` is a
             // type error, not a deferred-to-rustc one.
@@ -917,11 +1076,30 @@ fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             }
             Ok(())
         }
-        Stmt::IndexAssign { obj, idx, value, span: _ } => {
+        Stmt::IndexAssign { obj, idx, value, span } => {
             // Validate the target base chain, the subscript, and the value.
-            check_expr(obj, env)?;
+            let obj_ty = check_expr(obj, env)?;
             check_expr(idx, env)?;
             check_expr(value, env)?;
+            // Detect mutation of a by-value non-Copy parameter via index assignment.
+            // Exception: if the param is returned by the function, the mutation is valid.
+            if let Some(root) = root_ident(obj) {
+                if root != "self"
+                    && env.params.contains(root)
+                    && !env.reassigned_params.contains(root)
+                    && !env.returned_params.contains(root)
+                    && is_non_copy(&obj_ty)
+                {
+                    return Err(Error::Type {
+                        span: *span,
+                        msg: format!(
+                            "mutation of by-value parameter `{}` is not visible to the caller; \
+                             mutate via a method on it or return the updated value",
+                            root
+                        ),
+                    });
+                }
+            }
             Ok(())
         }
         Stmt::Func(_) | Stmt::Class(_) => Ok(()), // Nested — punt in v0.
@@ -1083,6 +1261,9 @@ fn lambda_ret_with_elem(
                 locals: env.locals.clone(),
                 ret_ty: Ty::Unknown,
                 used_vars: env.used_vars.clone(),
+                params: std::collections::HashSet::new(),
+                reassigned_params: std::collections::HashSet::new(),
+                returned_params: std::collections::HashSet::new(),
             };
             // Bind every param: the first to the iterable element type, the
             // rest to their declared type or Unknown (map/filter pass a single
@@ -1144,6 +1325,9 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 locals: env.locals.clone(),
                 ret_ty: env.ret_ty.clone(),
                 used_vars: env.used_vars.clone(),
+                params: env.params.clone(),
+                reassigned_params: env.reassigned_params.clone(),
+                returned_params: env.returned_params.clone(),
             };
             inner_env.locals.insert(target.clone(), elem_ty);
             if let Some(c) = cond { check_expr(c, &mut inner_env)?; }
@@ -1163,6 +1347,9 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 locals: env.locals.clone(),
                 ret_ty: env.ret_ty.clone(),
                 used_vars: env.used_vars.clone(),
+                params: env.params.clone(),
+                reassigned_params: env.reassigned_params.clone(),
+                returned_params: env.returned_params.clone(),
             };
             inner_env.locals.insert(target.clone(), elem_ty);
             if let Some(c) = cond { check_expr(c, &mut inner_env)?; }
@@ -1185,6 +1372,9 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 locals: env.locals.clone(),
                 ret_ty: env.ret_ty.clone(),
                 used_vars: env.used_vars.clone(),
+                params: env.params.clone(),
+                reassigned_params: env.reassigned_params.clone(),
+                returned_params: env.returned_params.clone(),
             };
             inner_env.locals.insert(target.clone(), elem_ty);
             if let Some(c) = cond { check_expr(c, &mut inner_env)?; }
@@ -1514,7 +1704,32 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                                     msg: format!("type `{}` has no method `{}`", type_name, name),
                                 });
                             }
-                            // (b) Element-type argument check for set mutators only.
+                            // (b) Detect in-place mutating method calls on a by-value param.
+                            // e.g. `visited.add(node)` where `visited` is a Set parameter.
+                            // Only fires when the receiver `obj` is the param ident directly
+                            // (not a field or element of it) — `ds.values.append(x)` must
+                            // NOT fire because it is a nested attribute access and a separate
+                            // concern from direct param mutation.
+                            if PARAM_MUTATING_METHODS.contains(&name.as_str()) {
+                                if let Expr::Ident(param_name, _) = obj.as_ref() {
+                                    if param_name != "self"
+                                        && env.params.contains(param_name.as_str())
+                                        && !env.reassigned_params.contains(param_name.as_str())
+                                        && !env.returned_params.contains(param_name.as_str())
+                                        && is_non_copy(&obj_ty)
+                                    {
+                                        return Err(Error::Type {
+                                            span: *span,
+                                            msg: format!(
+                                                "mutation of by-value parameter `{}` is not visible to the caller; \
+                                                 mutate via a method on it or return the updated value",
+                                                param_name
+                                            ),
+                                        });
+                                    }
+                                }
+                            }
+                            // (c) Element-type argument check for set mutators only.
                             if let Some(elem_ty) = elem_arg_check_ty(&obj_ty, name) {
                                 if let Some(arg0) = args.first() {
                                     let arg_ty = check_expr(arg0, env)?;
@@ -1661,6 +1876,9 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 locals: env.locals.clone(),
                 ret_ty: Ty::Unknown,
                 used_vars: env.used_vars.clone(),
+                params: std::collections::HashSet::new(),
+                reassigned_params: std::collections::HashSet::new(),
+                returned_params: std::collections::HashSet::new(),
             };
             for (param_name, param_ty) in params {
                 let ty = lambda_param_ty(param_ty);

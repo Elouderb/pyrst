@@ -280,6 +280,22 @@ See `DESIGN_DECISIONS.md` §11 and `RUST_BACKEND.md` for the `catch_unwind` lowe
 - **`@classmethod`:** the `cls` parameter cannot be cleanly annotated, so classmethods are effectively unsupported (use `@staticmethod` or a module function).
 - **Caught exceptions** print no stderr noise; uncaught ones still surface a message and a non-zero exit code.
 - **Mutating through a subscript does not persist:** indexing yields a value (a clone, per the value-semantics model), so `d[k].append(x)` or `matrix[i][j] = v` on a *nested* collection mutates a temporary, not the stored element. Pull the element into a variable, mutate it, and reassign the whole element (`row = matrix[i]; row[j] = v; matrix[i] = row`).
+- **Mutating a by-value non-Copy parameter is a compile error:** pyrst compiles function parameters to owned Rust values (a clone of the caller's value), so mutations to a `list`, `dict`, `set`, `str`, or user-defined class parameter are NOT visible to the caller. The typeck pass detects three patterns and reports a hard error rather than letting them compile silently:
+  1. Field assignment — `param.field = v`
+  2. Index assignment — `param[k] = v`
+  3. In-place method call directly on the param — `param.append(x)`, `param.add(x)`, `param.update(d)`, etc.
+  The correct idioms are (a) accept a `&mut`-like approach by using a method on `self` (for class methods), or (b) build and return the updated value:
+  ```python
+  # WRONG — mutation invisible to caller
+  def push(items: list[int], x: int) -> None:
+      items.append(x)              # compile error: by-value param
+  # CORRECT — return the new value
+  def push(items: list[int], x: int) -> list[int]:
+      result = list(items)
+      result.append(x)
+      return result
+  ```
+  Note: calling a mutating method on a FIELD of a class parameter (`ds.values.append(x)`) is not caught at this level — it compiles but still produces wrong output (the field mutation is local to the clone). Avoid this pattern; restructure using the return idiom or make `add_value` a class method operating on `self`.
 - **Block scope follows Python:** a variable first assigned inside an `if`/`elif`/`else`/`for`/`while`/`with`/`try` body is visible after the block (it is hoisted to function scope). Edge case: a name is not hoisted — and so stays block-local — if its type cannot be statically inferred, or is a tuple or an all-numeric-field class (which has no `Default`). Also: a hoisted name is initialized to a default (`0`/`""`/empty), so reading it on a path where it was never assigned yields that default rather than raising Python's `UnboundLocalError`.
 - **No subtype polymorphism:** classes compile to plain Rust structs with value semantics and no inheritance relationship, so a `list[Base]` cannot hold `Derived` instances and a `Base`-typed variable cannot be reassigned a `Derived`. Use a single concrete type per collection. (`super()`, method inheritance, and overriding within one type still work.)
 - **Builtin runtime errors are not catchable exceptions:** index-out-of-range, missing dict key, and divide-by-zero abort the program (Rust panic, non-zero exit). `try`/`except` only catches values from an explicit `raise` of the matching type — a bare `except IndexError` will **not** catch an out-of-bounds subscript.

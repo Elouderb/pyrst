@@ -1451,13 +1451,14 @@ impl<'a> Codegen<'a> {
                 let target_ty = self.locals.get(target.as_str()).cloned().unwrap_or(Ty::Unknown);
                 match op {
                     BinOp::FloorDiv => {
-                        // Python's //= floors toward negative infinity; Rust's /= truncates toward zero
-                        // Use explicit float division + floor cast for correctness.
-                        // A float target keeps its f64 type; an int target floors back to i64.
+                        // Python's //= floors toward negative infinity; Rust's /= truncates toward zero.
+                        // For float targets keep the f64 floor path.
+                        // For int targets route through __py_floordiv which also panics on /0
+                        // with a catchable ZeroDivisionError payload.
                         if matches!(target_ty, Ty::Float) {
                             self.line(&format!("{} = ({} as f64 / {} as f64).floor();", target, target, v));
                         } else {
-                            self.line(&format!("{} = ({} as f64 / {} as f64).floor() as i64;", target, target, v));
+                            self.line(&format!("{} = __py_floordiv(({}), ({}));", target, target, v));
                         }
                     }
                     BinOp::Mod => {
@@ -3400,13 +3401,16 @@ impl<'a> Codegen<'a> {
                     BinOp::FloorDiv => {
                         // Python `//` floors toward negative infinity; Rust integer `/`
                         // truncates toward zero and Rust float `/` does not floor at all.
-                        // Compute the true floored quotient in f64. Result type follows
-                        // type_of_expr: int unless either operand is float.
+                        // For integer operands use __py_floordiv which also panics on /0
+                        // with a catchable ZeroDivisionError payload.
+                        // For float operands keep the f64 path (float //0.0 -> INF in
+                        // Python is also a ZeroDivisionError but lower-priority; noted as
+                        // a known gap).
                         let is_float = matches!(lt, Ty::Float) || matches!(rt, Ty::Float);
                         if is_float {
                             return Ok(format!("((({} as f64) / ({} as f64)).floor())", l, r));
                         }
-                        return Ok(format!("((({} as f64) / ({} as f64)).floor() as i64)", l, r));
+                        return Ok(format!("__py_floordiv(({}), ({}))", l, r));
                     }
                     BinOp::Mod => {
                         // Python `%` returns a result with the sign of the divisor; Rust
@@ -3780,10 +3784,20 @@ pub fn emit_program(modules: &[(Module, String)], ctx: &TyCtx) -> Result<String>
     cg.line("    if x { \"True\".to_string() } else { \"False\".to_string() }");
     cg.line("}");
     // Python integer modulo: the result takes the sign of the divisor (Rust's
-    // `%` takes the sign of the dividend). Single-evaluation helper.
+    // `%` takes the sign of the dividend). Panics on b==0 with a catchable
+    // "ZeroDivisionError panic: ..." payload matching the try/except dispatcher.
     cg.line("fn __py_mod(a: i64, b: i64) -> i64 {");
+    cg.line("    if b == 0 { panic!(\"ZeroDivisionError panic: integer division or modulo by zero\"); }");
     cg.line("    let m = a % b;");
     cg.line("    if m != 0 && ((m < 0) != (b < 0)) { m + b } else { m }");
+    cg.line("}");
+    // Python integer floor division: floors toward negative infinity.
+    // Panics on b==0 with a catchable "ZeroDivisionError panic: ..." payload.
+    // The f64 path previously used here silently returned i64::MAX for x//0.
+    cg.line("fn __py_floordiv(a: i64, b: i64) -> i64 {");
+    cg.line("    if b == 0 { panic!(\"ZeroDivisionError panic: integer division or modulo by zero\"); }");
+    cg.line("    let q = a / b;");
+    cg.line("    if (a % b != 0) && ((a % b < 0) != (b < 0)) { q - 1 } else { q }");
     cg.line("}");
     // Python integer exponentiation. A negative exponent yields a float in
     // Python, which cannot be represented in an i64 result, so panic with a

@@ -1,0 +1,4 @@
+caught ZeroDivisionError from //: integer division or modulo by zero
+caught ZeroDivisionError from %: integer division or modulo by zero
+caught ZeroDivisionError from //=: integer division or modulo by zero
+done

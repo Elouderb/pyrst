@@ -97,6 +97,15 @@ impl<'a> Codegen<'a> {
             Ty::Int | Ty::Float | Ty::Bool | Ty::Str | Ty::Unit => true,
             Ty::List(_) | Ty::Set(_) | Ty::Dict(_, _) | Ty::Option(_) => true,
             Ty::Class(n) => {
+                // (EPIC-5 C2-3) A polymorphic base lowers (via `rust_ty`) to its
+                // companion enum `n__`, a data-variant enum that CANNOT derive
+                // `Default` (emit_companion_enum is `#[derive(Clone, Debug)]`
+                // only). So an outer struct holding such a field must NOT include
+                // `Default` in its own derive list, and such a local is not
+                // hoistable with `Default::default()`.
+                if self.is_polymorphic_base(n) {
+                    return false;
+                }
                 // Copy classes don't get #[derive(Default)] (see emit_class).
                 let all_copy = self.ctx.get_all_fields(n).iter().all(|f| {
                     Ty::from_type_expr(&f.ty).map(|t| self.is_copy_type(&t)).unwrap_or(false)
@@ -105,6 +114,25 @@ impl<'a> Codegen<'a> {
             }
             _ => false,
         }
+    }
+
+    /// (EPIC-5 C2-3) True when the companion enum `base__` carries `impl PartialEq`.
+    /// `emit_companion_enum` forwards `PartialEq` to the variant structs ONLY when
+    /// EVERY variant defines `__eq__` (its `all_have_eq` predicate); otherwise the
+    /// enum has no `PartialEq` at all (cross-variant equality is honestly absent).
+    /// A struct holding a polymorphic-base field can therefore derive `PartialEq`
+    /// only when this returns true — mirrors `emit_companion_enum`'s `all_have_eq`.
+    fn companion_enum_has_partial_eq(&self, base: &str) -> bool {
+        if !self.is_polymorphic_base(base) {
+            return false;
+        }
+        let mut variants: Vec<String> = vec![base.to_string()];
+        if let Some(subs) = self.poly_map.get(base) {
+            variants.extend(subs.iter().cloned());
+        }
+        variants
+            .iter()
+            .all(|v| self.resolved_methods(v).iter().any(|m| m.name == "__eq__"))
     }
 
     /// Returns a zero-value Rust initializer for any type, including Copy classes
@@ -420,6 +448,32 @@ impl<'a> Codegen<'a> {
             // silent miscompile). Documented as a C2-3 gap alongside list+concat.
             _ => self.emit_consuming(value),
         }
+    }
+
+    /// (EPIC-5 C2-3) Emit constructor argument `arg` into a slot whose declared
+    /// type is `slot` (a `__init__` param type, or a struct field type). When the
+    /// slot mentions a polymorphic base, wrap a raw-struct/subclass value into the
+    /// companion-enum variant (delegating to `emit_into_base_slot`, the same
+    /// wrap-or-passthrough used at the return / annotated-assign / free-fn-arg
+    /// sites); otherwise keep the uniform clone-on-use emission. A `None` slot
+    /// (untyped / variadic) also keeps clone-on-use. This closes the constructor
+    /// arg path, which the keystone's three `ty_has_poly_base` sites did not cover.
+    fn emit_arg_into_slot(&mut self, arg: &Expr, slot: Option<&Ty>) -> Result<String> {
+        match slot {
+            Some(t) if self.ty_has_poly_base(t) => self.emit_into_base_slot(arg, t),
+            _ => self.emit_consuming(arg),
+        }
+    }
+
+    /// (EPIC-5 C2-3) The declared pyrst `Ty` of field `field_name` on class
+    /// `class_def`, looking through inherited base fields (mirrors the constructor
+    /// branch's own + inherited field walk). `None` when the field is unknown.
+    fn class_field_type(&self, class_def: &ClassDef, field_name: &str) -> Option<Ty> {
+        self.ctx
+            .get_all_fields(&class_def.name)
+            .iter()
+            .find(|f| f.name == field_name)
+            .and_then(|f| Ty::from_type_expr(&f.ty).ok())
     }
 
     /// (EPIC-5) Coerce an already-emitted expression `s` (for source expr `e`)
@@ -1192,7 +1246,17 @@ impl<'a> Codegen<'a> {
         // and don't fall back to a field-wise derived eq that ignores the
         // inherited custom semantics.
         let has_eq = resolved_methods.iter().any(|m| m.name == "__eq__");
-        let pe = if has_eq { "" } else { ", PartialEq" };
+        // (EPIC-5 C2-3) A field whose type is a polymorphic base lowers to the
+        // companion enum `B__`. A `#[derive(PartialEq)]` on this struct then
+        // requires `B__: PartialEq`, which holds ONLY when every variant defines
+        // `__eq__`. If any polymorphic-base field's enum lacks PartialEq, derive
+        // without it (Python `==` on such a struct is then honestly unavailable
+        // — consistent with cross-variant equality being absent on the enum).
+        let field_blocks_eq = all_fields.iter().any(|f| {
+            matches!(Ty::from_type_expr(&f.ty), Ok(Ty::Class(ref n))
+                if self.is_polymorphic_base(n) && !self.companion_enum_has_partial_eq(n))
+        });
+        let pe = if has_eq || field_blocks_eq { "" } else { ", PartialEq" };
         // Only derive Default when every field actually implements Default.
         // Copy classes (all-primitive fields) don't derive Default, so an outer
         // struct holding one must NOT include Default in its own derive list.
@@ -2222,7 +2286,12 @@ impl<'a> Codegen<'a> {
                 // Uniform clone-on-use: assigning from a non-Copy place (`y = x`,
                 // `y = self.field`) deep-clones so the two bindings are independent
                 // (Python value semantics). Owned temps (call/literal/binop) are bare.
-                let v = self.emit_consuming(value)?;
+                // (EPIC-5 C2-3 cleanup) `v` is computed lazily per branch: the
+                // annotated poly-base path emits via `emit_into_base_slot` directly
+                // (which recomputes the clone-on-use emission internally), so the
+                // earlier unconditional `emit_consuming(value)` here was redundant
+                // work it then discarded. The non-poly annotated path, the inferred
+                // path, and the rebind path each compute the clone-on-use `v` once.
                 let is_declared = self.declared.contains(target);
                 if !is_declared {
                     self.declared.insert(target.clone());
@@ -2232,11 +2301,11 @@ impl<'a> Codegen<'a> {
                             // (EPIC-5 C2-2b-i) `a: Animal = Account(...)` — a raw
                             // struct into a polymorphic-base `Animal__` slot is
                             // WRAPPED in the right variant (replaces the C1 gate).
-                            // Non-polymorphic slots keep the clone-on-use `v` above.
+                            // Non-polymorphic slots keep the clone-on-use emission.
                             let v = if self.ty_has_poly_base(&ty_obj) {
                                 self.emit_into_base_slot(value, &ty_obj)?
                             } else {
-                                v
+                                self.emit_consuming(value)?
                             };
                             self.locals.insert(target.clone(), ty_obj.clone());
                             // (EPIC-5) An Optional-annotated binding wraps a bare
@@ -2260,6 +2329,7 @@ impl<'a> Codegen<'a> {
                             }
                         }
                         None => {
+                            let v = self.emit_consuming(value)?;
                             // Infer type from the value expression, but prefer a
                             // richer type discovered by the forward pre-pass
                             // (e.g. an `acc = 0` later assigned floats).
@@ -2281,6 +2351,7 @@ impl<'a> Codegen<'a> {
                         }
                     }
                 } else {
+                    let v = self.emit_consuming(value)?;
                     // Python permits rebinding a name to a value of a different
                     // type. When that happens, emit a shadowing `let` (which
                     // always type-checks) instead of a plain reassignment.
@@ -3554,9 +3625,29 @@ impl<'a> Codegen<'a> {
                         // including the zero-arg case so that __init__ side-effects
                         // (field assignments, etc.) always run.
                         if has_init {
+                            // (EPIC-5 C2-3) The `new()` signature lowers each
+                            // `__init__` param via `rust_ty`, so a base-typed param
+                            // is `B__`. A raw-struct / subclass argument into such a
+                            // slot must be WRAPPED in the right variant (the same
+                            // wrap-or-passthrough used at return / assign / free-fn
+                            // sites) — otherwise the bare `Dog::new(..)` mismatches
+                            // the `Animal__` param (E0308). Non-polymorphic params
+                            // keep the clone-on-use emission.
+                            let init_params: Vec<(String, Ty)> = class_def.methods.iter()
+                                .find(|m| m.name == "__init__")
+                                .map(|m| m.params.iter()
+                                    .filter(|p| p.name != "self")
+                                    .filter_map(|p| Ty::from_type_expr(&p.ty).ok().map(|t| (p.name.clone(), t)))
+                                    .collect())
+                                .unwrap_or_default();
                             let mut call_parts = Vec::new();
-                            for a in args { call_parts.push(self.emit_consuming(a)?); }
-                            for (_, v) in kwargs { call_parts.push(self.emit_consuming(v)?); }
+                            for (i, a) in args.iter().enumerate() {
+                                call_parts.push(self.emit_arg_into_slot(a, init_params.get(i).map(|(_, t)| t))?);
+                            }
+                            for (kw, v) in kwargs {
+                                let pt = init_params.iter().find(|(n, _)| n == kw).map(|(_, t)| t);
+                                call_parts.push(self.emit_arg_into_slot(v, pt)?);
+                            }
                             return Ok(format!("{}::new({})", name, call_parts.join(", ")));
                         }
 
@@ -3588,7 +3679,12 @@ impl<'a> Codegen<'a> {
                             }
                             let mut parts = Vec::new();
                             for (field_name, arg) in all_field_names.iter().zip(args.iter()) {
-                                let v = self.emit_consuming(arg)?;
+                                // (EPIC-5 C2-3) The struct field lowers to `B__` for
+                                // a polymorphic-base field, so a raw-struct/subclass
+                                // value wraps in its variant (same as the ctor/new
+                                // path above).
+                                let fty = self.class_field_type(&class_def, field_name);
+                                let v = self.emit_arg_into_slot(arg, fty.as_ref())?;
                                 parts.push(format!("{}: {}", field_name, v));
                             }
                             return Ok(format!("{} {{ {} }}", name, parts.join(", ")));
@@ -3598,7 +3694,8 @@ impl<'a> Codegen<'a> {
                         if !kwargs.is_empty() {
                             let mut parts = Vec::new();
                             for (kw, val) in kwargs {
-                                let v = self.emit_consuming(val)?;
+                                let fty = self.class_field_type(&class_def, kw);
+                                let v = self.emit_arg_into_slot(val, fty.as_ref())?;
                                 parts.push(format!("{}: {}", kw, v));
                             }
                             return Ok(format!("{} {{ {} }}", name, parts.join(", ")));
@@ -4423,6 +4520,22 @@ impl<'a> Codegen<'a> {
                         let r = self.emit_expr(rhs)?;
                         // Use format! for robust string concatenation
                         return Ok(format!(r#"format!("{{}}{{}}", {}, {})"#, l, r));
+                    }
+                    // (EPIC-5 C2-3) `list + list` concatenation is a PRE-EXISTING
+                    // gap: typeck accepts it, but the generic numeric `+` lowering
+                    // below emits `vec![..] + vec![..]`, and Rust's `Vec` has no
+                    // `Add` impl — so it leaked a raw rustc E0369 (a miscompile,
+                    // for ANY element type, not just subtypes). Refuse honestly
+                    // here rather than emit invalid Rust; the documented workaround
+                    // is `.extend()` / a comprehension. (Element-wise subtype
+                    // wrapping for a base-typed result is the follow-on once concat
+                    // itself is implemented.) NOT an EPIC-4 path.
+                    if matches!(lt, Ty::List(_)) && matches!(rt, Ty::List(_)) {
+                        return Err(crate::diag::Error::Codegen(
+                            "list `+` list concatenation is not yet supported — \
+                             build the combined list with `.extend()` (e.g. \
+                             `xs.extend(ys)`) or a comprehension instead".into(),
+                        ));
                     }
                 }
 

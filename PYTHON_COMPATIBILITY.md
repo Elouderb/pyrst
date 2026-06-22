@@ -70,6 +70,7 @@ This document clarifies which Python features are supported, partially supported
 | `__init__` constructor | ✅ Supported | User-defined `__init__` honored |
 | Inheritance (single) | ✅ Supported | `class Derived(Base):` |
 | `super()` | ✅ Supported | Calls base-class methods |
+| Subtype polymorphism | ✅ Supported | Pass/assign/return a `Derived` where a `Base` is expected; heterogeneous `list[Base]`; virtual dispatch. See [Class Subtyping / Polymorphism](#class-subtyping--polymorphism). |
 | Operator overloading | ✅ Supported | `__add__`, `__eq__`, `__lt__`, `__str__`, etc. |
 | `@property` | ✅ Supported | Computed read-only attributes |
 | `@staticmethod` | ✅ Supported | No-`self` methods |
@@ -81,6 +82,40 @@ This document clarifies which Python features are supported, partially supported
 | Metaclasses | ❌ Not Supported | Not part of the type system |
 
 **Key Semantic Difference:** Classes (and all non-`Copy` values) use **value semantics** (Rust), not reference semantics (Python). Assignment and argument passing **deep-copy** the value (clone-on-use) — there is no shared-mutable aliasing. A callee that should mutate the caller's object opts in explicitly with a `Mut[T]` (by-reference) parameter; otherwise mutating a by-value parameter is a compile error. See *Notable Limitations* for the full model.
+
+---
+
+## Class Subtyping / Polymorphism
+
+Subtype polymorphism — accepting a `Derived` value where a `Base` is expected — **is supported** (single inheritance). Because pyrst compiles each class to an independent value-struct (no `dyn`/`Rc`/trait objects, per the value-semantics model), a base class **that has at least one subclass in the program** is compiled to a **closed-set companion enum** `Base__` with one variant per class in its hierarchy. Every base-typed slot (variable, parameter, return, field, list element) becomes that enum, a `Derived` value is wrapped into its variant, and method calls dispatch through a generated `match`. A base class with no subclasses stays a plain struct, so non-inheriting code is unaffected.
+
+### What works
+
+| Pattern | Example | Notes |
+|---------|---------|-------|
+| Derived where Base is expected | `a: Animal = Dog("Rex")` | Assignment, parameter passing, and `-> Base` returns all wrap the value into the right variant. |
+| Heterogeneous collections | `animals: list[Animal] = [Dog("a"), Cat("b")]` | A `list[Base]` literal holds mixed subclasses; each element is wrapped. Two **sibling** subclasses in a bare list literal (`[Dog(), Cat()]`) unify to their nearest common base. |
+| Polymorphic method dispatch | `for a in animals: print(a.speak())` | `a.speak()` calls the **subclass override** for the actual variant (virtual dispatch through the companion enum). |
+| Base-field READ through a base var | `a.name` where `a: Animal` | Reading a field declared on the **base** resolves via a generated accessor. (Reading a **derived-only** field through a base var is a typeck error — see below.) |
+| Base-typed FIELD init + read | `class Zoo: star: Animal` then `Zoo(Dog("Rex"))`, `z.star.speak()` | A base-typed struct field is the companion enum; a subclass passed to the constructor is wrapped, and reading + dispatching on the field works. |
+| Direct construct of a leaf into an ancestor slot | `a: A = C(...)` for `A <- B <- C` | Constructing a leaf directly at any ancestor slot works (the leaf is a variant of the ancestor's enum). |
+| `print` / `==` / `<` on a base var | `print(m)`, `a == b`, `a < b` where `m, a, b: Mid` | When the base defines `__str__`/`__repr__`, `__eq__`, `__lt__`, the companion enum forwards `Display`/`PartialEq`/`PartialOrd` to the variant structs. Cross-variant comparison is Python-honest (`==` is `False`, ordering is absent) unless the dunder says otherwise. |
+| Single inheritance | `class Dog(Animal):` | One base only (multiple inheritance is unsupported). |
+
+### Limitations (honest errors today — never a miscompile)
+
+Each of the following is reported as a clean pyrst error (typeck or codegen), not a silent miscompile or a raw `rustc` failure. Construct the value differently or use the suggested idiom.
+
+| Pattern | Behavior | Workaround |
+|---------|----------|-----------|
+| **Upcast an *intermediate* polymorphic base** | `b: B = B(1); a: A = b` for `A <- B <- C` → `codegen error: upcasting an intermediate polymorphic base 'B' to 'A' is not yet supported — construct the value at the 'A' slot directly`. (`b` is already a `B__` enum, which is not an `A__` variant.) | Construct directly at the target slot: `a: A = B(1)`. (Direct leaf/derived construction at any ancestor slot **does** work.) |
+| **Field WRITE through a base var** | `a.field = x` where `a: Animal` → `codegen error: writing field 'field' through a polymorphic-base 'Animal' variable is not yet supported … (read-only base-field access is supported)`. | Mutate via a method on the class (`a.set_field(x)` dispatched through the enum), or work with the concrete type. |
+| **Read a *derived-only* field through a base var** | `a.breed` where `a: Animal` and `breed` is only on `Dog` → typeck error (the field is not on the declared base type). | Use the concrete `Dog` type, or move the field/accessor onto the base. |
+| **`list` + `list` concatenation** | `[Dog()] + [Cat()]` (and even homogeneous `[1] + [2]`) → `codegen error: list '+' list concatenation is not yet supported …`. This is a pre-existing gap for **all** element types, not just subtypes. | Build the result with `.extend()` (`xs.extend(ys)`) or a comprehension. |
+| **Dict-literal subtype values** | `d: dict[str, Animal] = {"a": Dog("Rex")}` → typeck error: *type mismatch in assignment: declared `Dict(Str, Class("Animal"))`, got `Dict(Str, Class("Dog"))`*. A `list[Base]` literal wraps its elements, but a dict literal does not yet. | Build the dict and `[]`-assign already-`Base` values, or construct values typed as the base. |
+| **Exception subtyping** | `class MyErr(Exception)` can be defined, raised, and caught by exact name, but `Exception` is a builtin (not a user class in the type graph), so it is not part of the companion-enum machinery and there is no user exception *hierarchy*. | Catch by the exact class name. |
+
+**Model in one line:** a base class with subclasses compiles to a closed-set companion enum (`Base__ { Base(Base), Dog(Dog), … }`) with generated method dispatch and base-field accessors; values are wrapped at base-typed slots and dispatched through a `match`. This gives full polymorphism (including heterogeneous collections) within the value-semantics / no-`dyn` model.
 
 ---
 
@@ -433,7 +468,7 @@ compiler (which would otherwise reject the emitted `Some(sink())` as `Option<()>
   - **`Mut[set]` / `Mut[dict]` need element types:** write `Mut[set[int]]` / `Mut[dict[str, int]]`, not bare `Mut[set]` — a bare `set`/`dict` head parses as an (unknown) class, so the argument-type check rejects the call.
   - **`Mut[<primitive>]` has a known deref limitation:** `Mut[int]`/`Mut[float]`/`Mut[bool]` emit `&mut i64` etc., but the codegen does not auto-dereference the reference in expression position, so arithmetic on the parameter (`n + 1`) fails to compile, and reassigning the parameter would not write back anyway. Use a `Mut[T]` of a collection or class, or the return idiom, for primitives.
 - **Block scope follows Python:** a variable first assigned inside an `if`/`elif`/`else`/`for`/`while`/`with`/`try` body is visible after the block (it is hoisted to function scope). Edge case: a name is not hoisted — and so stays block-local — if its type cannot be statically inferred, or is a tuple or an all-numeric-field class (which has no `Default`). Also: a hoisted name is initialized to a default (`0`/`""`/empty), so reading it on a path where it was never assigned yields that default rather than raising Python's `UnboundLocalError`.
-- **No subtype polymorphism:** classes compile to plain Rust structs with value semantics and no inheritance relationship, so a `list[Base]` cannot hold `Derived` instances and a `Base`-typed variable cannot be reassigned a `Derived`. Use a single concrete type per collection. (`super()`, method inheritance, and overriding within one type still work.)
+- **Subtype polymorphism is supported (with documented edges):** a base class with subclasses compiles to a closed-set companion enum, so a `list[Base]` *can* hold `Derived` instances, a `Base`-typed slot *can* take a `Derived`, and method calls dispatch to the subclass override. See [Class Subtyping / Polymorphism](#class-subtyping--polymorphism) for the full what-works / honest-limitations table (the edges still rejected with a clear error: upcasting an intermediate base, field-write through a base var, `list`+`list` concat, dict-literal subtype values, and exception subtyping).
 - **Builtin runtime errors are not catchable exceptions:** index-out-of-range, missing dict key, and divide-by-zero abort the program (Rust panic, non-zero exit). `try`/`except` only catches values from an explicit `raise` of the matching type — a bare `except IndexError` will **not** catch an out-of-bounds subscript.
 
 ---
@@ -452,5 +487,5 @@ The dynamic half of Python — metaclasses, monkey-patching, `eval`/`exec`, gene
 
 ---
 
-*Last updated: June 20, 2026*  
-*Phase: 38 — verified against the live compiler (112/112 examples passing)*
+*Last updated: June 22, 2026*  
+*Phase: 38 (EPIC-5 class subtyping complete) — verified against the live compiler (189/189 positive examples passing)*

@@ -1,6 +1,6 @@
 # EPIC-5 Class Subtyping — Design Document
 
-**Roadmap card:** 10d7a97b (EPIC-5). **Status:** design only, no source modified. **Date:** 2026-06-21.
+**Roadmap card:** 10d7a97b (EPIC-5). **Status:** ✅ C1 + C2 COMPLETE — shipped `7a649d6..926cd7b` (see §G). **Date:** 2026-06-21 (design) / 2026-06-22 (complete).
 
 ## Bottom line
 
@@ -140,3 +140,44 @@ emitting `n__` with no enum defined won't compile — so emission + activation a
 dispatch + accessors + flip rust_ty to `n__` + wrap at the 3 gate sites + list-literal + zeroed_default +
 field-access lowering + remove the C1 gate + positive goldens) → **C2-3** docs (PYTHON_COMPATIBILITY.md +
 this file) + extra goldens (3-level hierarchy, base-typed param/field) + the documented concat limitation.
+
+---
+
+## G. C1 + C2 COMPLETE (status, 2026-06-22)
+
+**Both phases shipped. EPIC-5 class subtyping is live.** Commit range `7a649d6..926cd7b`, closed out by the
+C2-3 polish card (`0a48385b`).
+
+**Shipped (what works, with goldens):**
+- **C1** (`7a649d6`): `is_subclass`, `&TyCtx`-threaded `types_compatible`, unify-to-base, and the honest C1
+  codegen gate. Sibling subclasses also unify to their nearest common ancestor (`nearest_common_ancestor`
+  in `unify_branch_types`), so `[Dog(), Cat()]` types as `list[Animal]`.
+- **C2-1** (`918b467`): `poly_map` pre-pass + `rust_ty` as a `Codegen` method (behavior-preserving prep).
+- **C2-2a / C2-2a2** (`68607d9`, `bacff0d`): companion enum + method dispatch + `__field_*` accessors +
+  `Display`/`PartialEq`/`PartialOrd` forwarding, emitted as compiling dead code.
+- **C2-2b keystone** (`926cd7b`): flipped `rust_ty` to `B__` for a polymorphic base; `emit_into_base_slot`
+  wrapping at the return / annotated-assign / free-fn-arg sites + list-literal + `zeroed_default`; base-field
+  READ lowering; removed the C1 gate + its harness section. Verified by an independent code-review +
+  verification-engineer pass.
+- **C2-3** (this card, `0a48385b`): probed the remaining shapes and **fixed the base-typed FIELD path** —
+  the previously-missing **constructor-argument** wrapping (struct-literal, `::new()`, and kwargs paths now
+  route base-typed args through `emit_into_base_slot`, keyed on the field / `__init__`-param type) **plus the
+  containing-struct derive correctness** (a struct with a polymorphic-base field omits `PartialEq`/`Default`
+  from its derives, since the companion enum carries `PartialEq` only when every variant defines `__eq__`
+  and never carries `Default`). New goldens: `subtype_field.py` (base-typed field init + read + dispatch),
+  `subtype_three_level.py` (3-level direct construct). Also a pure-cleanup of the redundant `emit_consuming`
+  at the annotated-assign site, and docs (PYTHON_COMPATIBILITY.md + this file).
+
+**Deferred (honest errors today — never a miscompile):**
+- **Upcast of an intermediate polymorphic base** (`b: B = B(1); a: A = b`) → `Error::Codegen` (a
+  `From<B__> for A__` up-conversion is the follow-on). Direct leaf/derived construction at any ancestor slot
+  works.
+- **Field-WRITE through a base var** (`a.field = x`, `a: Base`) → `Error::Codegen` (needs a mutating enum
+  accessor). Read is supported.
+- **`list` + `list` concatenation** — a PRE-EXISTING gap for **all** element types (Rust `Vec` has no `Add`):
+  C2-3 turned the former raw-rustc leak into an honest `Error::Codegen` pointing at `.extend()`. Element-wise
+  subtype wrapping is a follow-on once concat itself is implemented.
+- **Dict-literal subtype values** (`dict[str, Base] = {"k": Derived()}`) → typeck rejects (no dict-value
+  subtype unification / element wrapping yet). Locked in by `fail_dict_subtype_value.py`.
+- **Exception subtyping** — `Exception` is a builtin, not in `ctx.classes`, so user exception hierarchies stay
+  out of the companion-enum machinery (catch by exact name).

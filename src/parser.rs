@@ -665,8 +665,15 @@ impl Parser {
         while self.eat(&Tok::Dot) {
             path.push(self.expect_ident("module name")?);
         }
-        // Optional `as alias` — consume and discard for v0
-        if self.eat(&Tok::As) { self.expect_ident("alias")?; }
+        // `as alias` — honest rejection (import aliases are not yet supported)
+        if self.eat(&Tok::As) {
+            let alias_span = self.peek_span();
+            let alias = self.expect_ident("alias")?;
+            return Err(Error::Parse {
+                span: alias_span,
+                msg: format!("import aliases (`as`) are not yet supported (alias `{}`)", alias),
+            });
+        }
         self.eat_newline()?;
         Ok(Stmt::Import { path, names: vec![], span })
     }
@@ -682,8 +689,15 @@ impl Parser {
             // from module import (A, B, C)
             loop {
                 let name = self.expect_ident("import name")?;
-                let alias = if self.eat(&Tok::As) { Some(self.expect_ident("alias")?) } else { None };
-                names.push((name, alias));
+                if self.eat(&Tok::As) {
+                    let alias_span = self.peek_span();
+                    let alias = self.expect_ident("alias")?;
+                    return Err(Error::Parse {
+                        span: alias_span,
+                        msg: format!("import aliases (`as`) are not yet supported (alias `{}`)", alias),
+                    });
+                }
+                names.push((name, None));
                 if !self.eat(&Tok::Comma) { break; }
             }
             self.expect(&Tok::RParen, "import list")?;
@@ -691,8 +705,15 @@ impl Parser {
             // from module import A, B, C  (or just A)
             loop {
                 let name = self.expect_ident("import name")?;
-                let alias = if self.eat(&Tok::As) { Some(self.expect_ident("alias")?) } else { None };
-                names.push((name, alias));
+                if self.eat(&Tok::As) {
+                    let alias_span = self.peek_span();
+                    let alias = self.expect_ident("alias")?;
+                    return Err(Error::Parse {
+                        span: alias_span,
+                        msg: format!("import aliases (`as`) are not yet supported (alias `{}`)", alias),
+                    });
+                }
+                names.push((name, None));
                 if !self.eat(&Tok::Comma) { break; }
             }
         }

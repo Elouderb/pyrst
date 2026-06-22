@@ -1498,6 +1498,100 @@ impl<'a> Codegen<'a> {
         self.line("}");
         self.line("");
 
+        // 4. Dunder-trait FORWARDING impls (EPIC-5 C2-2a2). A polymorphic-base var
+        // becomes `B__` after the d5a4ff03 flip, and inherit_dunders shows base
+        // vars used with `print(m)` (Display), `==` (PartialEq), and `<`
+        // (PartialOrd). The companion enum must carry those traits BEFORE the flip
+        // — emitted here as DEAD CODE that must COMPILE (B__ is unused until the
+        // keystone). Emit a trait impl for B__ ONLY when EVERY variant struct
+        // already has that trait, determined by the SAME predicate emit_class uses
+        // to decide whether to emit `impl <Trait> for <variant struct>` (off the
+        // variant's RESOLVED method set): Display ⇐ __str__|__repr__
+        // (display_source, codegen.rs ~1224), PartialEq ⇐ __eq__ (has_eq, ~1056),
+        // PartialOrd ⇐ __lt__ (has_lt, ~1096). If ANY variant lacks the trait, the
+        // forward (`write!("{}", x)`, `a == b`, `a.partial_cmp(b)`) would not
+        // resolve, so emit NO impl of that trait for B__. Cross-variant comparison
+        // is Python-honest: `==` is false, ordering is None.
+        let variant_resolved: Vec<Vec<Func>> =
+            variants.iter().map(|v| self.resolved_methods(v)).collect();
+        let all_variants_have = |pred: &dyn Fn(&Func) -> bool| -> bool {
+            variant_resolved.iter().all(|ms| ms.iter().any(|m| pred(m)))
+        };
+        let all_have_display =
+            all_variants_have(&|m| m.name == "__str__" || m.name == "__repr__");
+        let all_have_eq = all_variants_have(&|m| m.name == "__eq__");
+        let all_have_lt = all_variants_have(&|m| m.name == "__lt__");
+
+        if all_have_display {
+            let arms: Vec<String> = variants
+                .iter()
+                .map(|v| format!("{}::{}(x) => write!(__f, \"{{}}\", x)", enum_name, v))
+                .collect();
+            self.line("#[allow(dead_code)]");
+            self.line(&format!("impl ::std::fmt::Display for {} {{", enum_name));
+            self.indent += 1;
+            self.line(
+                "fn fmt(&self, __f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {",
+            );
+            self.indent += 1;
+            self.line(&format!("match self {{ {} }}", arms.join(", ")));
+            self.indent -= 1;
+            self.line("}");
+            self.indent -= 1;
+            self.line("}");
+            self.line("");
+        }
+
+        if all_have_eq {
+            let mut arms: Vec<String> = variants
+                .iter()
+                .map(|v| format!("({0}::{1}(a), {0}::{1}(b)) => a == b", enum_name, v))
+                .collect();
+            // Cross-variant: Python `Dog(..) == Cat(..)` is False.
+            arms.push("_ => false".to_string());
+            self.line("#[allow(dead_code)]");
+            self.line(&format!("impl ::std::cmp::PartialEq for {} {{", enum_name));
+            self.indent += 1;
+            self.line(&format!("fn eq(&self, other: &{}) -> bool {{", enum_name));
+            self.indent += 1;
+            self.line(&format!("match (self, other) {{ {} }}", arms.join(", ")));
+            self.indent -= 1;
+            self.line("}");
+            self.indent -= 1;
+            self.line("}");
+            self.line("");
+        }
+
+        // Rust's `PartialOrd: PartialEq` supertrait bound: the enum can only impl
+        // PartialOrd if it ALSO impls PartialEq. emit_class satisfies this on each
+        // variant struct by DERIVING PartialEq when `__eq__` is absent, but the
+        // companion enum derives only Clone+Debug and never PartialEq, so require
+        // all_have_eq here too (true for inherit_dunders: every variant has both).
+        if all_have_lt && all_have_eq {
+            let mut arms: Vec<String> = variants
+                .iter()
+                .map(|v| {
+                    format!("({0}::{1}(a), {0}::{1}(b)) => a.partial_cmp(b)", enum_name, v)
+                })
+                .collect();
+            // Cross-variant: two different concrete types are uncomparable → None.
+            arms.push("_ => None".to_string());
+            self.line("#[allow(dead_code)]");
+            self.line(&format!("impl ::std::cmp::PartialOrd for {} {{", enum_name));
+            self.indent += 1;
+            self.line(&format!(
+                "fn partial_cmp(&self, other: &{}) -> Option<::std::cmp::Ordering> {{",
+                enum_name
+            ));
+            self.indent += 1;
+            self.line(&format!("match (self, other) {{ {} }}", arms.join(", ")));
+            self.indent -= 1;
+            self.line("}");
+            self.indent -= 1;
+            self.line("}");
+            self.line("");
+        }
+
         Ok(())
     }
 

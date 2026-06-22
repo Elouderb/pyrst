@@ -152,7 +152,9 @@ impl<'a> Codegen<'a> {
                     // Build a struct literal with zeroed primitive fields.
                     let fields: Vec<String> = self.ctx.get_all_fields(n).iter().map(|f| {
                         let inner_ty = Ty::from_type_expr(&f.ty).unwrap_or(Ty::Int);
-                        format!("{}: {}", f.name, self.zeroed_default(&inner_ty))
+                        // (EPIC-6) Escape a keyword field name in the zeroed
+                        // struct-literal default (matches the struct field def).
+                        format!("{}: {}", escape_ident(&f.name), self.zeroed_default(&inner_ty))
                     }).collect();
                     format!("{} {{ {} }}", n, fields.join(", "))
                 } else {
@@ -263,11 +265,24 @@ impl<'a> Codegen<'a> {
             if ch.is_alphanumeric() || ch == '_' {
                 // Collect the full identifier
                 let mut ident = String::from(ch);
-                let mut lookahead = vec![ch];
+
+                // (EPIC-6) A raw identifier `r#kw` is a single token: if we are at
+                // a bare `r` immediately followed by `#` and then an identifier
+                // char, absorb the `#` so the whole `r#kw` is collected as one
+                // token (and can match a `r#`-escaped `old_name`). Without this,
+                // `r#type` would split into `r` / `#` / `type` and a replace of
+                // `r#type` would corrupt the raw identifier.
+                if ch == 'r' && chars.peek() == Some(&'#') {
+                    let mut probe = chars.clone();
+                    probe.next(); // consume '#'
+                    if matches!(probe.peek(), Some(c) if c.is_alphanumeric() || *c == '_') {
+                        chars.next(); // consume '#'
+                        ident.push('#');
+                    }
+                }
 
                 while let Some(&next_ch) = chars.peek() {
                     if next_ch.is_alphanumeric() || next_ch == '_' {
-                        lookahead.push(next_ch);
                         ident.push(next_ch);
                         chars.next();
                     } else {
@@ -1073,6 +1088,14 @@ impl<'a> Codegen<'a> {
         let is_static = f.decorators.contains(&"staticmethod".to_string());
         let name = if f.name == "main" && method_of.is_none() {
             "user_main".to_string()
+        } else if method_of.is_none() {
+            // (EPIC-6) Free-function name: escape a keyword name so the `fn` def
+            // matches every call site (call sites emit the name through
+            // `emit_expr`'s Ident arm, which escapes identically). METHOD names
+            // are deliberately NOT escaped here — method-name escaping is the
+            // sibling dispatch card's concern, and escaping only the definition
+            // would desync it from the (untouched) dispatch call sites.
+            escape_ident(&f.name)
         } else {
             f.name.clone()
         };
@@ -1107,12 +1130,14 @@ impl<'a> Codegen<'a> {
                 // prefix: the binding itself is the reference (already `&mut`);
                 // field/method mutation and `place.clone()` reads both work
                 // through auto-deref.
-                let _ = write!(sig, "{}: &mut {}", p.name, pty);
+                let _ = write!(sig, "{}: &mut {}", escape_ident(&p.name), pty);
             } else {
                 // Value params are bound `mut` so functions may mutate them or
                 // their fields in place (Python passes mutable objects by
                 // reference); unused-mut is allowed in the generated crate.
-                let _ = write!(sig, "mut {}: {}", p.name, pty);
+                // (EPIC-6) Escape a keyword param name; body uses resolve to the
+                // same escaped form via emit_expr's Ident arm.
+                let _ = write!(sig, "mut {}: {}", escape_ident(&p.name), pty);
             }
         }
         let ret = Ty::from_type_expr(&f.ret)?;
@@ -1169,7 +1194,9 @@ impl<'a> Codegen<'a> {
         for name in hoist {
             let ty = self.locals.get(&name).cloned().unwrap_or(Ty::Unknown);
             if let Some(def) = self.default_val(&ty) {
-                self.line(&format!("let mut {}: {} = {};", name, self.rust_ty(&ty), def));
+                // (EPIC-6) Escape the hoisted local's emitted name; the raw name
+                // stays the `declared`/`locals` key.
+                self.line(&format!("let mut {}: {} = {};", escape_ident(&name), self.rust_ty(&ty), def));
                 self.declared.insert(name);
             }
         }
@@ -1293,7 +1320,9 @@ impl<'a> Codegen<'a> {
         self.indent += 1;
         for f in &all_fields {
             let ty = Ty::from_type_expr(&f.ty)?;
-            self.line(&format!("{}: {},", f.name, self.rust_ty(&ty)));
+            // (EPIC-6) Escape a keyword field name in the struct definition; every
+            // field read/write/init escapes the same way so they stay in sync.
+            self.line(&format!("{}: {},", escape_ident(&f.name), self.rust_ty(&ty)));
         }
         self.indent -= 1;
         self.line("}");
@@ -1326,17 +1355,21 @@ impl<'a> Codegen<'a> {
                     let param_strs: Result<Vec<_>> = non_self.iter()
                         .map(|p| {
                             let ty = Ty::from_type_expr(&p.ty)?;
-                            Ok(format!("{}: {}", p.name, self.rust_ty(&ty)))
+                            // (EPIC-6) new()'s params + their forwarded uses below
+                            // escape identically.
+                            Ok(format!("{}: {}", escape_ident(&p.name), self.rust_ty(&ty)))
                         })
                         .collect();
                     let param_strs = param_strs?;
-                    let param_names: Vec<_> = non_self.iter().map(|p| p.name.clone()).collect();
+                    let param_names: Vec<_> = non_self.iter().map(|p| escape_ident(&p.name)).collect();
                     let defaults: Vec<String> = all_fields.iter().map(|f| {
                         let ty = Ty::from_type_expr(&f.ty).unwrap_or(Ty::Unknown);
                         // Use zeroed_default which handles Copy classes that don't
                         // implement Default (unlike a plain Default::default() call).
                         let dv = self.zeroed_default(&ty);
-                        format!("{}: {}", f.name, dv)
+                        // (EPIC-6) Escape a keyword field name in the struct-literal
+                        // initializer (matches the escaped struct field def).
+                        format!("{}: {}", escape_ident(&f.name), dv)
                     }).collect();
                     self.line(&format!("fn new({}) -> Self {{", param_strs.join(", ")));
                     self.indent += 1;
@@ -1354,11 +1387,14 @@ impl<'a> Codegen<'a> {
                 let param_strs: Result<Vec<_>> = all_fields.iter()
                     .map(|f| {
                         let ty = Ty::from_type_expr(&f.ty)?;
-                        Ok(format!("{}: {}", f.name, self.rust_ty(&ty)))
+                        // (EPIC-6) Dataclass ctor: param name == field name; both
+                        // the param binding here and the field-init shorthand below
+                        // escape, so `ClassName { r#type, .. }` stays consistent.
+                        Ok(format!("{}: {}", escape_ident(&f.name), self.rust_ty(&ty)))
                     })
                     .collect();
                 let param_strs = param_strs?;
-                let field_inits: Vec<_> = all_fields.iter().map(|f| f.name.clone()).collect();
+                let field_inits: Vec<_> = all_fields.iter().map(|f| escape_ident(&f.name)).collect();
                 self.line(&format!("fn new({}) -> Self {{", param_strs.join(", ")));
                 self.indent += 1;
                 self.line(&format!("{} {{ {} }}", c.name, field_inits.join(", ")));
@@ -1702,10 +1738,14 @@ impl<'a> Codegen<'a> {
         for f in &accessor_fields {
             let fty = Ty::from_type_expr(&f.ty)?;
             let ret = self.rust_ty(&fty);
+            // (EPIC-6) `x.<field>` reads the inner value struct's field, so a
+            // keyword field name is escaped to match the (escaped) struct def. The
+            // accessor METHOD itself is `__field_<name>` (prefix → never a
+            // keyword), so its name is left unescaped at both def and call site.
             let read = if crate::typeck::is_copy(&fty) {
-                format!("x.{}", f.name)
+                format!("x.{}", escape_ident(&f.name))
             } else {
-                format!("x.{}.clone()", f.name)
+                format!("x.{}.clone()", escape_ident(&f.name))
             };
             let arms: Vec<String> = variants
                 .iter()
@@ -1859,12 +1899,15 @@ impl<'a> Codegen<'a> {
         let mut fwd: Vec<String> = Vec::new();
         for p in &non_self {
             let pty = self.rust_ty(&Ty::from_type_expr(&p.ty)?);
+            // (EPIC-6) Dispatch-wrapper params + their forwarding both escape so a
+            // keyword-named param stays consistent. (The method NAME `m.name` is
+            // left unescaped — method-name escaping is the sibling dispatch card.)
             if p.by_ref {
-                sig_params.push(format!("{}: &mut {}", p.name, pty));
+                sig_params.push(format!("{}: &mut {}", escape_ident(&p.name), pty));
             } else {
-                sig_params.push(format!("{}: {}", p.name, pty));
+                sig_params.push(format!("{}: {}", escape_ident(&p.name), pty));
             }
-            fwd.push(p.name.clone());
+            fwd.push(escape_ident(&p.name));
         }
         let ret = self.rust_ty(&Ty::from_type_expr(&m.ret)?);
         let fwd_args = fwd.join(", ");
@@ -1969,12 +2012,14 @@ impl<'a> Codegen<'a> {
     fn emit_place(&mut self, e: &Expr) -> Result<String> {
         match e {
             // A bare name (`self`, a local, a `mut` param) is already a place.
-            Expr::Ident(n, _) => Ok(n.clone()),
+            // (EPIC-6) Escape a keyword-named place so it matches its `let`/param
+            // definition (which is also escaped).
+            Expr::Ident(n, _) => Ok(escape_ident(n)),
             // Field access: the base recursively as a place, then `.field`.
             // (No @property handling: a property getter is not an lvalue.)
             Expr::Attr { obj, name, .. } => {
                 let base = self.emit_place(obj)?;
-                Ok(format!("{}.{}", base, name))
+                Ok(format!("{}.{}", base, escape_ident(name)))
             }
             // Subscript in a *base* position (we are descending further into the
             // target, e.g. `grid[r][c]` or `self.dict[k].field`): produce a place
@@ -2336,12 +2381,15 @@ impl<'a> Codegen<'a> {
                             // `emits_int_pow` covers the case the oracle now types as
                             // Float (D5) but emission still lowers to i64.
                             let value_ty = self.type_of_expr(value);
+                            // (EPIC-6) Escape the emitted binding name; the raw
+                            // `target` stays the `declared`/`locals` key.
+                            let target_e = escape_ident(target);
                             if matches!(ty_obj, Ty::Float)
                                 && (matches!(value_ty, Ty::Int) || self.emits_int_pow(value))
                             {
-                                self.line(&format!("let mut {}: {} = {} as f64;", target, self.rust_ty(&ty_obj), v));
+                                self.line(&format!("let mut {}: {} = {} as f64;", target_e, self.rust_ty(&ty_obj), v));
                             } else {
-                                self.line(&format!("let mut {}: {} = {};", target, self.rust_ty(&ty_obj), v));
+                                self.line(&format!("let mut {}: {} = {};", target_e, self.rust_ty(&ty_obj), v));
                             }
                         }
                         None => {
@@ -2357,12 +2405,14 @@ impl<'a> Codegen<'a> {
                             self.locals.insert(target.clone(), decl_ty.clone());
                             // If the variable is later widened from int to float,
                             // declare it as f64 and cast the integer initializer.
+                            // (EPIC-6) Escape the emitted binding name.
+                            let target_e = escape_ident(target);
                             if matches!(decl_ty, Ty::Float)
                                 && (matches!(value_ty, Ty::Int) || self.emits_int_pow(value))
                             {
-                                self.line(&format!("let mut {}: f64 = {} as f64;", target, v));
+                                self.line(&format!("let mut {}: f64 = {} as f64;", target_e, v));
                             } else {
-                                self.line(&format!("let mut {} = {};", target, v));
+                                self.line(&format!("let mut {} = {};", target_e, v));
                             }
                         }
                     }
@@ -2373,26 +2423,36 @@ impl<'a> Codegen<'a> {
                     // always type-checks) instead of a plain reassignment.
                     let value_ty = self.type_of_expr(value);
                     let cur = self.locals.get(target).cloned().unwrap_or(Ty::Unknown);
+                    // (EPIC-6) Escape the emitted name (raw `target` stays map key).
+                    let target_e = escape_ident(target);
                     if Self::types_conflict(&cur, &value_ty) {
                         self.locals.insert(target.clone(), value_ty);
-                        self.line(&format!("let mut {} = {};", target, v));
+                        self.line(&format!("let mut {} = {};", target_e, v));
                     } else if matches!(cur, Ty::Float)
                         && (matches!(value_ty, Ty::Int) || self.emits_int_pow(value))
                     {
                         // Reassigning an int into a float-typed (e.g. hoisted) var.
-                        self.line(&format!("{} = {} as f64;", target, v));
+                        self.line(&format!("{} = {} as f64;", target_e, v));
                     } else {
-                        self.line(&format!("{} = {};", target, v));
+                        self.line(&format!("{} = {};", target_e, v));
                     }
                 }
             }
             Stmt::Unpack { targets, value, .. } => {
                 let v = self.emit_expr(value)?;
-                self.line(&format!("let ({}) = {};", targets.join(", "), v));
+                // (EPIC-6) Escape each unpack target name; body uses resolve to the
+                // same escaped form via emit_expr's Ident arm.
+                let targets_e: Vec<String> = targets.iter().map(|t| escape_ident(t)).collect();
+                self.line(&format!("let ({}) = {};", targets_e.join(", "), v));
             }
             Stmt::AugAssign { target, op, value, .. } => {
                 let v = self.emit_expr(value)?;
                 let target_ty = self.locals.get(target.as_str()).cloned().unwrap_or(Ty::Unknown);
+                // (EPIC-6) `target` names an existing local (emitted escaped by its
+                // `let`), so every occurrence here — store target AND read — uses
+                // the escaped form.
+                let target = escape_ident(target);
+                let target = target.as_str();
                 match op {
                     BinOp::FloorDiv => {
                         // Python's //= floors toward negative infinity; Rust's /= truncates toward zero.
@@ -2448,7 +2508,10 @@ impl<'a> Codegen<'a> {
                 // the block (e.g. `str(x)`) sees the inner type; restore after.
                 let then_narrow = narrowed.as_ref().filter(|(_, is_not_none, _)| *is_not_none);
                 let then_saved = then_narrow.map(|(var, _, inner)| {
-                    self.line(&format!("let {} = {}.unwrap();", var, var));
+                    // (EPIC-6) `var` names an existing Optional local; both the new
+                    // shadow binding and the `.unwrap()` read escape identically.
+                    let var_e = escape_ident(var);
+                    self.line(&format!("let {} = {}.unwrap();", var_e, var_e));
                     let prev = self.locals.insert(var.clone(), inner.clone());
                     (var.clone(), prev)
                 });
@@ -2471,7 +2534,9 @@ impl<'a> Codegen<'a> {
                     let else_narrow = narrowed.as_ref()
                         .filter(|(_, is_not_none, _)| !*is_not_none && elifs.is_empty());
                     let else_saved = else_narrow.map(|(var, _, inner)| {
-                        self.line(&format!("let {} = {}.unwrap();", var, var));
+                        // (EPIC-6) Same escape as the THEN-branch narrowing above.
+                        let var_e = escape_ident(var);
+                        self.line(&format!("let {} = {}.unwrap();", var_e, var_e));
                         let prev = self.locals.insert(var.clone(), inner.clone());
                         (var.clone(), prev)
                     });
@@ -2540,10 +2605,12 @@ impl<'a> Codegen<'a> {
                 } else {
                     format!("{}.iter().cloned()", i)
                 };
+                // (EPIC-6) Escape each loop-variable name in the `for` pattern;
+                // body uses resolve to the same escaped form (emit_expr Ident).
                 let pat = if targets.len() == 1 {
-                    targets[0].clone()
+                    escape_ident(&targets[0])
                 } else {
-                    format!("({})", targets.join(", "))
+                    format!("({})", targets.iter().map(|t| escape_ident(t)).collect::<Vec<_>>().join(", "))
                 };
                 self.line(&format!("for {} in {} {{", pat, iter_expr));
                 self.indent += 1;
@@ -2701,8 +2768,13 @@ impl<'a> Codegen<'a> {
                         }
                         self.indent += 1;
                         if let Some(name) = &h.exc_name {
-                            self.line(&format!("let {} = __exc_msg.clone();", name));
-                            self.line(&format!("let _ = &{};", name));
+                            // (EPIC-6) `except E as <name>:` binds a user local;
+                            // escape it and the suppression read so a keyword name
+                            // (`except ValueError as type:`) compiles. Body uses
+                            // resolve to the same escaped form.
+                            let name_e = escape_ident(name);
+                            self.line(&format!("let {} = __exc_msg.clone();", name_e));
+                            self.line(&format!("let _ = &{};", name_e));
                         }
                         for s in &h.body { self.emit_stmt(s)?; }
                         self.line("::std::option::Option::None");
@@ -2745,7 +2817,9 @@ impl<'a> Codegen<'a> {
                     // on it (f.write/read) resolve to the right emission.
                     let prev = self.locals.get(name).cloned();
                     self.locals.insert(name.clone(), self.type_of_expr(ctx_expr));
-                    self.line(&format!("let mut {} = {};", name, ctx_s));
+                    // (EPIC-6) `with ... as <name>:` binds a user local; escape the
+                    // emitted name (raw stays the `locals` key).
+                    self.line(&format!("let mut {} = {};", escape_ident(name), ctx_s));
                     Some((name.clone(), prev))
                 } else {
                     self.line(&format!("let _ = {};", ctx_s));
@@ -2793,7 +2867,9 @@ impl<'a> Codegen<'a> {
                 // The base must be emitted as a *place* (lvalue), not the
                 // clone-based rvalue emit_expr produces for Attr/Index.
                 let place = self.emit_place(obj)?;
-                self.line(&format!("{}.{} = {};", place, attr, v));
+                // (EPIC-6) Escape a keyword field name in the field-WRITE target so
+                // it matches the (escaped) struct field def.
+                self.line(&format!("{}.{} = {};", place, escape_ident(attr), v));
             }
             Stmt::IndexAssign { obj, idx, value, .. } => {
                 let v = self.emit_consuming(value)?;
@@ -2951,6 +3027,9 @@ impl<'a> Codegen<'a> {
                     format!("{}.iter().cloned()", iter_s)
                 };
                 let elt_s = self.emit_expr(elt)?;
+                // (EPIC-6) Escape the comprehension target in the closure pattern;
+                // the elt/cond bodies reference it via emit_expr Ident (same escape).
+                let target = escape_ident(target);
                 if let Some(cond_expr) = cond {
                     let cond_s = self.emit_expr(cond_expr)?;
                     format!("{}.filter_map(|{}| if {} {{ Some({}) }} else {{ None }} ).collect::<Vec<_>>()",
@@ -2970,6 +3049,8 @@ impl<'a> Codegen<'a> {
                     format!("{}.iter().cloned()", iter_s)
                 };
                 let elt_s = self.emit_expr(elt)?;
+                // (EPIC-6) Escape the comprehension target (see ListComp above).
+                let target = escape_ident(target);
                 if let Some(cond_expr) = cond {
                     let cond_s = self.emit_expr(cond_expr)?;
                     format!("{}.filter_map(|{}| if {} {{ Some({}) }} else {{ None }} ).collect::<::std::collections::HashSet<_>>()",
@@ -2990,6 +3071,8 @@ impl<'a> Codegen<'a> {
                 };
                 let key_s = self.emit_expr(key)?;
                 let val_s = self.emit_expr(val)?;
+                // (EPIC-6) Escape the comprehension target (see ListComp above).
+                let target = escape_ident(target);
                 if let Some(cond_expr) = cond {
                     let cond_s = self.emit_expr(cond_expr)?;
                     format!("{}.filter_map(|{}| if {} {{ Some(({}, {})) }} else {{ None }} ).collect::<::std::collections::HashMap<_,_>>()",
@@ -3029,7 +3112,12 @@ impl<'a> Codegen<'a> {
                 format!("vec![{}].into_iter().collect::<::std::collections::HashMap<_,_>>()",
                     inserts.join(", "))
             }
-            Expr::Ident(n, _) => n.clone(),
+            // (EPIC-6) THE central identifier-use emission. Covers a bare
+            // variable read AND a free-function call name (a user-fn call falls
+            // through to `emit_expr(callee)` here), so escaping once here keeps
+            // def and every use in sync. `self` is not a keyword and passes
+            // through unchanged (legitimate receiver).
+            Expr::Ident(n, _) => escape_ident(n),
             Expr::Call { callee, args, kwargs, .. } => {
                 // Multi-arg print with inline format
                 if let Expr::Ident(n, _) = callee.as_ref() {
@@ -3179,8 +3267,14 @@ impl<'a> Codegen<'a> {
                                     } else {
                                         self.locals.remove(param_name.as_str());
                                     }
-                                    // Replace param_name with __x in the body (word-boundary aware)
-                                    Self::replace_identifier(&body_s, param_name.as_str(), "__x")
+                                    // Replace param_name with __x in the body (word-boundary aware).
+                                    // (EPIC-6) The body emitted the param through
+                                    // emit_expr's Ident arm, which ESCAPES a keyword
+                                    // param to `r#<name>`; search for that escaped
+                                    // form so a keyword sort-key param is renamed
+                                    // correctly (replace_identifier treats `r#kw` as
+                                    // one token).
+                                    Self::replace_identifier(&body_s, escape_ident(&param_name).as_str(), "__x")
                                 } else {
                                     // Regular expression: wrap in closure that calls the key function
                                     self.emit_expr(key_expr)?
@@ -3221,8 +3315,14 @@ impl<'a> Codegen<'a> {
                                     } else {
                                         self.locals.remove(param_name.as_str());
                                     }
-                                    // Replace param_name with __x in the body (word-boundary aware)
-                                    Self::replace_identifier(&body_s, param_name.as_str(), "__x")
+                                    // Replace param_name with __x in the body (word-boundary aware).
+                                    // (EPIC-6) The body emitted the param through
+                                    // emit_expr's Ident arm, which ESCAPES a keyword
+                                    // param to `r#<name>`; search for that escaped
+                                    // form so a keyword sort-key param is renamed
+                                    // correctly (replace_identifier treats `r#kw` as
+                                    // one token).
+                                    Self::replace_identifier(&body_s, escape_ident(&param_name).as_str(), "__x")
                                 } else {
                                     // Regular expression: wrap in closure that calls the key function
                                     self.emit_expr(key_expr)?
@@ -3315,8 +3415,14 @@ impl<'a> Codegen<'a> {
                                     } else {
                                         self.locals.remove(param_name.as_str());
                                     }
-                                    // Replace param_name with __x in the body (word-boundary aware)
-                                    Self::replace_identifier(&body_s, param_name.as_str(), "__x")
+                                    // Replace param_name with __x in the body (word-boundary aware).
+                                    // (EPIC-6) The body emitted the param through
+                                    // emit_expr's Ident arm, which ESCAPES a keyword
+                                    // param to `r#<name>`; search for that escaped
+                                    // form so a keyword sort-key param is renamed
+                                    // correctly (replace_identifier treats `r#kw` as
+                                    // one token).
+                                    Self::replace_identifier(&body_s, escape_ident(&param_name).as_str(), "__x")
                                 } else {
                                     // Regular expression: wrap in closure that calls the key function
                                     self.emit_expr(key_expr)?
@@ -3701,7 +3807,9 @@ impl<'a> Codegen<'a> {
                                 // path above).
                                 let fty = self.class_field_type(&class_def, field_name);
                                 let v = self.emit_arg_into_slot(arg, fty.as_ref())?;
-                                parts.push(format!("{}: {}", field_name, v));
+                                // (EPIC-6) Escape a keyword field name in the
+                                // positional struct-literal init.
+                                parts.push(format!("{}: {}", escape_ident(field_name), v));
                             }
                             return Ok(format!("{} {{ {} }}", name, parts.join(", ")));
                         }
@@ -3712,7 +3820,9 @@ impl<'a> Codegen<'a> {
                             for (kw, val) in kwargs {
                                 let fty = self.class_field_type(&class_def, kw);
                                 let v = self.emit_arg_into_slot(val, fty.as_ref())?;
-                                parts.push(format!("{}: {}", kw, v));
+                                // (EPIC-6) Escape a keyword field name in the
+                                // keyword-arg struct-literal init.
+                                parts.push(format!("{}: {}", escape_ident(kw), v));
                             }
                             return Ok(format!("{} {{ {} }}", name, parts.join(", ")));
                         }
@@ -3733,7 +3843,9 @@ impl<'a> Codegen<'a> {
                             } else {
                                 "Default::default()".to_string()
                             };
-                            parts.push(format!("{}: {}", fname, default));
+                            // (EPIC-6) Escape a keyword field name in the no-arg
+                            // default struct-literal init.
+                            parts.push(format!("{}: {}", escape_ident(fname), default));
                         }
                         return Ok(format!("{} {{ {} }}", name, parts.join(", ")));
                     }
@@ -4323,7 +4435,10 @@ impl<'a> Codegen<'a> {
                 // Check if this is a @property access
                 let is_property = self.is_property_access(obj, name);
                 if is_property {
-                    format!("{}.{}()", o, name)
+                    // A @property getter call: the method name (`name`) is a user
+                    // method name — escaped so a keyword-named property still
+                    // compiles. (Plain field reads below are escaped likewise.)
+                    format!("{}.{}()", o, escape_ident(name))
                 } else if !matches!(obj.as_ref(),
                                     Expr::Ident(n, _) if n == "self"
                                         || self.concrete_struct_params.contains(n))
@@ -4340,9 +4455,15 @@ impl<'a> Codegen<'a> {
                     // `self` is the concrete struct (`Account`/`Savings`), so
                     // `self.balance` is an ordinary struct-field read. A field-WRITE
                     // through a base var is a deferred honest error (AttrAssign).
+                    // The companion-enum accessor is named `__field_<name>` (the
+                    // `__field_` prefix makes it a non-keyword), so it is NOT
+                    // escaped here — it must match the unescaped accessor emitted
+                    // by emit_companion_enum.
                     format!("{}.__field_{}()", o, name)
                 } else {
-                    format!("{}.{}", o, name)
+                    // (EPIC-6) Ordinary struct-field read: escape a keyword field
+                    // name so it matches the (escaped) struct field definition.
+                    format!("{}.{}", o, escape_ident(name))
                 }
             }
             Expr::Index { obj, idx, .. } => {
@@ -4688,8 +4809,11 @@ impl<'a> Codegen<'a> {
                 // element type for a lambda passed to map()/filter(). Hardcoding
                 // `: i64` was only correct for int iterables and broke e.g.
                 // `map(lambda w: len(w), words)` over a list[str].
+                // (EPIC-6) Escape each lambda param; the body references it via
+                // emit_expr Ident (same escape), so `|r#type| r#type + 1` stays
+                // consistent.
                 let param_strs: Vec<String> = params.iter()
-                    .map(|(name, _ty)| name.clone())
+                    .map(|(name, _ty)| escape_ident(name))
                     .collect();
                 let body_s = self.emit_expr(body)?;
                 format!("|{}| {}", param_strs.join(", "), body_s)
@@ -4803,6 +4927,51 @@ impl<'a> Codegen<'a> {
 /// Returns an empty vec for leaves, unknown/user-defined types, and
 /// `Exception` — in every one of those cases the caller falls back to an
 /// exact-match condition (`Exception` never reaches here: it is handled
+/// (EPIC-6) Rust keywords that CAN be used as raw identifiers (`r#kw`). A pyrst
+/// user name (var / param / field / free-fn) colliding with one of these is
+/// escaped so it round-trips through rustc instead of producing a confusing
+/// syntax error. The set is intentionally the Rust 2021 keyword set MINUS the
+/// four that rustc rejects as raw identifiers (`crate`, `self`, `super`, `Self`
+/// — handled by typeck rejection, see `reject_reserved_idents`). The pyrst lexer
+/// already reserves the *Python* keywords (`for`, `if`, `class`, `as`, `in`,
+/// `with`, `match`, `lambda`, ...), so those can never reach codegen as an
+/// identifier; only Rust-only keywords (`type`, `loop`, `fn`, `move`, `let`,
+/// `mut`, ...) can. `true`/`false` are NOT pyrst keywords (pyrst spells them
+/// `True`/`False`) and rustc *does* accept `r#true`/`r#false`, so they are
+/// escaped here rather than rejected.
+const RUST_RAW_ESCAPABLE_KEYWORDS: &[&str] = &[
+    // strict keywords (2015) that are not pyrst keywords
+    "as", "const", "enum", "extern", "fn", "impl", "let", "loop", "mod",
+    "move", "mut", "pub", "ref", "static", "struct", "trait", "type", "unsafe",
+    "use", "where",
+    // `true`/`false` — keywords in Rust, ordinary identifiers in pyrst, and
+    // valid as raw identifiers (`r#true`/`r#false`) per rustc 2021.
+    "true", "false",
+    // 2018+ strict keywords
+    "async", "await", "dyn",
+    // reserved-for-future keywords (escapable, kept for forward safety)
+    "abstract", "become", "box", "do", "final", "macro", "override", "priv",
+    "typeof", "unsized", "virtual", "yield", "try",
+];
+
+/// (EPIC-6) Escape a USER identifier (var / param / field / free-fn name) so it
+/// is a valid Rust identifier. Returns `r#<name>` when `name` is a raw-escapable
+/// Rust keyword; the bare name otherwise. This is a NO-OP for every non-keyword
+/// identifier (so the 189 existing positive goldens are byte-for-byte
+/// unchanged), and must be applied IDENTICALLY at the definition site and at
+/// every use of a name (a missed site = def/use mismatch = rustc error).
+///
+/// `self` is never passed through this for the method receiver (it is emitted
+/// verbatim as the Rust receiver); a *user* binding named `self`/`Self`/`super`/
+/// `crate` is rejected upstream by typeck, so it never reaches here.
+pub fn escape_ident(name: &str) -> String {
+    if RUST_RAW_ESCAPABLE_KEYWORDS.contains(&name) {
+        format!("r#{}", name)
+    } else {
+        name.to_string()
+    }
+}
+
 /// upstream as the catch-all `true` arm). The builtin hierarchy is only two
 /// levels deep, so each base's transitive closure is written out directly.
 fn exc_descendants(base: &str) -> Vec<&'static str> {

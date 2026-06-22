@@ -642,7 +642,223 @@ fn is_bare_main_call(s: &Stmt) -> bool {
 
 /// Type-check function/class bodies against a pre-built context.
 /// Used for multi-file compilation where the context is merged from all modules.
+/// (EPIC-6) Rust keywords that CANNOT be raw identifiers — `r#crate` / `r#self`
+/// / `r#super` / `r#Self` are rejected by rustc (verified against rustc 2021).
+/// A pyrst USER identifier (var / param / field / free-fn / comprehension or
+/// lambda target / except-as / with-as binding) colliding with one of these
+/// would have to be mangled to compile, so we reject it HONESTLY at typeck (an
+/// honest pyrst diagnostic beats a confusing rustc error or a silent mangle).
+/// All OTHER Rust keywords are escapable (`r#type`, `r#loop`, ...) and are
+/// handled transparently by codegen's `escape_ident`. NOTE: `self` here is a
+/// *user* binding named `self` — the legitimate method receiver `self` (the
+/// first parameter of a method) is recognized and exempted below.
+const RUST_NON_RAW_KEYWORDS: &[&str] = &["crate", "self", "super", "Self"];
+
+fn reject_if_reserved(name: &str, span: Span, role: &str) -> Result<()> {
+    if RUST_NON_RAW_KEYWORDS.contains(&name) {
+        return Err(Error::Type {
+            span,
+            msg: format!(
+                "`{}` cannot be used as a {} name: it is a Rust keyword that has no \
+                 raw-identifier form (`r#{}` is rejected by rustc), so pyrst cannot \
+                 lower it. Rename it (other Rust keywords like `type`/`loop` are \
+                 escaped automatically and need no change).",
+                name, role, name
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Walk a statement body and reject any local binding whose name is a non-raw
+/// Rust keyword (the same honest rejection applied to params/fields/fns at the
+/// top level). Covers `=` / `:` assignment targets, tuple-unpack targets, for
+/// loop variables, `with ... as`, `except ... as`, and the binding targets of
+/// comprehensions / lambdas reachable through expressions.
+fn reject_reserved_in_body(stmts: &[Stmt]) -> Result<()> {
+    for s in stmts {
+        match s {
+            Stmt::Assign { target, value, span, .. }
+            | Stmt::AugAssign { target, value, span, .. } => {
+                reject_if_reserved(target, *span, "variable")?;
+                reject_reserved_in_expr(value)?;
+            }
+            Stmt::Unpack { targets, value, span } => {
+                for t in targets { reject_if_reserved(t, *span, "variable")?; }
+                reject_reserved_in_expr(value)?;
+            }
+            Stmt::For { targets, iter, body, span } => {
+                for t in targets { reject_if_reserved(t, *span, "loop variable")?; }
+                reject_reserved_in_expr(iter)?;
+                reject_reserved_in_body(body)?;
+            }
+            Stmt::While { cond, body, .. } => {
+                reject_reserved_in_expr(cond)?;
+                reject_reserved_in_body(body)?;
+            }
+            Stmt::If { cond, then, elifs, else_, .. } => {
+                reject_reserved_in_expr(cond)?;
+                reject_reserved_in_body(then)?;
+                for (c, b) in elifs {
+                    reject_reserved_in_expr(c)?;
+                    reject_reserved_in_body(b)?;
+                }
+                if let Some(b) = else_ { reject_reserved_in_body(b)?; }
+            }
+            Stmt::With { ctx_expr, as_name, body, span } => {
+                reject_reserved_in_expr(ctx_expr)?;
+                if let Some(n) = as_name { reject_if_reserved(n, *span, "variable")?; }
+                reject_reserved_in_body(body)?;
+            }
+            Stmt::Try { body, handlers, else_, finally_, .. } => {
+                reject_reserved_in_body(body)?;
+                for h in handlers {
+                    if let Some(n) = &h.exc_name {
+                        reject_if_reserved(n, h.span, "variable")?;
+                    }
+                    reject_reserved_in_body(&h.body)?;
+                }
+                if let Some(b) = else_ { reject_reserved_in_body(b)?; }
+                if let Some(b) = finally_ { reject_reserved_in_body(b)?; }
+            }
+            Stmt::Match { subject, arms, .. } => {
+                reject_reserved_in_expr(subject)?;
+                for arm in arms {
+                    if let Some(g) = &arm.guard { reject_reserved_in_expr(g)?; }
+                    reject_reserved_in_body(&arm.body)?;
+                }
+            }
+            Stmt::Return(Some(e), _) | Stmt::Expr(e) | Stmt::Del { target: e, .. } => {
+                reject_reserved_in_expr(e)?;
+            }
+            Stmt::Assert { cond, msg, .. } => {
+                reject_reserved_in_expr(cond)?;
+                if let Some(m) = msg { reject_reserved_in_expr(m)?; }
+            }
+            Stmt::Raise { exc, .. } => {
+                if let Some(e) = exc { reject_reserved_in_expr(e)?; }
+            }
+            Stmt::AttrAssign { obj, value, .. } => {
+                reject_reserved_in_expr(obj)?;
+                reject_reserved_in_expr(value)?;
+            }
+            Stmt::IndexAssign { obj, idx, value, .. } => {
+                reject_reserved_in_expr(obj)?;
+                reject_reserved_in_expr(idx)?;
+                reject_reserved_in_expr(value)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Reject a comprehension / lambda binding target inside an expression. Only the
+/// BINDING positions matter (a non-raw keyword used as a plain `Expr::Ident`
+/// READ never resolves to a real var — name resolution already rejects an
+/// undefined name — so we only police the introducing positions here).
+fn reject_reserved_in_expr(e: &Expr) -> Result<()> {
+    match e {
+        Expr::ListComp { elt, target, iter, cond, span }
+        | Expr::SetComp { elt, target, iter, cond, span } => {
+            reject_if_reserved(target, *span, "comprehension variable")?;
+            reject_reserved_in_expr(elt)?;
+            reject_reserved_in_expr(iter)?;
+            if let Some(c) = cond { reject_reserved_in_expr(c)?; }
+        }
+        Expr::DictComp { key, val, target, iter, cond, span } => {
+            reject_if_reserved(target, *span, "comprehension variable")?;
+            reject_reserved_in_expr(key)?;
+            reject_reserved_in_expr(val)?;
+            reject_reserved_in_expr(iter)?;
+            if let Some(c) = cond { reject_reserved_in_expr(c)?; }
+        }
+        Expr::Lambda { params, body, span } => {
+            for (n, _) in params { reject_if_reserved(n, *span, "lambda parameter")?; }
+            reject_reserved_in_expr(body)?;
+        }
+        Expr::Call { callee, args, kwargs, .. } => {
+            reject_reserved_in_expr(callee)?;
+            for a in args { reject_reserved_in_expr(a)?; }
+            for (_, v) in kwargs { reject_reserved_in_expr(v)?; }
+        }
+        Expr::Attr { obj, .. } => reject_reserved_in_expr(obj)?,
+        Expr::Index { obj, idx, .. } => {
+            reject_reserved_in_expr(obj)?;
+            reject_reserved_in_expr(idx)?;
+        }
+        Expr::Slice { obj, start, stop, step, .. } => {
+            reject_reserved_in_expr(obj)?;
+            if let Some(x) = start { reject_reserved_in_expr(x)?; }
+            if let Some(x) = stop { reject_reserved_in_expr(x)?; }
+            if let Some(x) = step { reject_reserved_in_expr(x)?; }
+        }
+        Expr::BinOp { lhs, rhs, .. } => {
+            reject_reserved_in_expr(lhs)?;
+            reject_reserved_in_expr(rhs)?;
+        }
+        Expr::UnOp { expr, .. } => reject_reserved_in_expr(expr)?,
+        Expr::IfExp { test, body, orelse, .. } => {
+            reject_reserved_in_expr(test)?;
+            reject_reserved_in_expr(body)?;
+            reject_reserved_in_expr(orelse)?;
+        }
+        Expr::List(items, _) | Expr::Tuple(items, _) | Expr::Set(items, _) => {
+            for it in items { reject_reserved_in_expr(it)?; }
+        }
+        Expr::Dict(pairs, _) => {
+            for (k, v) in pairs {
+                reject_reserved_in_expr(k)?;
+                reject_reserved_in_expr(v)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// (EPIC-6) Reject every USER identifier whose name is a non-raw Rust keyword
+/// (`crate`/`self`/`super`/`Self`) BEFORE body type-checking, so both `check`
+/// and `build` fail honestly. The method receiver `self` is exempt (it is the
+/// conventional receiver, emitted verbatim as the Rust `&self`).
+fn reject_reserved_idents(m: &Module) -> Result<()> {
+    for s in &m.stmts {
+        match s {
+            Stmt::Func(f) => {
+                reject_if_reserved(&f.name, f.span, "function")?;
+                for p in &f.params {
+                    reject_if_reserved(&p.name, p.span, "parameter")?;
+                }
+                reject_reserved_in_body(&f.body)?;
+            }
+            Stmt::Class(c) => {
+                for field in &c.fields {
+                    reject_if_reserved(&field.name, field.span, "field")?;
+                }
+                for method in &c.methods {
+                    // A method's first param `self` is the legitimate receiver and
+                    // is exempt; every other param/binding is policed.
+                    for (i, p) in method.params.iter().enumerate() {
+                        let is_receiver = i == 0 && p.name == "self";
+                        if !is_receiver {
+                            reject_if_reserved(&p.name, p.span, "parameter")?;
+                        }
+                    }
+                    reject_reserved_in_body(&method.body)?;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 pub fn check_bodies(m: &Module, ctx: &TyCtx) -> Result<()> {
+    // (EPIC-6) Reject non-raw-keyword user identifiers up front (honest in both
+    // `check` and `build`). Escapable Rust keywords (`type`, `loop`, ...) are
+    // accepted here and lowered via codegen's `escape_ident`.
+    reject_reserved_idents(m)?;
+
     // Second pass: type-check function bodies.
     for s in &m.stmts {
         match s {

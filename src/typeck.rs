@@ -354,6 +354,34 @@ pub fn is_subclass(child: &str, ancestor: &str, ctx: &TyCtx) -> bool {
     }
 }
 
+/// (EPIC-5 C2-2b-i) The nearest common ancestor of two user classes, or `None`
+/// when they share no user-declared ancestor. Single inheritance makes each
+/// class's ancestor chain linear, so we walk `a`'s chain (a, a's base, ...) and
+/// return the first entry that is also an ancestor of `b` (`is_subclass(b, x)`).
+/// Used to unify two SIBLING subclasses (`Dog`, `Cat`) flowing into one slot —
+/// e.g. a `list[Animal] = [Dog(...), Cat(...)]` literal — to their common base
+/// `Animal`. `is_subclass` is reflexive, so an ancestor/descendant pair already
+/// resolves at the first step (covered by the explicit arms in
+/// `unify_branch_types`); this only adds the sibling case.
+pub fn nearest_common_ancestor(a: &str, b: &str, ctx: &TyCtx) -> Option<String> {
+    let mut current = a;
+    let mut visited = std::collections::HashSet::new();
+    loop {
+        if !visited.insert(current.to_string()) {
+            return None; // cycle guard (defensive; single inheritance enforced)
+        }
+        // `current` is an ancestor of `b` (reflexively for `current == b`).
+        if is_subclass(b, current, ctx) {
+            return Some(current.to_string());
+        }
+        let def = ctx.classes.get(current)?;
+        match def.bases.iter().find(|x| ctx.classes.contains_key(x.as_str())) {
+            Some(base) => current = base,
+            None => return None, // chain ended at a builtin/no base — no common ancestor
+        }
+    }
+}
+
 // Extract field assignments from __init__ method
 pub fn extract_init_fields(class_def: &mut ClassDef) {
     let mut discovered_fields: std::collections::HashMap<String, TypeExpr> = std::collections::HashMap::new();
@@ -931,8 +959,12 @@ fn unify_branch_types(a: Ty, b: Ty, ctx: &TyCtx) -> Option<Ty> {
     // class-pair arm only fires for `(Class, Class)`, and for unrelated classes
     // both `is_subclass` checks are false, so the original directional gate is
     // the deciding test exactly as before.
+    // (EPIC-5 C2-2b-i) Two classes are "related" for unification when one derives
+    // from the other OR they share a common user-declared ancestor (sibling
+    // subclasses unify at that ancestor — `Dog` & `Cat` meet at `Animal`).
     let class_related = matches!((&a, &b), (Ty::Class(x), Ty::Class(y))
-        if is_subclass(x, y, ctx) || is_subclass(y, x, ctx));
+        if is_subclass(x, y, ctx) || is_subclass(y, x, ctx)
+            || nearest_common_ancestor(x, y, ctx).is_some());
     if !class_related && !types_compatible(&a, &b, ctx) {
         return None;
     }
@@ -949,6 +981,16 @@ fn unify_branch_types(a: Ty, b: Ty, ctx: &TyCtx) -> Option<Ty> {
         // the equal-name case fell through to the default `=> a` arm unchanged.
         (Ty::Class(da), Ty::Class(db)) if da != db && is_subclass(da, db, ctx) => b, // a derives from b -> b is base
         (Ty::Class(da), Ty::Class(db)) if da != db && is_subclass(db, da, ctx) => a, // b derives from a -> a is base
+        // (EPIC-5 C2-2b-i) Two SIBLING subclasses unify to their nearest common
+        // ancestor (`Dog` & `Cat` -> `Animal`). Reached only when neither is a
+        // subclass of the other but a common ancestor exists (the `class_related`
+        // guard above admitted the pair).
+        (Ty::Class(da), Ty::Class(db)) if da != db => {
+            match nearest_common_ancestor(da, db, ctx) {
+                Some(anc) => Ty::Class(anc),
+                None => a, // defensive: guard already ensured one exists
+            }
+        }
         // `a` is the concrete side (or both equal) -> keep it.
         _ => a,
     })
@@ -3416,6 +3458,49 @@ mod tests {
         // Unrelated classes do not unify (no common slot in C1).
         assert_eq!(
             unify_branch_types(Ty::Class("Rock".into()), Ty::Class("Animal".into()), &ctx),
+            None
+        );
+    }
+
+    /// Sibling subclasses both directly under one base (`Dog`, `Cat` : `Animal`).
+    fn sibling_ctx() -> TyCtx {
+        let mut ctx = TyCtx::new();
+        ctx.classes.insert("Animal".into(), class_def("Animal", &[]));
+        ctx.classes.insert("Dog".into(), class_def("Dog", &["Animal"]));
+        ctx.classes.insert("Cat".into(), class_def("Cat", &["Animal"]));
+        ctx.classes.insert("Rock".into(), class_def("Rock", &[]));
+        ctx
+    }
+
+    #[test]
+    fn nearest_common_ancestor_siblings_and_chain() {
+        let ctx = sibling_ctx();
+        // (EPIC-5 C2-2b-i) Two sibling subclasses meet at their shared base.
+        assert_eq!(nearest_common_ancestor("Dog", "Cat", &ctx), Some("Animal".into()));
+        assert_eq!(nearest_common_ancestor("Cat", "Dog", &ctx), Some("Animal".into()));
+        // Reflexive / ancestor-descendant cases resolve at the wider class.
+        assert_eq!(nearest_common_ancestor("Dog", "Animal", &ctx), Some("Animal".into()));
+        assert_eq!(nearest_common_ancestor("Dog", "Dog", &ctx), Some("Dog".into()));
+        // No common user-declared ancestor -> None.
+        assert_eq!(nearest_common_ancestor("Dog", "Rock", &ctx), None);
+    }
+
+    #[test]
+    fn unify_branch_types_siblings_yield_common_base() {
+        let ctx = sibling_ctx();
+        // (EPIC-5 C2-2b-i) `[Dog(), Cat()]` -> the literal's element type is the
+        // common base `Animal`, in EITHER element order.
+        assert_eq!(
+            unify_branch_types(Ty::Class("Dog".into()), Ty::Class("Cat".into()), &ctx),
+            Some(Ty::Class("Animal".into()))
+        );
+        assert_eq!(
+            unify_branch_types(Ty::Class("Cat".into()), Ty::Class("Dog".into()), &ctx),
+            Some(Ty::Class("Animal".into()))
+        );
+        // A class with no common ancestor with `Dog` still does NOT unify.
+        assert_eq!(
+            unify_branch_types(Ty::Class("Dog".into()), Ty::Class("Rock".into()), &ctx),
             None
         );
     }

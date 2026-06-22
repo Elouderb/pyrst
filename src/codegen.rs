@@ -17,6 +17,17 @@ use crate::diag::Result;
 // name so the local call sites read unchanged.
 use crate::typeck::{Ty, TyCtx, MUTATING_METHODS};
 
+/// (EPIC-5) Dunder method names that lower to Rust TRAIT impls (Display /
+/// PartialEq / PartialOrd / Add / ...) rather than inherent methods. ONE source
+/// of truth (same discipline as `MUTATING_METHODS` / `is_copy`): emit_class, the
+/// `__super_` alias pass, and the companion-enum dispatch all key off this list
+/// to decide what is NOT an ordinary dispatchable method. Hoisted from three
+/// identical local arrays (EPIC-5 C2-2b-i Step 0).
+const DUNDER_TRAIT_NAMES: &[&str] = &[
+    "__str__", "__repr__", "__add__", "__sub__", "__mul__",
+    "__eq__", "__neg__", "__bool__", "__lt__",
+];
+
 pub struct Codegen<'a> {
     pub ctx: &'a TyCtx,
     out: String,
@@ -51,11 +62,20 @@ pub struct Codegen<'a> {
     /// companion-enum name `n__` for polymorphic bases. Empty until the pre-pass
     /// runs.
     poly_map: HashMap<String, Vec<String>>,
+    /// (EPIC-5 C2-2b-i) Param names that, in the CURRENT emission context, are
+    /// bound to a CONCRETE value-struct even though their pyrst type is a
+    /// polymorphic base — namely `other` inside a value-struct dunder impl
+    /// (`impl PartialEq/PartialOrd for B`, whose `other: &B` is the struct, not
+    /// the `B__` enum). Field reads on such a receiver must NOT lower to the
+    /// `__field_*` enum accessor. Populated only around eq/lt/lt_impl bodies;
+    /// empty everywhere else (a regular base-typed param IS the enum and DOES
+    /// lower). `self` is exempt structurally, so it is never added here.
+    concrete_struct_params: std::collections::HashSet<String>,
 }
 
 impl<'a> Codegen<'a> {
     pub fn new(ctx: &'a TyCtx) -> Self {
-        Self { ctx, out: String::new(), indent: 0, locals: HashMap::new(), declared: Default::default(), current_class: None, current_ret_ty: Ty::Unit, dead_funcs: Default::default(), mut_self: HashMap::new(), by_ref_locals: Default::default(), poly_map: HashMap::new() }
+        Self { ctx, out: String::new(), indent: 0, locals: HashMap::new(), declared: Default::default(), current_class: None, current_ret_ty: Ty::Unit, dead_funcs: Default::default(), mut_self: HashMap::new(), by_ref_locals: Default::default(), poly_map: HashMap::new(), concrete_struct_params: Default::default() }
     }
 
     pub fn with_dead_funcs(mut self, dead: std::collections::HashSet<String>) -> Self {
@@ -100,7 +120,7 @@ impl<'a> Codegen<'a> {
                 let all_copy = self.ctx.get_all_fields(n).iter().all(|f| {
                     Ty::from_type_expr(&f.ty).map(|t| self.is_copy_type(&t)).unwrap_or(false)
                 });
-                if all_copy {
+                let struct_init = if all_copy {
                     // Build a struct literal with zeroed primitive fields.
                     let fields: Vec<String> = self.ctx.get_all_fields(n).iter().map(|f| {
                         let inner_ty = Ty::from_type_expr(&f.ty).unwrap_or(Ty::Int);
@@ -109,6 +129,16 @@ impl<'a> Codegen<'a> {
                     format!("{} {{ {} }}", n, fields.join(", "))
                 } else {
                     "Default::default()".to_string()
+                };
+                // (EPIC-5 C2-2b-i) A polymorphic-base local is Rust `B__`, so the
+                // zeroed initializer must be the base variant carrying the zeroed
+                // value struct (`B__::B(B{..})`), not a bare struct literal (the
+                // wrong type for the enum slot). Leaf/non-polymorphic classes keep
+                // the plain struct init.
+                if self.is_polymorphic_base(n) {
+                    format!("{}__::{}({})", n, n, struct_init)
+                } else {
+                    struct_init
                 }
             }
             _ => "Default::default()".to_string(),
@@ -248,39 +278,148 @@ impl<'a> Codegen<'a> {
     /// `is_subclass(got, expected)` holds). Exact-type flows (`got == expected`),
     /// non-class types, and unrelated classes (which typeck already rejected)
     /// pass through untouched, so no existing exact-typed example is affected.
-    /// `expected` is the declared SLOT type (annotation / return / param / element);
-    /// `got` is the inferred type of the value expression flowing into it.
-    fn check_subtype_gate(&self, got: &Ty, expected: &Ty) -> Result<()> {
-        match (got, expected) {
-            (Ty::Class(d), Ty::Class(b)) => {
-                if d != b && crate::typeck::is_subclass(d, b, self.ctx) {
-                    return Err(crate::diag::Error::Codegen(format!(
-                        "class subtyping ({} where {} expected) is not yet emittable \
-                         — pending EPIC-5 C2 companion-enum codegen",
-                        d, b
-                    )));
-                }
-            }
-            // Recurse into matching homogeneous containers: a `list[Dog]` into a
-            // `list[Animal]` slot (`a: list[Animal] = [dog, ...]`) is the same
-            // non-emittable flow (`Vec<Dog>` is not `Vec<Animal>`). Only same-kind
-            // containers are compared; element counts/kinds that genuinely differ
-            // were already rejected by typeck.
-            (Ty::List(gi), Ty::List(ei)) => self.check_subtype_gate(gi, ei)?,
-            (Ty::Set(gi), Ty::Set(ei)) => self.check_subtype_gate(gi, ei)?,
-            (Ty::Option(gi), Ty::Option(ei)) => self.check_subtype_gate(gi, ei)?,
-            (Ty::Dict(gk, gv), Ty::Dict(ek, ev)) => {
-                self.check_subtype_gate(gk, ek)?;
-                self.check_subtype_gate(gv, ev)?;
-            }
-            (Ty::Tuple(gs), Ty::Tuple(es)) if gs.len() == es.len() => {
-                for (g, e) in gs.iter().zip(es.iter()) {
-                    self.check_subtype_gate(g, e)?;
-                }
-            }
-            _ => {}
+    /// (EPIC-5 C2-2b-i) True iff `ty` mentions a polymorphic base anywhere — i.e.
+    /// a slot of this type lowers (via `rust_ty`) to a companion enum `B__` at
+    /// some position, so a raw-struct value flowing in needs WRAPPING. When this
+    /// is false the slot is exact-typed and the legacy `emit_consuming` path is
+    /// used unchanged (keeps every non-polymorphic example byte-for-byte stable).
+    fn ty_has_poly_base(&self, ty: &Ty) -> bool {
+        match ty {
+            Ty::Class(n) => self.is_polymorphic_base(n),
+            Ty::List(e) | Ty::Set(e) | Ty::Option(e) => self.ty_has_poly_base(e),
+            Ty::Dict(k, v) => self.ty_has_poly_base(k) || self.ty_has_poly_base(v),
+            Ty::Tuple(ts) => ts.iter().any(|t| self.ty_has_poly_base(t)),
+            _ => false,
         }
-        Ok(())
+    }
+
+    /// If `e` is a constructor call `C(...)` for a user class `C`, return `C`.
+    /// (Mirrors `infer_expr_ty`'s constructor recognition: a Call whose callee is
+    /// a bare Ident registered in `ctx.classes`.) Used to disambiguate a RAW
+    /// struct temp (a constructor) from an enum-typed place at a base slot.
+    fn constructor_class(&self, e: &Expr) -> Option<String> {
+        if let Expr::Call { callee, .. } = e {
+            if let Expr::Ident(n, _) = callee.as_ref() {
+                if self.ctx.classes.contains_key(n.as_str()) {
+                    return Some(n.clone());
+                }
+            }
+        }
+        None
+    }
+
+    /// (EPIC-5 C2-2b-i, the crux) Emit value expression `value` into a slot whose
+    /// declared type `expected` mentions a polymorphic base (caller gated on
+    /// `ty_has_poly_base`). Replaces the C1 honest gate: a raw-struct value at a
+    /// `B__` slot is WRAPPED in the right enum variant; a value already typed as
+    /// the base passes through; a strict-polymorphic-subclass place (multi-level
+    /// upcast) is an HONEST Error::Codegen rather than a miscompile.
+    fn emit_into_base_slot(&mut self, value: &Expr, expected: &Ty) -> Result<String> {
+        match expected {
+            // Scalar polymorphic-base slot `B__`.
+            Ty::Class(b) if self.is_polymorphic_base(b) => {
+                // A constructor `C(...)` is a RAW struct temp -> wrap as variant C.
+                if let Some(ctor) = self.constructor_class(value) {
+                    let inner = self.emit_consuming(value)?;
+                    return Ok(format!("{}__::{}({})", b, ctor, inner));
+                }
+                let et = self.type_of_expr(value);
+                match &et {
+                    Ty::Class(c) if self.is_polymorphic_base(c) => {
+                        if c == b {
+                            // Already a `B__` value (a base-typed place) -> pass through.
+                            self.emit_consuming(value)
+                        } else if crate::typeck::is_subclass(c, b, self.ctx) {
+                            // `et` is a strict POLYMORPHIC subclass: the value is an
+                            // `et__` enum, NOT a `B__` variant. A From<et__> for B__
+                            // up-conversion is a deferred follow-on — refuse honestly.
+                            Err(crate::diag::Error::Codegen(format!(
+                                "upcasting an intermediate polymorphic base `{}` to `{}` \
+                                 is not yet supported — construct the value at the `{}` \
+                                 slot directly (multi-level upcast deferred)",
+                                c, b, b
+                            )))
+                        } else {
+                            // Unrelated polymorphic class — typeck already rejected
+                            // this flow; pass through defensively.
+                            self.emit_consuming(value)
+                        }
+                    }
+                    // A concrete / non-polymorphic value whose type is `B` or a
+                    // (leaf) subclass of `B` -> RAW struct -> wrap as variant `et`.
+                    Ty::Class(c) => {
+                        let inner = self.emit_consuming(value)?;
+                        Ok(format!("{}__::{}({})", b, c, inner))
+                    }
+                    // Non-class value into a base slot — should not occur (typeck);
+                    // emit unchanged so any genuine mismatch surfaces as rustc E0308.
+                    _ => self.emit_consuming(value),
+                }
+            }
+            // List literal whose element slot mentions a polymorphic base: wrap
+            // each element. A non-literal list (already `Vec<B__>`) passes through.
+            Ty::List(elem) if self.ty_has_poly_base(elem) => {
+                if let Expr::List(elems, _) = value {
+                    let mut parts = Vec::with_capacity(elems.len());
+                    for el in elems {
+                        parts.push(self.emit_into_base_slot(el, elem)?);
+                    }
+                    Ok(format!("vec![{}]", parts.join(", ")))
+                } else {
+                    self.emit_consuming(value)
+                }
+            }
+            // Set literal — same element wrapping as the list path.
+            Ty::Set(elem) if self.ty_has_poly_base(elem) => {
+                if let Expr::Set(elems, _) = value {
+                    let mut parts = Vec::with_capacity(elems.len());
+                    for el in elems {
+                        parts.push(self.emit_into_base_slot(el, elem)?);
+                    }
+                    Ok(format!(
+                        "vec![{}].into_iter().collect::<::std::collections::HashSet<_>>()",
+                        parts.join(", ")
+                    ))
+                } else {
+                    self.emit_consuming(value)
+                }
+            }
+            // Tuple literal — wrap element-wise at each polymorphic-base position.
+            Ty::Tuple(parts_ty) if self.ty_has_poly_base(expected) => {
+                if let Expr::Tuple(elems, _) = value {
+                    if elems.len() == parts_ty.len() {
+                        let mut parts = Vec::with_capacity(elems.len());
+                        for (el, et) in elems.iter().zip(parts_ty.iter()) {
+                            if self.ty_has_poly_base(et) {
+                                parts.push(self.emit_into_base_slot(el, et)?);
+                            } else {
+                                parts.push(self.emit_consuming(el)?);
+                            }
+                        }
+                        return Ok(match parts.len() {
+                            1 => format!("({},)", parts[0]),
+                            _ => format!("({})", parts.join(", ")),
+                        });
+                    }
+                }
+                self.emit_consuming(value)
+            }
+            // Optional polymorphic-base slot: the bare-value case wraps the inner
+            // value; the `None` literal and already-Optional values are handled by
+            // the caller's `coerce_to_option`, so only a bare value reaches here.
+            Ty::Option(inner) if self.ty_has_poly_base(inner) => {
+                if matches!(value, Expr::None_(_)) {
+                    self.emit_consuming(value)
+                } else {
+                    self.emit_into_base_slot(value, inner)
+                }
+            }
+            // Dict with a polymorphic-base value/key slot through a literal is not
+            // exercised by the corpus; defer element wrapping (honest passthrough —
+            // a genuine subtype dict literal would surface as rustc E0308, not a
+            // silent miscompile). Documented as a C2-3 gap alongside list+concat.
+            _ => self.emit_consuming(value),
+        }
     }
 
     /// (EPIC-5) Coerce an already-emitted expression `s` (for source expr `e`)
@@ -720,8 +859,7 @@ impl<'a> Codegen<'a> {
 
         // Dunder-trait method names (these become trait impls, not inherent
         // methods, and never get a `__super_` alias — mirrors `emit_class`).
-        let dunder_trait_names = ["__str__", "__repr__", "__add__", "__sub__", "__mul__",
-                                   "__eq__", "__neg__", "__bool__", "__lt__"];
+        let dunder_trait_names = DUNDER_TRAIT_NAMES;
 
         let class_names: Vec<String> = self.ctx.classes.keys().cloned().collect();
         for cls in &class_names {
@@ -1084,8 +1222,7 @@ impl<'a> Codegen<'a> {
         self.current_class = Some(c.name.clone());
 
         // Dunder methods that become Rust trait impls instead of regular methods.
-        let dunder_trait_names = ["__str__", "__repr__", "__add__", "__sub__", "__mul__",
-                                   "__eq__", "__neg__", "__bool__", "__lt__"];
+        let dunder_trait_names = DUNDER_TRAIT_NAMES;
 
         // Constructor emission keys off the OWN __init__ (the existing model:
         // every subclass in scope defines its own __init__). The inherent-impl
@@ -1190,7 +1327,11 @@ impl<'a> Codegen<'a> {
                         self.indent += 1;
                         self.locals.insert("self".into(), Ty::Class(c.name.clone()));
                         self.locals.insert("other".into(), Ty::Class(c.name.clone()));
+                        // `other: &c.name` is the CONCRETE struct here — exempt it
+                        // from base-field-read lowering (C2-2b-i).
+                        self.concrete_struct_params.insert("other".into());
                         for s in &m.body { self.emit_stmt(s)?; }
+                        self.concrete_struct_params.remove("other");
                         self.locals.remove("self");
                         self.locals.remove("other");
                         self.indent -= 1;
@@ -1283,7 +1424,11 @@ impl<'a> Codegen<'a> {
                     self.indent += 1;
                     self.locals.insert("self".into(), Ty::Class(c.name.clone()));
                     self.locals.insert("other".into(), Ty::Class(c.name.clone()));
+                    // `other: &c.name` is the CONCRETE struct here — exempt it
+                    // from base-field-read lowering (C2-2b-i).
+                    self.concrete_struct_params.insert("other".into());
                     for s in &m.body { self.emit_stmt(s)?; }
+                    self.concrete_struct_params.remove("other");
                     self.locals.remove("self");
                     self.locals.remove("other");
                     self.indent -= 1;
@@ -1437,8 +1582,7 @@ impl<'a> Codegen<'a> {
         // (this is the inherit_dunders crux). Also skip `__init__` (a constructor,
         // not dispatched) and any `@staticmethod` (no `self` receiver). The list
         // mirrors emit_class's `dunder_trait_names` exactly.
-        let dunder_trait_names = ["__str__", "__repr__", "__add__", "__sub__", "__mul__",
-                                   "__eq__", "__neg__", "__bool__", "__lt__"];
+        let dunder_trait_names = DUNDER_TRAIT_NAMES;
         let resolved = self.resolved_methods(base);
         let dispatchable: Vec<Func> = resolved
             .into_iter()
@@ -1834,6 +1978,35 @@ impl<'a> Codegen<'a> {
         }
     }
 
+    /// (EPIC-5 C2-2b-i, Step 3) If a list literal's elements share a common
+    /// POLYMORPHIC-base class, return that base name (the slot is `Vec<B__>` and
+    /// each element must be wrapped). Returns `None` when the elements are not all
+    /// classes, or their common ancestor is a leaf / non-polymorphic class (the
+    /// ordinary homogeneous-vec path applies). Mirrors typeck's
+    /// `nearest_common_ancestor` fold over `unify_branch_types`, so codegen and
+    /// typeck agree on the element type of a heterogeneous-subclass literal.
+    fn list_poly_base(&self, elems: &[Expr]) -> Option<String> {
+        if elems.is_empty() { return None; }
+        let mut acc = match self.type_of_expr(&elems[0]) {
+            Ty::Class(n) => n,
+            _ => return None,
+        };
+        for e in &elems[1..] {
+            let cn = match self.type_of_expr(e) {
+                Ty::Class(n) => n,
+                _ => return None,
+            };
+            acc = if crate::typeck::is_subclass(&cn, &acc, self.ctx) {
+                acc // acc is already an ancestor of cn
+            } else if crate::typeck::is_subclass(&acc, &cn, self.ctx) {
+                cn // cn is the wider (base) of the two
+            } else {
+                crate::typeck::nearest_common_ancestor(&acc, &cn, self.ctx)?
+            };
+        }
+        if self.is_polymorphic_base(&acc) { Some(acc) } else { None }
+    }
+
     /// Unified element type of a list/set literal's elements. Folds every
     /// element's type with `unify_ty` (rather than first-element-wins) so a
     /// mixed numeric literal like `[1, 2.0]` is typed `Float` — matching
@@ -2026,14 +2199,18 @@ impl<'a> Codegen<'a> {
                 } else if matches!(e, Expr::None_(_)) {
                     self.line("return;");
                 } else {
-                    // (EPIC-5 C1-C) `return dog` from a `-> Animal` function —
-                    // Derived value into a Base return slot. Honest gate.
-                    self.check_subtype_gate(&self.type_of_expr(e), &self.current_ret_ty)?;
-                    // Uniform clone-on-use: a non-Copy place (variable, field, index)
-                    // is deep-cloned so the returned value is independent of the
-                    // binding. This subsumes the former `return self.field`
-                    // special-case heuristic.
-                    let s = self.emit_consuming(e)?;
+                    // (EPIC-5 C2-2b-i) `return dog` from a `-> Animal` function —
+                    // a raw-struct value into a polymorphic-base `Animal__` return
+                    // slot is WRAPPED in the right variant (replaces the C1 gate).
+                    // Non-polymorphic returns keep the uniform clone-on-use path: a
+                    // non-Copy place (variable, field, index) is deep-cloned so the
+                    // returned value is independent of the binding.
+                    let s = if self.ty_has_poly_base(&self.current_ret_ty) {
+                        let ret_ty = self.current_ret_ty.clone();
+                        self.emit_into_base_slot(e, &ret_ty)?
+                    } else {
+                        self.emit_consuming(e)?
+                    };
                     self.line(&format!("return {};", s));
                 }
             }
@@ -2052,9 +2229,15 @@ impl<'a> Codegen<'a> {
                     match ty {
                         Some(t) => {
                             let ty_obj = Ty::from_type_expr(t)?;
-                            // (EPIC-5 C1-C) `a: Animal = Dog(...)` — Derived RHS into
-                            // a Base-annotated slot. Honest gate before emission.
-                            self.check_subtype_gate(&self.type_of_expr(value), &ty_obj)?;
+                            // (EPIC-5 C2-2b-i) `a: Animal = Account(...)` — a raw
+                            // struct into a polymorphic-base `Animal__` slot is
+                            // WRAPPED in the right variant (replaces the C1 gate).
+                            // Non-polymorphic slots keep the clone-on-use `v` above.
+                            let v = if self.ty_has_poly_base(&ty_obj) {
+                                self.emit_into_base_slot(value, &ty_obj)?
+                            } else {
+                                v
+                            };
                             self.locals.insert(target.clone(), ty_obj.clone());
                             // (EPIC-5) An Optional-annotated binding wraps a bare
                             // value in `Some(..)` (or emits `None` for the None
@@ -2496,6 +2679,29 @@ impl<'a> Codegen<'a> {
                 self.line(&format!("drop({});", t));
             }
             Stmt::AttrAssign { obj, attr, value, .. } => {
+                // (EPIC-5 C2-2b-i) A field-WRITE through a polymorphic-base var
+                // (`a.balance = ...` where `a: Account` and Account has subclasses)
+                // would target a `B__` enum, which has no fields. A mutating
+                // accessor on the companion enum is a deferred follow-on — refuse
+                // honestly rather than miscompile. `self.field = ...` inside a
+                // method is EXEMPT: `self` is the concrete struct (the method body
+                // runs on a `Account`/`Savings`, not `Account__`), so the write is
+                // an ordinary in-place struct-field store.
+                if !matches!(obj.as_ref(),
+                             Expr::Ident(n, _) if n == "self"
+                                 || self.concrete_struct_params.contains(n)) {
+                    if let Ty::Class(b) = self.type_of_expr(obj) {
+                        if self.is_polymorphic_base(&b) {
+                            return Err(crate::diag::Error::Codegen(format!(
+                                "writing field `{}` through a polymorphic-base `{}` variable \
+                                 is not yet supported — a mutating field accessor on the \
+                                 companion enum is a deferred follow-on (read-only base-field \
+                                 access is supported)",
+                                attr, b
+                            )));
+                        }
+                    }
+                }
                 let v = self.emit_consuming(value)?;
                 // The base must be emitted as a *place* (lvalue), not the
                 // clone-based rvalue emit_expr produces for Attr/Index.
@@ -2617,6 +2823,18 @@ impl<'a> Codegen<'a> {
                 }
             }
             Expr::List(elems, _) => {
+                // (EPIC-5 C2-2b-i, Step 3) A list literal whose elements' common
+                // type is a polymorphic base is `Vec<B__>`: each raw-struct/ctor
+                // element is wrapped into its enum variant (`[Dog(), Cat()]` ->
+                // `vec![Animal__::Dog(..), Animal__::Cat(..)]`). A list of already-
+                // `B__` places passes through element-wise. (list+list `+` CONCAT
+                // element wrapping stays a documented C2-3 gap — not handled here.)
+                if let Some(base) = self.list_poly_base(elems) {
+                    let base_ty = Ty::Class(base);
+                    let mut parts = Vec::with_capacity(elems.len());
+                    for e in elems { parts.push(self.emit_into_base_slot(e, &base_ty)?); }
+                    return Ok(format!("vec![{}]", parts.join(", ")));
+                }
                 // When the literal's unified element type is Float but some
                 // elements are int literals (`[1, 2.0]`), cast the int elements
                 // to f64 so the vec is a homogeneous `Vec<f64>` (card 5c2f31d8).
@@ -3924,12 +4142,14 @@ impl<'a> Codegen<'a> {
                         parts.push(self.byref_borrow(a, &place));
                         continue;
                     }
-                    // (EPIC-5 C1-C) A Derived argument into a Base-typed parameter
-                    // (`f(dog)` where `f(a: Animal)`). Honest gate before emission.
-                    if let Some(pt) = param_tys.get(i) {
-                        self.check_subtype_gate(&self.type_of_expr(a), pt)?;
-                    }
-                    let s = self.emit_consuming(a)?;
+                    // (EPIC-5 C2-2b-i) A raw-struct argument into a polymorphic-base
+                    // parameter (`feed(dog)` where `feed(a: Animal)`) is WRAPPED in
+                    // the right `Animal__` variant (replaces the C1 gate). A
+                    // non-polymorphic param keeps the clone-on-use emission.
+                    let s = match param_tys.get(i) {
+                        Some(pt) if self.ty_has_poly_base(pt) => self.emit_into_base_slot(a, pt)?,
+                        _ => self.emit_consuming(a)?,
+                    };
                     let s = match param_tys.get(i) {
                         Some(pt) => self.coerce_to_option(s, a, pt),
                         None => s,
@@ -3991,6 +4211,23 @@ impl<'a> Codegen<'a> {
                 let is_property = self.is_property_access(obj, name);
                 if is_property {
                     format!("{}.{}()", o, name)
+                } else if !matches!(obj.as_ref(),
+                                    Expr::Ident(n, _) if n == "self"
+                                        || self.concrete_struct_params.contains(n))
+                    && matches!(&self.type_of_expr(obj),
+                                Ty::Class(b) if self.is_polymorphic_base(b)) {
+                    // (EPIC-5 C2-2b-i) FIELD READ through a polymorphic-base var
+                    // (a local/param/field whose static type is a polymorphic base).
+                    // The receiver is Rust `B__` (an enum with no fields), so a
+                    // direct `.{name}` won't compile. Lower to the companion enum's
+                    // field-accessor `__field_{name}()` (emitted by
+                    // emit_companion_enum for every base field — only base fields
+                    // are reachable here; typeck already rejects a derived-only
+                    // field on a base var). `self` is EXEMPT: inside a method body
+                    // `self` is the concrete struct (`Account`/`Savings`), so
+                    // `self.balance` is an ordinary struct-field read. A field-WRITE
+                    // through a base var is a deferred honest error (AttrAssign).
+                    format!("{}.__field_{}()", o, name)
                 } else {
                     format!("{}.{}", o, name)
                 }
@@ -4409,13 +4646,16 @@ impl<'a> Codegen<'a> {
             }
             Ty::Option(inner) => format!("Option<{}>", self.rust_ty(inner)),
             Ty::Class(n) => {
-                // (EPIC-5 C2-1 HOOK) Consult the polymorphism map. C2-1 is
-                // behavior-preserving: BOTH branches return plain `n`, so output
-                // is byte-for-byte identical to the pre-method free fn. C2-2
-                // flips the polymorphic branch to `format!("{n}__")` (the
-                // companion-enum name) once the enums are actually emitted.
+                // (EPIC-5 C2-2b-i) Polymorphism activation. A class that is a
+                // polymorphic base (has ≥1 subclass in this unit) lowers to its
+                // companion enum `n__` — emitted by emit_companion_enum with
+                // method/field/dunder dispatch — for EVERY param/return/field/
+                // var/element position. A leaf or non-subclassed class stays its
+                // plain value-struct `n`. The C2-2b-i wrapping (at the 3 former
+                // gate sites + list literals) and field-read lowering keep the
+                // emitted Rust well-typed against this `n__` slot.
                 if self.is_polymorphic_base(n) {
-                    n.clone()
+                    format!("{}__", n)
                 } else {
                     n.clone()
                 }
@@ -4820,22 +5060,24 @@ mod tests {
     }
 
     #[test]
-    fn rust_ty_class_arm_behavior_preserving() {
-        // C2-1 acceptance: rust_ty(Class(n)) returns plain `n` for BOTH a
-        // polymorphic base and a sub-less class — no `n__`, identical to today.
+    fn rust_ty_class_arm_polymorphism_activated() {
+        // C2-2b-i acceptance: rust_ty(Class(n)) emits the companion-enum name
+        // `n__` for a POLYMORPHIC base (a class with ≥1 subclass), and the plain
+        // value-struct name `n` for a leaf / sub-less class. (C2-1 used to return
+        // plain `n` for both; the keystone flips the polymorphic branch.)
         let ctx = ctx_with(&[("Animal", &[]), ("Dog", &["Animal"]), ("Rock", &[])]);
         let mut cg = Codegen::new(&ctx);
         cg.build_poly_map();
         assert!(cg.is_polymorphic_base("Animal"));
-        // Polymorphic base still emits plain name (C2-2 flips this to "Animal__").
-        assert_eq!(cg.rust_ty(&Ty::Class("Animal".into())), "Animal");
-        // Sub-less / leaf classes unchanged.
+        // Polymorphic base -> companion enum.
+        assert_eq!(cg.rust_ty(&Ty::Class("Animal".into())), "Animal__");
+        // Sub-less / leaf classes stay their plain value-struct name.
         assert_eq!(cg.rust_ty(&Ty::Class("Rock".into())), "Rock");
         assert_eq!(cg.rust_ty(&Ty::Class("Dog".into())), "Dog");
-        // A list of a polymorphic base is still Vec<Animal>, not Vec<Animal__>.
+        // A list of a polymorphic base is Vec<Animal__> (the element type flips too).
         assert_eq!(
             cg.rust_ty(&Ty::List(Box::new(Ty::Class("Animal".into())))),
-            "Vec<Animal>"
+            "Vec<Animal__>"
         );
     }
 }

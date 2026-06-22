@@ -140,7 +140,19 @@ fn merge_ctx_from_module(m: &Module, ctx: &mut TyCtx, is_root: bool) -> Result<(
                 // Register method signatures
                 for m_fn in &c.methods {
                     let method_name = format!("{}.{}", c.name, m_fn.name);
+                    // EPIC-4 V2-c STEP 0: filter `self` from `params` so all three
+                    // parallel vectors (params / param_defaults / param_by_ref) are
+                    // self-EXCLUSIVE and index-aligned at length N — mirroring
+                    // typeck::TyCtx::find_method (which already filters self from
+                    // all three). Previously `params` kept self (len N+1) while the
+                    // other two dropped it (len N), so `param_by_ref[i]` lined up
+                    // with `params[i+1]` — a latent off-by-one that would assign the
+                    // first real param's by-ref flag to the `self` slot once method
+                    // call-site by-ref logic started reading it (this card). No
+                    // existing reader consumed method-keyed `params` (only `.ret`),
+                    // so aligning here is non-breaking.
                     let method_params: Vec<(String, crate::typeck::Ty)> = m_fn.params.iter()
+                        .filter(|p| p.name != "self")
                         .map(|p| crate::typeck::Ty::from_type_expr(&p.ty).map(|ty| (p.name.clone(), ty)))
                         .collect::<crate::diag::Result<Vec<_>>>()?;
                     ctx.funcs.insert(method_name, crate::typeck::FuncSig {
@@ -199,4 +211,59 @@ pub fn resolve(root_path: &Path) -> Result<ResolvedProgram> {
         .collect();
 
     Ok(ResolvedProgram { modules, ctx })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::typeck::Ty;
+
+    /// EPIC-4 V2-c STEP 0 regression: a method whose FIRST real param is `Mut[T]`
+    /// must register with `param_by_ref[0] == true` aligned to the FIRST REAL
+    /// param (`amt`), NOT to the implicit `self` slot. Before the fix, `params`
+    /// kept `self` (so `params[0]` was `self` and `params[1]` was `amt`) while
+    /// `param_by_ref` dropped `self` (so `param_by_ref[0]` described `amt`) — an
+    /// off-by-one that would mis-assign the by-ref flag once method call sites
+    /// began reading it. After the fix all three vectors are self-exclusive and
+    /// index-aligned.
+    #[test]
+    fn method_param_by_ref_aligns_to_first_real_param_not_self() {
+        let src = "\
+class Bank:
+    total: int
+    def __init__(self, total: int) -> None:
+        self.total = total
+    def transfer(self, amt: Mut[Account], note: int) -> None:
+        pass
+
+class Account:
+    balance: int
+    def __init__(self, balance: int) -> None:
+        self.balance = balance
+";
+        let m = crate::parser::parse(src).expect("parse");
+        let mut ctx = TyCtx::new();
+        merge_ctx_from_module(&m, &mut ctx, true).expect("merge");
+
+        let sig = ctx.funcs.get("Bank.transfer").expect("Bank.transfer registered");
+
+        // Self is filtered from params: exactly the two REAL params remain, in order.
+        assert_eq!(
+            sig.params.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            vec!["amt", "note"],
+            "params must exclude self and keep real params in order"
+        );
+        // All three parallel vectors share length N (the real-param count).
+        assert_eq!(sig.params.len(), 2);
+        assert_eq!(sig.param_by_ref.len(), 2, "param_by_ref must align to params (self-exclusive)");
+        assert_eq!(sig.param_defaults.len(), 2, "param_defaults must align to params (self-exclusive)");
+
+        // The Mut[T] flag maps to the FIRST REAL param (`amt`), not the self slot.
+        assert!(sig.param_by_ref[0], "amt (first real param) is Mut[T] -> by_ref at index 0");
+        assert!(!sig.param_by_ref[1], "note (second real param) is by-value");
+
+        // And `amt`'s type is the UNWRAPPED inner T (Account), not a Mut wrapper.
+        assert!(matches!(sig.params[0].1, Ty::Class(ref c) if c == "Account"),
+            "Mut[Account] param's type is the inner Account");
+    }
 }

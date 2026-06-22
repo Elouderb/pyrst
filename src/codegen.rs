@@ -35,11 +35,18 @@ pub struct Codegen<'a> {
     /// mutates `self` only by calling another mutating `self.<m>()` is still
     /// emitted `&mut self`. Empty until the pre-pass runs.
     mut_self: HashMap<(String, String), bool>,
+    /// (EPIC-4 V2-c) Names of the CURRENT function's by-reference (`Mut[T]` ->
+    /// `&mut T`) param bindings. Populated by `emit_func`'s param loop and
+    /// saved/restored across the call. When such a binding is itself forwarded
+    /// as a by-reference call argument (e.g. a recursive `fill(visited, ..)`),
+    /// `&mut visited` would re-borrow an already-`&mut` binding (rustc E0596);
+    /// the call site emits an explicit reborrow `&mut *visited` instead.
+    by_ref_locals: std::collections::HashSet<String>,
 }
 
 impl<'a> Codegen<'a> {
     pub fn new(ctx: &'a TyCtx) -> Self {
-        Self { ctx, out: String::new(), indent: 0, locals: HashMap::new(), declared: Default::default(), current_class: None, current_ret_ty: Ty::Unit, dead_funcs: Default::default(), mut_self: HashMap::new() }
+        Self { ctx, out: String::new(), indent: 0, locals: HashMap::new(), declared: Default::default(), current_class: None, current_ret_ty: Ty::Unit, dead_funcs: Default::default(), mut_self: HashMap::new(), by_ref_locals: Default::default() }
     }
 
     pub fn with_dead_funcs(mut self, dead: std::collections::HashSet<String>) -> Self {
@@ -376,8 +383,96 @@ impl<'a> Codegen<'a> {
                 }
                 _ => {}
             }
+            // (EPIC-4 V2-c / V3 interaction) A call anywhere in this statement that
+            // passes a self-rooted place (`self.field`, `self.list[i]`, ...) into a
+            // by-reference (`Mut[T]`) parameter MUTATES self — the callee writes
+            // through the `&mut self.field` borrow. The intra-method seed above
+            // misses it (it only catches `self`-rooted assignments and mutating
+            // method calls), so without this a method that mutates self ONLY by
+            // handing `self.field` to a by-ref callee would be emitted `&self` and
+            // rustc would reject `&mut self.field` with E0596. Detect it here so
+            // the method becomes `&mut self` and propagates through the V3 fixpoint.
+            if self.stmt_passes_self_by_ref(stmt) {
+                return true;
+            }
         }
         false
+    }
+
+    /// True when any `Expr::Call` reachable from `stmt` (in any expression
+    /// position) passes a SELF-ROOTED place as a by-reference (`Mut[T]`) argument.
+    /// Walks the same statement nesting `method_modifies_self` does and scans
+    /// every embedded expression (conditions, RHS, return values, call args).
+    fn stmt_passes_self_by_ref(&self, stmt: &Stmt) -> bool {
+        let mut found = false;
+        let mut check = |e: &Expr| { if self.expr_passes_self_by_ref(e) { found = true; } };
+        match stmt {
+            Stmt::Expr(e) | Stmt::Return(Some(e), _) => check(e),
+            Stmt::Assign { value, .. } | Stmt::AugAssign { value, .. } => check(value),
+            Stmt::Unpack { value, .. } => check(value),
+            Stmt::AttrAssign { obj, value, .. } | Stmt::IndexAssign { obj, value, .. } => {
+                check(obj);
+                check(value);
+            }
+            Stmt::If { cond, .. } => check(cond),
+            Stmt::While { cond, .. } => check(cond),
+            Stmt::For { iter, .. } => check(iter),
+            Stmt::With { ctx_expr, .. } => check(ctx_expr),
+            _ => {}
+        }
+        found
+    }
+
+    /// Recursively scan `e` for a call that passes a self-rooted place into a
+    /// by-reference param. For each `Expr::Call`, resolve the callee's per-param
+    /// by-ref flags (free function via `ctx.funcs`; method via `get_method`,
+    /// self-exclusive and index-aligned to the args after STEP 0) and report a
+    /// self-rooted place sitting in a by-ref slot. Sub-expressions are walked too
+    /// so a by-ref call nested in an argument / operand is still caught.
+    fn expr_passes_self_by_ref(&self, e: &Expr) -> bool {
+        match e {
+            Expr::Call { callee, args, kwargs, .. } => {
+                let by_ref: Vec<bool> = match callee.as_ref() {
+                    Expr::Ident(n, _) => self.ctx.funcs.get(n.as_str())
+                        .map(|s| s.param_by_ref.clone()).unwrap_or_default(),
+                    Expr::Attr { obj, name, .. } => {
+                        if let Ty::Class(cls) = self.type_of_expr(obj.as_ref()) {
+                            self.ctx.get_method(&cls, name)
+                                .map(|s| s.param_by_ref.clone()).unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        }
+                    }
+                    _ => Vec::new(),
+                };
+                for (i, a) in args.iter().enumerate() {
+                    if by_ref.get(i).copied().unwrap_or(false)
+                        && Self::expr_roots_at_self(a)
+                    {
+                        return true;
+                    }
+                }
+                // Walk callee + args + kwargs for nested by-ref-self calls.
+                if self.expr_passes_self_by_ref(callee) { return true; }
+                if args.iter().any(|a| self.expr_passes_self_by_ref(a)) { return true; }
+                if kwargs.iter().any(|(_, v)| self.expr_passes_self_by_ref(v)) { return true; }
+                false
+            }
+            Expr::Attr { obj, .. } => self.expr_passes_self_by_ref(obj),
+            Expr::Index { obj, idx, .. } => {
+                self.expr_passes_self_by_ref(obj) || self.expr_passes_self_by_ref(idx)
+            }
+            Expr::BinOp { lhs, rhs, .. } => {
+                self.expr_passes_self_by_ref(lhs) || self.expr_passes_self_by_ref(rhs)
+            }
+            Expr::UnOp { expr, .. } => self.expr_passes_self_by_ref(expr),
+            Expr::IfExp { test, body, orelse, .. } => {
+                self.expr_passes_self_by_ref(test)
+                    || self.expr_passes_self_by_ref(body)
+                    || self.expr_passes_self_by_ref(orelse)
+            }
+            _ => false,
+        }
     }
 
     // ───────────────────────── (EPIC-4 V3) transitive &mut self ──────────────
@@ -702,10 +797,21 @@ impl<'a> Codegen<'a> {
         for p in f.params.iter().filter(|p| p.name != "self") {
             if !first { sig.push_str(", "); }
             first = false;
-            // Value params are bound `mut` so functions may mutate them or their
-            // fields in place (Python passes mutable objects by reference);
-            // unused-mut is allowed in the generated crate.
-            let _ = write!(sig, "mut {}: {}", p.name, rust_ty(&Ty::from_type_expr(&p.ty)?));
+            let pty = rust_ty(&Ty::from_type_expr(&p.ty)?);
+            if p.by_ref {
+                // (EPIC-4 V2-c) An opt-in by-reference param (`Mut[T]`) becomes
+                // `name: &mut T`. The callee's mutations persist to the caller,
+                // which threads `&mut <place>` at the call site. No `mut` binding
+                // prefix: the binding itself is the reference (already `&mut`);
+                // field/method mutation and `place.clone()` reads both work
+                // through auto-deref.
+                let _ = write!(sig, "{}: &mut {}", p.name, pty);
+            } else {
+                // Value params are bound `mut` so functions may mutate them or
+                // their fields in place (Python passes mutable objects by
+                // reference); unused-mut is allowed in the generated crate.
+                let _ = write!(sig, "mut {}: {}", p.name, pty);
+            }
         }
         let ret = Ty::from_type_expr(&f.ret)?;
         let ret_s = rust_ty(&ret);
@@ -714,6 +820,17 @@ impl<'a> Codegen<'a> {
         self.indent += 1;
         // (EPIC-5) Track the active return type for Some/None wrapping in `return`.
         let saved_ret_ty = std::mem::replace(&mut self.current_ret_ty, ret.clone());
+        // (EPIC-4 V2-c) Track this function's by-reference (`&mut T`) param
+        // bindings so a forwarded-by-reference arg that names one emits an
+        // explicit reborrow (`&mut *x`) instead of a double `&mut` (E0596).
+        // Save+restore so a nested func/method emission can never leak its set
+        // into the enclosing one (mirrors `current_ret_ty`).
+        let saved_by_ref = std::mem::take(&mut self.by_ref_locals);
+        for p in f.params.iter().filter(|p| p.name != "self") {
+            if p.by_ref {
+                self.by_ref_locals.insert(p.name.clone());
+            }
+        }
 
         // Populate locals from parameters
         // Register self with its class type if this is a method
@@ -766,6 +883,7 @@ impl<'a> Codegen<'a> {
         self.locals.clear();
         self.declared.clear();
         self.current_ret_ty = saved_ret_ty;
+        self.by_ref_locals = saved_by_ref;
         Ok(())
     }
 
@@ -1260,6 +1378,33 @@ impl<'a> Codegen<'a> {
             // chains as assignment-target bases.
             _ => self.emit_expr(e),
         }
+    }
+
+    /// (EPIC-4 V2-c) Borrow form for an argument flowing into a by-reference
+    /// (`Mut[T]` -> `&mut T`) callee parameter. `place` is the already-emitted
+    /// `emit_place(a)` text.
+    ///
+    /// The normal form is `&mut <place>` (a fresh mutable borrow of the caller's
+    /// storage). The ONE exception is when `a` is a bare name that is itself a
+    /// `&mut T` param binding of the current function (a forwarded-by-reference
+    /// arg, e.g. a recursive `fill(visited, ..)` where `visited: &mut HashSet`):
+    /// `&mut visited` would re-borrow an already-`&mut` binding and rustc rejects
+    /// it (E0596). Emit an explicit reborrow `&mut *visited` instead — valid in
+    /// every position including last-use/recursive, so we prefer it over relying
+    /// on a bare auto-reborrow.
+    ///
+    /// Only the BARE-ident case needs this. A field/index of a by-reference param
+    /// (`param.field`, `param[k]`) is not an `Expr::Ident`, so `&mut param.field`
+    /// stays — that already auto-derefs through the `&mut`. An owned local
+    /// (`&mut my_account`) and a self place (`&mut self.field`) are not in
+    /// `by_ref_locals`, so they are unchanged.
+    fn byref_borrow(&self, a: &Expr, place: &str) -> String {
+        if let Expr::Ident(n, _) = a {
+            if self.by_ref_locals.contains(n) {
+                return format!("&mut *{}", place);
+            }
+        }
+        format!("&mut {}", place)
     }
 
     /// Emit a list/set element, promoting int-typed elements to `f64` when the
@@ -3294,7 +3439,38 @@ impl<'a> Codegen<'a> {
                         return Ok(format!("{}.clone()", obj_s));
                     }
 
-                    // Regular method call
+                    // Regular method call.
+                    // (EPIC-4 V2-c) Thread `&mut <place>` for any by-reference
+                    // (`Mut[T]`) method parameter so the callee's mutation persists
+                    // to the caller. The method's per-param by-ref flags come from
+                    // get_method (self-EXCLUSIVE and index-aligned to `args` after
+                    // STEP 0). Only user-defined methods on a known class receiver
+                    // can be by-ref; the builtin string/list/dict branches above
+                    // all `return`ed earlier, so the by-value `parts` they share is
+                    // never reached here. We rebuild `parts` only when the receiver
+                    // resolves to a class with a matching method that actually has
+                    // a by-ref param; otherwise the original by-value `parts`
+                    // (clone-on-use) is used unchanged.
+                    let method_by_ref: Vec<bool> =
+                        if let Ty::Class(cls) = self.type_of_expr(obj.as_ref()) {
+                            self.ctx.get_method(&cls, name)
+                                .map(|sig| sig.param_by_ref.clone())
+                                .unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        };
+                    if method_by_ref.iter().any(|&b| b) {
+                        let mut mparts = Vec::with_capacity(args.len());
+                        for (i, a) in args.iter().enumerate() {
+                            if method_by_ref.get(i).copied().unwrap_or(false) {
+                                let place = self.emit_place(a)?;
+                                mparts.push(self.byref_borrow(a, &place));
+                            } else {
+                                mparts.push(self.emit_consuming(a)?);
+                            }
+                        }
+                        return Ok(format!("{}.{}({})", obj_s, method, mparts.join(", ")));
+                    }
                     return Ok(format!("{}.{}({})", obj_s, method, parts.join(", ")));
                 }
 
@@ -3311,8 +3487,32 @@ impl<'a> Codegen<'a> {
                 } else {
                     Vec::new()
                 };
+                // (EPIC-4 V2-c) Per-arg by-reference (`Mut[T]`) flags for this
+                // free-function callee. Parallel to `args` (free functions have no
+                // `self`, so `param_by_ref[i]` lines up with `args[i]` directly).
+                let param_by_ref: Vec<bool> = if let Expr::Ident(n, _) = callee.as_ref() {
+                    self.ctx.funcs.get(n.as_str())
+                        .map(|sig| sig.param_by_ref.clone())
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
                 let mut parts = Vec::with_capacity(args.len());
                 for (i, a) in args.iter().enumerate() {
+                    if param_by_ref.get(i).copied().unwrap_or(false) {
+                        // By-reference arg: borrow the caller's PLACE so the
+                        // callee's mutation persists. typeck already required `a`
+                        // to be a place (Ident/Attr/Index), so `emit_place` is
+                        // valid and `&mut` of it is a sound mutable borrow. No
+                        // clone, no Option coercion — we pass the storage itself.
+                        // `byref_borrow` emits an explicit reborrow (`&mut *x`)
+                        // when `a` names one of this function's own `&mut T`
+                        // params (forwarded-by-reference, e.g. a recursive call),
+                        // avoiding the E0596 double-`&mut`.
+                        let place = self.emit_place(a)?;
+                        parts.push(self.byref_borrow(a, &place));
+                        continue;
+                    }
                     let s = self.emit_consuming(a)?;
                     let s = match param_tys.get(i) {
                         Some(pt) => self.coerce_to_option(s, a, pt),

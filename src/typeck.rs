@@ -538,9 +538,39 @@ pub fn check_bodies(m: &Module, ctx: &TyCtx) -> Result<()> {
                     });
                 }
 
+                // (EPIC-4 V2-c) Validate explicit class-FIELD annotations at
+                // `check` time. Field types are otherwise only lowered lazily at
+                // codegen (`build`), so a `Mut[T]` field annotation would slip past
+                // `pyrst check`. Running each field through `from_type_expr` here
+                // makes the existing `("Mut", _)` rejection arm fire at check time,
+                // so a class-field `Mut[T]` is an honest error in BOTH `check` and
+                // `build` (mode markers belong only on parameters).
+                for field in &c.fields {
+                    Ty::from_type_expr(&field.ty)?;
+                }
+
                 for method in &c.methods {
                     // Reject unsupported decorators on class methods.
                     validate_decorators(&method.decorators, method.span)?;
+
+                    // (EPIC-4 V2-c) `Mut[T]` is unsupported on a CONSTRUCTOR
+                    // parameter. The generated `new()` wrapper passes owned values
+                    // into `self.__init__(...)`, which would mismatch a `&mut T`
+                    // `__init__` signature — and a fresh `__inst` has no
+                    // caller-visible storage for a by-ref param to alias anyway.
+                    // Reject here so both `check` and `build` catch it cleanly
+                    // rather than silently mis-emitting.
+                    if method.name == "__init__" {
+                        if let Some(p) = method.params.iter().find(|p| p.by_ref) {
+                            return Err(Error::Type {
+                                span: method.span,
+                                msg: format!(
+                                    "Mut[T] is not supported on a constructor (`__init__`) parameter `{}`",
+                                    p.name
+                                ),
+                            });
+                        }
+                    }
 
                     let mut params: Vec<(String, Ty)> = method.params.iter()
                         .filter(|p| p.name != "self")
@@ -2439,7 +2469,35 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                         let obj_ty = check_expr(obj, env)?;
                         if let Ty::Class(class_name) = &obj_ty {
                             let key = format!("{}.{}", class_name, name);
-                            if let Some(sig) = env.ctx.funcs.get(&key) {
+                            if let Some(sig) = env.ctx.funcs.get(&key).cloned() {
+                                // (EPIC-4 V2-c) Enforce the by-reference (`Mut[T]`)
+                                // place-requirement at METHOD call sites too (it was
+                                // already enforced for free functions in V2-ab). An
+                                // arg bound to a by-ref method param must be a PLACE
+                                // (Ident/Attr/Index) — a temporary has no
+                                // caller-visible storage to borrow `&mut`. We look
+                                // up the by-ref flags via get_method, whose vectors
+                                // are self-EXCLUSIVE and index-aligned to `args`
+                                // (mirrors the resolver alignment fixed in STEP 0).
+                                let method_sig = env.ctx.get_method(class_name, name);
+                                if let Some(msig) = &method_sig {
+                                    for (i, a) in args.iter().enumerate() {
+                                        if msig.param_by_ref.get(i).copied().unwrap_or(false)
+                                            && !is_place_expr(a)
+                                        {
+                                            let pname = msig.params.get(i)
+                                                .map(|(n, _)| n.as_str())
+                                                .unwrap_or("<arg>");
+                                            return Err(Error::Type {
+                                                span: *span,
+                                                msg: format!(
+                                                    "by-reference parameter `{}` requires a variable, not a temporary",
+                                                    pname
+                                                ),
+                                            });
+                                        }
+                                    }
+                                }
                                 for a in args { check_expr(a, env)?; }
                                 return Ok(sig.ret.clone());
                             }
@@ -4539,5 +4597,150 @@ def deposit(account: Mut[Account], amt: int) -> None:
         }
         assert!(check_bodies(&m, &ctx).is_ok(),
             "a mutated by-ref param must typeck-pass (backstop skipped)");
+    }
+
+    /// Build a TyCtx from a module exactly as the single-module resolver path
+    /// does (classes extracted, free funcs + methods registered self-exclusive).
+    /// Used by the V2-c end-to-end check_bodies tests below.
+    fn ctx_from_module(m: &Module) -> TyCtx {
+        let mut ctx = TyCtx::new();
+        for s in &m.stmts {
+            if let Stmt::Class(c) = s {
+                let mut c = c.clone();
+                extract_init_fields(&mut c);
+                ctx.classes.insert(c.name.clone(), c.clone());
+                for mf in &c.methods {
+                    let key = format!("{}.{}", c.name, mf.name);
+                    ctx.funcs.insert(key, FuncSig {
+                        params: mf.params.iter().filter(|p| p.name != "self")
+                            .map(|p| (p.name.clone(), Ty::from_type_expr(&p.ty).unwrap_or(Ty::Unknown)))
+                            .collect(),
+                        param_defaults: mf.params.iter().filter(|p| p.name != "self")
+                            .map(|p| p.default.clone()).collect(),
+                        param_by_ref: mf.params.iter().filter(|p| p.name != "self")
+                            .map(|p| p.by_ref).collect(),
+                        ret: Ty::from_type_expr(&mf.ret).unwrap_or(Ty::Unknown),
+                    });
+                }
+            }
+        }
+        for s in &m.stmts {
+            if let Stmt::Func(f) = s {
+                ctx.funcs.insert(f.name.clone(), FuncSig {
+                    params: f.params.iter().filter(|p| p.name != "self")
+                        .map(|p| (p.name.clone(), Ty::from_type_expr(&p.ty).unwrap_or(Ty::Unknown)))
+                        .collect(),
+                    param_defaults: f.params.iter().filter(|p| p.name != "self")
+                        .map(|p| p.default.clone()).collect(),
+                    param_by_ref: f.params.iter().filter(|p| p.name != "self")
+                        .map(|p| p.by_ref).collect(),
+                    ret: Ty::from_type_expr(&f.ret).unwrap_or(Ty::Unknown),
+                });
+            }
+        }
+        ctx
+    }
+
+    #[test]
+    fn mut_on_constructor_param_is_rejected() {
+        // EPIC-4 V2-c: `Mut[T]` on an __init__ parameter is unsupported (the
+        // generated new() wrapper passes owned values into __init__). Rejected at
+        // check time so both `check` and `build` catch it.
+        let src = "\
+class Account:
+    balance: int
+    def __init__(self, balance: int) -> None:
+        self.balance = balance
+
+class Vault:
+    held: Account
+    def __init__(self, acct: Mut[Account]) -> None:
+        self.held = acct
+";
+        let m = crate::parser::parse(src).expect("parse");
+        let ctx = ctx_from_module(&m);
+        let r = check_bodies(&m, &ctx);
+        assert!(r.is_err(), "Mut[T] on a constructor param must be rejected");
+        let msg = format!("{:?}", r.unwrap_err());
+        assert!(msg.contains("constructor") && msg.contains("__init__"),
+            "error must name the constructor: {msg}");
+    }
+
+    #[test]
+    fn mut_on_class_field_is_rejected_at_check() {
+        // EPIC-4 V2-c: a class-FIELD annotated `Mut[T]` is rejected at CHECK time
+        // (fields are now from_type_expr'd in check_bodies), not deferred to build.
+        let src = "\
+class Holder:
+    value: Mut[int]
+    def __init__(self, value: int) -> None:
+        self.value = value
+";
+        let m = crate::parser::parse(src).expect("parse");
+        let ctx = ctx_from_module(&m);
+        let r = check_bodies(&m, &ctx);
+        assert!(r.is_err(), "Mut[T] class field must be rejected at check");
+        let msg = format!("{:?}", r.unwrap_err());
+        assert!(msg.contains("Mut[...] is only valid on a parameter"),
+            "field-Mut error must be the parameter-only message: {msg}");
+    }
+
+    #[test]
+    fn method_byref_arg_temporary_is_rejected() {
+        // EPIC-4 V2-c: the by-ref place-requirement is now enforced at METHOD call
+        // sites too. Passing a temporary (a constructor result) to a by-ref method
+        // param is an honest typeck error.
+        let src = "\
+class Account:
+    balance: int
+    def __init__(self, balance: int) -> None:
+        self.balance = balance
+
+class Bank:
+    name: str
+    def __init__(self, name: str) -> None:
+        self.name = name
+    def pay_into(self, acct: Mut[Account], amt: int) -> None:
+        acct.balance = acct.balance + amt
+
+def main() -> None:
+    b: Bank = Bank(\"ACME\")
+    b.pay_into(Account(5), 25)
+";
+        let m = crate::parser::parse(src).expect("parse");
+        let ctx = ctx_from_module(&m);
+        let r = check_bodies(&m, &ctx);
+        assert!(r.is_err(), "a temporary passed to a by-ref method param must be rejected");
+        let msg = format!("{:?}", r.unwrap_err());
+        assert!(msg.contains("by-reference parameter `acct` requires a variable"),
+            "method by-ref place error expected: {msg}");
+    }
+
+    #[test]
+    fn method_byref_arg_place_is_accepted() {
+        // The companion positive: a variable place passed to a by-ref method param
+        // typeck-passes.
+        let src = "\
+class Account:
+    balance: int
+    def __init__(self, balance: int) -> None:
+        self.balance = balance
+
+class Bank:
+    name: str
+    def __init__(self, name: str) -> None:
+        self.name = name
+    def pay_into(self, acct: Mut[Account], amt: int) -> None:
+        acct.balance = acct.balance + amt
+
+def main() -> None:
+    b: Bank = Bank(\"ACME\")
+    a: Account = Account(100)
+    b.pay_into(a, 25)
+";
+        let m = crate::parser::parse(src).expect("parse");
+        let ctx = ctx_from_module(&m);
+        assert!(check_bodies(&m, &ctx).is_ok(),
+            "a place passed to a by-ref method param must typeck-pass");
     }
 }

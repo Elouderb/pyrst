@@ -31,6 +31,13 @@ pub struct Param {
     pub ty: TypeExpr,
     pub default: Option<Expr>,
     pub span: Span,
+    /// EPIC-4 V2: opt-in by-reference param mode. Set true when the annotation
+    /// was `Mut[T]` (the parser unwraps `ty` to `T` and raises this flag). It is
+    /// meaningful only on a *function/method parameter* — class fields never set
+    /// it. Front-end use only for now: typeck reads it to require a place at the
+    /// call site and to skip the by-value mutation backstop; codegen still emits
+    /// the param by value (the `&mut T` emission is V2-c). Default false.
+    pub by_ref: bool,
 }
 
 #[derive(Debug, Clone)]

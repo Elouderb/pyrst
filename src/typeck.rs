@@ -68,6 +68,15 @@ impl Ty {
                         Ty::Unknown
                     }
                 }
+                // EPIC-4 V2: `Mut[T]` is a by-reference PARAMETER mode marker, not
+                // a type. The parser peels a top-level `Mut[T]` off a parameter
+                // annotation (raising `Param.by_ref`), so a `Mut[...]` that reaches
+                // here is in an illegal position — a return type, a field/variable
+                // annotation, or nested inside another type (e.g. `list[Mut[T]]`).
+                ("Mut", _) => return Err(Error::Type {
+                    span: Span::DUMMY,
+                    msg: "Mut[...] is only valid on a parameter".to_string(),
+                }),
                 (other, _) => return Err(Error::Type {
                     span: Span::DUMMY,
                     msg: format!("unknown generic type `{}`", other),
@@ -86,6 +95,13 @@ pub struct FuncSig {
     pub params: Vec<(String, Ty)>,
     pub ret: Ty,
     pub param_defaults: Vec<Option<Expr>>,  // None = required, Some = has default
+    /// EPIC-4 V2: per-param by-reference (`Mut[T]`) flag, PARALLEL to `params`
+    /// (self filtered out, like `param_defaults`). A kept-as-`Vec<bool>` sidecar
+    /// rather than widening the `params` tuple so the many `sig.params` readers
+    /// stay untouched. Built-ins and synthetic sigs leave it empty (`vec![]`):
+    /// the call-site place-check treats a missing entry as "by value", which is
+    /// always correct because no built-in takes a by-ref param.
+    pub param_by_ref: Vec<bool>,
 }
 
 pub struct TyCtx {
@@ -103,6 +119,7 @@ impl TyCtx {
             params: vec![("x".into(), Ty::Unknown)],
             ret: Ty::Unit,
             param_defaults: vec![],
+            param_by_ref: vec![],
         });
         // range(n) yields ints; model as a list of ints so loop vars/usages are
         // typed. NOTE: codegen emits range as a Rust range expr (0..n), not a
@@ -113,76 +130,84 @@ impl TyCtx {
             params: vec![("n".into(), Ty::Int)],
             ret: Ty::List(Box::new(Ty::Int)),
             param_defaults: vec![],
+            param_by_ref: vec![],
         });
         // Core builtins
         funcs.insert("len".into(), FuncSig {
             params: vec![("x".into(), Ty::Unknown)],
             ret: Ty::Int,
             param_defaults: vec![],
+            param_by_ref: vec![],
         });
         funcs.insert("str".into(), FuncSig {
             params: vec![("x".into(), Ty::Unknown)],
             ret: Ty::Str,
             param_defaults: vec![],
+            param_by_ref: vec![],
         });
         funcs.insert("int".into(), FuncSig {
             params: vec![("x".into(), Ty::Unknown)],
             ret: Ty::Int,
             param_defaults: vec![],
+            param_by_ref: vec![],
         });
         funcs.insert("float".into(), FuncSig {
             params: vec![("x".into(), Ty::Unknown)],
             ret: Ty::Float,
             param_defaults: vec![],
+            param_by_ref: vec![],
         });
         funcs.insert("bool".into(), FuncSig {
             params: vec![("x".into(), Ty::Unknown)],
             ret: Ty::Bool,
             param_defaults: vec![],
+            param_by_ref: vec![],
         });
         funcs.insert("enumerate".into(), FuncSig {
             params: vec![("x".into(), Ty::Unknown)],
             ret: Ty::Unknown,
             param_defaults: vec![],
+            param_by_ref: vec![],
         });
         funcs.insert("zip".into(), FuncSig {
             params: vec![("a".into(), Ty::Unknown), ("b".into(), Ty::Unknown)],
             ret: Ty::Unknown,
             param_defaults: vec![],
+            param_by_ref: vec![],
         });
-        funcs.insert("abs".into(), FuncSig { params: vec![("x".into(), Ty::Unknown)], ret: Ty::Unknown, param_defaults: vec![] });
-        funcs.insert("min".into(), FuncSig { params: vec![("a".into(), Ty::Unknown), ("b".into(), Ty::Unknown)], ret: Ty::Unknown, param_defaults: vec![] });
-        funcs.insert("max".into(), FuncSig { params: vec![("a".into(), Ty::Unknown), ("b".into(), Ty::Unknown)], ret: Ty::Unknown, param_defaults: vec![] });
-        funcs.insert("sorted".into(), FuncSig { params: vec![("x".into(), Ty::Unknown)], ret: Ty::List(Box::new(Ty::Unknown)), param_defaults: vec![] });
-        funcs.insert("sum".into(), FuncSig { params: vec![("x".into(), Ty::Unknown)], ret: Ty::Unknown, param_defaults: vec![] });
-        funcs.insert("input".into(), FuncSig { params: vec![("prompt".into(), Ty::Unknown)], ret: Ty::Str, param_defaults: vec![] });
-        funcs.insert("any".into(), FuncSig { params: vec![("x".into(), Ty::Unknown)], ret: Ty::Bool, param_defaults: vec![] });
-        funcs.insert("all".into(), FuncSig { params: vec![("x".into(), Ty::Unknown)], ret: Ty::Bool, param_defaults: vec![] });
-        funcs.insert("round".into(), FuncSig { params: vec![("x".into(), Ty::Unknown)], ret: Ty::Int, param_defaults: vec![] });
+        funcs.insert("abs".into(), FuncSig { params: vec![("x".into(), Ty::Unknown)], ret: Ty::Unknown, param_defaults: vec![], param_by_ref: vec![] });
+        funcs.insert("min".into(), FuncSig { params: vec![("a".into(), Ty::Unknown), ("b".into(), Ty::Unknown)], ret: Ty::Unknown, param_defaults: vec![], param_by_ref: vec![] });
+        funcs.insert("max".into(), FuncSig { params: vec![("a".into(), Ty::Unknown), ("b".into(), Ty::Unknown)], ret: Ty::Unknown, param_defaults: vec![], param_by_ref: vec![] });
+        funcs.insert("sorted".into(), FuncSig { params: vec![("x".into(), Ty::Unknown)], ret: Ty::List(Box::new(Ty::Unknown)), param_defaults: vec![], param_by_ref: vec![] });
+        funcs.insert("sum".into(), FuncSig { params: vec![("x".into(), Ty::Unknown)], ret: Ty::Unknown, param_defaults: vec![], param_by_ref: vec![] });
+        funcs.insert("input".into(), FuncSig { params: vec![("prompt".into(), Ty::Unknown)], ret: Ty::Str, param_defaults: vec![], param_by_ref: vec![] });
+        funcs.insert("any".into(), FuncSig { params: vec![("x".into(), Ty::Unknown)], ret: Ty::Bool, param_defaults: vec![], param_by_ref: vec![] });
+        funcs.insert("all".into(), FuncSig { params: vec![("x".into(), Ty::Unknown)], ret: Ty::Bool, param_defaults: vec![], param_by_ref: vec![] });
+        funcs.insert("round".into(), FuncSig { params: vec![("x".into(), Ty::Unknown)], ret: Ty::Int, param_defaults: vec![], param_by_ref: vec![] });
         // open(path) / open(path, mode) -> file handle. Arity is not checked
         // (added to the variadic skip list) so the optional mode arg works.
-        funcs.insert("open".into(), FuncSig { params: vec![("path".into(), Ty::Str), ("mode".into(), Ty::Str)], ret: Ty::File, param_defaults: vec![] });
-        funcs.insert("pow".into(), FuncSig { params: vec![("base".into(), Ty::Unknown), ("exp".into(), Ty::Unknown)], ret: Ty::Int, param_defaults: vec![] });
-        funcs.insert("chr".into(), FuncSig { params: vec![("x".into(), Ty::Int)], ret: Ty::Str, param_defaults: vec![] });
-        funcs.insert("ord".into(), FuncSig { params: vec![("x".into(), Ty::Str)], ret: Ty::Int, param_defaults: vec![] });
-        funcs.insert("reversed".into(), FuncSig { params: vec![("x".into(), Ty::Unknown)], ret: Ty::List(Box::new(Ty::Unknown)), param_defaults: vec![] });
-        funcs.insert("map".into(), FuncSig { params: vec![("f".into(), Ty::Unknown), ("x".into(), Ty::Unknown)], ret: Ty::Unknown, param_defaults: vec![] });
-        funcs.insert("filter".into(), FuncSig { params: vec![("f".into(), Ty::Unknown), ("x".into(), Ty::Unknown)], ret: Ty::Unknown, param_defaults: vec![] });
-        funcs.insert("isinstance".into(), FuncSig { params: vec![("obj".into(), Ty::Unknown), ("type_".into(), Ty::Unknown)], ret: Ty::Bool, param_defaults: vec![] });
-        funcs.insert("type".into(), FuncSig { params: vec![("obj".into(), Ty::Unknown)], ret: Ty::Str, param_defaults: vec![] });
-        funcs.insert("hex".into(), FuncSig { params: vec![("x".into(), Ty::Int)], ret: Ty::Str, param_defaults: vec![] });
-        funcs.insert("oct".into(), FuncSig { params: vec![("x".into(), Ty::Int)], ret: Ty::Str, param_defaults: vec![] });
-        funcs.insert("bin".into(), FuncSig { params: vec![("x".into(), Ty::Int)], ret: Ty::Str, param_defaults: vec![] });
-        funcs.insert("callable".into(), FuncSig { params: vec![("obj".into(), Ty::Unknown)], ret: Ty::Bool, param_defaults: vec![] });
-        funcs.insert("repr".into(), FuncSig { params: vec![("obj".into(), Ty::Unknown)], ret: Ty::Str, param_defaults: vec![] });
-        funcs.insert("ascii".into(), FuncSig { params: vec![("obj".into(), Ty::Unknown)], ret: Ty::Str, param_defaults: vec![] });
-        funcs.insert("list".into(), FuncSig { params: vec![("x".into(), Ty::Unknown)], ret: Ty::List(Box::new(Ty::Unknown)), param_defaults: vec![] });
-        funcs.insert("dict".into(), FuncSig { params: vec![], ret: Ty::Dict(Box::new(Ty::Unknown), Box::new(Ty::Unknown)), param_defaults: vec![] });
-        funcs.insert("tuple".into(), FuncSig { params: vec![("x".into(), Ty::Unknown)], ret: Ty::Tuple(vec![]), param_defaults: vec![] });
-        funcs.insert("getattr".into(), FuncSig { params: vec![("obj".into(), Ty::Unknown), ("name".into(), Ty::Str)], ret: Ty::Unknown, param_defaults: vec![] });
-        funcs.insert("setattr".into(), FuncSig { params: vec![("obj".into(), Ty::Unknown), ("name".into(), Ty::Str), ("value".into(), Ty::Unknown)], ret: Ty::Unit, param_defaults: vec![] });
-        funcs.insert("hasattr".into(), FuncSig { params: vec![("obj".into(), Ty::Unknown), ("name".into(), Ty::Str)], ret: Ty::Bool, param_defaults: vec![] });
-        funcs.insert("set".into(), FuncSig { params: vec![("x".into(), Ty::Unknown)], ret: Ty::Set(Box::new(Ty::Unknown)), param_defaults: vec![] });
+        funcs.insert("open".into(), FuncSig { params: vec![("path".into(), Ty::Str), ("mode".into(), Ty::Str)], ret: Ty::File, param_defaults: vec![], param_by_ref: vec![] });
+        funcs.insert("pow".into(), FuncSig { params: vec![("base".into(), Ty::Unknown), ("exp".into(), Ty::Unknown)], ret: Ty::Int, param_defaults: vec![], param_by_ref: vec![] });
+        funcs.insert("chr".into(), FuncSig { params: vec![("x".into(), Ty::Int)], ret: Ty::Str, param_defaults: vec![], param_by_ref: vec![] });
+        funcs.insert("ord".into(), FuncSig { params: vec![("x".into(), Ty::Str)], ret: Ty::Int, param_defaults: vec![], param_by_ref: vec![] });
+        funcs.insert("reversed".into(), FuncSig { params: vec![("x".into(), Ty::Unknown)], ret: Ty::List(Box::new(Ty::Unknown)), param_defaults: vec![], param_by_ref: vec![] });
+        funcs.insert("map".into(), FuncSig { params: vec![("f".into(), Ty::Unknown), ("x".into(), Ty::Unknown)], ret: Ty::Unknown, param_defaults: vec![], param_by_ref: vec![] });
+        funcs.insert("filter".into(), FuncSig { params: vec![("f".into(), Ty::Unknown), ("x".into(), Ty::Unknown)], ret: Ty::Unknown, param_defaults: vec![], param_by_ref: vec![] });
+        funcs.insert("isinstance".into(), FuncSig { params: vec![("obj".into(), Ty::Unknown), ("type_".into(), Ty::Unknown)], ret: Ty::Bool, param_defaults: vec![], param_by_ref: vec![] });
+        funcs.insert("type".into(), FuncSig { params: vec![("obj".into(), Ty::Unknown)], ret: Ty::Str, param_defaults: vec![], param_by_ref: vec![] });
+        funcs.insert("hex".into(), FuncSig { params: vec![("x".into(), Ty::Int)], ret: Ty::Str, param_defaults: vec![], param_by_ref: vec![] });
+        funcs.insert("oct".into(), FuncSig { params: vec![("x".into(), Ty::Int)], ret: Ty::Str, param_defaults: vec![], param_by_ref: vec![] });
+        funcs.insert("bin".into(), FuncSig { params: vec![("x".into(), Ty::Int)], ret: Ty::Str, param_defaults: vec![], param_by_ref: vec![] });
+        funcs.insert("callable".into(), FuncSig { params: vec![("obj".into(), Ty::Unknown)], ret: Ty::Bool, param_defaults: vec![], param_by_ref: vec![] });
+        funcs.insert("repr".into(), FuncSig { params: vec![("obj".into(), Ty::Unknown)], ret: Ty::Str, param_defaults: vec![], param_by_ref: vec![] });
+        funcs.insert("ascii".into(), FuncSig { params: vec![("obj".into(), Ty::Unknown)], ret: Ty::Str, param_defaults: vec![], param_by_ref: vec![] });
+        funcs.insert("list".into(), FuncSig { params: vec![("x".into(), Ty::Unknown)], ret: Ty::List(Box::new(Ty::Unknown)), param_defaults: vec![], param_by_ref: vec![] });
+        funcs.insert("dict".into(), FuncSig { params: vec![], ret: Ty::Dict(Box::new(Ty::Unknown), Box::new(Ty::Unknown)), param_defaults: vec![], param_by_ref: vec![] });
+        funcs.insert("tuple".into(), FuncSig { params: vec![("x".into(), Ty::Unknown)], ret: Ty::Tuple(vec![]), param_defaults: vec![], param_by_ref: vec![] });
+        funcs.insert("getattr".into(), FuncSig { params: vec![("obj".into(), Ty::Unknown), ("name".into(), Ty::Str)], ret: Ty::Unknown, param_defaults: vec![], param_by_ref: vec![] });
+        funcs.insert("setattr".into(), FuncSig { params: vec![("obj".into(), Ty::Unknown), ("name".into(), Ty::Str), ("value".into(), Ty::Unknown)], ret: Ty::Unit, param_defaults: vec![], param_by_ref: vec![] });
+        funcs.insert("hasattr".into(), FuncSig { params: vec![("obj".into(), Ty::Unknown), ("name".into(), Ty::Str)], ret: Ty::Bool, param_defaults: vec![], param_by_ref: vec![] });
+        funcs.insert("set".into(), FuncSig { params: vec![("x".into(), Ty::Unknown)], ret: Ty::Set(Box::new(Ty::Unknown)), param_defaults: vec![], param_by_ref: vec![] });
 
         // Builtin type names for isinstance checks
         let mut vars = HashMap::new();
@@ -245,7 +270,11 @@ impl TyCtx {
                     .filter(|p| p.name != "self")
                     .map(|p| p.default.clone())
                     .collect();
-                return Some(FuncSig { params, ret, param_defaults });
+                let param_by_ref = method.params.iter()
+                    .filter(|p| p.name != "self")
+                    .map(|p| p.by_ref)
+                    .collect();
+                return Some(FuncSig { params, ret, param_defaults, param_by_ref });
             }
             // Check parent classes
             for base in &class_def.bases {
@@ -316,6 +345,7 @@ pub fn extract_init_fields(class_def: &mut ClassDef) {
             ty: attr_type,
             default: None,
             span: Span::DUMMY,
+            by_ref: false,
         });
     }
 }
@@ -421,10 +451,18 @@ struct FuncEnv<'a> {
     /// functional pattern — the callee works on its own copy and returns the result; the caller
     /// captures the new value. We suppress the by-value-param-mutation error for these params.
     returned_params: std::collections::HashSet<String>,
+    /// EPIC-4 V2: subset of `params` declared `Mut[T]` (by-reference). A by-ref
+    /// param's mutation IS visible to the caller, so the by-value mutation
+    /// backstop (AttrAssign / IndexAssign / mutating method-call) must NOT fire
+    /// for these names.
+    by_ref_params: std::collections::HashSet<String>,
 }
 
 impl<'a> FuncEnv<'a> {
-    fn new(ctx: &'a TyCtx, params: &[(String, Ty)], ret_ty: Ty) -> Self {
+    /// Build a function-checking environment. `by_ref_names` is the set of
+    /// parameter names declared `Mut[T]` (empty for lambdas, test helpers, and
+    /// any function with no by-reference params).
+    fn with_by_ref(ctx: &'a TyCtx, params: &[(String, Ty)], by_ref_names: &[String], ret_ty: Ty) -> Self {
         let mut locals = HashMap::new();
         let mut used_vars = std::collections::HashSet::new();
         let mut param_set = std::collections::HashSet::new();
@@ -433,7 +471,8 @@ impl<'a> FuncEnv<'a> {
             used_vars.insert(name.clone());  // Parameters are always considered "used"
             param_set.insert(name.clone());
         }
-        FuncEnv { ctx, locals, ret_ty, used_vars, params: param_set, reassigned_params: std::collections::HashSet::new(), returned_params: std::collections::HashSet::new() }
+        let by_ref_params = by_ref_names.iter().cloned().collect();
+        FuncEnv { ctx, locals, ret_ty, used_vars, params: param_set, reassigned_params: std::collections::HashSet::new(), returned_params: std::collections::HashSet::new(), by_ref_params }
     }
 
     fn lookup(&self, name: &str) -> Option<Ty> {
@@ -481,8 +520,12 @@ pub fn check_bodies(m: &Module, ctx: &TyCtx) -> Result<()> {
                     .filter(|p| p.name != "self")
                     .map(|p| Ty::from_type_expr(&p.ty).map(|ty| (p.name.clone(), ty)))
                     .collect::<Result<Vec<_>>>()?;
+                let by_ref_names: Vec<String> = f.params.iter()
+                    .filter(|p| p.name != "self" && p.by_ref)
+                    .map(|p| p.name.clone())
+                    .collect();
                 let ret = Ty::from_type_expr(&f.ret)?;
-                let mut env = FuncEnv::new(ctx, &params, ret);
+                let mut env = FuncEnv::with_by_ref(ctx, &params, &by_ref_names, ret);
                 collect_returned_param_idents(&f.body, &env.params, &mut env.returned_params);
                 check_body(&f.body, &mut env)?;
             }
@@ -504,8 +547,12 @@ pub fn check_bodies(m: &Module, ctx: &TyCtx) -> Result<()> {
                         .map(|p| Ty::from_type_expr(&p.ty).map(|ty| (p.name.clone(), ty)))
                         .collect::<Result<Vec<_>>>()?;
                     params.insert(0, ("self".into(), Ty::Class(c.name.clone())));
+                    let by_ref_names: Vec<String> = method.params.iter()
+                        .filter(|p| p.name != "self" && p.by_ref)
+                        .map(|p| p.name.clone())
+                        .collect();
                     let ret = Ty::from_type_expr(&method.ret)?;
-                    let mut env = FuncEnv::new(ctx, &params, ret);
+                    let mut env = FuncEnv::with_by_ref(ctx, &params, &by_ref_names, ret);
                     collect_returned_param_idents(&method.body, &env.params, &mut env.returned_params);
                     check_body(&method.body, &mut env)?;
                 }
@@ -823,6 +870,14 @@ fn root_ident(e: &Expr) -> Option<&str> {
     }
 }
 
+/// EPIC-4 V2: is `e` a *place* (an addressable lvalue) we could borrow `&mut`?
+/// A by-reference (`Mut[T]`) argument must be one of these — a variable, a field
+/// access, or an index — never a temporary (call/constructor/literal/binop/etc.),
+/// which has no caller-visible storage to mutate.
+fn is_place_expr(e: &Expr) -> bool {
+    matches!(e, Expr::Ident(..) | Expr::Attr { .. } | Expr::Index { .. })
+}
+
 /// The single source of truth for copy-ness, consumed by both `typeck` and
 /// `codegen` (via `crate::typeck::is_copy` / `is_owned`). A type is `Copy` when
 /// its emitted Rust representation implements the `Copy` trait, so a by-value
@@ -881,6 +936,20 @@ pub const MUTATING_METHODS: &[&str] = &[
     // Dict mutators
     "update", "pop", "setdefault", "popitem",
 ];
+
+/// Shared body of the by-value-parameter-mutation backstop error. EPIC-4 V2 adds
+/// the `Mut[T]` on-ramp to the remedy clause: the user can now opt into a real
+/// by-reference param instead of only the return-the-value idiom. All three
+/// backstop sites (AttrAssign / IndexAssign / mutating method-call) use this so
+/// the message can never drift between them.
+fn by_value_mutation_error(param: &str) -> String {
+    format!(
+        "mutation of by-value parameter `{}` is not visible to the caller; \
+         mutate via a method on it or return the updated value; \
+         or declare the parameter `Mut[T]` to mutate it in place",
+        param
+    )
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1211,15 +1280,12 @@ fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
                     && env.params.contains(root)
                     && !env.reassigned_params.contains(root)
                     && !env.returned_params.contains(root)
+                    && !env.by_ref_params.contains(root)
                     && is_owned(&obj_ty)
                 {
                     return Err(Error::Type {
                         span: *span,
-                        msg: format!(
-                            "mutation of by-value parameter `{}` is not visible to the caller; \
-                             mutate via a method on it or return the updated value",
-                            root
-                        ),
+                        msg: by_value_mutation_error(root),
                     });
                 }
             }
@@ -1252,15 +1318,12 @@ fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
                     && env.params.contains(root)
                     && !env.reassigned_params.contains(root)
                     && !env.returned_params.contains(root)
+                    && !env.by_ref_params.contains(root)
                     && is_owned(&obj_ty)
                 {
                     return Err(Error::Type {
                         span: *span,
-                        msg: format!(
-                            "mutation of by-value parameter `{}` is not visible to the caller; \
-                             mutate via a method on it or return the updated value",
-                            root
-                        ),
+                        msg: by_value_mutation_error(root),
                     });
                 }
             }
@@ -1922,6 +1985,7 @@ fn lambda_ret_with_elem(
                 params: std::collections::HashSet::new(),
                 reassigned_params: std::collections::HashSet::new(),
                 returned_params: std::collections::HashSet::new(),
+                by_ref_params: std::collections::HashSet::new(),
             };
             // Bind every param: the first to the iterable element type, the
             // rest to their declared type or Unknown (map/filter pass a single
@@ -1986,6 +2050,7 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 params: env.params.clone(),
                 reassigned_params: env.reassigned_params.clone(),
                 returned_params: env.returned_params.clone(),
+                by_ref_params: env.by_ref_params.clone(),
             };
             inner_env.locals.insert(target.clone(), elem_ty);
             if let Some(c) = cond { check_expr(c, &mut inner_env)?; }
@@ -2008,6 +2073,7 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 params: env.params.clone(),
                 reassigned_params: env.reassigned_params.clone(),
                 returned_params: env.returned_params.clone(),
+                by_ref_params: env.by_ref_params.clone(),
             };
             inner_env.locals.insert(target.clone(), elem_ty);
             if let Some(c) = cond { check_expr(c, &mut inner_env)?; }
@@ -2033,6 +2099,7 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 params: env.params.clone(),
                 reassigned_params: env.reassigned_params.clone(),
                 returned_params: env.returned_params.clone(),
+                by_ref_params: env.by_ref_params.clone(),
             };
             inner_env.locals.insert(target.clone(), elem_ty);
             if let Some(c) = cond { check_expr(c, &mut inner_env)?; }
@@ -2295,8 +2362,32 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                             });
                         }
                         let sig_params = sig.params.clone();
+                        let sig_by_ref = sig.param_by_ref.clone();
                         let sig_ret = sig.ret.clone();
                         for (i, a) in args.iter().enumerate() {
+                            // EPIC-4 V2: an argument bound to a by-reference
+                            // (`Mut[T]`) param must be a PLACE — an lvalue we can
+                            // take `&mut` of (variable / field / index). A
+                            // temporary (call/constructor/literal/binop result)
+                            // has no caller-visible storage to borrow, so it is an
+                            // honest typeck error here rather than a later rustc
+                            // borrow failure. The arg's TYPE is still checked
+                            // against the inner `T` by the compatibility check
+                            // below (the param type was unwrapped from `Mut[T]`).
+                            if sig_by_ref.get(i).copied().unwrap_or(false)
+                                && !is_place_expr(a)
+                            {
+                                let pname = sig_params.get(i)
+                                    .map(|(n, _)| n.as_str())
+                                    .unwrap_or("<arg>");
+                                return Err(Error::Type {
+                                    span: *span,
+                                    msg: format!(
+                                        "by-reference parameter `{}` requires a variable, not a temporary",
+                                        pname
+                                    ),
+                                });
+                            }
                             let arg_ty = check_expr(a, env)?;
                             // Concrete-only positional arg-type check (skip variadic builtins).
                             // Only fires when BOTH param and arg types are concrete and
@@ -2374,15 +2465,12 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                                         && env.params.contains(param_name.as_str())
                                         && !env.reassigned_params.contains(param_name.as_str())
                                         && !env.returned_params.contains(param_name.as_str())
+                                        && !env.by_ref_params.contains(param_name.as_str())
                                         && is_owned(&obj_ty)
                                     {
                                         return Err(Error::Type {
                                             span: *span,
-                                            msg: format!(
-                                                "mutation of by-value parameter `{}` is not visible to the caller; \
-                                                 mutate via a method on it or return the updated value",
-                                                param_name
-                                            ),
+                                            msg: by_value_mutation_error(param_name),
                                         });
                                     }
                                 }
@@ -2563,6 +2651,7 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 params: std::collections::HashSet::new(),
                 reassigned_params: std::collections::HashSet::new(),
                 returned_params: std::collections::HashSet::new(),
+                by_ref_params: std::collections::HashSet::new(),
             };
             for (param_name, param_ty) in params {
                 let ty = lambda_param_ty(param_ty);
@@ -2606,12 +2695,12 @@ mod tests {
 
     /// Build a minimal FuncEnv backed by a fresh TyCtx, returning Unit.
     fn make_env(ctx: &TyCtx) -> FuncEnv<'_> {
-        FuncEnv::new(ctx, &[], Ty::Unit)
+        FuncEnv::with_by_ref(ctx, &[], &[], Ty::Unit)
     }
 
     /// Build a FuncEnv with a declared return type.
     fn make_env_ret(ctx: &TyCtx, ret: Ty) -> FuncEnv<'_> {
-        FuncEnv::new(ctx, &[], ret)
+        FuncEnv::with_by_ref(ctx, &[], &[], ret)
     }
 
     /// Construct a Call expr: callee is an Ident, no kwargs.
@@ -3825,6 +3914,7 @@ mod tests {
         ctx.funcs.insert("myfn".into(), FuncSig {
             params: vec![("x".into(), Ty::Int)],
             param_defaults: vec![None],
+            param_by_ref: vec![],
             ret: Ty::Int,
         });
         let mut env = make_env(&ctx);
@@ -3839,6 +3929,7 @@ mod tests {
         ctx.funcs.insert("twoarg".into(), FuncSig {
             params: vec![("a".into(), Ty::Int), ("b".into(), Ty::Str)],
             param_defaults: vec![None, None],
+            param_by_ref: vec![],
             ret: Ty::Bool,
         });
         let mut env = make_env(&ctx);
@@ -3853,6 +3944,7 @@ mod tests {
         ctx.funcs.insert("takes_int".into(), FuncSig {
             params: vec![("n".into(), Ty::Int)],
             param_defaults: vec![None],
+            param_by_ref: vec![],
             ret: Ty::Unit,
         });
         let mut env = make_env(&ctx);
@@ -3877,6 +3969,7 @@ mod tests {
         ctx.funcs.insert("takes_float".into(), FuncSig {
             params: vec![("f".into(), Ty::Float)],
             param_defaults: vec![None],
+            param_by_ref: vec![],
             ret: Ty::Unit,
         });
         let mut env = make_env(&ctx);
@@ -4160,6 +4253,7 @@ mod tests {
         ctx.funcs.insert("takes_str".into(), FuncSig {
             params: vec![("s".into(), Ty::Str)],
             param_defaults: vec![None],
+            param_by_ref: vec![],
             ret: Ty::Unit,
         });
         let mut env = make_env(&ctx);
@@ -4301,5 +4395,149 @@ mod tests {
         // Option<non-Copy> is non-Copy.
         assert!(!is_copy(&Ty::Option(Box::new(Ty::Str))));
         assert!(!is_copy(&Ty::Option(Box::new(Ty::Class("Point".into())))));
+    }
+
+    // =========================================================================
+    // Category — EPIC-4 V2: Mut[T] by-reference param mode (front-end)
+    // =========================================================================
+
+    /// Register a single-param function whose one param is by-reference.
+    fn ctx_with_byref_fn(name: &str, param: &str, ty: Ty) -> TyCtx {
+        let mut ctx = TyCtx::new();
+        ctx.funcs.insert(name.into(), FuncSig {
+            params: vec![(param.into(), ty)],
+            param_defaults: vec![None],
+            param_by_ref: vec![true],
+            ret: Ty::Unit,
+        });
+        ctx
+    }
+
+    #[test]
+    fn byref_arg_temporary_is_rejected() {
+        // A by-ref param given a TEMPORARY (here an int literal) is an honest
+        // typeck error — you cannot borrow `&mut` of a value with no storage.
+        let ctx = ctx_with_byref_fn("touch", "slot", Ty::Int);
+        let mut env = make_env(&ctx);
+        let r = check_expr(&call_fn("touch", vec![int_lit(7)]), &mut env);
+        assert_type_err(r, "by-reference parameter `slot` requires a variable, not a temporary");
+    }
+
+    #[test]
+    fn byref_arg_constructor_temporary_is_rejected() {
+        // A constructor/call result is equally a temporary, not a place.
+        let ctx = ctx_with_byref_fn("touch", "slot", Ty::Int);
+        let mut env = make_env(&ctx);
+        // `helper()` returns Unknown; the place-check fires BEFORE arg-type
+        // compatibility, so the diagnostic is the by-reference one.
+        let temp = call_fn("helper", vec![]);
+        // Register `helper` so the inner call resolves (it returns Unknown).
+        let mut ctx2 = ctx;
+        ctx2.funcs.insert("helper".into(), FuncSig {
+            params: vec![], param_defaults: vec![], param_by_ref: vec![], ret: Ty::Int,
+        });
+        let mut env2 = make_env(&ctx2);
+        let r = check_expr(&call_fn("touch", vec![temp]), &mut env2);
+        assert_type_err(r, "requires a variable, not a temporary");
+    }
+
+    #[test]
+    fn byref_arg_place_ident_is_accepted() {
+        // A bound variable (a place) satisfies the by-ref requirement.
+        let ctx = ctx_with_byref_fn("touch", "slot", Ty::Int);
+        let mut env = make_env(&ctx);
+        env.locals.insert("n".into(), Ty::Int);
+        let r = check_expr(&call_fn("touch", vec![ident("n")]), &mut env);
+        assert!(r.is_ok(), "a variable place should satisfy a by-ref param, got {:?}", r);
+    }
+
+    #[test]
+    fn mut_type_rejected_in_non_param_position() {
+        // `Mut[T]` is never a real type: from_type_expr (the lowering boundary for
+        // every NON-param annotation — return types, field/variable annotations,
+        // and nested forms) rejects it with the directed message.
+        let me = TypeExpr::Generic("Mut".into(), vec![TypeExpr::Named("int".into())]);
+        let r = Ty::from_type_expr(&me);
+        match r {
+            Err(Error::Type { msg, .. }) =>
+                assert!(msg.contains("Mut[...] is only valid on a parameter"), "got: {}", msg),
+            other => panic!("expected Mut rejection, got {:?}", other),
+        }
+        // Nested inside another generic is rejected the same way.
+        let nested = TypeExpr::Generic("list".into(), vec![me]);
+        assert!(Ty::from_type_expr(&nested).is_err(), "list[Mut[T]] must be rejected");
+    }
+
+    #[test]
+    fn backstop_message_mentions_mut_remedy() {
+        // The by-value-param-mutation backstop now offers the `Mut[T]` on-ramp in
+        // addition to the existing return-the-value idiom.
+        let msg = by_value_mutation_error("acc");
+        assert!(msg.contains("mutate via a method on it or return the updated value"),
+            "must keep the original remedy: {}", msg);
+        assert!(msg.contains("declare the parameter `Mut[T]` to mutate it in place"),
+            "must add the Mut[T] on-ramp: {}", msg);
+    }
+
+    #[test]
+    fn parser_unwraps_mut_param_to_by_ref_flag() {
+        // `Mut[Account]` on a parameter raises by_ref and the param's annotation
+        // is unwrapped to the inner `Account` (Mut never survives as a type).
+        let src = "def f(a: Mut[int], b: str) -> None:\n    pass\n";
+        let m = crate::parser::parse(src).expect("parse");
+        let func = m.stmts.iter().find_map(|s| match s {
+            Stmt::Func(f) => Some(f),
+            _ => None,
+        }).expect("func");
+        let a = &func.params[0];
+        assert!(a.by_ref, "Mut[int] param must set by_ref");
+        assert_eq!(a.ty, TypeExpr::Named("int".into()), "Mut must be unwrapped to inner");
+        let b = &func.params[1];
+        assert!(!b.by_ref, "a plain param must not be by_ref");
+        assert_eq!(b.ty, TypeExpr::Named("str".into()));
+    }
+
+    #[test]
+    fn byref_param_mutation_typechecks() {
+        // End-to-end (parse + check_bodies): a by-ref param that IS mutated must
+        // typeck-PASS — the backstop is skipped because the mutation is now
+        // legitimately caller-visible. NOTE this is a CHECK-only assertion; it is
+        // deliberately NOT a build/run golden because codegen does not yet emit
+        // `&mut` (V2-c), so a built binary would silently drop the mutation.
+        let src = "\
+class Account:
+    balance: int
+    def __init__(self, balance: int) -> None:
+        self.balance = balance
+
+def deposit(account: Mut[Account], amt: int) -> None:
+    account.balance = account.balance + amt
+";
+        let m = crate::parser::parse(src).expect("parse");
+        // Build a context the way the resolver does for a single module.
+        let mut ctx = TyCtx::new();
+        for s in &m.stmts {
+            if let Stmt::Class(c) = s {
+                let mut c = c.clone();
+                extract_init_fields(&mut c);
+                ctx.classes.insert(c.name.clone(), c);
+            }
+        }
+        for s in &m.stmts {
+            if let Stmt::Func(f) = s {
+                ctx.funcs.insert(f.name.clone(), FuncSig {
+                    params: f.params.iter().filter(|p| p.name != "self")
+                        .map(|p| (p.name.clone(), Ty::from_type_expr(&p.ty).unwrap()))
+                        .collect(),
+                    param_defaults: f.params.iter().filter(|p| p.name != "self")
+                        .map(|p| p.default.clone()).collect(),
+                    param_by_ref: f.params.iter().filter(|p| p.name != "self")
+                        .map(|p| p.by_ref).collect(),
+                    ret: Ty::from_type_expr(&f.ret).unwrap(),
+                });
+            }
+        }
+        assert!(check_bodies(&m, &ctx).is_ok(),
+            "a mutated by-ref param must typeck-pass (backstop skipped)");
     }
 }

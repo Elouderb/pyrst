@@ -349,12 +349,26 @@ impl Parser {
         let name = self.expect_ident("parameter name")?;
         // `self` parameter has no type annotation in Python — it is always the receiver.
         if name == "self" {
-            return Ok(Param { name, ty: TypeExpr::Named("Self_".to_string()), default: None, span });
+            return Ok(Param { name, ty: TypeExpr::Named("Self_".to_string()), default: None, span, by_ref: false });
         }
         self.expect(&Tok::Colon, "parameter — type annotation required")?;
         let ty = self.parse_type()?;
+        // EPIC-4 V2: `Mut[T]` is the opt-in by-reference param mode. It is only
+        // valid as the TOP-LEVEL annotation of a parameter, so we peel it here
+        // (the one param-lowering boundary): raise `by_ref` and replace the
+        // annotation with the inner `T`, so the rest of the compiler sees a
+        // plain `T` param plus the mode flag. `Mut` is never a real type — any
+        // `Mut[...]` that survives into a non-param position (return type, field,
+        // variable annotation, or nested like `list[Mut[T]]`) reaches
+        // `Ty::from_type_expr` and is rejected there.
+        let (ty, by_ref) = match ty {
+            TypeExpr::Generic(ref head, ref args) if head == "Mut" && args.len() == 1 => {
+                (args[0].clone(), true)
+            }
+            other => (other, false),
+        };
         let default = if self.eat(&Tok::Assign) { Some(self.parse_expr()?) } else { None };
-        Ok(Param { name, ty, default, span })
+        Ok(Param { name, ty, default, span, by_ref })
     }
 
     fn parse_class(&mut self) -> Result<ClassDef> {
@@ -435,7 +449,7 @@ impl Parser {
                     let ty = self.parse_type()?;
                     let default = if self.eat(&Tok::Assign) { Some(self.parse_expr()?) } else { None };
                     self.eat_newline()?;
-                    fields.push(Param { name: fname, ty, default, span: field_span });
+                    fields.push(Param { name: fname, ty, default, span: field_span, by_ref: false });
                 }
                 other => return Err(Error::Parse {
                     span: self.peek_span(),

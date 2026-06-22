@@ -501,10 +501,18 @@ impl Formatter {
                 parts.push("self".to_string());
                 continue;
             }
-            if let Some(default) = &p.default {
-                parts.push(format!("{}: {} = {}", p.name, self.format_type(&p.ty), self.format_expr(default)?));
+            // EPIC-4 V2: a by-reference param had its `Mut[T]` annotation peeled
+            // into `ty = T` + the `by_ref` flag at parse time, so re-wrap it here
+            // to round-trip the surface syntax (`account: Mut[Account]`).
+            let ty_str = if p.by_ref {
+                format!("Mut[{}]", self.format_type(&p.ty))
             } else {
-                parts.push(format!("{}: {}", p.name, self.format_type(&p.ty)));
+                self.format_type(&p.ty)
+            };
+            if let Some(default) = &p.default {
+                parts.push(format!("{}: {} = {}", p.name, ty_str, self.format_expr(default)?));
+            } else {
+                parts.push(format!("{}: {}", p.name, ty_str));
             }
         }
         Ok(parts.join(", "))

@@ -125,6 +125,12 @@ fn merge_ctx_from_module(m: &Module, ctx: &mut TyCtx, is_root: bool) -> Result<(
                         .filter(|p| p.name != "self")
                         .map(|p| p.default.clone())
                         .collect(),
+                    // EPIC-4 V2: per-param by-reference (`Mut[T]`) mode, parallel
+                    // to `params`/`param_defaults` (self filtered out).
+                    param_by_ref: f.params.iter()
+                        .filter(|p| p.name != "self")
+                        .map(|p| p.by_ref)
+                        .collect(),
                 });
             }
             Stmt::Class(c) => {
@@ -143,6 +149,10 @@ fn merge_ctx_from_module(m: &Module, ctx: &mut TyCtx, is_root: bool) -> Result<(
                         param_defaults: m_fn.params.iter()
                             .filter(|p| p.name != "self")
                             .map(|p| p.default.clone())
+                            .collect(),
+                        param_by_ref: m_fn.params.iter()
+                            .filter(|p| p.name != "self")
+                            .map(|p| p.by_ref)
                             .collect(),
                     });
                 }

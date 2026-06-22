@@ -1374,6 +1374,197 @@ impl<'a> Codegen<'a> {
         Ok(())
     }
 
+    /// (EPIC-5 C2-2a) Emit the closed-set companion enum + method-dispatch impl +
+    /// field-accessor impl for every polymorphic base, as DEAD CODE that must
+    /// compile. C2-2a leaves all of this UNUSED — `rust_ty` still emits plain `n`,
+    /// constructors are not wrapped, and the C1 honest gate stays — so output is
+    /// byte-for-byte identical and the golden suite staying green proves the
+    /// emitted Rust compiles. C2-2b activates it (flips `rust_ty` to `n__`, wraps
+    /// constructors, removes the gate, lowers field access to the accessors).
+    ///
+    /// Run from `emit_program` AFTER the top-level statement loop, so every
+    /// variant's value-struct (emitted by `emit_class`) already exists — "after
+    /// the structs". Bases are visited in sorted order for deterministic codegen.
+    fn emit_companion_enums(&mut self) -> Result<()> {
+        let mut bases: Vec<String> = self
+            .poly_map
+            .iter()
+            .filter(|(_, subs)| !subs.is_empty())
+            .map(|(b, _)| b.clone())
+            .collect();
+        bases.sort();
+        for base in &bases {
+            self.emit_companion_enum(base)?;
+        }
+        Ok(())
+    }
+
+    /// Emit the companion enum + dispatch + field accessors for ONE polymorphic
+    /// base `base` (guaranteed to have a non-empty `poly_map` entry). All three
+    /// items are `#[allow(dead_code)]` so the 0-warning gate does not trip on the
+    /// as-yet-unused machinery.
+    fn emit_companion_enum(&mut self, base: &str) -> Result<()> {
+        // Variant set: the base itself, then every TRANSITIVE subclass (poly_map
+        // is transitive and already sorted). Each variant's payload is the BARE
+        // concrete value-struct — NOT `rust_ty` (which would later become `n__`)
+        // and NOT a companion-enum name; intermediate bases therefore appear as
+        // raw-struct variants too (e.g. `Base__ { Base(Base), Leaf(Leaf),
+        // Mid(Mid) }`), so both `Base__` and `Mid__` are independent flat enums.
+        let mut variants: Vec<String> = vec![base.to_string()];
+        if let Some(subs) = self.poly_map.get(base) {
+            variants.extend(subs.iter().cloned());
+        }
+        let enum_name = format!("{}__", base);
+
+        // 1. The enum. Always exactly `#[derive(Clone, Debug)]`: a data-variant
+        // enum cannot derive Default or Copy, and Display/PartialEq for the enum
+        // are deferred (C2-2b+). Do NOT reuse emit_class's all_fields_copy derive
+        // logic (design §F).
+        self.line("#[allow(dead_code)]");
+        self.line("#[derive(Clone, Debug)]");
+        self.line(&format!("enum {} {{", enum_name));
+        self.indent += 1;
+        for v in &variants {
+            self.line(&format!("{}({}),", v, v));
+        }
+        self.indent -= 1;
+        self.line("}");
+        self.line("");
+
+        // 2. Method-dispatch impl. Dunder methods become Rust TRAIT impls (Display
+        // / PartialEq / PartialOrd / Add / ...), not inherent methods, so a
+        // dispatch `match self { _ => x.__str__() }` would not compile — skip them
+        // (this is the inherit_dunders crux). Also skip `__init__` (a constructor,
+        // not dispatched) and any `@staticmethod` (no `self` receiver). The list
+        // mirrors emit_class's `dunder_trait_names` exactly.
+        let dunder_trait_names = ["__str__", "__repr__", "__add__", "__sub__", "__mul__",
+                                   "__eq__", "__neg__", "__bool__", "__lt__"];
+        let resolved = self.resolved_methods(base);
+        let dispatchable: Vec<Func> = resolved
+            .into_iter()
+            .filter(|m| {
+                m.name != "__init__"
+                    && !m.decorators.contains(&"staticmethod".to_string())
+                    && !dunder_trait_names.contains(&m.name.as_str())
+                    && m.params.iter().any(|p| p.name == "self")
+            })
+            .collect();
+
+        self.line("#[allow(dead_code)]");
+        self.line(&format!("impl {} {{", enum_name));
+        self.indent += 1;
+        for m in &dispatchable {
+            self.emit_dispatch_method(base, &enum_name, &variants, m)?;
+        }
+        self.indent -= 1;
+        self.line("}");
+        self.line("");
+
+        // 3. Field-accessor impl: one `__field_<f>` per base field (every variant
+        // inherits the base's fields, so the field exists on every variant
+        // struct). Non-Copy fields clone (value semantics); Copy fields read bare.
+        // Dedup by field NAME (mirrors emit_class's all_fields walk): get_all_fields
+        // can yield the same name more than once across a base chain, which would
+        // otherwise emit two identical `__field_<f>` methods (rustc E0592).
+        let mut accessor_fields: Vec<Param> = Vec::new();
+        for f in self.ctx.get_all_fields(base) {
+            if !accessor_fields.iter().any(|ef: &Param| ef.name == f.name) {
+                accessor_fields.push(f);
+            }
+        }
+        self.line("#[allow(dead_code)]");
+        self.line(&format!("impl {} {{", enum_name));
+        self.indent += 1;
+        for f in &accessor_fields {
+            let fty = Ty::from_type_expr(&f.ty)?;
+            let ret = self.rust_ty(&fty);
+            let read = if crate::typeck::is_copy(&fty) {
+                format!("x.{}", f.name)
+            } else {
+                format!("x.{}.clone()", f.name)
+            };
+            let arms: Vec<String> = variants
+                .iter()
+                .map(|v| format!("{}::{}(x) => {}", enum_name, v, read))
+                .collect();
+            self.line(&format!(
+                "fn __field_{}(&self) -> {} {{ match self {{ {} }} }}",
+                f.name,
+                ret,
+                arms.join(", ")
+            ));
+        }
+        self.indent -= 1;
+        self.line("}");
+        self.line("");
+
+        Ok(())
+    }
+
+    /// Emit a single dispatch method on the companion enum for resolved base
+    /// method `m`. The signature mirrors `m`: each non-`self` param via `rust_ty`
+    /// (a `Mut[T]` by-ref param becomes `&mut T`), the return via `rust_ty`. The
+    /// receiver is `&mut self` when `m` needs `&mut self` on the base OR on ANY
+    /// variant (the per-variant V3 query, design §F): if any variant's concrete
+    /// `m` is `&mut self`, binding `x` as `&mut` is required for `x.m()` to
+    /// compile. The body forwards each param by name to the variant's inherent
+    /// `m` (every variant struct has it — inherited or overridden).
+    fn emit_dispatch_method(
+        &mut self,
+        base: &str,
+        enum_name: &str,
+        variants: &[String],
+        m: &Func,
+    ) -> Result<()> {
+        // Per-variant `&mut self`: needs_mut_self for the base's `m`, OR for the
+        // SAME-named method resolved on any variant (a variant may override `m`
+        // as `&mut self` even when the base is `&self`). Bodies come from each
+        // variant's resolved method set so the V3 decision is queried against the
+        // exact body that variant emits.
+        let mut needs_mut = self.needs_mut_self(base, &m.name, &m.body);
+        if !needs_mut {
+            for v in variants {
+                if let Some(vm) = self.resolved_methods(v).into_iter().find(|x| x.name == m.name) {
+                    if self.needs_mut_self(v, &m.name, &vm.body) {
+                        needs_mut = true;
+                        break;
+                    }
+                }
+            }
+        }
+        let receiver = if needs_mut { "&mut self" } else { "&self" };
+
+        // Non-self params + their forwarded names. A by-ref (`Mut[T]`) param
+        // renders `name: &mut T` and forwards the bare binding (already a `&mut`).
+        let non_self: Vec<&Param> = m.params.iter().filter(|p| p.name != "self").collect();
+        let mut sig_params: Vec<String> = Vec::new();
+        let mut fwd: Vec<String> = Vec::new();
+        for p in &non_self {
+            let pty = self.rust_ty(&Ty::from_type_expr(&p.ty)?);
+            if p.by_ref {
+                sig_params.push(format!("{}: &mut {}", p.name, pty));
+            } else {
+                sig_params.push(format!("{}: {}", p.name, pty));
+            }
+            fwd.push(p.name.clone());
+        }
+        let ret = self.rust_ty(&Ty::from_type_expr(&m.ret)?);
+        let fwd_args = fwd.join(", ");
+        let arms: Vec<String> = variants
+            .iter()
+            .map(|v| format!("{}::{}(x) => x.{}({})", enum_name, v, m.name, fwd_args))
+            .collect();
+
+        let mut sig = format!("fn {}({}", m.name, receiver);
+        for sp in &sig_params {
+            sig.push_str(", ");
+            sig.push_str(sp);
+        }
+        let _ = write!(sig, ") -> {} {{ match self {{ {} }} }}", ret, arms.join(", "));
+        self.line(&sig);
+        Ok(())
+    }
+
     /// True when `obj.name` resolves to a `@property` getter (an owned temp
     /// produced by a method call `obj.name()`), rather than a plain field read.
     /// Shared by the `emit_expr` Attr arm (which appends `()`) and
@@ -4419,6 +4610,14 @@ pub fn emit_program(modules: &[(Module, String)], ctx: &TyCtx) -> Result<String>
             cg.emit_top_stmt(s)?;
         }
     }
+
+    // (EPIC-5 C2-2a) Emit the companion-enum machinery (closed-set enum +
+    // method-dispatch impl + field-accessor impl) for every polymorphic base,
+    // AFTER all value-structs exist. C2-2a emits it as #[allow(dead_code)] and
+    // never references it (rust_ty still plain `n`, C1 gate intact), so output is
+    // byte-for-byte unchanged; the dead code merely has to compile. C2-2b wires
+    // it in.
+    cg.emit_companion_enums()?;
 
     // Synthetic entry point (same as current emit_module logic)
     if ctx.funcs.contains_key("main") {

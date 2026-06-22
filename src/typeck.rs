@@ -601,6 +601,45 @@ fn validate_decorators(decorators: &[String], span: Span) -> Result<()> {
     Ok(())
 }
 
+/// Return a best-effort `Span` for a statement, used for error reporting.
+fn stmt_span(s: &Stmt) -> Span {
+    match s {
+        Stmt::Expr(e) => e.span(),
+        Stmt::Assign { span, .. }
+        | Stmt::AugAssign { span, .. }
+        | Stmt::Unpack { span, .. }
+        | Stmt::If { span, .. }
+        | Stmt::While { span, .. }
+        | Stmt::For { span, .. }
+        | Stmt::Assert { span, .. }
+        | Stmt::Raise { span, .. }
+        | Stmt::Try { span, .. }
+        | Stmt::With { span, .. }
+        | Stmt::Del { span, .. }
+        | Stmt::Match { span, .. }
+        | Stmt::AttrAssign { span, .. }
+        | Stmt::IndexAssign { span, .. }
+        | Stmt::Import { span, .. } => *span,
+        Stmt::Return(_, span) | Stmt::Pass(span) | Stmt::Break(span) | Stmt::Continue(span) => *span,
+        Stmt::Func(f) => f.span,
+        Stmt::Class(c) => c.span,
+    }
+}
+
+/// Return true if `s` is a bare top-level call to `main()` with no arguments —
+/// the conventional pyrst entry-point idiom.  The Rust `fn main()` emitted by
+/// `emit_program` already calls `user_main()`, so this call is a recognised
+/// no-op that must be silently accepted to keep existing positive examples green.
+fn is_bare_main_call(s: &Stmt) -> bool {
+    matches!(
+        s,
+        Stmt::Expr(Expr::Call { callee, args, kwargs, .. })
+            if matches!(callee.as_ref(), Expr::Ident(name, _) if name == "main")
+                && args.is_empty()
+                && kwargs.is_empty()
+    )
+}
+
 /// Type-check function/class bodies against a pre-built context.
 /// Used for multi-file compilation where the context is merged from all modules.
 pub fn check_bodies(m: &Module, ctx: &TyCtx) -> Result<()> {
@@ -701,7 +740,23 @@ pub fn check_bodies(m: &Module, ctx: &TyCtx) -> Result<()> {
                     check_body(&method.body, &mut env)?;
                 }
             }
-            _ => {}
+            // Import statements are resolved by the resolver and are
+            // intentionally not type-checked here (no body to check).
+            Stmt::Import { .. } => {}
+            _ => {
+                // Silently accept a bare top-level `main()` call — it is the
+                // conventional pyrst entry-point idiom and is already driven by
+                // the synthetic Rust `fn main() { user_main(); }`.
+                if !is_bare_main_call(s) {
+                    let span = stmt_span(s);
+                    return Err(Error::Type {
+                        span,
+                        msg: "top-level statements other than function/class/import \
+                              definitions are not supported"
+                            .to_string(),
+                    });
+                }
+            }
         }
     }
     Ok(())

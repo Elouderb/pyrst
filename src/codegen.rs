@@ -543,10 +543,26 @@ impl<'a> Codegen<'a> {
                 self.emit_class(c)
             }
             other => {
-                // Top-level non-decl statements are not yet supported (would need
-                // collecting them into the synthetic main). v0 punts.
-                self.line(&format!("// TODO: top-level stmt {:?}", std::mem::discriminant(other)));
-                Ok(())
+                // Silently accept a bare top-level `main()` call — the Rust
+                // `fn main() { user_main(); }` already drives the entry point,
+                // so this idiom is a recognised no-op.
+                if matches!(
+                    other,
+                    Stmt::Expr(crate::ast::Expr::Call { callee, args, kwargs, .. })
+                        if matches!(callee.as_ref(), crate::ast::Expr::Ident(name, _) if name == "main")
+                            && args.is_empty()
+                            && kwargs.is_empty()
+                ) {
+                    return Ok(());
+                }
+                // Any other unsupported top-level statement is an honest error.
+                // This arm is a backstop; typeck's check_bodies fires the same
+                // rejection earlier (at `pyrst check` time).
+                Err(crate::diag::Error::Codegen(
+                    "top-level statements other than function/class/import \
+                     definitions are not supported"
+                        .to_string(),
+                ))
             }
         }
     }

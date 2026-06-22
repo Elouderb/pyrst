@@ -10,17 +10,12 @@ use std::fmt::Write;
 
 use crate::ast::*;
 use crate::diag::Result;
-use crate::typeck::{Ty, TyCtx};
-
-/// Canonical list of collection methods that mutate the receiver in-place.
-/// Consulted by both `method_modifies_self` (to infer `&mut self` on the
-/// enclosing method) and the emission site (to pick `emit_place` for
-/// subscripted receivers so the mutation lands on the real element).
-const MUTATING_METHODS: &[&str] = &[
-    "append", "extend", "insert", "remove", "pop", "clear",
-    "sort", "reverse", "update", "add", "discard",
-    "setdefault", "popitem",
-];
+// `MUTATING_METHODS` (collection in-place mutators) now lives in one place —
+// `crate::typeck::MUTATING_METHODS` — and is consumed here by
+// `method_modifies_self` (to infer `&mut self`) and by the emission site (to
+// pick `emit_place` for subscripted receivers). Imported under its original
+// name so the local call sites read unchanged.
+use crate::typeck::{Ty, TyCtx, MUTATING_METHODS};
 
 pub struct Codegen<'a> {
     pub ctx: &'a TyCtx,
@@ -34,11 +29,17 @@ pub struct Codegen<'a> {
     /// `None` (when the function returns `Option<T>`) vs. a bare `return;` (Unit).
     current_ret_ty: Ty,
     dead_funcs: std::collections::HashSet<String>,  // Functions that are never called
+    /// (EPIC-4 V3) Transitive `&mut self` decision per `(class, method)`.
+    /// Computed once by `compute_mut_self` (a pre-pass like `prescan_types`)
+    /// before any emission, then consulted by `emit_func` so a method that
+    /// mutates `self` only by calling another mutating `self.<m>()` is still
+    /// emitted `&mut self`. Empty until the pre-pass runs.
+    mut_self: HashMap<(String, String), bool>,
 }
 
 impl<'a> Codegen<'a> {
     pub fn new(ctx: &'a TyCtx) -> Self {
-        Self { ctx, out: String::new(), indent: 0, locals: HashMap::new(), declared: Default::default(), current_class: None, current_ret_ty: Ty::Unit, dead_funcs: Default::default() }
+        Self { ctx, out: String::new(), indent: 0, locals: HashMap::new(), declared: Default::default(), current_class: None, current_ret_ty: Ty::Unit, dead_funcs: Default::default(), mut_self: HashMap::new() }
     }
 
     pub fn with_dead_funcs(mut self, dead: std::collections::HashSet<String>) -> Self {
@@ -379,6 +380,298 @@ impl<'a> Codegen<'a> {
         false
     }
 
+    // ───────────────────────── (EPIC-4 V3) transitive &mut self ──────────────
+    //
+    // `method_modifies_self` above is INTRA-method: it sees `self.x = v` and
+    // `self.items.append(x)`, but it does NOT follow a call to another method
+    // (`self.advance()`). So a method that mutates `self` only by delegating to
+    // a mutating `self.<helper>()` was emitted `&self` → rustc E0596.
+    //
+    // We close that gap with a call-graph fixpoint, computed once before any
+    // emission (`compute_mut_self`, run from `emit_program`) and consulted by
+    // `emit_func`:
+    //   1. seed `mutates[(C, m)] = method_modifies_self(m.body)` (the precise
+    //      intra-method analysis — kept verbatim as the seed),
+    //   2. build `self_calls[(C, m)]` = the `self.<name>()` callees in `m`,
+    //   3. propagate: `mutates[k] |= any(mutates[resolve(C, c)])` to a fixpoint.
+    // Keys are `(emitting_class, method_name)`: `emit_class` emits every
+    // RESOLVED method (own + inherited) onto the subclass struct, so an
+    // inherited body is keyed under the subclass and its self-calls resolve
+    // against the SUBCLASS MRO — an inherited mutating method propagates `&mut`
+    // up to a subclass caller.
+
+    /// Collect the set of method names invoked as `self.<name>(...)` anywhere in
+    /// `body`, walking the SAME statement nesting `method_modifies_self` does
+    /// (if/elif/else, while, for, try body+handlers+else+finally, with) AND the
+    /// expression positions a call can hide in (assignment RHS, return value,
+    /// conditions, call args, …). Scope is `self.<method>()` chains ONLY: the
+    /// receiver must be exactly `self` (`Expr::Attr { obj: Ident("self"), name }`).
+    /// `self.child.method()` — a method on a FIELD — is intentionally NOT
+    /// collected (that is nested-mutation / V2-d territory, out of scope here).
+    fn collect_self_calls(&self, body: &[Stmt], out: &mut std::collections::HashSet<String>) {
+        for stmt in body {
+            match stmt {
+                Stmt::Expr(e) | Stmt::Return(Some(e), _) => Self::collect_self_calls_expr(e, out),
+                Stmt::Assign { value, .. } | Stmt::AugAssign { value, .. } => {
+                    Self::collect_self_calls_expr(value, out)
+                }
+                Stmt::Unpack { value, .. } => Self::collect_self_calls_expr(value, out),
+                Stmt::AttrAssign { obj, value, .. } => {
+                    Self::collect_self_calls_expr(obj, out);
+                    Self::collect_self_calls_expr(value, out);
+                }
+                Stmt::IndexAssign { obj, idx, value, .. } => {
+                    Self::collect_self_calls_expr(obj, out);
+                    Self::collect_self_calls_expr(idx, out);
+                    Self::collect_self_calls_expr(value, out);
+                }
+                Stmt::If { cond, then, elifs, else_, .. } => {
+                    Self::collect_self_calls_expr(cond, out);
+                    self.collect_self_calls(then, out);
+                    for (c, elif_body) in elifs {
+                        Self::collect_self_calls_expr(c, out);
+                        self.collect_self_calls(elif_body, out);
+                    }
+                    if let Some(else_body) = else_ {
+                        self.collect_self_calls(else_body, out);
+                    }
+                }
+                Stmt::While { cond, body, .. } => {
+                    Self::collect_self_calls_expr(cond, out);
+                    self.collect_self_calls(body, out);
+                }
+                Stmt::For { iter, body, .. } => {
+                    Self::collect_self_calls_expr(iter, out);
+                    self.collect_self_calls(body, out);
+                }
+                Stmt::Try { body, handlers, else_, finally_, .. } => {
+                    self.collect_self_calls(body, out);
+                    for handler in handlers {
+                        self.collect_self_calls(&handler.body, out);
+                    }
+                    if let Some(else_body) = else_ {
+                        self.collect_self_calls(else_body, out);
+                    }
+                    if let Some(finally_body) = finally_ {
+                        self.collect_self_calls(finally_body, out);
+                    }
+                }
+                Stmt::With { ctx_expr, body, .. } => {
+                    Self::collect_self_calls_expr(ctx_expr, out);
+                    self.collect_self_calls(body, out);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Recurse into an expression collecting `self.<name>(...)` method callees.
+    /// Only a call whose callee is `self.<name>` *directly* (receiver is the bare
+    /// `self` ident) is recorded; the callee subexpressions are still walked so a
+    /// nested `self.a(self.b())` records both `a` and `b`.
+    fn collect_self_calls_expr(expr: &Expr, out: &mut std::collections::HashSet<String>) {
+        match expr {
+            Expr::Call { callee, args, kwargs, .. } => {
+                if let Expr::Attr { obj, name, .. } = callee.as_ref() {
+                    match obj.as_ref() {
+                        // Direct `self.<name>(...)`.
+                        Expr::Ident(n, _) if n == "self" => {
+                            out.insert(name.clone());
+                        }
+                        // `super().<name>(...)` lowers to `self.__super_<name>()`
+                        // (an alias carrying the immediate parent's body). Record
+                        // it under that exact emitted name so the fixpoint can
+                        // propagate &mut from a mutating inherited method up to a
+                        // delegating-only override (e.g. a `__init__` that does
+                        // nothing but `super().__init__()`).
+                        Expr::Call { callee: sup, args: sup_args, .. }
+                            if sup_args.is_empty()
+                                && matches!(sup.as_ref(), Expr::Ident(s, _) if s == "super") =>
+                        {
+                            out.insert(format!("__super_{}", name));
+                        }
+                        _ => {}
+                    }
+                }
+                Self::collect_self_calls_expr(callee, out);
+                for a in args {
+                    Self::collect_self_calls_expr(a, out);
+                }
+                for (_, v) in kwargs {
+                    Self::collect_self_calls_expr(v, out);
+                }
+            }
+            Expr::Attr { obj, .. } => Self::collect_self_calls_expr(obj, out),
+            Expr::Index { obj, idx, .. } => {
+                Self::collect_self_calls_expr(obj, out);
+                Self::collect_self_calls_expr(idx, out);
+            }
+            Expr::Slice { obj, start, stop, step, .. } => {
+                Self::collect_self_calls_expr(obj, out);
+                for e in [start, stop, step].into_iter().flatten() {
+                    Self::collect_self_calls_expr(e, out);
+                }
+            }
+            Expr::BinOp { lhs, rhs, .. } => {
+                Self::collect_self_calls_expr(lhs, out);
+                Self::collect_self_calls_expr(rhs, out);
+            }
+            Expr::UnOp { expr: e, .. } => Self::collect_self_calls_expr(e, out),
+            Expr::IfExp { test, body, orelse, .. } => {
+                Self::collect_self_calls_expr(test, out);
+                Self::collect_self_calls_expr(body, out);
+                Self::collect_self_calls_expr(orelse, out);
+            }
+            Expr::List(elems, _) | Expr::Tuple(elems, _) | Expr::Set(elems, _) => {
+                for e in elems {
+                    Self::collect_self_calls_expr(e, out);
+                }
+            }
+            Expr::Dict(pairs, _) => {
+                for (k, v) in pairs {
+                    Self::collect_self_calls_expr(k, out);
+                    Self::collect_self_calls_expr(v, out);
+                }
+            }
+            Expr::ListComp { elt, iter, cond, .. } | Expr::SetComp { elt, iter, cond, .. } => {
+                Self::collect_self_calls_expr(elt, out);
+                Self::collect_self_calls_expr(iter, out);
+                if let Some(c) = cond {
+                    Self::collect_self_calls_expr(c, out);
+                }
+            }
+            Expr::DictComp { key, val, iter, cond, .. } => {
+                Self::collect_self_calls_expr(key, out);
+                Self::collect_self_calls_expr(val, out);
+                Self::collect_self_calls_expr(iter, out);
+                if let Some(c) = cond {
+                    Self::collect_self_calls_expr(c, out);
+                }
+            }
+            Expr::Lambda { body, .. } => Self::collect_self_calls_expr(body, out),
+            _ => {}
+        }
+    }
+
+    /// Pre-pass (run once from `emit_program`, before any emission): compute the
+    /// transitive `&mut self` decision for every `(class, method)` and store it
+    /// in `self.mut_self`. See the block comment above for the algorithm.
+    fn compute_mut_self(&mut self) {
+        // 1+2: seed `mutates` and build `self_calls`, keyed by (class, method),
+        // over the RESOLVED method set of every class (own + inherited).
+        let mut mutates: HashMap<(String, String), bool> = HashMap::new();
+        let mut self_calls: HashMap<(String, String), std::collections::HashSet<String>> =
+            HashMap::new();
+        // `resolved[class]` = set of method names visible on the class via MRO,
+        // so `resolve(class, name)` can check membership cheaply.
+        let mut resolved: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+
+        // Dunder-trait method names (these become trait impls, not inherent
+        // methods, and never get a `__super_` alias — mirrors `emit_class`).
+        let dunder_trait_names = ["__str__", "__repr__", "__add__", "__sub__", "__mul__",
+                                   "__eq__", "__neg__", "__bool__", "__lt__"];
+
+        let class_names: Vec<String> = self.ctx.classes.keys().cloned().collect();
+        for cls in &class_names {
+            let methods = self.resolved_methods(cls);
+            let mut names = std::collections::HashSet::new();
+            for m in &methods {
+                names.insert(m.name.clone());
+                let key = (cls.clone(), m.name.clone());
+                mutates.insert(key.clone(), self.method_modifies_self(&m.body));
+                let mut calls = std::collections::HashSet::new();
+                self.collect_self_calls(&m.body, &mut calls);
+                self_calls.insert(key, calls);
+            }
+
+            // Seed the `__super_<name>` aliases EXACTLY as `emit_class` emits
+            // them (codegen.rs ~903): one per OWN method that overrides an
+            // immediate-parent method. The alias carries the PARENT's body but is
+            // emitted onto THIS class's struct, so its own self-calls resolve
+            // against THIS class's MRO. This lets a delegating-only override
+            // (`__init__` that just calls `super().__init__()`) inherit `&mut`
+            // from the mutating parent method through the fixpoint.
+            if let Some(cd) = self.ctx.classes.get(cls) {
+                let own_method_names: std::collections::HashSet<&str> =
+                    cd.methods.iter().map(|m| m.name.as_str()).collect();
+                for base in &cd.bases {
+                    if let Some(base_def) = self.ctx.classes.get(base.as_str()) {
+                        for m in &base_def.methods {
+                            if !dunder_trait_names.contains(&m.name.as_str())
+                                && own_method_names.contains(m.name.as_str())
+                            {
+                                let alias = format!("__super_{}", m.name);
+                                names.insert(alias.clone());
+                                let key = (cls.clone(), alias);
+                                mutates.insert(key.clone(), self.method_modifies_self(&m.body));
+                                let mut calls = std::collections::HashSet::new();
+                                self.collect_self_calls(&m.body, &mut calls);
+                                self_calls.insert(key, calls);
+                            }
+                        }
+                    }
+                }
+            }
+
+            resolved.insert(cls.clone(), names);
+        }
+
+        // 3: fixpoint. `mutates` is monotone (only ever flips false→true) over a
+        // finite key set, so it converges; cap iterations at len+1 to defend
+        // against mutual-recursion cycles (A↔B) — each pass can newly-true at
+        // most one key per chain link, so len passes suffice.
+        let max_iters = mutates.len() + 1;
+        for _ in 0..max_iters {
+            let mut changed = false;
+            // Iterate over a stable key snapshot; read `mutates` for callees.
+            let keys: Vec<(String, String)> = mutates.keys().cloned().collect();
+            for key in &keys {
+                if *mutates.get(key).unwrap_or(&false) {
+                    continue; // already true — monotone, never reverts
+                }
+                let (cls, _method) = key;
+                let mut now_true = false;
+                if let Some(callees) = self_calls.get(key) {
+                    for callee in callees {
+                        // resolve(cls, callee): the callee is emitted onto THIS
+                        // class only if it is visible via the class's MRO; key it
+                        // under (cls, callee) so an inherited mutating method
+                        // (also seeded under cls) propagates.
+                        if resolved.get(cls).map_or(false, |s| s.contains(callee)) {
+                            let ckey = (cls.clone(), callee.clone());
+                            if *mutates.get(&ckey).unwrap_or(&false) {
+                                now_true = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if now_true {
+                    mutates.insert(key.clone(), true);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        self.mut_self = mutates;
+    }
+
+    /// The `&mut self` decision for a method, consulted by `emit_func`. Uses the
+    /// precomputed transitive result from `compute_mut_self` (the normal path —
+    /// the pre-pass map covers every resolved class method, including the
+    /// `__super_` aliases). Falls back to the intra-method `method_modifies_self`
+    /// seed only for a method absent from the map (a defensive path; the
+    /// `__lt_impl` helper is emitted inline and never routed through here).
+    fn needs_mut_self(&self, class_name: &str, method_name: &str, body: &[Stmt]) -> bool {
+        match self.mut_self.get(&(class_name.to_string(), method_name.to_string())) {
+            Some(v) => *v,
+            None => self.method_modifies_self(body),
+        }
+    }
+
     fn emit_func(&mut self, f: &Func, method_of: Option<&str>) -> Result<()> {
         let is_static = f.decorators.contains(&"staticmethod".to_string());
         let name = if f.name == "main" && method_of.is_none() {
@@ -389,14 +682,21 @@ impl<'a> Codegen<'a> {
         let mut sig = format!("fn {}(", name);
         let mut first = true;
         // Static methods don't get self; regular methods take &self or &mut self based on whether they modify self.
-        if method_of.is_some() && !is_static && f.params.iter().any(|p| p.name == "self") {
-            let needs_mut = self.method_modifies_self(&f.body);
-            if needs_mut {
-                sig.push_str("&mut self");
-            } else {
-                sig.push_str("&self");
+        if let Some(cls) = method_of {
+            if !is_static && f.params.iter().any(|p| p.name == "self") {
+                // (EPIC-4 V3) Use the precomputed TRANSITIVE decision: a method
+                // that mutates self only by calling a mutating `self.<helper>()`
+                // is now `&mut self` too. Falls back to the intra-method seed for
+                // synthesized funcs not in the pre-pass map (`__super_` aliases /
+                // `__lt_impl`).
+                let needs_mut = self.needs_mut_self(cls, &f.name, &f.body);
+                if needs_mut {
+                    sig.push_str("&mut self");
+                } else {
+                    sig.push_str("&self");
+                }
+                first = false;
             }
-            first = false;
         }
         // Always skip `self` from the explicit params list.
         for p in f.params.iter().filter(|p| p.name != "self") {
@@ -3699,6 +3999,12 @@ pub fn emit_program(modules: &[(Module, String)], ctx: &TyCtx) -> Result<String>
     }
 
     let mut cg = Codegen::new(ctx).with_dead_funcs(dead_funcs);
+
+    // (EPIC-4 V3) Compute the transitive `&mut self` decision for every
+    // (class, method) BEFORE any emission, so `emit_func` can consult it. Reads
+    // only `ctx.classes` (the resolved MRO), so it is independent of the
+    // module-by-module emission order below.
+    cg.compute_mut_self();
 
     // Preamble — written once
     cg.line("#![allow(unused_parens, unused_variables, unused_mut, dead_code)]");

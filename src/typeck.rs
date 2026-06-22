@@ -861,9 +861,19 @@ pub fn is_owned(ty: &Ty) -> bool {
     !is_copy(ty)
 }
 
-/// In-place mutating methods that callers may call on a List, Set, or Dict
-/// parameter — calling any of these on a by-value non-Copy param is a bug.
-const PARAM_MUTATING_METHODS: &[&str] = &[
+/// The single source of truth for collection methods that mutate their receiver
+/// in place (List/Set/Dict mutators). Consumed by BOTH modules — same "one
+/// source of truth" discipline as [`is_copy`]:
+/// - `typeck`'s by-value-param backstop: calling any of these on a by-value
+///   non-Copy param is a bug (the mutation is lost on the caller's copy).
+/// - `codegen`'s `method_modifies_self` (to infer `&mut self` on the enclosing
+///   method) and the emission site (to pick `emit_place` for subscripted
+///   receivers so the mutation lands on the real element).
+///
+/// Previously duplicated as `codegen::MUTATING_METHODS` and
+/// `typeck::PARAM_MUTATING_METHODS` (content-identical 13-name lists, differing
+/// only in ordering); merged here so the two analyses can never drift.
+pub const MUTATING_METHODS: &[&str] = &[
     // List mutators
     "append", "extend", "insert", "remove", "sort", "reverse", "clear",
     // Set mutators
@@ -2358,7 +2368,7 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                             // (not a field or element of it) — `ds.values.append(x)` must
                             // NOT fire because it is a nested attribute access and a separate
                             // concern from direct param mutation.
-                            if PARAM_MUTATING_METHODS.contains(&name.as_str()) {
+                            if MUTATING_METHODS.contains(&name.as_str()) {
                                 if let Expr::Ident(param_name, _) = obj.as_ref() {
                                     if param_name != "self"
                                         && env.params.contains(param_name.as_str())

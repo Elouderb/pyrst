@@ -1615,11 +1615,16 @@ impl<'a> Codegen<'a> {
                         };
                         if let Some(first_arg) = args.first() {
                             let msg = self.emit_expr(first_arg)?;
-                            self.line(&format!("panic!(\"{{}} panic: {{}}\", \"{}\", {});", exc_type, msg));
+                            // Delimit type from message with a NUL byte: it cannot
+                            // appear in pyrst user data, so a user message that itself
+                            // contains the old " panic: " separator no longer mangles
+                            // the type dispatch or the bound `as e` text. See the
+                            // try/except dispatcher split for the consuming side.
+                            self.line(&format!("panic!(\"{{}}\\0{{}}\", \"{}\", {});", exc_type, msg));
                         } else {
-                            // No message: still use the "<Type> panic: <msg>" payload
-                            // format so `except <Type>:` type-matching can parse it.
-                            self.line(&format!("panic!(\"{{}} panic: \", \"{}\");", exc_type));
+                            // No message: still use the "<Type>\0<msg>" payload format
+                            // (empty message) so `except <Type>:` type-matching parses it.
+                            self.line(&format!("panic!(\"{{}}\\0\", \"{}\");", exc_type));
                         }
                     }
                     Some(other) => {
@@ -1926,9 +1931,11 @@ impl<'a> Codegen<'a> {
                 self.indent += 1;
 
                 // Run the try body inside catch_unwind. pyrst's `raise` compiles
-                // to a panic whose payload is a formatted string (see Stmt::Raise):
-                //   raise Foo("m")  -> "Foo panic: m"
-                //   raise Foo       -> "Foo panic: "   (empty message)
+                // to a panic whose payload is a formatted string (see Stmt::Raise).
+                // The exception type and message are separated by a NUL byte (`\0`),
+                // a delimiter that cannot occur in pyrst user data:
+                //   raise Foo("m")  -> "Foo\0m"
+                //   raise Foo       -> "Foo\0"   (empty message)
                 //   raise           -> "explicit raise"
                 //
                 // Suppress the default panic hook while the try body runs so that a
@@ -1990,8 +1997,11 @@ impl<'a> Codegen<'a> {
                 self.line("} else {");
                 self.line("    String::from(\"unknown panic\")");
                 self.line("};");
-                // Split "<Type> panic: <msg>"; otherwise type == msg == whole string.
-                self.line("let (__exc_type, __exc_msg): (String, String) = match __exc_str.split_once(\" panic: \") {");
+                // Split "<Type>\0<msg>" on the NUL delimiter (which cannot appear in
+                // user data); otherwise type == msg == whole string. split_once takes
+                // the message verbatim after the delimiter, so a message that contains
+                // the old " panic: " text is preserved intact.
+                self.line("let (__exc_type, __exc_msg): (String, String) = match __exc_str.split_once('\\0') {");
                 self.line("    Some((t, m)) => (t.to_string(), m.to_string()),");
                 self.line("    None => (__exc_str.clone(), __exc_str.clone()),");
                 self.line("};");
@@ -2436,7 +2446,7 @@ impl<'a> Codegen<'a> {
                             let arg_type = self.type_of_expr(&args[0]);
                             match arg_type {
                                 Ty::Str => {
-                                    // Use helper so a bad string panics with "ValueError panic: ..."
+                                    // Use helper so a bad string panics with "ValueError\0..."
                                     // which the try/except dispatcher can match on ValueError.
                                     return Ok(format!("(__py_int_from_str(&{}))", a));
                                 }
@@ -2448,7 +2458,7 @@ impl<'a> Codegen<'a> {
                             let arg_type = self.type_of_expr(&args[0]);
                             match arg_type {
                                 Ty::Str => {
-                                    // Use helper so a bad string panics with "ValueError panic: ..."
+                                    // Use helper so a bad string panics with "ValueError\0..."
                                     // which the try/except dispatcher can match on ValueError.
                                     return Ok(format!("(__py_float_from_str(&{}))", a));
                                 }
@@ -3610,25 +3620,25 @@ impl<'a> Codegen<'a> {
                 let i = self.emit_expr(idx)?;
                 match &obj_ty {
                     Ty::Dict(..) => {
-                        // .expect() produces a Rust message without " panic: " delimiter;
-                        // unwrap_or_else lets us emit a matchable "KeyError panic: ..." payload.
-                        format!("({}.get(&{}).cloned().unwrap_or_else(|| panic!(\"KeyError panic: {{:?}}\", &{})))", o, i, i)
+                        // .expect() produces a Rust message without the NUL delimiter;
+                        // unwrap_or_else lets us emit a matchable "KeyError\0..." payload.
+                        format!("({}.get(&{}).cloned().unwrap_or_else(|| panic!(\"KeyError\\0{{:?}}\", &{})))", o, i, i)
                     }
                     Ty::Str => {
                         // String indexing with negative index support.
-                        // Explicit bounds check emits "IndexError panic: ..." so the
+                        // Explicit bounds check emits "IndexError\0..." so the
                         // try/except dispatcher can catch it as IndexError.
                         format!(
-                            "{{ let __chars: Vec<char> = {}.chars().collect(); let __idx = if {} < 0 {{ ((__chars.len() as i64) + {}) as usize }} else {{ {} as usize }}; if __idx >= __chars.len() {{ panic!(\"IndexError panic: string index out of range\") }}; __chars[__idx].to_string() }}",
+                            "{{ let __chars: Vec<char> = {}.chars().collect(); let __idx = if {} < 0 {{ ((__chars.len() as i64) + {}) as usize }} else {{ {} as usize }}; if __idx >= __chars.len() {{ panic!(\"IndexError\\0string index out of range\") }}; __chars[__idx].to_string() }}",
                             o, i, i, i
                         )
                     }
                     _ => {
                         // List indexing with negative index support.
-                        // Explicit bounds check emits "IndexError panic: ..." so the
+                        // Explicit bounds check emits "IndexError\0..." so the
                         // try/except dispatcher can catch it as IndexError.
                         format!(
-                            "{{ let __list = {}.clone(); let __idx = if {} < 0 {{ ((__list.len() as i64) + {}) as usize }} else {{ {} as usize }}; if __idx >= __list.len() {{ panic!(\"IndexError panic: list index out of range\") }}; __list[__idx].clone() }}",
+                            "{{ let __list = {}.clone(); let __idx = if {} < 0 {{ ((__list.len() as i64) + {}) as usize }} else {{ {} as usize }}; if __idx >= __list.len() {{ panic!(\"IndexError\\0list index out of range\") }}; __list[__idx].clone() }}",
                             o, i, i, i
                         )
                     }
@@ -4234,28 +4244,28 @@ pub fn emit_program(modules: &[(Module, String)], ctx: &TyCtx) -> Result<String>
     cg.line("}");
     // Python integer modulo: the result takes the sign of the divisor (Rust's
     // `%` takes the sign of the dividend). Panics on b==0 with a catchable
-    // "ZeroDivisionError panic: ..." payload matching the try/except dispatcher.
+    // "ZeroDivisionError\0..." payload matching the try/except dispatcher.
     cg.line("fn __py_mod(a: i64, b: i64) -> i64 {");
-    cg.line("    if b == 0 { panic!(\"ZeroDivisionError panic: integer division or modulo by zero\"); }");
+    cg.line("    if b == 0 { panic!(\"ZeroDivisionError\\0integer division or modulo by zero\"); }");
     cg.line("    let m = a % b;");
     cg.line("    if m != 0 && ((m < 0) != (b < 0)) { m + b } else { m }");
     cg.line("}");
     // Python integer floor division: floors toward negative infinity.
-    // Panics on b==0 with a catchable "ZeroDivisionError panic: ..." payload.
+    // Panics on b==0 with a catchable "ZeroDivisionError\0..." payload.
     // The f64 path previously used here silently returned i64::MAX for x//0.
     cg.line("fn __py_floordiv(a: i64, b: i64) -> i64 {");
-    cg.line("    if b == 0 { panic!(\"ZeroDivisionError panic: integer division or modulo by zero\"); }");
+    cg.line("    if b == 0 { panic!(\"ZeroDivisionError\\0integer division or modulo by zero\"); }");
     cg.line("    let q = a / b;");
     cg.line("    if (a % b != 0) && ((a % b < 0) != (b < 0)) { q - 1 } else { q }");
     cg.line("}");
-    // int() from str: panics with catchable "ValueError panic: ..." payload
+    // int() from str: panics with catchable "ValueError\0..." payload
     // instead of Rust's generic unwrap message.
     cg.line("fn __py_int_from_str(s: &str) -> i64 {");
-    cg.line("    s.trim().parse::<i64>().unwrap_or_else(|_| panic!(\"ValueError panic: invalid literal for int() with base 10: '{}'\", s.trim()))");
+    cg.line("    s.trim().parse::<i64>().unwrap_or_else(|_| panic!(\"ValueError\\0invalid literal for int() with base 10: '{}'\", s.trim()))");
     cg.line("}");
-    // float() from str: panics with catchable "ValueError panic: ..." payload.
+    // float() from str: panics with catchable "ValueError\0..." payload.
     cg.line("fn __py_float_from_str(s: &str) -> f64 {");
-    cg.line("    s.trim().parse::<f64>().unwrap_or_else(|_| panic!(\"ValueError panic: could not convert string to float: '{}'\", s.trim()))");
+    cg.line("    s.trim().parse::<f64>().unwrap_or_else(|_| panic!(\"ValueError\\0could not convert string to float: '{}'\", s.trim()))");
     cg.line("}");
     // Python integer exponentiation. A negative exponent yields a float in
     // Python, which cannot be represented in an i64 result, so panic with a

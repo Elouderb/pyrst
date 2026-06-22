@@ -629,10 +629,11 @@ raise ValueError("message")
 Compiles to:
 
 ```rust
-panic!("{} panic: {}", "ValueError", "message");
+panic!("{}\0{}", "ValueError", "message");
 ```
 
-The payload is always the string `"<Type> panic: <msg>"` so that `try`/`except`
+The payload is always the string `"<Type>\0<msg>"` (a NUL byte separates the type
+from the message — it cannot occur in pyrst user data) so that `try`/`except`
 can recover the exception type at the catch site.
 
 ### Try / Except / Finally
@@ -661,7 +662,7 @@ Compiles to (shape; some boilerplate elided):
     let __prev_hook = ::std::panic::take_hook();
     ::std::panic::set_hook(::std::boxed::Box::new(|_| {}));
     let __try_result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
-        panic!("{} panic: {}", "ValueError", "bad");
+        panic!("{}\0{}", "ValueError", "bad");
     }));
     ::std::panic::set_hook(__prev_hook);            // restore before any re-raise
 
@@ -670,8 +671,8 @@ Compiles to (shape; some boilerplate elided):
         ::std::result::Result::Ok(__ok) => { let _ = __ok; ::std::option::Option::None }
         ::std::result::Result::Err(__payload) => {
             let __exc_str: String = /* downcast payload to String / &str */;
-            // Recover "<Type> panic: <msg>".
-            let (__exc_type, __exc_msg) = match __exc_str.split_once(" panic: ") {
+            // Recover "<Type>\0<msg>".
+            let (__exc_type, __exc_msg) = match __exc_str.split_once('\0') {
                 Some((t, m)) => (t.to_string(), m.to_string()),
                 None => (__exc_str.clone(), __exc_str.clone()),
             };

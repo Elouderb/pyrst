@@ -261,11 +261,27 @@ impl TyCtx {
         if let Some(class_def) = self.classes.get(class_name) {
             // Check this class's methods
             if let Some(method) = class_def.methods.iter().find(|m| &m.name == method_name) {
-                let params: Vec<(String, Ty)> = method.params.iter()
+                // Resolve param/return types consistently with the error-propagating
+                // path in `check_bodies` (commit 8023fbc): `from_type_expr` is taken
+                // as the single source of truth. Any method reaching here already
+                // passed `check_bodies` (the driver runs it before any inference /
+                // codegen site that calls `get_method`), so every annotation lowered
+                // successfully and these resolutions cannot fail in practice. Should
+                // one ever fail, we surface it as method-not-found (`None`) rather
+                // than silently DROPPING a param (the old `.filter_map(...ok())`) or
+                // fabricating `Ty::Unknown` for the return — never a corrupt FuncSig.
+                let params: Vec<(String, Ty)> = match method.params.iter()
                     .filter(|p| p.name != "self")
-                    .filter_map(|p| Ty::from_type_expr(&p.ty).ok().map(|ty| (p.name.clone(), ty)))
-                    .collect();
-                let ret = Ty::from_type_expr(&method.ret).unwrap_or(Ty::Unknown);
+                    .map(|p| Ty::from_type_expr(&p.ty).map(|ty| (p.name.clone(), ty)))
+                    .collect::<Result<Vec<_>>>()
+                {
+                    Ok(ps) => ps,
+                    Err(_) => return None,
+                };
+                let ret = match Ty::from_type_expr(&method.ret) {
+                    Ok(ty) => ty,
+                    Err(_) => return None,
+                };
                 let param_defaults = method.params.iter()
                     .filter(|p| p.name != "self")
                     .map(|p| p.default.clone())
@@ -4853,5 +4869,49 @@ def main() -> None:
         let ctx = ctx_from_module(&m);
         assert!(check_bodies(&m, &ctx).is_ok(),
             "a place passed to a by-ref method param must typeck-pass");
+    }
+
+    #[test]
+    fn get_method_resolves_param_and_return_types() {
+        // find_method (via get_method) resolves the method's param and return
+        // types through `from_type_expr`, consistent with check_bodies'
+        // error-propagating path. A valid annotation must come back as the
+        // concrete Ty (never silently dropped or coerced to Unknown).
+        let src = "\
+class Box:
+    value: int
+    def __init__(self, value: int) -> None:
+        self.value = value
+    def scale(self, factor: int, label: str) -> int:
+        return self.value * factor
+";
+        let m = crate::parser::parse(src).expect("parse");
+        let ctx = ctx_from_module(&m);
+        let sig = ctx.get_method("Box", "scale").expect("scale must be found");
+        assert_eq!(
+            sig.params,
+            vec![("factor".to_string(), Ty::Int), ("label".to_string(), Ty::Str)],
+            "both annotated params must be resolved (none dropped)"
+        );
+        assert_eq!(sig.ret, Ty::Int, "the return annotation must lower to Int");
+    }
+
+    #[test]
+    fn get_method_resolves_inherited_method() {
+        // A method defined on a base class is resolved for a subclass, with its
+        // param/return types lowered the same way.
+        let src = "\
+class Base:
+    def describe(self, n: int) -> str:
+        return \"base\"
+
+class Derived(Base):
+    pass
+";
+        let m = crate::parser::parse(src).expect("parse");
+        let ctx = ctx_from_module(&m);
+        let sig = ctx.get_method("Derived", "describe").expect("inherited method must be found");
+        assert_eq!(sig.params, vec![("n".to_string(), Ty::Int)]);
+        assert_eq!(sig.ret, Ty::Str);
     }
 }

@@ -223,19 +223,21 @@ def add(a: int, b: int) -> int:
 payload. The lower-risk evolution of the original panic-based placeholder was chosen
 over a ground-up `Result` rewrite (see card `be3c6353`).
 
-**Payload format.** Every pyrst `raise` panics with the string `"<Type> panic: <msg>"`:
+**Payload format.** Every pyrst `raise` panics with the string `"<Type>\0<msg>"`,
+using a NUL byte to separate the exception type from the message. A NUL cannot
+appear in pyrst user data, so the separator can never collide with message content:
 
 ```python
-raise ValueError("message")   # -> panic!("{} panic: {}", "ValueError", "message")
-raise ValueError              # -> panic!("{} panic: ", "ValueError")  (empty message)
+raise ValueError("message")   # -> panic!("{}\0{}", "ValueError", "message")
+raise ValueError              # -> panic!("{}\0", "ValueError")  (empty message)
 ```
 
-The uniform `"<Type> panic: <msg>"` shape lets the handler dispatch recover the
+The uniform `"<Type>\0<msg>"` shape lets the handler dispatch recover the
 exception type. (A bare `raise` with no active exception emits `"explicit raise"`.)
 
 **`try`/`except` lowering** (see RUST_BACKEND.md for the generated Rust):
 - The `try` body runs inside `catch_unwind`. On `Err`, the payload string is split
-  on `" panic: "` via `split_once` into `(__exc_type, __exc_msg)`.
+  on the NUL byte `'\0'` via `split_once` into `(__exc_type, __exc_msg)`.
 - Handlers are an `if`/`else if` chain matching on `__exc_type`; **first match wins**.
 - **Exception-class hierarchy (builtin):** a base type catches its subclasses — e.g.
   `except LookupError:` catches `KeyError`/`IndexError`, `except ArithmeticError:`

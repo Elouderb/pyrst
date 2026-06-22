@@ -91,3 +91,52 @@ typeck.rs (types_compatible 677, unify_branch_types 751, unify_elem_types 781, T
 200, get_method 225, Ty 9, check_stmt 965/985, check_expr 2237/2325, list-+ infer 2460); codegen.rs
 (emit_class 512, resolved_methods 479, Codegen struct 25, rust_ty 3483, list-+ 3183); ast.rs (ClassDef
 56); PYTHON_COMPATIBILITY.md (limitation 380); docs/design/inference-oracle.md (precedent).
+
+---
+
+## F. C2 revalidation addendum (post-EPIC-4, 2026-06-22)
+
+C1 landed (commit `7a649d6`: is_subclass, ctx-threaded types_compatible, unify-to-base, honest codegen
+gate). Before building C2, the design was re-validated against the now-complete EPIC-4 codebase (a
+read-only 8-axis source audit). **The companion-enum approach holds**, with these EPIC-4-specific
+refinements the original (pre-EPIC-4) plan did not anticipate. Current anchors (post-EPIC-4 drift):
+`rust_ty` codegen.rs:4149, `emit_class` :981, the 3 `check_subtype_gate` sites :1700 (return) / :1726
+(annotated-assign) / :3599 (call-arg), list-literal :2288, `zeroed_default` :84, `is_copy` typeck.rs:1040,
+`is_subclass` typeck.rs:321.
+
+**Composes cleanly, no change (audited):** `is_copy` (`Ty::Class(_)` is always non-Copy — the `n__`
+substitution is pure Rust-text, the `Ty` stays `Class("Animal")`); `emit_consuming` (keys on the Python
+`Ty`, the enum derives `Clone` → `x.clone()` works on `Animal__`); `byref_borrow` (name-based — `&mut
+Animal__` and the `&mut *x` reborrow compose).
+
+**Refinements to the C2-A..F breakdown:**
+- **C2-C (`rust_ty`):** implement `rust_ty` as a `Codegen` METHOD reading `self.poly_map` (emit `n__` for a
+  polymorphic base), NOT a free fn with an added param — else every call site (emit_func param/return,
+  emit_class fields, emit_stmt hoists) must change. Big blast radius; the method form is the low-friction path.
+- **C2-B (companion enum + dispatch):** (1) the enum always gets `#[derive(Clone, Debug)]` — do NOT reuse
+  `emit_class`'s `all_fields_copy` derive logic (a data-variant enum has no Default/Copy). (2) **the dispatch
+  method's receiver must be `&mut self` if ANY variant's concrete method is `&mut self`** (query the V3
+  `needs_mut_self` map per-subclass-variant, not just the base) — a direct V3 interaction. Dispatch impl per
+  method in `resolved_methods(base)`: `fn m(&self|&mut self) { match self { Base__::Dog(x) => x.m(), ... } }`.
+- **C2-G (NEW — the crux, was design §D's open risk):** field access on a polymorphic-base var. After C2,
+  `a: Animal` is Rust `Animal__` (an enum with no fields), so `a.name` won't compile. Reading a BASE field
+  polymorphically is legitimate Python (C1 already rejects *derived-only* fields like `a.breed`). So C2 must
+  generate **field-accessor dispatch methods** on the enum (`fn name(&self) -> T { match self { ... =>
+  x.name.clone() } }`) and lower `a.name` (on a polymorphic base) to the accessor. (Fallback if it balloons:
+  an honest "read base fields via a method" error — but accessors are mechanically the same as method dispatch.)
+- **C2-H (NEW):** `zeroed_default` for a polymorphic-base local must wrap the zeroed struct in the enum
+  variant (`Animal__::Animal(Animal{..})`), not emit a bare struct literal. Address with C2-D.
+- **C2-E:** list-literal element wrapping at the `vec![..]` site is fine; **list+list `+` concat element
+  wrapping is a PRE-EXISTING gap → DEFER** and document as a §D limitation (the intermediate `+` Vec already
+  holds constructed elements).
+- **C2-D / C2-F:** the 3 `check_subtype_gate` sites are the correct & complete wrapping interception points;
+  replace the gate error with `format!("{base}__::{derived}({inner})")`; C2-F then deletes the gate + the
+  `examples/codegen_gate/` harness section (the gate fixture becomes a positive).
+
+**Sequencing (warning-gate-aware):** an emitted-but-unused enum trips the 0-warning gate, and `rust_ty`
+emitting `n__` with no enum defined won't compile — so emission + activation are coupled. Land as:
+**C2-1** poly_map pre-pass + `rust_ty`-as-method that consults poly_map but still emits plain `n`
+(behavior-preserving prep; de-risks the wide rust_ty refactor) → **C2-2** the atomic keystone (emit enums +
+dispatch + accessors + flip rust_ty to `n__` + wrap at the 3 gate sites + list-literal + zeroed_default +
+field-access lowering + remove the C1 gate + positive goldens) → **C2-3** docs (PYTHON_COMPATIBILITY.md +
+this file) + extra goldens (3-level hierarchy, base-typed param/field) + the documented concat limitation.

@@ -226,6 +226,54 @@ impl<'a> Codegen<'a> {
         crate::typeck::infer_expr_ty(e, &self.locals, self.ctx)
     }
 
+    /// (EPIC-5 C1-C) Honest codegen gate for class subtyping.
+    ///
+    /// Part B made typeck ACCEPT a `Derived` value flowing into a `Base` slot
+    /// (`is_subclass(derived, base)`), but codegen cannot yet EMIT it: each pyrst
+    /// class is a standalone Rust struct, so a `Dog` value does not fit a slot
+    /// typed `Animal` and rustc would reject it with an opaque E0308. Until the
+    /// EPIC-5 C2 companion-enum codegen lands, refuse such a flow here with a
+    /// clear pyrst error instead of leaking a raw rustc failure.
+    ///
+    /// Fires ONLY for a strictly-derived class pair (`got != expected` and
+    /// `is_subclass(got, expected)` holds). Exact-type flows (`got == expected`),
+    /// non-class types, and unrelated classes (which typeck already rejected)
+    /// pass through untouched, so no existing exact-typed example is affected.
+    /// `expected` is the declared SLOT type (annotation / return / param / element);
+    /// `got` is the inferred type of the value expression flowing into it.
+    fn check_subtype_gate(&self, got: &Ty, expected: &Ty) -> Result<()> {
+        match (got, expected) {
+            (Ty::Class(d), Ty::Class(b)) => {
+                if d != b && crate::typeck::is_subclass(d, b, self.ctx) {
+                    return Err(crate::diag::Error::Codegen(format!(
+                        "class subtyping ({} where {} expected) is not yet emittable \
+                         — pending EPIC-5 C2 companion-enum codegen",
+                        d, b
+                    )));
+                }
+            }
+            // Recurse into matching homogeneous containers: a `list[Dog]` into a
+            // `list[Animal]` slot (`a: list[Animal] = [dog, ...]`) is the same
+            // non-emittable flow (`Vec<Dog>` is not `Vec<Animal>`). Only same-kind
+            // containers are compared; element counts/kinds that genuinely differ
+            // were already rejected by typeck.
+            (Ty::List(gi), Ty::List(ei)) => self.check_subtype_gate(gi, ei)?,
+            (Ty::Set(gi), Ty::Set(ei)) => self.check_subtype_gate(gi, ei)?,
+            (Ty::Option(gi), Ty::Option(ei)) => self.check_subtype_gate(gi, ei)?,
+            (Ty::Dict(gk, gv), Ty::Dict(ek, ev)) => {
+                self.check_subtype_gate(gk, ek)?;
+                self.check_subtype_gate(gv, ev)?;
+            }
+            (Ty::Tuple(gs), Ty::Tuple(es)) if gs.len() == es.len() => {
+                for (g, e) in gs.iter().zip(es.iter()) {
+                    self.check_subtype_gate(g, e)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     /// (EPIC-5) Coerce an already-emitted expression `s` (for source expr `e`)
     /// into the Rust representation expected by `target` when `target` is
     /// `Option<T>`:
@@ -1647,6 +1695,9 @@ impl<'a> Codegen<'a> {
                 } else if matches!(e, Expr::None_(_)) {
                     self.line("return;");
                 } else {
+                    // (EPIC-5 C1-C) `return dog` from a `-> Animal` function —
+                    // Derived value into a Base return slot. Honest gate.
+                    self.check_subtype_gate(&self.type_of_expr(e), &self.current_ret_ty)?;
                     // Uniform clone-on-use: a non-Copy place (variable, field, index)
                     // is deep-cloned so the returned value is independent of the
                     // binding. This subsumes the former `return self.field`
@@ -1670,6 +1721,9 @@ impl<'a> Codegen<'a> {
                     match ty {
                         Some(t) => {
                             let ty_obj = Ty::from_type_expr(t)?;
+                            // (EPIC-5 C1-C) `a: Animal = Dog(...)` — Derived RHS into
+                            // a Base-annotated slot. Honest gate before emission.
+                            self.check_subtype_gate(&self.type_of_expr(value), &ty_obj)?;
                             self.locals.insert(target.clone(), ty_obj.clone());
                             // (EPIC-5) An Optional-annotated binding wraps a bare
                             // value in `Some(..)` (or emits `None` for the None
@@ -3538,6 +3592,11 @@ impl<'a> Codegen<'a> {
                         let place = self.emit_place(a)?;
                         parts.push(self.byref_borrow(a, &place));
                         continue;
+                    }
+                    // (EPIC-5 C1-C) A Derived argument into a Base-typed parameter
+                    // (`f(dog)` where `f(a: Animal)`). Honest gate before emission.
+                    if let Some(pt) = param_tys.get(i) {
+                        self.check_subtype_gate(&self.type_of_expr(a), pt)?;
                     }
                     let s = self.emit_consuming(a)?;
                     let s = match param_tys.get(i) {

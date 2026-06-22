@@ -303,6 +303,57 @@ impl TyCtx {
     }
 }
 
+/// (EPIC-5 C1-A) Is `child` the same class as, or a subclass of, `ancestor`?
+///
+/// Walks `child`'s single-inheritance `bases` chain (via `ctx.classes` /
+/// `ClassDef.bases`) until it reaches `ancestor` or runs out of bases. The
+/// relation is REFLEXIVE (`is_subclass(X, X, _) == true`) so that the exact-type
+/// behaviour of `types_compatible` is preserved when both sides name the same
+/// class — the `(Class(d), Class(b)) if is_subclass(d, b, ctx)` arm subsumes the
+/// `a == b` arm for class pairs without changing its result.
+///
+/// Only user-declared classes live in `ctx.classes`. Builtins such as
+/// `Exception` are NOT registered there, so `is_subclass(MyErr, "Exception", _)`
+/// returns `false` — exception subtyping deliberately stays unimplemented (see
+/// design §D). A `visited` set guards against a malformed cyclic base chain so
+/// this can never loop (single inheritance is already enforced at the resolver,
+/// but the guard keeps this total regardless of input).
+pub fn is_subclass(child: &str, ancestor: &str, ctx: &TyCtx) -> bool {
+    // Reflexive: a class is a subclass of itself (mirrors the `a == b` fast path
+    // in `types_compatible`). This holds for any name, registered or not.
+    if child == ancestor {
+        return true;
+    }
+    // For the strict-ancestor case the relationship is only recognized when the
+    // walk stays inside USER-declared classes: we follow `bases` edges through
+    // `ctx.classes` and report success only on reaching `ancestor` AS A
+    // REGISTERED CLASS. A base naming a BUILTIN (e.g. `Exception`) is not in
+    // `ctx.classes`, so it is never followed and never matched — exception
+    // subtyping therefore stays unimplemented (design §D), which is correct.
+    let mut current = child;
+    let mut visited = std::collections::HashSet::new();
+    loop {
+        let def = match ctx.classes.get(current) {
+            Some(d) => d,
+            None => return false, // current is not a user class -> chain ends
+        };
+        if !visited.insert(current.to_string()) {
+            return false; // cycle guard — defensive; single inheritance is enforced
+        }
+        // Single inheritance is enforced elsewhere (>1 base rejected upstream).
+        // Follow the first base that is itself a registered class; a base that
+        // is a builtin (not in ctx.classes) terminates the walk. We compare
+        // against `ancestor` only AFTER confirming the base is a real class node,
+        // so an unregistered base name can never satisfy the query.
+        let next = def.bases.iter().find(|b| ctx.classes.contains_key(b.as_str()));
+        match next {
+            Some(base) if base == ancestor => return true,
+            Some(base) => current = base,
+            None => return false,
+        }
+    }
+}
+
 // Extract field assignments from __init__ method
 pub fn extract_init_fields(class_def: &mut ClassDef) {
     let mut discovered_fields: std::collections::HashMap<String, TypeExpr> = std::collections::HashMap::new();
@@ -786,10 +837,20 @@ fn check_body(stmts: &[Stmt], env: &mut FuncEnv) -> Result<()> {
 
 /// Check if two types are compatible for assignment.
 /// Collections with Unknown element types are considered compatible with any collection of the same kind.
-fn types_compatible(val_ty: &Ty, declared_ty: &Ty) -> bool {
+fn types_compatible(val_ty: &Ty, declared_ty: &Ty, ctx: &TyCtx) -> bool {
     match (val_ty, declared_ty) {
         // Exact match
         (a, b) if a == b => true,
+        // (EPIC-5 C1-B) A `Derived` value satisfies a `Base` slot. `is_subclass`
+        // is reflexive, but the `a == b` arm above already handled the equal-name
+        // case, so this arm only adds the strictly-derived direction. It is
+        // DIRECTIONAL: a Derived flows into a Base slot, never the reverse
+        // (`is_subclass(Base, Derived)` is false), matching the value-flow meaning
+        // of `types_compatible(val_ty, declared_ty)`. Builtins (e.g. Exception)
+        // are not in `ctx.classes`, so exception subtyping stays an honest error.
+        // NOTE: typeck ACCEPTS this here; codegen still rejects it via the
+        // honest gate (EPIC-5 C1-C) until the C2 companion-enum codegen lands.
+        (Ty::Class(d), Ty::Class(b)) if is_subclass(d, b, ctx) => true,
         // Unknown is compatible with anything
         (Ty::Unknown, _) | (_, Ty::Unknown) => true,
         // List with Unknown elements compatible with any List
@@ -828,13 +889,13 @@ fn types_compatible(val_ty: &Ty, declared_ty: &Ty) -> bool {
         (Ty::NoneVal, Ty::NoneVal) => true,
         // 2. Optional[A] fills Optional[B] when the inner types are compatible
         //    (covers Optional[Unknown] permissively, and Optional[T]~Optional[T]).
-        (Ty::Option(a), Ty::Option(b)) => types_compatible(a, b),
+        (Ty::Option(a), Ty::Option(b)) => types_compatible(a, b, ctx),
         // 3. A bare value of type A fills Optional[B] when A fits B (auto-Some).
         //    Checked AFTER the Option/Option arm so an Optional value never takes
         //    this path. `NoneVal` is excluded (it is handled by 1a above, never by
         //    recursing into the inner type). Codegen wraps the bare value in
         //    `Some(...)` at the site.
-        (a, Ty::Option(b)) if !matches!(a, Ty::Option(_) | Ty::NoneVal) => types_compatible(a, b),
+        (a, Ty::Option(b)) if !matches!(a, Ty::Option(_) | Ty::NoneVal) => types_compatible(a, b, ctx),
         // Otherwise not compatible
         _ => false,
     }
@@ -860,8 +921,19 @@ fn extract_none_guard(cond: &Expr) -> Option<(String, bool)> {
 /// concrete type when the branches are compatible (an `Unknown`, or a
 /// collection with `Unknown` elements, absorbs the concrete side), or `None`
 /// when they are genuinely incompatible.
-fn unify_branch_types(a: Ty, b: Ty) -> Option<Ty> {
-    if !types_compatible(&a, &b) {
+fn unify_branch_types(a: Ty, b: Ty, ctx: &TyCtx) -> Option<Ty> {
+    // (EPIC-5 C1-B) Unification is SYMMETRIC ("can these two coexist in one
+    // slot?"), whereas `types_compatible` is DIRECTIONAL (value→slot). For two
+    // classes related by subtyping in EITHER order the answer is yes (they meet
+    // at the base), so probe both directions before bailing — otherwise a branch
+    // that yields `Base` then `Derived` (the order in which `types_compatible`
+    // is false) would be wrongly rejected. Non-class pairs are unaffected: the
+    // class-pair arm only fires for `(Class, Class)`, and for unrelated classes
+    // both `is_subclass` checks are false, so the original directional gate is
+    // the deciding test exactly as before.
+    let class_related = matches!((&a, &b), (Ty::Class(x), Ty::Class(y))
+        if is_subclass(x, y, ctx) || is_subclass(y, x, ctx));
+    if !class_related && !types_compatible(&a, &b, ctx) {
         return None;
     }
     Some(match (&a, &b) {
@@ -869,6 +941,14 @@ fn unify_branch_types(a: Ty, b: Ty) -> Option<Ty> {
         (Ty::List(i), Ty::List(_)) if **i == Ty::Unknown => b,
         (Ty::Set(i), Ty::Set(_)) if **i == Ty::Unknown => b,
         (Ty::Dict(k, v), Ty::Dict(_, _)) if **k == Ty::Unknown && **v == Ty::Unknown => b,
+        // (EPIC-5 C1-B) Two subtype-related classes unify to the BASE (wider)
+        // type, not the first-seen one — a `Derived` and its `Base` share a
+        // common slot only at the `Base`. `types_compatible` above already
+        // verified the pair is related (in EITHER direction, since it is checked
+        // both ways below). For unrelated classes neither `is_subclass` holds and
+        // the equal-name case fell through to the default `=> a` arm unchanged.
+        (Ty::Class(da), Ty::Class(db)) if da != db && is_subclass(da, db, ctx) => b, // a derives from b -> b is base
+        (Ty::Class(da), Ty::Class(db)) if da != db && is_subclass(db, da, ctx) => a, // b derives from a -> a is base
         // `a` is the concrete side (or both equal) -> keep it.
         _ => a,
     })
@@ -890,11 +970,11 @@ fn unify_branch_types(a: Ty, b: Ty) -> Option<Ty> {
 /// compile (f64 is not `Eq`/`Hash`), so SET literals pass `false` and `{1, 2.0}`
 /// is rejected. (Dict keys are hashable -> `false`; dict values -> `true`.)
 /// The broader `set[float]` gap is tracked separately.
-fn unify_elem_types(a: Ty, b: Ty, widen_numeric: bool) -> Option<Ty> {
+fn unify_elem_types(a: Ty, b: Ty, widen_numeric: bool, ctx: &TyCtx) -> Option<Ty> {
     match (&a, &b) {
         // Numeric promotion to Float — only where a Float element is representable.
         (Ty::Int, Ty::Float) | (Ty::Float, Ty::Int) if widen_numeric => Some(Ty::Float),
-        _ => unify_branch_types(a, b),
+        _ => unify_branch_types(a, b, ctx),
     }
 }
 
@@ -1138,7 +1218,7 @@ fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
         }
         Stmt::Return(Some(e), span) => {
             let ty = check_expr(e, env)?;
-            if !types_compatible(&ty, &env.ret_ty) {
+            if !types_compatible(&ty, &env.ret_ty, env.ctx) {
                 return Err(Error::Type {
                     span: *span,
                     msg: format!("return type mismatch: expected {:?}, found {:?}", env.ret_ty, ty),
@@ -1158,7 +1238,7 @@ fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             };
             if let Some(t) = ty {
                 let explicit = Ty::from_type_expr(t)?;
-                if !types_compatible(&val_ty, &explicit) {
+                if !types_compatible(&val_ty, &explicit, env.ctx) {
                     return Err(Error::Type {
                         span: *span,
                         msg: format!("type mismatch in assignment: declared {:?}, got {:?}", explicit, val_ty),
@@ -1752,8 +1832,8 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
                     let vt = infer_expr_ty(v, locals, ctx);
                     // widen_numeric=false: float dict keys are non-hashable and
                     // dict values have no codegen cast, matching check_expr.
-                    k_ty = unify_elem_types(k_ty.clone(), kt, false).unwrap_or(Ty::Unknown);
-                    v_ty = unify_elem_types(v_ty.clone(), vt, false).unwrap_or(Ty::Unknown);
+                    k_ty = unify_elem_types(k_ty.clone(), kt, false, ctx).unwrap_or(Ty::Unknown);
+                    v_ty = unify_elem_types(v_ty.clone(), vt, false, ctx).unwrap_or(Ty::Unknown);
                 }
                 Ty::Dict(Box::new(k_ty), Box::new(v_ty))
             }
@@ -2090,7 +2170,7 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
             let ot = check_expr(orelse, env)?;
             // Both arms must agree; the more concrete side wins so a branch like
             // `[]` (List(Unknown)) unifies with `[1, 2, 3]` (List(Int)).
-            unify_branch_types(bt.clone(), ot.clone()).ok_or_else(|| Error::Type {
+            unify_branch_types(bt.clone(), ot.clone(), env.ctx).ok_or_else(|| Error::Type {
                 span: *span,
                 msg: format!(
                     "conditional expression branches have incompatible types: `{:?}` vs `{:?}`",
@@ -2190,7 +2270,7 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 for e in &elems[1..] {
                     let next = check_expr(e, env)?;
                     // Lists may hold floats, so int/float elements widen to Float.
-                    acc = unify_elem_types(acc.clone(), next.clone(), true).ok_or_else(|| Error::Type {
+                    acc = unify_elem_types(acc.clone(), next.clone(), true, env.ctx).ok_or_else(|| Error::Type {
                         span: *span,
                         msg: format!(
                             "list elements have incompatible types: {:?} vs {:?}",
@@ -2213,7 +2293,7 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 let mut acc = check_expr(&elems[0], env)?;
                 for e in &elems[1..] {
                     let next = check_expr(e, env)?;
-                    acc = unify_elem_types(acc.clone(), next.clone(), false).ok_or_else(|| Error::Type {
+                    acc = unify_elem_types(acc.clone(), next.clone(), false, env.ctx).ok_or_else(|| Error::Type {
                         span: *span,
                         msg: format!(
                             "set elements have incompatible types: {:?} vs {:?}",
@@ -2248,14 +2328,14 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 for (k, v) in &pairs[1..] {
                     let kt = check_expr(k, env)?;
                     let vt = check_expr(v, env)?;
-                    k_ty = unify_elem_types(k_ty.clone(), kt.clone(), false).ok_or_else(|| Error::Type {
+                    k_ty = unify_elem_types(k_ty.clone(), kt.clone(), false, env.ctx).ok_or_else(|| Error::Type {
                         span: *span,
                         msg: format!(
                             "dict keys have incompatible types: {:?} vs {:?}",
                             k_ty, kt
                         ),
                     })?;
-                    v_ty = unify_elem_types(v_ty.clone(), vt.clone(), false).ok_or_else(|| Error::Type {
+                    v_ty = unify_elem_types(v_ty.clone(), vt.clone(), false, env.ctx).ok_or_else(|| Error::Type {
                         span: *span,
                         msg: format!(
                             "dict values have incompatible types: {:?} vs {:?}",
@@ -2464,7 +2544,7 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                                     if !int_to_float
                                         && !matches!(arg_ty, Ty::Unknown)
                                         && !matches!(param_ty, Ty::Unknown)
-                                        && !types_compatible(&arg_ty, param_ty)
+                                        && !types_compatible(&arg_ty, param_ty, env.ctx)
                                     {
                                         return Err(Error::Type {
                                             span: *span,
@@ -2586,7 +2666,7 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                                     if !int_to_float
                                         && !matches!(arg_ty, Ty::Unknown)
                                         && !matches!(elem_ty, Ty::Unknown)
-                                        && !types_compatible(&arg_ty, &elem_ty)
+                                        && !types_compatible(&arg_ty, &elem_ty, env.ctx)
                                     {
                                         return Err(Error::Type {
                                             span: *span,
@@ -2790,6 +2870,17 @@ mod tests {
     use super::*;
     use crate::ast::{BinOp, Expr, Stmt, TypeExpr, UnOp};
     use crate::diag::Span;
+
+    // (EPIC-5 C1-B) `types_compatible` gained a `&TyCtx` param. The existing
+    // class-free matrix tests below do not exercise subtyping, so this 2-arg
+    // shim forwards to the real function with an empty `TyCtx` (no user classes),
+    // keeping those assertions readable and unchanged in meaning. This local item
+    // intentionally shadows the glob-imported `super::types_compatible` for the
+    // 2-arg call sites in this module; the new subtyping tests call
+    // `super::types_compatible(a, b, ctx)` explicitly with a populated ctx.
+    fn types_compatible(val_ty: &Ty, declared_ty: &Ty) -> bool {
+        super::types_compatible(val_ty, declared_ty, &TyCtx::new())
+    }
 
     // -------------------------------------------------------------------------
     // Helpers
@@ -3168,6 +3259,174 @@ mod tests {
             &Ty::Class("Foo".into()),
             &Ty::Class("Bar".into())
         ));
+    }
+
+    // =========================================================================
+    // Category A' — (EPIC-5 C1) class subtyping: is_subclass + types_compatible
+    // =========================================================================
+
+    /// Build a `ClassDef` with the given name and direct bases (no fields/methods).
+    fn class_def(name: &str, bases: &[&str]) -> crate::ast::ClassDef {
+        crate::ast::ClassDef {
+            name: name.to_string(),
+            bases: bases.iter().map(|s| s.to_string()).collect(),
+            fields: vec![],
+            methods: vec![],
+            is_dataclass: false,
+            span: Span::DUMMY,
+        }
+    }
+
+    /// A `TyCtx` with a single-inheritance chain Cat <- Dog <- Animal, plus an
+    /// unrelated class Rock and an Exception-subclass MyErr(Exception). Note
+    /// `Exception` itself is intentionally NOT registered (it is a builtin), so
+    /// `is_subclass(MyErr, "Exception")` must be false.
+    fn subtype_ctx() -> TyCtx {
+        let mut ctx = TyCtx::new();
+        ctx.classes.insert("Animal".into(), class_def("Animal", &[]));
+        ctx.classes.insert("Dog".into(), class_def("Dog", &["Animal"]));
+        ctx.classes.insert("Cat".into(), class_def("Cat", &["Dog"])); // transitive
+        ctx.classes.insert("Rock".into(), class_def("Rock", &[]));
+        ctx.classes.insert("MyErr".into(), class_def("MyErr", &["Exception"]));
+        ctx
+    }
+
+    #[test]
+    fn is_subclass_reflexive() {
+        let ctx = subtype_ctx();
+        assert!(is_subclass("Animal", "Animal", &ctx));
+        assert!(is_subclass("Dog", "Dog", &ctx));
+        // Reflexive even for a name not in ctx (mirrors the `a == b` fast path).
+        assert!(is_subclass("Unknown", "Unknown", &ctx));
+    }
+
+    #[test]
+    fn is_subclass_direct() {
+        let ctx = subtype_ctx();
+        assert!(is_subclass("Dog", "Animal", &ctx)); // Dog -> Animal (direct)
+    }
+
+    #[test]
+    fn is_subclass_transitive() {
+        let ctx = subtype_ctx();
+        assert!(is_subclass("Cat", "Animal", &ctx)); // Cat -> Dog -> Animal
+        assert!(is_subclass("Cat", "Dog", &ctx));
+    }
+
+    #[test]
+    fn is_subclass_not_reverse() {
+        let ctx = subtype_ctx();
+        // Directional: a Base is NOT a subclass of its Derived.
+        assert!(!is_subclass("Animal", "Dog", &ctx));
+        assert!(!is_subclass("Animal", "Cat", &ctx));
+    }
+
+    #[test]
+    fn is_subclass_unrelated() {
+        let ctx = subtype_ctx();
+        assert!(!is_subclass("Rock", "Animal", &ctx));
+        assert!(!is_subclass("Dog", "Rock", &ctx));
+    }
+
+    #[test]
+    fn is_subclass_builtin_exception_false() {
+        let ctx = subtype_ctx();
+        // `Exception` is a builtin not registered in ctx.classes, so even though
+        // MyErr lists it as a base, is_subclass cannot reach it -> false. Exception
+        // subtyping stays deliberately unimplemented (design §D).
+        assert!(!is_subclass("MyErr", "Exception", &ctx));
+    }
+
+    #[test]
+    fn types_compatible_accepts_derived_for_base() {
+        let ctx = subtype_ctx();
+        // A Derived value satisfies a Base slot (direct and transitive).
+        assert!(super::types_compatible(
+            &Ty::Class("Dog".into()),
+            &Ty::Class("Animal".into()),
+            &ctx
+        ));
+        assert!(super::types_compatible(
+            &Ty::Class("Cat".into()),
+            &Ty::Class("Animal".into()),
+            &ctx
+        ));
+    }
+
+    #[test]
+    fn types_compatible_rejects_base_for_derived() {
+        let ctx = subtype_ctx();
+        // The reverse (Base value into a Derived slot) is NOT compatible.
+        assert!(!super::types_compatible(
+            &Ty::Class("Animal".into()),
+            &Ty::Class("Dog".into()),
+            &ctx
+        ));
+    }
+
+    #[test]
+    fn types_compatible_rejects_unrelated_classes() {
+        let ctx = subtype_ctx();
+        assert!(!super::types_compatible(
+            &Ty::Class("Rock".into()),
+            &Ty::Class("Animal".into()),
+            &ctx
+        ));
+        // Sibling-ish but unrelated by inheritance.
+        assert!(!super::types_compatible(
+            &Ty::Class("Animal".into()),
+            &Ty::Class("Rock".into()),
+            &ctx
+        ));
+    }
+
+    #[test]
+    fn types_compatible_exception_subclass_stays_incompatible() {
+        let ctx = subtype_ctx();
+        // MyErr is not is_subclass of the builtin Exception -> incompatible.
+        assert!(!super::types_compatible(
+            &Ty::Class("MyErr".into()),
+            &Ty::Class("Exception".into()),
+            &ctx
+        ));
+    }
+
+    #[test]
+    fn unify_branch_types_two_subtypes_yields_base() {
+        let ctx = subtype_ctx();
+        // Both orderings unify to the BASE (wider) class, not the first-seen one.
+        assert_eq!(
+            unify_branch_types(Ty::Class("Dog".into()), Ty::Class("Animal".into()), &ctx),
+            Some(Ty::Class("Animal".into()))
+        );
+        assert_eq!(
+            unify_branch_types(Ty::Class("Animal".into()), Ty::Class("Dog".into()), &ctx),
+            Some(Ty::Class("Animal".into()))
+        );
+        // Transitive: Cat & Animal -> Animal.
+        assert_eq!(
+            unify_branch_types(Ty::Class("Cat".into()), Ty::Class("Animal".into()), &ctx),
+            Some(Ty::Class("Animal".into()))
+        );
+    }
+
+    #[test]
+    fn unify_branch_types_unrelated_classes_rejected() {
+        let ctx = subtype_ctx();
+        // Unrelated classes do not unify (no common slot in C1).
+        assert_eq!(
+            unify_branch_types(Ty::Class("Rock".into()), Ty::Class("Animal".into()), &ctx),
+            None
+        );
+    }
+
+    #[test]
+    fn unify_branch_types_same_class_unchanged() {
+        let ctx = subtype_ctx();
+        assert_eq!(
+            unify_branch_types(Ty::Class("Dog".into()), Ty::Class("Dog".into()), &ctx),
+            Some(Ty::Class("Dog".into()))
+        );
     }
 
     // =========================================================================

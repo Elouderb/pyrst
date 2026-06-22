@@ -203,6 +203,56 @@ else
     multi_failures+=("multi_file_demo")
 fi
 
+# ── 5. CODEGEN-GATE LOOP ─────────────────────────────────────────────────────
+# (EPIC-5 C1) Honest-gate fixtures live in examples/codegen_gate/ — deliberately
+# OUTSIDE the top-level *.py and *fail* globs above, because they are a DISTINCT
+# category: a class-subtyping program that PASSES typeck (`check`) but is REJECTED
+# by codegen (`build`) with the honest EPIC-5-C2 message rather than a raw rustc
+# E0308. (A normal fail_* file must be rejected by BOTH loops; these must pass
+# `check` and fail `build`, so they cannot be fail_* files.) In EPIC-5 C2-F these
+# graduate into ordinary positives once companion-enum codegen lands.
+
+gate_dir="$EXAMPLES/codegen_gate"
+gate_count=0
+gate_ok=0
+gate_failures=()
+
+if [[ -d "$gate_dir" ]]; then
+    for f in "$gate_dir"/*.py; do
+        [[ -e "$f" ]] || continue
+        base=$(basename "$f" .py)
+        gate_count=$((gate_count + 1))
+
+        # (a) `check` (typeck only) MUST PASS — the subtype flow is accepted.
+        timeout 10 "$BIN" check "$f" >/dev/null 2>&1
+        check_exit=$?
+
+        # (b) `build` (typeck + codegen) MUST be REJECTED by the honest gate.
+        build_stderr=$(timeout 30 "$BIN" build "$f" 2>&1 >/dev/null)
+        build_exit=$?
+        rm -f "$base" "$base.rs"
+
+        if [[ $check_exit -ne 0 ]]; then
+            echo "GATE FAIL [check rejected a gate fixture]: $base (exit $check_exit)"
+            gate_failures+=("$base")
+        elif [[ $build_exit -eq 0 ]]; then
+            echo "GATE FAIL [build wrongly accepted subtyping]: $base"
+            gate_failures+=("$base")
+        elif ! grep -qi "subtyping" <<<"$build_stderr"; then
+            # Reject if it failed for the WRONG reason (e.g. a raw rustc error)
+            # instead of the honest pyrst codegen gate.
+            echo "GATE FAIL [build rejected for the wrong reason]: $base"
+            echo "  stderr: $(printf '%s' "$build_stderr" | head -2)"
+            gate_failures+=("$base")
+        else
+            gate_ok=$((gate_ok + 1))
+        fi
+    done
+fi
+
+echo ""
+echo "CODEGEN GATE (check pass + build honest-reject): $gate_ok / $gate_count"
+
 # ── SUMMARY ──────────────────────────────────────────────────────────────────
 
 echo ""
@@ -210,10 +260,11 @@ echo "════════════════════════�
 echo "POSITIVES:              $pos_passed / $pos_count"
 echo "NEGATIVES (build):      $neg_ok / $neg_count"
 echo "NEGATIVES (typeck):     $typeck_ok / $typeck_count"
+echo "CODEGEN GATE:           $gate_ok / $gate_count"
 echo "MULTI_FILE_DEMO:        $multi_ok / 1"
 echo "══════════════════════════════════════════════"
 
-total_failures=$(( ${#pos_failures[@]} + ${#neg_build_failures[@]} + ${#typeck_failures[@]} + ${#multi_failures[@]} ))
+total_failures=$(( ${#pos_failures[@]} + ${#neg_build_failures[@]} + ${#typeck_failures[@]} + ${#gate_failures[@]} + ${#multi_failures[@]} ))
 
 if [[ $total_failures -gt 0 ]]; then
     echo ""
@@ -221,6 +272,7 @@ if [[ $total_failures -gt 0 ]]; then
     for name in "${pos_failures[@]}"; do echo "  [positive] $name"; done
     for name in "${neg_build_failures[@]}"; do echo "  [neg-build-leak] $name"; done
     for name in "${typeck_failures[@]}"; do echo "  [typeck-leak] $name"; done
+    for name in "${gate_failures[@]}"; do echo "  [codegen-gate] $name"; done
     for name in "${multi_failures[@]}"; do echo "  [multi-file] $name"; done
     echo ""
     exit 1

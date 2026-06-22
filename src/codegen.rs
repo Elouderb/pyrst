@@ -42,11 +42,20 @@ pub struct Codegen<'a> {
     /// `&mut visited` would re-borrow an already-`&mut` binding (rustc E0596);
     /// the call site emits an explicit reborrow `&mut *visited` instead.
     by_ref_locals: std::collections::HashSet<String>,
+    /// (EPIC-5 C2-1) Closed-set polymorphism map: `base -> all subclasses in the
+    /// compilation unit` (direct AND transitive). Computed once by
+    /// `build_poly_map` (a pre-pass like `compute_mut_self`) from `ctx.classes`
+    /// before any emission. A base is "polymorphic" iff it has a non-empty entry
+    /// here (`is_polymorphic_base`). C2-1 only CONSULTS this map (in `rust_ty`'s
+    /// `Class` arm) without changing output; C2-2 flips that hook to emit the
+    /// companion-enum name `n__` for polymorphic bases. Empty until the pre-pass
+    /// runs.
+    poly_map: HashMap<String, Vec<String>>,
 }
 
 impl<'a> Codegen<'a> {
     pub fn new(ctx: &'a TyCtx) -> Self {
-        Self { ctx, out: String::new(), indent: 0, locals: HashMap::new(), declared: Default::default(), current_class: None, current_ret_ty: Ty::Unit, dead_funcs: Default::default(), mut_self: HashMap::new(), by_ref_locals: Default::default() }
+        Self { ctx, out: String::new(), indent: 0, locals: HashMap::new(), declared: Default::default(), current_class: None, current_ret_ty: Ty::Unit, dead_funcs: Default::default(), mut_self: HashMap::new(), by_ref_locals: Default::default(), poly_map: HashMap::new() }
     }
 
     pub fn with_dead_funcs(mut self, dead: std::collections::HashSet<String>) -> Self {
@@ -802,6 +811,43 @@ impl<'a> Codegen<'a> {
         self.mut_self = mutates;
     }
 
+    /// (EPIC-5 C2-1) Pre-pass building the closed-set polymorphism map
+    /// `base -> all subclasses in the unit` (direct AND transitive). Run from
+    /// `emit_program` right after `compute_mut_self`, BEFORE any emission, so the
+    /// map is populated when `rust_ty` consults it. Reads only `ctx.classes`, so
+    /// it is independent of module emission order.
+    ///
+    /// For every ordered pair of registered classes `(sub, base)` with
+    /// `is_subclass(sub, base)` and `sub != base`, `sub` is registered under
+    /// `base`. Reusing the audited `crate::typeck::is_subclass` (which walks
+    /// `bases` edges through `ctx.classes` and terminates at builtins like
+    /// `Exception`) gives transitivity for free: in a `C(B(A))` chain,
+    /// `is_subclass(C, A)` holds, so `C` lands under `A` as well as under `B`.
+    /// Each subclass list is sorted for deterministic, stable codegen.
+    fn build_poly_map(&mut self) {
+        let class_names: Vec<String> = self.ctx.classes.keys().cloned().collect();
+        let mut map: HashMap<String, Vec<String>> = HashMap::new();
+        for sub in &class_names {
+            for base in &class_names {
+                if sub != base && crate::typeck::is_subclass(sub, base, self.ctx) {
+                    map.entry(base.clone()).or_default().push(sub.clone());
+                }
+            }
+        }
+        for subs in map.values_mut() {
+            subs.sort();
+        }
+        self.poly_map = map;
+    }
+
+    /// (EPIC-5 C2-1) True when `name` is a base class with at least one subclass
+    /// in the compilation unit — i.e. it has a non-empty `poly_map` entry. C2-1
+    /// only consults this (in `rust_ty`) without changing emitted text; C2-2 will
+    /// branch on it to emit the companion-enum name `n__`.
+    fn is_polymorphic_base(&self, name: &str) -> bool {
+        self.poly_map.get(name).is_some_and(|subs| !subs.is_empty())
+    }
+
     /// The `&mut self` decision for a method, consulted by `emit_func`. Uses the
     /// precomputed transitive result from `compute_mut_self` (the normal path —
     /// the pre-pass map covers every resolved class method, including the
@@ -845,7 +891,7 @@ impl<'a> Codegen<'a> {
         for p in f.params.iter().filter(|p| p.name != "self") {
             if !first { sig.push_str(", "); }
             first = false;
-            let pty = rust_ty(&Ty::from_type_expr(&p.ty)?);
+            let pty = self.rust_ty(&Ty::from_type_expr(&p.ty)?);
             if p.by_ref {
                 // (EPIC-4 V2-c) An opt-in by-reference param (`Mut[T]`) becomes
                 // `name: &mut T`. The callee's mutations persist to the caller,
@@ -862,7 +908,7 @@ impl<'a> Codegen<'a> {
             }
         }
         let ret = Ty::from_type_expr(&f.ret)?;
-        let ret_s = rust_ty(&ret);
+        let ret_s = self.rust_ty(&ret);
         let _ = write!(sig, ") -> {} {{", ret_s);
         self.line(&sig);
         self.indent += 1;
@@ -915,7 +961,7 @@ impl<'a> Codegen<'a> {
         for name in hoist {
             let ty = self.locals.get(&name).cloned().unwrap_or(Ty::Unknown);
             if let Some(def) = self.default_val(&ty) {
-                self.line(&format!("let mut {}: {} = {};", name, rust_ty(&ty), def));
+                self.line(&format!("let mut {}: {} = {};", name, self.rust_ty(&ty), def));
                 self.declared.insert(name);
             }
         }
@@ -1029,7 +1075,7 @@ impl<'a> Codegen<'a> {
         self.indent += 1;
         for f in &all_fields {
             let ty = Ty::from_type_expr(&f.ty)?;
-            self.line(&format!("{}: {},", f.name, rust_ty(&ty)));
+            self.line(&format!("{}: {},", f.name, self.rust_ty(&ty)));
         }
         self.indent -= 1;
         self.line("}");
@@ -1063,7 +1109,7 @@ impl<'a> Codegen<'a> {
                     let param_strs: Result<Vec<_>> = non_self.iter()
                         .map(|p| {
                             let ty = Ty::from_type_expr(&p.ty)?;
-                            Ok(format!("{}: {}", p.name, rust_ty(&ty)))
+                            Ok(format!("{}: {}", p.name, self.rust_ty(&ty)))
                         })
                         .collect();
                     let param_strs = param_strs?;
@@ -1091,7 +1137,7 @@ impl<'a> Codegen<'a> {
                 let param_strs: Result<Vec<_>> = all_fields.iter()
                     .map(|f| {
                         let ty = Ty::from_type_expr(&f.ty)?;
-                        Ok(format!("{}: {}", f.name, rust_ty(&ty)))
+                        Ok(format!("{}: {}", f.name, self.rust_ty(&ty)))
                     })
                     .collect();
                 let param_strs = param_strs?;
@@ -1214,10 +1260,10 @@ impl<'a> Codegen<'a> {
                         .map(|p| Ty::from_type_expr(&p.ty).unwrap_or(Ty::Class(c.name.clone())))
                         .unwrap_or(Ty::Class(c.name.clone()));
                     let ret_ty = Ty::from_type_expr(&m.ret).unwrap_or(Ty::Class(c.name.clone()));
-                    self.line(&format!("impl ::std::ops::Add<{}> for {} {{", rust_ty(&other_ty), c.name));
+                    self.line(&format!("impl ::std::ops::Add<{}> for {} {{", self.rust_ty(&other_ty), c.name));
                     self.indent += 1;
-                    self.line(&format!("type Output = {};", rust_ty(&ret_ty)));
-                    self.line(&format!("fn add(self, other: {}) -> {} {{", rust_ty(&other_ty), rust_ty(&ret_ty)));
+                    self.line(&format!("type Output = {};", self.rust_ty(&ret_ty)));
+                    self.line(&format!("fn add(self, other: {}) -> {} {{", self.rust_ty(&other_ty), self.rust_ty(&ret_ty)));
                     self.indent += 1;
                     self.locals.insert("self".into(), Ty::Class(c.name.clone()));
                     self.locals.insert("other".into(), other_ty);
@@ -1252,10 +1298,10 @@ impl<'a> Codegen<'a> {
                         .map(|p| Ty::from_type_expr(&p.ty).unwrap_or(Ty::Class(c.name.clone())))
                         .unwrap_or(Ty::Class(c.name.clone()));
                     let ret_ty = Ty::from_type_expr(&m.ret).unwrap_or(Ty::Class(c.name.clone()));
-                    self.line(&format!("impl ::std::ops::Sub<{}> for {} {{", rust_ty(&other_ty), c.name));
+                    self.line(&format!("impl ::std::ops::Sub<{}> for {} {{", self.rust_ty(&other_ty), c.name));
                     self.indent += 1;
-                    self.line(&format!("type Output = {};", rust_ty(&ret_ty)));
-                    self.line(&format!("fn sub(self, other: {}) -> {} {{", rust_ty(&other_ty), rust_ty(&ret_ty)));
+                    self.line(&format!("type Output = {};", self.rust_ty(&ret_ty)));
+                    self.line(&format!("fn sub(self, other: {}) -> {} {{", self.rust_ty(&other_ty), self.rust_ty(&ret_ty)));
                     self.indent += 1;
                     self.locals.insert("self".into(), Ty::Class(c.name.clone()));
                     self.locals.insert("other".into(), other_ty);
@@ -1274,10 +1320,10 @@ impl<'a> Codegen<'a> {
                         .map(|p| Ty::from_type_expr(&p.ty).unwrap_or(Ty::Class(c.name.clone())))
                         .unwrap_or(Ty::Class(c.name.clone()));
                     let ret_ty = Ty::from_type_expr(&m.ret).unwrap_or(Ty::Class(c.name.clone()));
-                    self.line(&format!("impl ::std::ops::Mul<{}> for {} {{", rust_ty(&other_ty), c.name));
+                    self.line(&format!("impl ::std::ops::Mul<{}> for {} {{", self.rust_ty(&other_ty), c.name));
                     self.indent += 1;
-                    self.line(&format!("type Output = {};", rust_ty(&ret_ty)));
-                    self.line(&format!("fn mul(self, other: {}) -> {} {{", rust_ty(&other_ty), rust_ty(&ret_ty)));
+                    self.line(&format!("type Output = {};", self.rust_ty(&ret_ty)));
+                    self.line(&format!("fn mul(self, other: {}) -> {} {{", self.rust_ty(&other_ty), self.rust_ty(&ret_ty)));
                     self.indent += 1;
                     self.locals.insert("self".into(), Ty::Class(c.name.clone()));
                     self.locals.insert("other".into(), other_ty);
@@ -1294,8 +1340,8 @@ impl<'a> Codegen<'a> {
                     let ret_ty = Ty::from_type_expr(&m.ret).unwrap_or(Ty::Class(c.name.clone()));
                     self.line(&format!("impl ::std::ops::Neg for {} {{", c.name));
                     self.indent += 1;
-                    self.line(&format!("type Output = {};", rust_ty(&ret_ty)));
-                    self.line(&format!("fn neg(self) -> {} {{", rust_ty(&ret_ty)));
+                    self.line(&format!("type Output = {};", self.rust_ty(&ret_ty)));
+                    self.line(&format!("fn neg(self) -> {} {{", self.rust_ty(&ret_ty)));
                     self.indent += 1;
                     self.locals.insert("self".into(), Ty::Class(c.name.clone()));
                     for s in &m.body { self.emit_stmt(s)?; }
@@ -1740,9 +1786,9 @@ impl<'a> Codegen<'a> {
                             if matches!(ty_obj, Ty::Float)
                                 && (matches!(value_ty, Ty::Int) || self.emits_int_pow(value))
                             {
-                                self.line(&format!("let mut {}: {} = {} as f64;", target, rust_ty(&ty_obj), v));
+                                self.line(&format!("let mut {}: {} = {} as f64;", target, self.rust_ty(&ty_obj), v));
                             } else {
-                                self.line(&format!("let mut {}: {} = {};", target, rust_ty(&ty_obj), v));
+                                self.line(&format!("let mut {}: {} = {};", target, self.rust_ty(&ty_obj), v));
                             }
                         }
                         None => {
@@ -4042,6 +4088,57 @@ impl<'a> Codegen<'a> {
         self.out.push_str(s);
         self.out.push('\n');
     }
+
+    /// Maps a pyrst `Ty` to its emitted Rust type text.
+    ///
+    /// (EPIC-5 C2-1) This is a `Codegen` METHOD (not a free fn) specifically so
+    /// the `Class` arm can consult `self.poly_map` via `is_polymorphic_base` —
+    /// the method form avoids threading a `poly_map` parameter through every one
+    /// of the call sites (emit_func params/returns, emit_class fields/dunder
+    /// impls, emit_stmt hoists). See design §F. C2-1 is BEHAVIOR-PRESERVING: the
+    /// `Class` arm still returns plain `n` for every class; the single marked
+    /// hook below is what C2-2 flips to `format!("{n}__")` for a polymorphic base.
+    fn rust_ty(&self, t: &Ty) -> String {
+        match t {
+            Ty::Int => "i64".into(),
+            Ty::Float => "f64".into(),
+            Ty::Bool => "bool".into(),
+            Ty::Str => "String".into(),
+            Ty::Unit => "()".into(),
+            // The `None` literal's type. It never appears as a real binding
+            // annotation (annotations come from `from_type_expr`, which yields
+            // `Unit`/`Option`, never `NoneVal`); this arm exists for
+            // exhaustiveness and mirrors `Unit` (`None` as a bare value is an
+            // upstream type error).
+            Ty::NoneVal => "()".into(),
+            Ty::List(inner) => format!("Vec<{}>", self.rust_ty(inner)),
+            Ty::Set(inner) => format!("::std::collections::HashSet<{}>", self.rust_ty(inner)),
+            Ty::Dict(k, v) => format!("::std::collections::HashMap<{}, {}>", self.rust_ty(k), self.rust_ty(v)),
+            Ty::Tuple(parts) => {
+                let inner = parts.iter().map(|p| self.rust_ty(p)).collect::<Vec<_>>().join(", ");
+                if parts.len() == 1 {
+                    format!("({},)", inner)
+                } else {
+                    format!("({})", inner)
+                }
+            }
+            Ty::Option(inner) => format!("Option<{}>", self.rust_ty(inner)),
+            Ty::Class(n) => {
+                // (EPIC-5 C2-1 HOOK) Consult the polymorphism map. C2-1 is
+                // behavior-preserving: BOTH branches return plain `n`, so output
+                // is byte-for-byte identical to the pre-method free fn. C2-2
+                // flips the polymorphic branch to `format!("{n}__")` (the
+                // companion-enum name) once the enums are actually emitted.
+                if self.is_polymorphic_base(n) {
+                    n.clone()
+                } else {
+                    n.clone()
+                }
+            }
+            Ty::File => "PyFile".into(),
+            Ty::Unknown => "()".into(),
+        }
+    }
 }
 
 /// Return the set of builtin exception type names that `base` covers (i.e.
@@ -4144,36 +4241,6 @@ fn try_fold_const(expr: &Expr) -> Option<Expr> {
         _ => {}
     }
     None
-}
-
-fn rust_ty(t: &Ty) -> String {
-    match t {
-        Ty::Int => "i64".into(),
-        Ty::Float => "f64".into(),
-        Ty::Bool => "bool".into(),
-        Ty::Str => "String".into(),
-        Ty::Unit => "()".into(),
-        // The `None` literal's type. It never appears as a real binding
-        // annotation (annotations come from `from_type_expr`, which yields
-        // `Unit`/`Option`, never `NoneVal`); this arm exists for exhaustiveness
-        // and mirrors `Unit` (`None` as a bare value is an upstream type error).
-        Ty::NoneVal => "()".into(),
-        Ty::List(inner) => format!("Vec<{}>", rust_ty(inner)),
-        Ty::Set(inner) => format!("::std::collections::HashSet<{}>", rust_ty(inner)),
-        Ty::Dict(k, v) => format!("::std::collections::HashMap<{}, {}>", rust_ty(k), rust_ty(v)),
-        Ty::Tuple(parts) => {
-            let inner = parts.iter().map(rust_ty).collect::<Vec<_>>().join(", ");
-            if parts.len() == 1 {
-                format!("({},)", inner)
-            } else {
-                format!("({})", inner)
-            }
-        }
-        Ty::Option(inner) => format!("Option<{}>", rust_ty(inner)),
-        Ty::Class(n) => n.clone(),
-        Ty::File => "PyFile".into(),
-        Ty::Unknown => "()".into(),
-    }
 }
 
 /// Prelude implementing CPython-style `repr` for collections, used by
@@ -4291,6 +4358,12 @@ pub fn emit_program(modules: &[(Module, String)], ctx: &TyCtx) -> Result<String>
     // module-by-module emission order below.
     cg.compute_mut_self();
 
+    // (EPIC-5 C2-1) Build the closed-set polymorphism map (base -> subclasses)
+    // BEFORE emission, the same prepass shape as compute_mut_self. C2-1 only
+    // CONSULTS it (in `rust_ty`'s Class arm) without changing output; C2-2 flips
+    // that hook to emit the companion-enum name for polymorphic bases.
+    cg.build_poly_map();
+
     // Preamble — written once
     cg.line("#![allow(unused_parens, unused_variables, unused_mut, dead_code)]");
     cg.line("use std::io::Write;");
@@ -4357,4 +4430,119 @@ pub fn emit_program(modules: &[(Module, String)], ctx: &TyCtx) -> Result<String>
     }
 
     Ok(cg.out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ast::ClassDef;
+    use crate::diag::Span;
+
+    /// A minimal `ClassDef` carrying only name + bases — enough for the poly_map
+    /// pre-pass, which reads `ctx.classes` / `bases` via `is_subclass`.
+    fn class_def(name: &str, bases: &[&str]) -> ClassDef {
+        ClassDef {
+            name: name.to_string(),
+            bases: bases.iter().map(|s| s.to_string()).collect(),
+            fields: vec![],
+            methods: vec![],
+            is_dataclass: false,
+            span: Span::DUMMY,
+        }
+    }
+
+    /// Build a `TyCtx` populated with the given `(name, bases)` classes.
+    fn ctx_with(classes: &[(&str, &[&str])]) -> TyCtx {
+        let mut ctx = TyCtx::new();
+        for (name, bases) in classes {
+            ctx.classes.insert(name.to_string(), class_def(name, bases));
+        }
+        ctx
+    }
+
+    #[test]
+    fn poly_map_direct_siblings() {
+        // Dog(Animal) + Cat(Animal) -> poly_map[Animal] == {Cat, Dog} (sorted).
+        let ctx = ctx_with(&[
+            ("Animal", &[]),
+            ("Dog", &["Animal"]),
+            ("Cat", &["Animal"]),
+        ]);
+        let mut cg = Codegen::new(&ctx);
+        cg.build_poly_map();
+        assert_eq!(
+            cg.poly_map.get("Animal"),
+            Some(&vec!["Cat".to_string(), "Dog".to_string()])
+        );
+        assert!(cg.is_polymorphic_base("Animal"));
+    }
+
+    #[test]
+    fn poly_map_subless_class_not_polymorphic() {
+        // A class with no subclasses in the unit is NOT polymorphic and has no
+        // poly_map entry. A leaf subclass (Dog) is likewise not a base.
+        let ctx = ctx_with(&[
+            ("Animal", &[]),
+            ("Dog", &["Animal"]),
+            ("Rock", &[]), // unrelated, sub-less
+        ]);
+        let mut cg = Codegen::new(&ctx);
+        cg.build_poly_map();
+        assert!(!cg.is_polymorphic_base("Rock"));
+        assert!(cg.poly_map.get("Rock").is_none());
+        assert!(!cg.is_polymorphic_base("Dog")); // leaf: no subclasses
+        // Animal IS a base (has Dog under it).
+        assert!(cg.is_polymorphic_base("Animal"));
+        assert_eq!(cg.poly_map.get("Animal"), Some(&vec!["Dog".to_string()]));
+    }
+
+    #[test]
+    fn poly_map_transitive_chain() {
+        // C(B(A)): poly_map[A] must contain BOTH B and C (direct + transitive),
+        // poly_map[B] contains C. is_subclass(C, A) drives the transitivity.
+        let ctx = ctx_with(&[
+            ("A", &[]),
+            ("B", &["A"]),
+            ("C", &["B"]),
+        ]);
+        let mut cg = Codegen::new(&ctx);
+        cg.build_poly_map();
+        let a_subs = cg.poly_map.get("A").expect("A must be a polymorphic base");
+        assert!(a_subs.contains(&"B".to_string()));
+        assert!(a_subs.contains(&"C".to_string()));
+        assert_eq!(a_subs, &vec!["B".to_string(), "C".to_string()]);
+        assert_eq!(cg.poly_map.get("B"), Some(&vec!["C".to_string()]));
+        assert!(cg.is_polymorphic_base("A"));
+        assert!(cg.is_polymorphic_base("B"));
+        assert!(!cg.is_polymorphic_base("C")); // leaf
+    }
+
+    #[test]
+    fn poly_map_empty_before_prepass() {
+        // The field is empty until the pre-pass runs (mirrors mut_self).
+        let ctx = ctx_with(&[("Animal", &[]), ("Dog", &["Animal"])]);
+        let cg = Codegen::new(&ctx);
+        assert!(cg.poly_map.is_empty());
+        assert!(!cg.is_polymorphic_base("Animal"));
+    }
+
+    #[test]
+    fn rust_ty_class_arm_behavior_preserving() {
+        // C2-1 acceptance: rust_ty(Class(n)) returns plain `n` for BOTH a
+        // polymorphic base and a sub-less class — no `n__`, identical to today.
+        let ctx = ctx_with(&[("Animal", &[]), ("Dog", &["Animal"]), ("Rock", &[])]);
+        let mut cg = Codegen::new(&ctx);
+        cg.build_poly_map();
+        assert!(cg.is_polymorphic_base("Animal"));
+        // Polymorphic base still emits plain name (C2-2 flips this to "Animal__").
+        assert_eq!(cg.rust_ty(&Ty::Class("Animal".into())), "Animal");
+        // Sub-less / leaf classes unchanged.
+        assert_eq!(cg.rust_ty(&Ty::Class("Rock".into())), "Rock");
+        assert_eq!(cg.rust_ty(&Ty::Class("Dog".into())), "Dog");
+        // A list of a polymorphic base is still Vec<Animal>, not Vec<Animal__>.
+        assert_eq!(
+            cg.rust_ty(&Ty::List(Box::new(Ty::Class("Animal".into())))),
+            "Vec<Animal>"
+        );
+    }
 }

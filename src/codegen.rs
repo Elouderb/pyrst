@@ -846,23 +846,79 @@ impl<'a> Codegen<'a> {
         Ok(())
     }
 
-    /// Emit an expression in a position that takes ownership of the value
-    /// (function argument, container store). A bare identifier of an owned
-    /// (non-`Copy`) type is `.clone()`d so the original binding stays usable.
-    /// pyrst follows Python value semantics and performs no move/borrow
-    /// analysis, so cloning here is the conservative, always-compiling choice.
-    fn emit_owned(&mut self, e: &Expr) -> Result<String> {
-        let s = self.emit_expr(e)?;
-        if let Expr::Ident(name, _) = e {
-            let owned = self.locals.get(name)
-                .or_else(|| self.ctx.vars.get(name))
-                .map(crate::typeck::is_owned)
-                .unwrap_or(false);
-            if owned {
-                return Ok(format!("{}.clone()", s));
-            }
+    /// True when `obj.name` resolves to a `@property` getter (an owned temp
+    /// produced by a method call `obj.name()`), rather than a plain field read.
+    /// Shared by the `emit_expr` Attr arm (which appends `()`) and
+    /// `emit_consuming` (which must NOT clone a property — its result is already
+    /// an owned temporary, not a borrowable place). Mirrors the inheritance-aware
+    /// method lookup used elsewhere by resolving through the class's methods.
+    fn is_property_access(&self, obj: &Expr, name: &str) -> bool {
+        if let Expr::Ident(var, _) = obj {
+            self.locals.get(var.as_str()).cloned()
+                .and_then(|ty| if let Ty::Class(cn) = ty {
+                    self.ctx.classes.get(&cn).map(|cd|
+                        cd.methods.iter().any(|m|
+                            m.name.as_str() == name
+                            && m.decorators.contains(&"property".to_string())
+                        )
+                    )
+                } else { None })
+                .unwrap_or(false)
+        } else {
+            false
         }
-        Ok(s)
+    }
+
+    /// The SINGLE ownership-decision point for value semantics (EPIC-4 V1).
+    ///
+    /// Emit `e` in a position that takes ownership of the value (constructor /
+    /// method / function argument, container store, `return`, assignment RHS,
+    /// ternary arm, `match` scrutinee). A non-`Copy` *place* — a reusable binding
+    /// the program may read again — is deep-`.clone()`d so the original stays
+    /// usable, reproducing Python value semantics without aliasing. A deep clone
+    /// never changes observable behavior here, so uniform clone-on-use is always
+    /// correctness-safe (last-use move-elision is a deferred optimization).
+    ///
+    /// Decision (the only place this judgement lives):
+    /// - `Copy` type (per the shared `crate::typeck::is_copy`) -> bare, no clone.
+    /// - `Expr::Ident` -> `<n>.clone()` (a reusable variable place).
+    /// - `Expr::Attr` FIELD read -> `<obj>.<field>.clone()` (a reusable field
+    ///   place; this is the new capability that fixes `Wrapper(self.items)`
+    ///   E0382). A `@property` access is an owned temp (a getter call), so it is
+    ///   emitted bare — cloning it would be a redundant temp-clone.
+    /// - `Expr::Index` -> `emit_expr(e)` UNCHANGED. Index reads already self-clone
+    ///   (tuple `.clone()`, dict `.cloned()`, list `__list[i].clone()`); appending
+    ///   another `.clone()` would be a double-clone bug.
+    /// - `Expr::IfExp` -> the ARMS are the consuming leaves; recurse so the arm
+    ///   *places* clone, not the whole owned if-temp.
+    /// - everything else (Call/constructor result, BinOp, literal, comprehension,
+    ///   slice, …) -> a fresh owned rvalue temp -> bare, nothing to clone.
+    fn emit_consuming(&mut self, e: &Expr) -> Result<String> {
+        if self.is_copy_type(&self.type_of_expr(e)) {
+            return self.emit_expr(e);
+        }
+        match e {
+            Expr::Ident(..) => Ok(format!("{}.clone()", self.emit_expr(e)?)),
+            Expr::Attr { obj, name, .. } => {
+                if self.is_property_access(obj, name) {
+                    // Owned temp from a getter call — already owned, do not clone.
+                    self.emit_expr(e)
+                } else {
+                    Ok(format!("{}.clone()", self.emit_expr(e)?))
+                }
+            }
+            // Index reads already self-clone — pass through to avoid double-clone.
+            Expr::Index { .. } => self.emit_expr(e),
+            // Clone the arm PLACES, not the whole owned if-temp.
+            Expr::IfExp { test, body, orelse, .. } => {
+                let t = self.emit_expr(test)?;
+                let b = self.emit_consuming(body)?;
+                let o = self.emit_consuming(orelse)?;
+                Ok(format!("(if {} {{ {} }} else {{ {} }})", t, b, o))
+            }
+            // Owned rvalue temp (call/ctor/literal/binop/slice/...) — nothing to clone.
+            _ => self.emit_expr(e),
+        }
     }
 
     /// Emit an lvalue *place* expression (one assignable / mutable in Rust) for
@@ -913,7 +969,7 @@ impl<'a> Codegen<'a> {
     /// `Vec<f64>` instead of the rustc-rejected `vec![(1i64), (2.0f64)]`
     /// (card 5c2f31d8). Float (and non-int) elements are emitted unchanged.
     fn emit_collection_elem(&mut self, e: &Expr, widen: bool) -> Result<String> {
-        let s = self.emit_owned(e)?;
+        let s = self.emit_consuming(e)?;
         if widen && matches!(self.type_of_expr(e), Ty::Int) {
             Ok(format!("({}) as f64", s))
         } else {
@@ -1117,39 +1173,20 @@ impl<'a> Codegen<'a> {
                 // `None` -> `return None;`, a bare T -> `return Some(T);`, an
                 // already-Optional value -> pass through.
                 if matches!(self.current_ret_ty, Ty::Option(_)) {
-                    let s = self.emit_expr(e)?;
+                    // emit_consuming clones a non-Copy place (e.g. `return self.field`)
+                    // before coerce_to_option wraps the result in `Some(..)`.
+                    let s = self.emit_consuming(e)?;
                     let wrapped = self.coerce_to_option(s, e, &self.current_ret_ty);
                     self.line(&format!("return {};", wrapped));
                 } else if matches!(e, Expr::None_(_)) {
                     self.line("return;");
                 } else {
-                    let s = self.emit_expr(e)?;
-                    // Auto-clone non-Copy types when returning from methods that take &self
-                    let should_clone = match e {
-                        Expr::Attr { obj, name, .. } => {
-                            if let Expr::Ident(obj_name, _) = obj.as_ref() {
-                                if obj_name == "self" && self.current_class.is_some() {
-                                    // Check if the attribute type is non-Copy
-                                    if let Some(class_name) = &self.current_class {
-                                        let all_fields = self.ctx.get_all_fields(class_name.as_str());
-                                        all_fields.iter().any(|f| &f.name == name)
-                                    } else {
-                                        false
-                                    }
-                                } else {
-                                    false
-                                }
-                            } else {
-                                false
-                            }
-                        }
-                        _ => false,
-                    };
-                    if should_clone {
-                        self.line(&format!("return {}.clone();", s));
-                    } else {
-                        self.line(&format!("return {};", s));
-                    }
+                    // Uniform clone-on-use: a non-Copy place (variable, field, index)
+                    // is deep-cloned so the returned value is independent of the
+                    // binding. This subsumes the former `return self.field`
+                    // special-case heuristic.
+                    let s = self.emit_consuming(e)?;
+                    self.line(&format!("return {};", s));
                 }
             }
             Stmt::Expr(e) => {
@@ -1157,7 +1194,10 @@ impl<'a> Codegen<'a> {
                 self.line(&format!("{};", s));
             }
             Stmt::Assign { target, ty, value, .. } => {
-                let v = self.emit_expr(value)?;
+                // Uniform clone-on-use: assigning from a non-Copy place (`y = x`,
+                // `y = self.field`) deep-clones so the two bindings are independent
+                // (Python value semantics). Owned temps (call/literal/binop) are bare.
+                let v = self.emit_consuming(value)?;
                 let is_declared = self.declared.contains(target);
                 if !is_declared {
                     self.declared.insert(target.clone());
@@ -1331,11 +1371,16 @@ impl<'a> Codegen<'a> {
                 self.line("}");
             }
             Stmt::For { targets, iter, body, .. } => {
-                // Check if element type is Copy to use .iter().copied() instead of .iter().cloned()
+                // Check if element type is Copy to use .iter().copied() instead of
+                // .iter().cloned(). Copy-ness goes through the single shared
+                // predicate (`crate::typeck::is_copy`), so the for-loop lowering
+                // can't drift from the rest of codegen — it also picks up `Unit`
+                // and recursively-Copy `Tuple`/`Option` elements the old inline
+                // `matches!` omitted.
                 let is_copy_elem = if let Expr::Ident(name, _) = iter {
                     self.locals.get(name.as_str()).or_else(|| self.ctx.vars.get(name.as_str()))
                         .map(|ty| if let Ty::List(inner) = ty {
-                            matches!(inner.as_ref(), Ty::Int | Ty::Float | Ty::Bool)
+                            self.is_copy_type(inner)
                         } else { false })
                         .unwrap_or(false)
                 } else {
@@ -1595,14 +1640,14 @@ impl<'a> Codegen<'a> {
                 self.line(&format!("drop({});", t));
             }
             Stmt::AttrAssign { obj, attr, value, .. } => {
-                let v = self.emit_owned(value)?;
+                let v = self.emit_consuming(value)?;
                 // The base must be emitted as a *place* (lvalue), not the
                 // clone-based rvalue emit_expr produces for Attr/Index.
                 let place = self.emit_place(obj)?;
                 self.line(&format!("{}.{} = {};", place, attr, v));
             }
             Stmt::IndexAssign { obj, idx, value, .. } => {
-                let v = self.emit_owned(value)?;
+                let v = self.emit_consuming(value)?;
                 let place = self.emit_place(obj)?;
                 // Dispatch on the base's collection kind (dict -> HashMap::insert,
                 // list -> indexed store). type_of_expr resolves chained bases
@@ -1611,7 +1656,7 @@ impl<'a> Codegen<'a> {
                 if is_dict {
                     // HashMap::insert takes ownership of the key, so emit it owned
                     // (a String key var becomes `k.clone()`; Copy keys are unchanged).
-                    let k = self.emit_owned(idx)?;
+                    let k = self.emit_consuming(idx)?;
                     self.line(&format!("{}.insert({}, {});", place, k, v));
                 } else {
                     let i = self.emit_expr(idx)?;
@@ -1619,7 +1664,9 @@ impl<'a> Codegen<'a> {
                 }
             }
             Stmt::Match { subject, arms, .. } => {
-                let subj = self.emit_expr(subject)?;
+                // Clone (do not move) a non-Copy scrutinee place so it stays usable
+                // after the match — uniform clone-on-use.
+                let subj = self.emit_consuming(subject)?;
                 let temp_var = "__match_val".to_string();
                 self.line(&format!("let {} = {};", temp_var, subj));
 
@@ -1723,7 +1770,7 @@ impl<'a> Codegen<'a> {
                 format!("vec![{}]", parts.join(", "))
             }
             Expr::Tuple(elems, _) => {
-                let parts: Result<Vec<_>> = elems.iter().map(|e| self.emit_owned(e)).collect();
+                let parts: Result<Vec<_>> = elems.iter().map(|e| self.emit_consuming(e)).collect();
                 let parts = parts?;
                 match parts.len() {
                     0 => "()".to_string(),
@@ -1814,8 +1861,8 @@ impl<'a> Codegen<'a> {
                 }
                 let mut inserts = Vec::new();
                 for (k, v) in pairs {
-                    let ks = self.emit_owned(k)?;
-                    let vs = self.emit_owned(v)?;
+                    let ks = self.emit_consuming(k)?;
+                    let vs = self.emit_consuming(v)?;
                     inserts.push(format!("({}, {})", ks, vs));
                 }
                 format!("vec![{}].into_iter().collect::<::std::collections::HashMap<_,_>>()",
@@ -2434,8 +2481,8 @@ impl<'a> Codegen<'a> {
                         // (field assignments, etc.) always run.
                         if has_init {
                             let mut call_parts = Vec::new();
-                            for a in args { call_parts.push(self.emit_expr(a)?); }
-                            for (_, v) in kwargs { call_parts.push(self.emit_expr(v)?); }
+                            for a in args { call_parts.push(self.emit_consuming(a)?); }
+                            for (_, v) in kwargs { call_parts.push(self.emit_consuming(v)?); }
                             return Ok(format!("{}::new({})", name, call_parts.join(", ")));
                         }
 
@@ -2467,7 +2514,7 @@ impl<'a> Codegen<'a> {
                             }
                             let mut parts = Vec::new();
                             for (field_name, arg) in all_field_names.iter().zip(args.iter()) {
-                                let v = self.emit_expr(arg)?;
+                                let v = self.emit_consuming(arg)?;
                                 parts.push(format!("{}: {}", field_name, v));
                             }
                             return Ok(format!("{} {{ {} }}", name, parts.join(", ")));
@@ -2477,7 +2524,7 @@ impl<'a> Codegen<'a> {
                         if !kwargs.is_empty() {
                             let mut parts = Vec::new();
                             for (kw, val) in kwargs {
-                                let v = self.emit_expr(val)?;
+                                let v = self.emit_consuming(val)?;
                                 parts.push(format!("{}: {}", kw, v));
                             }
                             return Ok(format!("{} {{ {} }}", name, parts.join(", ")));
@@ -2513,7 +2560,7 @@ impl<'a> Codegen<'a> {
                                 if let Some(_class_name) = self.current_class.clone() {
                                     // Call __super_ alias method which has parent's body
                                     let mut arg_parts = Vec::new();
-                                    for a in args { arg_parts.push(self.emit_expr(a)?); }
+                                    for a in args { arg_parts.push(self.emit_consuming(a)?); }
                                     return Ok(format!("self.__super_{}({})", method_name, arg_parts.join(", ")));
                                 }
                             }
@@ -2526,7 +2573,7 @@ impl<'a> Codegen<'a> {
                     // Math module functions
                     if let Expr::Ident(modname, _) = obj.as_ref() {
                         if modname == "math" {
-                            let parts: Result<Vec<_>> = args.iter().map(|a| self.emit_expr(a)).collect();
+                            let parts: Result<Vec<_>> = args.iter().map(|a| self.emit_consuming(a)).collect();
                             let parts = parts?;
                             let a0 = parts.get(0).map(|s| s.as_str()).unwrap_or("0.0");
                             let a1 = parts.get(1).map(|s| s.as_str()).unwrap_or("0.0");
@@ -2564,7 +2611,7 @@ impl<'a> Codegen<'a> {
                         if let Some(class_def) = self.ctx.classes.get(class_name.as_str()) {
                             if let Some(method_def) = class_def.methods.iter().find(|m| &m.name == name) {
                                 if method_def.decorators.contains(&"staticmethod".to_string()) {
-                                    let parts: Result<Vec<_>> = args.iter().map(|a| self.emit_expr(a)).collect();
+                                    let parts: Result<Vec<_>> = args.iter().map(|a| self.emit_consuming(a)).collect();
                                     let parts = parts?;
                                     return Ok(format!("{}::{}({})", class_name, name, parts.join(", ")));
                                 }
@@ -2600,7 +2647,7 @@ impl<'a> Codegen<'a> {
                         // passthrough
                         other        => other,
                     };
-                    let parts: Result<Vec<_>> = args.iter().map(|a| self.emit_expr(a)).collect();
+                    let parts: Result<Vec<_>> = args.iter().map(|a| self.emit_consuming(a)).collect();
                     let parts = parts?;
 
                     // Special handling for string methods that return &str and need to be converted to String
@@ -2659,14 +2706,14 @@ impl<'a> Codegen<'a> {
                     }
                     if name == "removeprefix" && !parts.is_empty() {
                         return Ok(format!(
-                            "{{ let __s = {}.clone(); let __prefix = {}.clone(); \
+                            "{{ let __s = {}.clone(); let __prefix = {}; \
                             if __s.starts_with(__prefix.as_str()) {{ __s[__prefix.len()..].to_string() }} else {{ __s }} }}",
                             obj_s, parts[0]
                         ));
                     }
                     if name == "removesuffix" && !parts.is_empty() {
                         return Ok(format!(
-                            "{{ let __s = {}.clone(); let __suffix = {}.clone(); \
+                            "{{ let __s = {}.clone(); let __suffix = {}; \
                             if __s.ends_with(__suffix.as_str()) {{ __s[..__s.len() - __suffix.len()].to_string() }} else {{ __s }} }}",
                             obj_s, parts[0]
                         ));
@@ -2685,7 +2732,7 @@ impl<'a> Codegen<'a> {
                     }
                     if name == "partition" && !parts.is_empty() {
                         return Ok(format!(
-                            "{{ let __s = {}.clone(); let __sep = {}.clone(); \
+                            "{{ let __s = {}.clone(); let __sep = {}; \
                             if let Some(__idx) = __s.find(__sep.as_str()) {{ \
                             vec![__s[..__idx].to_string(), __sep.clone(), __s[__idx + __sep.len()..].to_string()] \
                             }} else {{ vec![__s, String::new(), String::new()] }} }}",
@@ -2694,7 +2741,7 @@ impl<'a> Codegen<'a> {
                     }
                     if name == "rpartition" && !parts.is_empty() {
                         return Ok(format!(
-                            "{{ let __s = {}.clone(); let __sep = {}.clone(); \
+                            "{{ let __s = {}.clone(); let __sep = {}; \
                             if let Some(__idx) = __s.rfind(__sep.as_str()) {{ \
                             vec![__s[..__idx].to_string(), __sep.clone(), __s[__idx + __sep.len()..].to_string()] \
                             }} else {{ vec![String::new(), String::new(), __s] }} }}",
@@ -2809,7 +2856,7 @@ impl<'a> Codegen<'a> {
                         match obj_ty {
                             Ty::Str => {
                                 return Ok(format!(
-                                    "{{ let __s = {}.clone(); let __sub = {}.clone(); let mut __count = 0i64; let mut __start = 0; while let Some(__pos) = __s.as_str()[__start..].find(__sub.as_str()) {{ __count += 1; __start += __pos + __sub.len(); }} __count }}",
+                                    "{{ let __s = {}.clone(); let __sub = {}; let mut __count = 0i64; let mut __start = 0; while let Some(__pos) = __s.as_str()[__start..].find(__sub.as_str()) {{ __count += 1; __start += __pos + __sub.len(); }} __count }}",
                                     obj_s, parts[0]
                                 ));
                             }
@@ -2863,7 +2910,7 @@ impl<'a> Codegen<'a> {
                             // insert takes ownership, so emit the element owned
                             // (a String var becomes `x.clone()`).
                             "add" if !parts.is_empty() =>
-                                return Ok(format!("{{ {}.insert({}); }}", obj_s, self.emit_owned(&args[0])?)),
+                                return Ok(format!("{{ {}.insert({}); }}", obj_s, self.emit_consuming(&args[0])?)),
                             // NB: unlike Python, neither discard nor remove raises on an
                             // absent element here (Rust's HashSet::remove returns an ignored bool).
                             "discard" | "remove" if !parts.is_empty() =>
@@ -2890,7 +2937,7 @@ impl<'a> Codegen<'a> {
 
                     // dict.update(other) — merge another mapping in place.
                     if name == "update" && !parts.is_empty() {
-                        return Ok(format!("{{ {}.extend({}.clone()); }}", obj_s, parts[0]));
+                        return Ok(format!("{{ {}.extend({}); }}", obj_s, parts[0]));
                     }
 
                     if name == "pop" {
@@ -2920,7 +2967,7 @@ impl<'a> Codegen<'a> {
                     }
                     // List methods
                     if name == "extend" && !parts.is_empty() {
-                        return Ok(format!("{}.extend({}.clone())", obj_s, parts[0]));
+                        return Ok(format!("{}.extend({})", obj_s, parts[0]));
                     }
                     if name == "insert" && parts.len() >= 2 {
                         return Ok(format!("{}.insert({} as usize, {})", obj_s, parts[0], parts[1]));
@@ -2966,7 +3013,7 @@ impl<'a> Codegen<'a> {
                 };
                 let mut parts = Vec::with_capacity(args.len());
                 for (i, a) in args.iter().enumerate() {
-                    let s = self.emit_owned(a)?;
+                    let s = self.emit_consuming(a)?;
                     let s = match param_tys.get(i) {
                         Some(pt) => self.coerce_to_option(s, a, pt),
                         None => s,
@@ -3025,20 +3072,7 @@ impl<'a> Codegen<'a> {
 
                 let o = self.emit_expr(obj)?;
                 // Check if this is a @property access
-                let is_property = if let Expr::Ident(var, _) = obj.as_ref() {
-                    self.locals.get(var.as_str()).cloned()
-                        .and_then(|ty| if let Ty::Class(cn) = ty {
-                            self.ctx.classes.get(&cn).map(|cd|
-                                cd.methods.iter().any(|m|
-                                    m.name.as_str() == name.as_str()
-                                    && m.decorators.contains(&"property".to_string())
-                                )
-                            )
-                        } else { None })
-                        .unwrap_or(false)
-                } else {
-                    false
-                };
+                let is_property = self.is_property_access(obj, name);
                 if is_property {
                     format!("{}.{}()", o, name)
                 } else {

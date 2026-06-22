@@ -80,7 +80,7 @@ This document clarifies which Python features are supported, partially supported
 | Dynamic attribute access | ❌ Not Supported | No runtime `getattr`/`setattr` |
 | Metaclasses | ❌ Not Supported | Not part of the type system |
 
-**Key Semantic Difference:** Classes use **value semantics** (Rust), not reference semantics (Python). Assignment copies the struct.
+**Key Semantic Difference:** Classes (and all non-`Copy` values) use **value semantics** (Rust), not reference semantics (Python). Assignment and argument passing **deep-copy** the value (clone-on-use) — there is no shared-mutable aliasing. A callee that should mutate the caller's object opts in explicitly with a `Mut[T]` (by-reference) parameter; otherwise mutating a by-value parameter is a compile error. See *Notable Limitations* for the full model.
 
 ---
 
@@ -359,23 +359,79 @@ compiler (which would otherwise reject the emitted `Some(sink())` as `Option<()>
 - **No first-class function values to builtins:** e.g. `map(str, xs)` does not work; use a comprehension.
 - **`@classmethod`:** the `cls` parameter cannot be cleanly annotated, so classmethods are effectively unsupported (use `@staticmethod` or a module function).
 - **Caught exceptions** print no stderr noise; uncaught ones still surface a message and a non-zero exit code.
-- **Mutating through a subscript does not persist:** indexing yields a value (a clone, per the value-semantics model), so `d[k].append(x)` or `matrix[i][j] = v` on a *nested* collection mutates a temporary, not the stored element. Pull the element into a variable, mutate it, and reassign the whole element (`row = matrix[i]; row[j] = v; matrix[i] = row`).
-- **Mutating a by-value non-Copy parameter is a compile error:** pyrst compiles function parameters to owned Rust values (a clone of the caller's value), so mutations to a `list`, `dict`, `set`, `str`, or user-defined class parameter are NOT visible to the caller. The typeck pass detects three patterns and reports a hard error rather than letting them compile silently:
+- **Mutating through a subscript does not persist:** indexing yields a value (a clone, per the value-semantics model), so `local[k].append(x)` or `matrix[i][j] = v` on a *nested* collection of a **local** mutates a temporary, not the stored element. Pull the element into a variable, mutate it, and reassign the whole element (`row = matrix[i]; row[j] = v; matrix[i] = row`). (When the subscripted collection is rooted at a **by-value parameter**, this is no longer a silent no-op but a hard compile error — see the by-value-parameter bullet below; use `Mut[T]` to mutate the caller's value in place.)
+- **Mutating a by-value non-Copy parameter is a compile error:** pyrst compiles a plain (by-value) parameter to an owned Rust value — a *deep clone* of the caller's value, taken at the call site (clone-on-use). The callee therefore mutates its own copy, and the change is NOT visible to the caller. Rather than let that miscompile silently, the typeck pass rejects every mutation of a by-value non-`Copy` (`list`, `dict`, `set`, `str`, or user-defined class) parameter — whether the mutation is **direct** or reaches **through a field or index** of the parameter:
   1. Field assignment — `param.field = v`
   2. Index assignment — `param[k] = v`
-  3. In-place method call directly on the param — `param.append(x)`, `param.add(x)`, `param.update(d)`, etc.
-  The correct idioms are (a) accept a `&mut`-like approach by using a method on `self` (for class methods), or (b) build and return the updated value:
-  ```python
-  # WRONG — mutation invisible to caller
-  def push(items: list[int], x: int) -> None:
-      items.append(x)              # compile error: by-value param
-  # CORRECT — return the new value
-  def push(items: list[int], x: int) -> list[int]:
-      result = list(items)
-      result.append(x)
-      return result
+  3. In-place mutating method on the param **or on any place rooted at it** — `param.append(x)`, `param.add(x)`, `param.update(d)`, **and** `param.field.append(x)`, `param[0].add(x)`, `param.a.b.sort()`, etc. (the mutating methods are the 13 in-place list/set/dict mutators: `append`, `extend`, `insert`, `remove`, `sort`, `reverse`, `clear`, `add`, `discard`, `update`, `pop`, `setdefault`, `popitem`).
+
+  The nested case (`param.field.append(x)`) used to compile and silently produce wrong output; it is now a loud error like the rest. The error always names the remedy:
+
+  ```text
+  mutation of by-value parameter `ds` is not visible to the caller;
+  mutate via a method on it or return the updated value;
+  or declare the parameter `Mut[T]` to mutate it in place
   ```
-  Note: calling a mutating method on a FIELD of a class parameter (`ds.values.append(x)`) is not caught at this level — it compiles but still produces wrong output (the field mutation is local to the clone). Avoid this pattern; restructure using the return idiom or make `add_value` a class method operating on `self`.
+
+  You have three remedies:
+  - **(a) Declare the parameter `Mut[T]`** — opt into by-reference mode so the mutation persists to the caller (see the next bullet). This is the most direct fix for "the callee should mutate the caller's object."
+  - **(b) Return the updated value** and let the caller reassign:
+    ```python
+    # WRONG — mutation invisible to caller
+    def push(items: list[int], x: int) -> None:
+        items.append(x)              # compile error: by-value param
+    # CORRECT — return the new value
+    def push(items: list[int], x: int) -> list[int]:
+        result = list(items)
+        result.append(x)
+        return result
+    ```
+  - **(c) Make it a method on `self`** (for state owned by a class) — a mutating method takes `&mut self`, so `self.values.append(x)` is fine.
+
+  > A param that is *reassigned* before mutation (`p = ...; p.append(x)`) or that *flows into a `return`* (`xs.append(x); return xs`) is exempt — in both cases the mutation is the callee's own value, not a lost write.
+
+- **Opt-in by-reference parameters — `Mut[T]`:** annotate a parameter `Mut[T]` to pass it **by mutable reference** (`&mut T` in the emitted Rust) instead of by value. The callee's mutations to a `Mut[T]` parameter — direct, nested, or via a mutating method — **persist to the caller**, and the by-value backstop above is suppressed for that parameter.
+
+  ```python
+  class Account:
+      balance: int
+      def __init__(self, balance: int) -> None:
+          self.balance = balance
+
+  # `account` is borrowed &mut Account; the deposit is visible to the caller.
+  def deposit(account: Mut[Account], amt: int) -> None:
+      account.balance = account.balance + amt
+
+  def main() -> None:
+      a: Account = Account(100)
+      deposit(a, 25)
+      deposit(a, 5)
+      print(a.balance)   # 130 — the mutation persisted
+  ```
+
+  It composes with the nested case the backstop now guards. The graph/DFS shape — fill the caller's set in place — is written by declaring the collection `Mut[...]`:
+
+  ```python
+  def visit(seen: Mut[set[int]], node: int) -> None:
+      seen.add(node)            # persists to the caller's set
+
+  def record(ds: Mut[DataSet], x: int) -> None:
+      ds.values.append(x)       # nested field mutation, now legal via Mut[T]
+  ```
+
+  Rules and limits:
+  - **Place requirement:** a `Mut[T]` argument must be a **place** — a variable, field, or index (`deposit(a, 5)`), never a temporary. `deposit(make_account(), 5)` is an honest typeck error (*"by-reference parameter `account` requires a variable, not a temporary"*): a temporary has no caller-visible storage to borrow.
+  - **Parameter-only:** `Mut[T]` is a parameter *mode*, not a type. It is rejected anywhere else — return types, variable/field annotations, or nested forms like `list[Mut[T]]` (*"Mut[...] is only valid on a parameter"*).
+  - **The aliasing trade (the conscious price of not using `Rc`):** `&mut` forbids aliasing, so passing the **same** variable as two `Mut[T]` arguments — or as a `Mut[T]` arg while it is also borrowed elsewhere in the same call — surfaces an **honest Rust borrow-check error**, never silent-wrong output and never a runtime aliasing panic. Python permits such aliasing; pyrst deliberately does not. Rewrite by **sequencing** the mutations or by **return-and-reassign**:
+    ```python
+    # REJECTED — `acc` aliased as two &mut args at once
+    transfer(acc, acc, 10)
+    # OK — sequence the two mutations instead
+    withdraw(acc, 10)
+    deposit(acc, 10)
+    ```
+  - **`Mut[set]` / `Mut[dict]` need element types:** write `Mut[set[int]]` / `Mut[dict[str, int]]`, not bare `Mut[set]` — a bare `set`/`dict` head parses as an (unknown) class, so the argument-type check rejects the call.
+  - **`Mut[<primitive>]` has a known deref limitation:** `Mut[int]`/`Mut[float]`/`Mut[bool]` emit `&mut i64` etc., but the codegen does not auto-dereference the reference in expression position, so arithmetic on the parameter (`n + 1`) fails to compile, and reassigning the parameter would not write back anyway. Use a `Mut[T]` of a collection or class, or the return idiom, for primitives.
 - **Block scope follows Python:** a variable first assigned inside an `if`/`elif`/`else`/`for`/`while`/`with`/`try` body is visible after the block (it is hoisted to function scope). Edge case: a name is not hoisted — and so stays block-local — if its type cannot be statically inferred, or is a tuple or an all-numeric-field class (which has no `Default`). Also: a hoisted name is initialized to a default (`0`/`""`/empty), so reading it on a path where it was never assigned yields that default rather than raising Python's `UnboundLocalError`.
 - **No subtype polymorphism:** classes compile to plain Rust structs with value semantics and no inheritance relationship, so a `list[Base]` cannot hold `Derived` instances and a `Base`-typed variable cannot be reassigned a `Derived`. Use a single concrete type per collection. (`super()`, method inheritance, and overriding within one type still work.)
 - **Builtin runtime errors are not catchable exceptions:** index-out-of-range, missing dict key, and divide-by-zero abort the program (Rust panic, non-zero exit). `try`/`except` only catches values from an explicit `raise` of the matching type — a bare `except IndexError` will **not** catch an out-of-bounds subscript.

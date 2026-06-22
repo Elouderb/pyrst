@@ -2512,18 +2512,27 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                                 });
                             }
                             // (b) Detect in-place mutating method calls on a by-value param.
-                            // e.g. `visited.add(node)` where `visited` is a Set parameter.
-                            // Only fires when the receiver `obj` is the param ident directly
-                            // (not a field or element of it) — `ds.values.append(x)` must
-                            // NOT fire because it is a nested attribute access and a separate
-                            // concern from direct param mutation.
+                            // e.g. `visited.add(node)` where `visited` is a Set parameter,
+                            // OR `param.field.append(x)` / `param[0].add(x)` — a mutator on
+                            // any PLACE rooted at the param (the mutation is lost on the
+                            // caller's clone either way). EPIC-4 V2-d closes the former
+                            // nested-mutation gap: we now root the receiver via `root_ident`
+                            // (like the AttrAssign / IndexAssign backstops already do)
+                            // instead of requiring the receiver to be the bare param ident.
+                            // `obj_ty` is the RECEIVER's type (the collection being mutated),
+                            // which is always owned inside this builtin-method-table arm, so
+                            // the `is_owned(&obj_ty)` guard still holds for the field/index
+                            // case. The suppressions are preserved verbatim: self-exclusion,
+                            // reassigned, returned, and — critically — by_ref (`Mut[T]`)
+                            // params, whose nested mutation IS caller-visible and must NOT
+                            // fire.
                             if MUTATING_METHODS.contains(&name.as_str()) {
-                                if let Expr::Ident(param_name, _) = obj.as_ref() {
+                                if let Some(param_name) = root_ident(obj) {
                                     if param_name != "self"
-                                        && env.params.contains(param_name.as_str())
-                                        && !env.reassigned_params.contains(param_name.as_str())
-                                        && !env.returned_params.contains(param_name.as_str())
-                                        && !env.by_ref_params.contains(param_name.as_str())
+                                        && env.params.contains(param_name)
+                                        && !env.reassigned_params.contains(param_name)
+                                        && !env.returned_params.contains(param_name)
+                                        && !env.by_ref_params.contains(param_name)
                                         && is_owned(&obj_ty)
                                     {
                                         return Err(Error::Type {
@@ -4535,6 +4544,89 @@ mod tests {
             "must keep the original remedy: {}", msg);
         assert!(msg.contains("declare the parameter `Mut[T]` to mutate it in place"),
             "must add the Mut[T] on-ramp: {}", msg);
+    }
+
+    #[test]
+    fn nested_index_mutate_on_by_value_param_fires() {
+        // EPIC-4 V2-d: a mutating method on an INDEX of a by-value non-Copy param
+        // — `rows[0].append(x)` where `rows: list[list[int]]` — now fires the
+        // backstop. Before V2-d the receiver `rows[0]` (an `Expr::Index`, not the
+        // bare param ident) escaped silently. The fix roots the receiver via
+        // `root_ident`, recovering `rows` as the mutated by-value param.
+        let ctx = TyCtx::new();
+        let mut env = FuncEnv::with_by_ref(
+            &ctx,
+            &[("rows".into(), Ty::List(Box::new(Ty::List(Box::new(Ty::Int)))))],
+            &[],
+            Ty::Unit,
+        );
+        // rows[0].append(7)
+        let receiver = Expr::Index {
+            obj: Box::new(ident("rows")),
+            idx: Box::new(int_lit(0)),
+            span: Span::DUMMY,
+        };
+        let call = method_call(receiver, "append", vec![int_lit(7)]);
+        let r = check_expr(&call, &mut env);
+        assert_type_err(r, "mutation of by-value parameter `rows` is not visible");
+        // And it points the user at the Mut[T] remedy.
+        if let Err(Error::Type { msg, .. }) =
+            check_expr(&{
+                let receiver = Expr::Index {
+                    obj: Box::new(ident("rows")),
+                    idx: Box::new(int_lit(0)),
+                    span: Span::DUMMY,
+                };
+                method_call(receiver, "append", vec![int_lit(7)])
+            }, &mut env)
+        {
+            assert!(msg.contains("declare the parameter `Mut[T]`"),
+                "nested-mutation error must offer the Mut[T] remedy: {}", msg);
+        }
+    }
+
+    #[test]
+    fn nested_index_mutate_on_by_ref_param_is_suppressed() {
+        // EPIC-4 V2-d suppression: when the SAME nested shape roots at a `Mut[T]`
+        // (by-reference) param, the mutation IS visible to the caller, so the
+        // backstop must NOT fire. Closing the gap must not weaken this.
+        let ctx = TyCtx::new();
+        let mut env = FuncEnv::with_by_ref(
+            &ctx,
+            &[("rows".into(), Ty::List(Box::new(Ty::List(Box::new(Ty::Int)))))],
+            &["rows".into()], // declared Mut[list[list[int]]]
+            Ty::Unit,
+        );
+        let receiver = Expr::Index {
+            obj: Box::new(ident("rows")),
+            idx: Box::new(int_lit(0)),
+            span: Span::DUMMY,
+        };
+        let call = method_call(receiver, "append", vec![int_lit(7)]);
+        let r = check_expr(&call, &mut env);
+        assert!(r.is_ok(),
+            "a Mut[T] param's nested mutation must NOT fire the backstop, got {:?}", r);
+    }
+
+    #[test]
+    fn nested_index_mutate_on_local_does_not_fire() {
+        // Guard against over-firing: the same shape on a LOCAL (non-param) place
+        // must never fire — only by-value PARAMS are caller-invisible.
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        env.locals.insert(
+            "rows".into(),
+            Ty::List(Box::new(Ty::List(Box::new(Ty::Int)))),
+        );
+        let receiver = Expr::Index {
+            obj: Box::new(ident("rows")),
+            idx: Box::new(int_lit(0)),
+            span: Span::DUMMY,
+        };
+        let call = method_call(receiver, "append", vec![int_lit(7)]);
+        let r = check_expr(&call, &mut env);
+        assert!(r.is_ok(),
+            "mutating a local (not a param) must not fire the backstop, got {:?}", r);
     }
 
     #[test]

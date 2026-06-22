@@ -8,7 +8,12 @@ class DataSet:
         self.name = name
         self.values = []
 
-def add_value(ds: DataSet, val: float) -> None:
+# `add_value` mutates the caller's DataSet in place (it appends to ds.values),
+# so `ds` is declared Mut[DataSet] — a by-reference param whose mutation IS
+# visible to the caller (EPIC-4 V2). Passing it by value would lose every
+# append on a clone (a silent wrong-output bug the V2-d backstop now rejects);
+# the read-only accessors below keep their by-value `DataSet` params.
+def add_value(ds: Mut[DataSet], val: float) -> None:
     ds.values.append(val)
 
 def get_mean(ds: DataSet) -> float:

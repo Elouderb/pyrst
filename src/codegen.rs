@@ -46,8 +46,11 @@ impl<'a> Codegen<'a> {
         self
     }
 
+    /// Thin wrapper over the single shared copy-ness predicate
+    /// (`crate::typeck::is_copy`) so the derive/Default decisions read cleanly.
+    /// The LOGIC lives in one place; this is only sugar for the `self.` call sites.
     fn is_copy_type(&self, ty: &Ty) -> bool {
-        matches!(ty, Ty::Int | Ty::Float | Ty::Bool | Ty::Unit)
+        crate::typeck::is_copy(ty)
     }
 
     /// Returns true when `ty` implements the `Default` trait in the emitted Rust.
@@ -843,12 +846,6 @@ impl<'a> Codegen<'a> {
         Ok(())
     }
 
-    /// True for types that are move-only (non-`Copy`) in the generated Rust.
-    fn is_owned_ty(t: &Ty) -> bool {
-        matches!(t,
-            Ty::Str | Ty::List(_) | Ty::Set(_) | Ty::Dict(_, _) | Ty::Tuple(_) | Ty::Class(_))
-    }
-
     /// Emit an expression in a position that takes ownership of the value
     /// (function argument, container store). A bare identifier of an owned
     /// (non-`Copy`) type is `.clone()`d so the original binding stays usable.
@@ -859,7 +856,7 @@ impl<'a> Codegen<'a> {
         if let Expr::Ident(name, _) = e {
             let owned = self.locals.get(name)
                 .or_else(|| self.ctx.vars.get(name))
-                .map(Self::is_owned_ty)
+                .map(crate::typeck::is_owned)
                 .unwrap_or(false);
             if owned {
                 return Ok(format!("{}.clone()", s));

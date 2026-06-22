@@ -823,10 +823,42 @@ fn root_ident(e: &Expr) -> Option<&str> {
     }
 }
 
-/// Returns `true` for types that are NOT Copy in Rust — i.e. by-value passing
-/// gives the callee a clone whose mutations cannot propagate back to the caller.
-fn is_non_copy(ty: &Ty) -> bool {
-    matches!(ty, Ty::Class(_) | Ty::List(_) | Ty::Set(_) | Ty::Dict(_, _) | Ty::Str)
+/// The single source of truth for copy-ness, consumed by both `typeck` and
+/// `codegen` (via `crate::typeck::is_copy` / `is_owned`). A type is `Copy` when
+/// its emitted Rust representation implements the `Copy` trait, so a by-value
+/// use neither moves the original binding nor needs a `.clone()`.
+///
+/// Rule (defined recursively for the aggregate variants):
+/// - `Int`/`Float`/`Bool`/`Unit` are `Copy`.
+/// - `Tuple(elems)` is `Copy` iff **every** element is `Copy` (Rust tuples of
+///   `Copy` elements are `Copy`).
+/// - `Option(inner)` is `Copy` iff `inner` is `Copy` (Rust `Option<T: Copy>` is
+///   `Copy`).
+/// - Everything else is non-`Copy`: `Str`, `List`, `Set`, `Dict`, `Class`, and
+///   the conservative `NoneVal`/`File`/`Unknown` cases (excluded here exactly as
+///   the legacy `is_copy_type` excluded them).
+pub fn is_copy(ty: &Ty) -> bool {
+    match ty {
+        Ty::Int | Ty::Float | Ty::Bool | Ty::Unit => true,
+        Ty::Tuple(elems) => elems.iter().all(is_copy),
+        Ty::Option(inner) => is_copy(inner),
+        Ty::Str
+        | Ty::List(_)
+        | Ty::Set(_)
+        | Ty::Dict(_, _)
+        | Ty::Class(_)
+        | Ty::NoneVal
+        | Ty::File
+        | Ty::Unknown => false,
+    }
+}
+
+/// Complement of [`is_copy`]: `true` for move-only (non-`Copy`) types, i.e. ones
+/// that need clone-on-use because a by-value pass would otherwise consume the
+/// original binding (and, for params, hand the callee a clone whose mutations
+/// cannot propagate back to the caller).
+pub fn is_owned(ty: &Ty) -> bool {
+    !is_copy(ty)
 }
 
 /// In-place mutating methods that callers may call on a List, Set, or Dict
@@ -1169,7 +1201,7 @@ fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
                     && env.params.contains(root)
                     && !env.reassigned_params.contains(root)
                     && !env.returned_params.contains(root)
-                    && is_non_copy(&obj_ty)
+                    && is_owned(&obj_ty)
                 {
                     return Err(Error::Type {
                         span: *span,
@@ -1210,7 +1242,7 @@ fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
                     && env.params.contains(root)
                     && !env.reassigned_params.contains(root)
                     && !env.returned_params.contains(root)
-                    && is_non_copy(&obj_ty)
+                    && is_owned(&obj_ty)
                 {
                     return Err(Error::Type {
                         span: *span,
@@ -2332,7 +2364,7 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                                         && env.params.contains(param_name.as_str())
                                         && !env.reassigned_params.contains(param_name.as_str())
                                         && !env.returned_params.contains(param_name.as_str())
-                                        && is_non_copy(&obj_ty)
+                                        && is_owned(&obj_ty)
                                     {
                                         return Err(Error::Type {
                                             span: *span,
@@ -4198,5 +4230,66 @@ mod tests {
                  (card 36f66dd2 drift guard)"
             );
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // EPIC-4 V1-a: the single shared copy-ness predicate (`is_copy`/`is_owned`).
+    // Pins the defined rule, including the intentional Tuple/Option refinement
+    // and the conservative non-Copy treatment of NoneVal/File/Unknown.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn is_copy_scalars_are_copy() {
+        for t in [Ty::Int, Ty::Float, Ty::Bool, Ty::Unit] {
+            assert!(is_copy(&t), "{t:?} must be Copy");
+            assert!(!is_owned(&t), "{t:?} must not be owned");
+        }
+    }
+
+    #[test]
+    fn is_copy_collections_and_class_are_non_copy() {
+        let cases = [
+            Ty::Str,
+            Ty::List(Box::new(Ty::Int)),
+            Ty::Set(Box::new(Ty::Int)),
+            Ty::Dict(Box::new(Ty::Str), Box::new(Ty::Int)),
+            Ty::Class("Point".into()),
+        ];
+        for t in cases {
+            assert!(!is_copy(&t), "{t:?} must be non-Copy");
+            assert!(is_owned(&t), "{t:?} must be owned");
+        }
+    }
+
+    #[test]
+    fn is_copy_conservative_non_copy_variants() {
+        // Matches the legacy `is_copy_type`, which excluded these (=> non-Copy).
+        for t in [Ty::NoneVal, Ty::File, Ty::Unknown] {
+            assert!(!is_copy(&t), "{t:?} must be conservatively non-Copy");
+        }
+    }
+
+    #[test]
+    fn is_copy_tuple_is_elementwise() {
+        // All-Copy elements => Copy (the V1-a refinement: tuple-of-ints no longer cloned).
+        assert!(is_copy(&Ty::Tuple(vec![Ty::Int, Ty::Int])));
+        assert!(is_copy(&Ty::Tuple(vec![Ty::Int, Ty::Float, Ty::Bool])));
+        // The empty tuple () is trivially Copy.
+        assert!(is_copy(&Ty::Tuple(vec![])));
+        // Any non-Copy element makes the whole tuple non-Copy.
+        assert!(!is_copy(&Ty::Tuple(vec![Ty::Int, Ty::Str])));
+        assert!(!is_copy(&Ty::Tuple(vec![Ty::List(Box::new(Ty::Int))])));
+        // Nested all-Copy tuple stays Copy.
+        assert!(is_copy(&Ty::Tuple(vec![Ty::Tuple(vec![Ty::Int, Ty::Int]), Ty::Bool])));
+    }
+
+    #[test]
+    fn is_copy_option_follows_inner() {
+        // Option<Copy> is Copy (the V1-a refinement: Optional[int] no longer cloned).
+        assert!(is_copy(&Ty::Option(Box::new(Ty::Int))));
+        assert!(is_copy(&Ty::Option(Box::new(Ty::Tuple(vec![Ty::Int, Ty::Bool])))));
+        // Option<non-Copy> is non-Copy.
+        assert!(!is_copy(&Ty::Option(Box::new(Ty::Str))));
+        assert!(!is_copy(&Ty::Option(Box::new(Ty::Class("Point".into())))));
     }
 }

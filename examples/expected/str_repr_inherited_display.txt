@@ -1,0 +1,2 @@
+base-str(1)
+child-str(2)

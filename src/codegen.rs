@@ -1119,9 +1119,25 @@ impl<'a> Codegen<'a> {
         // (the impl body is the ancestor's, but every reference is to c.name and
         // to fields that get_all_fields guarantees exist on the subclass).
         let c_methods = resolved_methods.clone();
+
+        // Both __str__ and __repr__ lower to the SAME Rust trait (Display), so a
+        // class that defines/inherits BOTH would otherwise emit two `impl Display`
+        // → rustc E0119 (conflicting impl). Dedup by the Rust TRAIT, not the Python
+        // method name: pick a single Display source, PREFERRING __str__ (Python uses
+        // __str__ for str()/print — the user-facing one), else __repr__. The chosen
+        // name is matched against the resolved set so the dedup also holds across
+        // inheritance (e.g. inherited __str__ + local __repr__).
+        let display_source: Option<&str> = if c_methods.iter().any(|m| m.name == "__str__") {
+            Some("__str__")
+        } else if c_methods.iter().any(|m| m.name == "__repr__") {
+            Some("__repr__")
+        } else {
+            None
+        };
+
         for m in &c_methods {
             match m.name.as_str() {
-                "__str__" | "__repr__" => {
+                "__str__" | "__repr__" if Some(m.name.as_str()) == display_source => {
                     self.line(&format!("impl ::std::fmt::Display for {} {{", c.name));
                     self.indent += 1;
                     self.line("fn fmt(&self, __f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {");

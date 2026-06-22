@@ -553,6 +553,25 @@ pub fn check_bodies(m: &Module, ctx: &TyCtx) -> Result<()> {
                     // Reject unsupported decorators on class methods.
                     validate_decorators(&method.decorators, method.span)?;
 
+                    // `__bool__` is listed among the dunder-trait names in codegen
+                    // (so it is skipped by the inherent-methods loop) but has no
+                    // trait-impl arm, which would silently DROP a user-defined
+                    // `__bool__`. pyrst also has no working object-truthiness
+                    // lowering today: `bool(obj)` lowers numerically and an
+                    // `if obj:` / `while obj:` condition is not constrained to
+                    // `bool`, so a class instance in a truthiness position emits
+                    // invalid Rust regardless. Rather than mislead the user with a
+                    // silently-ignored method, reject `__bool__` honestly here (it
+                    // is then caught by both `check` and `build`). Lowering object
+                    // truthiness is a separate, larger feature.
+                    if method.name == "__bool__" {
+                        return Err(Error::Type {
+                            span: method.span,
+                            msg: "__bool__ is not yet supported (object truthiness is not lowered); \
+                                  define an explicit predicate method instead".to_string(),
+                        });
+                    }
+
                     // (EPIC-4 V2-c) `Mut[T]` is unsupported on a CONSTRUCTOR
                     // parameter. The generated `new()` wrapper passes owned values
                     // into `self.__init__(...)`, which would mismatch a `&mut T`

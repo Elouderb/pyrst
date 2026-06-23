@@ -800,15 +800,15 @@ fn reject_reserved_in_body(stmts: &[Stmt]) -> Result<()> {
 /// undefined name — so we only police the introducing positions here).
 fn reject_reserved_in_expr(e: &Expr) -> Result<()> {
     match e {
-        Expr::ListComp { elt, target, iter, cond, span }
-        | Expr::SetComp { elt, target, iter, cond, span } => {
-            reject_if_reserved(target, *span, "comprehension variable")?;
+        Expr::ListComp { elt, targets, iter, cond, span }
+        | Expr::SetComp { elt, targets, iter, cond, span } => {
+            for target in targets { reject_if_reserved(target, *span, "comprehension variable")?; }
             reject_reserved_in_expr(elt)?;
             reject_reserved_in_expr(iter)?;
             if let Some(c) = cond { reject_reserved_in_expr(c)?; }
         }
-        Expr::DictComp { key, val, target, iter, cond, span } => {
-            reject_if_reserved(target, *span, "comprehension variable")?;
+        Expr::DictComp { key, val, targets, iter, cond, span } => {
+            for target in targets { reject_if_reserved(target, *span, "comprehension variable")?; }
             reject_reserved_in_expr(key)?;
             reject_reserved_in_expr(val)?;
             reject_reserved_in_expr(iter)?;
@@ -2196,16 +2196,19 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
             // Unify all element types (mirrors the list case).
             Ty::Set(Box::new(infer_list_elem_ty(elems, locals, ctx)))
         }
-        Expr::ListComp { elt, target, iter, .. } => {
+        Expr::ListComp { elt, targets, iter, .. } => {
             // Infer element type from the iterable and element expression.
             let iter_ty = infer_expr_ty(iter, locals, ctx);
             let elem_iter_ty = match &iter_ty {
                 Ty::List(inner) | Ty::Set(inner) => Some(inner.as_ref().clone()),
                 _ => None,
             };
-            if let Some(elem_iter_type) = elem_iter_ty {
+            // The single-variable oracle only applies to single-target comps;
+            // for tuple-unpacking targets we fall through to the iterable-elem
+            // fallback (the authoritative element type comes from `check_expr`).
+            if let (Some(elem_iter_type), [target]) = (&elem_iter_ty, targets.as_slice()) {
                 let inferred =
-                    infer_comp_elt_type_with_var(elt, &elem_iter_type, target, ctx);
+                    infer_comp_elt_type_with_var(elt, elem_iter_type, target, ctx);
                 if inferred != Ty::Unknown {
                     return Ty::List(Box::new(inferred));
                 }
@@ -2217,7 +2220,7 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
                 _ => Ty::List(Box::new(Ty::Unknown)),
             }
         }
-        Expr::SetComp { elt, target: _, iter, .. } => {
+        Expr::SetComp { elt, targets: _, iter, .. } => {
             let iter_ty = infer_expr_ty(iter, locals, ctx);
             if let Ty::List(ref inner) | Ty::Set(ref inner) = iter_ty {
                 match elt.as_ref() {
@@ -2248,7 +2251,7 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
                 Ty::Set(Box::new(Ty::Unknown))
             }
         }
-        Expr::DictComp { key, val, target: _, iter, .. } => {
+        Expr::DictComp { key, val, targets: _, iter, .. } => {
             let iter_ty = infer_expr_ty(iter, locals, ctx);
             let field_ty = |e: &Expr| -> Ty {
                 if let Expr::Attr { name, .. } = e {
@@ -2370,6 +2373,25 @@ fn infer_expr_ty_bound(
         }
         // Other forms do not depend on `param` for their result type — delegate.
         _ => infer_expr_ty(e, locals, ctx),
+    }
+}
+
+/// Bind a comprehension's loop target(s) into `locals` from the iterable's
+/// element type. A single target gets the full element type; multiple targets
+/// (tuple-unpacking, e.g. `for k, v in d.items()`) destructure a matching-arity
+/// `Ty::Tuple` into each, falling back to `Unknown`. Mirrors the `Stmt::For`
+/// binding in `check_stmt`.
+fn bind_comp_targets(targets: &[String], elem_ty: Ty, locals: &mut HashMap<String, Ty>) {
+    if targets.len() == 1 {
+        locals.insert(targets[0].clone(), elem_ty);
+    } else {
+        let elem_tys = match &elem_ty {
+            Ty::Tuple(tys) if tys.len() == targets.len() => tys.clone(),
+            _ => vec![Ty::Unknown; targets.len()],
+        };
+        for (i, target) in targets.iter().enumerate() {
+            locals.insert(target.clone(), elem_tys.get(i).cloned().unwrap_or(Ty::Unknown));
+        }
     }
 }
 
@@ -2534,7 +2556,7 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 ),
             })?
         }
-        Expr::ListComp { elt, target, iter, cond, .. } => {
+        Expr::ListComp { elt, targets, iter, cond, .. } => {
             let iter_ty = check_expr(iter, env)?;
             let elem_ty = match &iter_ty {
                 Ty::List(inner) => *inner.clone(),
@@ -2542,7 +2564,7 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 Ty::Str => Ty::Str, // iterating a string yields 1-char strings
                 _ => Ty::Int, // ranges and unknown iterables -> Int
             };
-            // Create a new scope with the loop variable bound
+            // Create a new scope with the loop variable(s) bound
             let mut inner_env = FuncEnv {
                 ctx: env.ctx,
                 locals: env.locals.clone(),
@@ -2553,12 +2575,12 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 returned_params: env.returned_params.clone(),
                 by_ref_params: env.by_ref_params.clone(),
             };
-            inner_env.locals.insert(target.clone(), elem_ty);
+            bind_comp_targets(targets, elem_ty, &mut inner_env.locals);
             if let Some(c) = cond { check_expr(c, &mut inner_env)?; }
             let elt_ty = check_expr(elt, &mut inner_env)?;
             Ty::List(Box::new(elt_ty))
         }
-        Expr::SetComp { elt, target, iter, cond, span } => {
+        Expr::SetComp { elt, targets, iter, cond, span } => {
             let iter_ty = check_expr(iter, env)?;
             let elem_ty = match &iter_ty {
                 Ty::List(inner) => *inner.clone(),
@@ -2576,7 +2598,7 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 returned_params: env.returned_params.clone(),
                 by_ref_params: env.by_ref_params.clone(),
             };
-            inner_env.locals.insert(target.clone(), elem_ty);
+            bind_comp_targets(targets, elem_ty, &mut inner_env.locals);
             if let Some(c) = cond { check_expr(c, &mut inner_env)?; }
             let elt_ty = check_expr(elt, &mut inner_env)?;
             // Same hashability rule as set literals: a Float element produces
@@ -2584,7 +2606,7 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
             require_hashable(&elt_ty, *span, "set element")?;
             Ty::Set(Box::new(elt_ty))
         }
-        Expr::DictComp { key, val, target, iter, cond, span } => {
+        Expr::DictComp { key, val, targets, iter, cond, span } => {
             let iter_ty = check_expr(iter, env)?;
             let elem_ty = match &iter_ty {
                 Ty::List(inner) => *inner.clone(),
@@ -2602,7 +2624,7 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 returned_params: env.returned_params.clone(),
                 by_ref_params: env.by_ref_params.clone(),
             };
-            inner_env.locals.insert(target.clone(), elem_ty);
+            bind_comp_targets(targets, elem_ty, &mut inner_env.locals);
             if let Some(c) = cond { check_expr(c, &mut inner_env)?; }
             let key_ty = check_expr(key, &mut inner_env)?;
             let val_ty = check_expr(val, &mut inner_env)?;

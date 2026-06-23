@@ -3089,7 +3089,7 @@ impl<'a> Codegen<'a> {
                     _ => format!("({})", parts.join(", ")),
                 }
             }
-            Expr::ListComp { elt, target, iter, cond, .. } => {
+            Expr::ListComp { elt, targets, iter, cond, .. } => {
                 let iter_s = self.emit_expr(iter)?;
                 let is_range = iter_s.contains("..");
                 let chain = if is_range {
@@ -3101,9 +3101,12 @@ impl<'a> Codegen<'a> {
                     format!("{}.iter().cloned()", iter_s)
                 };
                 let elt_s = self.emit_expr(elt)?;
-                // (EPIC-6) Escape the comprehension target in the closure pattern;
+                // (EPIC-6) Escape each comprehension target in the closure pattern;
                 // the elt/cond bodies reference it via emit_expr Ident (same escape).
-                let target = escape_ident(target);
+                // A single target is a bare name; multiple targets (tuple-unpacking,
+                // e.g. `[v for k, v in d.items()]`) form a tuple pattern `(k, v)`
+                // (mirrors the `Stmt::For` lowering).
+                let target = comp_target_pat(targets);
                 if let Some(cond_expr) = cond {
                     let cond_s = self.emit_expr(cond_expr)?;
                     format!("{}.filter_map(|{}| if {} {{ Some({}) }} else {{ None }} ).collect::<Vec<_>>()",
@@ -3112,7 +3115,7 @@ impl<'a> Codegen<'a> {
                     format!("{}.map(|{}| {}).collect::<Vec<_>>()", chain, target, elt_s)
                 }
             }
-            Expr::SetComp { elt, target, iter, cond, .. } => {
+            Expr::SetComp { elt, targets, iter, cond, .. } => {
                 let iter_s = self.emit_expr(iter)?;
                 let is_range = iter_s.contains("..");
                 let chain = if is_range {
@@ -3123,8 +3126,8 @@ impl<'a> Codegen<'a> {
                     format!("{}.iter().cloned()", iter_s)
                 };
                 let elt_s = self.emit_expr(elt)?;
-                // (EPIC-6) Escape the comprehension target (see ListComp above).
-                let target = escape_ident(target);
+                // (EPIC-6) Escape the comprehension target(s) (see ListComp above).
+                let target = comp_target_pat(targets);
                 if let Some(cond_expr) = cond {
                     let cond_s = self.emit_expr(cond_expr)?;
                     format!("{}.filter_map(|{}| if {} {{ Some({}) }} else {{ None }} ).collect::<::std::collections::HashSet<_>>()",
@@ -3133,7 +3136,7 @@ impl<'a> Codegen<'a> {
                     format!("{}.map(|{}| {}).collect::<::std::collections::HashSet<_>>()", chain, target, elt_s)
                 }
             }
-            Expr::DictComp { key, val, target, iter, cond, .. } => {
+            Expr::DictComp { key, val, targets, iter, cond, .. } => {
                 let iter_s = self.emit_expr(iter)?;
                 let is_range = iter_s.contains("..");
                 let chain = if is_range {
@@ -3145,8 +3148,8 @@ impl<'a> Codegen<'a> {
                 };
                 let key_s = self.emit_expr(key)?;
                 let val_s = self.emit_expr(val)?;
-                // (EPIC-6) Escape the comprehension target (see ListComp above).
-                let target = escape_ident(target);
+                // (EPIC-6) Escape the comprehension target(s) (see ListComp above).
+                let target = comp_target_pat(targets);
                 if let Some(cond_expr) = cond {
                     let cond_s = self.emit_expr(cond_expr)?;
                     format!("{}.filter_map(|{}| if {} {{ Some(({}, {})) }} else {{ None }} ).collect::<::std::collections::HashMap<_,_>>()",
@@ -5071,6 +5074,18 @@ pub fn escape_ident(name: &str) -> String {
         format!("r#{}", name)
     } else {
         name.to_string()
+    }
+}
+
+/// Build a comprehension closure-parameter pattern from its loop target(s),
+/// escaping each name (EPIC-6). A single target is a bare binding; multiple
+/// targets (tuple-unpacking, e.g. `for k, v in d.items()`) form a tuple pattern
+/// `(k, v)` — mirroring the `Stmt::For` loop-variable lowering.
+fn comp_target_pat(targets: &[String]) -> String {
+    if targets.len() == 1 {
+        escape_ident(&targets[0])
+    } else {
+        format!("({})", targets.iter().map(|t| escape_ident(t)).collect::<Vec<_>>().join(", "))
     }
 }
 

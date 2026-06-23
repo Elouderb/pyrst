@@ -1265,14 +1265,17 @@ impl Parser {
                 }
                 let first = self.parse_expr()?;
                 if matches!(self.peek(), Tok::For) {
-                    // List comprehension: [elt for target in iter (if cond)?]
+                    // List comprehension: [elt for target(, ...) in iter (if cond)?]
                     self.bump(); // consume 'for'
-                    let target = self.expect_ident("list comp target")?;
+                    let mut targets = vec![self.expect_ident("list comp target")?];
+                    while self.eat(&Tok::Comma) {
+                        targets.push(self.expect_ident("list comp target")?);
+                    }
                     self.expect(&Tok::In, "list comp")?;
                     let iter = self.parse_or()?; // or_test: leaves a trailing `if` for the comp filter
                     let cond = if self.eat(&Tok::If) { Some(Box::new(self.parse_expr()?)) } else { None };
                     self.expect(&Tok::RBracket, "list comp")?;
-                    Ok(Expr::ListComp { elt: Box::new(first), target, iter: Box::new(iter), cond, span })
+                    Ok(Expr::ListComp { elt: Box::new(first), targets, iter: Box::new(iter), cond, span })
                 } else {
                     // Regular list: [e1, e2, ...]
                     let mut elems = vec![first];
@@ -1295,14 +1298,17 @@ impl Parser {
                     self.bump(); // consume ':'
                     let val = self.parse_expr()?;
                     if matches!(self.peek(), Tok::For) {
-                        // Dict comprehension: {key: value for target in iter (if cond)?}
+                        // Dict comprehension: {key: value for target(, ...) in iter (if cond)?}
                         self.bump(); // consume 'for'
-                        let target = self.expect_ident("dict comp target")?;
+                        let mut targets = vec![self.expect_ident("dict comp target")?];
+                        while self.eat(&Tok::Comma) {
+                            targets.push(self.expect_ident("dict comp target")?);
+                        }
                         self.expect(&Tok::In, "dict comp")?;
                         let iter = self.parse_or()?; // or_test: leaves a trailing `if` for the comp filter
                         let cond = if self.eat(&Tok::If) { Some(Box::new(self.parse_expr()?)) } else { None };
                         self.expect(&Tok::RBrace, "dict comp")?;
-                        Ok(Expr::DictComp { key: Box::new(first), val: Box::new(val), target, iter: Box::new(iter), cond, span })
+                        Ok(Expr::DictComp { key: Box::new(first), val: Box::new(val), targets, iter: Box::new(iter), cond, span })
                     } else {
                         // Regular dict: {key: value, ...}
                         let mut pairs = vec![(first, val)];
@@ -1316,14 +1322,17 @@ impl Parser {
                         Ok(Expr::Dict(pairs, span))
                     }
                 } else if matches!(self.peek(), Tok::For) {
-                    // Set comprehension: {elem for target in iter (if cond)?}
+                    // Set comprehension: {elem for target(, ...) in iter (if cond)?}
                     self.bump(); // consume 'for'
-                    let target = self.expect_ident("set comp target")?;
+                    let mut targets = vec![self.expect_ident("set comp target")?];
+                    while self.eat(&Tok::Comma) {
+                        targets.push(self.expect_ident("set comp target")?);
+                    }
                     self.expect(&Tok::In, "set comp")?;
                     let iter = self.parse_or()?; // or_test: leaves a trailing `if` for the comp filter
                     let cond = if self.eat(&Tok::If) { Some(Box::new(self.parse_expr()?)) } else { None };
                     self.expect(&Tok::RBrace, "set comp")?;
-                    Ok(Expr::SetComp { elt: Box::new(first), target, iter: Box::new(iter), cond, span })
+                    Ok(Expr::SetComp { elt: Box::new(first), targets, iter: Box::new(iter), cond, span })
                 } else {
                     // It's a set: {elem1, elem2, ...}
                     let mut elems = vec![first];

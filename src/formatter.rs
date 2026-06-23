@@ -438,26 +438,26 @@ impl Formatter {
                 };
                 format!("{}{}", op_str, self.format_expr(expr)?)
             }
-            Expr::ListComp { elt, target, iter, cond, .. } => {
+            Expr::ListComp { elt, targets, iter, cond, .. } => {
                 let cond_str = match cond {
                     Some(c) => format!(" if {}", self.format_expr(c)?),
                     None => String::new(),
                 };
-                format!("[{} for {} in {}{}]", self.format_expr(elt)?, target, self.format_expr(iter)?, cond_str)
+                format!("[{} for {} in {}{}]", self.format_expr(elt)?, targets.join(", "), self.format_expr(iter)?, cond_str)
             }
-            Expr::SetComp { elt, target, iter, cond, .. } => {
+            Expr::SetComp { elt, targets, iter, cond, .. } => {
                 let cond_str = match cond {
                     Some(c) => format!(" if {}", self.format_expr(c)?),
                     None => String::new(),
                 };
-                format!("{{{} for {} in {}{}}}", self.format_expr(elt)?, target, self.format_expr(iter)?, cond_str)
+                format!("{{{} for {} in {}{}}}", self.format_expr(elt)?, targets.join(", "), self.format_expr(iter)?, cond_str)
             }
-            Expr::DictComp { key, val, target, iter, cond, .. } => {
+            Expr::DictComp { key, val, targets, iter, cond, .. } => {
                 let cond_str = match cond {
                     Some(c) => format!(" if {}", self.format_expr(c)?),
                     None => String::new(),
                 };
-                format!("{{{}: {} for {} in {}{}}}", self.format_expr(key)?, self.format_expr(val)?, target, self.format_expr(iter)?, cond_str)
+                format!("{{{}: {} for {} in {}{}}}", self.format_expr(key)?, self.format_expr(val)?, targets.join(", "), self.format_expr(iter)?, cond_str)
             }
             Expr::Lambda { params, body, .. } => {
                 let param_strs = params.iter()

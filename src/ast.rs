@@ -158,9 +158,12 @@ pub enum Expr {
     Ident(String, Span),
     List(Vec<Expr>, Span),
     Tuple(Vec<Expr>, Span),
-    ListComp { elt: Box<Expr>, target: String, iter: Box<Expr>, cond: Option<Box<Expr>>, span: Span },
-    SetComp { elt: Box<Expr>, target: String, iter: Box<Expr>, cond: Option<Box<Expr>>, span: Span },
-    DictComp { key: Box<Expr>, val: Box<Expr>, target: String, iter: Box<Expr>, cond: Option<Box<Expr>>, span: Span },
+    // `targets` carries the comprehension loop target(s): a single name for
+    // `[x for x in xs]` or several for tuple-unpacking like
+    // `[v for k, v in d.items()]` (mirrors `Stmt::For.targets`).
+    ListComp { elt: Box<Expr>, targets: Vec<String>, iter: Box<Expr>, cond: Option<Box<Expr>>, span: Span },
+    SetComp { elt: Box<Expr>, targets: Vec<String>, iter: Box<Expr>, cond: Option<Box<Expr>>, span: Span },
+    DictComp { key: Box<Expr>, val: Box<Expr>, targets: Vec<String>, iter: Box<Expr>, cond: Option<Box<Expr>>, span: Span },
     Dict(Vec<(Expr, Expr)>, Span),
     Set(Vec<Expr>, Span),
     Call { callee: Box<Expr>, args: Vec<Expr>, kwargs: Vec<(String, Expr)>, span: Span },

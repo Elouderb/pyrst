@@ -10,5 +10,7 @@ name = "pyrst"
 path = "src/main.rs"
 
 [dependencies]
+tower-lsp-server = "0.23"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std"] }
 
 [dev-dependencies]

@@ -12,6 +12,7 @@ mod resolver;
 mod formatter;
 mod linter;
 mod repl;
+mod lsp;
 pub mod analysis;
 
 fn print_usage() {
@@ -26,6 +27,7 @@ fn print_usage() {
     eprintln!("  fmt   <file.pyrs>   format a pyrst source file in-place");
     eprintln!("  lint  <file.pyrs>   check code style and common issues");
     eprintln!("  repl                start interactive shell");
+    eprintln!("  lsp                 start the language server (stdin/stdout, for editors)");
 }
 
 fn main() -> ExitCode {
@@ -48,6 +50,10 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         };
+    }
+
+    if cmd == "lsp" {
+        return lsp::run();
     }
 
     let path = match args.next() {

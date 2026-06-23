@@ -122,7 +122,9 @@ impl Resolver {
 }
 
 /// Merge function/class signatures from a single module into a context.
-fn merge_ctx_from_module(m: &Module, ctx: &mut TyCtx, is_root: bool) -> Result<()> {
+/// Exposed as `pub(crate)` so `analysis.rs` can build a single-module TyCtx
+/// without touching the filesystem resolver.
+pub(crate) fn merge_ctx_from_module(m: &Module, ctx: &mut TyCtx, is_root: bool) -> Result<()> {
     for s in &m.stmts {
         match s {
             Stmt::Func(f) => {

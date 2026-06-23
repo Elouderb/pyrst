@@ -12,6 +12,7 @@ mod resolver;
 mod formatter;
 mod linter;
 mod repl;
+pub mod analysis;
 
 fn print_usage() {
     eprintln!("pyrst {} — Pythonic language that compiles to Rust", env!("CARGO_PKG_VERSION"));

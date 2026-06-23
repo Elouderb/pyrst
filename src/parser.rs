@@ -228,6 +228,47 @@ impl Parser {
                 self.eat_newline()?;
                 return Ok(Stmt::AugAssign { target: name, op, value, span: name_tok.span });
             }
+            // Bare tuple-unpack LHS: `a, b = <rhs>` (no parentheses).
+            // Detect by seeing a comma after the first ident, then more idents, then `=`.
+            // Plain `a = 1` never reaches here (caught above), so a comma here means unpack.
+            if matches!(self.peek(), Tok::Comma) {
+                let span = name_tok.span;
+                let mut targets: Vec<String> = vec![name.clone()];
+                let save = self.pos;
+                let mut ok = true;
+                while matches!(self.peek(), Tok::Comma) {
+                    self.bump(); // consume ','
+                    if let Tok::Ident(n) = self.peek().clone() {
+                        targets.push(n.clone());
+                        self.bump();
+                    } else {
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok && matches!(self.peek(), Tok::Assign) {
+                    self.bump(); // consume '='
+                    // Parse RHS as a bare-tuple-aware expression:
+                    // `a, b = b, a` — the RHS `b, a` is a comma list → Expr::Tuple.
+                    let first = self.parse_expr()?;
+                    let value = if matches!(self.peek(), Tok::Comma) {
+                        let tuple_span = first.span();
+                        let mut elems = vec![first];
+                        while matches!(self.peek(), Tok::Comma) {
+                            self.bump(); // consume ','
+                            if matches!(self.peek(), Tok::Newline | Tok::Eof) { break; }
+                            elems.push(self.parse_expr()?);
+                        }
+                        Expr::Tuple(elems, tuple_span)
+                    } else {
+                        first
+                    };
+                    self.eat_newline()?;
+                    return Ok(Stmt::Unpack { targets, value, span });
+                }
+                // Pattern didn't match — back off.
+                self.pos = save;
+            }
             // Not an assignment — back off and parse as expression.
             self.pos = start;
         }
@@ -1120,6 +1161,8 @@ impl Parser {
                                 args.push(self.parse_expr()?);
                             }
                             if !self.eat(&Tok::Comma) { break; }
+                            // Allow trailing comma before closing paren: f(1, 2,)
+                            if matches!(self.peek(), Tok::RParen) { break; }
                         }
                     }
                     self.expect(&Tok::RParen, "call args")?;

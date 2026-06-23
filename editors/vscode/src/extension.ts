@@ -10,6 +10,25 @@ import {
 let client: LanguageClient | undefined;
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
+  // The language server launches an external executable (pyrst.server.path). To
+  // avoid workspace-controlled code execution, only start it when the workspace
+  // is TRUSTED. Syntax highlighting comes from the contributed grammar and works
+  // regardless. If the user grants trust later, start the server then.
+  if (vscode.workspace.isTrusted) {
+    await startServer(context);
+  } else {
+    context.subscriptions.push(
+      vscode.workspace.onDidGrantWorkspaceTrust(() => {
+        void startServer(context);
+      }),
+    );
+  }
+}
+
+async function startServer(context: vscode.ExtensionContext): Promise<void> {
+  if (client) {
+    return; // already started
+  }
   const config = vscode.workspace.getConfiguration('pyrst');
   const serverPath: string = config.get<string>('server.path', 'pyrst');
 

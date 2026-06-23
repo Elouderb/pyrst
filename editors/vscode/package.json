@@ -19,6 +19,12 @@
     "onLanguage:pyrst"
   ],
   "main": "./out/extension.js",
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": "limited",
+      "description": "In an untrusted workspace the pyrst language server is NOT started (it launches an external executable named by pyrst.server.path). Syntax highlighting still works; grant Workspace Trust to enable diagnostics and formatting."
+    }
+  },
   "contributes": {
     "languages": [
       {
@@ -41,7 +47,8 @@
         "pyrst.server.path": {
           "type": "string",
           "default": "pyrst",
-          "description": "Path to the pyrst executable. Defaults to 'pyrst', which requires the binary to be on your PATH. Set this to an absolute path if you want to use a specific build."
+          "scope": "machine-overridable",
+          "description": "Path to the pyrst executable. Defaults to 'pyrst', which requires the binary to be on your PATH. Set this to an absolute path if you want to use a specific build. (machine-overridable scope: cannot be set by workspace/folder settings, so an untrusted project cannot point this at an arbitrary executable.)"
         },
         "pyrst.trace.server": {
           "type": "string",

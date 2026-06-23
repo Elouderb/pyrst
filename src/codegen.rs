@@ -308,6 +308,50 @@ impl<'a> Codegen<'a> {
         crate::typeck::infer_expr_ty(e, &self.locals, self.ctx)
     }
 
+    /// (EPIC-6) Emit a user-defined method call `obj_s.method_name(args)` on a
+    /// known class receiver `cls`, threading per-param by-reference (`Mut[T]`)
+    /// arguments exactly like the long-standing "Regular method call" tail of
+    /// the dispatch block. Factored out so the receiver-type-guarded early
+    /// return (which routes a user-class receiver PAST the builtin arms, fixing
+    /// the silent miscompile where `instance.get(k)` lowered to a dict
+    /// `.get(&k).cloned()`) reuses the SAME by-ref/companion-enum emission
+    /// rather than duplicating-and-drifting it.
+    ///
+    /// `method_name` is the user method's RAW name — not the builtin remap (so a
+    /// user method legitimately named `append`/`upper`/`pop` calls the real
+    /// `obj.append(..)` inherent/dispatch method, not the remapped `.push(..)`).
+    /// For a polymorphic-base receiver `cls` is the base name and the per-param
+    /// flags come from `get_method(base, name)` (the base's signature), so the
+    /// emitted `obj_s.method_name(..)` resolves to the companion enum `cls__`'s
+    /// dispatch method — identical to the pre-existing EPIC-5 lowering.
+    fn emit_user_method_call(
+        &mut self,
+        obj_s: &str,
+        cls: &str,
+        method_name: &str,
+        args: &[Expr],
+        parts: &[String],
+    ) -> Result<String> {
+        let method_by_ref: Vec<bool> = self
+            .ctx
+            .get_method(cls, method_name)
+            .map(|sig| sig.param_by_ref.clone())
+            .unwrap_or_default();
+        if method_by_ref.iter().any(|&b| b) {
+            let mut mparts = Vec::with_capacity(args.len());
+            for (i, a) in args.iter().enumerate() {
+                if method_by_ref.get(i).copied().unwrap_or(false) {
+                    let place = self.emit_place(a)?;
+                    mparts.push(self.byref_borrow(a, &place));
+                } else {
+                    mparts.push(self.emit_consuming(a)?);
+                }
+            }
+            return Ok(format!("{}.{}({})", obj_s, method_name, mparts.join(", ")));
+        }
+        Ok(format!("{}.{}({})", obj_s, method_name, parts.join(", ")))
+    }
+
     /// (EPIC-5 C1-C) Honest codegen gate for class subtyping.
     ///
     /// Part B made typeck ACCEPT a `Derived` value flowing into a `Base` slot
@@ -3948,6 +3992,34 @@ impl<'a> Codegen<'a> {
                     };
                     let parts: Result<Vec<_>> = args.iter().map(|a| self.emit_consuming(a)).collect();
                     let parts = parts?;
+
+                    // (EPIC-6) Receiver-type-guarded early return. The builtin
+                    // method arms below match purely on `name` with NO receiver
+                    // guard on most of them (`get`, `keys`, `values`, `items`,
+                    // `update`, `pop`, `copy`, `clear`, `append`, `extend`,
+                    // `insert`, `remove`, `sort`, ...). So a USER class that
+                    // defines a method with one of those names previously had
+                    // `instance.get(k)` silently lowered to a dict
+                    // `.get(&k).cloned()` (wrong Rust / wrong behavior / a
+                    // compile error) — the builtin arm won because it ran BEFORE
+                    // the user-method tail. Guard it here: if the receiver's
+                    // static type is a user class that HAS an instance method
+                    // named `name` (resolved via `get_method`, walking the
+                    // inheritance chain — the SAME lookup the user-method tail
+                    // uses), dispatch to that user method NOW and return,
+                    // bypassing every builtin arm. A builtin receiver
+                    // (str/list/dict/set/file) is never `Ty::Class`, so the
+                    // guard never fires for it and the builtin arms below run
+                    // byte-for-byte unchanged. A polymorphic-base receiver
+                    // composes too: `cls` is the base name, `get_method` returns
+                    // the base's signature, and `obj_s.name(..)` resolves to the
+                    // companion enum `cls__`'s dispatch method — identical to the
+                    // pre-existing EPIC-5 lowering.
+                    if let Ty::Class(cls) = self.type_of_expr(obj.as_ref()) {
+                        if self.ctx.get_method(&cls, name).is_some() {
+                            return self.emit_user_method_call(&obj_s, &cls, name, args, &parts);
+                        }
+                    }
 
                     // Special handling for string methods that return &str and need to be converted to String
                     if matches!(name.as_str(), "strip" | "lstrip" | "rstrip") {

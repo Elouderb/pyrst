@@ -257,7 +257,7 @@ A broad surface is supported. Representative coverage:
 | Custom exception classes | ⚠️ Partial | Can define/raise (`class MyErr(Exception)`); caught by exact type name (no user-defined subclass hierarchy) |
 | `raise ... from ...` | ❌ Not Supported | Exception chaining not supported |
 
-See `DESIGN_DECISIONS.md` §11 and `RUST_BACKEND.md` for the `catch_unwind` lowering.
+See `RUST_BACKEND.md` for the `catch_unwind` lowering.
 
 ---
 

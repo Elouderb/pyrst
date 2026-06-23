@@ -123,8 +123,7 @@ field and a local, `loop` as a function name).
 
 pyrst uses a **static, compile-time type system** with local inference inside
 function bodies and mandatory annotations at boundaries. There is no implicit
-`Any`. A fuller treatment lives in [TYPE_SYSTEM.md](TYPE_SYSTEM.md); this section
-states the rules the current compiler enforces.
+`Any`. This section states the rules the current compiler enforces.
 
 > **Inference is a single source of truth.** Type inference for expressions is
 > served by one shared, pure oracle consulted by both the type checker and the
@@ -855,8 +854,7 @@ gaps are tracked as deferred items.
 
 ### Diagnostics
 Type, parse, and lex errors are reported with source spans, context lines, and
-visual indicators; runtime errors panic via Rust's panic mechanism. See
-[ERRORS.md](ERRORS.md).
+visual indicators; runtime errors panic via Rust's panic mechanism.
 
 ---
 
@@ -865,9 +863,7 @@ visual indicators; runtime errors panic via Rust's panic mechanism. See
 - [PYTHON_COMPATIBILITY.md](PYTHON_COMPATIBILITY.md) — authoritative support
   matrix (this SPEC mirrors it).
 - [GRAMMAR.md](GRAMMAR.md) — formal grammar.
-- [TYPE_SYSTEM.md](TYPE_SYSTEM.md) — type system and inference detail.
-- [DESIGN_DECISIONS.md](DESIGN_DECISIONS.md), [RUST_BACKEND.md](RUST_BACKEND.md),
-  [ERRORS.md](ERRORS.md) — rationale, lowering, and diagnostics.
+- [RUST_BACKEND.md](RUST_BACKEND.md) — rationale, lowering, and implementation detail.
 - `docs/design/` — subsystem design notes: `inference-oracle.md` (unified
   inference), `value-semantics.md` (clone-on-use + `Mut[T]`),
   `class-subtyping.md` (companion-enum polymorphism).

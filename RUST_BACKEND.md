@@ -639,9 +639,25 @@ can recover the exception type at the catch site.
 ### Try / Except / Finally
 
 `try`/`except` is lowered onto `std::panic::catch_unwind` + handler dispatch on the
-panic payload (see DESIGN_DECISIONS.md §11). A `base` exception catches its builtin
-subclasses, `except E as e` binds `e` to the message string, `finally` always runs,
-and an unmatched exception is re-raised after `finally`.
+panic payload. A base exception catches its builtin subclasses, `except E as e` binds
+`e` to the message string, `finally` always runs, and an unmatched exception is
+re-raised after `finally`.
+
+**Design rationale.** Exceptions use Rust's panic/unwind machinery rather than
+`Result<T, E>`. This was a deliberate low-risk evolution of the original panic-based
+placeholder: adopting `catch_unwind` dispatch retained the existing code paths while
+adding structured exception routing, avoiding the cost and scope of a ground-up
+`Result` rewrite.
+
+**Known limitations:**
+- Only the **builtin** exception hierarchy is modeled. User-defined exception classes
+  match by exact type name — `except MyError:` will not catch a subclass of `MyError`
+  defined by the user.
+- The payload carries only a **message string** (`Ty::Str`), not a structured
+  exception object; `except E as e` binds `e` to that message string.
+- `take_hook`/`set_hook` run per `try` execution (allocates + acquires a global
+  `RwLock`); a single global hook + thread-local suppress flag is a possible future
+  optimization.
 
 ```pyrst
 try:

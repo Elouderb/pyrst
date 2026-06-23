@@ -13,13 +13,13 @@ A statically typed Python-like language that compiles to efficient Rust. Combine
 
 ## Status
 
-**Phase 38 (in development)** — Full compiler pipeline (lexer → parser → resolver → type checker → Rust codegen → `rustc`). **All 194 single-file examples transpile and run successfully** (`./test_all.sh`: 194/194 positives, 64/64 rejection fixtures, 199 in-crate `#[test]` cases).
+**Active development** — Full compiler pipeline (lexer → parser → resolver → type checker → Rust codegen → `rustc`). **All 194 single-file examples transpile and run successfully** (`./test_all.sh`: 194/194 positives, 64/64 rejection fixtures, 199 in-crate `#[test]` cases).
 
 The core pipeline is working end-to-end, including multi-file imports, classes with single inheritance and dunder methods, comprehensions, and a broad set of string/list/dict methods. Lambdas are implemented (see `examples/lambda_demo.py`, `examples/lambda_closure.py`).
 
 **Known limitations (honest status):**
 - The static type checker is **best-effort, not yet fully sound**: some expressions still infer to an `Unknown` type that is permissively compatible with everything, so a few type/ownership errors are surfaced by the downstream `rustc` invocation against generated Rust rather than by pyrst itself. Recent work (type-inference soundness pass) has narrowed this escape hatch substantially; the remaining gaps are tracked as deferred items.
-- `try`/`except` matches on exception type and binds `except E as e` (the bound value is the exception message string). Remaining limitations: there is no exception class hierarchy (catching a base type does not catch a more specific one), and a caught exception still prints Rust's panic message to stderr before the handler runs (cosmetic; stdout and exit code are correct).
+- `try`/`except` matches on exception type and binds `except E as e` (the bound value is the exception message string). The builtin exception hierarchy is modeled — a base catches its builtin subclasses (e.g. `except LookupError:` catches `KeyError`/`IndexError`) — and caught exceptions print no stderr noise. Remaining limitation: user-defined exception classes match by exact type name (no user-defined subclass catching).
 
 ## Documentation Structure
 
@@ -27,15 +27,12 @@ The core pipeline is working end-to-end, including multi-file imports, classes w
 
 1. **[SPEC.md](SPEC.md)** — Formal language specification (what's supported, what's not)
 2. **[GRAMMAR.md](GRAMMAR.md)** — Formal grammar for the parser
-3. **[TYPE_SYSTEM.md](TYPE_SYSTEM.md)** — Type system and inference
-4. **[PYTHON_COMPATIBILITY.md](PYTHON_COMPATIBILITY.md)** — Compatibility matrix (honest comparison)
+3. **[PYTHON_COMPATIBILITY.md](PYTHON_COMPATIBILITY.md)** — Compatibility matrix (honest comparison)
 
 **Design & implementation:**
 
-5. **[DESIGN_DECISIONS.md](DESIGN_DECISIONS.md)** — Key design choices and tradeoffs
-6. **[RUST_BACKEND.md](RUST_BACKEND.md)** — How pyrst constructs map to Rust
-7. **[ERRORS.md](ERRORS.md)** — Diagnostics and error-message philosophy
-8. **[DEVELOPMENT_PLAN.md](DEVELOPMENT_PLAN.md)** — Roadmap and design principles
+4. **[RUST_BACKEND.md](RUST_BACKEND.md)** — How pyrst constructs map to Rust
+5. **[docs/design/](docs/design/)** — Design documents (inference oracle, class subtyping, etc.)
 
 ## Quick Example
 
@@ -91,7 +88,7 @@ See [PYTHON_COMPATIBILITY.md](PYTHON_COMPATIBILITY.md) for a complete matrix.
 Notable omissions (by design):
 - Generators and `yield`
 - Multiple inheritance
-- Exception class hierarchy (catching a base type does not catch derived types)
+- User-defined exception-subclass catching (the *builtin* hierarchy works; user-defined exceptions match by exact type name)
 - Metaclasses and dynamic attribute access
 - `eval`/`exec` and reflection
 - Python standard library compatibility
@@ -131,7 +128,7 @@ This means:
 - ❌ NOT a Python-compatible subset
 - ❌ NOT a Python runtime emulator
 
-See [DESIGN_DECISIONS.md](DESIGN_DECISIONS.md) for key tradeoffs.
+See [SPEC.md](SPEC.md) and [RUST_BACKEND.md](RUST_BACKEND.md) for design details and key tradeoffs.
 
 ## Status Summary
 
@@ -143,14 +140,14 @@ See [DESIGN_DECISIONS.md](DESIGN_DECISIONS.md) for key tradeoffs.
 - Error messages with source code context
 
 **Current Status:**
-Phase 38, in active development. The pipeline is functional; the type checker's
-remaining soundness gaps and several codegen corner cases (int/float promotion,
-collection mutation, exception-class hierarchy) are the main areas of ongoing
-work.
+The pipeline is functional end-to-end (lexer → type checker → Rust codegen →
+`rustc`) and matures with each epic — 194 passing example programs. Remaining work
+is incremental (diagnostics polish, parser edge cases, docs). See SPEC.md and
+PYTHON_COMPATIBILITY.md for the current feature surface and its honest limitations.
 
 ## Contributing
 
-See [DEVELOPMENT_PLAN.md](DEVELOPMENT_PLAN.md) and [DESIGN_DECISIONS.md](DESIGN_DECISIONS.md) before proposing major features.
+See [SPEC.md](SPEC.md) and [docs/design/](docs/design/) before proposing major features.
 
 The project prioritizes **semantic clarity** and **compiler maturity** over raw feature count. New features should have explicit design decisions before implementation.
 

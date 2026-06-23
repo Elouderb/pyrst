@@ -1,4 +1,5 @@
 use std::fmt;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Span {
@@ -26,6 +27,15 @@ pub enum Error {
     Rustc(String),
     ImportNotFound { path: String, span: Span, importing_file: String },
     CircularImport { cycle: Vec<String>, span: Span },
+    /// Multi-file error sourcing (EPIC-8): a wrapper that pairs an inner error
+    /// with the source text (and originating file) it should be rendered
+    /// against. Constructed ONLY at the driver/resolver per-module boundary via
+    /// [`Error::with_render_source`] — never at the ~90 `Lex`/`Parse`/`Type`
+    /// construction sites. The inner span (line:col) indexes into `source`, so
+    /// the snippet shows the correct module's line + caret instead of the root
+    /// file's text. `Display` delegates to `inner`, so non-snippet rendering
+    /// paths (the REPL, the bare `{}` path) are unaffected.
+    Sourced { inner: Box<Error>, file: Option<PathBuf>, source: String },
 }
 
 impl fmt::Display for Error {
@@ -44,13 +54,45 @@ impl fmt::Display for Error {
                 let cycle_str = cycle.join(" → ");
                 write!(f, "import error at {}:{}: circular import detected: {}", span.line, span.col, cycle_str)
             }
+            // The render-source wrapper is transparent to `Display`: the bare
+            // `{}` rendering (REPL, main.rs:46) is identical to the inner error.
+            Error::Sourced { inner, .. } => write!(f, "{}", inner),
         }
     }
 }
 
 impl Error {
+    /// Pair this error with the source text (and originating file) it should be
+    /// rendered against — used at the driver/resolver per-module boundary so an
+    /// error from an imported module renders against THAT module's source rather
+    /// than the root file (EPIC-8 multi-file error sourcing).
+    ///
+    /// Only `Lex`/`Parse`/`Type` carry a span that indexes into per-module
+    /// source; for every other variant (already self-contained: import, IO,
+    /// codegen, rustc) wrapping would add no value, so they are returned
+    /// unchanged. Wrapping is also idempotent: an already-`Sourced` error keeps
+    /// its innermost (origin) source and is not double-wrapped.
+    pub fn with_render_source(self, file: Option<PathBuf>, source: &str) -> Error {
+        match self {
+            Error::Lex { .. } | Error::Parse { .. } | Error::Type { .. } => Error::Sourced {
+                inner: Box::new(self),
+                file,
+                source: source.to_string(),
+            },
+            // Already paired at an inner boundary — keep the origin source.
+            Error::Sourced { .. } => self,
+            // Self-contained variants gain nothing from a source snippet.
+            other => other,
+        }
+    }
+
     /// Format error with source code snippet for display.
     /// If source is provided, includes the offending line and visual indicator.
+    ///
+    /// A `Sourced` error renders its inner error against the source text it was
+    /// paired with at the per-module boundary, ignoring the `source` passed in
+    /// here (which is the CLI root file). This is what makes an imported
+    /// module's error show that module's line + caret (and file name).
     pub fn format_with_source(&self, source: Option<&str>) -> String {
         match self {
             Error::Io(e) => format!("io error: {}", e),
@@ -63,6 +105,23 @@ impl Error {
                 let cycle_str = cycle.join(" → ");
                 format!("import error at {}:{}: circular import detected: {}", span.line, span.col, cycle_str)
             }
+            // Render the wrapped error against its OWN module source + file name,
+            // not the root source `main` re-read from the CLI argument.
+            Error::Sourced { inner, file, source: module_src } => {
+                inner.format_with_source_and_file(Some(module_src), file.as_deref())
+            }
+            Error::Lex { .. } | Error::Parse { .. } | Error::Type { .. } => {
+                self.format_with_source_and_file(source, None)
+            }
+        }
+    }
+
+    /// Snippet rendering for the span-bearing variants, optionally naming the
+    /// originating file. Shared by the root-file path (`file = None`, byte-for-
+    /// byte identical to the pre-EPIC-8 single-file output) and the per-module
+    /// path (`file = Some`, which adds an `in <file>` suffix to the location).
+    fn format_with_source_and_file(&self, source: Option<&str>, file: Option<&Path>) -> String {
+        match self {
             Error::Lex { span, msg } |
             Error::Parse { span, msg } |
             Error::Type { span, msg } => {
@@ -75,6 +134,12 @@ impl Error {
 
                 let mut output = format!("{}: {}\n  at {}:{}", error_type, msg, span.line, span.col);
 
+                // Name the originating file only on the multi-file path so the
+                // single-file output (`file = None`) is unchanged.
+                if let Some(f) = file {
+                    output.push_str(&format!(" in {}", f.display()));
+                }
+
                 if let Some(src) = source {
                     if let Some(snippet) = Self::extract_snippet(src, *span) {
                         output.push_str(&format!("\n\n{}", snippet));
@@ -83,6 +148,10 @@ impl Error {
 
                 output
             }
+            // Only span-bearing variants reach this helper; anything else
+            // delegates to the public formatter (defensive — keeps Display
+            // semantics intact if a future caller routes a wrapper here).
+            other => other.format_with_source(source),
         }
     }
 

@@ -209,6 +209,44 @@ fi
 # fixture `gate_subtype_assign.py` graduated into the ordinary positive
 # `examples/subtype_assign.py` exercised by Section 1.
 
+# ── 4b. MULTI-FILE NEGATIVE: error sourced to the IMPORTED module (EPIC-8) ────
+# A root main.py imports lib.py, where lib.py has a TYPE error. `pyrst check`
+# must (1) REJECT the program and (2) render the diagnostic against lib.py — the
+# imported file — naming lib.py and showing ITS offending line, NOT main.py's.
+# This is the negative that proves multi-file error sourcing.
+
+multi_neg_ok=0
+multi_neg_failures=()
+
+MF_FAIL_MAIN="$EXAMPLES/multi_file_fail/main.py"
+mf_out=$(timeout 10 "$BIN" check "$MF_FAIL_MAIN" 2>&1)
+mf_exit=$?
+
+if [[ $mf_exit -eq 0 ]]; then
+    echo ""
+    echo "MULTI_FILE_NEGATIVE: FAIL [check wrongly ACCEPTED an imported-module type error]"
+    multi_neg_failures+=("multi_file_fail:accepted")
+elif [[ $mf_exit -eq 101 ]]; then
+    echo ""
+    echo "MULTI_FILE_NEGATIVE: FAIL [ICE/panic on check]"
+    multi_neg_failures+=("multi_file_fail:panic")
+else
+    # Rejected as required. Now assert correct-FILE sourcing: the diagnostic must
+    # name lib.py (the imported module) and must NOT point the caret at main.py.
+    if printf '%s' "$mf_out" | grep -q "lib.py" \
+       && ! printf '%s' "$mf_out" | grep -q "in .*main.py"; then
+        multi_neg_ok=1
+        echo ""
+        echo "MULTI_FILE_NEGATIVE: PASS [rejected + sourced to lib.py]"
+    else
+        echo ""
+        echo "MULTI_FILE_NEGATIVE: FAIL [rejected but NOT sourced to lib.py]"
+        echo "  diagnostic was:"
+        printf '%s\n' "$mf_out" | sed 's/^/    /'
+        multi_neg_failures+=("multi_file_fail:wrong-source")
+    fi
+fi
+
 # ── SUMMARY ──────────────────────────────────────────────────────────────────
 
 echo ""
@@ -217,9 +255,10 @@ echo "POSITIVES:              $pos_passed / $pos_count"
 echo "NEGATIVES (build):      $neg_ok / $neg_count"
 echo "NEGATIVES (typeck):     $typeck_ok / $typeck_count"
 echo "MULTI_FILE_DEMO:        $multi_ok / 1"
+echo "MULTI_FILE_NEGATIVE:    $multi_neg_ok / 1"
 echo "══════════════════════════════════════════════"
 
-total_failures=$(( ${#pos_failures[@]} + ${#neg_build_failures[@]} + ${#typeck_failures[@]} + ${#multi_failures[@]} ))
+total_failures=$(( ${#pos_failures[@]} + ${#neg_build_failures[@]} + ${#typeck_failures[@]} + ${#multi_failures[@]} + ${#multi_neg_failures[@]} ))
 
 if [[ $total_failures -gt 0 ]]; then
     echo ""
@@ -228,6 +267,7 @@ if [[ $total_failures -gt 0 ]]; then
     for name in "${neg_build_failures[@]}"; do echo "  [neg-build-leak] $name"; done
     for name in "${typeck_failures[@]}"; do echo "  [typeck-leak] $name"; done
     for name in "${multi_failures[@]}"; do echo "  [multi-file] $name"; done
+    for name in "${multi_neg_failures[@]}"; do echo "  [multi-file-negative] $name"; done
     echo ""
     exit 1
 fi

@@ -5,8 +5,16 @@ use crate::diag::{Error, Result};
 
 pub fn check(path: &Path) -> Result<()> {
     let prog = crate::resolver::resolve(path)?;
-    for (m, _src) in &prog.modules {
-        crate::typeck::check_bodies(m, &prog.ctx)?;
+    // Name the originating file only when more than one module is involved, so
+    // single-file error output stays byte-for-byte identical (EPIC-8).
+    let multi = prog.modules.len() > 1;
+    for (m, src) in &prog.modules {
+        // EPIC-8: a body-check error belongs to THIS module — pair its own
+        // source (and file) so `main` renders the snippet against the right
+        // file instead of the root file.
+        let render_path = if multi { m.source_path.clone() } else { None };
+        crate::typeck::check_bodies(m, &prog.ctx)
+            .map_err(|e| e.with_render_source(render_path, src))?;
     }
     eprintln!("ok: {} module(s) typecheck", prog.modules.len());
     Ok(())
@@ -140,8 +148,13 @@ pub fn lint(path: &Path) -> Result<()> {
 
 fn compile_to_rust(path: &Path) -> Result<String> {
     let prog = crate::resolver::resolve(path)?;
-    for (m, _src) in &prog.modules {
-        crate::typeck::check_bodies(m, &prog.ctx)?;
+    // Name the originating file only in the multi-module case (EPIC-8).
+    let multi = prog.modules.len() > 1;
+    for (m, src) in &prog.modules {
+        // EPIC-8: render any body-check error against this module's own source.
+        let render_path = if multi { m.source_path.clone() } else { None };
+        crate::typeck::check_bodies(m, &prog.ctx)
+            .map_err(|e| e.with_render_source(render_path, src))?;
     }
     crate::codegen::emit_program(&prog.modules, &prog.ctx)
 }

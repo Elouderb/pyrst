@@ -70,7 +70,16 @@ impl Resolver {
             }
         })?;
 
-        let mut m = crate::parser::parse(&src)?;
+        // EPIC-8: a parse error belongs to THIS file — pair its own source (and
+        // path) so the snippet renders against the imported file, not the root.
+        // Name the file ONLY when it was reached via an import (DFS depth > 1):
+        // a parse error in the ROOT of a single-file program must render exactly
+        // as before (no `in <file>` suffix), so the source is attached but the
+        // file name is withheld for the root.
+        let name_file = self.dfs_stack.len() > 1;
+        let render_path = if name_file { Some(abs_path.clone()) } else { None };
+        let mut m = crate::parser::parse(&src)
+            .map_err(|e| e.with_render_source(render_path, &src))?;
         m.source_path = Some(abs_path.clone());
 
         // Recurse into this module's imports BEFORE adding self to order (post-order DFS)
@@ -197,9 +206,15 @@ pub fn resolve(root_path: &Path) -> Result<ResolvedProgram> {
     let mut ctx = TyCtx::new();
     let total_modules = resolver.order.len();
     for (idx, path) in resolver.order.iter().enumerate() {
-        let (m, _src) = &resolver.cache[path];
+        let (m, src) = &resolver.cache[path];
         let is_root = idx == total_modules - 1;
-        merge_ctx_from_module(m, &mut ctx, is_root)?;
+        // EPIC-8: signature-merge errors (e.g. an invalid annotation such as
+        // `set[float]`) originate in THIS module — pair its own source/path so
+        // the snippet renders against the right file. Name the file only in the
+        // multi-file case so single-file output is byte-for-byte unchanged.
+        let render_path = if total_modules > 1 { m.source_path.clone() } else { None };
+        merge_ctx_from_module(m, &mut ctx, is_root)
+            .map_err(|e| e.with_render_source(render_path, src))?;
     }
 
     // Build output: (Module, source_text) pairs in dependency order

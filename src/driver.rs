@@ -66,7 +66,7 @@ fn rustc_path() -> std::path::PathBuf {
 }
 
 /// A self-deleting temp path: removes the file at `path` on drop. Keeps the
-/// REPL's compile/run helpers from leaking temp `.py`/`.rs`/binary artifacts
+/// REPL's compile/run helpers from leaking temp `.pyrs`/`.rs`/binary artifacts
 /// even on an early `?` return.
 struct TempArtifact {
     path: std::path::PathBuf,
@@ -94,15 +94,15 @@ fn unique_temp_path(prefix: &str, ext: &str) -> std::path::PathBuf {
 /// input, so it needs a text-in / Rust-out entry point. The existing
 /// [`compile_to_rust`] is path-based (it goes through the import resolver, which
 /// reads a file and resolves `import` statements relative to that file's
-/// directory), so we materialize `source` to a temp `.py` and feed that path
+/// directory), so we materialize `source` to a temp `.pyrs` and feed that path
 /// through the same resolve → typeck → codegen pipeline. The temp file is
 /// removed on return (including on the `?` error path) via [`TempArtifact`].
 ///
 /// Imports in REPL input resolve relative to the temp dir, which generally has
-/// no sibling `.py` files — a documented limitation (the REPL targets compute /
+/// no sibling `.pyrs` files — a documented limitation (the REPL targets compute /
 /// learning snippets, not multi-file projects).
 pub fn compile_str(source: &str) -> Result<String> {
-    let py_path = unique_temp_path("pyrst-repl", "py");
+    let py_path = unique_temp_path("pyrst-repl", "pyrs");
     let _py_guard = TempArtifact { path: py_path.clone() };
     std::fs::write(&py_path, source)?;
     compile_to_rust(&py_path)
@@ -267,7 +267,7 @@ mod fmt_tests {
     /// Create a uniquely-named temp file with `contents` and return its path.
     fn temp_file(name: &str, contents: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!(
-            "pyrst-fmt-test-{}-{}-{}.py",
+            "pyrst-fmt-test-{}-{}-{}.pyrs",
             std::process::id(),
             name,
             std::time::SystemTime::now()

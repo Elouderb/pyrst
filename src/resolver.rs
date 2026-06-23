@@ -99,7 +99,7 @@ impl Resolver {
                     continue;
                 }
 
-                let dep_path = base_dir.join(format!("{}.py", mod_name));
+                let dep_path = base_dir.join(format!("{}.pyrs", mod_name));
 
                 // Resolve to absolute path
                 let dep_abs = dep_path.canonicalize().map_err(|_| Error::ImportNotFound {
@@ -200,7 +200,7 @@ fn merge_ctx_from_module(m: &Module, ctx: &mut TyCtx, is_root: bool) -> Result<(
     Ok(())
 }
 
-/// Resolve all imports from a root .py file and return a merged program.
+/// Resolve all imports from a root .pyrs file and return a merged program.
 pub fn resolve(root_path: &Path) -> Result<ResolvedProgram> {
     let abs_root = root_path.canonicalize().map_err(|e| crate::diag::Error::Io(e))?;
     let root_dir = abs_root.parent().unwrap_or_else(|| Path::new("."));

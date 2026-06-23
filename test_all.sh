@@ -33,8 +33,8 @@ pos_count=0
 pos_passed=0
 pos_failures=()
 
-for f in "$EXAMPLES"/*.py; do
-    base=$(basename "$f" .py)
+for f in "$EXAMPLES"/*.pyrs; do
+    base=$(basename "$f" .pyrs)
     # Skip negative examples (name contains "fail")
     [[ "$base" == *fail* ]] && continue
 
@@ -111,9 +111,9 @@ neg_count=0
 neg_ok=0
 neg_build_failures=()
 
-for f in "$EXAMPLES"/*fail*.py; do
+for f in "$EXAMPLES"/*fail*.pyrs; do
     [[ -e "$f" ]] || continue
-    base=$(basename "$f" .py)
+    base=$(basename "$f" .pyrs)
     neg_count=$((neg_count + 1))
 
     build_exit=0
@@ -146,9 +146,9 @@ typeck_count=0
 typeck_ok=0
 typeck_failures=()
 
-for f in "$EXAMPLES"/*fail*.py; do
+for f in "$EXAMPLES"/*fail*.pyrs; do
     [[ -e "$f" ]] || continue
-    base=$(basename "$f" .py)
+    base=$(basename "$f" .pyrs)
     typeck_count=$((typeck_count + 1))
 
     check_exit=0
@@ -179,7 +179,7 @@ multi_failures=()
 
 MULTI_EXPECTED="$(printf '100\n5\n1000')"
 
-stderr_out=$(timeout 30 "$BIN" build "$EXAMPLES/multi_file_demo/main.py" 2>&1 >/dev/null)
+stderr_out=$(timeout 30 "$BIN" build "$EXAMPLES/multi_file_demo/main.pyrs" 2>&1 >/dev/null)
 multi_build_exit=$?
 if [[ $multi_build_exit -eq 0 ]]; then
     multi_got=$(timeout 5 ./main 2>/dev/null)
@@ -218,7 +218,7 @@ fi
 multi_neg_ok=0
 multi_neg_failures=()
 
-MF_FAIL_MAIN="$EXAMPLES/multi_file_fail/main.py"
+MF_FAIL_MAIN="$EXAMPLES/multi_file_fail/main.pyrs"
 mf_out=$(timeout 10 "$BIN" check "$MF_FAIL_MAIN" 2>&1)
 mf_exit=$?
 
@@ -233,8 +233,8 @@ elif [[ $mf_exit -eq 101 ]]; then
 else
     # Rejected as required. Now assert correct-FILE sourcing: the diagnostic must
     # name lib.py (the imported module) and must NOT point the caret at main.py.
-    if printf '%s' "$mf_out" | grep -q "lib.py" \
-       && ! printf '%s' "$mf_out" | grep -q "in .*main.py"; then
+    if printf '%s' "$mf_out" | grep -q "lib.pyrs" \
+       && ! printf '%s' "$mf_out" | grep -q "in .*main.pyrs"; then
         multi_neg_ok=1
         echo ""
         echo "MULTI_FILE_NEGATIVE: PASS [rejected + sourced to lib.py]"

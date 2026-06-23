@@ -19,11 +19,11 @@ fn print_usage() {
     eprintln!("usage: pyrst <command> [args]");
     eprintln!();
     eprintln!("commands:");
-    eprintln!("  build <file.py>     compile a pyrst source file to a native binary");
-    eprintln!("  emit  <file.py>     emit generated Rust source to stdout (no rustc)");
-    eprintln!("  check <file.py>     parse and typecheck only");
-    eprintln!("  fmt   <file.py>     format a pyrst source file in-place");
-    eprintln!("  lint  <file.py>     check code style and common issues");
+    eprintln!("  build <file.pyrs>   compile a pyrst source file to a native binary");
+    eprintln!("  emit  <file.pyrs>   emit generated Rust source to stdout (no rustc)");
+    eprintln!("  check <file.pyrs>   parse and typecheck only");
+    eprintln!("  fmt   <file.pyrs>   format a pyrst source file in-place");
+    eprintln!("  lint  <file.pyrs>   check code style and common issues");
     eprintln!("  repl                start interactive shell");
 }
 

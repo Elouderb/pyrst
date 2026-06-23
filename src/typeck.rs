@@ -52,7 +52,20 @@ impl std::fmt::Display for Ty {
 }
 
 impl Ty {
-    pub fn from_type_expr(t: &TypeExpr) -> Result<Ty> {
+    /// Lower a `TypeExpr` annotation to a `Ty`, rejecting illegal annotations
+    /// (non-hashable `set`/`dict` keys, misplaced `Mut[...]`, unknown generics).
+    ///
+    /// `span` is the source location of the *whole annotation* and is attached
+    /// to every diagnostic this produces (EPIC-8): callers pass the most precise
+    /// real span they have (a param's `.span`, an annotated assignment's `.span`,
+    /// the enclosing function's `.span` for a return type, etc.) so the rendered
+    /// error points at a real `line:col` with a caret instead of `0:0`. Recursive
+    /// calls for nested element types reuse the same `span` — a nested
+    /// `set[float]` error pointing at the full annotation is correct and far
+    /// better than a dummy span. Callers that only consult this for inference and
+    /// discard any error (codegen, type-inference fallbacks) may pass
+    /// `Span::DUMMY` since the error never reaches the user.
+    pub fn from_type_expr(t: &TypeExpr, span: Span) -> Result<Ty> {
         Ok(match t {
             TypeExpr::None_ => Ty::Unit,
             TypeExpr::Named(n) => {
@@ -66,32 +79,32 @@ impl Ty {
                 }
             }
             TypeExpr::Generic(n, args) => match (n.as_str(), args.as_slice()) {
-                ("list", [t]) => Ty::List(Box::new(Ty::from_type_expr(t)?)),
+                ("list", [t]) => Ty::List(Box::new(Ty::from_type_expr(t, span)?)),
                 ("set", [t]) => {
                     // A declared `set[float]` resolves to Set(Float), which
                     // codegen would emit as the uncompilable `HashSet<f64>`.
                     // Reject it at the resolver so vars, params, and returns are
                     // covered uniformly — even when initialized with `set()`.
-                    let elem = Ty::from_type_expr(t)?;
-                    require_hashable(&elem, Span::DUMMY, "set element")?;
+                    let elem = Ty::from_type_expr(t, span)?;
+                    require_hashable(&elem, span, "set element")?;
                     Ty::Set(Box::new(elem))
                 }
                 ("dict", [k, v]) => {
                     // A declared `dict[float, _]` resolves to Dict(Float, _) ->
                     // uncompilable `HashMap<f64, _>`. Reject the KEY only; float
                     // values are fine.
-                    let key = Ty::from_type_expr(k)?;
-                    require_hashable(&key, Span::DUMMY, "dict key")?;
-                    Ty::Dict(Box::new(key), Box::new(Ty::from_type_expr(v)?))
+                    let key = Ty::from_type_expr(k, span)?;
+                    require_hashable(&key, span, "dict key")?;
+                    Ty::Dict(Box::new(key), Box::new(Ty::from_type_expr(v, span)?))
                 }
-                ("tuple", args) => Ty::Tuple(args.iter().map(Ty::from_type_expr).collect::<Result<Vec<_>>>()?),
-                ("Optional", [t]) => Ty::Option(Box::new(Ty::from_type_expr(t)?)),
+                ("tuple", args) => Ty::Tuple(args.iter().map(|a| Ty::from_type_expr(a, span)).collect::<Result<Vec<_>>>()?),
+                ("Optional", [t]) => Ty::Option(Box::new(Ty::from_type_expr(t, span)?)),
                 ("Union", args) => {
                     let non_none: Vec<_> = args.iter()
                         .filter(|a| !matches!(a, TypeExpr::None_))
                         .collect();
                     if non_none.len() == 1 {
-                        Ty::Option(Box::new(Ty::from_type_expr(non_none[0])?))
+                        Ty::Option(Box::new(Ty::from_type_expr(non_none[0], span)?))
                     } else {
                         Ty::Unknown
                     }
@@ -102,16 +115,16 @@ impl Ty {
                 // here is in an illegal position — a return type, a field/variable
                 // annotation, or nested inside another type (e.g. `list[Mut[T]]`).
                 ("Mut", _) => return Err(Error::Type {
-                    span: Span::DUMMY,
+                    span,
                     msg: "Mut[...] is only valid on a parameter".to_string(),
                 }),
                 (other, _) => return Err(Error::Type {
-                    span: Span::DUMMY,
+                    span,
                     msg: format!("unknown generic type `{}`", other),
                 }),
             },
             TypeExpr::Tuple(parts) => {
-                let tys = parts.iter().map(Ty::from_type_expr).collect::<Result<Vec<_>>>()?;
+                let tys = parts.iter().map(|p| Ty::from_type_expr(p, span)).collect::<Result<Vec<_>>>()?;
                 Ty::Tuple(tys)
             }
         })
@@ -300,13 +313,13 @@ impl TyCtx {
                 // fabricating `Ty::Unknown` for the return — never a corrupt FuncSig.
                 let params: Vec<(String, Ty)> = match method.params.iter()
                     .filter(|p| p.name != "self")
-                    .map(|p| Ty::from_type_expr(&p.ty).map(|ty| (p.name.clone(), ty)))
+                    .map(|p| Ty::from_type_expr(&p.ty, p.span).map(|ty| (p.name.clone(), ty)))
                     .collect::<Result<Vec<_>>>()
                 {
                     Ok(ps) => ps,
                     Err(_) => return None,
                 };
-                let ret = match Ty::from_type_expr(&method.ret) {
+                let ret = match Ty::from_type_expr(&method.ret, method.span) {
                     Ok(ty) => ty,
                     Err(_) => return None,
                 };
@@ -896,13 +909,13 @@ pub fn check_bodies(m: &Module, ctx: &TyCtx) -> Result<()> {
 
                 let params: Vec<(String, Ty)> = f.params.iter()
                     .filter(|p| p.name != "self")
-                    .map(|p| Ty::from_type_expr(&p.ty).map(|ty| (p.name.clone(), ty)))
+                    .map(|p| Ty::from_type_expr(&p.ty, p.span).map(|ty| (p.name.clone(), ty)))
                     .collect::<Result<Vec<_>>>()?;
                 let by_ref_names: Vec<String> = f.params.iter()
                     .filter(|p| p.name != "self" && p.by_ref)
                     .map(|p| p.name.clone())
                     .collect();
-                let ret = Ty::from_type_expr(&f.ret)?;
+                let ret = Ty::from_type_expr(&f.ret, f.span)?;
                 let mut env = FuncEnv::with_by_ref(ctx, &params, &by_ref_names, ret);
                 collect_returned_param_idents(&f.body, &env.params, &mut env.returned_params);
                 check_body(&f.body, &mut env)?;
@@ -924,7 +937,7 @@ pub fn check_bodies(m: &Module, ctx: &TyCtx) -> Result<()> {
                 // so a class-field `Mut[T]` is an honest error in BOTH `check` and
                 // `build` (mode markers belong only on parameters).
                 for field in &c.fields {
-                    Ty::from_type_expr(&field.ty)?;
+                    Ty::from_type_expr(&field.ty, field.span)?;
                 }
 
                 for method in &c.methods {
@@ -971,14 +984,14 @@ pub fn check_bodies(m: &Module, ctx: &TyCtx) -> Result<()> {
 
                     let mut params: Vec<(String, Ty)> = method.params.iter()
                         .filter(|p| p.name != "self")
-                        .map(|p| Ty::from_type_expr(&p.ty).map(|ty| (p.name.clone(), ty)))
+                        .map(|p| Ty::from_type_expr(&p.ty, p.span).map(|ty| (p.name.clone(), ty)))
                         .collect::<Result<Vec<_>>>()?;
                     params.insert(0, ("self".into(), Ty::Class(c.name.clone())));
                     let by_ref_names: Vec<String> = method.params.iter()
                         .filter(|p| p.name != "self" && p.by_ref)
                         .map(|p| p.name.clone())
                         .collect();
-                    let ret = Ty::from_type_expr(&method.ret)?;
+                    let ret = Ty::from_type_expr(&method.ret, method.span)?;
                     let mut env = FuncEnv::with_by_ref(ctx, &params, &by_ref_names, ret);
                     collect_returned_param_idents(&method.body, &env.params, &mut env.returned_params);
                     check_body(&method.body, &mut env)?;
@@ -1574,11 +1587,11 @@ fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
         Stmt::Assign { target, ty, value, span } => {
             let val_ty = check_expr(value, env)?;
             let declared = match ty {
-                Some(t) => Ty::from_type_expr(t)?,
+                Some(t) => Ty::from_type_expr(t, *span)?,
                 None => val_ty.clone(),
             };
             if let Some(t) = ty {
-                let explicit = Ty::from_type_expr(t)?;
+                let explicit = Ty::from_type_expr(t, *span)?;
                 if !types_compatible(&val_ty, &explicit, env.ctx) {
                     return Err(Error::Type {
                         span: *span,
@@ -2048,7 +2061,7 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
             if let Ty::Class(cls) = infer_expr_ty(obj, locals, ctx) {
                 let all_fields = ctx.get_all_fields(cls.as_str());
                 if let Some(f) = all_fields.iter().find(|f| f.name == *name) {
-                    return Ty::from_type_expr(&f.ty).unwrap_or(Ty::Unknown);
+                    return Ty::from_type_expr(&f.ty, f.span).unwrap_or(Ty::Unknown);
                 }
             }
             Ty::Unknown
@@ -2212,7 +2225,7 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
                         if let Ty::Class(cls) = inner.as_ref() {
                             if let Some(c) = ctx.classes.get(cls.as_str()) {
                                 if let Some(f) = c.fields.iter().find(|f| f.name == *name) {
-                                    if let Ok(ty) = Ty::from_type_expr(&f.ty) {
+                                    if let Ok(ty) = Ty::from_type_expr(&f.ty, f.span) {
                                         return Ty::Set(Box::new(ty));
                                     }
                                 }
@@ -2242,7 +2255,7 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
                     if let Ty::Class(ref cls) = iter_ty {
                         if let Some(c) = ctx.classes.get(cls.as_str()) {
                             if let Some(f) = c.fields.iter().find(|f| f.name == *name) {
-                                return Ty::from_type_expr(&f.ty).unwrap_or(Ty::Unknown);
+                                return Ty::from_type_expr(&f.ty, f.span).unwrap_or(Ty::Unknown);
                             }
                         }
                     }
@@ -2384,7 +2397,7 @@ fn infer_comp_elt_type_with_var(
             if let Ty::Class(cls) = obj_ty {
                 if let Some(c) = ctx.classes.get(cls.as_str()) {
                     if let Some(f) = c.fields.iter().find(|f| f.name == *name) {
-                        return Ty::from_type_expr(&f.ty).unwrap_or(Ty::Unknown);
+                        return Ty::from_type_expr(&f.ty, f.span).unwrap_or(Ty::Unknown);
                     }
                 }
             }
@@ -2442,7 +2455,9 @@ fn lambda_param_ty(param_ty: &TypeExpr) -> Ty {
             return Ty::Unknown;
         }
     }
-    Ty::from_type_expr(param_ty).unwrap_or(Ty::Unknown)
+    // Inference-only fallback: a lambda param annotation has no carried span and
+    // any error is swallowed to `Unknown`, so a dummy span never reaches a user.
+    Ty::from_type_expr(param_ty, Span::DUMMY).unwrap_or(Ty::Unknown)
 }
 
 /// Infer the return type of a callable applied to a single element of type
@@ -3054,7 +3069,7 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                     // Check field access (including inherited fields).
                     let all_fields = env.ctx.get_all_fields(class_name.as_str());
                     if let Some(field) = all_fields.iter().find(|f| &f.name == name) {
-                        return Ty::from_type_expr(&field.ty);
+                        return Ty::from_type_expr(&field.ty, *span);
                     }
                     // Check method access (including inherited methods).
                     if let Some(method) = env.ctx.get_method(class_name.as_str(), name) {
@@ -4170,7 +4185,7 @@ mod tests {
             "set".to_string(),
             vec![TypeExpr::Named("float".to_string())],
         );
-        let err = Ty::from_type_expr(&t).unwrap_err();
+        let err = Ty::from_type_expr(&t, Span::DUMMY).unwrap_err();
         match err {
             Error::Type { msg, .. } => assert!(
                 msg.contains("hashable"),
@@ -4191,7 +4206,7 @@ mod tests {
                 TypeExpr::Named("str".to_string()),
             ],
         );
-        assert!(matches!(Ty::from_type_expr(&t), Err(Error::Type { .. })));
+        assert!(matches!(Ty::from_type_expr(&t, Span::DUMMY), Err(Error::Type { .. })));
     }
 
     #[test]
@@ -4205,7 +4220,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            Ty::from_type_expr(&t).unwrap(),
+            Ty::from_type_expr(&t, Span::DUMMY).unwrap(),
             Ty::Dict(Box::new(Ty::Str), Box::new(Ty::Float))
         );
     }
@@ -5202,7 +5217,7 @@ mod tests {
         // every NON-param annotation — return types, field/variable annotations,
         // and nested forms) rejects it with the directed message.
         let me = TypeExpr::Generic("Mut".into(), vec![TypeExpr::Named("int".into())]);
-        let r = Ty::from_type_expr(&me);
+        let r = Ty::from_type_expr(&me, Span::DUMMY);
         match r {
             Err(Error::Type { msg, .. }) =>
                 assert!(msg.contains("Mut[...] is only valid on a parameter"), "got: {}", msg),
@@ -5210,7 +5225,7 @@ mod tests {
         }
         // Nested inside another generic is rejected the same way.
         let nested = TypeExpr::Generic("list".into(), vec![me]);
-        assert!(Ty::from_type_expr(&nested).is_err(), "list[Mut[T]] must be rejected");
+        assert!(Ty::from_type_expr(&nested, Span::DUMMY).is_err(), "list[Mut[T]] must be rejected");
     }
 
     #[test]
@@ -5355,13 +5370,13 @@ def deposit(account: Mut[Account], amt: int) -> None:
             if let Stmt::Func(f) = s {
                 ctx.funcs.insert(f.name.clone(), FuncSig {
                     params: f.params.iter().filter(|p| p.name != "self")
-                        .map(|p| (p.name.clone(), Ty::from_type_expr(&p.ty).unwrap()))
+                        .map(|p| (p.name.clone(), Ty::from_type_expr(&p.ty, p.span).unwrap()))
                         .collect(),
                     param_defaults: f.params.iter().filter(|p| p.name != "self")
                         .map(|p| p.default.clone()).collect(),
                     param_by_ref: f.params.iter().filter(|p| p.name != "self")
                         .map(|p| p.by_ref).collect(),
-                    ret: Ty::from_type_expr(&f.ret).unwrap(),
+                    ret: Ty::from_type_expr(&f.ret, f.span).unwrap(),
                 });
             }
         }
@@ -5383,13 +5398,13 @@ def deposit(account: Mut[Account], amt: int) -> None:
                     let key = format!("{}.{}", c.name, mf.name);
                     ctx.funcs.insert(key, FuncSig {
                         params: mf.params.iter().filter(|p| p.name != "self")
-                            .map(|p| (p.name.clone(), Ty::from_type_expr(&p.ty).unwrap_or(Ty::Unknown)))
+                            .map(|p| (p.name.clone(), Ty::from_type_expr(&p.ty, p.span).unwrap_or(Ty::Unknown)))
                             .collect(),
                         param_defaults: mf.params.iter().filter(|p| p.name != "self")
                             .map(|p| p.default.clone()).collect(),
                         param_by_ref: mf.params.iter().filter(|p| p.name != "self")
                             .map(|p| p.by_ref).collect(),
-                        ret: Ty::from_type_expr(&mf.ret).unwrap_or(Ty::Unknown),
+                        ret: Ty::from_type_expr(&mf.ret, mf.span).unwrap_or(Ty::Unknown),
                     });
                 }
             }
@@ -5398,13 +5413,13 @@ def deposit(account: Mut[Account], amt: int) -> None:
             if let Stmt::Func(f) = s {
                 ctx.funcs.insert(f.name.clone(), FuncSig {
                     params: f.params.iter().filter(|p| p.name != "self")
-                        .map(|p| (p.name.clone(), Ty::from_type_expr(&p.ty).unwrap_or(Ty::Unknown)))
+                        .map(|p| (p.name.clone(), Ty::from_type_expr(&p.ty, p.span).unwrap_or(Ty::Unknown)))
                         .collect(),
                     param_defaults: f.params.iter().filter(|p| p.name != "self")
                         .map(|p| p.default.clone()).collect(),
                     param_by_ref: f.params.iter().filter(|p| p.name != "self")
                         .map(|p| p.by_ref).collect(),
-                    ret: Ty::from_type_expr(&f.ret).unwrap_or(Ty::Unknown),
+                    ret: Ty::from_type_expr(&f.ret, f.span).unwrap_or(Ty::Unknown),
                 });
             }
         }

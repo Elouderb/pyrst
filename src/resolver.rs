@@ -116,11 +116,13 @@ fn merge_ctx_from_module(m: &Module, ctx: &mut TyCtx, is_root: bool) -> Result<(
                     continue;
                 }
                 let params: Vec<(String, crate::typeck::Ty)> = f.params.iter()
-                    .map(|p| crate::typeck::Ty::from_type_expr(&p.ty).map(|ty| (p.name.clone(), ty)))
+                    .map(|p| crate::typeck::Ty::from_type_expr(&p.ty, p.span).map(|ty| (p.name.clone(), ty)))
                     .collect::<crate::diag::Result<Vec<_>>>()?;
                 ctx.funcs.insert(f.name.clone(), crate::typeck::FuncSig {
                     params,
-                    ret: crate::typeck::Ty::from_type_expr(&f.ret)?,
+                    // A return annotation carries no span of its own; point at the
+                    // function definition so a bad `-> ...` still gets a real caret.
+                    ret: crate::typeck::Ty::from_type_expr(&f.ret, f.span)?,
                     param_defaults: f.params.iter()
                         .filter(|p| p.name != "self")
                         .map(|p| p.default.clone())
@@ -153,11 +155,11 @@ fn merge_ctx_from_module(m: &Module, ctx: &mut TyCtx, is_root: bool) -> Result<(
                     // so aligning here is non-breaking.
                     let method_params: Vec<(String, crate::typeck::Ty)> = m_fn.params.iter()
                         .filter(|p| p.name != "self")
-                        .map(|p| crate::typeck::Ty::from_type_expr(&p.ty).map(|ty| (p.name.clone(), ty)))
+                        .map(|p| crate::typeck::Ty::from_type_expr(&p.ty, p.span).map(|ty| (p.name.clone(), ty)))
                         .collect::<crate::diag::Result<Vec<_>>>()?;
                     ctx.funcs.insert(method_name, crate::typeck::FuncSig {
                         params: method_params,
-                        ret: crate::typeck::Ty::from_type_expr(&m_fn.ret)?,
+                        ret: crate::typeck::Ty::from_type_expr(&m_fn.ret, m_fn.span)?,
                         param_defaults: m_fn.params.iter()
                             .filter(|p| p.name != "self")
                             .map(|p| p.default.clone())
@@ -169,11 +171,11 @@ fn merge_ctx_from_module(m: &Module, ctx: &mut TyCtx, is_root: bool) -> Result<(
                     });
                 }
             }
-            Stmt::Assign { target, ty: Some(t), .. } => {
+            Stmt::Assign { target, ty: Some(t), span, .. } => {
                 // Register module-level annotated globals with their concrete type
                 // (ported from typeck::check_module). Propagate errors so that
                 // invalid annotations (e.g. set[float]) are rejected at typeck.
-                let resolved = crate::typeck::Ty::from_type_expr(t)?;
+                let resolved = crate::typeck::Ty::from_type_expr(t, *span)?;
                 ctx.vars.insert(target.clone(), resolved);
             }
             Stmt::Import { .. } => {}

@@ -108,7 +108,7 @@ impl<'a> Codegen<'a> {
                 }
                 // Copy classes don't get #[derive(Default)] (see emit_class).
                 let all_copy = self.ctx.get_all_fields(n).iter().all(|f| {
-                    Ty::from_type_expr(&f.ty).map(|t| self.is_copy_type(&t)).unwrap_or(false)
+                    Ty::from_type_expr(&f.ty, f.span).map(|t| self.is_copy_type(&t)).unwrap_or(false)
                 });
                 !all_copy
             }
@@ -146,12 +146,12 @@ impl<'a> Codegen<'a> {
             Ty::Str => "String::new()".to_string(),
             Ty::Class(n) => {
                 let all_copy = self.ctx.get_all_fields(n).iter().all(|f| {
-                    Ty::from_type_expr(&f.ty).map(|t| self.is_copy_type(&t)).unwrap_or(false)
+                    Ty::from_type_expr(&f.ty, f.span).map(|t| self.is_copy_type(&t)).unwrap_or(false)
                 });
                 let struct_init = if all_copy {
                     // Build a struct literal with zeroed primitive fields.
                     let fields: Vec<String> = self.ctx.get_all_fields(n).iter().map(|f| {
-                        let inner_ty = Ty::from_type_expr(&f.ty).unwrap_or(Ty::Int);
+                        let inner_ty = Ty::from_type_expr(&f.ty, f.span).unwrap_or(Ty::Int);
                         // (EPIC-6) Escape a keyword field name in the zeroed
                         // struct-literal default (matches the struct field def).
                         format!("{}: {}", escape_ident(&f.name), self.zeroed_default(&inner_ty))
@@ -532,7 +532,7 @@ impl<'a> Codegen<'a> {
             .get_all_fields(&class_def.name)
             .iter()
             .find(|f| f.name == field_name)
-            .and_then(|f| Ty::from_type_expr(&f.ty).ok())
+            .and_then(|f| Ty::from_type_expr(&f.ty, f.span).ok())
     }
 
     /// (EPIC-5) Coerce an already-emitted expression `s` (for source expr `e`)
@@ -1166,7 +1166,7 @@ impl<'a> Codegen<'a> {
         for p in f.params.iter().filter(|p| p.name != "self") {
             if !first { sig.push_str(", "); }
             first = false;
-            let pty = self.rust_ty(&Ty::from_type_expr(&p.ty)?);
+            let pty = self.rust_ty(&Ty::from_type_expr(&p.ty, p.span)?);
             if p.by_ref {
                 // (EPIC-4 V2-c) An opt-in by-reference param (`Mut[T]`) becomes
                 // `name: &mut T`. The callee's mutations persist to the caller,
@@ -1184,7 +1184,7 @@ impl<'a> Codegen<'a> {
                 let _ = write!(sig, "mut {}: {}", escape_ident(&p.name), pty);
             }
         }
-        let ret = Ty::from_type_expr(&f.ret)?;
+        let ret = Ty::from_type_expr(&f.ret, f.span)?;
         let ret_s = self.rust_ty(&ret);
         let _ = write!(sig, ") -> {} {{", ret_s);
         self.line(&sig);
@@ -1211,7 +1211,7 @@ impl<'a> Codegen<'a> {
 
         for p in &f.params {
             if p.name != "self" {
-                let ty = Ty::from_type_expr(&p.ty)?;
+                let ty = Ty::from_type_expr(&p.ty, p.span)?;
                 self.locals.insert(p.name.clone(), ty);
             }
         }
@@ -1323,7 +1323,7 @@ impl<'a> Codegen<'a> {
         let resolved_methods = self.resolved_methods(&c.name);
 
         let all_fields_copy = all_fields.iter().all(|f| {
-            Ty::from_type_expr(&f.ty)
+            Ty::from_type_expr(&f.ty, f.span)
                 .map(|ty| self.is_copy_type(&ty))
                 .unwrap_or(false)
         });
@@ -1340,7 +1340,7 @@ impl<'a> Codegen<'a> {
         // without it (Python `==` on such a struct is then honestly unavailable
         // — consistent with cross-variant equality being absent on the enum).
         let field_blocks_eq = all_fields.iter().any(|f| {
-            matches!(Ty::from_type_expr(&f.ty), Ok(Ty::Class(ref n))
+            matches!(Ty::from_type_expr(&f.ty, f.span), Ok(Ty::Class(ref n))
                 if self.is_polymorphic_base(n) && !self.companion_enum_has_partial_eq(n))
         });
         let pe = if has_eq || field_blocks_eq { "" } else { ", PartialEq" };
@@ -1348,7 +1348,7 @@ impl<'a> Codegen<'a> {
         // Copy classes (all-primitive fields) don't derive Default, so an outer
         // struct holding one must NOT include Default in its own derive list.
         let all_fields_default = all_fields.iter().all(|f| {
-            Ty::from_type_expr(&f.ty)
+            Ty::from_type_expr(&f.ty, f.span)
                 .map(|ty| self.type_has_default(&ty))
                 .unwrap_or(false)
         });
@@ -1363,7 +1363,7 @@ impl<'a> Codegen<'a> {
         self.line(&format!("struct {} {{", c.name));
         self.indent += 1;
         for f in &all_fields {
-            let ty = Ty::from_type_expr(&f.ty)?;
+            let ty = Ty::from_type_expr(&f.ty, f.span)?;
             // (EPIC-6) Escape a keyword field name in the struct definition; every
             // field read/write/init escapes the same way so they stay in sync.
             self.line(&format!("{}: {},", escape_ident(&f.name), self.rust_ty(&ty)));
@@ -1398,7 +1398,7 @@ impl<'a> Codegen<'a> {
                     let non_self: Vec<_> = init_fn.params.iter().filter(|p| p.name != "self").collect();
                     let param_strs: Result<Vec<_>> = non_self.iter()
                         .map(|p| {
-                            let ty = Ty::from_type_expr(&p.ty)?;
+                            let ty = Ty::from_type_expr(&p.ty, p.span)?;
                             // (EPIC-6) new()'s params + their forwarded uses below
                             // escape identically.
                             Ok(format!("{}: {}", escape_ident(&p.name), self.rust_ty(&ty)))
@@ -1407,7 +1407,7 @@ impl<'a> Codegen<'a> {
                     let param_strs = param_strs?;
                     let param_names: Vec<_> = non_self.iter().map(|p| escape_ident(&p.name)).collect();
                     let defaults: Vec<String> = all_fields.iter().map(|f| {
-                        let ty = Ty::from_type_expr(&f.ty).unwrap_or(Ty::Unknown);
+                        let ty = Ty::from_type_expr(&f.ty, f.span).unwrap_or(Ty::Unknown);
                         // Use zeroed_default which handles Copy classes that don't
                         // implement Default (unlike a plain Default::default() call).
                         let dv = self.zeroed_default(&ty);
@@ -1430,7 +1430,7 @@ impl<'a> Codegen<'a> {
             if is_dataclass && !has_init {
                 let param_strs: Result<Vec<_>> = all_fields.iter()
                     .map(|f| {
-                        let ty = Ty::from_type_expr(&f.ty)?;
+                        let ty = Ty::from_type_expr(&f.ty, f.span)?;
                         // (EPIC-6) Dataclass ctor: param name == field name; both
                         // the param binding here and the field-init shorthand below
                         // escape, so `ClassName { r#type, .. }` stays consistent.
@@ -1558,9 +1558,9 @@ impl<'a> Codegen<'a> {
                 "__add__" => {
                     let other_param = m.params.iter().find(|p| p.name == "other");
                     let other_ty = other_param
-                        .map(|p| Ty::from_type_expr(&p.ty).unwrap_or(Ty::Class(c.name.clone())))
+                        .map(|p| Ty::from_type_expr(&p.ty, p.span).unwrap_or(Ty::Class(c.name.clone())))
                         .unwrap_or(Ty::Class(c.name.clone()));
-                    let ret_ty = Ty::from_type_expr(&m.ret).unwrap_or(Ty::Class(c.name.clone()));
+                    let ret_ty = Ty::from_type_expr(&m.ret, m.span).unwrap_or(Ty::Class(c.name.clone()));
                     self.line(&format!("impl ::std::ops::Add<{}> for {} {{", self.rust_ty(&other_ty), c.name));
                     self.indent += 1;
                     self.line(&format!("type Output = {};", self.rust_ty(&ret_ty)));
@@ -1600,9 +1600,9 @@ impl<'a> Codegen<'a> {
                 "__sub__" => {
                     let other_param = m.params.iter().find(|p| p.name == "other");
                     let other_ty = other_param
-                        .map(|p| Ty::from_type_expr(&p.ty).unwrap_or(Ty::Class(c.name.clone())))
+                        .map(|p| Ty::from_type_expr(&p.ty, p.span).unwrap_or(Ty::Class(c.name.clone())))
                         .unwrap_or(Ty::Class(c.name.clone()));
-                    let ret_ty = Ty::from_type_expr(&m.ret).unwrap_or(Ty::Class(c.name.clone()));
+                    let ret_ty = Ty::from_type_expr(&m.ret, m.span).unwrap_or(Ty::Class(c.name.clone()));
                     self.line(&format!("impl ::std::ops::Sub<{}> for {} {{", self.rust_ty(&other_ty), c.name));
                     self.indent += 1;
                     self.line(&format!("type Output = {};", self.rust_ty(&ret_ty)));
@@ -1622,9 +1622,9 @@ impl<'a> Codegen<'a> {
                 "__mul__" => {
                     let other_param = m.params.iter().find(|p| p.name == "other");
                     let other_ty = other_param
-                        .map(|p| Ty::from_type_expr(&p.ty).unwrap_or(Ty::Class(c.name.clone())))
+                        .map(|p| Ty::from_type_expr(&p.ty, p.span).unwrap_or(Ty::Class(c.name.clone())))
                         .unwrap_or(Ty::Class(c.name.clone()));
-                    let ret_ty = Ty::from_type_expr(&m.ret).unwrap_or(Ty::Class(c.name.clone()));
+                    let ret_ty = Ty::from_type_expr(&m.ret, m.span).unwrap_or(Ty::Class(c.name.clone()));
                     self.line(&format!("impl ::std::ops::Mul<{}> for {} {{", self.rust_ty(&other_ty), c.name));
                     self.indent += 1;
                     self.line(&format!("type Output = {};", self.rust_ty(&ret_ty)));
@@ -1642,7 +1642,7 @@ impl<'a> Codegen<'a> {
                     self.line("");
                 }
                 "__neg__" => {
-                    let ret_ty = Ty::from_type_expr(&m.ret).unwrap_or(Ty::Class(c.name.clone()));
+                    let ret_ty = Ty::from_type_expr(&m.ret, m.span).unwrap_or(Ty::Class(c.name.clone()));
                     self.line(&format!("impl ::std::ops::Neg for {} {{", c.name));
                     self.indent += 1;
                     self.line(&format!("type Output = {};", self.rust_ty(&ret_ty)));
@@ -1780,7 +1780,7 @@ impl<'a> Codegen<'a> {
         self.line(&format!("impl {} {{", enum_name));
         self.indent += 1;
         for f in &accessor_fields {
-            let fty = Ty::from_type_expr(&f.ty)?;
+            let fty = Ty::from_type_expr(&f.ty, f.span)?;
             let ret = self.rust_ty(&fty);
             // (EPIC-6) `x.<field>` reads the inner value struct's field, so a
             // keyword field name is escaped to match the (escaped) struct def. The
@@ -1942,7 +1942,7 @@ impl<'a> Codegen<'a> {
         let mut sig_params: Vec<String> = Vec::new();
         let mut fwd: Vec<String> = Vec::new();
         for p in &non_self {
-            let pty = self.rust_ty(&Ty::from_type_expr(&p.ty)?);
+            let pty = self.rust_ty(&Ty::from_type_expr(&p.ty, p.span)?);
             // (EPIC-6) Dispatch-wrapper params + their forwarding both escape so a
             // keyword-named param stays consistent. (The method NAME `m.name` is
             // left unescaped — method-name escaping is the sibling dispatch card.)
@@ -1953,7 +1953,7 @@ impl<'a> Codegen<'a> {
             }
             fwd.push(escape_ident(&p.name));
         }
-        let ret = self.rust_ty(&Ty::from_type_expr(&m.ret)?);
+        let ret = self.rust_ty(&Ty::from_type_expr(&m.ret, m.span)?);
         let fwd_args = fwd.join(", ");
         let arms: Vec<String> = variants
             .iter()
@@ -2212,8 +2212,8 @@ impl<'a> Codegen<'a> {
     fn prescan_types(&mut self, stmts: &[Stmt]) {
         for s in stmts {
             match s {
-                Stmt::Assign { target, ty: Some(te), .. } => {
-                    if let Ok(t) = Ty::from_type_expr(te) {
+                Stmt::Assign { target, ty: Some(te), span, .. } => {
+                    if let Ok(t) = Ty::from_type_expr(te, *span) {
                         self.locals.insert(target.clone(), t);
                     }
                 }
@@ -2387,7 +2387,7 @@ impl<'a> Codegen<'a> {
                 let s = self.emit_expr(e)?;
                 self.line(&format!("{};", s));
             }
-            Stmt::Assign { target, ty, value, .. } => {
+            Stmt::Assign { target, ty, value, span, .. } => {
                 // Uniform clone-on-use: assigning from a non-Copy place (`y = x`,
                 // `y = self.field`) deep-clones so the two bindings are independent
                 // (Python value semantics). Owned temps (call/literal/binop) are bare.
@@ -2402,7 +2402,7 @@ impl<'a> Codegen<'a> {
                     self.declared.insert(target.clone());
                     match ty {
                         Some(t) => {
-                            let ty_obj = Ty::from_type_expr(t)?;
+                            let ty_obj = Ty::from_type_expr(t, *span)?;
                             // (EPIC-5 C2-2b-i) `a: Animal = Account(...)` — a raw
                             // struct into a polymorphic-base `Animal__` slot is
                             // WRAPPED in the right variant (replaces the C1 gate).
@@ -3409,7 +3409,7 @@ impl<'a> Codegen<'a> {
                                             if let Ty::Class(cls) = elem_ty.as_ref() {
                                                 if let Some(c) = self.ctx.classes.get(cls.as_str()) {
                                                     if let Some(f) = c.fields.iter().find(|f| &f.name == name) {
-                                                        Ty::from_type_expr(&f.ty).unwrap_or(Ty::Unknown)
+                                                        Ty::from_type_expr(&f.ty, f.span).unwrap_or(Ty::Unknown)
                                                     } else {
                                                         Ty::Unknown
                                                     }
@@ -3803,7 +3803,7 @@ impl<'a> Codegen<'a> {
                                 .find(|m| m.name == "__init__")
                                 .map(|m| m.params.iter()
                                     .filter(|p| p.name != "self")
-                                    .filter_map(|p| Ty::from_type_expr(&p.ty).ok().map(|t| (p.name.clone(), t)))
+                                    .filter_map(|p| Ty::from_type_expr(&p.ty, p.span).ok().map(|t| (p.name.clone(), t)))
                                     .collect())
                                 .unwrap_or_default();
                             let mut call_parts = Vec::new();
@@ -3882,7 +3882,7 @@ impl<'a> Codegen<'a> {
                                     })
                                 });
                             let default = if let Some(f) = field {
-                                let ty = Ty::from_type_expr(&f.ty)?;
+                                let ty = Ty::from_type_expr(&f.ty, f.span)?;
                                 self.zeroed_default(&ty)
                             } else {
                                 "Default::default()".to_string()

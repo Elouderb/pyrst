@@ -33,17 +33,7 @@ pub fn build(path: &Path) -> Result<()> {
     let bin_path = std::env::current_dir()?.join(stem);
     std::fs::write(&rs_path, rust)?;
 
-    // Try to find rustc in standard locations
-    let rustc_path = if let Ok(home) = std::env::var("HOME") {
-        let cargo_rustc = Path::new(&home).join(".cargo/bin/rustc");
-        if cargo_rustc.exists() {
-            cargo_rustc
-        } else {
-            Path::new("rustc").to_path_buf()
-        }
-    } else {
-        Path::new("rustc").to_path_buf()
-    };
+    let rustc_path = rustc_path();
 
     let status = Command::new(&rustc_path)
         .arg(&rs_path)
@@ -60,6 +50,114 @@ pub fn build(path: &Path) -> Result<()> {
 
     eprintln!("built: {}", bin_path.display());
     Ok(())
+}
+
+/// Locate `rustc`: prefer `~/.cargo/bin/rustc` (the rustup shim), else fall back
+/// to bare `rustc` on PATH. Shared by [`build`] and [`run_rust`] so the REPL's
+/// rustc invocation never drifts from the `build` command's.
+fn rustc_path() -> std::path::PathBuf {
+    if let Ok(home) = std::env::var("HOME") {
+        let cargo_rustc = Path::new(&home).join(".cargo/bin/rustc");
+        if cargo_rustc.exists() {
+            return cargo_rustc;
+        }
+    }
+    Path::new("rustc").to_path_buf()
+}
+
+/// A self-deleting temp path: removes the file at `path` on drop. Keeps the
+/// REPL's compile/run helpers from leaking temp `.py`/`.rs`/binary artifacts
+/// even on an early `?` return.
+struct TempArtifact {
+    path: std::path::PathBuf,
+}
+
+impl Drop for TempArtifact {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Build a unique-enough temp path in the system temp dir from `prefix`/`ext`,
+/// disambiguated by pid + a monotonically increasing counter so concurrent or
+/// rapid successive REPL evaluations never collide.
+fn unique_temp_path(prefix: &str, ext: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("{}-{}-{}.{}", prefix, std::process::id(), n, ext))
+}
+
+/// Compile pyrst SOURCE TEXT (not a path) to Rust source.
+///
+/// The REPL accumulates a session and recompiles the whole program on each
+/// input, so it needs a text-in / Rust-out entry point. The existing
+/// [`compile_to_rust`] is path-based (it goes through the import resolver, which
+/// reads a file and resolves `import` statements relative to that file's
+/// directory), so we materialize `source` to a temp `.py` and feed that path
+/// through the same resolve → typeck → codegen pipeline. The temp file is
+/// removed on return (including on the `?` error path) via [`TempArtifact`].
+///
+/// Imports in REPL input resolve relative to the temp dir, which generally has
+/// no sibling `.py` files — a documented limitation (the REPL targets compute /
+/// learning snippets, not multi-file projects).
+pub fn compile_str(source: &str) -> Result<String> {
+    let py_path = unique_temp_path("pyrst-repl", "py");
+    let _py_guard = TempArtifact { path: py_path.clone() };
+    std::fs::write(&py_path, source)?;
+    compile_to_rust(&py_path)
+}
+
+/// Compile `rust_source` with `rustc` and run the resulting binary, returning
+/// its captured STDOUT.
+///
+/// Mirrors [`build`]'s rustc invocation (same `--edition 2021`, same
+/// [`rustc_path`] lookup) so REPL evaluation matches the `build` command's
+/// semantics. On a rustc compile failure the captured stderr is returned as an
+/// [`Error::Rustc`]; on a non-zero exit from the user's program, the program's
+/// stderr is surfaced the same way. All temp artifacts (the `.rs` and the
+/// produced binary) are cleaned up on every exit path via [`TempArtifact`].
+pub fn run_rust(rust_source: &str) -> Result<String> {
+    let rs_path = unique_temp_path("pyrst-repl", "rs");
+    let _rs_guard = TempArtifact { path: rs_path.clone() };
+    std::fs::write(&rs_path, rust_source)?;
+
+    // Windows needs the `.exe` suffix; on Unix the bare path is the executable.
+    let bin_ext = if cfg!(windows) { "exe" } else { "bin" };
+    let bin_path = unique_temp_path("pyrst-repl", bin_ext);
+    let _bin_guard = TempArtifact { path: bin_path.clone() };
+
+    let rustc_path = rustc_path();
+    let compile = Command::new(&rustc_path)
+        .arg(&rs_path)
+        .arg("-o")
+        .arg(&bin_path)
+        .arg("--edition")
+        .arg("2021")
+        .output()
+        .map_err(|e| Error::Rustc(format!("failed to invoke rustc: {}", e)))?;
+
+    if !compile.status.success() {
+        let stderr = String::from_utf8_lossy(&compile.stderr);
+        return Err(Error::Rustc(format!(
+            "rustc exited with status {}\n{}",
+            compile.status, stderr
+        )));
+    }
+
+    let run = Command::new(&bin_path)
+        .output()
+        .map_err(|e| Error::Rustc(format!("failed to run compiled program: {}", e)))?;
+
+    if !run.status.success() {
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        return Err(Error::Rustc(format!(
+            "program exited with status {}\n{}",
+            run.status, stderr
+        )));
+    }
+
+    Ok(String::from_utf8_lossy(&run.stdout).into_owned())
 }
 
 pub fn fmt(path: &Path) -> Result<()> {

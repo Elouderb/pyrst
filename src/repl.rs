@@ -45,12 +45,14 @@ pub fn repl() -> Result<()> {
                 if io::stdin().read_line(&mut cont_line)? == 0 {
                     break;
                 }
-                let cont_trimmed = cont_line.trim();
-                if cont_trimmed.is_empty() {
+                // A blank (whitespace-only) line ends the block.
+                if cont_line.trim().is_empty() {
                     break;
                 }
                 full_input.push('\n');
-                full_input.push_str(cont_trimmed);
+                // Preserve leading indentation (so `def`/`class`/`if` bodies keep
+                // their block structure); drop only the trailing newline.
+                full_input.push_str(cont_line.trim_end());
             }
         }
 
@@ -92,7 +94,18 @@ fn classify(module: &Module) -> Classified {
     if module.stmts.len() == 1 {
         match &module.stmts[0] {
             Stmt::Func(_) | Stmt::Class(_) | Stmt::Import { .. } => return Classified::Decl,
-            Stmt::Expr(_) => return Classified::BareExpr,
+            // A bare CALL (`print(x)`, `f(3)`) runs as a statement — its own output
+            // shows and a returned value is discarded. Wrapping it in `print(...)`
+            // would double-print (`print(print(x))` → `()` isn't Display → E0277).
+            // A bare VALUE expression (`2 + 3`, `x`, `x == y`) IS wrapped so its
+            // value is shown.
+            Stmt::Expr(e) => {
+                return if matches!(e, crate::ast::Expr::Call { .. }) {
+                    Classified::Stmt
+                } else {
+                    Classified::BareExpr
+                };
+            }
             _ => return Classified::Stmt,
         }
     }
@@ -273,9 +286,10 @@ mod tests {
     }
 
     #[test]
-    fn classify_call_expr_is_bare_expr() {
-        // A bare call expression — its value should be printed.
-        assert_eq!(classify_src("f(3)"), Classified::BareExpr);
+    fn classify_call_expr_runs_as_stmt() {
+        // A bare call runs as a statement (its output shows; a returned value is
+        // discarded) — it is NOT wrapped in print(), which would double-print.
+        assert_eq!(classify_src("f(3)"), Classified::Stmt);
     }
 
     #[test]
@@ -286,10 +300,10 @@ mod tests {
     }
 
     #[test]
-    fn classify_print_call_is_bare_expr() {
-        // `print(x)` is itself a bare expression statement; it is NOT double-wrapped
-        // (the BareExpr path wraps the SOURCE, but a print call already shows output).
-        assert_eq!(classify_src("print(x)"), Classified::BareExpr);
+    fn classify_print_call_runs_as_stmt() {
+        // `print(x)` runs as-is; classifying it as a statement avoids the
+        // print(print(x)) double-wrap (which fails to compile: () isn't Display).
+        assert_eq!(classify_src("print(x)"), Classified::Stmt);
     }
 
     #[test]

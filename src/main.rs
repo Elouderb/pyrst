@@ -73,7 +73,12 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            let source = std::fs::read_to_string(&path).ok();
+            // Normalize line endings here too: the lexer saw the resolver's
+            // normalized source, so the renderer must read the SAME normalized
+            // text or CRLF files would render carets at desynced columns.
+            let source = std::fs::read_to_string(&path)
+                .ok()
+                .map(|s| lexer::normalize_line_endings(&s));
             let formatted = e.format_with_source(source.as_deref());
             eprintln!("{}", formatted);
             ExitCode::FAILURE

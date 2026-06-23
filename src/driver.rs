@@ -63,7 +63,9 @@ pub fn build(path: &Path) -> Result<()> {
 }
 
 pub fn fmt(path: &Path) -> Result<()> {
-    let source = std::fs::read_to_string(path)?;
+    // Normalize CRLF / bare CR -> LF at the read site so the lexer (via parse)
+    // and any diagnostic snippet operate on byte-identical `\n`-only text.
+    let source = crate::lexer::normalize_line_endings(&std::fs::read_to_string(path)?);
 
     // The lexer discards comments, so reformatting would silently delete them.
     // Until comment attachment exists, refuse rather than destroy user code.
@@ -125,7 +127,8 @@ fn write_atomic(path: &Path, contents: &str) -> Result<()> {
 }
 
 pub fn lint(path: &Path) -> Result<()> {
-    let source = std::fs::read_to_string(path)?;
+    // Normalize CRLF / bare CR -> LF at the read site (see fmt/resolver).
+    let source = crate::lexer::normalize_line_endings(&std::fs::read_to_string(path)?);
     let module = crate::parser::parse(&source)?;
     let lints = crate::linter::lint(&module);
 

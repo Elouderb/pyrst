@@ -1,5 +1,23 @@
 use crate::diag::{Error, Result, Span};
 
+/// Normalize platform line endings to a single `\n`.
+///
+/// `\r\n` (Windows/CRLF) collapses to `\n` and any remaining bare `\r`
+/// (classic-Mac) also becomes `\n`. This MUST be applied at the point each
+/// source string is READ FROM A FILE, before it is lexed AND before it is
+/// stored for error rendering, so the lexer's byte/line/col spans and the
+/// diagnostic renderer's `source.lines()` view operate on byte-identical text.
+/// Normalizing inside `lex` alone would desync caret columns from a renderer
+/// that holds the raw (still-CRLF) source.
+///
+/// `\n`-only input is returned untouched in spirit (the two `replace`s are
+/// no-ops), so LF files are unaffected.
+pub fn normalize_line_endings(src: &str) -> String {
+    // Order matters: collapse CRLF first so a `\r\n` does not leave a stray
+    // `\n` behind, then map any lone `\r` (old-Mac) to `\n`.
+    src.replace("\r\n", "\n").replace('\r', "\n")
+}
+
 fn split_fstr_spec(s: &str) -> (String, Option<String>) {
     let mut depth = 0;
     for (i, c) in s.char_indices() {
@@ -89,6 +107,8 @@ pub enum Tok {
     AmpAssign,    // &=
     PipeAssign,   // |=
     CaretAssign,  // ^=
+    LShiftAssign, // <<=
+    RShiftAssign, // >>=
     Plus,
     Minus,
     Star,
@@ -558,6 +578,11 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
         let (tok, len) = match three {
             Some((b'*', b'*', b'=')) => (Tok::DoubleStarAssign, 3),
             Some((b'/', b'/', b'=')) => (Tok::DoubleSlashAssign, 3),
+            // `<<=` / `>>=` MUST be checked before the 2-char `<<` / `>>` cases
+            // below, or the shift token would be emitted and the trailing `=`
+            // would parse as a separate assignment.
+            Some((b'<', b'<', b'=')) => (Tok::LShiftAssign, 3),
+            Some((b'>', b'>', b'=')) => (Tok::RShiftAssign, 3),
             _ => match two {
                 Some((b'-', b'>')) => (Tok::Arrow, 2),
                 Some((b'=', b'=')) => (Tok::Eq, 2),
@@ -768,5 +793,90 @@ mod tests {
         assert!(matches!(toks[0], Tok::Ident(ref s) if s == "x"));
         assert!(matches!(toks[1], Tok::Assign));
         assert!(matches!(toks[2], Tok::Str(ref s) if s == "hi\n"));
+    }
+
+    // ───────── EPIC-10 Card 1 Part A: CRLF / bare-CR normalization ─────────
+
+    /// Normalizing CRLF (`\r\n`) yields exactly the LF text, so a Windows-saved
+    /// file lexes identically — same token KINDS and same SPANS (line/col/byte) —
+    /// to its LF twin. Equal spans is the property that keeps error carets
+    /// correctly positioned, since the renderer indexes source by span.line/col.
+    #[test]
+    fn crlf_normalizes_and_lexes_identically_to_lf() {
+        let lf = "a = 1\nb = 2\n";
+        let crlf = "a = 1\r\nb = 2\r\n";
+
+        // The normalizer reproduces the LF text byte-for-byte.
+        assert_eq!(normalize_line_endings(crlf), lf);
+
+        // And lexing the normalized CRLF gives the same tokens AND spans as LF.
+        let lf_tokens = lex(lf).unwrap();
+        let crlf_tokens = lex(&normalize_line_endings(crlf)).unwrap();
+        assert_eq!(lf_tokens.len(), crlf_tokens.len());
+        for (a, b) in lf_tokens.iter().zip(crlf_tokens.iter()) {
+            assert_eq!(a.tok, b.tok, "token kinds must match");
+            assert_eq!(a.span.start, b.span.start, "byte start must match");
+            assert_eq!(a.span.end, b.span.end, "byte end must match");
+            assert_eq!(a.span.line, b.span.line, "line must match");
+            assert_eq!(a.span.col, b.span.col, "col must match");
+        }
+    }
+
+    /// A bare `\r` (classic-Mac line ending) also normalizes to `\n` and lexes
+    /// identically to the LF twin. Without normalization the lexer's catch-all
+    /// would reject `\r` as an unexpected character.
+    #[test]
+    fn bare_cr_normalizes_and_lexes_identically_to_lf() {
+        let lf = "a = 1\nb = 2\n";
+        let cr = "a = 1\rb = 2\r";
+
+        assert_eq!(normalize_line_endings(cr), lf);
+
+        // Raw bare-CR source fails to lex today (catch-all rejects '\r')...
+        assert!(lex(cr).is_err(), "raw bare-CR must fail to lex without normalization");
+        // ...but the normalized form matches the LF token stream exactly.
+        let lf_tokens = lex(lf).unwrap();
+        let cr_tokens = lex(&normalize_line_endings(cr)).unwrap();
+        assert_eq!(lf_tokens.len(), cr_tokens.len());
+        for (a, b) in lf_tokens.iter().zip(cr_tokens.iter()) {
+            assert_eq!(a.tok, b.tok);
+            assert_eq!(a.span.start, b.span.start);
+            assert_eq!(a.span.line, b.span.line);
+            assert_eq!(a.span.col, b.span.col);
+        }
+    }
+
+    /// LF-only source is unaffected by the normalizer (no spurious rewrites).
+    #[test]
+    fn lf_source_passes_through_unchanged() {
+        let lf = "def main() -> None:\n    x: int = 1\n";
+        assert_eq!(normalize_line_endings(lf), lf);
+    }
+
+    // ───────── EPIC-10 Card 1 Part B: new aug-assign operator tokens ─────────
+
+    /// All six previously-missing augmented-assignment operators lex to their
+    /// dedicated single tokens. `<<=` / `>>=` must lex as ONE 3-char token, not
+    /// a shift token followed by a stray `=` — the 3-char cases are checked
+    /// before the 2-char `<<` / `>>` cases.
+    #[test]
+    fn new_aug_assign_operators_lex() {
+        assert_eq!(kinds("x **= 2\n")[1], Tok::DoubleStarAssign);
+        assert_eq!(kinds("x &= 2\n")[1], Tok::AmpAssign);
+        assert_eq!(kinds("x |= 2\n")[1], Tok::PipeAssign);
+        assert_eq!(kinds("x ^= 2\n")[1], Tok::CaretAssign);
+        assert_eq!(kinds("x <<= 2\n")[1], Tok::LShiftAssign);
+        assert_eq!(kinds("x >>= 2\n")[1], Tok::RShiftAssign);
+
+        // Precedence guard: `<<=` is a single token, so the stream after the
+        // target ident is exactly [LShiftAssign, Int(2), Newline, Eof] — there
+        // is NO separate Assign token.
+        let toks = kinds("x <<= 2\n");
+        assert_eq!(toks[1], Tok::LShiftAssign);
+        assert_eq!(toks[2], Tok::Int(2));
+        assert!(!toks.contains(&Tok::Assign), "<<= must not split into << then =");
+        // And bare `<<` / `>>` still lex as the 2-char shift tokens.
+        assert_eq!(kinds("x << 2\n")[1], Tok::LShift);
+        assert_eq!(kinds("x >> 2\n")[1], Tok::RShift);
     }
 }

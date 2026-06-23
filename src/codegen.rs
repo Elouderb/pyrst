@@ -2521,12 +2521,42 @@ impl<'a> Codegen<'a> {
                             self.line(&format!("{} = __py_mod(({}), ({}));", target, target, v));
                         }
                     }
-                    _ => {
+                    BinOp::Pow => {
+                        // `x **= y` keeps `x`'s declared type (Python semantics),
+                        // unlike binary `**` whose oracle type is Float. Mirror the
+                        // operand-driven emission of the binary Pow arm:
+                        //   int target  -> __py_ipow (i64, panics on negative exp)
+                        //   float target-> f64 powf
+                        // so `12 **= 2` stays the int 144 and a float target stays float.
+                        if matches!(target_ty, Ty::Float) {
+                            self.line(&format!("{} = (({} as f64).powf({} as f64));", target, target, v));
+                        } else {
+                            self.line(&format!("{} = __py_ipow(({}), ({}));", target, target, v));
+                        }
+                    }
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div
+                    | BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor
+                    | BinOp::LShift | BinOp::RShift => {
+                        // Direct Rust compound-assignment. Bitwise/shift ops are
+                        // int-only in pyrst, so `&=`/`|=`/`^=`/`<<=`/`>>=` map 1:1.
                         let op_s = match op {
                             BinOp::Add => "+=", BinOp::Sub => "-=", BinOp::Mul => "*=", BinOp::Div => "/=",
-                            _ => "+=", // fallback for other ops
+                            BinOp::BitAnd => "&=", BinOp::BitOr => "|=", BinOp::BitXor => "^=",
+                            BinOp::LShift => "<<=", BinOp::RShift => ">>=",
+                            _ => unreachable!(),
                         };
                         self.line(&format!("{} {} {};", target, op_s, v));
+                    }
+                    // FloorDiv/Mod/Pow are handled by explicit arms above. No other
+                    // BinOp can reach an AugAssign target: comparison, logical,
+                    // identity, and membership operators are not augmented-assign
+                    // operators, so the parser never produces them here. Make an
+                    // unhandled op a hard error rather than silently miscompiling
+                    // (the previous `_ => "+="` fallback was a latent miscompile).
+                    BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+                    | BinOp::And | BinOp::Or
+                    | BinOp::Is | BinOp::IsNot | BinOp::In | BinOp::NotIn => {
+                        unreachable!("non-augmentable BinOp {:?} reached AugAssign codegen", op);
                     }
                 }
             }

@@ -60,15 +60,21 @@ impl Resolver {
         self.in_flight.insert(abs_path.clone());
         self.dfs_stack.push(abs_path.clone());
 
-        // Load and parse this file
-        let src = std::fs::read_to_string(&abs_path).map_err(|_| {
-            let importing_file = abs_path.file_stem().unwrap_or_default().to_string_lossy().to_string();
-            Error::ImportNotFound {
-                path: importing_file,
-                span: import_span,
-                importing_file: base_dir.display().to_string(),
-            }
-        })?;
+        // Load and parse this file. Normalize line endings (CRLF / bare CR -> LF)
+        // at the read site so the SAME `\n`-only text feeds both the lexer (spans)
+        // and the diagnostic renderer (this `src` is cached below and later paired
+        // into `Error::Sourced` via `with_render_source`); see
+        // `lexer::normalize_line_endings`.
+        let src = std::fs::read_to_string(&abs_path)
+            .map(|s| crate::lexer::normalize_line_endings(&s))
+            .map_err(|_| {
+                let importing_file = abs_path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+                Error::ImportNotFound {
+                    path: importing_file,
+                    span: import_span,
+                    importing_file: base_dir.display().to_string(),
+                }
+            })?;
 
         // EPIC-8: a parse error belongs to THIS file — pair its own source (and
         // path) so the snippet renders against the imported file, not the root.

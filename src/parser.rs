@@ -214,6 +214,12 @@ impl Parser {
                 Tok::SlashAssign => Some(BinOp::Div),
                 Tok::PercentAssign => Some(BinOp::Mod),
                 Tok::DoubleSlashAssign => Some(BinOp::FloorDiv),
+                Tok::DoubleStarAssign => Some(BinOp::Pow),
+                Tok::AmpAssign => Some(BinOp::BitAnd),
+                Tok::PipeAssign => Some(BinOp::BitOr),
+                Tok::CaretAssign => Some(BinOp::BitXor),
+                Tok::LShiftAssign => Some(BinOp::LShift),
+                Tok::RShiftAssign => Some(BinOp::RShift),
                 _ => None,
             };
             if let Some(op) = aug {
@@ -236,6 +242,12 @@ impl Parser {
             Tok::SlashAssign => Some(BinOp::Div),
             Tok::PercentAssign => Some(BinOp::Mod),
             Tok::DoubleSlashAssign => Some(BinOp::FloorDiv),
+            Tok::DoubleStarAssign => Some(BinOp::Pow),
+            Tok::AmpAssign => Some(BinOp::BitAnd),
+            Tok::PipeAssign => Some(BinOp::BitOr),
+            Tok::CaretAssign => Some(BinOp::BitXor),
+            Tok::LShiftAssign => Some(BinOp::LShift),
+            Tok::RShiftAssign => Some(BinOp::RShift),
             _ => None,
         };
 

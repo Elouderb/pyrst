@@ -12,12 +12,12 @@ states that a feature is supported, that claim is backed either by a row in
 PYTHON_COMPATIBILITY.md or by a passing program in the example corpus
 (`examples/*.py` with a golden `examples/expected/*.txt`), and usually both.
 
-**Corpus anchor (the ground truth this spec describes):** 191 passing example
+**Corpus anchor (the ground truth this spec describes):** 194 passing example
 programs (`examples/<name>.py`, each with a golden `examples/expected/<name>.txt`),
-plus 59 honest-rejection fixtures (`examples/fail_*.py`) and one multi-file
-negative scenario (`examples/multi_file_fail/`). The full pipeline (lexer →
-parser → resolver → type checker → Rust codegen → `rustc`) is exercised by these
-programs and by 199 in-crate `#[test]` cases.
+plus 64 honest-rejection fixtures (`examples/*fail*.py` — the `fail_*` and
+`set_fail_*` files) and one multi-file negative scenario (`examples/multi_file_fail/`).
+The full pipeline (lexer → parser → resolver → type checker → Rust codegen →
+`rustc`) is exercised by these programs and by 199 in-crate `#[test]` cases.
 
 ---
 
@@ -311,11 +311,9 @@ class Point:
 - Instance attributes must be declared and typed in the class body; direct field
   read `obj.field` and assignment `obj.field = value`.
 - Instance methods take an implicit `self`.
-- **`@staticmethod`** and **`@property`** are listed as supported in
-  PYTHON_COMPATIBILITY.md (`@staticmethod` = no-`self` methods; `@property` =
-  computed read-only attributes). *(Caveat: these two decorators are not
-  exercised by any current corpus example; treat them as compatibility-matrix
-  claims pending a golden.)*
+- **`@staticmethod`** and **`@property`** are supported (`@staticmethod` =
+  no-`self` methods, corpus: `staticmethod_demo.py`; `@property` = computed
+  read-only attributes, corpus: `property_demo.py`).
 - **`@dataclass`** is supported (corpus: `dataclass_demo.py`).
 - `@classmethod` is effectively unsupported: the `cls` parameter cannot be
   cleanly annotated. Use `@staticmethod` or a module-level function.
@@ -454,9 +452,8 @@ exponentiation. `int ** int → float` (Python semantics).
 `and`/`or` short-circuit left-to-right (Python semantics).
 
 ### Comparison chaining — **supported**
-`a < b < c` is supported with Python semantics (`a < b and b < c`), per
-PYTHON_COMPATIBILITY.md. *(Caveat: not exercised by any current corpus example;
-treat as a compatibility-matrix claim pending a golden.)*
+`a < b < c` is supported with Python semantics (`a < b and b < c`), corpus:
+`comparison_chain.py`.
 
 ### Operator overloading — **supported**
 Dunder methods are honored: `__add__`, `__sub__`, `__mul__`, `__eq__`, `__lt__`,
@@ -799,9 +796,8 @@ Throughout, when a Python construct cannot be lowered faithfully, pyrst emits a
 **clean diagnostic** — a lex / parse / typeck / codegen error with a source span,
 context lines, visual carets, and (where applicable) a named remedy — rather than
 emitting wrong-but-compiling Rust or leaking a raw `rustc` failure. The
-honest-rejection corpus (`examples/fail_*.py`, 59 fixtures, plus
-`examples/multi_file_fail/`) pins these errors. See [ERRORS.md](ERRORS.md) for the
-diagnostics philosophy.
+honest-rejection corpus (`examples/*fail*.py`, 64 fixtures, plus
+`examples/multi_file_fail/`) pins these errors.
 
 ---
 

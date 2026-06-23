@@ -2723,6 +2723,146 @@ impl<'a> Codegen<'a> {
                 // Silently drop imports in v0
             }
             Stmt::Try { body, handlers, else_, finally_, .. } => {
+                self.emit_try(body, handlers, else_, finally_)?;
+            }
+            Stmt::With { ctx_expr, as_name, body, .. } => {
+                let ctx_s = self.emit_expr(ctx_expr)?;
+                self.line("{");
+                self.indent += 1;
+                // The bound name is block-scoped in the generated Rust, so save and
+                // restore the outer locals entry around the body (mirrors for-loop).
+                let saved = if let Some(name) = as_name {
+                    // Register the bound type (e.g. open() -> File) so method calls
+                    // on it (f.write/read) resolve to the right emission.
+                    let prev = self.locals.get(name).cloned();
+                    self.locals.insert(name.clone(), self.type_of_expr(ctx_expr));
+                    // (EPIC-6) `with ... as <name>:` binds a user local; escape the
+                    // emitted name (raw stays the `locals` key).
+                    self.line(&format!("let mut {} = {};", escape_ident(name), ctx_s));
+                    Some((name.clone(), prev))
+                } else {
+                    self.line(&format!("let _ = {};", ctx_s));
+                    None
+                };
+                for s in body { self.emit_stmt(s)?; }
+                if let Some((name, prev)) = saved {
+                    match prev {
+                        Some(ty) => { self.locals.insert(name, ty); }
+                        None => { self.locals.remove(name.as_str()); }
+                    }
+                }
+                self.indent -= 1;
+                self.line("}");
+            }
+            Stmt::Del { target, .. } => {
+                let t = self.emit_expr(target)?;
+                self.line(&format!("drop({});", t));
+            }
+            Stmt::AttrAssign { obj, attr, value, .. } => {
+                // (EPIC-5 C2-2b-i) A field-WRITE through a polymorphic-base var
+                // (`a.balance = ...` where `a: Account` and Account has subclasses)
+                // would target a `B__` enum, which has no fields. A mutating
+                // accessor on the companion enum is a deferred follow-on — refuse
+                // honestly rather than miscompile. `self.field = ...` inside a
+                // method is EXEMPT: `self` is the concrete struct (the method body
+                // runs on a `Account`/`Savings`, not `Account__`), so the write is
+                // an ordinary in-place struct-field store.
+                if !matches!(obj.as_ref(),
+                             Expr::Ident(n, _) if n == "self"
+                                 || self.concrete_struct_params.contains(n)) {
+                    if let Ty::Class(b) = self.type_of_expr(obj) {
+                        if self.is_polymorphic_base(&b) {
+                            return Err(crate::diag::Error::Codegen(format!(
+                                "writing field `{}` through a polymorphic-base `{}` variable \
+                                 is not yet supported — a mutating field accessor on the \
+                                 companion enum is a deferred follow-on (read-only base-field \
+                                 access is supported)",
+                                attr, b
+                            )));
+                        }
+                    }
+                }
+                let v = self.emit_consuming(value)?;
+                // The base must be emitted as a *place* (lvalue), not the
+                // clone-based rvalue emit_expr produces for Attr/Index.
+                let place = self.emit_place(obj)?;
+                // (EPIC-6) Escape a keyword field name in the field-WRITE target so
+                // it matches the (escaped) struct field def.
+                self.line(&format!("{}.{} = {};", place, escape_ident(attr), v));
+            }
+            Stmt::IndexAssign { obj, idx, value, .. } => {
+                let v = self.emit_consuming(value)?;
+                let place = self.emit_place(obj)?;
+                // Dispatch on the base's collection kind (dict -> HashMap::insert,
+                // list -> indexed store). type_of_expr resolves chained bases
+                // (self.dict, grid[r], ...), not just bare locals.
+                let is_dict = matches!(self.type_of_expr(obj), Ty::Dict(..));
+                if is_dict {
+                    // HashMap::insert takes ownership of the key, so emit it owned
+                    // (a String key var becomes `k.clone()`; Copy keys are unchanged).
+                    let k = self.emit_consuming(idx)?;
+                    self.line(&format!("{}.insert({}, {});", place, k, v));
+                } else {
+                    let i = self.emit_expr(idx)?;
+                    self.line(&format!("{}[{} as usize] = {};", place, i, v));
+                }
+            }
+            Stmt::Match { subject, arms, .. } => {
+                // Clone (do not move) a non-Copy scrutinee place so it stays usable
+                // after the match — uniform clone-on-use.
+                let subj = self.emit_consuming(subject)?;
+                let temp_var = "__match_val".to_string();
+                self.line(&format!("let {} = {};", temp_var, subj));
+
+                // Emit as if/else chain
+                let mut first = true;
+                for (idx, arm) in arms.iter().enumerate() {
+                    let is_last = idx == arms.len() - 1;
+                    let is_catchall = matches!(&arm.pattern, crate::ast::MatchPattern::Wildcard | crate::ast::MatchPattern::Capture(_));
+
+                    let cond = self.emit_pattern_cond(&temp_var, &arm.pattern)?;
+                    let guard_str = if let Some(guard) = &arm.guard {
+                        let g = self.emit_expr(guard)?;
+                        format!(" && {}", g)
+                    } else {
+                        String::new()
+                    };
+
+                    if first {
+                        self.line(&format!("if {}{} {{", cond, guard_str));
+                        first = false;
+                    } else if is_last && is_catchall && guard_str.is_empty() {
+                        // Last arm is catchall without guard — emit as plain else
+                        self.line("} else {");
+                    } else {
+                        self.line(&format!("}} else if {}{} {{", cond, guard_str));
+                    }
+                    self.indent += 1;
+                    for s in &arm.body {
+                        self.emit_stmt(s)?;
+                    }
+                    self.indent -= 1;
+                }
+                if !first {
+                    self.line("}");
+                }
+            }
+            Stmt::Func(_) | Stmt::Class(_) => {
+                // Nested functions/classes — punt.
+                self.line("// TODO: nested function/class");
+            }
+        }
+        Ok(())
+    }
+
+
+    fn emit_try(
+        &mut self,
+        body: &[Stmt],
+        handlers: &[ExceptHandler],
+        else_: &Option<Vec<Stmt>>,
+        finally_: &Option<Vec<Stmt>>,
+    ) -> Result<()> {
                 self.line("{");
                 self.indent += 1;
 
@@ -2879,137 +3019,1388 @@ impl<'a> Codegen<'a> {
 
                 self.indent -= 1;
                 self.line("}");
-            }
-            Stmt::With { ctx_expr, as_name, body, .. } => {
-                let ctx_s = self.emit_expr(ctx_expr)?;
-                self.line("{");
-                self.indent += 1;
-                // The bound name is block-scoped in the generated Rust, so save and
-                // restore the outer locals entry around the body (mirrors for-loop).
-                let saved = if let Some(name) = as_name {
-                    // Register the bound type (e.g. open() -> File) so method calls
-                    // on it (f.write/read) resolve to the right emission.
-                    let prev = self.locals.get(name).cloned();
-                    self.locals.insert(name.clone(), self.type_of_expr(ctx_expr));
-                    // (EPIC-6) `with ... as <name>:` binds a user local; escape the
-                    // emitted name (raw stays the `locals` key).
-                    self.line(&format!("let mut {} = {};", escape_ident(name), ctx_s));
-                    Some((name.clone(), prev))
-                } else {
-                    self.line(&format!("let _ = {};", ctx_s));
-                    None
-                };
-                for s in body { self.emit_stmt(s)?; }
-                if let Some((name, prev)) = saved {
-                    match prev {
-                        Some(ty) => { self.locals.insert(name, ty); }
-                        None => { self.locals.remove(name.as_str()); }
-                    }
-                }
-                self.indent -= 1;
-                self.line("}");
-            }
-            Stmt::Del { target, .. } => {
-                let t = self.emit_expr(target)?;
-                self.line(&format!("drop({});", t));
-            }
-            Stmt::AttrAssign { obj, attr, value, .. } => {
-                // (EPIC-5 C2-2b-i) A field-WRITE through a polymorphic-base var
-                // (`a.balance = ...` where `a: Account` and Account has subclasses)
-                // would target a `B__` enum, which has no fields. A mutating
-                // accessor on the companion enum is a deferred follow-on — refuse
-                // honestly rather than miscompile. `self.field = ...` inside a
-                // method is EXEMPT: `self` is the concrete struct (the method body
-                // runs on a `Account`/`Savings`, not `Account__`), so the write is
-                // an ordinary in-place struct-field store.
-                if !matches!(obj.as_ref(),
-                             Expr::Ident(n, _) if n == "self"
-                                 || self.concrete_struct_params.contains(n)) {
-                    if let Ty::Class(b) = self.type_of_expr(obj) {
-                        if self.is_polymorphic_base(&b) {
-                            return Err(crate::diag::Error::Codegen(format!(
-                                "writing field `{}` through a polymorphic-base `{}` variable \
-                                 is not yet supported — a mutating field accessor on the \
-                                 companion enum is a deferred follow-on (read-only base-field \
-                                 access is supported)",
-                                attr, b
-                            )));
-                        }
-                    }
-                }
-                let v = self.emit_consuming(value)?;
-                // The base must be emitted as a *place* (lvalue), not the
-                // clone-based rvalue emit_expr produces for Attr/Index.
-                let place = self.emit_place(obj)?;
-                // (EPIC-6) Escape a keyword field name in the field-WRITE target so
-                // it matches the (escaped) struct field def.
-                self.line(&format!("{}.{} = {};", place, escape_ident(attr), v));
-            }
-            Stmt::IndexAssign { obj, idx, value, .. } => {
-                let v = self.emit_consuming(value)?;
-                let place = self.emit_place(obj)?;
-                // Dispatch on the base's collection kind (dict -> HashMap::insert,
-                // list -> indexed store). type_of_expr resolves chained bases
-                // (self.dict, grid[r], ...), not just bare locals.
-                let is_dict = matches!(self.type_of_expr(obj), Ty::Dict(..));
-                if is_dict {
-                    // HashMap::insert takes ownership of the key, so emit it owned
-                    // (a String key var becomes `k.clone()`; Copy keys are unchanged).
-                    let k = self.emit_consuming(idx)?;
-                    self.line(&format!("{}.insert({}, {});", place, k, v));
-                } else {
-                    let i = self.emit_expr(idx)?;
-                    self.line(&format!("{}[{} as usize] = {};", place, i, v));
-                }
-            }
-            Stmt::Match { subject, arms, .. } => {
-                // Clone (do not move) a non-Copy scrutinee place so it stays usable
-                // after the match — uniform clone-on-use.
-                let subj = self.emit_consuming(subject)?;
-                let temp_var = "__match_val".to_string();
-                self.line(&format!("let {} = {};", temp_var, subj));
-
-                // Emit as if/else chain
-                let mut first = true;
-                for (idx, arm) in arms.iter().enumerate() {
-                    let is_last = idx == arms.len() - 1;
-                    let is_catchall = matches!(&arm.pattern, crate::ast::MatchPattern::Wildcard | crate::ast::MatchPattern::Capture(_));
-
-                    let cond = self.emit_pattern_cond(&temp_var, &arm.pattern)?;
-                    let guard_str = if let Some(guard) = &arm.guard {
-                        let g = self.emit_expr(guard)?;
-                        format!(" && {}", g)
-                    } else {
-                        String::new()
-                    };
-
-                    if first {
-                        self.line(&format!("if {}{} {{", cond, guard_str));
-                        first = false;
-                    } else if is_last && is_catchall && guard_str.is_empty() {
-                        // Last arm is catchall without guard — emit as plain else
-                        self.line("} else {");
-                    } else {
-                        self.line(&format!("}} else if {}{} {{", cond, guard_str));
-                    }
-                    self.indent += 1;
-                    for s in &arm.body {
-                        self.emit_stmt(s)?;
-                    }
-                    self.indent -= 1;
-                }
-                if !first {
-                    self.line("}");
-                }
-            }
-            Stmt::Func(_) | Stmt::Class(_) => {
-                // Nested functions/classes — punt.
-                self.line("// TODO: nested function/class");
-            }
-        }
         Ok(())
     }
 
+    // The body of this helper is moved verbatim from the former `Expr::Call`
+    // arm of `emit_expr`, whose match binding typed `callee`/`args`/`kwargs` as
+    // `&Box<Expr>` / `&Vec<_>`. Keeping those exact parameter types lets the
+    // moved code (`callee.as_ref()`, `args[..]`, `kwargs.iter()`, ...) compile
+    // unchanged, so the emitted Rust is byte-for-byte identical.
+    #[allow(clippy::borrowed_box)]
+    fn emit_call(
+        &mut self,
+        callee: &Box<Expr>,
+        args: &[Expr],
+        kwargs: &[(String, Expr)],
+    ) -> Result<String> {
+                if let Some(__s) = self.emit_builtin_call(callee, args, kwargs)? { return Ok(__s); }
+
+                if let Some(__s) = self.emit_constructor_call(callee, args, kwargs)? { return Ok(__s); }
+
+                if let Some(__s) = self.emit_super_method_call(callee, args)? { return Ok(__s); }
+
+                if let Some(__s) = self.emit_method_call_on_attr(callee, args)? { return Ok(__s); }
+
+                // Regular function call (not a class).
+                // (EPIC-5) Look up the callee signature so an argument flowing
+                // into an `Optional[T]` parameter is wrapped (`Some(..)` for a
+                // bare value, `None` for the None literal, pass-through for an
+                // already-Optional value) — the same coercion as assignment and
+                // return. Methods / unknown callees keep the bare emission.
+                let param_tys: Vec<Ty> = if let Expr::Ident(n, _) = callee.as_ref() {
+                    self.ctx.funcs.get(n.as_str())
+                        .map(|sig| sig.params.iter().map(|(_, t)| t.clone()).collect())
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                // (EPIC-4 V2-c) Per-arg by-reference (`Mut[T]`) flags for this
+                // free-function callee. Parallel to `args` (free functions have no
+                // `self`, so `param_by_ref[i]` lines up with `args[i]` directly).
+                let param_by_ref: Vec<bool> = if let Expr::Ident(n, _) = callee.as_ref() {
+                    self.ctx.funcs.get(n.as_str())
+                        .map(|sig| sig.param_by_ref.clone())
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                let mut parts = Vec::with_capacity(args.len());
+                for (i, a) in args.iter().enumerate() {
+                    if param_by_ref.get(i).copied().unwrap_or(false) {
+                        // By-reference arg: borrow the caller's PLACE so the
+                        // callee's mutation persists. typeck already required `a`
+                        // to be a place (Ident/Attr/Index), so `emit_place` is
+                        // valid and `&mut` of it is a sound mutable borrow. No
+                        // clone, no Option coercion — we pass the storage itself.
+                        // `byref_borrow` emits an explicit reborrow (`&mut *x`)
+                        // when `a` names one of this function's own `&mut T`
+                        // params (forwarded-by-reference, e.g. a recursive call),
+                        // avoiding the E0596 double-`&mut`.
+                        let place = self.emit_place(a)?;
+                        parts.push(self.byref_borrow(a, &place));
+                        continue;
+                    }
+                    // (EPIC-5 C2-2b-i) A raw-struct argument into a polymorphic-base
+                    // parameter (`feed(dog)` where `feed(a: Animal)`) is WRAPPED in
+                    // the right `Animal__` variant (replaces the C1 gate). A
+                    // non-polymorphic param keeps the clone-on-use emission.
+                    let s = match param_tys.get(i) {
+                        Some(pt) if self.ty_has_poly_base(pt) => self.emit_into_base_slot(a, pt)?,
+                        _ => self.emit_consuming(a)?,
+                    };
+                    let s = match param_tys.get(i) {
+                        Some(pt) => self.coerce_to_option(s, a, pt),
+                        None => s,
+                    };
+                    parts.push(s);
+                }
+
+                // Inject default arguments for named functions
+                if let Expr::Ident(n, _) = callee.as_ref() {
+                    if let Some(sig) = self.ctx.funcs.get(n.as_str()).cloned() {
+                        let expected = sig.params.len();
+                        if parts.len() < expected && !sig.param_defaults.is_empty() {
+                            let defaults_needed = expected - parts.len();
+                            let defaults_start = sig.param_defaults.len().saturating_sub(defaults_needed);
+                            for def_expr in &sig.param_defaults[defaults_start..] {
+                                match def_expr {
+                                    Some(e) => parts.push(self.emit_expr(e)?),
+                                    None => return Err(crate::diag::Error::Codegen("missing required argument".into())),
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let callee_s = self.emit_expr(callee)?;
+                // Parenthesize lambda expressions when used as callees
+                let callee_s = if matches!(callee.as_ref(), Expr::Lambda { .. }) {
+                    format!("({})", callee_s)
+                } else {
+                    callee_s
+                };
+
+                // kwargs on a non-class call site are an error in v0.
+                if !kwargs.is_empty() {
+                    return Err(crate::diag::Error::Codegen(
+                        "keyword arguments are only supported for class constructors in v0".into()
+                    ));
+                }
+
+                Ok(format!("{}({})", callee_s, parts.join(", ")))
+    }
+
+    #[allow(clippy::borrowed_box)]
+    fn emit_method_call_on_attr(
+        &mut self,
+        callee: &Box<Expr>,
+        args: &[Expr],
+    ) -> Result<Option<String>> {
+                // Method call with attribute callee — handle method name remapping
+                if let Expr::Attr { obj, name, .. } = callee.as_ref() {
+                    // Math module functions
+                    if let Expr::Ident(modname, _) = obj.as_ref() {
+                        if modname == "math" {
+                            let parts: Result<Vec<_>> = args.iter().map(|a| self.emit_consuming(a)).collect();
+                            let parts = parts?;
+                            let a0 = parts.get(0).map(|s| s.as_str()).unwrap_or("0.0");
+                            let a1 = parts.get(1).map(|s| s.as_str()).unwrap_or("0.0");
+                            return Ok(Some(match name.as_str() {
+                                "sqrt"     => format!("({} as f64).sqrt()", a0),
+                                "floor"    => format!("({} as f64).floor()", a0),
+                                "ceil"     => format!("({} as f64).ceil()", a0),
+                                "trunc"    => format!("({} as f64).trunc()", a0),
+                                "fabs" | "abs" => format!("({} as f64).abs()", a0),
+                                "exp"      => format!("({} as f64).exp()", a0),
+                                "log"      => if parts.len() == 2 { format!("({} as f64).log({} as f64)", a0, a1) } else { format!("({} as f64).ln()", a0) },
+                                "log2"     => format!("({} as f64).log2()", a0),
+                                "log10"    => format!("({} as f64).log10()", a0),
+                                "sin"      => format!("({} as f64).sin()", a0),
+                                "cos"      => format!("({} as f64).cos()", a0),
+                                "tan"      => format!("({} as f64).tan()", a0),
+                                "asin"     => format!("({} as f64).asin()", a0),
+                                "acos"     => format!("({} as f64).acos()", a0),
+                                "atan"     => format!("({} as f64).atan()", a0),
+                                "atan2"    => format!("({} as f64).atan2({} as f64)", a0, a1),
+                                "pow"      => format!("({} as f64).powf({} as f64)", a0, a1),
+                                "hypot"    => format!("({} as f64).hypot({} as f64)", a0, a1),
+                                "degrees"  => format!("({} as f64).to_degrees()", a0),
+                                "radians"  => format!("({} as f64).to_radians()", a0),
+                                "isnan"    => format!("({} as f64).is_nan()", a0),
+                                "isinf"    => format!("({} as f64).is_infinite()", a0),
+                                "isfinite" => format!("({} as f64).is_finite()", a0),
+                                _ => return Err(crate::diag::Error::Codegen(format!("unknown math function: math.{}", name))),
+                            }));
+                        }
+                    }
+
+                    // Check for static method calls: ClassName.method(args)
+                    if let Expr::Ident(class_name, _) = obj.as_ref() {
+                        if let Some(class_def) = self.ctx.classes.get(class_name.as_str()) {
+                            if let Some(method_def) = class_def.methods.iter().find(|m| &m.name == name) {
+                                if method_def.decorators.contains(&"staticmethod".to_string()) {
+                                    let parts: Result<Vec<_>> = args.iter().map(|a| self.emit_consuming(a)).collect();
+                                    let parts = parts?;
+                                    return Ok(Some(format!("{}::{}({})", class_name, name, parts.join(", "))));
+                                }
+                            }
+                        }
+                    }
+
+                    // Mutating list/set/dict methods need an lvalue receiver. For
+                    // a *subscripted* receiver (`self.rows[i].append(x)`,
+                    // `grid[r].sort()`) emit_expr would produce a clone-based
+                    // rvalue, so the mutation would hit (and drop) a temporary.
+                    // Use emit_place for those so the in-place mutation lands on
+                    // the real element. Bare-name and `self.field` receivers are
+                    // already place expressions under emit_expr.
+                    // MUTATING_METHODS is the module-level const above.
+                    let obj_s = if matches!(obj.as_ref(), Expr::Index { .. })
+                        && MUTATING_METHODS.contains(&name.as_str())
+                    {
+                        self.emit_place(obj)?
+                    } else {
+                        self.emit_expr(obj)?
+                    };
+                    let method = match name.as_str() {
+                        // String methods
+                        "upper"      => "to_uppercase",
+                        "lower"      => "to_lowercase",
+                        "strip"      => "trim",
+                        "lstrip"     => "trim_start",
+                        "rstrip"     => "trim_end",
+                        // List methods
+                        "append"     => "push",
+                        "pop"        => "pop().unwrap",
+                        // passthrough
+                        other        => other,
+                    };
+                    let parts: Result<Vec<_>> = args.iter().map(|a| self.emit_consuming(a)).collect();
+                    let parts = parts?;
+
+                    // (EPIC-6) Receiver-type-guarded early return. The builtin
+                    // method arms below match purely on `name` with NO receiver
+                    // guard on most of them (`get`, `keys`, `values`, `items`,
+                    // `update`, `pop`, `copy`, `clear`, `append`, `extend`,
+                    // `insert`, `remove`, `sort`, ...). So a USER class that
+                    // defines a method with one of those names previously had
+                    // `instance.get(k)` silently lowered to a dict
+                    // `.get(&k).cloned()` (wrong Rust / wrong behavior / a
+                    // compile error) — the builtin arm won because it ran BEFORE
+                    // the user-method tail. Guard it here: if the receiver's
+                    // static type is a user class that HAS an instance method
+                    // named `name` (resolved via `get_method`, walking the
+                    // inheritance chain — the SAME lookup the user-method tail
+                    // uses), dispatch to that user method NOW and return,
+                    // bypassing every builtin arm. A builtin receiver
+                    // (str/list/dict/set/file) is never `Ty::Class`, so the
+                    // guard never fires for it and the builtin arms below run
+                    // byte-for-byte unchanged. A polymorphic-base receiver
+                    // composes too: `cls` is the base name, `get_method` returns
+                    // the base's signature, and `obj_s.name(..)` resolves to the
+                    // companion enum `cls__`'s dispatch method — identical to the
+                    // pre-existing EPIC-5 lowering.
+                    if let Ty::Class(cls) = self.type_of_expr(obj.as_ref()) {
+                        if self.ctx.get_method(&cls, name).is_some() {
+                            return self.emit_user_method_call(&obj_s, &cls, name, args, &parts).map(Some);
+                        }
+                    }
+
+                    // Special handling for string methods that return &str and need to be converted to String
+                    if matches!(name.as_str(), "strip" | "lstrip" | "rstrip") {
+                        return Ok(Some(format!("{}.{}().to_string()", obj_s, method)));
+                    }
+
+                    // Special case: split()
+                    if name == "split" {
+                        return if args.is_empty() {
+                            Ok(Some(format!("{}.split_whitespace().map(|s| s.to_string()).collect::<Vec<_>>()", obj_s)))
+                        } else {
+                            let sep = parts[0].clone();
+                            Ok(Some(format!("{}.split({}.as_str()).map(|s| s.to_string()).collect::<Vec<_>>()", obj_s, sep)))
+                        };
+                    }
+
+                    // Special case: join()
+                    if name == "join" {
+                        return Ok(Some(format!("{}.join(&{})", parts[0], obj_s)));
+                    }
+
+                    // Special case: len() as method
+                    if name == "len" {
+                        // str length is character count, not UTF-8 byte count.
+                        if matches!(self.type_of_expr(obj.as_ref()), Ty::Str) {
+                            return Ok(Some(format!("{}.chars().count() as i64", obj_s)));
+                        }
+                        return Ok(Some(format!("{}.len() as i64", obj_s)));
+                    }
+
+                    // Special case: get() for dicts. Arg-count-aware, mirroring
+                    // the static typing in `typeck::dict_get_ret`:
+                    //   d.get(k)           -> Option<V>  (None when absent), so a
+                    //                         caller can narrow it with `is None`.
+                    //   d.get(k, default)  -> V          (the supplied fallback).
+                    if name == "get" {
+                        if parts.len() > 1 {
+                            return Ok(Some(format!(
+                                "{}.get(&{}).cloned().unwrap_or({})",
+                                obj_s, parts[0], parts[1]
+                            )));
+                        }
+                        return Ok(Some(format!("{}.get(&{}).cloned()", obj_s, parts[0])));
+                    }
+
+                    // String methods
+                    if name == "startswith" && !parts.is_empty() {
+                        return Ok(Some(format!("{}.starts_with({}.as_str())", obj_s, parts[0])));
+                    }
+                    if name == "endswith" && !parts.is_empty() {
+                        return Ok(Some(format!("{}.ends_with({}.as_str())", obj_s, parts[0])));
+                    }
+                    if name == "replace" && parts.len() >= 2 {
+                        return Ok(Some(format!("{}.replace({}.as_str(), {}.as_str())", obj_s, parts[0], parts[1])));
+                    }
+                    if name == "removeprefix" && !parts.is_empty() {
+                        return Ok(Some(format!(
+                            "{{ let __s = {}.clone(); let __prefix = {}; \
+                            if __s.starts_with(__prefix.as_str()) {{ __s[__prefix.len()..].to_string() }} else {{ __s }} }}",
+                            obj_s, parts[0]
+                        )));
+                    }
+                    if name == "removesuffix" && !parts.is_empty() {
+                        return Ok(Some(format!(
+                            "{{ let __s = {}.clone(); let __suffix = {}; \
+                            if __s.ends_with(__suffix.as_str()) {{ __s[..__s.len() - __suffix.len()].to_string() }} else {{ __s }} }}",
+                            obj_s, parts[0]
+                        )));
+                    }
+                    if name == "expandtabs" {
+                        let tab_size = if !parts.is_empty() {
+                            format!("{} as usize", parts[0])
+                        } else {
+                            "8usize".to_string()
+                        };
+                        return Ok(Some(format!(
+                            "{{ let __s = {}.clone(); let __tab_size = {}; \
+                            __s.replace('\\t', &\" \".repeat(__tab_size)) }}",
+                            obj_s, tab_size
+                        )));
+                    }
+                    if name == "partition" && !parts.is_empty() {
+                        return Ok(Some(format!(
+                            "{{ let __s = {}.clone(); let __sep = {}; \
+                            if let Some(__idx) = __s.find(__sep.as_str()) {{ \
+                            vec![__s[..__idx].to_string(), __sep.clone(), __s[__idx + __sep.len()..].to_string()] \
+                            }} else {{ vec![__s, String::new(), String::new()] }} }}",
+                            obj_s, parts[0]
+                        )));
+                    }
+                    if name == "rpartition" && !parts.is_empty() {
+                        return Ok(Some(format!(
+                            "{{ let __s = {}.clone(); let __sep = {}; \
+                            if let Some(__idx) = __s.rfind(__sep.as_str()) {{ \
+                            vec![__s[..__idx].to_string(), __sep.clone(), __s[__idx + __sep.len()..].to_string()] \
+                            }} else {{ vec![String::new(), String::new(), __s] }} }}",
+                            obj_s, parts[0]
+                        )));
+                    }
+                    if name == "find" && !parts.is_empty() {
+                        return Ok(Some(format!("{}.find({}.as_str()).map(|i| i as i64).unwrap_or(-1i64)", obj_s, parts[0])));
+                    }
+                    if name == "contains" && !parts.is_empty() {
+                        return Ok(Some(format!("{}.contains({}.as_str())", obj_s, parts[0])));
+                    }
+                    if name == "rfind" && !parts.is_empty() {
+                        return Ok(Some(format!("{}.rfind({}.as_str()).map(|i| i as i64).unwrap_or(-1i64)", obj_s, parts[0])));
+                    }
+                    if name == "rindex" && !parts.is_empty() {
+                        return Ok(Some(format!(
+                            "{{ let __idx = {}.rfind({}.as_str()); match __idx {{ Some(i) => i as i64, None => panic!(\"substring not found\") }} }}",
+                            obj_s, parts[0]
+                        )));
+                    }
+
+                    // String utility methods
+                    if name == "isdigit" {
+                        return Ok(Some(format!("(!{}.is_empty() && {}.chars().all(|c| c.is_numeric()))", obj_s, obj_s)));
+                    }
+                    if name == "isalpha" {
+                        return Ok(Some(format!("(!{}.is_empty() && {}.chars().all(|c| c.is_alphabetic()))", obj_s, obj_s)));
+                    }
+                    if name == "isupper" {
+                        return Ok(Some(format!("(!{}.is_empty() && {}.chars().filter(|c| c.is_alphabetic()).all(|c| c.is_uppercase()) && {}.chars().any(|c| c.is_alphabetic()))", obj_s, obj_s, obj_s)));
+                    }
+                    if name == "islower" {
+                        return Ok(Some(format!("(!{}.is_empty() && {}.chars().filter(|c| c.is_alphabetic()).all(|c| c.is_lowercase()) && {}.chars().any(|c| c.is_alphabetic()))", obj_s, obj_s, obj_s)));
+                    }
+                    if name == "isspace" {
+                        return Ok(Some(format!("(!{}.is_empty() && {}.chars().all(|c| c.is_whitespace()))", obj_s, obj_s)));
+                    }
+                    if name == "isalnum" {
+                        return Ok(Some(format!("(!{}.is_empty() && {}.chars().all(|c| c.is_alphanumeric()))", obj_s, obj_s)));
+                    }
+                    if name == "isidentifier" {
+                        return Ok(Some(format!(
+                            "(!{}.is_empty() && ({}.chars().next().unwrap().is_alphabetic() || {}.chars().next().unwrap() == '_') && {}.chars().all(|c| c.is_alphanumeric() || c == '_'))",
+                            obj_s, obj_s, obj_s, obj_s
+                        )));
+                    }
+                    if name == "isnumeric" {
+                        return Ok(Some(format!("(!{}.is_empty() && {}.chars().all(|c| c.is_numeric()))", obj_s, obj_s)));
+                    }
+                    if name == "isprintable" {
+                        return Ok(Some(format!("({}.chars().all(|c| !c.is_control()))", obj_s)));
+                    }
+                    if name == "istitle" {
+                        return Ok(Some(format!(
+                            "(!{}.is_empty() && {}.split_whitespace().all(|word| if word.is_empty() {{ true }} else {{ word.chars().next().unwrap().is_uppercase() && word[1..].chars().all(|c| !c.is_alphabetic() || c.is_lowercase()) }}))",
+                            obj_s, obj_s
+                        )));
+                    }
+
+                    // Additional string methods
+                    if name == "capitalize" {
+                        return Ok(Some(format!(
+                            "{{ let __s = {}.clone(); if __s.is_empty() {{ __s }} else {{ format!(\"{{}}{{}}\" , __s.chars().next().unwrap().to_uppercase(), &__s[1..].to_lowercase()) }} }}",
+                            obj_s
+                        )));
+                    }
+                    if name == "title" {
+                        return Ok(Some(format!(
+                            "{{ let __s = {}.clone(); __s.split_whitespace().map(|w| if w.is_empty() {{ w.to_string() }} else {{ format!(\"{{}}{{}}\" , w.chars().next().unwrap().to_uppercase(), &w[1..].to_lowercase()) }} ).collect::<Vec<_>>().join(\" \") }}",
+                            obj_s
+                        )));
+                    }
+                    if name == "zfill" && !parts.is_empty() {
+                        return Ok(Some(format!(
+                            "{{ let __width = {} as usize; let __s = {}.clone(); if __s.len() >= __width {{ __s }} else {{ format!(\"{{:0>width$}}\" , __s, width = __width) }} }}",
+                            parts[0], obj_s
+                        )));
+                    }
+                    if name == "ljust" && !parts.is_empty() {
+                        return Ok(Some(format!(
+                            "{{ let __width = {} as usize; let __s = {}.clone(); if __s.len() >= __width {{ __s }} else {{ format!(\"{{:<width$}}\" , __s, width = __width) }} }}",
+                            parts[0], obj_s
+                        )));
+                    }
+                    if name == "rjust" && !parts.is_empty() {
+                        return Ok(Some(format!(
+                            "{{ let __width = {} as usize; let __s = {}.clone(); if __s.len() >= __width {{ __s }} else {{ format!(\"{{:>width$}}\" , __s, width = __width) }} }}",
+                            parts[0], obj_s
+                        )));
+                    }
+                    if name == "center" && !parts.is_empty() {
+                        return Ok(Some(format!(
+                            "{{ let __width = {} as usize; let __s = {}.clone(); if __s.len() >= __width {{ __s }} else {{ let __total = __width - __s.len(); let __left = (__total + 1) / 2; let __right = __total / 2; format!(\"{{}}{{}}{{}}\" , \" \".repeat(__left), __s, \" \".repeat(__right)) }} }}",
+                            parts[0], obj_s
+                        )));
+                    }
+                    if name == "swapcase" {
+                        return Ok(Some(format!(
+                            "{{ let __s = {}.clone(); __s.chars().map(|c| if c.is_uppercase() {{ c.to_lowercase().to_string() }} else {{ c.to_uppercase().to_string() }} ).collect::<String>() }}",
+                            obj_s
+                        )));
+                    }
+                    if name == "splitlines" {
+                        return Ok(Some(format!(
+                            "{}.lines().map(|l| l.to_string()).collect::<Vec<_>>()",
+                            obj_s
+                        )));
+                    }
+                    if name == "count" && !parts.is_empty() {
+                        let obj_ty = self.type_of_expr(obj);
+                        match obj_ty {
+                            Ty::Str => {
+                                return Ok(Some(format!(
+                                    "{{ let __s = {}.clone(); let __sub = {}; let mut __count = 0i64; let mut __start = 0; while let Some(__pos) = __s.as_str()[__start..].find(__sub.as_str()) {{ __count += 1; __start += __pos + __sub.len(); }} __count }}",
+                                    obj_s, parts[0]
+                                )));
+                            }
+                            _ => {} // Fall through to list count below
+                        }
+                    }
+                    if name == "index" && !parts.is_empty() {
+                        let obj_ty = self.type_of_expr(obj);
+                        match obj_ty {
+                            Ty::Str => {
+                                return Ok(Some(format!(
+                                    "{}.find({}.as_str()).map(|i| i as i64).expect(\"substring not found\")",
+                                    obj_s, parts[0]
+                                )));
+                            }
+                            _ => {} // Fall through to list index below
+                        }
+                    }
+
+                    // File methods (PyFile; gated on a File receiver). write takes
+                    // &str, so borrow the argument.
+                    if let Ty::File = self.type_of_expr(obj) {
+                        match name.as_str() {
+                            "write" if !parts.is_empty() => return Ok(Some(format!("{}.write(&{})", obj_s, parts[0]))),
+                            "write" => return Err(crate::diag::Error::Codegen("file write() requires one argument".into())),
+                            "read" | "readlines" | "close" =>
+                                return Ok(Some(format!("{}.{}()", obj_s, name))),
+                            _ => {}
+                        }
+                    }
+
+                    // Dict views - materialize into a Vec so they work both in a
+                    // for-loop and as a value (e.g. print(d.keys()), len(d.values())),
+                    // matching their List(K)/List(V) static type.
+                    if name == "keys" {
+                        return Ok(Some(format!("{}.keys().cloned().collect::<Vec<_>>()", obj_s)));
+                    }
+                    if name == "values" {
+                        return Ok(Some(format!("{}.values().cloned().collect::<Vec<_>>()", obj_s)));
+                    }
+                    if name == "items" {
+                        // Collect into a Vec<(K, V)> so the for-loop lowering treats it
+                        // as a normal collection (it wraps the iterable in .iter().cloned()).
+                        return Ok(Some(format!("{}.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<Vec<_>>()", obj_s)));
+                    }
+
+                    // Set methods (gated on receiver type — many names overlap with
+                    // list/dict, so disambiguate by the static type of the receiver).
+                    if let Ty::Set(_) = self.type_of_expr(obj) {
+                        match name.as_str() {
+                            // insert takes ownership, so emit the element owned
+                            // (a String var becomes `x.clone()`).
+                            "add" if !parts.is_empty() =>
+                                return Ok(Some(format!("{{ {}.insert({}); }}", obj_s, self.emit_consuming(&args[0])?))),
+                            // NB: unlike Python, neither discard nor remove raises on an
+                            // absent element here (Rust's HashSet::remove returns an ignored bool).
+                            "discard" | "remove" if !parts.is_empty() =>
+                                return Ok(Some(format!("{{ {}.remove(&{}); }}", obj_s, parts[0]))),
+                            "update" if !parts.is_empty() =>
+                                return Ok(Some(format!("{{ {}.extend({}.iter().cloned()); }}", obj_s, parts[0]))),
+                            "union" if !parts.is_empty() =>
+                                return Ok(Some(format!("{}.union(&{}).cloned().collect::<std::collections::HashSet<_>>()", obj_s, parts[0]))),
+                            "intersection" if !parts.is_empty() =>
+                                return Ok(Some(format!("{}.intersection(&{}).cloned().collect::<std::collections::HashSet<_>>()", obj_s, parts[0]))),
+                            "difference" if !parts.is_empty() =>
+                                return Ok(Some(format!("{}.difference(&{}).cloned().collect::<std::collections::HashSet<_>>()", obj_s, parts[0]))),
+                            "symmetric_difference" if !parts.is_empty() =>
+                                return Ok(Some(format!("{}.symmetric_difference(&{}).cloned().collect::<std::collections::HashSet<_>>()", obj_s, parts[0]))),
+                            "issubset" if !parts.is_empty() =>
+                                return Ok(Some(format!("{}.is_subset(&{})", obj_s, parts[0]))),
+                            "issuperset" if !parts.is_empty() =>
+                                return Ok(Some(format!("{}.is_superset(&{})", obj_s, parts[0]))),
+                            "isdisjoint" if !parts.is_empty() =>
+                                return Ok(Some(format!("{}.is_disjoint(&{})", obj_s, parts[0]))),
+                            _ => {}
+                        }
+                    }
+
+                    // dict.update(other) — merge another mapping in place.
+                    if name == "update" && !parts.is_empty() {
+                        return Ok(Some(format!("{{ {}.extend({}); }}", obj_s, parts[0])));
+                    }
+
+                    if name == "pop" {
+                        // list.pop(): remove and return the last element (or pop(i) -> remove index).
+                        if let Ty::List(_) = self.type_of_expr(obj) {
+                            return Ok(Some(if parts.is_empty() {
+                                format!("{}.pop().expect(\"pop from empty list\")", obj_s)
+                            } else {
+                                // Honor Python negative indices: pop(-1) is the last element.
+                                format!(
+                                    "{{ let __n = {obj}.len() as i64; let __i = {idx}; \
+                                     {obj}.remove((if __i < 0 {{ __n + __i }} else {{ __i }}) as usize) }}",
+                                    obj = obj_s, idx = parts[0]
+                                )
+                            }));
+                        }
+                        // dict.pop(key[, default])
+                        if parts.is_empty() {
+                            return Err(crate::diag::Error::Codegen("pop requires at least one argument".into()));
+                        } else if parts.len() == 1 {
+                            // pop(key) — remove from the receiver and return the value (panic if absent)
+                            return Ok(Some(format!("{}.remove(&{}).expect(\"KeyError: key not found\")", obj_s, parts[0])));
+                        } else {
+                            // pop(key, default) — remove from the receiver; default if absent
+                            return Ok(Some(format!("{}.remove(&{}).unwrap_or({})", obj_s, parts[0], parts[1])));
+                        }
+                    }
+                    // List methods
+                    if name == "extend" && !parts.is_empty() {
+                        return Ok(Some(format!("{}.extend({})", obj_s, parts[0])));
+                    }
+                    if name == "insert" && parts.len() >= 2 {
+                        return Ok(Some(format!("{}.insert({} as usize, {})", obj_s, parts[0], parts[1])));
+                    }
+                    if name == "remove" && !parts.is_empty() {
+                        return Ok(Some(format!("{{ let __idx = {}.iter().position(|__x| *__x == {}).expect(\"value not found\"); {}.remove(__idx); }}", obj_s, parts[0], obj_s)));
+                    }
+                    if name == "index" && !parts.is_empty() {
+                        return Ok(Some(format!("{}.iter().position(|__x| *__x == {}).expect(\"value not found\") as i64", obj_s, parts[0])));
+                    }
+                    if name == "count" && !parts.is_empty() {
+                        return Ok(Some(format!("{}.iter().filter(|__x| **__x == {}).count() as i64", obj_s, parts[0])));
+                    }
+                    if name == "reverse" {
+                        return Ok(Some(format!("{}.reverse()", obj_s)));
+                    }
+                    if name == "sort" {
+                        return Ok(Some(format!("{}.sort()", obj_s)));
+                    }
+                    if name == "clear" {
+                        return Ok(Some(format!("{}.clear()", obj_s)));
+                    }
+                    if name == "copy" {
+                        return Ok(Some(format!("{}.clone()", obj_s)));
+                    }
+
+                    // Regular method call.
+                    // (EPIC-4 V2-c) Thread `&mut <place>` for any by-reference
+                    // (`Mut[T]`) method parameter so the callee's mutation persists
+                    // to the caller. The method's per-param by-ref flags come from
+                    // get_method (self-EXCLUSIVE and index-aligned to `args` after
+                    // STEP 0). Only user-defined methods on a known class receiver
+                    // can be by-ref; the builtin string/list/dict branches above
+                    // all `return`ed earlier, so the by-value `parts` they share is
+                    // never reached here. We rebuild `parts` only when the receiver
+                    // resolves to a class with a matching method that actually has
+                    // a by-ref param; otherwise the original by-value `parts`
+                    // (clone-on-use) is used unchanged.
+                    let method_by_ref: Vec<bool> =
+                        if let Ty::Class(cls) = self.type_of_expr(obj.as_ref()) {
+                            self.ctx.get_method(&cls, name)
+                                .map(|sig| sig.param_by_ref.clone())
+                                .unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        };
+                    if method_by_ref.iter().any(|&b| b) {
+                        let mut mparts = Vec::with_capacity(args.len());
+                        for (i, a) in args.iter().enumerate() {
+                            if method_by_ref.get(i).copied().unwrap_or(false) {
+                                let place = self.emit_place(a)?;
+                                mparts.push(self.byref_borrow(a, &place));
+                            } else {
+                                mparts.push(self.emit_consuming(a)?);
+                            }
+                        }
+                        return Ok(Some(format!("{}.{}({})", obj_s, method, mparts.join(", "))));
+                    }
+                    return Ok(Some(format!("{}.{}({})", obj_s, method, parts.join(", "))));
+                }
+        Ok(None)
+    }
+
+    #[allow(clippy::borrowed_box)]
+    fn emit_super_method_call(
+        &mut self,
+        callee: &Box<Expr>,
+        args: &[Expr],
+    ) -> Result<Option<String>> {
+                // Handle super().method(args)
+                if let Expr::Attr { obj: super_call_expr, name: method_name, .. } = callee.as_ref() {
+                    if let Expr::Call { callee: super_ident, args: super_args, .. } = super_call_expr.as_ref() {
+                        if let Expr::Ident(n, _) = super_ident.as_ref() {
+                            if n == "super" && super_args.is_empty() {
+                                if let Some(_class_name) = self.current_class.clone() {
+                                    // Call __super_ alias method which has parent's body
+                                    let mut arg_parts = Vec::new();
+                                    for a in args { arg_parts.push(self.emit_consuming(a)?); }
+                                    return Ok(Some(format!("self.__super_{}({})", method_name, arg_parts.join(", "))));
+                                }
+                            }
+                        }
+                    }
+                }
+        Ok(None)
+    }
+
+    #[allow(clippy::borrowed_box)]
+    fn emit_constructor_call(
+        &mut self,
+        callee: &Box<Expr>,
+        args: &[Expr],
+        kwargs: &[(String, Expr)],
+    ) -> Result<Option<String>> {
+                // Check if this is a class constructor call.
+                if let Expr::Ident(name, _) = callee.as_ref() {
+                    if let Some(class_def) = self.ctx.classes.get(name.as_str()).cloned() {
+                        let has_init = class_def.methods.iter().any(|m| m.name == "__init__");
+
+                        // Use ::new() constructor whenever __init__ is defined —
+                        // including the zero-arg case so that __init__ side-effects
+                        // (field assignments, etc.) always run.
+                        if has_init {
+                            // (EPIC-5 C2-3) The `new()` signature lowers each
+                            // `__init__` param via `rust_ty`, so a base-typed param
+                            // is `B__`. A raw-struct / subclass argument into such a
+                            // slot must be WRAPPED in the right variant (the same
+                            // wrap-or-passthrough used at return / assign / free-fn
+                            // sites) — otherwise the bare `Dog::new(..)` mismatches
+                            // the `Animal__` param (E0308). Non-polymorphic params
+                            // keep the clone-on-use emission.
+                            let init_params: Vec<(String, Ty)> = class_def.methods.iter()
+                                .find(|m| m.name == "__init__")
+                                .map(|m| m.params.iter()
+                                    .filter(|p| p.name != "self")
+                                    .filter_map(|p| Ty::from_type_expr(&p.ty, p.span).ok().map(|t| (p.name.clone(), t)))
+                                    .collect())
+                                .unwrap_or_default();
+                            let mut call_parts = Vec::new();
+                            for (i, a) in args.iter().enumerate() {
+                                call_parts.push(self.emit_arg_into_slot(a, init_params.get(i).map(|(_, t)| t))?);
+                            }
+                            for (kw, v) in kwargs {
+                                let pt = init_params.iter().find(|(n, _)| n == kw).map(|(_, t)| t);
+                                call_parts.push(self.emit_arg_into_slot(v, pt)?);
+                            }
+                            return Ok(Some(format!("{}::new({})", name, call_parts.join(", "))));
+                        }
+
+                        // Class constructor: emit a Rust struct literal.
+                        // Use inherited + own fields for positional.
+                        let mut all_field_names: Vec<String> = Vec::new();
+                        for base in &class_def.bases {
+                            if let Some(bd) = self.ctx.classes.get(base.as_str()).cloned() {
+                                for f in &bd.fields {
+                                    if !all_field_names.contains(&f.name) {
+                                        all_field_names.push(f.name.clone());
+                                    }
+                                }
+                            }
+                        }
+                        for f in &class_def.fields {
+                            if !all_field_names.contains(&f.name) {
+                                all_field_names.push(f.name.clone());
+                            }
+                        }
+
+                        if !args.is_empty() && kwargs.is_empty() {
+                            // Positional args to a class constructor.
+                            if args.len() != all_field_names.len() {
+                                return Err(crate::diag::Error::Codegen(format!(
+                                    "class `{}` has {} fields but {} positional arguments given",
+                                    name, all_field_names.len(), args.len()
+                                )));
+                            }
+                            let mut parts = Vec::new();
+                            for (field_name, arg) in all_field_names.iter().zip(args.iter()) {
+                                // (EPIC-5 C2-3) The struct field lowers to `B__` for
+                                // a polymorphic-base field, so a raw-struct/subclass
+                                // value wraps in its variant (same as the ctor/new
+                                // path above).
+                                let fty = self.class_field_type(&class_def, field_name);
+                                let v = self.emit_arg_into_slot(arg, fty.as_ref())?;
+                                // (EPIC-6) Escape a keyword field name in the
+                                // positional struct-literal init.
+                                parts.push(format!("{}: {}", escape_ident(field_name), v));
+                            }
+                            return Ok(Some(format!("{} {{ {} }}", name, parts.join(", "))));
+                        }
+
+                        // Keyword-args form.
+                        if !kwargs.is_empty() {
+                            let mut parts = Vec::new();
+                            for (kw, val) in kwargs {
+                                let fty = self.class_field_type(&class_def, kw);
+                                let v = self.emit_arg_into_slot(val, fty.as_ref())?;
+                                // (EPIC-6) Escape a keyword field name in the
+                                // keyword-arg struct-literal init.
+                                parts.push(format!("{}: {}", escape_ident(kw), v));
+                            }
+                            return Ok(Some(format!("{} {{ {} }}", name, parts.join(", "))));
+                        }
+
+                        // No args at all: emit default struct literal.
+                        let mut parts = Vec::new();
+                        for fname in &all_field_names {
+                            let field = class_def.fields.iter().find(|f| &f.name == fname)
+                                .or_else(|| {
+                                    class_def.bases.iter().find_map(|b| {
+                                        self.ctx.classes.get(b.as_str())
+                                            .and_then(|bd| bd.fields.iter().find(|f| &f.name == fname))
+                                    })
+                                });
+                            let default = if let Some(f) = field {
+                                let ty = Ty::from_type_expr(&f.ty, f.span)?;
+                                self.zeroed_default(&ty)
+                            } else {
+                                "Default::default()".to_string()
+                            };
+                            // (EPIC-6) Escape a keyword field name in the no-arg
+                            // default struct-literal init.
+                            parts.push(format!("{}: {}", escape_ident(fname), default));
+                        }
+                        return Ok(Some(format!("{} {{ {} }}", name, parts.join(", "))));
+                    }
+                }
+        Ok(None)
+    }
+
+    #[allow(clippy::borrowed_box)]
+    fn emit_builtin_call(
+        &mut self,
+        callee: &Box<Expr>,
+        args: &[Expr],
+        kwargs: &[(String, Expr)],
+    ) -> Result<Option<String>> {
+                // Multi-arg print with inline format
+                if let Expr::Ident(n, _) = callee.as_ref() {
+                    if n == "print" {
+                        if args.is_empty() {
+                            return Ok(Some("println!(\"\")".to_string()));
+                        }
+                        let mut parts: Vec<String> = Vec::new();
+                        for arg in args {
+                            let raw = self.emit_expr(arg)?;
+                            let formatted = match self.type_of_expr(arg) {
+                                Ty::Float => format!("__py_fmt_float({})", raw),
+                                Ty::Bool => format!("__py_fmt_bool({})", raw),
+                                Ty::List(_) | Ty::Set(_) | Ty::Dict(_, _) | Ty::Tuple(_) =>
+                                    format!("({}).py_repr()", raw),
+                                _ => raw,
+                            };
+                            parts.push(formatted);
+                        }
+                        // Use {} (Display format) for most types; {:?} breaks strings by adding quotes
+                        let fmt = (0..parts.len()).map(|_| "{}").collect::<Vec<_>>().join(" ");
+                        return Ok(Some(format!("println!(\"{}\" {})", fmt,
+                            if parts.is_empty() { "".to_string() } else { format!(", {}", parts.join(", ")) })));
+                    }
+                }
+
+                // Inline range() with 1, 2, or 3 args
+                if let Expr::Ident(n, _) = callee.as_ref() {
+                    if n == "range" {
+                        if args.len() == 1 {
+                            let a = self.emit_expr(&args[0])?;
+                            return Ok(Some(format!("(0..{})", a)));
+                        } else if args.len() == 2 {
+                            let a = self.emit_expr(&args[0])?;
+                            let b = self.emit_expr(&args[1])?;
+                            return Ok(Some(format!("({}..{})", a, b)));
+                        } else if args.len() == 3 {
+                            let a = self.emit_expr(&args[0])?;
+                            let b = self.emit_expr(&args[1])?;
+                            let step = self.emit_expr(&args[2])?;
+                            return Ok(Some(format!("({}..{}).step_by({} as usize)", a, b, step)));
+                        }
+                    }
+                }
+
+                // Inline enumerate(iter) — emits iterator chain without collecting
+                if let Expr::Ident(n, _) = callee.as_ref() {
+                    if n == "enumerate" && args.len() == 1 {
+                        let a = self.emit_expr(&args[0])?;
+                        let is_range = a.contains("..");
+                        let iter_chain = if is_range {
+                            format!("({}).into_iter()", a)
+                        } else {
+                            format!("{}.iter().cloned()", a)
+                        };
+                        return Ok(Some(format!("{}.enumerate().map(|(i, v)| (i as i64, v))", iter_chain)));
+                    }
+                }
+
+                // Inline zip(a, b) — emits iterator chain without collecting
+                if let Expr::Ident(n, _) = callee.as_ref() {
+                    if n == "zip" && args.len() == 2 {
+                        let a = self.emit_expr(&args[0])?;
+                        let b = self.emit_expr(&args[1])?;
+                        let is_range_a = a.contains("..");
+                        let is_range_b = b.contains("..");
+                        let iter_a = if is_range_a { format!("({}).into_iter()", a) } else { format!("{}.iter().cloned()", a) };
+                        let iter_b = if is_range_b { format!("({}).into_iter()", b) } else { format!("{}.iter().cloned()", b) };
+                        return Ok(Some(format!("{}.zip({})", iter_a, iter_b)));
+                    }
+                }
+
+                // Builtin function dispatch
+                if let Expr::Ident(n, _) = callee.as_ref() {
+                    match n.as_str() {
+                        "len" => {
+                            let a = self.emit_expr(&args[0])?;
+                            // Python len() of a str is the CHARACTER count, not the
+                            // UTF-8 byte count. Collections keep .len().
+                            if matches!(self.type_of_expr(&args[0]), Ty::Str) {
+                                return Ok(Some(format!("{}.chars().count() as i64", a)));
+                            }
+                            return Ok(Some(format!("{}.len() as i64", a)));
+                        }
+                        "str" => {
+                            let a = self.emit_expr(&args[0])?;
+                            match self.type_of_expr(&args[0]) {
+                                Ty::List(_) | Ty::Set(_) | Ty::Dict(_, _) | Ty::Tuple(_) =>
+                                    return Ok(Some(format!("({}).py_repr()", a))),
+                                _ => return Ok(Some(format!("format!(\"{{}}\" , {})", a))),
+                            }
+                        }
+                        "open" => {
+                            let path = self.emit_expr(&args[0])?;
+                            let mode = if args.len() >= 2 {
+                                self.emit_expr(&args[1])?
+                            } else {
+                                "\"r\".to_string()".to_string()
+                            };
+                            return Ok(Some(format!("__py_open(&{}, &{})", path, mode)));
+                        }
+                        "int" => {
+                            let a = self.emit_expr(&args[0])?;
+                            let arg_type = self.type_of_expr(&args[0]);
+                            match arg_type {
+                                Ty::Str => {
+                                    // Use helper so a bad string panics with "ValueError\0..."
+                                    // which the try/except dispatcher can match on ValueError.
+                                    return Ok(Some(format!("(__py_int_from_str(&{}))", a)));
+                                }
+                                _ => return Ok(Some(format!("({} as i64)", a))),
+                            }
+                        }
+                        "float" => {
+                            let a = self.emit_expr(&args[0])?;
+                            let arg_type = self.type_of_expr(&args[0]);
+                            match arg_type {
+                                Ty::Str => {
+                                    // Use helper so a bad string panics with "ValueError\0..."
+                                    // which the try/except dispatcher can match on ValueError.
+                                    return Ok(Some(format!("(__py_float_from_str(&{}))", a)));
+                                }
+                                _ => return Ok(Some(format!("({} as f64)", a))),
+                            }
+                        }
+                        "bool" => {
+                            let a = self.emit_expr(&args[0])?;
+                            return Ok(Some(format!("(({}) != 0)", a)));
+                        }
+                        "abs" => {
+                            let a = self.emit_expr(&args[0])?;
+                            return Ok(Some(format!("({}).abs()", a)));
+                        }
+                        "min" => {
+                            if let Some((_, key_expr)) = kwargs.iter().find(|(n, _)| n == "key") {
+                                // min with key parameter
+                                let a = self.emit_expr(&args[0])?;
+                                // Check if key_expr is a Lambda to handle it specially
+                                let key_code = if let Expr::Lambda { params, body, .. } = key_expr {
+                                    // Lambda: extract parameter name and body, rename param to __x
+                                    let param_name = params.first().map(|(n, _)| n.clone()).unwrap_or_else(|| "__x".to_string());
+                                    let saved_local = self.locals.get(&param_name).cloned();
+                                    self.locals.insert(param_name.clone(), Ty::Unknown);
+                                    let body_s = self.emit_expr(body)?;
+                                    if let Some(ty) = saved_local {
+                                        self.locals.insert(param_name.clone(), ty);
+                                    } else {
+                                        self.locals.remove(param_name.as_str());
+                                    }
+                                    // Replace param_name with __x in the body (word-boundary aware).
+                                    // (EPIC-6) The body emitted the param through
+                                    // emit_expr's Ident arm, which ESCAPES a keyword
+                                    // param to `r#<name>`; search for that escaped
+                                    // form so a keyword sort-key param is renamed
+                                    // correctly (replace_identifier treats `r#kw` as
+                                    // one token).
+                                    Self::replace_identifier(&body_s, escape_ident(&param_name).as_str(), "__x")
+                                } else {
+                                    // Regular expression: wrap in closure that calls the key function
+                                    self.emit_expr(key_expr)?
+                                };
+                                return Ok(Some(format!(
+                                    "{{ let __list = {}; __list.iter().min_by_key(|__x| {}).map(|__x| __x.clone()).unwrap_or_default() }}",
+                                    a, key_code
+                                )));
+                            } else if args.len() == 1 {
+                                let a = self.emit_expr(&args[0])?;
+                                let elem_ty = match self.type_of_expr(&args[0]) {
+                                    Ty::List(inner) => *inner,
+                                    _ => Ty::Int,
+                                };
+                                return Ok(Some(match elem_ty {
+                                    Ty::Float => format!("{{ let mut __min = f64::INFINITY; for __x in {}.iter() {{ if __x < &__min {{ __min = *__x; }} }} __min }}", a),
+                                    _ => format!("{}.iter().copied().min().unwrap_or(0)", a),
+                                }));
+                            } else {
+                                let a = self.emit_expr(&args[0])?;
+                                let b = self.emit_expr(&args[1])?;
+                                return Ok(Some(format!("::std::cmp::min({}, {})", a, b)));
+                            }
+                        }
+                        "max" => {
+                            if let Some((_, key_expr)) = kwargs.iter().find(|(n, _)| n == "key") {
+                                // max with key parameter
+                                let a = self.emit_expr(&args[0])?;
+                                // Check if key_expr is a Lambda to handle it specially
+                                let key_code = if let Expr::Lambda { params, body, .. } = key_expr {
+                                    // Lambda: extract parameter name and body, rename param to __x
+                                    let param_name = params.first().map(|(n, _)| n.clone()).unwrap_or_else(|| "__x".to_string());
+                                    let saved_local = self.locals.get(&param_name).cloned();
+                                    self.locals.insert(param_name.clone(), Ty::Unknown);
+                                    let body_s = self.emit_expr(body)?;
+                                    if let Some(ty) = saved_local {
+                                        self.locals.insert(param_name.clone(), ty);
+                                    } else {
+                                        self.locals.remove(param_name.as_str());
+                                    }
+                                    // Replace param_name with __x in the body (word-boundary aware).
+                                    // (EPIC-6) The body emitted the param through
+                                    // emit_expr's Ident arm, which ESCAPES a keyword
+                                    // param to `r#<name>`; search for that escaped
+                                    // form so a keyword sort-key param is renamed
+                                    // correctly (replace_identifier treats `r#kw` as
+                                    // one token).
+                                    Self::replace_identifier(&body_s, escape_ident(&param_name).as_str(), "__x")
+                                } else {
+                                    // Regular expression: wrap in closure that calls the key function
+                                    self.emit_expr(key_expr)?
+                                };
+                                return Ok(Some(format!(
+                                    "{{ let __list = {}; __list.iter().max_by_key(|__x| {}).map(|__x| __x.clone()).unwrap_or_default() }}",
+                                    a, key_code
+                                )));
+                            } else if args.len() == 1 {
+                                let a = self.emit_expr(&args[0])?;
+                                let elem_ty = match self.type_of_expr(&args[0]) {
+                                    Ty::List(inner) => *inner,
+                                    _ => Ty::Int,
+                                };
+                                return Ok(Some(match elem_ty {
+                                    Ty::Float => format!("{{ let mut __max = f64::NEG_INFINITY; for __x in {}.iter() {{ if __x > &__max {{ __max = *__x; }} }} __max }}", a),
+                                    _ => format!("{}.iter().copied().max().unwrap_or(0)", a),
+                                }));
+                            } else {
+                                let a = self.emit_expr(&args[0])?;
+                                let b = self.emit_expr(&args[1])?;
+                                return Ok(Some(format!("::std::cmp::max({}, {})", a, b)));
+                            }
+                        }
+                        "sorted" => {
+                            let a = self.emit_expr(&args[0])?;
+                            let list_ty = self.type_of_expr(&args[0]);
+
+                            if let Some((_, key_expr)) = kwargs.iter().find(|(n, _)| n == "key") {
+                                // sorted with key parameter
+                                // Determine the return type of the key expression
+                                let key_ret_ty = if let Expr::Lambda { params: _, body, .. } = key_expr {
+                                    // For lambdas, infer from the body expression
+                                    // We need to temporarily register the parameter to type-check the body
+                                    // But since type_of_expr is &self, we can't do that easily
+                                    // So we'll just check common patterns
+                                    if let Expr::Attr { name, .. } = body.as_ref() {
+                                        // Lambda body is field access - check the field type
+                                        if let Ty::List(ref elem_ty) = list_ty {
+                                            if let Ty::Class(cls) = elem_ty.as_ref() {
+                                                if let Some(c) = self.ctx.classes.get(cls.as_str()) {
+                                                    if let Some(f) = c.fields.iter().find(|f| &f.name == name) {
+                                                        Ty::from_type_expr(&f.ty, f.span).unwrap_or(Ty::Unknown)
+                                                    } else {
+                                                        Ty::Unknown
+                                                    }
+                                                } else {
+                                                    Ty::Unknown
+                                                }
+                                            } else {
+                                                Ty::Unknown
+                                            }
+                                        } else {
+                                            Ty::Unknown
+                                        }
+                                    } else if let Expr::Call { callee, .. } = body.as_ref() {
+                                        // Lambda body is a method call - check method return type
+                                        if let Expr::Attr { name, .. } = callee.as_ref() {
+                                            if let Ty::List(ref elem_ty) = list_ty {
+                                                if let Ty::Class(cls) = elem_ty.as_ref() {
+                                                    if let Some(method_sig) = self.ctx.get_method(cls.as_str(), name) {
+                                                        method_sig.ret.clone()
+                                                    } else {
+                                                        Ty::Unknown
+                                                    }
+                                                } else {
+                                                    Ty::Unknown
+                                                }
+                                            } else {
+                                                Ty::Unknown
+                                            }
+                                        } else {
+                                            Ty::Unknown
+                                        }
+                                    } else {
+                                        Ty::Unknown
+                                    }
+                                } else {
+                                    Ty::Unknown
+                                };
+
+                                let key_code = if let Expr::Lambda { params, body, .. } = key_expr {
+                                    // Lambda: extract parameter name and body, rename param to __x
+                                    let param_name = params.first().map(|(n, _)| n.clone()).unwrap_or_else(|| "__x".to_string());
+                                    let saved_local = self.locals.get(&param_name).cloned();
+                                    self.locals.insert(param_name.clone(), Ty::Unknown);
+                                    let body_s = self.emit_expr(body)?;
+                                    if let Some(ty) = saved_local {
+                                        self.locals.insert(param_name.clone(), ty);
+                                    } else {
+                                        self.locals.remove(param_name.as_str());
+                                    }
+                                    // Replace param_name with __x in the body (word-boundary aware).
+                                    // (EPIC-6) The body emitted the param through
+                                    // emit_expr's Ident arm, which ESCAPES a keyword
+                                    // param to `r#<name>`; search for that escaped
+                                    // form so a keyword sort-key param is renamed
+                                    // correctly (replace_identifier treats `r#kw` as
+                                    // one token).
+                                    Self::replace_identifier(&body_s, escape_ident(&param_name).as_str(), "__x")
+                                } else {
+                                    // Regular expression: wrap in closure that calls the key function
+                                    self.emit_expr(key_expr)?
+                                };
+
+                                // Use appropriate sorting method based on key return type
+                                return Ok(Some(match key_ret_ty {
+                                    Ty::Float => {
+                                        format!(
+                                            "{{ let mut __sorted = {}.clone(); __sorted.sort_by(|a, b| {{ let ka = {{ let __x = a.clone(); {} }}; let kb = {{ let __x = b.clone(); {} }}; ka.partial_cmp(&kb).unwrap_or(::std::cmp::Ordering::Equal) }}); __sorted }}",
+                                            a, key_code, key_code
+                                        )
+                                    }
+                                    _ => {
+                                        format!(
+                                            "{{ let mut __sorted = {}.clone(); __sorted.sort_by_key(|__x| {}); __sorted }}",
+                                            a, key_code
+                                        )
+                                    }
+                                }));
+                            } else {
+                                // Check if this is a float list to handle Ord constraint
+                                let is_float_list = matches!(&list_ty, Ty::List(inner) if inner.as_ref() == &Ty::Float);
+                                let sort_code = if is_float_list {
+                                    ".sort_by(|a, b| a.partial_cmp(b).unwrap_or(::std::cmp::Ordering::Equal))".to_string()
+                                } else {
+                                    ".sort()".to_string()
+                                };
+
+                                // `sorted` operates on a Vec. A list arg is cloned
+                                // directly; a set is materialized from its elements
+                                // and a dict from its KEYS (Python semantics — both
+                                // HashMap/HashSet lack `.sort()`).
+                                let base = match &list_ty {
+                                    Ty::Set(_) => format!("{}.iter().cloned().collect::<Vec<_>>()", a),
+                                    Ty::Dict(_, _) => format!("{}.keys().cloned().collect::<Vec<_>>()", a),
+                                    _ => format!("{}.clone()", a),
+                                };
+
+                                if let Some((_, rev_expr)) = kwargs.iter().find(|(n, _)| n == "reverse") {
+                                    // sorted with reverse parameter
+                                    let rev_s = self.emit_expr(rev_expr)?;
+                                    return Ok(Some(format!(
+                                        "{{ let mut __sorted = {}; __sorted{}; if {} {{ __sorted.reverse(); }} __sorted }}",
+                                        base, sort_code, rev_s
+                                    )));
+                                } else {
+                                    // Default sorted
+                                    return Ok(Some(format!("{{ let mut __sorted = {}; __sorted{}; __sorted }}", base, sort_code)));
+                                }
+                            }
+                        }
+                        "sum" => {
+                            let a = self.emit_expr(&args[0])?;
+                            // Determine the sum type based on the iterable's element type
+                            let sum_type = match self.type_of_expr(&args[0]) {
+                                Ty::List(inner) | Ty::Set(inner) => match *inner {
+                                    Ty::Float => "f64",
+                                    _ => "i64",
+                                },
+                                _ => "i64",
+                            };
+                            return Ok(Some(format!("{}.iter().sum::<{}>()", a, sum_type)));
+                        }
+                        "input" => {
+                            if args.is_empty() {
+                                return Ok(Some("{ let mut __s = String::new(); ::std::io::stdin().read_line(&mut __s).unwrap(); __s.trim_end().to_string() }".to_string()));
+                            } else {
+                                let p = self.emit_expr(&args[0])?;
+                                return Ok(Some(format!("{{ print!(\"{{}}\" , {}); ::std::io::stdout().flush().ok(); let mut __s = String::new(); ::std::io::stdin().read_line(&mut __s).unwrap(); __s.trim_end().to_string() }}", p)));
+                            }
+                        }
+                        "any" => {
+                            let a = self.emit_expr(&args[0])?;
+                            return Ok(Some(format!("{}.iter().any(|x| *x)", a)));
+                        }
+                        "all" => {
+                            let a = self.emit_expr(&args[0])?;
+                            return Ok(Some(format!("{}.iter().all(|x| *x)", a)));
+                        }
+                        "round" => {
+                            let a = self.emit_expr(&args[0])?;
+                            return Ok(Some(format!("({} as f64).round() as i64", a)));
+                        }
+                        "pow" => {
+                            let base = self.emit_expr(&args[0])?;
+                            let exp = self.emit_expr(&args[1])?;
+                            return Ok(Some(format!("({} as f64).powi({} as i32) as i64", base, exp)));
+                        }
+                        "chr" => {
+                            let a = self.emit_expr(&args[0])?;
+                            return Ok(Some(format!("(char::from_u32({} as u32).unwrap()).to_string()", a)));
+                        }
+                        "ord" => {
+                            let a = self.emit_expr(&args[0])?;
+                            return Ok(Some(format!("({}.chars().next().unwrap() as i64)", a)));
+                        }
+                        "reversed" => {
+                            let a = self.emit_expr(&args[0])?;
+                            return Ok(Some(format!("{{ let mut __r = {}.clone(); __r.reverse(); __r }}", a)));
+                        }
+                        "map" => {
+                            let f = self.emit_expr(&args[0])?;
+                            let it = self.emit_expr(&args[1])?;
+                            return Ok(Some(format!("{}.iter().cloned().map({}).collect::<Vec<_>>()", it, f)));
+                        }
+                        "filter" => {
+                            let f = self.emit_expr(&args[0])?;
+                            let it = self.emit_expr(&args[1])?;
+                            return Ok(Some(format!("{}.iter().cloned().filter(|__x| ({})((__x).clone())).collect::<Vec<_>>()", it, f)));
+                        }
+                        "isinstance" => {
+                            if args.len() != 2 {
+                                return Err(crate::diag::Error::Codegen("isinstance requires exactly 2 arguments".into()));
+                            }
+                            let obj_type = self.type_of_expr(&args[0]);
+                            // Check if args[1] is a builtin type identifier
+                            if let Expr::Ident(type_name, _) = &args[1] {
+                                let matches = match type_name.as_str() {
+                                    "int" => matches!(&obj_type, Ty::Int),
+                                    "str" => matches!(&obj_type, Ty::Str),
+                                    "float" => matches!(&obj_type, Ty::Float),
+                                    "bool" => matches!(&obj_type, Ty::Bool),
+                                    "list" => matches!(&obj_type, Ty::List(_)),
+                                    "dict" => matches!(&obj_type, Ty::Dict(_, _)),
+                                    "set" => matches!(&obj_type, Ty::Set(_)),
+                                    _ => {
+                                        // For custom classes, emit runtime check
+                                        let _obj = self.emit_expr(&args[0])?;
+                                        return Ok(Some(format!("true"))); // Placeholder for custom class check
+                                    }
+                                };
+                                return Ok(Some(if matches { "true" } else { "false" }.to_string()));
+                            } else {
+                                // Dynamic type check (not a literal type name)
+                                return Ok(Some("true".to_string())); // Conservative: assume true for dynamic checks
+                            }
+                        }
+                        "type" => {
+                            if args.len() != 1 {
+                                return Err(crate::diag::Error::Codegen("type requires exactly 1 argument".into()));
+                            }
+                            let obj_type = self.type_of_expr(&args[0]);
+                            let type_name = match obj_type {
+                                Ty::Int => "<class 'int'>",
+                                Ty::Str => "<class 'str'>",
+                                Ty::Float => "<class 'float'>",
+                                Ty::Bool => "<class 'bool'>",
+                                Ty::List(_) => "<class 'list'>",
+                                Ty::Dict(_, _) => "<class 'dict'>",
+                                Ty::Set(_) => "<class 'set'>",
+                                // Both the `None` literal (NoneVal) and a void
+                                // result (Unit) report Python's NoneType, matching
+                                // the pre-NoneVal behavior of `type(None)`.
+                                Ty::Unit | Ty::NoneVal => "<class 'NoneType'>",
+                                _ => "<class 'object'>",
+                            };
+                            return Ok(Some(format!("String::from(\"{}\")", type_name)));
+                        }
+                        "hex" => {
+                            let a = self.emit_expr(&args[0])?;
+                            return Ok(Some(format!("format!(\"{{:#x}}\", {})", a)));
+                        }
+                        "oct" => {
+                            let a = self.emit_expr(&args[0])?;
+                            return Ok(Some(format!("format!(\"{{:#o}}\", {})", a)));
+                        }
+                        "bin" => {
+                            let a = self.emit_expr(&args[0])?;
+                            return Ok(Some(format!("format!(\"{{:#b}}\", {})", a)));
+                        }
+                        "callable" => {
+                            if args.len() != 1 {
+                                return Err(crate::diag::Error::Codegen("callable requires exactly 1 argument".into()));
+                            }
+                            // Check if the argument is a function name
+                            if let Expr::Ident(name, _) = &args[0] {
+                                let is_callable = self.ctx.funcs.contains_key(name.as_str()) ||
+                                                 self.ctx.classes.contains_key(name.as_str());
+                                return Ok(Some(if is_callable { "true" } else { "false" }.to_string()));
+                            } else {
+                                // For non-identifier expressions, conservatively return false
+                                return Ok(Some("false".to_string()));
+                            }
+                        }
+                        "repr" => {
+                            if args.len() != 1 {
+                                return Err(crate::diag::Error::Codegen("repr requires exactly 1 argument".into()));
+                            }
+                            let obj_type = self.type_of_expr(&args[0]);
+                            let a = self.emit_expr(&args[0])?;
+                            let repr_expr = match obj_type {
+                                Ty::Str => format!("format!(\"'{{}}'\", {})", a),
+                                Ty::Bool => format!("format!(\"{{}}\" , if {} {{ \"True\" }} else {{ \"False\" }})", a),
+                                _ => format!("format!(\"{{}}\" , {})", a),
+                            };
+                            return Ok(Some(repr_expr));
+                        }
+                        "ascii" => {
+                            if args.len() != 1 {
+                                return Err(crate::diag::Error::Codegen("ascii requires exactly 1 argument".into()));
+                            }
+                            let obj_type = self.type_of_expr(&args[0]);
+                            let a = self.emit_expr(&args[0])?;
+                            let ascii_expr = match obj_type {
+                                Ty::Str => {
+                                    format!(
+                                        "format!(\"'{{}}'\", {}.escape_default())",
+                                        a
+                                    )
+                                }
+                                Ty::Bool => {
+                                    format!("format!(\"{{}}\" , if {} {{ \"True\" }} else {{ \"False\" }})", a)
+                                }
+                                _ => format!("format!(\"{{}}\" , {})", a),
+                            };
+                            return Ok(Some(ascii_expr));
+                        }
+                        "list" => {
+                            if args.is_empty() {
+                                return Ok(Some("Vec::<i64>::new()".to_string()));
+                            } else {
+                                let a = self.emit_expr(&args[0])?;
+                                let arg_type = self.type_of_expr(&args[0]);
+                                // If the argument is already a list, just return it. Otherwise collect the iterator.
+                                match arg_type {
+                                    Ty::List(_) => return Ok(Some(a)),
+                                    // A set/dict is a concrete container, not an
+                                    // iterator: take an owned Vec of its elements
+                                    // (dict -> its KEYS, Python semantics).
+                                    Ty::Set(_) => {
+                                        return Ok(Some(format!("{}.iter().cloned().collect::<Vec<_>>()", a)));
+                                    }
+                                    Ty::Dict(_, _) => {
+                                        return Ok(Some(format!("{}.keys().cloned().collect::<Vec<_>>()", a)));
+                                    }
+                                    _ => {
+                                        // Check if the expression looks like it returns a Vec (contains reverse, sort, etc.)
+                                        if a.contains("reverse") || a.contains("sort") || a.contains("clone()") {
+                                            return Ok(Some(a));
+                                        }
+                                        return Ok(Some(format!("{}.collect::<Vec<_>>()", a)));
+                                    }
+                                }
+                            }
+                        }
+                        "dict" => {
+                            if args.is_empty() && kwargs.is_empty() {
+                                return Ok(Some("std::collections::HashMap::new()".to_string()));
+                            } else {
+                                return Err(crate::diag::Error::Codegen("dict() constructor with arguments not yet supported".into()));
+                            }
+                        }
+                        "tuple" => {
+                            if args.is_empty() {
+                                return Ok(Some("()".to_string()));
+                            } else {
+                                let a = self.emit_expr(&args[0])?;
+                                return Ok(Some(format!("({},)", a)));
+                            }
+                        }
+                        "getattr" => {
+                            if args.len() < 2 || args.len() > 3 {
+                                return Err(crate::diag::Error::Codegen("getattr requires 2 or 3 arguments".into()));
+                            }
+                            let _obj = self.emit_expr(&args[0])?;
+                            let attr_name = self.emit_expr(&args[1])?;
+
+                            // For now, just access the field directly (works for simple cases)
+                            // This assumes the object is a struct with the matching field name
+                            return Ok(Some(format!("{{ let __attr_name = {}; format!(\"{{:?}}\", __attr_name) }}", attr_name)));
+                        }
+                        "setattr" => {
+                            if args.len() != 3 {
+                                return Err(crate::diag::Error::Codegen("setattr requires exactly 3 arguments".into()));
+                            }
+                            // Note: In Python, setattr modifies the object. In Rust, we can't modify through a reference.
+                            // For now, just return None
+                            return Ok(Some("()".to_string()));
+                        }
+                        "hasattr" => {
+                            if args.len() != 2 {
+                                return Err(crate::diag::Error::Codegen("hasattr requires exactly 2 arguments".into()));
+                            }
+                            // For now, just return true (conservative assumption)
+                            return Ok(Some("true".to_string()));
+                        }
+                        "set" => {
+                            if args.is_empty() {
+                                return Ok(Some("::std::collections::HashSet::new()".to_string()));
+                            } else {
+                                let a = self.emit_expr(&args[0])?;
+                                let arg_type = self.type_of_expr(&args[0]);
+                                // If the argument is already a set, just return it. Otherwise convert to set.
+                                match arg_type {
+                                    Ty::Set(_) => return Ok(Some(a)),
+                                    Ty::List(_) | Ty::Unknown => {
+                                        // Check if it looks like a vec literal or variable
+                                        if a.starts_with("vec!") {
+                                            return Ok(Some(format!("{}.into_iter().collect::<::std::collections::HashSet<_>>()", a)));
+                                        } else {
+                                            return Ok(Some(format!("{}.into_iter().collect::<::std::collections::HashSet<_>>()", a)));
+                                        }
+                                    }
+                                    _ => {
+                                        // For other iterables, try to convert
+                                        return Ok(Some(format!("{}.into_iter().collect::<::std::collections::HashSet<_>>()", a)));
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+        Ok(None)
+    }
     fn emit_expr(&mut self, e: &Expr) -> Result<String> {
         Ok(match e {
             Expr::Int(n, _) => format!("({}i64)", n),
@@ -3196,1330 +4587,7 @@ impl<'a> Codegen<'a> {
             // through unchanged (legitimate receiver).
             Expr::Ident(n, _) => escape_ident(n),
             Expr::Call { callee, args, kwargs, .. } => {
-                // Multi-arg print with inline format
-                if let Expr::Ident(n, _) = callee.as_ref() {
-                    if n == "print" {
-                        if args.is_empty() {
-                            return Ok("println!(\"\")".to_string());
-                        }
-                        let mut parts: Vec<String> = Vec::new();
-                        for arg in args {
-                            let raw = self.emit_expr(arg)?;
-                            let formatted = match self.type_of_expr(arg) {
-                                Ty::Float => format!("__py_fmt_float({})", raw),
-                                Ty::Bool => format!("__py_fmt_bool({})", raw),
-                                Ty::List(_) | Ty::Set(_) | Ty::Dict(_, _) | Ty::Tuple(_) =>
-                                    format!("({}).py_repr()", raw),
-                                _ => raw,
-                            };
-                            parts.push(formatted);
-                        }
-                        // Use {} (Display format) for most types; {:?} breaks strings by adding quotes
-                        let fmt = (0..parts.len()).map(|_| "{}").collect::<Vec<_>>().join(" ");
-                        return Ok(format!("println!(\"{}\" {})", fmt,
-                            if parts.is_empty() { "".to_string() } else { format!(", {}", parts.join(", ")) }));
-                    }
-                }
-
-                // Inline range() with 1, 2, or 3 args
-                if let Expr::Ident(n, _) = callee.as_ref() {
-                    if n == "range" {
-                        if args.len() == 1 {
-                            let a = self.emit_expr(&args[0])?;
-                            return Ok(format!("(0..{})", a));
-                        } else if args.len() == 2 {
-                            let a = self.emit_expr(&args[0])?;
-                            let b = self.emit_expr(&args[1])?;
-                            return Ok(format!("({}..{})", a, b));
-                        } else if args.len() == 3 {
-                            let a = self.emit_expr(&args[0])?;
-                            let b = self.emit_expr(&args[1])?;
-                            let step = self.emit_expr(&args[2])?;
-                            return Ok(format!("({}..{}).step_by({} as usize)", a, b, step));
-                        }
-                    }
-                }
-
-                // Inline enumerate(iter) — emits iterator chain without collecting
-                if let Expr::Ident(n, _) = callee.as_ref() {
-                    if n == "enumerate" && args.len() == 1 {
-                        let a = self.emit_expr(&args[0])?;
-                        let is_range = a.contains("..");
-                        let iter_chain = if is_range {
-                            format!("({}).into_iter()", a)
-                        } else {
-                            format!("{}.iter().cloned()", a)
-                        };
-                        return Ok(format!("{}.enumerate().map(|(i, v)| (i as i64, v))", iter_chain));
-                    }
-                }
-
-                // Inline zip(a, b) — emits iterator chain without collecting
-                if let Expr::Ident(n, _) = callee.as_ref() {
-                    if n == "zip" && args.len() == 2 {
-                        let a = self.emit_expr(&args[0])?;
-                        let b = self.emit_expr(&args[1])?;
-                        let is_range_a = a.contains("..");
-                        let is_range_b = b.contains("..");
-                        let iter_a = if is_range_a { format!("({}).into_iter()", a) } else { format!("{}.iter().cloned()", a) };
-                        let iter_b = if is_range_b { format!("({}).into_iter()", b) } else { format!("{}.iter().cloned()", b) };
-                        return Ok(format!("{}.zip({})", iter_a, iter_b));
-                    }
-                }
-
-                // Builtin function dispatch
-                if let Expr::Ident(n, _) = callee.as_ref() {
-                    match n.as_str() {
-                        "len" => {
-                            let a = self.emit_expr(&args[0])?;
-                            // Python len() of a str is the CHARACTER count, not the
-                            // UTF-8 byte count. Collections keep .len().
-                            if matches!(self.type_of_expr(&args[0]), Ty::Str) {
-                                return Ok(format!("{}.chars().count() as i64", a));
-                            }
-                            return Ok(format!("{}.len() as i64", a));
-                        }
-                        "str" => {
-                            let a = self.emit_expr(&args[0])?;
-                            match self.type_of_expr(&args[0]) {
-                                Ty::List(_) | Ty::Set(_) | Ty::Dict(_, _) | Ty::Tuple(_) =>
-                                    return Ok(format!("({}).py_repr()", a)),
-                                _ => return Ok(format!("format!(\"{{}}\" , {})", a)),
-                            }
-                        }
-                        "open" => {
-                            let path = self.emit_expr(&args[0])?;
-                            let mode = if args.len() >= 2 {
-                                self.emit_expr(&args[1])?
-                            } else {
-                                "\"r\".to_string()".to_string()
-                            };
-                            return Ok(format!("__py_open(&{}, &{})", path, mode));
-                        }
-                        "int" => {
-                            let a = self.emit_expr(&args[0])?;
-                            let arg_type = self.type_of_expr(&args[0]);
-                            match arg_type {
-                                Ty::Str => {
-                                    // Use helper so a bad string panics with "ValueError\0..."
-                                    // which the try/except dispatcher can match on ValueError.
-                                    return Ok(format!("(__py_int_from_str(&{}))", a));
-                                }
-                                _ => return Ok(format!("({} as i64)", a)),
-                            }
-                        }
-                        "float" => {
-                            let a = self.emit_expr(&args[0])?;
-                            let arg_type = self.type_of_expr(&args[0]);
-                            match arg_type {
-                                Ty::Str => {
-                                    // Use helper so a bad string panics with "ValueError\0..."
-                                    // which the try/except dispatcher can match on ValueError.
-                                    return Ok(format!("(__py_float_from_str(&{}))", a));
-                                }
-                                _ => return Ok(format!("({} as f64)", a)),
-                            }
-                        }
-                        "bool" => {
-                            let a = self.emit_expr(&args[0])?;
-                            return Ok(format!("(({}) != 0)", a));
-                        }
-                        "abs" => {
-                            let a = self.emit_expr(&args[0])?;
-                            return Ok(format!("({}).abs()", a));
-                        }
-                        "min" => {
-                            if let Some((_, key_expr)) = kwargs.iter().find(|(n, _)| n == "key") {
-                                // min with key parameter
-                                let a = self.emit_expr(&args[0])?;
-                                // Check if key_expr is a Lambda to handle it specially
-                                let key_code = if let Expr::Lambda { params, body, .. } = key_expr {
-                                    // Lambda: extract parameter name and body, rename param to __x
-                                    let param_name = params.first().map(|(n, _)| n.clone()).unwrap_or_else(|| "__x".to_string());
-                                    let saved_local = self.locals.get(&param_name).cloned();
-                                    self.locals.insert(param_name.clone(), Ty::Unknown);
-                                    let body_s = self.emit_expr(body)?;
-                                    if let Some(ty) = saved_local {
-                                        self.locals.insert(param_name.clone(), ty);
-                                    } else {
-                                        self.locals.remove(param_name.as_str());
-                                    }
-                                    // Replace param_name with __x in the body (word-boundary aware).
-                                    // (EPIC-6) The body emitted the param through
-                                    // emit_expr's Ident arm, which ESCAPES a keyword
-                                    // param to `r#<name>`; search for that escaped
-                                    // form so a keyword sort-key param is renamed
-                                    // correctly (replace_identifier treats `r#kw` as
-                                    // one token).
-                                    Self::replace_identifier(&body_s, escape_ident(&param_name).as_str(), "__x")
-                                } else {
-                                    // Regular expression: wrap in closure that calls the key function
-                                    self.emit_expr(key_expr)?
-                                };
-                                return Ok(format!(
-                                    "{{ let __list = {}; __list.iter().min_by_key(|__x| {}).map(|__x| __x.clone()).unwrap_or_default() }}",
-                                    a, key_code
-                                ));
-                            } else if args.len() == 1 {
-                                let a = self.emit_expr(&args[0])?;
-                                let elem_ty = match self.type_of_expr(&args[0]) {
-                                    Ty::List(inner) => *inner,
-                                    _ => Ty::Int,
-                                };
-                                return Ok(match elem_ty {
-                                    Ty::Float => format!("{{ let mut __min = f64::INFINITY; for __x in {}.iter() {{ if __x < &__min {{ __min = *__x; }} }} __min }}", a),
-                                    _ => format!("{}.iter().copied().min().unwrap_or(0)", a),
-                                });
-                            } else {
-                                let a = self.emit_expr(&args[0])?;
-                                let b = self.emit_expr(&args[1])?;
-                                return Ok(format!("::std::cmp::min({}, {})", a, b));
-                            }
-                        }
-                        "max" => {
-                            if let Some((_, key_expr)) = kwargs.iter().find(|(n, _)| n == "key") {
-                                // max with key parameter
-                                let a = self.emit_expr(&args[0])?;
-                                // Check if key_expr is a Lambda to handle it specially
-                                let key_code = if let Expr::Lambda { params, body, .. } = key_expr {
-                                    // Lambda: extract parameter name and body, rename param to __x
-                                    let param_name = params.first().map(|(n, _)| n.clone()).unwrap_or_else(|| "__x".to_string());
-                                    let saved_local = self.locals.get(&param_name).cloned();
-                                    self.locals.insert(param_name.clone(), Ty::Unknown);
-                                    let body_s = self.emit_expr(body)?;
-                                    if let Some(ty) = saved_local {
-                                        self.locals.insert(param_name.clone(), ty);
-                                    } else {
-                                        self.locals.remove(param_name.as_str());
-                                    }
-                                    // Replace param_name with __x in the body (word-boundary aware).
-                                    // (EPIC-6) The body emitted the param through
-                                    // emit_expr's Ident arm, which ESCAPES a keyword
-                                    // param to `r#<name>`; search for that escaped
-                                    // form so a keyword sort-key param is renamed
-                                    // correctly (replace_identifier treats `r#kw` as
-                                    // one token).
-                                    Self::replace_identifier(&body_s, escape_ident(&param_name).as_str(), "__x")
-                                } else {
-                                    // Regular expression: wrap in closure that calls the key function
-                                    self.emit_expr(key_expr)?
-                                };
-                                return Ok(format!(
-                                    "{{ let __list = {}; __list.iter().max_by_key(|__x| {}).map(|__x| __x.clone()).unwrap_or_default() }}",
-                                    a, key_code
-                                ));
-                            } else if args.len() == 1 {
-                                let a = self.emit_expr(&args[0])?;
-                                let elem_ty = match self.type_of_expr(&args[0]) {
-                                    Ty::List(inner) => *inner,
-                                    _ => Ty::Int,
-                                };
-                                return Ok(match elem_ty {
-                                    Ty::Float => format!("{{ let mut __max = f64::NEG_INFINITY; for __x in {}.iter() {{ if __x > &__max {{ __max = *__x; }} }} __max }}", a),
-                                    _ => format!("{}.iter().copied().max().unwrap_or(0)", a),
-                                });
-                            } else {
-                                let a = self.emit_expr(&args[0])?;
-                                let b = self.emit_expr(&args[1])?;
-                                return Ok(format!("::std::cmp::max({}, {})", a, b));
-                            }
-                        }
-                        "sorted" => {
-                            let a = self.emit_expr(&args[0])?;
-                            let list_ty = self.type_of_expr(&args[0]);
-
-                            if let Some((_, key_expr)) = kwargs.iter().find(|(n, _)| n == "key") {
-                                // sorted with key parameter
-                                // Determine the return type of the key expression
-                                let key_ret_ty = if let Expr::Lambda { params: _, body, .. } = key_expr {
-                                    // For lambdas, infer from the body expression
-                                    // We need to temporarily register the parameter to type-check the body
-                                    // But since type_of_expr is &self, we can't do that easily
-                                    // So we'll just check common patterns
-                                    if let Expr::Attr { name, .. } = body.as_ref() {
-                                        // Lambda body is field access - check the field type
-                                        if let Ty::List(ref elem_ty) = list_ty {
-                                            if let Ty::Class(cls) = elem_ty.as_ref() {
-                                                if let Some(c) = self.ctx.classes.get(cls.as_str()) {
-                                                    if let Some(f) = c.fields.iter().find(|f| &f.name == name) {
-                                                        Ty::from_type_expr(&f.ty, f.span).unwrap_or(Ty::Unknown)
-                                                    } else {
-                                                        Ty::Unknown
-                                                    }
-                                                } else {
-                                                    Ty::Unknown
-                                                }
-                                            } else {
-                                                Ty::Unknown
-                                            }
-                                        } else {
-                                            Ty::Unknown
-                                        }
-                                    } else if let Expr::Call { callee, .. } = body.as_ref() {
-                                        // Lambda body is a method call - check method return type
-                                        if let Expr::Attr { name, .. } = callee.as_ref() {
-                                            if let Ty::List(ref elem_ty) = list_ty {
-                                                if let Ty::Class(cls) = elem_ty.as_ref() {
-                                                    if let Some(method_sig) = self.ctx.get_method(cls.as_str(), name) {
-                                                        method_sig.ret.clone()
-                                                    } else {
-                                                        Ty::Unknown
-                                                    }
-                                                } else {
-                                                    Ty::Unknown
-                                                }
-                                            } else {
-                                                Ty::Unknown
-                                            }
-                                        } else {
-                                            Ty::Unknown
-                                        }
-                                    } else {
-                                        Ty::Unknown
-                                    }
-                                } else {
-                                    Ty::Unknown
-                                };
-
-                                let key_code = if let Expr::Lambda { params, body, .. } = key_expr {
-                                    // Lambda: extract parameter name and body, rename param to __x
-                                    let param_name = params.first().map(|(n, _)| n.clone()).unwrap_or_else(|| "__x".to_string());
-                                    let saved_local = self.locals.get(&param_name).cloned();
-                                    self.locals.insert(param_name.clone(), Ty::Unknown);
-                                    let body_s = self.emit_expr(body)?;
-                                    if let Some(ty) = saved_local {
-                                        self.locals.insert(param_name.clone(), ty);
-                                    } else {
-                                        self.locals.remove(param_name.as_str());
-                                    }
-                                    // Replace param_name with __x in the body (word-boundary aware).
-                                    // (EPIC-6) The body emitted the param through
-                                    // emit_expr's Ident arm, which ESCAPES a keyword
-                                    // param to `r#<name>`; search for that escaped
-                                    // form so a keyword sort-key param is renamed
-                                    // correctly (replace_identifier treats `r#kw` as
-                                    // one token).
-                                    Self::replace_identifier(&body_s, escape_ident(&param_name).as_str(), "__x")
-                                } else {
-                                    // Regular expression: wrap in closure that calls the key function
-                                    self.emit_expr(key_expr)?
-                                };
-
-                                // Use appropriate sorting method based on key return type
-                                return Ok(match key_ret_ty {
-                                    Ty::Float => {
-                                        format!(
-                                            "{{ let mut __sorted = {}.clone(); __sorted.sort_by(|a, b| {{ let ka = {{ let __x = a.clone(); {} }}; let kb = {{ let __x = b.clone(); {} }}; ka.partial_cmp(&kb).unwrap_or(::std::cmp::Ordering::Equal) }}); __sorted }}",
-                                            a, key_code, key_code
-                                        )
-                                    }
-                                    _ => {
-                                        format!(
-                                            "{{ let mut __sorted = {}.clone(); __sorted.sort_by_key(|__x| {}); __sorted }}",
-                                            a, key_code
-                                        )
-                                    }
-                                });
-                            } else {
-                                // Check if this is a float list to handle Ord constraint
-                                let is_float_list = matches!(&list_ty, Ty::List(inner) if inner.as_ref() == &Ty::Float);
-                                let sort_code = if is_float_list {
-                                    ".sort_by(|a, b| a.partial_cmp(b).unwrap_or(::std::cmp::Ordering::Equal))".to_string()
-                                } else {
-                                    ".sort()".to_string()
-                                };
-
-                                // `sorted` operates on a Vec. A list arg is cloned
-                                // directly; a set is materialized from its elements
-                                // and a dict from its KEYS (Python semantics — both
-                                // HashMap/HashSet lack `.sort()`).
-                                let base = match &list_ty {
-                                    Ty::Set(_) => format!("{}.iter().cloned().collect::<Vec<_>>()", a),
-                                    Ty::Dict(_, _) => format!("{}.keys().cloned().collect::<Vec<_>>()", a),
-                                    _ => format!("{}.clone()", a),
-                                };
-
-                                if let Some((_, rev_expr)) = kwargs.iter().find(|(n, _)| n == "reverse") {
-                                    // sorted with reverse parameter
-                                    let rev_s = self.emit_expr(rev_expr)?;
-                                    return Ok(format!(
-                                        "{{ let mut __sorted = {}; __sorted{}; if {} {{ __sorted.reverse(); }} __sorted }}",
-                                        base, sort_code, rev_s
-                                    ));
-                                } else {
-                                    // Default sorted
-                                    return Ok(format!("{{ let mut __sorted = {}; __sorted{}; __sorted }}", base, sort_code));
-                                }
-                            }
-                        }
-                        "sum" => {
-                            let a = self.emit_expr(&args[0])?;
-                            // Determine the sum type based on the iterable's element type
-                            let sum_type = match self.type_of_expr(&args[0]) {
-                                Ty::List(inner) | Ty::Set(inner) => match *inner {
-                                    Ty::Float => "f64",
-                                    _ => "i64",
-                                },
-                                _ => "i64",
-                            };
-                            return Ok(format!("{}.iter().sum::<{}>()", a, sum_type));
-                        }
-                        "input" => {
-                            if args.is_empty() {
-                                return Ok("{ let mut __s = String::new(); ::std::io::stdin().read_line(&mut __s).unwrap(); __s.trim_end().to_string() }".to_string());
-                            } else {
-                                let p = self.emit_expr(&args[0])?;
-                                return Ok(format!("{{ print!(\"{{}}\" , {}); ::std::io::stdout().flush().ok(); let mut __s = String::new(); ::std::io::stdin().read_line(&mut __s).unwrap(); __s.trim_end().to_string() }}", p));
-                            }
-                        }
-                        "any" => {
-                            let a = self.emit_expr(&args[0])?;
-                            return Ok(format!("{}.iter().any(|x| *x)", a));
-                        }
-                        "all" => {
-                            let a = self.emit_expr(&args[0])?;
-                            return Ok(format!("{}.iter().all(|x| *x)", a));
-                        }
-                        "round" => {
-                            let a = self.emit_expr(&args[0])?;
-                            return Ok(format!("({} as f64).round() as i64", a));
-                        }
-                        "pow" => {
-                            let base = self.emit_expr(&args[0])?;
-                            let exp = self.emit_expr(&args[1])?;
-                            return Ok(format!("({} as f64).powi({} as i32) as i64", base, exp));
-                        }
-                        "chr" => {
-                            let a = self.emit_expr(&args[0])?;
-                            return Ok(format!("(char::from_u32({} as u32).unwrap()).to_string()", a));
-                        }
-                        "ord" => {
-                            let a = self.emit_expr(&args[0])?;
-                            return Ok(format!("({}.chars().next().unwrap() as i64)", a));
-                        }
-                        "reversed" => {
-                            let a = self.emit_expr(&args[0])?;
-                            return Ok(format!("{{ let mut __r = {}.clone(); __r.reverse(); __r }}", a));
-                        }
-                        "map" => {
-                            let f = self.emit_expr(&args[0])?;
-                            let it = self.emit_expr(&args[1])?;
-                            return Ok(format!("{}.iter().cloned().map({}).collect::<Vec<_>>()", it, f));
-                        }
-                        "filter" => {
-                            let f = self.emit_expr(&args[0])?;
-                            let it = self.emit_expr(&args[1])?;
-                            return Ok(format!("{}.iter().cloned().filter(|__x| ({})((__x).clone())).collect::<Vec<_>>()", it, f));
-                        }
-                        "isinstance" => {
-                            if args.len() != 2 {
-                                return Err(crate::diag::Error::Codegen("isinstance requires exactly 2 arguments".into()));
-                            }
-                            let obj_type = self.type_of_expr(&args[0]);
-                            // Check if args[1] is a builtin type identifier
-                            if let Expr::Ident(type_name, _) = &args[1] {
-                                let matches = match type_name.as_str() {
-                                    "int" => matches!(&obj_type, Ty::Int),
-                                    "str" => matches!(&obj_type, Ty::Str),
-                                    "float" => matches!(&obj_type, Ty::Float),
-                                    "bool" => matches!(&obj_type, Ty::Bool),
-                                    "list" => matches!(&obj_type, Ty::List(_)),
-                                    "dict" => matches!(&obj_type, Ty::Dict(_, _)),
-                                    "set" => matches!(&obj_type, Ty::Set(_)),
-                                    _ => {
-                                        // For custom classes, emit runtime check
-                                        let _obj = self.emit_expr(&args[0])?;
-                                        return Ok(format!("true")); // Placeholder for custom class check
-                                    }
-                                };
-                                return Ok(if matches { "true" } else { "false" }.to_string());
-                            } else {
-                                // Dynamic type check (not a literal type name)
-                                return Ok("true".to_string()); // Conservative: assume true for dynamic checks
-                            }
-                        }
-                        "type" => {
-                            if args.len() != 1 {
-                                return Err(crate::diag::Error::Codegen("type requires exactly 1 argument".into()));
-                            }
-                            let obj_type = self.type_of_expr(&args[0]);
-                            let type_name = match obj_type {
-                                Ty::Int => "<class 'int'>",
-                                Ty::Str => "<class 'str'>",
-                                Ty::Float => "<class 'float'>",
-                                Ty::Bool => "<class 'bool'>",
-                                Ty::List(_) => "<class 'list'>",
-                                Ty::Dict(_, _) => "<class 'dict'>",
-                                Ty::Set(_) => "<class 'set'>",
-                                // Both the `None` literal (NoneVal) and a void
-                                // result (Unit) report Python's NoneType, matching
-                                // the pre-NoneVal behavior of `type(None)`.
-                                Ty::Unit | Ty::NoneVal => "<class 'NoneType'>",
-                                _ => "<class 'object'>",
-                            };
-                            return Ok(format!("String::from(\"{}\")", type_name));
-                        }
-                        "hex" => {
-                            let a = self.emit_expr(&args[0])?;
-                            return Ok(format!("format!(\"{{:#x}}\", {})", a));
-                        }
-                        "oct" => {
-                            let a = self.emit_expr(&args[0])?;
-                            return Ok(format!("format!(\"{{:#o}}\", {})", a));
-                        }
-                        "bin" => {
-                            let a = self.emit_expr(&args[0])?;
-                            return Ok(format!("format!(\"{{:#b}}\", {})", a));
-                        }
-                        "callable" => {
-                            if args.len() != 1 {
-                                return Err(crate::diag::Error::Codegen("callable requires exactly 1 argument".into()));
-                            }
-                            // Check if the argument is a function name
-                            if let Expr::Ident(name, _) = &args[0] {
-                                let is_callable = self.ctx.funcs.contains_key(name.as_str()) ||
-                                                 self.ctx.classes.contains_key(name.as_str());
-                                return Ok(if is_callable { "true" } else { "false" }.to_string());
-                            } else {
-                                // For non-identifier expressions, conservatively return false
-                                return Ok("false".to_string());
-                            }
-                        }
-                        "repr" => {
-                            if args.len() != 1 {
-                                return Err(crate::diag::Error::Codegen("repr requires exactly 1 argument".into()));
-                            }
-                            let obj_type = self.type_of_expr(&args[0]);
-                            let a = self.emit_expr(&args[0])?;
-                            let repr_expr = match obj_type {
-                                Ty::Str => format!("format!(\"'{{}}'\", {})", a),
-                                Ty::Bool => format!("format!(\"{{}}\" , if {} {{ \"True\" }} else {{ \"False\" }})", a),
-                                _ => format!("format!(\"{{}}\" , {})", a),
-                            };
-                            return Ok(repr_expr);
-                        }
-                        "ascii" => {
-                            if args.len() != 1 {
-                                return Err(crate::diag::Error::Codegen("ascii requires exactly 1 argument".into()));
-                            }
-                            let obj_type = self.type_of_expr(&args[0]);
-                            let a = self.emit_expr(&args[0])?;
-                            let ascii_expr = match obj_type {
-                                Ty::Str => {
-                                    format!(
-                                        "format!(\"'{{}}'\", {}.escape_default())",
-                                        a
-                                    )
-                                }
-                                Ty::Bool => {
-                                    format!("format!(\"{{}}\" , if {} {{ \"True\" }} else {{ \"False\" }})", a)
-                                }
-                                _ => format!("format!(\"{{}}\" , {})", a),
-                            };
-                            return Ok(ascii_expr);
-                        }
-                        "list" => {
-                            if args.is_empty() {
-                                return Ok("Vec::<i64>::new()".to_string());
-                            } else {
-                                let a = self.emit_expr(&args[0])?;
-                                let arg_type = self.type_of_expr(&args[0]);
-                                // If the argument is already a list, just return it. Otherwise collect the iterator.
-                                match arg_type {
-                                    Ty::List(_) => return Ok(a),
-                                    // A set/dict is a concrete container, not an
-                                    // iterator: take an owned Vec of its elements
-                                    // (dict -> its KEYS, Python semantics).
-                                    Ty::Set(_) => {
-                                        return Ok(format!("{}.iter().cloned().collect::<Vec<_>>()", a));
-                                    }
-                                    Ty::Dict(_, _) => {
-                                        return Ok(format!("{}.keys().cloned().collect::<Vec<_>>()", a));
-                                    }
-                                    _ => {
-                                        // Check if the expression looks like it returns a Vec (contains reverse, sort, etc.)
-                                        if a.contains("reverse") || a.contains("sort") || a.contains("clone()") {
-                                            return Ok(a);
-                                        }
-                                        return Ok(format!("{}.collect::<Vec<_>>()", a));
-                                    }
-                                }
-                            }
-                        }
-                        "dict" => {
-                            if args.is_empty() && kwargs.is_empty() {
-                                return Ok("std::collections::HashMap::new()".to_string());
-                            } else {
-                                return Err(crate::diag::Error::Codegen("dict() constructor with arguments not yet supported".into()));
-                            }
-                        }
-                        "tuple" => {
-                            if args.is_empty() {
-                                return Ok("()".to_string());
-                            } else {
-                                let a = self.emit_expr(&args[0])?;
-                                return Ok(format!("({},)", a));
-                            }
-                        }
-                        "getattr" => {
-                            if args.len() < 2 || args.len() > 3 {
-                                return Err(crate::diag::Error::Codegen("getattr requires 2 or 3 arguments".into()));
-                            }
-                            let _obj = self.emit_expr(&args[0])?;
-                            let attr_name = self.emit_expr(&args[1])?;
-
-                            // For now, just access the field directly (works for simple cases)
-                            // This assumes the object is a struct with the matching field name
-                            return Ok(format!("{{ let __attr_name = {}; format!(\"{{:?}}\", __attr_name) }}", attr_name));
-                        }
-                        "setattr" => {
-                            if args.len() != 3 {
-                                return Err(crate::diag::Error::Codegen("setattr requires exactly 3 arguments".into()));
-                            }
-                            // Note: In Python, setattr modifies the object. In Rust, we can't modify through a reference.
-                            // For now, just return None
-                            return Ok("()".to_string());
-                        }
-                        "hasattr" => {
-                            if args.len() != 2 {
-                                return Err(crate::diag::Error::Codegen("hasattr requires exactly 2 arguments".into()));
-                            }
-                            // For now, just return true (conservative assumption)
-                            return Ok("true".to_string());
-                        }
-                        "set" => {
-                            if args.is_empty() {
-                                return Ok("::std::collections::HashSet::new()".to_string());
-                            } else {
-                                let a = self.emit_expr(&args[0])?;
-                                let arg_type = self.type_of_expr(&args[0]);
-                                // If the argument is already a set, just return it. Otherwise convert to set.
-                                match arg_type {
-                                    Ty::Set(_) => return Ok(a),
-                                    Ty::List(_) | Ty::Unknown => {
-                                        // Check if it looks like a vec literal or variable
-                                        if a.starts_with("vec!") {
-                                            return Ok(format!("{}.into_iter().collect::<::std::collections::HashSet<_>>()", a));
-                                        } else {
-                                            return Ok(format!("{}.into_iter().collect::<::std::collections::HashSet<_>>()", a));
-                                        }
-                                    }
-                                    _ => {
-                                        // For other iterables, try to convert
-                                        return Ok(format!("{}.into_iter().collect::<::std::collections::HashSet<_>>()", a));
-                                    }
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-
-                // Check if this is a class constructor call.
-                if let Expr::Ident(name, _) = callee.as_ref() {
-                    if let Some(class_def) = self.ctx.classes.get(name.as_str()).cloned() {
-                        let has_init = class_def.methods.iter().any(|m| m.name == "__init__");
-
-                        // Use ::new() constructor whenever __init__ is defined —
-                        // including the zero-arg case so that __init__ side-effects
-                        // (field assignments, etc.) always run.
-                        if has_init {
-                            // (EPIC-5 C2-3) The `new()` signature lowers each
-                            // `__init__` param via `rust_ty`, so a base-typed param
-                            // is `B__`. A raw-struct / subclass argument into such a
-                            // slot must be WRAPPED in the right variant (the same
-                            // wrap-or-passthrough used at return / assign / free-fn
-                            // sites) — otherwise the bare `Dog::new(..)` mismatches
-                            // the `Animal__` param (E0308). Non-polymorphic params
-                            // keep the clone-on-use emission.
-                            let init_params: Vec<(String, Ty)> = class_def.methods.iter()
-                                .find(|m| m.name == "__init__")
-                                .map(|m| m.params.iter()
-                                    .filter(|p| p.name != "self")
-                                    .filter_map(|p| Ty::from_type_expr(&p.ty, p.span).ok().map(|t| (p.name.clone(), t)))
-                                    .collect())
-                                .unwrap_or_default();
-                            let mut call_parts = Vec::new();
-                            for (i, a) in args.iter().enumerate() {
-                                call_parts.push(self.emit_arg_into_slot(a, init_params.get(i).map(|(_, t)| t))?);
-                            }
-                            for (kw, v) in kwargs {
-                                let pt = init_params.iter().find(|(n, _)| n == kw).map(|(_, t)| t);
-                                call_parts.push(self.emit_arg_into_slot(v, pt)?);
-                            }
-                            return Ok(format!("{}::new({})", name, call_parts.join(", ")));
-                        }
-
-                        // Class constructor: emit a Rust struct literal.
-                        // Use inherited + own fields for positional.
-                        let mut all_field_names: Vec<String> = Vec::new();
-                        for base in &class_def.bases {
-                            if let Some(bd) = self.ctx.classes.get(base.as_str()).cloned() {
-                                for f in &bd.fields {
-                                    if !all_field_names.contains(&f.name) {
-                                        all_field_names.push(f.name.clone());
-                                    }
-                                }
-                            }
-                        }
-                        for f in &class_def.fields {
-                            if !all_field_names.contains(&f.name) {
-                                all_field_names.push(f.name.clone());
-                            }
-                        }
-
-                        if !args.is_empty() && kwargs.is_empty() {
-                            // Positional args to a class constructor.
-                            if args.len() != all_field_names.len() {
-                                return Err(crate::diag::Error::Codegen(format!(
-                                    "class `{}` has {} fields but {} positional arguments given",
-                                    name, all_field_names.len(), args.len()
-                                )));
-                            }
-                            let mut parts = Vec::new();
-                            for (field_name, arg) in all_field_names.iter().zip(args.iter()) {
-                                // (EPIC-5 C2-3) The struct field lowers to `B__` for
-                                // a polymorphic-base field, so a raw-struct/subclass
-                                // value wraps in its variant (same as the ctor/new
-                                // path above).
-                                let fty = self.class_field_type(&class_def, field_name);
-                                let v = self.emit_arg_into_slot(arg, fty.as_ref())?;
-                                // (EPIC-6) Escape a keyword field name in the
-                                // positional struct-literal init.
-                                parts.push(format!("{}: {}", escape_ident(field_name), v));
-                            }
-                            return Ok(format!("{} {{ {} }}", name, parts.join(", ")));
-                        }
-
-                        // Keyword-args form.
-                        if !kwargs.is_empty() {
-                            let mut parts = Vec::new();
-                            for (kw, val) in kwargs {
-                                let fty = self.class_field_type(&class_def, kw);
-                                let v = self.emit_arg_into_slot(val, fty.as_ref())?;
-                                // (EPIC-6) Escape a keyword field name in the
-                                // keyword-arg struct-literal init.
-                                parts.push(format!("{}: {}", escape_ident(kw), v));
-                            }
-                            return Ok(format!("{} {{ {} }}", name, parts.join(", ")));
-                        }
-
-                        // No args at all: emit default struct literal.
-                        let mut parts = Vec::new();
-                        for fname in &all_field_names {
-                            let field = class_def.fields.iter().find(|f| &f.name == fname)
-                                .or_else(|| {
-                                    class_def.bases.iter().find_map(|b| {
-                                        self.ctx.classes.get(b.as_str())
-                                            .and_then(|bd| bd.fields.iter().find(|f| &f.name == fname))
-                                    })
-                                });
-                            let default = if let Some(f) = field {
-                                let ty = Ty::from_type_expr(&f.ty, f.span)?;
-                                self.zeroed_default(&ty)
-                            } else {
-                                "Default::default()".to_string()
-                            };
-                            // (EPIC-6) Escape a keyword field name in the no-arg
-                            // default struct-literal init.
-                            parts.push(format!("{}: {}", escape_ident(fname), default));
-                        }
-                        return Ok(format!("{} {{ {} }}", name, parts.join(", ")));
-                    }
-                }
-
-                // Handle super().method(args)
-                if let Expr::Attr { obj: super_call_expr, name: method_name, .. } = callee.as_ref() {
-                    if let Expr::Call { callee: super_ident, args: super_args, .. } = super_call_expr.as_ref() {
-                        if let Expr::Ident(n, _) = super_ident.as_ref() {
-                            if n == "super" && super_args.is_empty() {
-                                if let Some(_class_name) = self.current_class.clone() {
-                                    // Call __super_ alias method which has parent's body
-                                    let mut arg_parts = Vec::new();
-                                    for a in args { arg_parts.push(self.emit_consuming(a)?); }
-                                    return Ok(format!("self.__super_{}({})", method_name, arg_parts.join(", ")));
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Method call with attribute callee — handle method name remapping
-                if let Expr::Attr { obj, name, .. } = callee.as_ref() {
-                    // Math module functions
-                    if let Expr::Ident(modname, _) = obj.as_ref() {
-                        if modname == "math" {
-                            let parts: Result<Vec<_>> = args.iter().map(|a| self.emit_consuming(a)).collect();
-                            let parts = parts?;
-                            let a0 = parts.get(0).map(|s| s.as_str()).unwrap_or("0.0");
-                            let a1 = parts.get(1).map(|s| s.as_str()).unwrap_or("0.0");
-                            return Ok(match name.as_str() {
-                                "sqrt"     => format!("({} as f64).sqrt()", a0),
-                                "floor"    => format!("({} as f64).floor()", a0),
-                                "ceil"     => format!("({} as f64).ceil()", a0),
-                                "trunc"    => format!("({} as f64).trunc()", a0),
-                                "fabs" | "abs" => format!("({} as f64).abs()", a0),
-                                "exp"      => format!("({} as f64).exp()", a0),
-                                "log"      => if parts.len() == 2 { format!("({} as f64).log({} as f64)", a0, a1) } else { format!("({} as f64).ln()", a0) },
-                                "log2"     => format!("({} as f64).log2()", a0),
-                                "log10"    => format!("({} as f64).log10()", a0),
-                                "sin"      => format!("({} as f64).sin()", a0),
-                                "cos"      => format!("({} as f64).cos()", a0),
-                                "tan"      => format!("({} as f64).tan()", a0),
-                                "asin"     => format!("({} as f64).asin()", a0),
-                                "acos"     => format!("({} as f64).acos()", a0),
-                                "atan"     => format!("({} as f64).atan()", a0),
-                                "atan2"    => format!("({} as f64).atan2({} as f64)", a0, a1),
-                                "pow"      => format!("({} as f64).powf({} as f64)", a0, a1),
-                                "hypot"    => format!("({} as f64).hypot({} as f64)", a0, a1),
-                                "degrees"  => format!("({} as f64).to_degrees()", a0),
-                                "radians"  => format!("({} as f64).to_radians()", a0),
-                                "isnan"    => format!("({} as f64).is_nan()", a0),
-                                "isinf"    => format!("({} as f64).is_infinite()", a0),
-                                "isfinite" => format!("({} as f64).is_finite()", a0),
-                                _ => return Err(crate::diag::Error::Codegen(format!("unknown math function: math.{}", name))),
-                            });
-                        }
-                    }
-
-                    // Check for static method calls: ClassName.method(args)
-                    if let Expr::Ident(class_name, _) = obj.as_ref() {
-                        if let Some(class_def) = self.ctx.classes.get(class_name.as_str()) {
-                            if let Some(method_def) = class_def.methods.iter().find(|m| &m.name == name) {
-                                if method_def.decorators.contains(&"staticmethod".to_string()) {
-                                    let parts: Result<Vec<_>> = args.iter().map(|a| self.emit_consuming(a)).collect();
-                                    let parts = parts?;
-                                    return Ok(format!("{}::{}({})", class_name, name, parts.join(", ")));
-                                }
-                            }
-                        }
-                    }
-
-                    // Mutating list/set/dict methods need an lvalue receiver. For
-                    // a *subscripted* receiver (`self.rows[i].append(x)`,
-                    // `grid[r].sort()`) emit_expr would produce a clone-based
-                    // rvalue, so the mutation would hit (and drop) a temporary.
-                    // Use emit_place for those so the in-place mutation lands on
-                    // the real element. Bare-name and `self.field` receivers are
-                    // already place expressions under emit_expr.
-                    // MUTATING_METHODS is the module-level const above.
-                    let obj_s = if matches!(obj.as_ref(), Expr::Index { .. })
-                        && MUTATING_METHODS.contains(&name.as_str())
-                    {
-                        self.emit_place(obj)?
-                    } else {
-                        self.emit_expr(obj)?
-                    };
-                    let method = match name.as_str() {
-                        // String methods
-                        "upper"      => "to_uppercase",
-                        "lower"      => "to_lowercase",
-                        "strip"      => "trim",
-                        "lstrip"     => "trim_start",
-                        "rstrip"     => "trim_end",
-                        // List methods
-                        "append"     => "push",
-                        "pop"        => "pop().unwrap",
-                        // passthrough
-                        other        => other,
-                    };
-                    let parts: Result<Vec<_>> = args.iter().map(|a| self.emit_consuming(a)).collect();
-                    let parts = parts?;
-
-                    // (EPIC-6) Receiver-type-guarded early return. The builtin
-                    // method arms below match purely on `name` with NO receiver
-                    // guard on most of them (`get`, `keys`, `values`, `items`,
-                    // `update`, `pop`, `copy`, `clear`, `append`, `extend`,
-                    // `insert`, `remove`, `sort`, ...). So a USER class that
-                    // defines a method with one of those names previously had
-                    // `instance.get(k)` silently lowered to a dict
-                    // `.get(&k).cloned()` (wrong Rust / wrong behavior / a
-                    // compile error) — the builtin arm won because it ran BEFORE
-                    // the user-method tail. Guard it here: if the receiver's
-                    // static type is a user class that HAS an instance method
-                    // named `name` (resolved via `get_method`, walking the
-                    // inheritance chain — the SAME lookup the user-method tail
-                    // uses), dispatch to that user method NOW and return,
-                    // bypassing every builtin arm. A builtin receiver
-                    // (str/list/dict/set/file) is never `Ty::Class`, so the
-                    // guard never fires for it and the builtin arms below run
-                    // byte-for-byte unchanged. A polymorphic-base receiver
-                    // composes too: `cls` is the base name, `get_method` returns
-                    // the base's signature, and `obj_s.name(..)` resolves to the
-                    // companion enum `cls__`'s dispatch method — identical to the
-                    // pre-existing EPIC-5 lowering.
-                    if let Ty::Class(cls) = self.type_of_expr(obj.as_ref()) {
-                        if self.ctx.get_method(&cls, name).is_some() {
-                            return self.emit_user_method_call(&obj_s, &cls, name, args, &parts);
-                        }
-                    }
-
-                    // Special handling for string methods that return &str and need to be converted to String
-                    if matches!(name.as_str(), "strip" | "lstrip" | "rstrip") {
-                        return Ok(format!("{}.{}().to_string()", obj_s, method));
-                    }
-
-                    // Special case: split()
-                    if name == "split" {
-                        return if args.is_empty() {
-                            Ok(format!("{}.split_whitespace().map(|s| s.to_string()).collect::<Vec<_>>()", obj_s))
-                        } else {
-                            let sep = parts[0].clone();
-                            Ok(format!("{}.split({}.as_str()).map(|s| s.to_string()).collect::<Vec<_>>()", obj_s, sep))
-                        };
-                    }
-
-                    // Special case: join()
-                    if name == "join" {
-                        return Ok(format!("{}.join(&{})", parts[0], obj_s));
-                    }
-
-                    // Special case: len() as method
-                    if name == "len" {
-                        // str length is character count, not UTF-8 byte count.
-                        if matches!(self.type_of_expr(obj.as_ref()), Ty::Str) {
-                            return Ok(format!("{}.chars().count() as i64", obj_s));
-                        }
-                        return Ok(format!("{}.len() as i64", obj_s));
-                    }
-
-                    // Special case: get() for dicts. Arg-count-aware, mirroring
-                    // the static typing in `typeck::dict_get_ret`:
-                    //   d.get(k)           -> Option<V>  (None when absent), so a
-                    //                         caller can narrow it with `is None`.
-                    //   d.get(k, default)  -> V          (the supplied fallback).
-                    if name == "get" {
-                        if parts.len() > 1 {
-                            return Ok(format!(
-                                "{}.get(&{}).cloned().unwrap_or({})",
-                                obj_s, parts[0], parts[1]
-                            ));
-                        }
-                        return Ok(format!("{}.get(&{}).cloned()", obj_s, parts[0]));
-                    }
-
-                    // String methods
-                    if name == "startswith" && !parts.is_empty() {
-                        return Ok(format!("{}.starts_with({}.as_str())", obj_s, parts[0]));
-                    }
-                    if name == "endswith" && !parts.is_empty() {
-                        return Ok(format!("{}.ends_with({}.as_str())", obj_s, parts[0]));
-                    }
-                    if name == "replace" && parts.len() >= 2 {
-                        return Ok(format!("{}.replace({}.as_str(), {}.as_str())", obj_s, parts[0], parts[1]));
-                    }
-                    if name == "removeprefix" && !parts.is_empty() {
-                        return Ok(format!(
-                            "{{ let __s = {}.clone(); let __prefix = {}; \
-                            if __s.starts_with(__prefix.as_str()) {{ __s[__prefix.len()..].to_string() }} else {{ __s }} }}",
-                            obj_s, parts[0]
-                        ));
-                    }
-                    if name == "removesuffix" && !parts.is_empty() {
-                        return Ok(format!(
-                            "{{ let __s = {}.clone(); let __suffix = {}; \
-                            if __s.ends_with(__suffix.as_str()) {{ __s[..__s.len() - __suffix.len()].to_string() }} else {{ __s }} }}",
-                            obj_s, parts[0]
-                        ));
-                    }
-                    if name == "expandtabs" {
-                        let tab_size = if !parts.is_empty() {
-                            format!("{} as usize", parts[0])
-                        } else {
-                            "8usize".to_string()
-                        };
-                        return Ok(format!(
-                            "{{ let __s = {}.clone(); let __tab_size = {}; \
-                            __s.replace('\\t', &\" \".repeat(__tab_size)) }}",
-                            obj_s, tab_size
-                        ));
-                    }
-                    if name == "partition" && !parts.is_empty() {
-                        return Ok(format!(
-                            "{{ let __s = {}.clone(); let __sep = {}; \
-                            if let Some(__idx) = __s.find(__sep.as_str()) {{ \
-                            vec![__s[..__idx].to_string(), __sep.clone(), __s[__idx + __sep.len()..].to_string()] \
-                            }} else {{ vec![__s, String::new(), String::new()] }} }}",
-                            obj_s, parts[0]
-                        ));
-                    }
-                    if name == "rpartition" && !parts.is_empty() {
-                        return Ok(format!(
-                            "{{ let __s = {}.clone(); let __sep = {}; \
-                            if let Some(__idx) = __s.rfind(__sep.as_str()) {{ \
-                            vec![__s[..__idx].to_string(), __sep.clone(), __s[__idx + __sep.len()..].to_string()] \
-                            }} else {{ vec![String::new(), String::new(), __s] }} }}",
-                            obj_s, parts[0]
-                        ));
-                    }
-                    if name == "find" && !parts.is_empty() {
-                        return Ok(format!("{}.find({}.as_str()).map(|i| i as i64).unwrap_or(-1i64)", obj_s, parts[0]));
-                    }
-                    if name == "contains" && !parts.is_empty() {
-                        return Ok(format!("{}.contains({}.as_str())", obj_s, parts[0]));
-                    }
-                    if name == "rfind" && !parts.is_empty() {
-                        return Ok(format!("{}.rfind({}.as_str()).map(|i| i as i64).unwrap_or(-1i64)", obj_s, parts[0]));
-                    }
-                    if name == "rindex" && !parts.is_empty() {
-                        return Ok(format!(
-                            "{{ let __idx = {}.rfind({}.as_str()); match __idx {{ Some(i) => i as i64, None => panic!(\"substring not found\") }} }}",
-                            obj_s, parts[0]
-                        ));
-                    }
-
-                    // String utility methods
-                    if name == "isdigit" {
-                        return Ok(format!("(!{}.is_empty() && {}.chars().all(|c| c.is_numeric()))", obj_s, obj_s));
-                    }
-                    if name == "isalpha" {
-                        return Ok(format!("(!{}.is_empty() && {}.chars().all(|c| c.is_alphabetic()))", obj_s, obj_s));
-                    }
-                    if name == "isupper" {
-                        return Ok(format!("(!{}.is_empty() && {}.chars().filter(|c| c.is_alphabetic()).all(|c| c.is_uppercase()) && {}.chars().any(|c| c.is_alphabetic()))", obj_s, obj_s, obj_s));
-                    }
-                    if name == "islower" {
-                        return Ok(format!("(!{}.is_empty() && {}.chars().filter(|c| c.is_alphabetic()).all(|c| c.is_lowercase()) && {}.chars().any(|c| c.is_alphabetic()))", obj_s, obj_s, obj_s));
-                    }
-                    if name == "isspace" {
-                        return Ok(format!("(!{}.is_empty() && {}.chars().all(|c| c.is_whitespace()))", obj_s, obj_s));
-                    }
-                    if name == "isalnum" {
-                        return Ok(format!("(!{}.is_empty() && {}.chars().all(|c| c.is_alphanumeric()))", obj_s, obj_s));
-                    }
-                    if name == "isidentifier" {
-                        return Ok(format!(
-                            "(!{}.is_empty() && ({}.chars().next().unwrap().is_alphabetic() || {}.chars().next().unwrap() == '_') && {}.chars().all(|c| c.is_alphanumeric() || c == '_'))",
-                            obj_s, obj_s, obj_s, obj_s
-                        ));
-                    }
-                    if name == "isnumeric" {
-                        return Ok(format!("(!{}.is_empty() && {}.chars().all(|c| c.is_numeric()))", obj_s, obj_s));
-                    }
-                    if name == "isprintable" {
-                        return Ok(format!("({}.chars().all(|c| !c.is_control()))", obj_s));
-                    }
-                    if name == "istitle" {
-                        return Ok(format!(
-                            "(!{}.is_empty() && {}.split_whitespace().all(|word| if word.is_empty() {{ true }} else {{ word.chars().next().unwrap().is_uppercase() && word[1..].chars().all(|c| !c.is_alphabetic() || c.is_lowercase()) }}))",
-                            obj_s, obj_s
-                        ));
-                    }
-
-                    // Additional string methods
-                    if name == "capitalize" {
-                        return Ok(format!(
-                            "{{ let __s = {}.clone(); if __s.is_empty() {{ __s }} else {{ format!(\"{{}}{{}}\" , __s.chars().next().unwrap().to_uppercase(), &__s[1..].to_lowercase()) }} }}",
-                            obj_s
-                        ));
-                    }
-                    if name == "title" {
-                        return Ok(format!(
-                            "{{ let __s = {}.clone(); __s.split_whitespace().map(|w| if w.is_empty() {{ w.to_string() }} else {{ format!(\"{{}}{{}}\" , w.chars().next().unwrap().to_uppercase(), &w[1..].to_lowercase()) }} ).collect::<Vec<_>>().join(\" \") }}",
-                            obj_s
-                        ));
-                    }
-                    if name == "zfill" && !parts.is_empty() {
-                        return Ok(format!(
-                            "{{ let __width = {} as usize; let __s = {}.clone(); if __s.len() >= __width {{ __s }} else {{ format!(\"{{:0>width$}}\" , __s, width = __width) }} }}",
-                            parts[0], obj_s
-                        ));
-                    }
-                    if name == "ljust" && !parts.is_empty() {
-                        return Ok(format!(
-                            "{{ let __width = {} as usize; let __s = {}.clone(); if __s.len() >= __width {{ __s }} else {{ format!(\"{{:<width$}}\" , __s, width = __width) }} }}",
-                            parts[0], obj_s
-                        ));
-                    }
-                    if name == "rjust" && !parts.is_empty() {
-                        return Ok(format!(
-                            "{{ let __width = {} as usize; let __s = {}.clone(); if __s.len() >= __width {{ __s }} else {{ format!(\"{{:>width$}}\" , __s, width = __width) }} }}",
-                            parts[0], obj_s
-                        ));
-                    }
-                    if name == "center" && !parts.is_empty() {
-                        return Ok(format!(
-                            "{{ let __width = {} as usize; let __s = {}.clone(); if __s.len() >= __width {{ __s }} else {{ let __total = __width - __s.len(); let __left = (__total + 1) / 2; let __right = __total / 2; format!(\"{{}}{{}}{{}}\" , \" \".repeat(__left), __s, \" \".repeat(__right)) }} }}",
-                            parts[0], obj_s
-                        ));
-                    }
-                    if name == "swapcase" {
-                        return Ok(format!(
-                            "{{ let __s = {}.clone(); __s.chars().map(|c| if c.is_uppercase() {{ c.to_lowercase().to_string() }} else {{ c.to_uppercase().to_string() }} ).collect::<String>() }}",
-                            obj_s
-                        ));
-                    }
-                    if name == "splitlines" {
-                        return Ok(format!(
-                            "{}.lines().map(|l| l.to_string()).collect::<Vec<_>>()",
-                            obj_s
-                        ));
-                    }
-                    if name == "count" && !parts.is_empty() {
-                        let obj_ty = self.type_of_expr(obj);
-                        match obj_ty {
-                            Ty::Str => {
-                                return Ok(format!(
-                                    "{{ let __s = {}.clone(); let __sub = {}; let mut __count = 0i64; let mut __start = 0; while let Some(__pos) = __s.as_str()[__start..].find(__sub.as_str()) {{ __count += 1; __start += __pos + __sub.len(); }} __count }}",
-                                    obj_s, parts[0]
-                                ));
-                            }
-                            _ => {} // Fall through to list count below
-                        }
-                    }
-                    if name == "index" && !parts.is_empty() {
-                        let obj_ty = self.type_of_expr(obj);
-                        match obj_ty {
-                            Ty::Str => {
-                                return Ok(format!(
-                                    "{}.find({}.as_str()).map(|i| i as i64).expect(\"substring not found\")",
-                                    obj_s, parts[0]
-                                ));
-                            }
-                            _ => {} // Fall through to list index below
-                        }
-                    }
-
-                    // File methods (PyFile; gated on a File receiver). write takes
-                    // &str, so borrow the argument.
-                    if let Ty::File = self.type_of_expr(obj) {
-                        match name.as_str() {
-                            "write" if !parts.is_empty() => return Ok(format!("{}.write(&{})", obj_s, parts[0])),
-                            "write" => return Err(crate::diag::Error::Codegen("file write() requires one argument".into())),
-                            "read" | "readlines" | "close" =>
-                                return Ok(format!("{}.{}()", obj_s, name)),
-                            _ => {}
-                        }
-                    }
-
-                    // Dict views - materialize into a Vec so they work both in a
-                    // for-loop and as a value (e.g. print(d.keys()), len(d.values())),
-                    // matching their List(K)/List(V) static type.
-                    if name == "keys" {
-                        return Ok(format!("{}.keys().cloned().collect::<Vec<_>>()", obj_s));
-                    }
-                    if name == "values" {
-                        return Ok(format!("{}.values().cloned().collect::<Vec<_>>()", obj_s));
-                    }
-                    if name == "items" {
-                        // Collect into a Vec<(K, V)> so the for-loop lowering treats it
-                        // as a normal collection (it wraps the iterable in .iter().cloned()).
-                        return Ok(format!("{}.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<Vec<_>>()", obj_s));
-                    }
-
-                    // Set methods (gated on receiver type — many names overlap with
-                    // list/dict, so disambiguate by the static type of the receiver).
-                    if let Ty::Set(_) = self.type_of_expr(obj) {
-                        match name.as_str() {
-                            // insert takes ownership, so emit the element owned
-                            // (a String var becomes `x.clone()`).
-                            "add" if !parts.is_empty() =>
-                                return Ok(format!("{{ {}.insert({}); }}", obj_s, self.emit_consuming(&args[0])?)),
-                            // NB: unlike Python, neither discard nor remove raises on an
-                            // absent element here (Rust's HashSet::remove returns an ignored bool).
-                            "discard" | "remove" if !parts.is_empty() =>
-                                return Ok(format!("{{ {}.remove(&{}); }}", obj_s, parts[0])),
-                            "update" if !parts.is_empty() =>
-                                return Ok(format!("{{ {}.extend({}.iter().cloned()); }}", obj_s, parts[0])),
-                            "union" if !parts.is_empty() =>
-                                return Ok(format!("{}.union(&{}).cloned().collect::<std::collections::HashSet<_>>()", obj_s, parts[0])),
-                            "intersection" if !parts.is_empty() =>
-                                return Ok(format!("{}.intersection(&{}).cloned().collect::<std::collections::HashSet<_>>()", obj_s, parts[0])),
-                            "difference" if !parts.is_empty() =>
-                                return Ok(format!("{}.difference(&{}).cloned().collect::<std::collections::HashSet<_>>()", obj_s, parts[0])),
-                            "symmetric_difference" if !parts.is_empty() =>
-                                return Ok(format!("{}.symmetric_difference(&{}).cloned().collect::<std::collections::HashSet<_>>()", obj_s, parts[0])),
-                            "issubset" if !parts.is_empty() =>
-                                return Ok(format!("{}.is_subset(&{})", obj_s, parts[0])),
-                            "issuperset" if !parts.is_empty() =>
-                                return Ok(format!("{}.is_superset(&{})", obj_s, parts[0])),
-                            "isdisjoint" if !parts.is_empty() =>
-                                return Ok(format!("{}.is_disjoint(&{})", obj_s, parts[0])),
-                            _ => {}
-                        }
-                    }
-
-                    // dict.update(other) — merge another mapping in place.
-                    if name == "update" && !parts.is_empty() {
-                        return Ok(format!("{{ {}.extend({}); }}", obj_s, parts[0]));
-                    }
-
-                    if name == "pop" {
-                        // list.pop(): remove and return the last element (or pop(i) -> remove index).
-                        if let Ty::List(_) = self.type_of_expr(obj) {
-                            return Ok(if parts.is_empty() {
-                                format!("{}.pop().expect(\"pop from empty list\")", obj_s)
-                            } else {
-                                // Honor Python negative indices: pop(-1) is the last element.
-                                format!(
-                                    "{{ let __n = {obj}.len() as i64; let __i = {idx}; \
-                                     {obj}.remove((if __i < 0 {{ __n + __i }} else {{ __i }}) as usize) }}",
-                                    obj = obj_s, idx = parts[0]
-                                )
-                            });
-                        }
-                        // dict.pop(key[, default])
-                        if parts.is_empty() {
-                            return Err(crate::diag::Error::Codegen("pop requires at least one argument".into()));
-                        } else if parts.len() == 1 {
-                            // pop(key) — remove from the receiver and return the value (panic if absent)
-                            return Ok(format!("{}.remove(&{}).expect(\"KeyError: key not found\")", obj_s, parts[0]));
-                        } else {
-                            // pop(key, default) — remove from the receiver; default if absent
-                            return Ok(format!("{}.remove(&{}).unwrap_or({})", obj_s, parts[0], parts[1]));
-                        }
-                    }
-                    // List methods
-                    if name == "extend" && !parts.is_empty() {
-                        return Ok(format!("{}.extend({})", obj_s, parts[0]));
-                    }
-                    if name == "insert" && parts.len() >= 2 {
-                        return Ok(format!("{}.insert({} as usize, {})", obj_s, parts[0], parts[1]));
-                    }
-                    if name == "remove" && !parts.is_empty() {
-                        return Ok(format!("{{ let __idx = {}.iter().position(|__x| *__x == {}).expect(\"value not found\"); {}.remove(__idx); }}", obj_s, parts[0], obj_s));
-                    }
-                    if name == "index" && !parts.is_empty() {
-                        return Ok(format!("{}.iter().position(|__x| *__x == {}).expect(\"value not found\") as i64", obj_s, parts[0]));
-                    }
-                    if name == "count" && !parts.is_empty() {
-                        return Ok(format!("{}.iter().filter(|__x| **__x == {}).count() as i64", obj_s, parts[0]));
-                    }
-                    if name == "reverse" {
-                        return Ok(format!("{}.reverse()", obj_s));
-                    }
-                    if name == "sort" {
-                        return Ok(format!("{}.sort()", obj_s));
-                    }
-                    if name == "clear" {
-                        return Ok(format!("{}.clear()", obj_s));
-                    }
-                    if name == "copy" {
-                        return Ok(format!("{}.clone()", obj_s));
-                    }
-
-                    // Regular method call.
-                    // (EPIC-4 V2-c) Thread `&mut <place>` for any by-reference
-                    // (`Mut[T]`) method parameter so the callee's mutation persists
-                    // to the caller. The method's per-param by-ref flags come from
-                    // get_method (self-EXCLUSIVE and index-aligned to `args` after
-                    // STEP 0). Only user-defined methods on a known class receiver
-                    // can be by-ref; the builtin string/list/dict branches above
-                    // all `return`ed earlier, so the by-value `parts` they share is
-                    // never reached here. We rebuild `parts` only when the receiver
-                    // resolves to a class with a matching method that actually has
-                    // a by-ref param; otherwise the original by-value `parts`
-                    // (clone-on-use) is used unchanged.
-                    let method_by_ref: Vec<bool> =
-                        if let Ty::Class(cls) = self.type_of_expr(obj.as_ref()) {
-                            self.ctx.get_method(&cls, name)
-                                .map(|sig| sig.param_by_ref.clone())
-                                .unwrap_or_default()
-                        } else {
-                            Vec::new()
-                        };
-                    if method_by_ref.iter().any(|&b| b) {
-                        let mut mparts = Vec::with_capacity(args.len());
-                        for (i, a) in args.iter().enumerate() {
-                            if method_by_ref.get(i).copied().unwrap_or(false) {
-                                let place = self.emit_place(a)?;
-                                mparts.push(self.byref_borrow(a, &place));
-                            } else {
-                                mparts.push(self.emit_consuming(a)?);
-                            }
-                        }
-                        return Ok(format!("{}.{}({})", obj_s, method, mparts.join(", ")));
-                    }
-                    return Ok(format!("{}.{}({})", obj_s, method, parts.join(", ")));
-                }
-
-                // Regular function call (not a class).
-                // (EPIC-5) Look up the callee signature so an argument flowing
-                // into an `Optional[T]` parameter is wrapped (`Some(..)` for a
-                // bare value, `None` for the None literal, pass-through for an
-                // already-Optional value) — the same coercion as assignment and
-                // return. Methods / unknown callees keep the bare emission.
-                let param_tys: Vec<Ty> = if let Expr::Ident(n, _) = callee.as_ref() {
-                    self.ctx.funcs.get(n.as_str())
-                        .map(|sig| sig.params.iter().map(|(_, t)| t.clone()).collect())
-                        .unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
-                // (EPIC-4 V2-c) Per-arg by-reference (`Mut[T]`) flags for this
-                // free-function callee. Parallel to `args` (free functions have no
-                // `self`, so `param_by_ref[i]` lines up with `args[i]` directly).
-                let param_by_ref: Vec<bool> = if let Expr::Ident(n, _) = callee.as_ref() {
-                    self.ctx.funcs.get(n.as_str())
-                        .map(|sig| sig.param_by_ref.clone())
-                        .unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
-                let mut parts = Vec::with_capacity(args.len());
-                for (i, a) in args.iter().enumerate() {
-                    if param_by_ref.get(i).copied().unwrap_or(false) {
-                        // By-reference arg: borrow the caller's PLACE so the
-                        // callee's mutation persists. typeck already required `a`
-                        // to be a place (Ident/Attr/Index), so `emit_place` is
-                        // valid and `&mut` of it is a sound mutable borrow. No
-                        // clone, no Option coercion — we pass the storage itself.
-                        // `byref_borrow` emits an explicit reborrow (`&mut *x`)
-                        // when `a` names one of this function's own `&mut T`
-                        // params (forwarded-by-reference, e.g. a recursive call),
-                        // avoiding the E0596 double-`&mut`.
-                        let place = self.emit_place(a)?;
-                        parts.push(self.byref_borrow(a, &place));
-                        continue;
-                    }
-                    // (EPIC-5 C2-2b-i) A raw-struct argument into a polymorphic-base
-                    // parameter (`feed(dog)` where `feed(a: Animal)`) is WRAPPED in
-                    // the right `Animal__` variant (replaces the C1 gate). A
-                    // non-polymorphic param keeps the clone-on-use emission.
-                    let s = match param_tys.get(i) {
-                        Some(pt) if self.ty_has_poly_base(pt) => self.emit_into_base_slot(a, pt)?,
-                        _ => self.emit_consuming(a)?,
-                    };
-                    let s = match param_tys.get(i) {
-                        Some(pt) => self.coerce_to_option(s, a, pt),
-                        None => s,
-                    };
-                    parts.push(s);
-                }
-
-                // Inject default arguments for named functions
-                if let Expr::Ident(n, _) = callee.as_ref() {
-                    if let Some(sig) = self.ctx.funcs.get(n.as_str()).cloned() {
-                        let expected = sig.params.len();
-                        if parts.len() < expected && !sig.param_defaults.is_empty() {
-                            let defaults_needed = expected - parts.len();
-                            let defaults_start = sig.param_defaults.len().saturating_sub(defaults_needed);
-                            for def_expr in &sig.param_defaults[defaults_start..] {
-                                match def_expr {
-                                    Some(e) => parts.push(self.emit_expr(e)?),
-                                    None => return Err(crate::diag::Error::Codegen("missing required argument".into())),
-                                }
-                            }
-                        }
-                    }
-                }
-
-                let callee_s = self.emit_expr(callee)?;
-                // Parenthesize lambda expressions when used as callees
-                let callee_s = if matches!(callee.as_ref(), Expr::Lambda { .. }) {
-                    format!("({})", callee_s)
-                } else {
-                    callee_s
-                };
-
-                // kwargs on a non-class call site are an error in v0.
-                if !kwargs.is_empty() {
-                    return Err(crate::diag::Error::Codegen(
-                        "keyword arguments are only supported for class constructors in v0".into()
-                    ));
-                }
-
-                format!("{}({})", callee_s, parts.join(", "))
+                self.emit_call(callee, args, kwargs)?
             }
             Expr::Attr { obj, name, .. } => {
                 // Math module constants

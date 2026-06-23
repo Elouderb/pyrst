@@ -5542,6 +5542,126 @@ mod tests {
         assert!(!cg.is_polymorphic_base("Animal"));
     }
 
+    // ── Emission helpers ──────────────────────────────────────────────────────
+    //
+    // `emit_src` compiles a snippet through the full pipeline (parse + typeck +
+    // codegen) and returns the Rust source string. Use `.contains(...)` — never
+    // byte-equality — because HashMap-backed field ordering is non-deterministic.
+
+    fn emit_src(src: &str) -> String {
+        let m = crate::parser::parse(src).expect("test snippet must parse");
+        let ctx = TyCtx::new();
+        emit_program(&[(m, src.to_string())], &ctx)
+            .expect("test snippet must emit successfully")
+    }
+
+    // ── Preamble helpers are always present ───────────────────────────────────
+
+    #[test]
+    fn preamble_contains_ipow_helper() {
+        // The preamble is emitted unconditionally; __py_ipow must always be present.
+        let src = "def f() -> None:\n    pass\n";
+        let out = emit_src(src);
+        assert!(out.contains("__py_ipow"), "preamble must define __py_ipow");
+    }
+
+    #[test]
+    fn preamble_contains_floordiv_helper() {
+        let src = "def f() -> None:\n    pass\n";
+        let out = emit_src(src);
+        assert!(out.contains("__py_floordiv"), "preamble must define __py_floordiv");
+    }
+
+    #[test]
+    fn preamble_contains_mod_helper() {
+        let src = "def f() -> None:\n    pass\n";
+        let out = emit_src(src);
+        assert!(out.contains("__py_mod"), "preamble must define __py_mod");
+    }
+
+    // ── Operator emission ─────────────────────────────────────────────────────
+
+    #[test]
+    fn emit_pow_uses_ipow_helper() {
+        // x ** 2 must lower to the __py_ipow helper call in the output.
+        let src = "def f(x: int) -> int:\n    y: int = x ** 2\n    return y\n";
+        let out = emit_src(src);
+        assert!(out.contains("__py_ipow"), "** operator must emit __py_ipow");
+    }
+
+    #[test]
+    fn emit_floordiv_uses_floordiv_helper() {
+        // a // b must lower to the __py_floordiv helper call.
+        let src = "def f(a: int, b: int) -> int:\n    c: int = a // b\n    return c\n";
+        let out = emit_src(src);
+        assert!(out.contains("__py_floordiv"), "// operator must emit __py_floordiv");
+    }
+
+    #[test]
+    fn emit_mod_uses_mod_helper() {
+        // a % b must lower to the __py_mod helper call.
+        let src = "def f(a: int, b: int) -> int:\n    c: int = a % b\n    return c\n";
+        let out = emit_src(src);
+        assert!(out.contains("__py_mod"), "% operator must emit __py_mod");
+    }
+
+    #[test]
+    fn emit_augassign_pow_uses_ipow_helper() {
+        // x **= 2 is an aug-assign; the emitted Rust must still use __py_ipow.
+        let src = "def f(x: int) -> int:\n    x **= 2\n    return x\n";
+        let out = emit_src(src);
+        assert!(out.contains("__py_ipow"), "**= aug-assign must emit __py_ipow");
+    }
+
+    // ── F-string emission ─────────────────────────────────────────────────────
+
+    #[test]
+    fn emit_fstring_uses_format_macro() {
+        // f"hello {name}" must lower to a Rust format! call.
+        let src = "def f(name: str) -> str:\n    s: str = f\"hello {name}\"\n    return s\n";
+        let out = emit_src(src);
+        assert!(out.contains("format!"), "f-string must emit Rust format! macro");
+    }
+
+    // ── Type emission ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn emit_int_type_becomes_i64() {
+        // A function returning int must annotate with i64 in the Rust signature.
+        let src = "def f(x: int) -> int:\n    return x\n";
+        let out = emit_src(src);
+        assert!(out.contains("i64"), "int type must emit as i64");
+    }
+
+    #[test]
+    fn emit_str_type_becomes_string() {
+        // A function returning str must annotate with String.
+        let src = "def f(x: str) -> str:\n    return x\n";
+        let out = emit_src(src);
+        assert!(out.contains("String"), "str type must emit as String");
+    }
+
+    #[test]
+    fn emit_bool_type_becomes_bool() {
+        // A function returning bool must annotate with bool.
+        let src = "def f(x: bool) -> bool:\n    return x\n";
+        let out = emit_src(src);
+        assert!(out.contains("bool"), "bool type must emit as bool");
+    }
+
+    // ── List comprehension emission ───────────────────────────────────────────
+
+    #[test]
+    fn emit_list_comp_uses_iterator_pattern() {
+        // [x * 2 for x in xs] must lower to an iterator chain (.map or .collect).
+        let src = "def f(xs: list[int]) -> list[int]:\n    result: list[int] = [x * 2 for x in xs]\n    return result\n";
+        let out = emit_src(src);
+        assert!(
+            out.contains(".map(") || out.contains(".collect()") || out.contains("collect::<"),
+            "list comprehension must emit an iterator map/collect pattern"
+        );
+    }
+
     #[test]
     fn rust_ty_class_arm_polymorphism_activated() {
         // C2-2b-i acceptance: rust_ty(Class(n)) emits the companion-enum name

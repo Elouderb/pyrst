@@ -1429,4 +1429,186 @@ mod tests {
         let m = parse(src).unwrap();
         assert_eq!(m.stmts.len(), 1);
     }
+
+    // ── AugAssign ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_augassign_plus_equals() {
+        let m = parse("x: int = 0\nx += 1\n").unwrap();
+        assert_eq!(m.stmts.len(), 2);
+        assert!(
+            matches!(&m.stmts[1], Stmt::AugAssign { target, op: BinOp::Add, .. } if target == "x"),
+            "x += 1 must parse as AugAssign with BinOp::Add"
+        );
+    }
+
+    #[test]
+    fn parse_augassign_pow_equals() {
+        let m = parse("x: int = 2\nx **= 3\n").unwrap();
+        assert_eq!(m.stmts.len(), 2);
+        assert!(
+            matches!(&m.stmts[1], Stmt::AugAssign { target, op: BinOp::Pow, .. } if target == "x"),
+            "x **= 3 must parse as AugAssign with BinOp::Pow"
+        );
+    }
+
+    #[test]
+    fn parse_augassign_lshift_equals() {
+        let m = parse("x: int = 1\nx <<= 2\n").unwrap();
+        assert!(
+            matches!(&m.stmts[1], Stmt::AugAssign { target, op: BinOp::LShift, .. } if target == "x"),
+            "x <<= 2 must parse as AugAssign with BinOp::LShift"
+        );
+    }
+
+    #[test]
+    fn parse_augassign_floor_div_equals() {
+        let m = parse("x: int = 10\nx //= 3\n").unwrap();
+        assert!(
+            matches!(&m.stmts[1], Stmt::AugAssign { target, op: BinOp::FloorDiv, .. } if target == "x"),
+            "x //= 3 must parse as AugAssign with BinOp::FloorDiv"
+        );
+    }
+
+    // ── Unpack (bare-tuple LHS) ───────────────────────────────────────────────
+
+    #[test]
+    fn parse_unpack_two_targets() {
+        let m = parse("a, b = 1, 2\n").unwrap();
+        assert_eq!(m.stmts.len(), 1);
+        match &m.stmts[0] {
+            Stmt::Unpack { targets, .. } => {
+                assert_eq!(targets, &["a", "b"]);
+            }
+            other => panic!("expected Stmt::Unpack, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_unpack_three_targets() {
+        let m = parse("a, b, c = 1, 2, 3\n").unwrap();
+        assert_eq!(m.stmts.len(), 1);
+        match &m.stmts[0] {
+            Stmt::Unpack { targets, .. } => {
+                assert_eq!(targets.len(), 3);
+                assert_eq!(targets[2], "c");
+            }
+            other => panic!("expected Stmt::Unpack, got {:?}", other),
+        }
+    }
+
+    // ── ListComp ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_listcomp_single_target() {
+        let m = parse("result: list[int] = [x * 2 for x in xs]\n").unwrap();
+        assert_eq!(m.stmts.len(), 1);
+        if let Stmt::Assign { value: Expr::ListComp { targets, .. }, .. } = &m.stmts[0] {
+            assert_eq!(targets, &["x"]);
+        } else {
+            panic!("expected Assign wrapping ListComp");
+        }
+    }
+
+    #[test]
+    fn parse_listcomp_multi_target() {
+        // `[v for k, v in d.items()]` — multi-target comprehension.
+        let m = parse("result: list[int] = [v for k, v in pairs]\n").unwrap();
+        assert_eq!(m.stmts.len(), 1);
+        if let Stmt::Assign { value: Expr::ListComp { targets, .. }, .. } = &m.stmts[0] {
+            assert_eq!(targets, &["k", "v"]);
+        } else {
+            panic!("expected Assign wrapping multi-target ListComp");
+        }
+    }
+
+    // ── F-strings ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_fstr_literal_only() {
+        // f"hello" with no interpolation → FStr with one Lit part.
+        let m = parse("x: str = f\"hello\"\n").unwrap();
+        if let Stmt::Assign { value: Expr::FStr(parts, _), .. } = &m.stmts[0] {
+            assert!(!parts.is_empty());
+            assert!(matches!(&parts[0], FStrPart::Lit(s) if s == "hello"));
+        } else {
+            panic!("expected FStr");
+        }
+    }
+
+    #[test]
+    fn parse_fstr_with_interpolation() {
+        // f"hello {name}" → Lit("hello ") + Interp(Ident("name"), None).
+        let m = parse("x: str = f\"hello {name}\"\n").unwrap();
+        if let Stmt::Assign { value: Expr::FStr(parts, _), .. } = &m.stmts[0] {
+            let has_interp = parts.iter().any(|p| matches!(p, FStrPart::Interp(_, _)));
+            assert!(has_interp, "f-string with {{name}} must produce an Interp part");
+        } else {
+            panic!("expected FStr");
+        }
+    }
+
+    // ── Match / case ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_match_basic() {
+        let src = "match x:\n    case 1:\n        pass\n    case _:\n        pass\n";
+        let m = parse(src).unwrap();
+        assert_eq!(m.stmts.len(), 1);
+        assert!(
+            matches!(&m.stmts[0], Stmt::Match { arms, .. } if arms.len() == 2),
+            "match with two arms must parse as Stmt::Match with 2 arms"
+        );
+    }
+
+    // ── Ternary / IfExp ───────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_ternary_ifexp() {
+        let m = parse("x: int = 1 if flag else 0\n").unwrap();
+        if let Stmt::Assign { value: Expr::IfExp { .. }, .. } = &m.stmts[0] {
+            // pass — correct structure
+        } else {
+            panic!("expected IfExp in assignment");
+        }
+    }
+
+    // ── Trailing comma in call ─────────────────────────────────────────────────
+
+    #[test]
+    fn parse_trailing_comma_in_call() {
+        // foo(a, b,) must parse and produce two args.
+        let m = parse("foo(a, b,)\n").unwrap();
+        assert_eq!(m.stmts.len(), 1);
+        if let Stmt::Expr(Expr::Call { args, .. }) = &m.stmts[0] {
+            assert_eq!(args.len(), 2, "trailing comma call must have 2 args");
+        } else {
+            panic!("expected Call expression statement");
+        }
+    }
+
+    // ── Triple-quoted strings ─────────────────────────────────────────────────
+
+    #[test]
+    fn parse_triple_quoted_string() {
+        let src = "x: str = \"\"\"hello world\"\"\"\n";
+        let m = parse(src).unwrap();
+        if let Stmt::Assign { value: Expr::Str(s, _), .. } = &m.stmts[0] {
+            assert_eq!(s, "hello world");
+        } else {
+            panic!("expected Str from triple-quoted literal");
+        }
+    }
+
+    // ── Power operator in expression ──────────────────────────────────────────
+
+    #[test]
+    fn parse_pow_expression() {
+        let m = parse("x: int = 2 ** 8\n").unwrap();
+        if let Stmt::Assign { value: Expr::BinOp { op, .. }, .. } = &m.stmts[0] {
+            assert_eq!(*op, BinOp::Pow);
+        } else {
+            panic!("expected BinOp::Pow");
+        }
+    }
 }

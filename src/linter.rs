@@ -454,3 +454,225 @@ pub fn lint(m: &Module) -> Vec<Lint> {
     linter.check_module(m);
     linter.lints
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Parse `src` and run the linter, returning the lint list.
+    fn lint_src(src: &str) -> Vec<Lint> {
+        let m = crate::parser::parse(src).expect("test source must parse");
+        lint(&m)
+    }
+
+    /// Collect just the codes from the lint list.
+    fn codes(lints: &[Lint]) -> Vec<&str> {
+        lints.iter().map(|l| l.code.as_str()).collect()
+    }
+
+    /// Return lints whose code matches `code`.
+    fn with_code<'a>(lints: &'a [Lint], code: &str) -> Vec<&'a Lint> {
+        lints.iter().filter(|l| l.code == code).collect()
+    }
+
+    // ── W001: function/method name not snake_case ─────────────────────────────
+
+    #[test]
+    fn w001_camel_case_function_triggers() {
+        let src = "def myFunction(x: int) -> int:\n    return x\n";
+        let lints = lint_src(src);
+        let w001: Vec<_> = with_code(&lints, "W001");
+        assert!(!w001.is_empty(), "expected W001 for camelCase function name");
+        assert!(
+            w001[0].message.contains("myFunction"),
+            "message must name the offending function"
+        );
+    }
+
+    #[test]
+    fn w001_snake_case_function_clean() {
+        let src = "def my_function(x: int) -> int:\n    return x\n";
+        let lints = lint_src(src);
+        assert!(
+            with_code(&lints, "W001").is_empty(),
+            "snake_case function should not trigger W001"
+        );
+    }
+
+    #[test]
+    fn w001_dunder_method_exempt() {
+        // __init__, __str__, __eq__, __add__ must NOT trigger W001 inside a class.
+        let src = "class Foo:\n    def __init__(self) -> None:\n        pass\n";
+        let lints = lint_src(src);
+        assert!(
+            with_code(&lints, "W001").is_empty(),
+            "__init__ must be exempt from W001"
+        );
+    }
+
+    #[test]
+    fn w001_method_bad_name_triggers() {
+        // A method that isn't a dunder and uses camelCase should trigger W001.
+        let src = "class Foo:\n    def myMethod(self) -> None:\n        pass\n";
+        let lints = lint_src(src);
+        let w001 = with_code(&lints, "W001");
+        assert!(!w001.is_empty(), "camelCase method must trigger W001");
+        assert!(w001[0].message.contains("myMethod"));
+    }
+
+    // ── W002: function body > 50 statements ──────────────────────────────────
+
+    #[test]
+    fn w002_short_function_clean() {
+        // A 3-statement body is well under the 50-stmt threshold.
+        let body = "    x: int = 1\n    y: int = 2\n    return x\n";
+        let src = format!("def short_fn(x: int) -> int:\n{}", body);
+        let lints = lint_src(&src);
+        assert!(with_code(&lints, "W002").is_empty(), "short function must not trigger W002");
+    }
+
+    #[test]
+    fn w002_long_function_triggers() {
+        // Build a function with 51 pass statements (> 50 → W002).
+        let stmts = "    pass\n".repeat(51);
+        let src = format!("def long_fn() -> None:\n{}", stmts);
+        let lints = lint_src(&src);
+        let w002 = with_code(&lints, "W002");
+        assert!(!w002.is_empty(), "51-stmt function must trigger W002");
+        assert!(w002[0].message.contains("long_fn"));
+    }
+
+    // ── W003: too many parameters (> 5) ──────────────────────────────────────
+
+    #[test]
+    fn w003_five_params_clean() {
+        // Exactly 5 parameters: no W003.
+        let src = "def f(a: int, b: int, c: int, d: int, e: int) -> int:\n    return a\n";
+        let lints = lint_src(src);
+        assert!(with_code(&lints, "W003").is_empty(), "5 params must not trigger W003");
+    }
+
+    #[test]
+    fn w003_six_params_triggers() {
+        // 6 parameters exceeds the limit of 5 → W003.
+        let src =
+            "def f(a: int, b: int, c: int, d: int, e: int, g: int) -> int:\n    return a\n";
+        let lints = lint_src(src);
+        let w003 = with_code(&lints, "W003");
+        assert!(!w003.is_empty(), "6 params must trigger W003");
+        assert!(w003[0].message.contains("f"));
+    }
+
+    // ── W004: class name not PascalCase ──────────────────────────────────────
+
+    #[test]
+    fn w004_snake_class_name_triggers() {
+        let src = "class my_class:\n    pass\n";
+        let lints = lint_src(src);
+        let w004 = with_code(&lints, "W004");
+        assert!(!w004.is_empty(), "snake_case class name must trigger W004");
+        assert!(w004[0].message.contains("my_class"));
+    }
+
+    #[test]
+    fn w004_pascal_class_name_clean() {
+        let src = "class MyClass:\n    pass\n";
+        let lints = lint_src(src);
+        assert!(with_code(&lints, "W004").is_empty(), "PascalCase class name must not trigger W004");
+    }
+
+    // ── W005: unused import ───────────────────────────────────────────────────
+
+    #[test]
+    fn w005_unused_import_triggers() {
+        // Import `math` but never reference it → W005.
+        let src = "import math\nx: int = 1\n";
+        let lints = lint_src(src);
+        let w005 = with_code(&lints, "W005");
+        assert!(!w005.is_empty(), "unused import must trigger W005");
+        assert!(w005[0].message.contains("math"));
+    }
+
+    #[test]
+    fn w005_used_import_clean() {
+        // Use a from-import and reference the imported name directly.
+        let src2 = "from os import path\nx: str = path\n";
+        let lints = lint_src(src2);
+        assert!(
+            with_code(&lints, "W005").is_empty(),
+            "used import must not trigger W005"
+        );
+    }
+
+    // ── W006: unused local variable ───────────────────────────────────────────
+
+    #[test]
+    fn w006_unused_param_triggers() {
+        // Parameter `unused` is never referenced in the body → W006.
+        let src = "def f(used: int, unused: int) -> int:\n    return used\n";
+        let lints = lint_src(src);
+        let w006 = with_code(&lints, "W006");
+        assert!(!w006.is_empty(), "unused param must trigger W006");
+        assert!(w006[0].message.contains("unused"));
+    }
+
+    #[test]
+    fn w006_all_params_used_clean() {
+        let src = "def f(a: int, b: int) -> int:\n    return a + b\n";
+        let lints = lint_src(src);
+        assert!(with_code(&lints, "W006").is_empty(), "all-used params must not trigger W006");
+    }
+
+    #[test]
+    fn w006_self_param_exempt() {
+        // `self` is always implicitly used; must not appear in W006 messages.
+        let src = "class Foo:\n    def bar(self) -> None:\n        pass\n";
+        let lints = lint_src(src);
+        let w006 = with_code(&lints, "W006");
+        // If there are any W006 lints they must not be about `self`.
+        for lint in &w006 {
+            assert!(!lint.message.contains("'self'"), "self must be exempt from W006");
+        }
+    }
+
+    #[test]
+    fn w006_unused_local_assign_triggers() {
+        // Assign to `z` inside a function but never read it → W006.
+        let src = "def f(x: int) -> int:\n    z: int = 42\n    return x\n";
+        let lints = lint_src(src);
+        let w006 = with_code(&lints, "W006");
+        assert!(!w006.is_empty(), "unused local variable must trigger W006");
+        assert!(w006.iter().any(|l| l.message.contains("'z'")));
+    }
+
+    // ── Lint level ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn all_emitted_lints_are_warnings() {
+        // Every lint the linter currently produces must have level Warning.
+        let src = "def myFunc(a: int, b: int, c: int, d: int, e: int, f: int) -> None:\n    pass\n";
+        let lints = lint_src(src);
+        for l in &lints {
+            assert_eq!(
+                l.level,
+                LintLevel::Warning,
+                "expected Warning level, got {:?} for code {}",
+                l.level,
+                l.code
+            );
+        }
+    }
+
+    // ── Multiple rules fire together ──────────────────────────────────────────
+
+    #[test]
+    fn multiple_rules_can_fire_simultaneously() {
+        // camelCase name (W001) + 6 params (W003) — both must fire.
+        let src =
+            "def badFunc(a: int, b: int, c: int, d: int, e: int, f: int) -> None:\n    pass\n";
+        let lints = lint_src(src);
+        let c = codes(&lints);
+        assert!(c.contains(&"W001"), "W001 must fire");
+        assert!(c.contains(&"W003"), "W003 must fire");
+    }
+}

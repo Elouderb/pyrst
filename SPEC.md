@@ -10,11 +10,11 @@ This document is the formal language reference. The companion
 row-by-row support matrix; this SPEC must never contradict it. Where this SPEC
 states that a feature is supported, that claim is backed either by a row in
 PYTHON_COMPATIBILITY.md or by a passing program in the example corpus
-(`examples/*.py` with a golden `examples/expected/*.txt`), and usually both.
+(`examples/*.pyrs` with a golden `examples/expected/*.txt`), and usually both.
 
 **Corpus anchor (the ground truth this spec describes):** 194 passing example
-programs (`examples/<name>.py`, each with a golden `examples/expected/<name>.txt`),
-plus 64 honest-rejection fixtures (`examples/*fail*.py` — the `fail_*` and
+programs (`examples/<name>.pyrs`, each with a golden `examples/expected/<name>.txt`),
+plus 64 honest-rejection fixtures (`examples/*fail*.pyrs` — the `fail_*` and
 `set_fail_*` files) and one multi-file negative scenario (`examples/multi_file_fail/`).
 The full pipeline (lexer → parser → resolver → type checker → Rust codegen →
 `rustc`) is exercised by these programs and by 199 in-crate `#[test]` cases.
@@ -105,8 +105,8 @@ recognized but their corresponding features are not supported (see §15).
 - None: `None` (only meaningful in optional types — see §3, §14).
 - Collections: list `[1, 2, 3]`, dict `{"a": 1}`, set `{1, 2, 3}`, tuple `(1, 2)`.
 - f-strings: `f"value: {expr}"` with arbitrary embedded expressions, compiled to
-  interpolation (corpus: `collection_repr.py`, `unicode_strings.py`,
-  `animal_super.py`).
+  interpolation (corpus: `collection_repr.pyrs`, `unicode_strings.pyrs`,
+  `animal_super.pyrs`).
 
 ### Identifiers and Rust-keyword escaping
 Identifiers are alphanumeric plus underscore and must start with a letter or
@@ -114,7 +114,7 @@ underscore. A pyrst identifier that collides with a Rust keyword (`type`, `loop`
 `fn`, `let`, `mut`, `struct`, `enum`, `impl`, `trait`, `match`, `move`, `ref`,
 `use`, `mod`, `crate`, …) is automatically emitted as a Rust **raw identifier**
 (`r#type`, `r#loop`), so Python code may freely use such names as variables,
-fields, or function names. Corpus: `rust_keyword_idents.py` (uses `type` as a
+fields, or function names. Corpus: `rust_keyword_idents.pyrs` (uses `type` as a
 field and a local, `loop` as a function name).
 
 ---
@@ -213,8 +213,8 @@ x = 5           # inferred type
 - Collections are mutated in place through their methods and subscript
   assignment: `xs.append(4)`, `d[key] = value`, `s.add(1)`.
 - **Note:** the dict mutation API is subscript assignment `d[key] = val` — there
-  is **no** `dict.insert(key, value)` method (corpus: `dict_ctor_test.py`,
-  `data_analysis_tool.py`, `text_processor.py`).
+  is **no** `dict.insert(key, value)` method (corpus: `dict_ctor_test.pyrs`,
+  `data_analysis_tool.pyrs`, `text_processor.pyrs`).
 
 ### Scope Rules (Python-style hoisting)
 A name first assigned inside an `if`/`elif`/`else`/`for`/`while`/`with`/`try`
@@ -245,22 +245,22 @@ def name(param1: Type1, param2: Type2) -> ReturnType:
 - Parameter types and the return type are **mandatory**.
 - `return` values must match the declared return type; all return paths agree.
 - Functions may be forward-declared / out-of-order (two-pass checking).
-- Recursion is supported (corpus: `fib.py` and others).
+- Recursion is supported (corpus: `fib.pyrs` and others).
 
 ### Default Arguments — **supported**
 ```python
 def greet(name: str, greeting: str = "Hello") -> str: ...
 def power(base: int, exp: int = 2) -> int: ...
 ```
-Corpus: `default_params.py`.
+Corpus: `default_params.pyrs`.
 
 ### Keyword Arguments — **supported**
 Arguments may be passed by name at the call site.
 
 ### Lambdas and Closures — **supported**
 Lambda expressions (`lambda x: x + 1`) are implemented, including closures that
-capture enclosing variables **by value**. Corpus: `lambda_demo.py`,
-`lambda_closure.py`. Note that functions/lambdas are still not first-class values
+capture enclosing variables **by value**. Corpus: `lambda_demo.pyrs`,
+`lambda_closure.pyrs`. Note that functions/lambdas are still not first-class values
 you can pass to *builtins* like `map`/`filter` (see §11, §15).
 
 ### Variadic Arguments — not supported
@@ -305,15 +305,15 @@ class Point:
 
 ### 6.3 Constructors, fields, methods
 - **`__init__` is supported** — a user-defined `__init__` is honored (corpus:
-  `accounts.py`, `vector2d.py`, `animal_super.py`, many others). A class without
+  `accounts.pyrs`, `vector2d.pyrs`, `animal_super.pyrs`, many others). A class without
   `__init__` gets a default field-wise constructor.
 - Instance attributes must be declared and typed in the class body; direct field
   read `obj.field` and assignment `obj.field = value`.
 - Instance methods take an implicit `self`.
 - **`@staticmethod`** and **`@property`** are supported (`@staticmethod` =
-  no-`self` methods, corpus: `staticmethod_demo.py`; `@property` = computed
-  read-only attributes, corpus: `property_demo.py`).
-- **`@dataclass`** is supported (corpus: `dataclass_demo.py`).
+  no-`self` methods, corpus: `staticmethod_demo.pyrs`; `@property` = computed
+  read-only attributes, corpus: `property_demo.pyrs`).
+- **`@dataclass`** is supported (corpus: `dataclass_demo.pyrs`).
 - `@classmethod` is effectively unsupported: the `cls` parameter cannot be
   cleanly annotated. Use `@staticmethod` or a module-level function.
 - Arbitrary / user-defined decorators are not supported.
@@ -325,12 +325,12 @@ Single inheritance only (`class Derived(Base):`; multiple inheritance is
 rejected). Method lookup checks the derived class first, then the base.
 
 **`super()` is supported** — a subclass can call base-class methods, including
-`super().__init__(...)` (corpus: `animal_super.py` line 16, `accounts.py`).
+`super().__init__(...)` (corpus: `animal_super.pyrs` line 16, `accounts.pyrs`).
 
 **Subtype polymorphism is supported** — you may pass, assign, or return a
 `Derived` where a `Base` is expected, build heterogeneous `list[Base]` literals,
-and dispatch methods virtually (corpus: `polymorphism.py`, `subtype_assign.py`,
-`subtype_field.py`, `subtype_three_level.py`). Design rationale:
+and dispatch methods virtually (corpus: `polymorphism.pyrs`, `subtype_assign.pyrs`,
+`subtype_field.pyrs`, `subtype_three_level.pyrs`). Design rationale:
 `docs/design/class-subtyping.md`.
 
 **How it is compiled (the model in one line).** Trait objects / `dyn` / `Rc` are
@@ -388,7 +388,7 @@ else:
 ```python
 c = a if cond else b
 ```
-Both branches must share a type; right-associative (corpus: `vs_ternary_of_vars.py`).
+Both branches must share a type; right-associative (corpus: `vs_ternary_of_vars.pyrs`).
 
 ### While loops
 ```python
@@ -421,7 +421,7 @@ match value:
     case _:
         ...
 ```
-Literal patterns and the `_` wildcard are supported (corpus: `match_demo.py`).
+Literal patterns and the `_` wildcard are supported (corpus: `match_demo.pyrs`).
 
 ---
 
@@ -452,12 +452,12 @@ exponentiation. `int ** int → float` (Python semantics).
 
 ### Comparison chaining — **supported**
 `a < b < c` is supported with Python semantics (`a < b and b < c`), corpus:
-`comparison_chain.py`.
+`comparison_chain.pyrs`.
 
 ### Operator overloading — **supported**
 Dunder methods are honored: `__add__`, `__sub__`, `__mul__`, `__eq__`, `__lt__`,
-`__str__`/`__repr__`, etc. (corpus: `vector2d.py` for `__add__`/`__lt__`,
-`accounts.py` for `__str__`, `inherit_dunders.py`). For a polymorphic base, the
+`__str__`/`__repr__`, etc. (corpus: `vector2d.pyrs` for `__add__`/`__lt__`,
+`accounts.pyrs` for `__str__`, `inherit_dunders.pyrs`). For a polymorphic base, the
 companion enum forwards the relevant Rust traits to the variant structs (§6.4).
 
 ### Bitwise / shift / augmented assignment
@@ -504,7 +504,7 @@ present: bool = 2 in s
 u: set[int] = s.union({5, 6})
 ```
 Literals, membership, iteration, comprehensions, and the set algebra / predicate
-methods are supported (corpus: `set_methods.py`, `set_comp_test.py`):
+methods are supported (corpus: `set_methods.pyrs`, `set_comp_test.pyrs`):
 `.add`, `.clear`, `.discard`, `.remove`, `.update`, `.union`, `.intersection`,
 `.difference`, `.symmetric_difference`, `.issubset`, `.issuperset`, `.isdisjoint`.
 **Caveat:** `.discard` / `.remove` do not raise `KeyError` on an absent element
@@ -526,7 +526,7 @@ uniq: set[int]       = {x for x in items}            # set comprehension
 table: dict[int,int] = {x: x * x for x in nums}      # dict comprehension
 ```
 List, set, and dict comprehensions are supported, with an optional `if` filter
-(corpus: `set_comp_test.py`, `dict_comp_test.py`). Generator expressions are
+(corpus: `set_comp_test.pyrs`, `dict_comp_test.pyrs`). Generator expressions are
 **not** supported — use a comprehension.
 
 ---
@@ -608,7 +608,7 @@ finally:
 ```
 `try`/`except` matches on exception **type**, binds `except E as e` (the bound
 value is the exception message string), and honors `else` and `finally`
-(corpus: `div_zero.py`, `catch_value_error.py`, `except_bound_len.py`). Lowered
+(corpus: `div_zero.pyrs`, `catch_value_error.pyrs`, `except_bound_len.pyrs`). Lowered
 via Rust `catch_unwind` (see `RUST_BACKEND.md`).
 
 **Limitations (honest):**
@@ -666,7 +666,7 @@ into a `return`*, is exempt — that mutation is the callee's own value.
 Annotate a parameter `Mut[T]` to pass it **by mutable reference** (`&mut T` in the
 emitted Rust). The callee's mutations to a `Mut[T]` parameter — direct, nested,
 or via a mutating method — **persist to the caller**, and the §13.1 backstop is
-suppressed for that parameter (corpus: `mut_method_arg.py`, `mut_put.py`).
+suppressed for that parameter (corpus: `mut_method_arg.pyrs`, `mut_put.pyrs`).
 
 ```python
 def deposit(account: Mut[Account], amt: int) -> None:
@@ -715,8 +715,8 @@ collections render as `[]`, `set()`, `{}`. Tuples up to 6 elements are covered.
 `Optional[T]` and `T | None` both lower to `Option<T>`; the bare `None` literal
 lowers to `Option::None`. The model is deliberately explicit — there is no
 implicit `Option`-to-`T` coercion, so a missing value can never be read as if it
-were present (corpus: `optional_narrowing.py`, `optional_pipe_none.py`,
-`optional_return_none.py`, `optional_class.py`).
+were present (corpus: `optional_narrowing.pyrs`, `optional_pipe_none.pyrs`,
+`optional_return_none.pyrs`, `optional_class.pyrs`).
 
 ### Auto-wrapping at the boundary
 A bare `T` or `None` is auto-wrapped into an `Optional[T]` slot at the consuming
@@ -769,7 +769,7 @@ with open(path) as f:
 ```
 `with X() as y:` is supported. The exercised context manager is file I/O via
 `open(path[, mode])` with `read()` / `readlines()` / `write()` / `close()` and
-modes `r` / `w` / `a` (corpus: `file_io.py`, `csv_parse.py`). File I/O is MVP:
+modes `r` / `w` / `a` (corpus: `file_io.pyrs`, `csv_parse.pyrs`). File I/O is MVP:
 no `for line in f`, no seek/tell, no binary or encoding control, and I/O errors
 panic.
 
@@ -795,7 +795,7 @@ Throughout, when a Python construct cannot be lowered faithfully, pyrst emits a
 **clean diagnostic** — a lex / parse / typeck / codegen error with a source span,
 context lines, visual carets, and (where applicable) a named remedy — rather than
 emitting wrong-but-compiling Rust or leaking a raw `rustc` failure. The
-honest-rejection corpus (`examples/*fail*.py`, 64 fixtures, plus
+honest-rejection corpus (`examples/*fail*.pyrs`, 64 fixtures, plus
 `examples/multi_file_fail/`) pins these errors.
 
 ---
@@ -811,14 +811,14 @@ from foo import bar as baz    # aliased import
 Multi-file programs are supported: imports are resolved via DFS over the import
 graph and the modules' declarations are merged into a flat namespace. In the
 corpus, multi-file programs are organized as **sibling modules in a
-subdirectory** — e.g. `examples/multi_file_demo/` (`main.py` doing
+subdirectory** — e.g. `examples/multi_file_demo/` (`main.pyrs` doing
 `from common import clamp` and `from math_utils import safe_div, bounded_sum`,
-alongside `common.py` and `math_utils.py`).
+alongside `common.pyrs` and `math_utils.pyrs`).
 
 **Limitations:**
 - Circular imports are **detected** (reported via cycle detection) but not
   resolved — see `examples/multi_file_fail/` for the negative scenario.
-- No package hierarchy (`foo/__init__.py`), no relative imports, no import-time
+- No package hierarchy (`foo/__init__.pyrs`), no relative imports, no import-time
   side effects (modules are declarations only), and no Python stdlib imports.
 
 ---
@@ -834,9 +834,9 @@ alongside `common.py` and `math_utils.py`).
 The pipeline is lexer → parser → resolver → type checker → Rust codegen → `rustc`.
 
 ```bash
-pyrst check <file.py>    # parse and type-check
-pyrst emit  <file.py>    # print generated Rust to stdout
-pyrst build <file.py>    # compile to a native binary via rustc
+pyrst check <file.pyrs>    # parse and type-check
+pyrst emit  <file.pyrs>    # print generated Rust to stdout
+pyrst build <file.pyrs>    # compile to a native binary via rustc
 ```
 
 ### Performance posture

@@ -70,7 +70,7 @@ but only worth doing if C2 is actually on the roadmap.
 
 Strangler-fig, suite green at each step (currently 158 pos / 46 neg). Key risks (all addressable):
 - **rust_ty duality** — only classes WITH a subclass in the unit become polymorphic; a sub-less class is
-  unchanged → no regression for non-inheritance code. animal_super.py / inheritance_test.py use `Dog`
+  unchanged → no regression for non-inheritance code. animal_super.pyrs / inheritance_test.pyrs use `Dog`
   only in `Dog`-typed positions, so unaffected.
 - **Field access on a base-typed var** (`a.breed` where `a: Animal`) must stay a typeck error — already
   true via `get_all_fields` on the declared type. Verify in C1-B.
@@ -164,8 +164,8 @@ C2-3 polish card (`0a48385b`).
   route base-typed args through `emit_into_base_slot`, keyed on the field / `__init__`-param type) **plus the
   containing-struct derive correctness** (a struct with a polymorphic-base field omits `PartialEq`/`Default`
   from its derives, since the companion enum carries `PartialEq` only when every variant defines `__eq__`
-  and never carries `Default`). New goldens: `subtype_field.py` (base-typed field init + read + dispatch),
-  `subtype_three_level.py` (3-level direct construct). Also a pure-cleanup of the redundant `emit_consuming`
+  and never carries `Default`). New goldens: `subtype_field.pyrs` (base-typed field init + read + dispatch),
+  `subtype_three_level.pyrs` (3-level direct construct). Also a pure-cleanup of the redundant `emit_consuming`
   at the annotated-assign site, and docs (PYTHON_COMPATIBILITY.md + this file).
 
 **Deferred (honest errors today — never a miscompile):**
@@ -178,6 +178,6 @@ C2-3 polish card (`0a48385b`).
   C2-3 turned the former raw-rustc leak into an honest `Error::Codegen` pointing at `.extend()`. Element-wise
   subtype wrapping is a follow-on once concat itself is implemented.
 - **Dict-literal subtype values** (`dict[str, Base] = {"k": Derived()}`) → typeck rejects (no dict-value
-  subtype unification / element wrapping yet). Locked in by `fail_dict_subtype_value.py`.
+  subtype unification / element wrapping yet). Locked in by `fail_dict_subtype_value.pyrs`.
 - **Exception subtyping** — `Exception` is a builtin, not in `ctx.classes`, so user exception hierarchies stay
   out of the companion-enum machinery (catch by exact name).

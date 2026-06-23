@@ -316,7 +316,7 @@ set_comp
 5. **Reserved for future expansion:**
    - `async`, `await` (deferred to v1.0)
 
-   `match`/`case` pattern matching is **fully supported** (see `match_stmt` grammar above; corpus: `examples/match_demo.py`). Literal patterns and the `_` wildcard are implemented end-to-end.
+   `match`/`case` pattern matching is **fully supported** (see `match_stmt` grammar above; corpus: `examples/match_demo.pyrs`). Literal patterns and the `_` wildcard are implemented end-to-end.
 
 6. **Operator precedence follows Python** but with explicit rules for clarity. The grammar avoids left recursion by using loops and alternation.
 

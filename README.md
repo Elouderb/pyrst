@@ -15,7 +15,7 @@ A statically typed Python-like language that compiles to efficient Rust. Combine
 
 **Active development** — Full compiler pipeline (lexer → parser → resolver → type checker → Rust codegen → `rustc`). **All 194 single-file examples transpile and run successfully** (`./test_all.sh`: 194/194 positives, 64/64 rejection fixtures, 199 in-crate `#[test]` cases).
 
-The core pipeline is working end-to-end, including multi-file imports, classes with single inheritance and dunder methods, comprehensions, and a broad set of string/list/dict methods. Lambdas are implemented (see `examples/lambda_demo.py`, `examples/lambda_closure.py`).
+The core pipeline is working end-to-end, including multi-file imports, classes with single inheritance and dunder methods, comprehensions, and a broad set of string/list/dict methods. Lambdas are implemented (see `examples/lambda_demo.pyrs`, `examples/lambda_closure.pyrs`).
 
 **Known limitations (honest status):**
 - The static type checker is **best-effort, not yet fully sound**: some expressions still infer to an `Unknown` type that is permissively compatible with everything, so a few type/ownership errors are surfaced by the downstream `rustc` invocation against generated Rust rather than by pyrst itself. Recent work (type-inference soundness pass) has narrowed this escape hatch substantially; the remaining gaps are tracked as deferred items.
@@ -50,7 +50,7 @@ def main() -> None:
 Compiles to Rust, then to native binary:
 
 ```bash
-pyrst build examples/fib.py
+pyrst build examples/fib.pyrs
 ./fib
 ```
 
@@ -92,7 +92,7 @@ Notable omissions (by design):
 - Metaclasses and dynamic attribute access
 - `eval`/`exec` and reflection
 - Python standard library compatibility
-- Package directories (`foo/__init__.py`)
+- Package directories (`foo/__init__.pyrs`)
 - Module visibility / private modules
 - Shared-mutable aliasing (`Rc`/`RefCell`-style); mutation is explicit via `Mut[T]`
 
@@ -105,16 +105,16 @@ cd pyrst
 cargo build --release
 
 # Test it
-cargo run --release -- build examples/hello.py
+cargo run --release -- build examples/hello.pyrs
 ./hello
 ```
 
 ## CLI Usage
 
 ```bash
-pyrst check <file.py>    # Parse and type-check
-pyrst emit <file.py>     # Print generated Rust to stdout
-pyrst build <file.py>    # Compile to native binary via rustc
+pyrst check <file.pyrs>    # Parse and type-check
+pyrst emit <file.pyrs>     # Print generated Rust to stdout
+pyrst build <file.pyrs>    # Compile to native binary via rustc
 ```
 
 ## Project Philosophy

@@ -23,6 +23,34 @@ pub enum Ty {
     Unknown,
 }
 
+impl std::fmt::Display for Ty {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Ty::Int     => write!(f, "int"),
+            Ty::Float   => write!(f, "float"),
+            Ty::Bool    => write!(f, "bool"),
+            Ty::Str     => write!(f, "str"),
+            Ty::Unit    => write!(f, "None"),
+            Ty::NoneVal => write!(f, "None"),
+            Ty::List(t) => write!(f, "list[{}]", t),
+            Ty::Set(t)  => write!(f, "set[{}]", t),
+            Ty::Dict(k, v) => write!(f, "dict[{}, {}]", k, v),
+            Ty::Tuple(ts) => {
+                write!(f, "tuple[")?;
+                for (i, t) in ts.iter().enumerate() {
+                    if i > 0 { write!(f, ", ")?; }
+                    write!(f, "{}", t)?;
+                }
+                write!(f, "]")
+            }
+            Ty::Option(t) => write!(f, "{} | None", t),
+            Ty::Class(n)  => write!(f, "{}", n),
+            Ty::File      => write!(f, "file"),
+            Ty::Unknown   => write!(f, "unknown"),
+        }
+    }
+}
+
 impl Ty {
     pub fn from_type_expr(t: &TypeExpr) -> Result<Ty> {
         Ok(match t {
@@ -1524,7 +1552,7 @@ fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             if env.ret_ty != Ty::Unit {
                 return Err(Error::Type {
                     span: *span,
-                    msg: format!("bare return in function declared to return {:?}", env.ret_ty),
+                    msg: format!("bare return in function declared to return {}", env.ret_ty),
                 });
             }
             Ok(())
@@ -1534,7 +1562,7 @@ fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             if !types_compatible(&ty, &env.ret_ty, env.ctx) {
                 return Err(Error::Type {
                     span: *span,
-                    msg: format!("return type mismatch: expected {:?}, found {:?}", env.ret_ty, ty),
+                    msg: format!("return type mismatch: expected {}, found {}", env.ret_ty, ty),
                 });
             }
             Ok(())
@@ -1554,7 +1582,7 @@ fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
                 if !types_compatible(&val_ty, &explicit, env.ctx) {
                     return Err(Error::Type {
                         span: *span,
-                        msg: format!("type mismatch in assignment: declared {:?}, got {:?}", explicit, val_ty),
+                        msg: format!("type mismatch in assignment: declared {}, got {}", explicit, val_ty),
                     });
                 }
             }
@@ -2486,7 +2514,7 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
             unify_branch_types(bt.clone(), ot.clone(), env.ctx).ok_or_else(|| Error::Type {
                 span: *span,
                 msg: format!(
-                    "conditional expression branches have incompatible types: `{:?}` vs `{:?}`",
+                    "conditional expression branches have incompatible types: `{}` vs `{}`",
                     bt, ot
                 ),
             })?
@@ -2586,7 +2614,7 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                     acc = unify_elem_types(acc.clone(), next.clone(), true, env.ctx).ok_or_else(|| Error::Type {
                         span: *span,
                         msg: format!(
-                            "list elements have incompatible types: {:?} vs {:?}",
+                            "list elements have incompatible types: {} vs {}",
                             acc, next
                         ),
                     })?;
@@ -2609,7 +2637,7 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                     acc = unify_elem_types(acc.clone(), next.clone(), false, env.ctx).ok_or_else(|| Error::Type {
                         span: *span,
                         msg: format!(
-                            "set elements have incompatible types: {:?} vs {:?}",
+                            "set elements have incompatible types: {} vs {}",
                             acc, next
                         ),
                     })?;
@@ -2644,14 +2672,14 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                     k_ty = unify_elem_types(k_ty.clone(), kt.clone(), false, env.ctx).ok_or_else(|| Error::Type {
                         span: *span,
                         msg: format!(
-                            "dict keys have incompatible types: {:?} vs {:?}",
+                            "dict keys have incompatible types: {} vs {}",
                             k_ty, kt
                         ),
                     })?;
                     v_ty = unify_elem_types(v_ty.clone(), vt.clone(), false, env.ctx).ok_or_else(|| Error::Type {
                         span: *span,
                         msg: format!(
-                            "dict values have incompatible types: {:?} vs {:?}",
+                            "dict values have incompatible types: {} vs {}",
                             v_ty, vt
                         ),
                     })?;
@@ -2862,7 +2890,7 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                                         return Err(Error::Type {
                                             span: *span,
                                             msg: format!(
-                                                "argument {} to `{}`: expected {:?}, found {:?}",
+                                                "argument {} to `{}`: expected {}, found {}",
                                                 i + 1, name, param_ty, arg_ty
                                             ),
                                         });
@@ -2984,7 +3012,7 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                                         return Err(Error::Type {
                                             span: *span,
                                             msg: format!(
-                                                "argument to `{}.{}`: expected element type {:?}, found {:?}",
+                                                "argument to `{}.{}`: expected element type {}, found {}",
                                                 type_name, name, elem_ty, arg_ty
                                             ),
                                         });
@@ -5528,5 +5556,68 @@ class Derived(Base):
         let sig = ctx.get_method("Derived", "describe").expect("inherited method must be found");
         assert_eq!(sig.params, vec![("n".to_string(), Ty::Int)]);
         assert_eq!(sig.ret, Ty::Str);
+    }
+
+    // =========================================================================
+    // Category E — Ty Display (surface-syntax rendering)
+    // =========================================================================
+
+    #[test]
+    fn display_primitives() {
+        assert_eq!(format!("{}", Ty::Int),   "int");
+        assert_eq!(format!("{}", Ty::Float), "float");
+        assert_eq!(format!("{}", Ty::Bool),  "bool");
+        assert_eq!(format!("{}", Ty::Str),   "str");
+        assert_eq!(format!("{}", Ty::Unit),  "None");
+        assert_eq!(format!("{}", Ty::NoneVal), "None");
+        assert_eq!(format!("{}", Ty::File),    "file");
+        assert_eq!(format!("{}", Ty::Unknown), "unknown");
+    }
+
+    #[test]
+    fn display_list_int() {
+        assert_eq!(format!("{}", Ty::List(Box::new(Ty::Int))), "list[int]");
+    }
+
+    #[test]
+    fn display_dict_str_animal() {
+        let ty = Ty::Dict(
+            Box::new(Ty::Str),
+            Box::new(Ty::Class("Animal".to_string())),
+        );
+        assert_eq!(format!("{}", ty), "dict[str, Animal]");
+    }
+
+    #[test]
+    fn display_option_int() {
+        assert_eq!(format!("{}", Ty::Option(Box::new(Ty::Int))), "int | None");
+    }
+
+    #[test]
+    fn display_tuple_int_str() {
+        let ty = Ty::Tuple(vec![Ty::Int, Ty::Str]);
+        assert_eq!(format!("{}", ty), "tuple[int, str]");
+    }
+
+    #[test]
+    fn display_nested_list_dict() {
+        // list[dict[str, Animal]]
+        let ty = Ty::List(Box::new(Ty::Dict(
+            Box::new(Ty::Str),
+            Box::new(Ty::Class("Animal".to_string())),
+        )));
+        assert_eq!(format!("{}", ty), "list[dict[str, Animal]]");
+    }
+
+    #[test]
+    fn display_list_option_int() {
+        // list[int | None]
+        let ty = Ty::List(Box::new(Ty::Option(Box::new(Ty::Int))));
+        assert_eq!(format!("{}", ty), "list[int | None]");
+    }
+
+    #[test]
+    fn display_class_name() {
+        assert_eq!(format!("{}", Ty::Class("Dog".to_string())), "Dog");
     }
 }

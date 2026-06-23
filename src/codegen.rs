@@ -4650,7 +4650,7 @@ impl<'a> Codegen<'a> {
                             }
                         }
                     }
-                    _ => return Err(crate::diag::Error::Codegen(format!("slicing not supported for type {:?}", obj_ty))),
+                    _ => return Err(crate::diag::Error::Codegen(format!("slicing not supported for type {}", obj_ty))),
                 }
             }
             Expr::BinOp { op, lhs, rhs, span } => {

@@ -1,0 +1,37 @@
+{
+  "comments": {
+    "lineComment": "#"
+  },
+  "brackets": [
+    ["(", ")"],
+    ["[", "]"],
+    ["{", "}"]
+  ],
+  "autoClosingPairs": [
+    { "open": "(", "close": ")" },
+    { "open": "[", "close": "]" },
+    { "open": "{", "close": "}" },
+    { "open": "\"", "close": "\"", "notIn": ["string"] },
+    { "open": "'", "close": "'", "notIn": ["string"] }
+  ],
+  "surroundingPairs": [
+    ["(", ")"],
+    ["[", "]"],
+    ["{", "}"],
+    ["\"", "\""],
+    ["'", "'"]
+  ],
+  "indentationRules": {
+    "increaseIndentPattern": "^((?!#).)*:\\s*(#.*)?$",
+    "decreaseIndentPattern": "^(\\s*)\\b(return|pass|break|continue|raise)\\b"
+  },
+  "onEnterRules": [
+    {
+      "beforeText": "^\\s*(?:def|class|if|elif|else|for|while|with|try|except|finally|match|case)\\b.*:\\s*$",
+      "action": {
+        "indent": "indent"
+      }
+    }
+  ],
+  "wordPattern": "(-?\\d*\\.\\d\\w*)|([^\\`\\~\\!\\@\\#\\%\\^\\&\\*\\(\\)\\-\\=\\+\\[\\{\\]\\}\\\\\\|\\;\\:\\'\\\"\\,\\<\\>\\/\\?\\s]+)"
+}

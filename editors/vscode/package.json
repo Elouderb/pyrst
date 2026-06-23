@@ -1,0 +1,68 @@
+{
+  "name": "pyrst",
+  "displayName": "Pyrst",
+  "description": "Language support for Pyrst (.pyrs) — syntax highlighting and live diagnostics via the pyrst language server.",
+  "version": "0.1.0",
+  "publisher": "pyrst",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/pyrst/pyrst"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "activationEvents": [
+    "onLanguage:pyrst"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "pyrst",
+        "aliases": ["pyrst", "Pyrst"],
+        "extensions": [".pyrs"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "pyrst",
+        "scopeName": "source.pyrst",
+        "path": "./syntaxes/pyrst.tmLanguage.json"
+      }
+    ],
+    "configuration": {
+      "title": "Pyrst",
+      "properties": {
+        "pyrst.server.path": {
+          "type": "string",
+          "default": "pyrst",
+          "description": "Path to the pyrst executable. Defaults to 'pyrst', which requires the binary to be on your PATH. Set this to an absolute path if you want to use a specific build."
+        },
+        "pyrst.trace.server": {
+          "type": "string",
+          "enum": ["off", "messages", "verbose"],
+          "default": "off",
+          "description": "Traces the communication between VS Code and the pyrst language server. Useful for debugging."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.3.0"
+  }
+}

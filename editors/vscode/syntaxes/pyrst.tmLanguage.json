@@ -1,0 +1,200 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Pyrst",
+  "scopeName": "source.pyrst",
+  "fileTypes": [".pyrs"],
+  "patterns": [
+    { "include": "#comment" },
+    { "include": "#decorator" },
+    { "include": "#string-triple-double" },
+    { "include": "#string-triple-single" },
+    { "include": "#fstring-double" },
+    { "include": "#fstring-single" },
+    { "include": "#string-double" },
+    { "include": "#string-single" },
+    { "include": "#keyword-control" },
+    { "include": "#keyword-operator" },
+    { "include": "#constant-language" },
+    { "include": "#constant-numeric" },
+    { "include": "#type-names" },
+    { "include": "#function-definition" },
+    { "include": "#class-definition" },
+    { "include": "#operator" }
+  ],
+  "repository": {
+    "comment": {
+      "name": "comment.line.number-sign.pyrst",
+      "match": "#.*$"
+    },
+
+    "decorator": {
+      "name": "meta.decorator.pyrst",
+      "match": "(@)(property|staticmethod|dataclass|[A-Za-z_][A-Za-z0-9_]*)",
+      "captures": {
+        "1": { "name": "punctuation.definition.decorator.pyrst" },
+        "2": { "name": "entity.name.function.decorator.pyrst" }
+      }
+    },
+
+    "string-triple-double": {
+      "name": "string.quoted.triple.double.pyrst",
+      "begin": "\"\"\"",
+      "end": "\"\"\"",
+      "patterns": [
+        { "include": "#string-escape" }
+      ]
+    },
+
+    "string-triple-single": {
+      "name": "string.quoted.triple.single.pyrst",
+      "begin": "'''",
+      "end": "'''",
+      "patterns": [
+        { "include": "#string-escape" }
+      ]
+    },
+
+    "fstring-double": {
+      "name": "string.quoted.double.pyrst meta.fstring.pyrst",
+      "begin": "(f)(\")",
+      "beginCaptures": {
+        "1": { "name": "storage.type.string.pyrst" },
+        "2": { "name": "punctuation.definition.string.begin.pyrst" }
+      },
+      "end": "\"",
+      "endCaptures": {
+        "0": { "name": "punctuation.definition.string.end.pyrst" }
+      },
+      "patterns": [
+        { "include": "#fstring-interpolation" },
+        { "include": "#string-escape" }
+      ]
+    },
+
+    "fstring-single": {
+      "name": "string.quoted.single.pyrst meta.fstring.pyrst",
+      "begin": "(f)(')",
+      "beginCaptures": {
+        "1": { "name": "storage.type.string.pyrst" },
+        "2": { "name": "punctuation.definition.string.begin.pyrst" }
+      },
+      "end": "'",
+      "endCaptures": {
+        "0": { "name": "punctuation.definition.string.end.pyrst" }
+      },
+      "patterns": [
+        { "include": "#fstring-interpolation" },
+        { "include": "#string-escape" }
+      ]
+    },
+
+    "fstring-interpolation": {
+      "name": "meta.embedded.expression.pyrst",
+      "begin": "\\{(?!\\{)",
+      "beginCaptures": {
+        "0": { "name": "punctuation.definition.template-expression.begin.pyrst" }
+      },
+      "end": "\\}",
+      "endCaptures": {
+        "0": { "name": "punctuation.definition.template-expression.end.pyrst" }
+      },
+      "patterns": [
+        { "include": "#keyword-operator" },
+        { "include": "#constant-language" },
+        { "include": "#constant-numeric" },
+        { "include": "#type-names" }
+      ]
+    },
+
+    "string-double": {
+      "name": "string.quoted.double.pyrst",
+      "begin": "\"",
+      "end": "\"",
+      "patterns": [
+        { "include": "#string-escape" }
+      ]
+    },
+
+    "string-single": {
+      "name": "string.quoted.single.pyrst",
+      "begin": "'",
+      "end": "'",
+      "patterns": [
+        { "include": "#string-escape" }
+      ]
+    },
+
+    "string-escape": {
+      "name": "constant.character.escape.pyrst",
+      "match": "\\\\."
+    },
+
+    "keyword-control": {
+      "name": "keyword.control.pyrst",
+      "match": "\\b(def|class|if|elif|else|for|while|return|import|from|match|case|pass|break|continue|with|try|except|finally|raise|global|lambda|in|is|not|and|or|as|yield|assert|del|nonlocal)\\b"
+    },
+
+    "keyword-operator": {
+      "name": "keyword.operator.pyrst",
+      "match": "\\b(and|or|not|in|is|lambda)\\b"
+    },
+
+    "constant-language": {
+      "name": "constant.language.pyrst",
+      "match": "\\b(None|True|False)\\b"
+    },
+
+    "constant-numeric": {
+      "patterns": [
+        {
+          "name": "constant.numeric.float.pyrst",
+          "match": "\\b[0-9][0-9_]*\\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?\\b"
+        },
+        {
+          "name": "constant.numeric.hex.pyrst",
+          "match": "\\b0[xX][0-9A-Fa-f][0-9A-Fa-f_]*\\b"
+        },
+        {
+          "name": "constant.numeric.octal.pyrst",
+          "match": "\\b0[oO][0-7][0-7_]*\\b"
+        },
+        {
+          "name": "constant.numeric.binary.pyrst",
+          "match": "\\b0[bB][01][01_]*\\b"
+        },
+        {
+          "name": "constant.numeric.integer.pyrst",
+          "match": "\\b[0-9][0-9_]*\\b"
+        }
+      ]
+    },
+
+    "type-names": {
+      "name": "support.type.pyrst",
+      "match": "\\b(int|float|str|bool|list|dict|set|tuple|Optional|Mut|Any|None)\\b"
+    },
+
+    "function-definition": {
+      "name": "meta.function.pyrst",
+      "match": "\\b(def)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\()",
+      "captures": {
+        "1": { "name": "keyword.control.pyrst" },
+        "2": { "name": "entity.name.function.pyrst" }
+      }
+    },
+
+    "class-definition": {
+      "name": "meta.class.pyrst",
+      "match": "\\b(class)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+      "captures": {
+        "1": { "name": "keyword.control.pyrst" },
+        "2": { "name": "entity.name.class.pyrst" }
+      }
+    },
+
+    "operator": {
+      "name": "keyword.operator.arithmetic.pyrst",
+      "match": "\\+|-|\\*|/|%|\\*\\*|//|==|!=|<=|>=|<|>|=|\\+=|-=|\\*=|/=|%=|&|\\||\\^|~|<<|>>"
+    }
+  }
+}

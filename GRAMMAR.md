@@ -9,7 +9,7 @@ This document defines the formal grammar for the v0 parser. The grammar is based
 - **Keywords:** `def`, `class`, `if`, `elif`, `else`, `while`, `for`, `in`, `return`, `raise`, `try`, `except`, `finally`, `import`, `from`, `as`, `pass`, `break`, `continue`, `and`, `or`, `not`, `is`, `None`, `True`, `False`, `match`, `case`, `with`, `async`, `await`
 - **Operators:** `+`, `-`, `*`, `/`, `//`, `%`, `**`, `==`, `!=`, `<`, `>`, `<=`, `>=`, `&`, `|`, `^`, `~`, `<<`, `>>`, `=`, `+=`, `-=`, `*=`, `/=`, `//=`, `%=`, `**=`, `&=`, `|=`, `^=`, `<<=`, `>>=`, `.`, `,`, `:`, `;`, `->`, `...`
 - **Delimiters:** `(`, `)`, `[`, `]`, `{`, `}`
-- **Literals:** integers, floats, strings (single/double/triple-quoted), identifiers
+- **Literals:** integers, floats, strings (single/double/triple-quoted), f-strings (`f"..."` / `f'...'` with `{expr}` interpolation), identifiers
 - **Comments:** `# ...` (line comment, consumed by lexer)
 - **Indentation:** INDENT (logical level increase), DEDENT (logical level decrease), NEWLINE
 
@@ -166,6 +166,7 @@ class_pattern
 
 test
     : or_test
+    | or_test "if" or_test "else" test
 
 or_test
     : and_test { "or" and_test }
@@ -265,7 +266,8 @@ intersection_type
     : primary_type
 
 primary_type
-    : atom_type [ "[" type_args "]" ]
+    : "Mut" "[" type_expr "]"
+    | atom_type [ "[" type_args "]" ]
 
 atom_type
     : NAME
@@ -313,8 +315,8 @@ set_comp
 
 5. **Reserved for future expansion:**
    - `async`, `await` (deferred to v1.0)
-   - `match`, `case` (deferred to v0.2)
-   - Pattern matching syntax is recognized but semantics are deferred
+
+   `match`/`case` pattern matching is **fully supported** (see `match_stmt` grammar above; corpus: `examples/match_demo.py`). Literal patterns and the `_` wildcard are implemented end-to-end.
 
 6. **Operator precedence follows Python** but with explicit rules for clarity. The grammar avoids left recursion by using loops and alternation.
 
@@ -333,4 +335,4 @@ Key CST preservation goals:
 
 - **Source files:** UTF-8 (or ASCII subset).
 - **Identifiers:** Alphanumeric + underscore; must start with letter or underscore.
-- **Strings:** Single-quoted `'...'`, double-quoted `"..."`, or triple-quoted `'''...'''` and `"""..."""`. Escape sequences: `\n`, `\t`, `\r`, `\\`, `\'`, `\"`. Unicode escapes: `\uXXXX`, `\UXXXXXXXX` (deferred).
+- **Strings:** Single-quoted `'...'`, double-quoted `"..."`, or triple-quoted `'''...'''` and `"""..."""`. F-strings: `f"..."` / `f'...'` with `{expr}` interpolation (the `expr` is any valid `test`). Escape sequences: `\n`, `\t`, `\r`, `\\`, `\'`, `\"`. Unicode escapes: `\uXXXX`, `\UXXXXXXXX` (deferred).

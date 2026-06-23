@@ -488,4 +488,4 @@ The dynamic half of Python — metaclasses, monkey-patching, `eval`/`exec`, gene
 ---
 
 *Last updated: June 22, 2026*  
-*Phase: 38 (EPIC-5 class subtyping complete) — verified against the live compiler (189/189 positive examples passing)*
+*Phase: 38 (EPICs 5–8 complete: class subtyping; honest errors / keyword escaping / receiver-guarded dispatch; dict/iteration / triple-quoted strings; surface diagnostics / Display for Ty / multi-file error sourcing) — verified against the live compiler (194/194 positive examples passing)*

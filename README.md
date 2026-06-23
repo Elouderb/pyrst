@@ -13,7 +13,7 @@ A statically typed Python-like language that compiles to efficient Rust. Combine
 
 ## Status
 
-**Phase 38 (in development)** — Full compiler pipeline (lexer → parser → resolver → type checker → Rust codegen → `rustc`). **All 129 single-file examples transpile and run successfully** (`./test_all.sh`: 129/129 positives, 21/21 negatives rejected, 24/24 output assertions).
+**Phase 38 (in development)** — Full compiler pipeline (lexer → parser → resolver → type checker → Rust codegen → `rustc`). **All 194 single-file examples transpile and run successfully** (`./test_all.sh`: 194/194 positives, 64/64 rejection fixtures, 199 in-crate `#[test]` cases).
 
 The core pipeline is working end-to-end, including multi-file imports, classes with single inheritance and dunder methods, comprehensions, and a broad set of string/list/dict methods. Lambdas are implemented (see `examples/lambda_demo.py`, `examples/lambda_closure.py`).
 
@@ -59,17 +59,26 @@ pyrst build examples/fib.py
 
 ## What's Implemented ✅
 
-- Functions with type annotations
-- Classes and methods (single inheritance)
+- Functions with type annotations and default arguments
+- Classes and methods (single inheritance, `super()`/`__init__`, dunder methods)
+- Class subtyping via companion-enum polymorphism (closed-set dispatch)
+- Decorators: `@property`, `@staticmethod`
+- Value semantics: clone-on-use; `Mut[T]` parameter mode for by-reference mutation
+- `Optional[T]` / `T | None` with explicit narrowing (`is None` / `is not None`)
 - Variables with static types and type inference
-- Collections: `list[T]`, `dict[K, V]`, `tuple[T1, T2, ...]`
-- Operators: arithmetic, comparison, logical, bitwise
-- Control flow: if/elif/else, while, for, break, continue
-- String operations and f-strings with interpolation
-- List comprehensions with filters
+- Collections: `list[T]`, `dict[K, V]`, `tuple[T1, T2, ...]`, `set[T]`
+- Operators: arithmetic, comparison (including chaining `a < b < c`), logical, bitwise
+- Ternary expressions: `x if cond else y`
+- Lambdas: `lambda x: expr`
+- Control flow: if/elif/else, while, for, break, continue, `with`/context managers
+- Pattern matching: `match`/`case` with literal patterns and `_` wildcard
+- String operations and f-strings with interpolation; triple-quoted strings
+- List, dict, and set comprehensions with filters
+- `try`/`except` with type-matched exception handling and `except E as e` binding
 - Tuple unpacking in assignments and for loops
 - `enumerate()`, `zip()`, `range()` with optional step
 - `assert` statements and `raise` (maps to panic)
+- Rust-keyword escaping: pyrst identifiers that collide with Rust keywords are emitted as raw identifiers (`r#type`, `r#loop`, etc.)
 - Type checking with two-pass inference
 - Code generation to readable Rust
 - Multi-file programs with `import` and `from...import`
@@ -80,15 +89,15 @@ pyrst build examples/fib.py
 See [PYTHON_COMPATIBILITY.md](PYTHON_COMPATIBILITY.md) for a complete matrix.
 
 Notable omissions (by design):
-- Exception handling with type matching / binding (`except E as e`) — `try`/`except` exists but runs handlers unconditionally
-- Type narrowing for optionals
 - Generators and `yield`
 - Multiple inheritance
+- Exception class hierarchy (catching a base type does not catch derived types)
 - Metaclasses and dynamic attribute access
 - `eval`/`exec` and reflection
 - Python standard library compatibility
 - Package directories (`foo/__init__.py`)
 - Module visibility / private modules
+- Shared-mutable aliasing (`Rc`/`RefCell`-style); mutation is explicit via `Mut[T]`
 
 ## Building from Source
 
@@ -128,7 +137,7 @@ See [DESIGN_DECISIONS.md](DESIGN_DECISIONS.md) for key tradeoffs.
 
 **Strengths:**
 - Full compiler pipeline working end-to-end (lexer → parser → resolver → type checker → codegen → `rustc`)
-- 106/106 single-file examples passing, covering core features and multi-file programs
+- 194/194 single-file examples passing, covering core features and multi-file programs
 - Clear separation of lexer, parser, type checker, code generator
 - Readable generated Rust code
 - Error messages with source code context

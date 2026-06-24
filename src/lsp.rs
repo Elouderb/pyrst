@@ -11,10 +11,12 @@
 //! - `textDocumentSync = FULL` (with `save`) — the editor sends the whole
 //!   document on every change, which we re-analyze.
 //! - `documentFormatting = true` — whole-document formatting.
+//! - `hover` / `definition` — type-on-cursor and go-to-declaration (EPIC-LSP L6).
+//! - `completion` (trigger `.`) — member completion on `obj.` and scope-symbol
+//!   completion otherwise (EPIC-LSP L7).
 //!
-//! Hover / completion / definition are deliberately NOT advertised: advertising
-//! a capability without a handler makes editors show empty popups. Those are
-//! later cards.
+//! A capability is advertised only once its handler exists: advertising a
+//! capability without a handler makes editors show empty popups.
 //!
 //! # Threading / runtime
 //! `main` is synchronous and returns an [`ExitCode`], so [`run`] builds its own
@@ -101,6 +103,34 @@ pub fn to_lsp_diagnostic(d: &analysis::Diagnostic) -> Diagnostic {
     }
 }
 
+/// Map an [`analysis::CompletionKind`] to the LSP [`CompletionItemKind`] that
+/// drives the editor's completion icon.
+///
+/// Pure: depends only on its argument, so it is unit-testable without a server.
+pub fn completion_kind_to_lsp(kind: analysis::CompletionKind) -> CompletionItemKind {
+    match kind {
+        analysis::CompletionKind::Field => CompletionItemKind::FIELD,
+        analysis::CompletionKind::Method => CompletionItemKind::METHOD,
+        analysis::CompletionKind::Function => CompletionItemKind::FUNCTION,
+        analysis::CompletionKind::Class => CompletionItemKind::CLASS,
+        analysis::CompletionKind::Variable => CompletionItemKind::VARIABLE,
+        analysis::CompletionKind::Keyword => CompletionItemKind::KEYWORD,
+    }
+}
+
+/// Convert an [`analysis::Completion`] into an LSP [`CompletionItem`].
+///
+/// Pure: depends only on its argument, so it is unit-testable without a running
+/// server or a [`Client`].
+pub fn to_completion_item(c: &analysis::Completion) -> CompletionItem {
+    CompletionItem {
+        label: c.label.clone(),
+        kind: Some(completion_kind_to_lsp(c.kind)),
+        detail: c.detail.clone(),
+        ..Default::default()
+    }
+}
+
 /// Compute the LSP [`Position`] of the very end of `text`.
 ///
 /// The end line is the number of `\n` characters (so a 2-line file ending in a
@@ -181,6 +211,14 @@ impl LanguageServer for Backend {
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 // Go-to-definition: jump to declaration site (EPIC-LSP L6).
                 definition_provider: Some(OneOf::Left(true)),
+                // Autocomplete: member completion on `obj.` + scope symbols
+                // (EPIC-LSP L7). `.` is a trigger character so the editor fires a
+                // completion request the instant the user types a dot.
+                completion_provider: Some(CompletionOptions {
+                    trigger_characters: Some(vec![".".to_string()]),
+                    resolve_provider: Some(false),
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
             ..Default::default()
@@ -330,6 +368,56 @@ impl LanguageServer for Backend {
             None => Ok(None),
         }
     }
+
+    // ── Completion (EPIC-LSP L7) ──────────────────────────────────────────────
+
+    async fn completion(
+        &self,
+        params: CompletionParams,
+    ) -> RpcResult<Option<CompletionResponse>> {
+        let tdp = params.text_document_position;
+        let uri = tdp.text_document.uri;
+        let position = tdp.position;
+
+        let text = match self.get_text(&uri) {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+
+        // The text pre-scan does NOT require the buffer to parse — crucial,
+        // because completion fires on an incomplete `p.` that fails to parse.
+        let completions: Vec<analysis::Completion> =
+            match analysis::completion_context(&text, position.line, position.character) {
+                // Member access (`obj.partial`): repair the buffer, type the
+                // receiver, and return its fields + methods (prefix-filtered).
+                analysis::CompletionContext::Member { .. } => {
+                    analysis::member_completions_at(&text, position.line, position.character)
+                }
+                // Otherwise: in-scope names. Requires the buffer to parse; when it
+                // does not (mid-edit), stay silent rather than guess.
+                analysis::CompletionContext::Scope { partial } => {
+                    match analysis::analyze_document(&text) {
+                        Some((module, ctx)) => {
+                            let mut items = analysis::scope_completions(
+                                &module,
+                                &ctx,
+                                &text,
+                                position.line,
+                                position.character,
+                            );
+                            if !partial.is_empty() {
+                                items.retain(|c| c.label.starts_with(&partial));
+                            }
+                            items
+                        }
+                        None => Vec::new(),
+                    }
+                }
+            };
+
+        let items: Vec<CompletionItem> = completions.iter().map(to_completion_item).collect();
+        Ok(Some(CompletionResponse::Array(items)))
+    }
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -455,5 +543,43 @@ mod tests {
     fn format_source_returns_none_on_parse_error() {
         let src = "def main(\n"; // unclosed paren
         assert!(format_source(src).is_none(), "unparseable source must not be formatted");
+    }
+
+    // ── Completion mappings (EPIC-LSP L7) ─────────────────────────────────────
+
+    #[test]
+    fn completion_kind_maps_each_variant() {
+        use analysis::CompletionKind as K;
+        assert_eq!(completion_kind_to_lsp(K::Field), CompletionItemKind::FIELD);
+        assert_eq!(completion_kind_to_lsp(K::Method), CompletionItemKind::METHOD);
+        assert_eq!(completion_kind_to_lsp(K::Function), CompletionItemKind::FUNCTION);
+        assert_eq!(completion_kind_to_lsp(K::Class), CompletionItemKind::CLASS);
+        assert_eq!(completion_kind_to_lsp(K::Variable), CompletionItemKind::VARIABLE);
+        assert_eq!(completion_kind_to_lsp(K::Keyword), CompletionItemKind::KEYWORD);
+    }
+
+    #[test]
+    fn completion_item_carries_label_kind_detail() {
+        let c = analysis::Completion {
+            label: "name".to_string(),
+            kind: analysis::CompletionKind::Field,
+            detail: Some(": str".to_string()),
+        };
+        let item = to_completion_item(&c);
+        assert_eq!(item.label, "name");
+        assert_eq!(item.kind, Some(CompletionItemKind::FIELD));
+        assert_eq!(item.detail.as_deref(), Some(": str"));
+    }
+
+    #[test]
+    fn completion_item_detail_none_is_preserved() {
+        let c = analysis::Completion {
+            label: "helper".to_string(),
+            kind: analysis::CompletionKind::Function,
+            detail: None,
+        };
+        let item = to_completion_item(&c);
+        assert_eq!(item.kind, Some(CompletionItemKind::FUNCTION));
+        assert!(item.detail.is_none());
     }
 }

@@ -1221,6 +1221,407 @@ fn stmt_span(s: &Stmt) -> crate::diag::Span {
     }
 }
 
+// ── Autocomplete (EPIC-LSP L7) ─────────────────────────────────────────────────
+//
+// Member completion on `obj.` (the fields + methods of `obj`'s class) and
+// scope-symbol completion otherwise. Like the rest of this module these helpers
+// are pure: they READ the AST + an already-built `TyCtx` and REUSE
+// `type_at_position` / `infer_expr_ty` as the type oracle — never re-implementing
+// inference and never mutating the parser/typeck/codegen.
+//
+// The key wrinkle is that completion fires on a buffer that often does NOT parse
+// (`p.` has a trailing incomplete member access). The text pre-scan
+// [`completion_context`] therefore does NOT require the buffer to parse, and the
+// member path [`member_completions_at`] REPAIRS the source (deleting the trailing
+// `.<partial>`) so the receiver alone parses and can be typed.
+
+/// What KIND of symbol a [`Completion`] refers to. The LSP layer maps each
+/// variant to a `CompletionItemKind`; kept as an internal enum so `analysis`
+/// stays free of any LSP type dependency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionKind {
+    Field,
+    Method,
+    Function,
+    Class,
+    Variable,
+    Keyword,
+}
+
+/// A single completion candidate. `label` is the inserted text (the bare name);
+/// `detail` is an optional human-readable annotation (a field's `": int"` or a
+/// method's `"(a: int) -> str"`); `kind` drives the editor's icon.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Completion {
+    pub label: String,
+    pub kind: CompletionKind,
+    pub detail: Option<String>,
+}
+
+/// The lexical situation immediately before the cursor, derived by a pure text
+/// pre-scan that does NOT need the buffer to parse.
+///
+/// - `Member` — the text before the cursor is `<receiver>.<partial>` (a member
+///   access). `receiver` is the source text of the receiver expression, and
+///   `receiver_end` is its end as a 0-indexed `(line, col)` position (which is
+///   exactly the position of the `.`). `partial` is the word already typed after
+///   the dot (possibly empty for a bare `obj.`).
+/// - `Scope` — anything else; `partial` is the word being typed before the
+///   cursor (possibly empty).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompletionContext {
+    Member { receiver: String, receiver_end: (u32, u32), partial: String },
+    Scope { partial: String },
+}
+
+/// True for characters that may appear in an identifier (the pyrst lexer's
+/// identifier alphabet: ASCII letters, digits, and `_`).
+fn is_word_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+/// Render a `TypeExpr` annotation as a `Ty`-formatted string (e.g. `int`,
+/// `list[int]`, `MyClass`), reusing `Ty::from_type_expr` + `Ty::Display` so
+/// completion detail matches hover exactly. Falls back to a best-effort name on
+/// the (practically unreachable) lowering error so a bad annotation never hides
+/// the whole completion.
+fn render_type_expr(te: &crate::ast::TypeExpr) -> String {
+    match Ty::from_type_expr(te, crate::diag::Span::DUMMY) {
+        Ok(ty) => ty.to_string(),
+        Err(_) => match te {
+            crate::ast::TypeExpr::Named(n) => n.clone(),
+            crate::ast::TypeExpr::None_ => "None".to_string(),
+            _ => "?".to_string(),
+        },
+    }
+}
+
+/// Build a method's `detail` signature string, e.g. `(a: int, b: str) -> bool`.
+/// `self` is omitted (it is implicit at the call site). The return type is always
+/// shown (`-> None` for a void method), mirroring how pyrst sources are written.
+fn method_detail(m: &Func) -> String {
+    let params: Vec<String> = m
+        .params
+        .iter()
+        .filter(|p| p.name != "self")
+        .map(|p| format!("{}: {}", p.name, render_type_expr(&p.ty)))
+        .collect();
+    format!("({}) -> {}", params.join(", "), render_type_expr(&m.ret))
+}
+
+/// Inheritance-aware method collector mirroring `TyCtx::collect_fields`: walks the
+/// base chain first, then this class, so a method defined on a derived class
+/// SHADOWS the same-named method on a base. Returns `(name, detail)` pairs in a
+/// stable order (bases first, then this class), deduped by name keeping the most
+/// derived definition.
+fn collect_methods(ctx: &TyCtx, class_name: &str) -> Vec<(String, String)> {
+    let mut ordered: Vec<String> = Vec::new();
+    let mut details: HashMap<String, String> = HashMap::new();
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    collect_methods_rec(ctx, class_name, &mut ordered, &mut details, &mut visited);
+    ordered
+        .into_iter()
+        .map(|name| {
+            let d = details.remove(&name).unwrap_or_default();
+            (name, d)
+        })
+        .collect()
+}
+
+fn collect_methods_rec(
+    ctx: &TyCtx,
+    class_name: &str,
+    ordered: &mut Vec<String>,
+    details: &mut HashMap<String, String>,
+    visited: &mut std::collections::HashSet<String>,
+) {
+    if !visited.insert(class_name.to_string()) {
+        return;
+    }
+    let Some(class_def) = ctx.classes.get(class_name) else { return };
+    // Bases first (so derived definitions overwrite inherited details below).
+    for base in &class_def.bases {
+        collect_methods_rec(ctx, base, ordered, details, visited);
+    }
+    for m in &class_def.methods {
+        if !details.contains_key(&m.name) {
+            ordered.push(m.name.clone());
+        }
+        // Always (re)write the detail with the most-derived signature seen.
+        details.insert(m.name.clone(), method_detail(m));
+    }
+}
+
+/// Fields + methods of the class `ty` resolves to, for `obj.` member completion.
+///
+/// When `ty` is `Ty::Class(name)`: returns its FIELDS (inheritance-aware via
+/// `TyCtx::get_all_fields`; `label = name`, `detail = ": <type>"`,
+/// `kind = Field`) followed by its METHODS (inheritance-aware; `label = name`,
+/// `detail = "(params) -> ret"`, `kind = Method`). For any non-class type
+/// (`int`, `list[..]`, `Unknown`, …) returns an empty vec — pyrst models no
+/// methods on builtins for completion.
+///
+/// Fields come before methods; both are deduped by label (a field shadows an
+/// inherited field of the same name via `get_all_fields`; a derived method
+/// shadows a base method via `collect_methods`).
+pub fn member_completions(ty: &Ty, ctx: &TyCtx) -> Vec<Completion> {
+    let class_name = match ty {
+        Ty::Class(n) => n.clone(),
+        _ => return Vec::new(),
+    };
+    if !ctx.classes.contains_key(&class_name) {
+        return Vec::new();
+    }
+
+    let mut out: Vec<Completion> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // Fields (inheritance-aware). `get_all_fields` lists bases first then this
+    // class; keep the FIRST occurrence of each name so a derived field wins is
+    // not required here (fields are not normally redeclared), but dedup defends
+    // against it regardless.
+    for field in ctx.get_all_fields(&class_name) {
+        if !seen.insert(field.name.clone()) {
+            continue;
+        }
+        out.push(Completion {
+            label: field.name.clone(),
+            kind: CompletionKind::Field,
+            detail: Some(format!(": {}", render_type_expr(&field.ty))),
+        });
+    }
+
+    // Methods (inheritance-aware, derived shadows base).
+    for (name, detail) in collect_methods(ctx, &class_name) {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        out.push(Completion {
+            label: name,
+            kind: CompletionKind::Method,
+            detail: Some(detail),
+        });
+    }
+
+    out
+}
+
+/// In-scope names visible at the cursor, for non-member (`Scope`) completion.
+///
+/// Collects, in priority order and deduped by label:
+/// 1. the enclosing function's params + locals visible at the cursor (`kind =
+///    Variable`, `detail = the type`), reconstructed exactly as
+///    `type_at_position` does (params from annotations, `self` as its class,
+///    body locals up to the cursor);
+/// 2. top-level functions from `ctx.funcs` (`kind = Function`) — this includes
+///    the builtins seeded into `TyCtx::new`;
+/// 3. classes from `ctx.classes` (`kind = Class`);
+/// 4. a small set of pyrst keywords (`kind = Keyword`).
+///
+/// Earlier entries win on a label collision (a local named `len` shadows the
+/// builtin in the list).
+pub fn scope_completions(
+    module: &Module,
+    ctx: &TyCtx,
+    src: &str,
+    line0: u32,
+    col0: u32,
+) -> Vec<Completion> {
+    let mut out: Vec<Completion> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // 1. Locals + params of the enclosing function, reconstructed at the cursor.
+    let off = position_to_byte_offset(src, line0, col0);
+    if let Some(path) = node_at_position(module, src, line0, col0) {
+        let locals = build_locals_for_func(&path, off, ctx);
+        // Sort for a stable, name-ordered presentation.
+        let mut names: Vec<&String> = locals.keys().collect();
+        names.sort();
+        for name in names {
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            let ty = &locals[name];
+            out.push(Completion {
+                label: name.clone(),
+                kind: CompletionKind::Variable,
+                detail: Some(ty.to_string()),
+            });
+        }
+    }
+
+    // 2. Top-level functions (and builtins). Sorted for determinism.
+    let mut func_names: Vec<&String> = ctx.funcs.keys().collect();
+    func_names.sort();
+    for name in func_names {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        out.push(Completion {
+            label: name.clone(),
+            kind: CompletionKind::Function,
+            detail: None,
+        });
+    }
+
+    // 3. Classes. Sorted for determinism.
+    let mut class_names: Vec<&String> = ctx.classes.keys().collect();
+    class_names.sort();
+    for name in class_names {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        out.push(Completion {
+            label: name.clone(),
+            kind: CompletionKind::Class,
+            detail: None,
+        });
+    }
+
+    // 4. Keywords.
+    for kw in ["def", "class", "if", "for", "return", "None", "True", "False"] {
+        if !seen.insert(kw.to_string()) {
+            continue;
+        }
+        out.push(Completion {
+            label: kw.to_string(),
+            kind: CompletionKind::Keyword,
+            detail: None,
+        });
+    }
+
+    out
+}
+
+/// Pure text pre-scan of the situation immediately before an LSP `(line0, col0)`
+/// cursor, WITHOUT requiring the buffer to parse.
+///
+/// Returns `Member { receiver, receiver_end, partial }` when the text before the
+/// cursor is `<receiver-expr>.<word>` (a member access — there is a `.` after an
+/// identifier / `)` / `]`, and only word chars sit between that `.` and the
+/// cursor). Otherwise returns `Scope { partial }`, where `partial` is the word
+/// being typed before the cursor (possibly empty).
+///
+/// Receiver detection is deliberately simple but correct for the common cases —
+/// `ident.`, `ident.partial`, `self.`, dotted `a.b.`, and a trailing call/index
+/// like `f().` or `xs[0].` — by walking backward over a balanced run of word
+/// chars, `.`, and matched `()` / `[]`.
+pub fn completion_context(src: &str, line0: u32, col0: u32) -> CompletionContext {
+    let cursor = position_to_byte_offset(src, line0, col0);
+    let before = &src[..cursor];
+    let bytes = before.as_bytes();
+
+    // The trailing run of word chars before the cursor is the `partial`.
+    let mut word_start = before.len();
+    while word_start > 0 && is_word_char(bytes[word_start - 1] as char) {
+        word_start -= 1;
+    }
+    let partial = before[word_start..].to_string();
+
+    // Is the char immediately before the word a `.`? If so this is a member
+    // access; the receiver is whatever precedes that `.`.
+    if word_start > 0 && bytes[word_start - 1] == b'.' {
+        let dot = word_start - 1;
+        if let Some(recv_start) = receiver_start(bytes, dot) {
+            if recv_start < dot {
+                let receiver = before[recv_start..dot].to_string();
+                let receiver_end = byte_offset_to_position(src, dot);
+                return CompletionContext::Member { receiver, receiver_end, partial };
+            }
+        }
+        // A `.` with no resolvable receiver before it (e.g. a leading `.` or a
+        // float like `3.`): fall through to scope completion.
+    }
+
+    CompletionContext::Scope { partial }
+}
+
+/// Walk backward from `dot` (the byte index of the `.`) over a balanced receiver
+/// expression, returning the byte index where it starts. Accepts word chars,
+/// `.` (dotted access), and matched `)` / `]` groups; stops at anything else.
+fn receiver_start(bytes: &[u8], dot: usize) -> Option<usize> {
+    let mut i = dot;
+    while i > 0 {
+        let c = bytes[i - 1] as char;
+        if is_word_char(c) || c == '.' {
+            i -= 1;
+        } else if c == ')' || c == ']' {
+            // Skip a balanced bracket group.
+            let (open, close) = if c == ')' { (b'(', b')') } else { (b'[', b']') };
+            let mut depth = 0usize;
+            let mut j = i;
+            loop {
+                if j == 0 {
+                    return None; // unbalanced — give up
+                }
+                let cj = bytes[j - 1];
+                if cj == close {
+                    depth += 1;
+                } else if cj == open {
+                    depth -= 1;
+                    if depth == 0 {
+                        j -= 1;
+                        break;
+                    }
+                }
+                j -= 1;
+            }
+            i = j;
+        } else {
+            break;
+        }
+    }
+    Some(i)
+}
+
+/// Member completion driven by the REPAIR strategy: given a cursor at
+/// `(line0, col0)` whose preceding text is `<receiver>.<partial>`, build a
+/// repaired source (delete the trailing `.<partial>` so the receiver stands
+/// alone and the buffer parses), type the receiver via `type_at_position`, and
+/// return its members filtered by the `partial` prefix.
+///
+/// Returns an empty vec (never panics) when the context is not a member access,
+/// the repaired buffer still doesn't parse, or the receiver type is unknown /
+/// non-class.
+pub fn member_completions_at(src: &str, line0: u32, col0: u32) -> Vec<Completion> {
+    let (receiver_end, partial) = match completion_context(src, line0, col0) {
+        CompletionContext::Member { receiver_end, partial, .. } => (receiver_end, partial),
+        CompletionContext::Scope { .. } => return Vec::new(),
+    };
+
+    let cursor = position_to_byte_offset(src, line0, col0);
+    // `receiver_end` is the position of the `.`; its byte offset is the start of
+    // the slice to delete, through the cursor (the end of `partial`).
+    let dot_off = position_to_byte_offset(src, receiver_end.0, receiver_end.1);
+    if dot_off >= cursor {
+        return Vec::new();
+    }
+
+    // Build the repaired buffer: original with `[dot_off, cursor)` removed. This
+    // leaves the receiver expression intact and syntactically valid in place
+    // (`    p.di` → `    p`, `    foo(p.)` → `    foo(p)`).
+    let mut repaired = String::with_capacity(src.len() - (cursor - dot_off));
+    repaired.push_str(&src[..dot_off]);
+    repaired.push_str(&src[cursor..]);
+
+    let Some((module, ctx)) = analyze_document(&repaired) else {
+        return Vec::new();
+    };
+
+    // Type the receiver at its end position (unchanged by the deletion, which
+    // happened at/after the dot). `type_at_position` reconstructs locals and runs
+    // the shared inference oracle — no forked inference.
+    let Some(ty) = type_at_position(&module, &ctx, &repaired, receiver_end.0, receiver_end.1) else {
+        return Vec::new();
+    };
+
+    let mut members = member_completions(&ty, &ctx);
+    if !partial.is_empty() {
+        members.retain(|c| c.label.starts_with(&partial));
+    }
+    members
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1896,5 +2297,299 @@ mod tests {
         // `result` on line 2, col 8.
         let ty = type_at_position(&module, &ctx, src, 2, 8);
         assert_eq!(ty, Some(Ty::Str), "annotated method-local target should return str");
+    }
+
+    // ── Autocomplete: member_completions (EPIC-LSP L7) ────────────────────────
+
+    /// Look up a completion by label in a slice (helper for assertions).
+    fn find<'a>(cs: &'a [Completion], label: &str) -> Option<&'a Completion> {
+        cs.iter().find(|c| c.label == label)
+    }
+
+    #[test]
+    fn member_completions_two_fields_one_method() {
+        // A class with two fields (x: int, name: str) and one method greet().
+        let src = concat!(
+            "class P:\n",
+            "    x: int\n",
+            "    name: str\n",
+            "    def greet(self, a: int) -> str:\n",
+            "        return self.name\n",
+        );
+        let (_module, ctx) = build(src);
+        let cs = member_completions(&Ty::Class("P".to_string()), &ctx);
+        // Exactly 3 completions: 2 fields + 1 method.
+        assert_eq!(cs.len(), 3, "expected 3 completions, got: {:?}", cs);
+
+        let x = find(&cs, "x").expect("field x");
+        assert_eq!(x.kind, CompletionKind::Field);
+        assert_eq!(x.detail.as_deref(), Some(": int"));
+
+        let name = find(&cs, "name").expect("field name");
+        assert_eq!(name.kind, CompletionKind::Field);
+        assert_eq!(name.detail.as_deref(), Some(": str"));
+
+        let greet = find(&cs, "greet").expect("method greet");
+        assert_eq!(greet.kind, CompletionKind::Method);
+        // `self` is omitted from the rendered signature.
+        assert_eq!(greet.detail.as_deref(), Some("(a: int) -> str"));
+    }
+
+    #[test]
+    fn member_completions_includes_inherited_for_subclass() {
+        // Base has field `base_field` + method `base_method`; Derived adds
+        // `own_field`. Completing on Derived must include the inherited members.
+        let src = concat!(
+            "class Base:\n",
+            "    base_field: int\n",
+            "    def base_method(self) -> None:\n",
+            "        pass\n",
+            "class Derived(Base):\n",
+            "    own_field: str\n",
+            "    def own_method(self) -> None:\n",
+            "        pass\n",
+        );
+        let (_module, ctx) = build(src);
+        let cs = member_completions(&Ty::Class("Derived".to_string()), &ctx);
+        // Inherited field + method present.
+        let bf = find(&cs, "base_field").expect("inherited field");
+        assert_eq!(bf.kind, CompletionKind::Field);
+        let bm = find(&cs, "base_method").expect("inherited method");
+        assert_eq!(bm.kind, CompletionKind::Method);
+        // Own members present too.
+        assert!(find(&cs, "own_field").is_some(), "own field present");
+        assert!(find(&cs, "own_method").is_some(), "own method present");
+    }
+
+    #[test]
+    fn member_completions_non_class_is_empty() {
+        let src = "def f() -> int:\n    return 1\n";
+        let (_module, ctx) = build(src);
+        assert!(member_completions(&Ty::Int, &ctx).is_empty(), "int has no members");
+        assert!(
+            member_completions(&Ty::List(Box::new(Ty::Int)), &ctx).is_empty(),
+            "list has no class members"
+        );
+        // A class name that doesn't exist → empty (no panic).
+        assert!(member_completions(&Ty::Class("Nope".into()), &ctx).is_empty());
+    }
+
+    // ── Autocomplete: completion_context ──────────────────────────────────────
+
+    #[test]
+    fn context_member_bare_dot() {
+        // `    p.` → Member, receiver "p", empty partial. Cursor at end (col 6).
+        let src = "    p.";
+        match completion_context(src, 0, 6) {
+            CompletionContext::Member { receiver, partial, receiver_end } => {
+                assert_eq!(receiver, "p");
+                assert_eq!(partial, "");
+                // The `.` is at col 5 (0-indexed): "    p" = 5 chars.
+                assert_eq!(receiver_end, (0, 5));
+            }
+            other => panic!("expected Member, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn context_member_with_partial() {
+        // `    p.di` → Member, receiver "p", partial "di". Cursor at end (col 8).
+        let src = "    p.di";
+        match completion_context(src, 0, 8) {
+            CompletionContext::Member { receiver, partial, .. } => {
+                assert_eq!(receiver, "p");
+                assert_eq!(partial, "di");
+            }
+            other => panic!("expected Member, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn context_scope_partial_word() {
+        // `    tot` → Scope, partial "tot". Cursor at end (col 7).
+        let src = "    tot";
+        match completion_context(src, 0, 7) {
+            CompletionContext::Scope { partial } => assert_eq!(partial, "tot"),
+            other => panic!("expected Scope, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn context_member_self_dot() {
+        // `self.` → Member, receiver "self", empty partial. Cursor at col 5.
+        let src = "self.";
+        match completion_context(src, 0, 5) {
+            CompletionContext::Member { receiver, partial, receiver_end } => {
+                assert_eq!(receiver, "self");
+                assert_eq!(partial, "");
+                assert_eq!(receiver_end, (0, 4)); // `.` after "self"
+            }
+            other => panic!("expected Member, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn context_empty_prefix_is_scope_empty_partial() {
+        // Cursor at the very start of a line → Scope with empty partial.
+        let src = "    ";
+        match completion_context(src, 0, 4) {
+            CompletionContext::Scope { partial } => assert_eq!(partial, ""),
+            other => panic!("expected Scope, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn context_dotted_receiver() {
+        // `a.b.c` → Member, receiver "a.b", partial "c" (cursor at end, col 5).
+        let src = "a.b.c";
+        match completion_context(src, 0, 5) {
+            CompletionContext::Member { receiver, partial, .. } => {
+                assert_eq!(receiver, "a.b");
+                assert_eq!(partial, "c");
+            }
+            other => panic!("expected Member, got {:?}", other),
+        }
+    }
+
+    // ── Autocomplete: scope_completions ───────────────────────────────────────
+
+    #[test]
+    fn scope_completions_local_param_func_class() {
+        // A top-level function `helper`, a class `C`, and a function `f` with a
+        // param `arg` and a local `total`. Inside f's body we should see all four.
+        let src = concat!(
+            "class C:\n",                       // line 0
+            "    x: int\n",                     // line 1
+            "def helper() -> int:\n",           // line 2
+            "    return 1\n",                   // line 3
+            "def f(arg: int) -> int:\n",        // line 4
+            "    total: int = 5\n",             // line 5
+            "    return total\n",               // line 6
+        );
+        let (module, ctx) = build(src);
+        // Cursor inside f's body on the `return total` line (line 6, col 11 → on
+        // the `total` use, well within f's scope).
+        let cs = scope_completions(&module, &ctx, src, 6, 11);
+
+        let total = find(&cs, "total").expect("local total");
+        assert_eq!(total.kind, CompletionKind::Variable);
+
+        let arg = find(&cs, "arg").expect("param arg");
+        assert_eq!(arg.kind, CompletionKind::Variable);
+
+        let helper = find(&cs, "helper").expect("top-level func helper");
+        assert_eq!(helper.kind, CompletionKind::Function);
+
+        let c = find(&cs, "C").expect("class C");
+        assert_eq!(c.kind, CompletionKind::Class);
+
+        // A builtin function is present too (seeded into TyCtx::new).
+        let len = find(&cs, "len").expect("builtin len");
+        assert_eq!(len.kind, CompletionKind::Function);
+
+        // No duplicate labels.
+        let mut labels: Vec<&str> = cs.iter().map(|c| c.label.as_str()).collect();
+        let n = labels.len();
+        labels.sort();
+        labels.dedup();
+        assert_eq!(labels.len(), n, "scope completions must be deduped by label");
+    }
+
+    // ── Autocomplete: the repair path (THE key case) ──────────────────────────
+
+    #[test]
+    fn unparseable_dot_buffer_does_not_parse() {
+        // Sanity: the buffer ending in `p.` genuinely fails to parse, so the
+        // repair strategy is load-bearing (analyze_document returns None).
+        let src = concat!(
+            "class P:\n",
+            "    x: int\n",
+            "    name: str\n",
+            "    def greet(self) -> str:\n",
+            "        return self.name\n",
+            "def f() -> None:\n",
+            "    p: P = P()\n",
+            "    p.\n",
+        );
+        assert!(
+            analyze_document(src).is_none(),
+            "the trailing `p.` must make the raw buffer unparseable"
+        );
+    }
+
+    #[test]
+    fn member_completions_at_repairs_trailing_dot() {
+        // THE case the LEAD pipes: a class with fields + method, a `p: P = P()`
+        // local, and a trailing `    p.` line. Completion at end-of-line must
+        // return the class members despite the buffer not parsing.
+        let src = concat!(
+            "class P:\n",                          // line 0
+            "    x: int\n",                        // line 1
+            "    name: str\n",                     // line 2
+            "    def greet(self) -> str:\n",       // line 3
+            "        return self.name\n",          // line 4
+            "def f() -> None:\n",                  // line 5
+            "    p: P = P()\n",                    // line 6
+            "    p.\n",                            // line 7
+        );
+        // Cursor right after the `.` on line 7: "    p." = 6 chars → col 6.
+        let cs = member_completions_at(src, 7, 6);
+        assert!(find(&cs, "x").is_some(), "field x present, got: {:?}", cs);
+        assert!(find(&cs, "name").is_some(), "field name present");
+        assert!(find(&cs, "greet").is_some(), "method greet present");
+        // Exactly the 2 fields + 1 method.
+        assert_eq!(cs.len(), 3, "expected 3 members, got: {:?}", cs);
+    }
+
+    #[test]
+    fn member_completions_at_filters_by_partial() {
+        // Same fixture but a partial `na` after the dot → only `name` survives.
+        let src = concat!(
+            "class P:\n",
+            "    x: int\n",
+            "    name: str\n",
+            "    def greet(self) -> str:\n",
+            "        return self.name\n",
+            "def f() -> None:\n",
+            "    p: P = P()\n",
+            "    p.na\n",                           // line 7
+        );
+        // Cursor after `na`: "    p.na" = 8 chars → col 8.
+        let cs = member_completions_at(src, 7, 8);
+        assert_eq!(cs.len(), 1, "only `name` matches prefix `na`, got: {:?}", cs);
+        assert_eq!(cs[0].label, "name");
+    }
+
+    #[test]
+    fn member_completions_at_self_receiver() {
+        // `self.` inside a method repairs to `self` and types as the class.
+        let src = concat!(
+            "class P:\n",
+            "    x: int\n",
+            "    def greet(self) -> str:\n",
+            "        self.\n",                      // line 3
+        );
+        // Cursor after `self.`: 8 spaces + "self." = 13 chars → col 13.
+        let cs = member_completions_at(src, 3, 13);
+        assert!(find(&cs, "x").is_some(), "self.x field present, got: {:?}", cs);
+        assert!(find(&cs, "greet").is_some(), "self.greet method present");
+    }
+
+    #[test]
+    fn member_completions_at_unknown_receiver_is_empty() {
+        // `q.` where `q` has no known type → empty (no panic).
+        let src = concat!(
+            "def f() -> None:\n",
+            "    q.\n",                             // line 1
+        );
+        let cs = member_completions_at(src, 1, 6);
+        assert!(cs.is_empty(), "unknown receiver yields no members, got: {:?}", cs);
+    }
+
+    #[test]
+    fn member_completions_at_on_scope_context_is_empty() {
+        // A non-member context fed to the member path returns empty.
+        let src = "    tot";
+        assert!(member_completions_at(src, 0, 7).is_empty());
     }
 }

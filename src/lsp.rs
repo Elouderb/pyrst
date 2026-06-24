@@ -51,7 +51,14 @@ impl Backend {
     }
 
     /// Record (or replace) the stored text for `uri`.
+    ///
+    /// Editors send the raw buffer, which on Windows is CRLF; normalize line
+    /// endings to `\n` here (as the file-read sites do) so the lexer never trips
+    /// on a bare `\r` and so positions stay consistent across every handler.
+    /// Line/column positions are unaffected — a `\r` sits at end-of-line, which
+    /// editors don't count in character offsets.
     fn store_text(&self, uri: &Uri, text: String) {
+        let text = crate::lexer::normalize_line_endings(&text);
         if let Ok(mut docs) = self.docs.lock() {
             docs.insert(uri.as_str().to_string(), text);
         }
@@ -74,8 +81,11 @@ impl Backend {
     /// A clean program publishes an EMPTY vector, which clears any stale
     /// squiggles the editor is still showing for this document.
     async fn on_change(&self, uri: Uri, text: &str) {
+        // Editors send the raw (CRLF on Windows) buffer; normalize so the lexer
+        // doesn't report a bare `\r` as an error on every line. See store_text.
+        let text = crate::lexer::normalize_line_endings(text);
         let diags: Vec<Diagnostic> =
-            analysis::analyze_str(text).iter().map(to_lsp_diagnostic).collect();
+            analysis::analyze_str(&text).iter().map(to_lsp_diagnostic).collect();
         self.client.publish_diagnostics(uri, diags, None).await;
     }
 }

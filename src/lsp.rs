@@ -31,7 +31,7 @@ use tower_lsp_server::jsonrpc::Result as RpcResult;
 use tower_lsp_server::ls_types::*;
 use tower_lsp_server::{Client, LanguageServer, LspService, Server};
 
-use crate::analysis::{self, Severity};
+use crate::analysis::{self, SemTok, SemTokKind, Severity};
 
 // ── Backend ─────────────────────────────────────────────────────────────────
 
@@ -141,6 +141,93 @@ pub fn to_completion_item(c: &analysis::Completion) -> CompletionItem {
     }
 }
 
+// ── Semantic tokens (EPIC-LSP L7) ─────────────────────────────────────────────
+
+/// The semantic-token legend, in the EXACT index order the wire encoding uses:
+/// `Function=0, Method=1, Variable=2, Parameter=3, Class=4, Property=5`. The
+/// `initialize` capability advertises this list, and [`sem_tok_legend_index`]
+/// maps a [`SemTokKind`] to its position in it — the two MUST stay in lockstep,
+/// so they are derived from the same source array.
+const SEMANTIC_TOKEN_KINDS: [SemTokKind; 6] = [
+    SemTokKind::Function,
+    SemTokKind::Method,
+    SemTokKind::Variable,
+    SemTokKind::Parameter,
+    SemTokKind::Class,
+    SemTokKind::Property,
+];
+
+/// Build the [`SemanticTokensLegend`] advertised at `initialize`. `token_types`
+/// is the standard [`SemanticTokenType`] const for each [`SemTokKind`] in
+/// legend-index order; `token_modifiers` is empty (pyrst emits no modifiers).
+pub fn semantic_tokens_legend() -> SemanticTokensLegend {
+    let token_types = SEMANTIC_TOKEN_KINDS.iter().map(sem_tok_type).collect();
+    SemanticTokensLegend { token_types, token_modifiers: Vec::new() }
+}
+
+/// The standard [`SemanticTokenType`] for a [`SemTokKind`]. Pure.
+fn sem_tok_type(kind: &SemTokKind) -> SemanticTokenType {
+    match kind {
+        SemTokKind::Function => SemanticTokenType::FUNCTION,
+        SemTokKind::Method => SemanticTokenType::METHOD,
+        SemTokKind::Variable => SemanticTokenType::VARIABLE,
+        SemTokKind::Parameter => SemanticTokenType::PARAMETER,
+        SemTokKind::Class => SemanticTokenType::CLASS,
+        SemTokKind::Property => SemanticTokenType::PROPERTY,
+    }
+}
+
+/// Map a [`SemTokKind`] to its index in the legend (the `tokenType` field of a
+/// wire token): `Function=0, Method=1, Variable=2, Parameter=3, Class=4,
+/// Property=5`. Pure, so it is unit-testable without a server.
+pub fn sem_tok_legend_index(kind: SemTokKind) -> u32 {
+    match kind {
+        SemTokKind::Function => 0,
+        SemTokKind::Method => 1,
+        SemTokKind::Variable => 2,
+        SemTokKind::Parameter => 3,
+        SemTokKind::Class => 4,
+        SemTokKind::Property => 5,
+    }
+}
+
+/// Delta-encode absolute [`SemTok`]s into the LSP wire format: a flat list of
+/// [`SemanticToken`]s where each token's position is RELATIVE to the previous
+/// one. `prev` starts at line 0, char 0; for each token (which the builder has
+/// already sorted by position):
+/// - `delta_line   = line - prevLine`
+/// - `delta_start  = (delta_line == 0) ? start - prevStart : start`
+/// - `length       = the token's length`
+/// - `token_type   = sem_tok_legend_index(kind)`
+/// - `token_modifiers_bitset = 0` (pyrst emits no modifiers)
+///
+/// Pure: depends only on its argument, so it is unit-testable without a running
+/// server. Inputs are assumed sorted and non-overlapping (the builder guarantees
+/// both); `saturating_sub` keeps a stray out-of-order pair from underflowing.
+pub fn encode_semantic_tokens(tokens: &[SemTok]) -> Vec<SemanticToken> {
+    let mut data = Vec::with_capacity(tokens.len());
+    let mut prev_line: u32 = 0;
+    let mut prev_start: u32 = 0;
+    for t in tokens {
+        let delta_line = t.line.saturating_sub(prev_line);
+        let delta_start = if delta_line == 0 {
+            t.start_char.saturating_sub(prev_start)
+        } else {
+            t.start_char
+        };
+        data.push(SemanticToken {
+            delta_line,
+            delta_start,
+            length: t.length,
+            token_type: sem_tok_legend_index(t.kind),
+            token_modifiers_bitset: 0,
+        });
+        prev_line = t.line;
+        prev_start = t.start_char;
+    }
+    data
+}
+
 /// Compute the LSP [`Position`] of the very end of `text`.
 ///
 /// The end line is the number of `\n` characters (so a 2-line file ending in a
@@ -229,6 +316,20 @@ impl LanguageServer for Backend {
                     resolve_provider: Some(false),
                     ..Default::default()
                 }),
+                // Semantic highlighting (EPIC-LSP L7): color user-defined
+                // variables, parameters, functions, methods, classes, and
+                // fields that the static TextMate grammar leaves uncolored.
+                // `full` only (no range/delta); the legend order is fixed by
+                // `semantic_tokens_legend` and mirrored by the wire encoder.
+                semantic_tokens_provider: Some(
+                    SemanticTokensOptions {
+                        legend: semantic_tokens_legend(),
+                        range: Some(false),
+                        full: Some(SemanticTokensFullOptions::Bool(true)),
+                        ..Default::default()
+                    }
+                    .into(),
+                ),
                 ..Default::default()
             },
             ..Default::default()
@@ -428,6 +529,38 @@ impl LanguageServer for Backend {
         let items: Vec<CompletionItem> = completions.iter().map(to_completion_item).collect();
         Ok(Some(CompletionResponse::Array(items)))
     }
+
+    // ── Semantic tokens (EPIC-LSP L7) ─────────────────────────────────────────
+
+    async fn semantic_tokens_full(
+        &self,
+        params: SemanticTokensParams,
+    ) -> RpcResult<Option<SemanticTokensResult>> {
+        let uri = params.text_document.uri;
+
+        let text = match self.get_text(&uri) {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+
+        // On a parse failure (mid-edit), emit NO tokens — the TextMate grammar
+        // still colors keywords/types, so the editor degrades gracefully rather
+        // than flickering stale highlights.
+        let (module, ctx) = match analysis::analyze_document(&text) {
+            Some(pair) => pair,
+            None => return Ok(None),
+        };
+
+        // Pure builder → absolute, sorted, non-overlapping tokens; then
+        // delta-encode to the protocol's relative wire format.
+        let tokens = analysis::semantic_tokens(&module, &ctx, &text);
+        let data = encode_semantic_tokens(&tokens);
+
+        Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
+            result_id: None,
+            data,
+        })))
+    }
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -591,5 +724,185 @@ mod tests {
         let item = to_completion_item(&c);
         assert_eq!(item.kind, Some(CompletionItemKind::FUNCTION));
         assert!(item.detail.is_none());
+    }
+
+    // ── Semantic tokens (EPIC-LSP L7) ─────────────────────────────────────────
+
+    #[test]
+    fn sem_tok_legend_index_maps_each_variant() {
+        // The index order is the protocol contract: it MUST match the legend's
+        // token_types order (Function=0, Method=1, Variable=2, Parameter=3,
+        // Class=4, Property=5).
+        assert_eq!(sem_tok_legend_index(SemTokKind::Function), 0);
+        assert_eq!(sem_tok_legend_index(SemTokKind::Method), 1);
+        assert_eq!(sem_tok_legend_index(SemTokKind::Variable), 2);
+        assert_eq!(sem_tok_legend_index(SemTokKind::Parameter), 3);
+        assert_eq!(sem_tok_legend_index(SemTokKind::Class), 4);
+        assert_eq!(sem_tok_legend_index(SemTokKind::Property), 5);
+    }
+
+    #[test]
+    fn semantic_tokens_legend_is_exact_order() {
+        // The advertised legend must be exactly the six standard token types in
+        // index order, with no modifiers.
+        let legend = semantic_tokens_legend();
+        assert_eq!(
+            legend.token_types,
+            vec![
+                SemanticTokenType::FUNCTION,
+                SemanticTokenType::METHOD,
+                SemanticTokenType::VARIABLE,
+                SemanticTokenType::PARAMETER,
+                SemanticTokenType::CLASS,
+                SemanticTokenType::PROPERTY,
+            ]
+        );
+        assert!(legend.token_modifiers.is_empty(), "pyrst emits no token modifiers");
+    }
+
+    #[test]
+    fn encode_semantic_tokens_empty_is_empty() {
+        assert!(encode_semantic_tokens(&[]).is_empty());
+    }
+
+    #[test]
+    fn encode_semantic_tokens_first_token_is_absolute() {
+        // The first token's delta is relative to (line 0, char 0), i.e. absolute.
+        let toks = [SemTok { line: 2, start_char: 5, length: 3, kind: SemTokKind::Function }];
+        let data = encode_semantic_tokens(&toks);
+        assert_eq!(data.len(), 1);
+        let t = data[0];
+        assert_eq!(t.delta_line, 2);
+        assert_eq!(t.delta_start, 5);
+        assert_eq!(t.length, 3);
+        assert_eq!(t.token_type, 0); // Function
+        assert_eq!(t.token_modifiers_bitset, 0);
+    }
+
+    #[test]
+    fn encode_semantic_tokens_same_line_uses_relative_start() {
+        // Two tokens on the SAME line: the second's delta_start is relative to
+        // the first's start (delta_line == 0).
+        let toks = [
+            SemTok { line: 1, start_char: 4, length: 5, kind: SemTokKind::Variable }, // type 2
+            SemTok { line: 1, start_char: 12, length: 6, kind: SemTokKind::Function }, // type 0
+        ];
+        let data = encode_semantic_tokens(&toks);
+        assert_eq!(data.len(), 2);
+
+        assert_eq!(data[0].delta_line, 1);
+        assert_eq!(data[0].delta_start, 4); // absolute (first token)
+        assert_eq!(data[0].length, 5);
+        assert_eq!(data[0].token_type, 2); // Variable
+
+        assert_eq!(data[1].delta_line, 0, "same line → delta_line 0");
+        assert_eq!(data[1].delta_start, 8, "12 - 4 = 8 relative to prev start");
+        assert_eq!(data[1].length, 6);
+        assert_eq!(data[1].token_type, 0); // Function
+    }
+
+    #[test]
+    fn encode_semantic_tokens_new_line_resets_start() {
+        // On a NEW line, delta_start is the ABSOLUTE start (not relative to the
+        // previous line's start).
+        let toks = [
+            SemTok { line: 0, start_char: 4, length: 3, kind: SemTokKind::Parameter }, // type 3
+            SemTok { line: 3, start_char: 8, length: 2, kind: SemTokKind::Property }, // type 5
+        ];
+        let data = encode_semantic_tokens(&toks);
+        assert_eq!(data[1].delta_line, 3, "3 - 0 = 3");
+        assert_eq!(data[1].delta_start, 8, "new line → absolute start, not relative");
+        assert_eq!(data[1].token_type, 5); // Property
+    }
+
+    #[test]
+    fn semantic_tokens_full_pipeline_decodes_to_expected_roles() {
+        // End-to-end over the SAME pipeline the `semantic_tokens_full` handler
+        // runs (analyze_document → semantic_tokens → encode_semantic_tokens),
+        // then DECODE the relative wire stream back to absolute positions and
+        // check the role at each — exactly what the LEAD does against a live
+        // server. This covers the handler's logic without the LSP transport.
+        let src = concat!(
+            "class Point:\n",                  // line 0
+            "    x: int\n",                    // line 1
+            "    def dist(self) -> int:\n",    // line 2
+            "        return self.x\n",         // line 3
+            "def add(a: int, b: int) -> int:\n", // line 4
+            "    total: int = a + b\n",        // line 5
+            "    return total\n",              // line 6
+        );
+        let (module, ctx) = analysis::analyze_document(src).expect("fixture parses");
+        let toks = analysis::semantic_tokens(&module, &ctx, src);
+        let data = encode_semantic_tokens(&toks);
+
+        // Decode the delta stream back to (line, char, len, legend_index).
+        let legend = ["function", "method", "variable", "parameter", "class", "property"];
+        let mut decoded: Vec<(u32, u32, u32, &str)> = Vec::new();
+        let (mut line, mut col) = (0u32, 0u32);
+        for t in &data {
+            if t.delta_line == 0 {
+                col += t.delta_start;
+            } else {
+                line += t.delta_line;
+                col = t.delta_start;
+            }
+            decoded.push((line, col, t.length, legend[t.token_type as usize]));
+        }
+
+        // Helper: find the decoded role at a position.
+        let role = |l: u32, c: u32| -> Option<&str> {
+            decoded.iter().find(|(dl, dc, _, _)| *dl == l && *dc == c).map(|(_, _, _, r)| *r)
+        };
+
+        // `class Point` → Point at (0,6) is a class.
+        assert_eq!(role(0, 6), Some("class"), "Point is a class");
+        // field `x` at (1,4) is a property.
+        assert_eq!(role(1, 4), Some("property"), "x field is a property");
+        // method `dist` at (2,8) is a method.
+        assert_eq!(role(2, 8), Some("method"), "dist is a method");
+        // `self` param at (2,13) is a parameter.
+        assert_eq!(role(2, 13), Some("parameter"), "self is a parameter");
+        // `self.x` access: receiver self (3,15) parameter, `.x` (3,20) property.
+        assert_eq!(role(3, 15), Some("parameter"), "self receiver is a parameter");
+        assert_eq!(role(3, 20), Some("property"), "self.x is a property");
+        // `add` at (4,4) is a function; params `a` (4,8), `b` (4,15).
+        assert_eq!(role(4, 4), Some("function"), "add is a function");
+        assert_eq!(role(4, 8), Some("parameter"), "a is a parameter");
+        assert_eq!(role(4, 16), Some("parameter"), "b is a parameter");
+        // `total: int = a + b`: total (5,4) variable, a (5,17) param, b (5,21) param.
+        assert_eq!(role(5, 4), Some("variable"), "total is a variable");
+        assert_eq!(role(5, 17), Some("parameter"), "a use is a parameter");
+        assert_eq!(role(5, 21), Some("parameter"), "b use is a parameter");
+        // `return total`: total (6,11) variable.
+        assert_eq!(role(6, 11), Some("variable"), "total use is a variable");
+
+        // The whole stream is a multiple of 5 ints and monotonic by construction.
+        assert_eq!(data.len(), decoded.len());
+    }
+
+    #[test]
+    fn encode_semantic_tokens_three_token_stream() {
+        // A full small stream exercising both same-line and new-line transitions.
+        let toks = [
+            SemTok { line: 0, start_char: 4, length: 3, kind: SemTokKind::Function }, // 0
+            SemTok { line: 0, start_char: 8, length: 1, kind: SemTokKind::Parameter }, // 3
+            SemTok { line: 1, start_char: 11, length: 1, kind: SemTokKind::Parameter }, // 3
+        ];
+        let data = encode_semantic_tokens(&toks);
+        // Flattened 5-int stream the wire would carry.
+        let flat: Vec<u32> = data
+            .iter()
+            .flat_map(|t| {
+                [t.delta_line, t.delta_start, t.length, t.token_type, t.token_modifiers_bitset]
+            })
+            .collect();
+        assert_eq!(
+            flat,
+            vec![
+                0, 4, 3, 0, 0, // def name `add` at (0,4)
+                0, 4, 1, 3, 0, // param `a` at (0,8): delta_start 8-4=4
+                1, 11, 1, 3, 0, // param use at (1,11): new line → absolute 11
+            ]
+        );
     }
 }

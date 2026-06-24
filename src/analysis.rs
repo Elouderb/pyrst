@@ -1622,6 +1622,527 @@ pub fn member_completions_at(src: &str, line0: u32, col0: u32) -> Vec<Completion
     members
 }
 
+// ── Semantic tokens (EPIC-LSP L7) ──────────────────────────────────────────────
+//
+// The pure token builder that powers editor *semantic highlighting*: the
+// TextMate grammar only colors fixed keywords/types, so user-defined names
+// (variables, parameters, functions, methods, classes, fields) are left
+// uncolored. `semantic_tokens` walks the whole AST and emits ONE token per
+// identifier OCCURRENCE, classified by its ROLE — a definition site, a binding,
+// or a use resolved through the same scope/type machinery hover and completion
+// already use (no forked inference).
+//
+// Like the rest of this module these helpers are pure: they READ the AST + an
+// already-built `TyCtx` and REUSE `type_at_position` / the locals reconstruction
+// as the oracle. They never mutate the parser/typeck/codegen. The LSP layer
+// delta-encodes the result to the wire format; this builder deals only in
+// absolute 0-indexed positions so it is trivially unit-testable.
+
+/// The semantic ROLE of an identifier occurrence. The LSP layer maps each
+/// variant to an index into the `SemanticTokensLegend` (see
+/// `crate::lsp::sem_tok_legend_index`); kept as an internal enum so `analysis`
+/// stays free of any LSP type dependency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SemTokKind {
+    Function,
+    Method,
+    Variable,
+    Parameter,
+    Class,
+    Property,
+}
+
+/// A single semantic token at an ABSOLUTE 0-indexed position. `line` and
+/// `start_char` are 0-indexed (LSP line/character numbering, same encoding as
+/// [`byte_offset_to_position`]); `length` is the token's width in characters.
+/// The LSP layer converts a sorted `Vec<SemTok>` into the protocol's relative
+/// (delta) wire encoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SemTok {
+    pub line: u32,
+    pub start_char: u32,
+    pub length: u32,
+    pub kind: SemTokKind,
+}
+
+/// Locate the identifier `name` as a whole word at or after byte offset
+/// `from`, returning its absolute `(line, start_char, length)` 0-indexed
+/// position. Used to pin a token onto the NAME inside a wider span (a `Func`
+/// span covers the whole `def NAME(...)`, a `Param` span may cover `name: T`,
+/// an `Attr` span covers `obj.name`).
+///
+/// "Whole word" means the match is not flanked by identifier characters, so
+/// searching for `m` does not match the `m` inside `format`. Returns `None`
+/// when the name does not occur after `from` (e.g. a synthesized node or a
+/// name the source spells differently) — the caller then SKIPS that token
+/// rather than emit a wrong span.
+fn locate_name(src: &str, from: usize, name: &str) -> Option<(u32, u32, u32)> {
+    if name.is_empty() {
+        return None;
+    }
+    let from = from.min(src.len());
+    let hay = &src[from..];
+    let nbytes = name.as_bytes();
+    let hbytes = hay.as_bytes();
+    let mut i = 0usize;
+    while i + nbytes.len() <= hbytes.len() {
+        if &hbytes[i..i + nbytes.len()] == nbytes {
+            let before_ok = i == 0 || !is_word_char(hbytes[i - 1] as char);
+            let after_idx = i + nbytes.len();
+            let after_ok =
+                after_idx >= hbytes.len() || !is_word_char(hbytes[after_idx] as char);
+            if before_ok && after_ok {
+                let abs = from + i;
+                let (line, col) = byte_offset_to_position(src, abs);
+                // `name` is the lexer's identifier alphabet (ASCII), so its char
+                // length equals its byte length.
+                return Some((line, col, name.chars().count() as u32));
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Push a token for `name` located at/after byte offset `from`, classified as
+/// `kind`. A no-op when the name cannot be precisely located (skip rather than
+/// mis-position).
+fn push_named(out: &mut Vec<SemTok>, src: &str, from: usize, name: &str, kind: SemTokKind) {
+    if let Some((line, start_char, length)) = locate_name(src, from, name) {
+        out.push(SemTok { line, start_char, length, kind });
+    }
+}
+
+/// Build the full set of semantic tokens for `module`.
+///
+/// Emits ONE token per identifier OCCURRENCE, classified by role:
+/// - `def NAME` → [`SemTokKind::Function`] (top-level) or [`SemTokKind::Method`]
+///   (inside a class); `class NAME` → [`SemTokKind::Class`]; the precise NAME
+///   span is located within the (wider) def/class span via [`locate_name`].
+/// - function/method PARAMETERS in the signature → [`SemTokKind::Parameter`].
+/// - class FIELD declarations (`x: int` in a class body) →
+///   [`SemTokKind::Property`].
+/// - `Expr::Ident` USES → classified by scope: an enclosing-function parameter →
+///   `Parameter`; a reconstructed local → `Variable`; a `ctx.funcs` name →
+///   `Function`; a `ctx.classes` name → `Class`; otherwise `Variable`.
+/// - `Expr::Attr` attribute name → [`SemTokKind::Method`] when the receiver's
+///   type is a class whose (inheritance-aware) method set contains the name,
+///   else [`SemTokKind::Property`].
+///
+/// The result is SORTED by `(line, start_char)` and de-overlapped (a later
+/// token whose start lies before the previous token's end is dropped), so the
+/// delta encoding in the LSP layer is monotonic and the editor never sees
+/// overlapping ranges.
+pub fn semantic_tokens(module: &Module, ctx: &TyCtx, src: &str) -> Vec<SemTok> {
+    let mut out: Vec<SemTok> = Vec::new();
+    for s in &module.stmts {
+        collect_stmt_tokens(s, ctx, src, None, None, &mut out);
+    }
+
+    // Sort by position, then drop any token that overlaps the one before it so
+    // the wire stream is strictly non-overlapping and monotonic.
+    out.sort_by_key(|t| (t.line, t.start_char));
+    let mut deduped: Vec<SemTok> = Vec::with_capacity(out.len());
+    for t in out {
+        if let Some(prev) = deduped.last() {
+            if prev.line == t.line {
+                let prev_end = prev.start_char + prev.length;
+                if t.start_char < prev_end {
+                    // Overlaps (or duplicates) the previous token — skip it.
+                    continue;
+                }
+            }
+        }
+        deduped.push(t);
+    }
+    deduped
+}
+
+/// Walk a top-level (or nested) statement, emitting definition/binding tokens
+/// for the functions/classes it introduces and use tokens for the expressions
+/// it contains. `func`/`class` carry the enclosing scope so uses can be
+/// classified.
+fn collect_stmt_tokens<'a>(
+    s: &'a Stmt,
+    ctx: &TyCtx,
+    src: &str,
+    func: Option<&'a Func>,
+    class: Option<&'a ClassDef>,
+    out: &mut Vec<SemTok>,
+) {
+    match s {
+        Stmt::Func(f) => collect_func_tokens(f, ctx, src, class, out),
+        Stmt::Class(c) => {
+            // The class NAME (located within the `class NAME(...)` span).
+            push_named(out, src, c.span.start, &c.name, SemTokKind::Class);
+            // Field declarations → Property. The field `Param.span` may cover
+            // `name: T`; pin to the name within it.
+            for field in &c.fields {
+                push_named(out, src, field.span.start, &field.name, SemTokKind::Property);
+            }
+            // Methods → Method-kind def + their own params/bodies.
+            for m in &c.methods {
+                collect_func_tokens(m, ctx, src, Some(c), out);
+            }
+        }
+        // Statements that hold expressions: emit use tokens from each.
+        Stmt::Expr(e) => collect_expr_tokens(e, ctx, src, func, class, out),
+        Stmt::Assign { target, value, span, .. } => {
+            // The assignment TARGET is a binding stored as a bare `String` (no
+            // `Expr::Ident`), so it is colored here. `span` is the target-
+            // identifier token span (see `find_local_decl`); classify it the
+            // same way a USE of that name would be (a param-shadowing target →
+            // Parameter, otherwise Variable) so the declaration matches its uses.
+            let kind = classify_ident_use(target, ctx, func);
+            push_named(out, src, span.start, target, kind);
+            collect_expr_tokens(value, ctx, src, func, class, out);
+        }
+        Stmt::AugAssign { target, value, span, .. } => {
+            // `target op= value`: the target is an in-place use of an existing
+            // binding; its `span` is the target-identifier token. Color it like
+            // any other use of that name.
+            let kind = classify_ident_use(target, ctx, func);
+            push_named(out, src, span.start, target, kind);
+            collect_expr_tokens(value, ctx, src, func, class, out);
+        }
+        Stmt::Unpack { value, .. } => collect_expr_tokens(value, ctx, src, func, class, out),
+        Stmt::Return(Some(e), _) => collect_expr_tokens(e, ctx, src, func, class, out),
+        Stmt::Return(None, _) => {}
+        Stmt::If { cond, then, elifs, else_, .. } => {
+            collect_expr_tokens(cond, ctx, src, func, class, out);
+            for st in then {
+                collect_stmt_tokens(st, ctx, src, func, class, out);
+            }
+            for (c, body) in elifs {
+                collect_expr_tokens(c, ctx, src, func, class, out);
+                for st in body {
+                    collect_stmt_tokens(st, ctx, src, func, class, out);
+                }
+            }
+            if let Some(body) = else_ {
+                for st in body {
+                    collect_stmt_tokens(st, ctx, src, func, class, out);
+                }
+            }
+        }
+        Stmt::While { cond, body, .. } => {
+            collect_expr_tokens(cond, ctx, src, func, class, out);
+            for st in body {
+                collect_stmt_tokens(st, ctx, src, func, class, out);
+            }
+        }
+        Stmt::For { iter, body, .. } => {
+            collect_expr_tokens(iter, ctx, src, func, class, out);
+            for st in body {
+                collect_stmt_tokens(st, ctx, src, func, class, out);
+            }
+        }
+        Stmt::Assert { cond, msg, .. } => {
+            collect_expr_tokens(cond, ctx, src, func, class, out);
+            if let Some(m) = msg {
+                collect_expr_tokens(m, ctx, src, func, class, out);
+            }
+        }
+        Stmt::Raise { exc: Some(e), .. } => collect_expr_tokens(e, ctx, src, func, class, out),
+        Stmt::Raise { exc: None, .. } => {}
+        Stmt::Try { body, handlers, else_, finally_, .. } => {
+            for st in body {
+                collect_stmt_tokens(st, ctx, src, func, class, out);
+            }
+            for h in handlers {
+                for st in &h.body {
+                    collect_stmt_tokens(st, ctx, src, func, class, out);
+                }
+            }
+            if let Some(b) = else_ {
+                for st in b {
+                    collect_stmt_tokens(st, ctx, src, func, class, out);
+                }
+            }
+            if let Some(b) = finally_ {
+                for st in b {
+                    collect_stmt_tokens(st, ctx, src, func, class, out);
+                }
+            }
+        }
+        Stmt::With { ctx_expr, body, .. } => {
+            collect_expr_tokens(ctx_expr, ctx, src, func, class, out);
+            for st in body {
+                collect_stmt_tokens(st, ctx, src, func, class, out);
+            }
+        }
+        Stmt::Del { target, .. } => collect_expr_tokens(target, ctx, src, func, class, out),
+        Stmt::Match { subject, arms, .. } => {
+            collect_expr_tokens(subject, ctx, src, func, class, out);
+            for arm in arms {
+                if let Some(g) = &arm.guard {
+                    collect_expr_tokens(g, ctx, src, func, class, out);
+                }
+                for st in &arm.body {
+                    collect_stmt_tokens(st, ctx, src, func, class, out);
+                }
+            }
+        }
+        Stmt::AttrAssign { obj, value, .. } => {
+            collect_expr_tokens(obj, ctx, src, func, class, out);
+            collect_expr_tokens(value, ctx, src, func, class, out);
+        }
+        Stmt::IndexAssign { obj, idx, value, .. } => {
+            collect_expr_tokens(obj, ctx, src, func, class, out);
+            collect_expr_tokens(idx, ctx, src, func, class, out);
+            collect_expr_tokens(value, ctx, src, func, class, out);
+        }
+        Stmt::Pass(_) | Stmt::Break(_) | Stmt::Continue(_) | Stmt::Import { .. } => {}
+    }
+}
+
+/// Emit the definition token for a function/method's NAME, its PARAMETER tokens,
+/// and the use tokens from its body (with `f` set as the enclosing function).
+fn collect_func_tokens<'a>(
+    f: &'a Func,
+    ctx: &TyCtx,
+    src: &str,
+    class: Option<&'a ClassDef>,
+    out: &mut Vec<SemTok>,
+) {
+    // The function/method NAME: located after the `def ` keyword inside the
+    // (wider) def span. Method when inside a class, Function at top level.
+    let kind = if class.is_some() { SemTokKind::Method } else { SemTokKind::Function };
+    push_named(out, src, f.span.start, &f.name, kind);
+
+    // Parameters in the signature → Parameter. `self` is a real binding too, so
+    // color it like any other parameter. The `Param.span` may cover `name: T`;
+    // pin to the name within it.
+    for p in &f.params {
+        push_named(out, src, p.span.start, &p.name, SemTokKind::Parameter);
+    }
+
+    // Body uses, scoped to this function.
+    for st in &f.body {
+        collect_stmt_tokens(st, ctx, src, Some(f), class, out);
+    }
+}
+
+/// Emit use tokens for every identifier occurrence inside an expression,
+/// classified against the enclosing scope (`func`/`class`).
+fn collect_expr_tokens<'a>(
+    e: &'a Expr,
+    ctx: &TyCtx,
+    src: &str,
+    func: Option<&'a Func>,
+    class: Option<&'a ClassDef>,
+    out: &mut Vec<SemTok>,
+) {
+    match e {
+        Expr::Ident(name, span) => {
+            let kind = classify_ident_use(name, ctx, func);
+            // The Ident span IS the bare name; pin precisely all the same.
+            push_named(out, src, span.start, name, kind);
+        }
+        Expr::Attr { obj, name, span } => {
+            // Color the receiver first (it may be an Ident/another Attr/Call).
+            collect_expr_tokens(obj, ctx, src, func, class, out);
+            // Then the attribute name: Method when the receiver's class has a
+            // method of that name (inheritance-aware), else Property.
+            let kind = classify_attr(obj, name, ctx, src, func, class);
+            // The attribute name sits AFTER the receiver inside `obj.name`, so
+            // search from the receiver's end (its span end) to skip a same-named
+            // receiver token.
+            let from = obj.span().end.max(span.start);
+            push_named(out, src, from, name, kind);
+        }
+        Expr::FStr(parts, _) => {
+            for p in parts {
+                if let crate::ast::FStrPart::Interp(ex, _) = p {
+                    collect_expr_tokens(ex, ctx, src, func, class, out);
+                }
+            }
+        }
+        Expr::List(elems, _) | Expr::Tuple(elems, _) | Expr::Set(elems, _) => {
+            for el in elems {
+                collect_expr_tokens(el, ctx, src, func, class, out);
+            }
+        }
+        Expr::Dict(pairs, _) => {
+            for (k, v) in pairs {
+                collect_expr_tokens(k, ctx, src, func, class, out);
+                collect_expr_tokens(v, ctx, src, func, class, out);
+            }
+        }
+        Expr::ListComp { elt, iter, cond, .. } | Expr::SetComp { elt, iter, cond, .. } => {
+            collect_expr_tokens(elt, ctx, src, func, class, out);
+            collect_expr_tokens(iter, ctx, src, func, class, out);
+            if let Some(c) = cond {
+                collect_expr_tokens(c, ctx, src, func, class, out);
+            }
+        }
+        Expr::DictComp { key, val, iter, cond, .. } => {
+            collect_expr_tokens(key, ctx, src, func, class, out);
+            collect_expr_tokens(val, ctx, src, func, class, out);
+            collect_expr_tokens(iter, ctx, src, func, class, out);
+            if let Some(c) = cond {
+                collect_expr_tokens(c, ctx, src, func, class, out);
+            }
+        }
+        Expr::Call { callee, args, kwargs, .. } => {
+            collect_expr_tokens(callee, ctx, src, func, class, out);
+            for a in args {
+                collect_expr_tokens(a, ctx, src, func, class, out);
+            }
+            for (_, v) in kwargs {
+                collect_expr_tokens(v, ctx, src, func, class, out);
+            }
+        }
+        Expr::Index { obj, idx, .. } => {
+            collect_expr_tokens(obj, ctx, src, func, class, out);
+            collect_expr_tokens(idx, ctx, src, func, class, out);
+        }
+        Expr::Slice { obj, start, stop, step, .. } => {
+            collect_expr_tokens(obj, ctx, src, func, class, out);
+            if let Some(x) = start {
+                collect_expr_tokens(x, ctx, src, func, class, out);
+            }
+            if let Some(x) = stop {
+                collect_expr_tokens(x, ctx, src, func, class, out);
+            }
+            if let Some(x) = step {
+                collect_expr_tokens(x, ctx, src, func, class, out);
+            }
+        }
+        Expr::BinOp { lhs, rhs, .. } => {
+            collect_expr_tokens(lhs, ctx, src, func, class, out);
+            collect_expr_tokens(rhs, ctx, src, func, class, out);
+        }
+        Expr::UnOp { expr, .. } => collect_expr_tokens(expr, ctx, src, func, class, out),
+        Expr::Lambda { body, .. } => collect_expr_tokens(body, ctx, src, func, class, out),
+        Expr::IfExp { test, body, orelse, .. } => {
+            collect_expr_tokens(test, ctx, src, func, class, out);
+            collect_expr_tokens(body, ctx, src, func, class, out);
+            collect_expr_tokens(orelse, ctx, src, func, class, out);
+        }
+        Expr::Int(..) | Expr::Float(..) | Expr::Str(..) | Expr::Bool(..) | Expr::None_(_) => {}
+    }
+}
+
+/// Classify a bare-name USE against the enclosing scope, mirroring the spec's
+/// priority: an enclosing-function parameter → [`SemTokKind::Parameter`]; a
+/// reconstructed local of that function → [`SemTokKind::Variable`]; a
+/// `ctx.funcs` name → [`SemTokKind::Function`]; a `ctx.classes` name →
+/// [`SemTokKind::Class`]; otherwise [`SemTokKind::Variable`].
+fn classify_ident_use(name: &str, ctx: &TyCtx, func: Option<&Func>) -> SemTokKind {
+    if let Some(f) = func {
+        if f.params.iter().any(|p| p.name == name) {
+            return SemTokKind::Parameter;
+        }
+        if func_introduces_local(f, name) {
+            return SemTokKind::Variable;
+        }
+    }
+    if ctx.funcs.contains_key(name) {
+        return SemTokKind::Function;
+    }
+    if ctx.classes.contains_key(name) {
+        return SemTokKind::Class;
+    }
+    SemTokKind::Variable
+}
+
+/// True when `name` is bound anywhere in `f`'s body as a local — an assignment
+/// target, an unpack/for/with target, or an except-name. Used to color a USE of
+/// a local as a Variable. Scans the whole body (not just up to a cursor), which
+/// is what classification needs: a name written before its first lexical
+/// assignment is still that local in pyrst's single-scope-per-function model.
+fn func_introduces_local(f: &Func, name: &str) -> bool {
+    fn scan(stmts: &[Stmt], name: &str) -> bool {
+        for s in stmts {
+            let hit = match s {
+                Stmt::Assign { target, .. } | Stmt::AugAssign { target, .. } => target == name,
+                Stmt::Unpack { targets, .. } | Stmt::For { targets, .. } => {
+                    targets.iter().any(|t| t == name)
+                }
+                Stmt::With { as_name: Some(n), .. } => n == name,
+                _ => false,
+            };
+            if hit {
+                return true;
+            }
+            // Recurse into nested blocks (a local introduced inside an `if`/`for`
+            // is still a local of the function).
+            let nested = match s {
+                Stmt::If { then, elifs, else_, .. } => {
+                    scan(then, name)
+                        || elifs.iter().any(|(_, b)| scan(b, name))
+                        || else_.as_ref().is_some_and(|b| scan(b, name))
+                }
+                Stmt::While { body, .. }
+                | Stmt::For { body, .. }
+                | Stmt::With { body, .. } => scan(body, name),
+                Stmt::Try { body, handlers, else_, finally_, .. } => {
+                    scan(body, name)
+                        || handlers.iter().any(|h| {
+                            h.exc_name.as_deref() == Some(name) || scan(&h.body, name)
+                        })
+                        || else_.as_ref().is_some_and(|b| scan(b, name))
+                        || finally_.as_ref().is_some_and(|b| scan(b, name))
+                }
+                Stmt::Match { arms, .. } => arms.iter().any(|a| scan(&a.body, name)),
+                _ => false,
+            };
+            if nested {
+                return true;
+            }
+        }
+        false
+    }
+    scan(&f.body, name)
+}
+
+/// Classify an `obj.name` attribute access: [`SemTokKind::Method`] when `obj`
+/// resolves to a class whose (inheritance-aware) method set contains `name`,
+/// else [`SemTokKind::Property`].
+///
+/// Receiver typing reuses the same locals reconstruction the hover/definition
+/// paths use, so `self`, typed params, and annotated locals all resolve to
+/// their class — never a forked inference. When the receiver's type is unknown
+/// or non-class, `Property` is the documented default.
+fn classify_attr(
+    obj: &Expr,
+    name: &str,
+    ctx: &TyCtx,
+    _src: &str,
+    func: Option<&Func>,
+    class: Option<&ClassDef>,
+) -> SemTokKind {
+    // Reconstruct the locals visible across the enclosing function so the
+    // receiver can be typed (mirrors `resolve_attr`). Using the function's full
+    // extent as the cutoff is sufficient for classification.
+    let mut locals: HashMap<String, Ty> = HashMap::new();
+    if let Some(f) = func {
+        if let Some(c) = class {
+            if f.params.iter().any(|p| p.name == "self") {
+                locals.insert("self".to_string(), Ty::Class(c.name.clone()));
+            }
+        }
+        for p in &f.params {
+            if p.name == "self" {
+                continue;
+            }
+            if let Ok(ty) = Ty::from_type_expr(&p.ty, p.span) {
+                locals.insert(p.name.clone(), ty);
+            }
+        }
+        reconstruct_locals(&f.body, f.span.end, ctx, &mut locals);
+    }
+
+    let recv = crate::typeck::infer_expr_ty(obj, &locals, ctx);
+    if let Ty::Class(class_name) = recv {
+        if ctx.get_method(&class_name, name).is_some() {
+            return SemTokKind::Method;
+        }
+    }
+    SemTokKind::Property
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -2591,5 +3112,192 @@ mod tests {
         // A non-member context fed to the member path returns empty.
         let src = "    tot";
         assert!(member_completions_at(src, 0, 7).is_empty());
+    }
+
+    // ── Semantic tokens (EPIC-LSP L7) ─────────────────────────────────────────
+
+    /// Find a token at a 0-indexed `(line, start_char)` position.
+    fn tok_at(toks: &[SemTok], line: u32, start_char: u32) -> Option<&SemTok> {
+        toks.iter().find(|t| t.line == line && t.start_char == start_char)
+    }
+
+    #[test]
+    fn sem_tokens_def_yields_function_and_parameter() {
+        // `def add(a: int) -> int:` — `add` is a Function token, `a` a Parameter.
+        // `def ` = 4 chars → `add` at col 4 (len 3); `add(` → `a` at col 8 (len 1).
+        let src = "def add(a: int) -> int:\n    return a\n";
+        let (module, ctx) = build(src);
+        let toks = semantic_tokens(&module, &ctx, src);
+
+        let add = tok_at(&toks, 0, 4).expect("function name token at (0,4)");
+        assert_eq!(add.kind, SemTokKind::Function);
+        assert_eq!(add.length, 3, "`add` is 3 chars");
+
+        let a_param = tok_at(&toks, 0, 8).expect("parameter token at (0,8)");
+        assert_eq!(a_param.kind, SemTokKind::Parameter);
+        assert_eq!(a_param.length, 1);
+
+        // The USE of `a` in `return a` (line 1) is also a Parameter.
+        let a_use = toks.iter().find(|t| t.line == 1).expect("a use on line 1");
+        assert_eq!(a_use.kind, SemTokKind::Parameter);
+    }
+
+    #[test]
+    fn sem_tokens_class_name_and_field_property() {
+        // `class P:` → Class token on `P`; `x: int` field → Property.
+        // `class ` = 6 chars → `P` at col 6 (len 1); field `    x` → col 4.
+        let src = concat!(
+            "class P:\n",      // line 0
+            "    x: int\n",    // line 1
+        );
+        let (module, ctx) = build(src);
+        let toks = semantic_tokens(&module, &ctx, src);
+
+        let p = tok_at(&toks, 0, 6).expect("class name token at (0,6)");
+        assert_eq!(p.kind, SemTokKind::Class);
+        assert_eq!(p.length, 1);
+
+        let field = tok_at(&toks, 1, 4).expect("field token at (1,4)");
+        assert_eq!(field.kind, SemTokKind::Property);
+        assert_eq!(field.length, 1, "`x` is 1 char");
+    }
+
+    #[test]
+    fn sem_tokens_method_kind_inside_class() {
+        // A method `def greet(self) ...` inside a class is a Method (not Function),
+        // and `self` is a Parameter.
+        let src = concat!(
+            "class P:\n",                       // line 0
+            "    x: int\n",                     // line 1
+            "    def greet(self) -> int:\n",    // line 2
+            "        return self.x\n",          // line 3
+        );
+        let (module, ctx) = build(src);
+        let toks = semantic_tokens(&module, &ctx, src);
+
+        // `    def ` = 8 chars → `greet` at col 8.
+        let greet = tok_at(&toks, 2, 8).expect("method name token at (2,8)");
+        assert_eq!(greet.kind, SemTokKind::Method, "method def, not a top-level function");
+
+        // `self` parameter present on the signature line.
+        let self_param = toks
+            .iter()
+            .find(|t| t.line == 2 && t.kind == SemTokKind::Parameter)
+            .expect("self parameter on signature line");
+        assert_eq!(self_param.length, 4);
+    }
+
+    #[test]
+    fn sem_tokens_attr_method_vs_property() {
+        // `self.x` is a Property (a field); `self.greet()` is a Method.
+        let src = concat!(
+            "class P:\n",                              // line 0
+            "    x: int\n",                            // line 1
+            "    def greet(self) -> int:\n",           // line 2
+            "        return self.x\n",                 // line 3
+            "    def caller(self) -> int:\n",          // line 4
+            "        return self.greet()\n",           // line 5
+        );
+        let (module, ctx) = build(src);
+        let toks = semantic_tokens(&module, &ctx, src);
+
+        // Line 3 `return self.x`: the `.x` access → Property. `        return ` =
+        // 8+7 = 15 chars → `self`=15, `.`=19, `x`=20.
+        let x_attr = tok_at(&toks, 3, 20).expect("attr `x` at (3,20)");
+        assert_eq!(x_attr.kind, SemTokKind::Property, "field access is a Property");
+
+        // Line 5 `return self.greet()`: the `.greet` access → Method. `greet`=20.
+        let greet_attr = tok_at(&toks, 5, 20).expect("attr `greet` at (5,20)");
+        assert_eq!(greet_attr.kind, SemTokKind::Method, "method access is a Method");
+    }
+
+    #[test]
+    fn sem_tokens_local_use_is_variable_and_func_use_is_function() {
+        // A top-level function `helper`, and `f` with a local `total`. Inside f:
+        // the `total` use is a Variable; the `helper()` call is a Function.
+        let src = concat!(
+            "def helper() -> int:\n",           // line 0
+            "    return 1\n",                    // line 1
+            "def f() -> int:\n",                 // line 2
+            "    total: int = helper()\n",       // line 3
+            "    return total\n",                // line 4
+        );
+        let (module, ctx) = build(src);
+        let toks = semantic_tokens(&module, &ctx, src);
+
+        // Line 3 `    total: int = helper()`: `total`=4 (Variable use of a local),
+        // `helper`=17 (Function use).
+        let total = tok_at(&toks, 3, 4).expect("total at (3,4)");
+        assert_eq!(total.kind, SemTokKind::Variable, "local use is a Variable");
+
+        let helper = tok_at(&toks, 3, 17).expect("helper at (3,17)");
+        assert_eq!(helper.kind, SemTokKind::Function, "top-level func use is a Function");
+
+        // Line 4 `    return total`: the `total` use is a Variable too.
+        let total_use = tok_at(&toks, 4, 11).expect("total use at (4,11)");
+        assert_eq!(total_use.kind, SemTokKind::Variable);
+    }
+
+    #[test]
+    fn sem_tokens_class_use_is_class() {
+        // `C()` constructor use → the `C` callee is a Class token.
+        let src = concat!(
+            "class C:\n",           // line 0
+            "    x: int\n",         // line 1
+            "def f() -> int:\n",    // line 2
+            "    c = C()\n",        // line 3
+            "    return c.x\n",     // line 4
+        );
+        let (module, ctx) = build(src);
+        let toks = semantic_tokens(&module, &ctx, src);
+
+        // Line 3 `    c = C()`: `c`=4 (Variable local), `C`=8 (Class use).
+        let c_use = tok_at(&toks, 3, 8).expect("C at (3,8)");
+        assert_eq!(c_use.kind, SemTokKind::Class, "constructor callee is a Class");
+    }
+
+    #[test]
+    fn sem_tokens_sorted_and_non_overlapping() {
+        // The output must be sorted by (line, start_char) and non-overlapping.
+        let src = concat!(
+            "def add(a: int, b: int) -> int:\n",
+            "    return a + b\n",
+        );
+        let (module, ctx) = build(src);
+        let toks = semantic_tokens(&module, &ctx, src);
+        assert!(!toks.is_empty());
+        for w in toks.windows(2) {
+            let (p, n) = (w[0], w[1]);
+            // Sorted.
+            assert!(
+                (p.line, p.start_char) <= (n.line, n.start_char),
+                "tokens must be sorted: {:?} then {:?}",
+                p,
+                n
+            );
+            // Non-overlapping on the same line.
+            if p.line == n.line {
+                assert!(
+                    n.start_char >= p.start_char + p.length,
+                    "tokens must not overlap: {:?} then {:?}",
+                    p,
+                    n
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sem_tokens_unknown_receiver_attr_is_property() {
+        // `q.field` where `q` has no known type → Property (the documented default).
+        let src = concat!(
+            "def f(q: int) -> int:\n",   // q is int (non-class)
+            "    return q.bit_length\n",
+        );
+        let (module, ctx) = build(src);
+        let toks = semantic_tokens(&module, &ctx, src);
+        // `    return q.bit_length`: `q`=11, `.`=12, `bit_length`=13.
+        let attr = tok_at(&toks, 1, 13).expect("attr token at (1,13)");
+        assert_eq!(attr.kind, SemTokKind::Property, "non-class receiver → Property default");
     }
 }

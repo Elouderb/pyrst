@@ -30,7 +30,11 @@ pub fn build(path: &Path) -> Result<()> {
     let rust = compile_to_rust(path)?;
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("a");
     let rs_path = std::env::temp_dir().join(format!("pyrst-{}.rs", stem));
-    let bin_path = std::env::current_dir()?.join(stem);
+    let cwd = std::env::current_dir()?;
+    // rustc emits exactly the `-o` name we give it, so on Windows we must add the
+    // `.exe` suffix ourselves — otherwise the produced file is not runnable.
+    let bin_name = if cfg!(windows) { format!("{}.exe", stem) } else { stem.to_string() };
+    let bin_path = cwd.join(&bin_name);
     std::fs::write(&rs_path, rust)?;
 
     let rustc_path = rustc_path();
@@ -46,6 +50,12 @@ pub fn build(path: &Path) -> Result<()> {
 
     if !status.success() {
         return Err(Error::Rustc(format!("rustc exited with status {}", status)));
+    }
+
+    // Windows (MSVC) drops a `<stem>.pdb` debug-symbols file next to the binary;
+    // remove it so a plain `build` doesn't litter the working directory.
+    if cfg!(windows) {
+        let _ = std::fs::remove_file(cwd.join(format!("{}.pdb", stem)));
     }
 
     eprintln!("built: {}", bin_path.display());

@@ -583,9 +583,48 @@ pub fn type_at_position(
     line0: u32,
     col0: u32,
 ) -> Option<Ty> {
-    let path = node_at_position(module, src, line0, col0)?;
     let off = position_to_byte_offset(src, line0, col0);
 
+    // Primary path: cursor is on an expression node.
+    if let Some(path) = node_at_position(module, src, line0, col0) {
+        let locals = build_locals_for_func(&path, off, ctx);
+
+        // When the cursor is on the bare callee identifier of a call (`g` in
+        // `g()`), a function name is not itself a value, so the oracle would
+        // return Unknown. Hovering a called function is most useful as the
+        // CALL's result type, so retarget to the parent `Call` in that case.
+        let target: &Expr = match (path.expr, path.parent()) {
+            (Expr::Ident(_, _), Some(parent @ Expr::Call { callee, .. }))
+                if std::ptr::eq(callee.as_ref(), path.expr) =>
+            {
+                parent
+            }
+            _ => path.expr,
+        };
+
+        let ty = crate::typeck::infer_expr_ty(target, &locals, ctx);
+        if ty != Ty::Unknown {
+            return Some(ty);
+        }
+    }
+
+    // Fallback path: cursor is on a BINDING identifier (a declaration site),
+    // not on an expression. Params and assignment targets are stored as bare
+    // `String` fields in the AST, so `node_at_position` finds nothing there.
+    binding_at_position(module, ctx, off)
+}
+
+/// Reconstruct the locals map visible at byte offset `off` inside the
+/// enclosing function described by `path`. Seeds `self` for methods and
+/// seeds params from their annotations before running `reconstruct_locals` on
+/// the body up to `off`.
+///
+/// Shared by `type_at_position` and callers in `binding_at_position`.
+fn build_locals_for_func<'a>(
+    path: &NodePath<'a>,
+    off: usize,
+    ctx: &TyCtx,
+) -> HashMap<String, Ty> {
     let mut locals: HashMap<String, Ty> = HashMap::new();
     if let Some(f) = path.func {
         // Seed `self` for methods (mirrors codegen.rs:1209).
@@ -606,26 +645,210 @@ pub fn type_at_position(
         // Reconstruct body locals up to the cursor.
         reconstruct_locals(&f.body, off, ctx, &mut locals);
     }
+    locals
+}
 
-    // The expression to type. When the cursor is on the bare callee identifier
-    // of a call (`g` in `g()`), a function name is not itself a value, so the
-    // oracle would return Unknown. Hovering a called function is most useful as
-    // the CALL's result type, so retarget to the parent `Call` in that case.
-    let target: &Expr = match (path.expr, path.parent()) {
-        (Expr::Ident(_, _), Some(parent @ Expr::Call { callee, .. }))
-            if std::ptr::eq(callee.as_ref(), path.expr) =>
-        {
-            parent
+/// Return the type of the BINDING identifier (declaration site) at byte offset
+/// `off`, or `None` when the cursor is not on a binding.
+///
+/// Covers three declaration kinds:
+///
+/// - **Function / method parameter** — if `off` falls within `Param.span` for
+///   any param of the enclosing function, return that param's declared type.
+///   `self` returns the enclosing class type.
+///
+/// - **Assignment target** — if `off` falls within `Stmt::Assign.span` (which
+///   is the target-identifier token span), return the annotation type when
+///   present, or infer the RHS type otherwise.
+///
+/// - **`for`-loop target** — `Stmt::For` stores targets as `Vec<String>` with
+///   no per-target sub-span, so for-targets cannot be hovered at the
+///   declaration site. This case is intentionally skipped.
+fn binding_at_position(
+    module: &Module,
+    ctx: &TyCtx,
+    off: usize,
+) -> Option<Ty> {
+    // Walk all top-level statements looking for the enclosing function/class,
+    // then check params and assignment targets.
+    for s in &module.stmts {
+        if let Some(ty) = check_stmt_for_binding(s, off, ctx, None, None) {
+            return Some(ty);
         }
-        _ => path.expr,
-    };
-
-    let ty = crate::typeck::infer_expr_ty(target, &locals, ctx);
-    if ty == Ty::Unknown {
-        None
-    } else {
-        Some(ty)
     }
+    None
+}
+
+/// Recursively check a statement (and its nested bodies) for a binding at `off`.
+/// Returns the type when a binding site is found, `None` otherwise.
+fn check_stmt_for_binding(
+    s: &Stmt,
+    off: usize,
+    ctx: &TyCtx,
+    enclosing_func: Option<&Func>,
+    enclosing_class: Option<&crate::ast::ClassDef>,
+) -> Option<Ty> {
+    match s {
+        Stmt::Func(f) => {
+            // Check whether the cursor is in this function's params or body.
+            if f.span.start > off {
+                return None;
+            }
+            // Check params first.
+            for p in &f.params {
+                if span_offset_contains(p.span, off) {
+                    if p.name == "self" {
+                        // `self` hover → the enclosing class type.
+                        return enclosing_class
+                            .map(|c| Ty::Class(c.name.clone()));
+                    }
+                    return Ty::from_type_expr(&p.ty, p.span).ok();
+                }
+            }
+            // Recurse into the body with this function as the enclosing scope.
+            for stmt in &f.body {
+                if let Some(ty) = check_stmt_for_binding(stmt, off, ctx, Some(f), enclosing_class) {
+                    return Some(ty);
+                }
+            }
+        }
+        Stmt::Class(c) => {
+            if c.span.start > off {
+                return None;
+            }
+            for m in &c.methods {
+                // Treat the method as a Stmt::Func for recursion.
+                let method_stmt = Stmt::Func(m.clone());
+                if let Some(ty) = check_stmt_for_binding(&method_stmt, off, ctx, enclosing_func, Some(c)) {
+                    return Some(ty);
+                }
+            }
+        }
+        Stmt::Assign { target: _, ty: Some(te), span, .. } => {
+            if span_offset_contains(*span, off) {
+                // Annotated assignment: return the annotation type directly.
+                return Ty::from_type_expr(te, *span).ok();
+            }
+        }
+        Stmt::Assign { target, ty: None, value, span, .. } => {
+            if span_offset_contains(*span, off) {
+                // Un-annotated assignment: infer type from RHS, using locals
+                // visible before this assignment.
+                if let Some(f) = enclosing_func {
+                    let mut locals: HashMap<String, Ty> = HashMap::new();
+                    // Seed self for methods.
+                    if let Some(c) = enclosing_class {
+                        if f.params.iter().any(|p| p.name == "self") {
+                            locals.insert("self".to_string(), Ty::Class(c.name.clone()));
+                        }
+                    }
+                    // Seed params.
+                    for p in &f.params {
+                        if p.name == "self" { continue; }
+                        if let Ok(ty) = Ty::from_type_expr(&p.ty, p.span) {
+                            locals.insert(p.name.clone(), ty);
+                        }
+                    }
+                    // Reconstruct locals up to (but not including) this span,
+                    // so we see what was known before this assignment.
+                    reconstruct_locals(&f.body, span.start, ctx, &mut locals);
+                    let vt = crate::typeck::infer_expr_ty(value, &locals, ctx);
+                    // Merge with any prior type for `target`.
+                    let merged = match locals.get(target.as_str()) {
+                        Some(existing) if vt == Ty::Unknown => existing.clone(),
+                        _ => vt,
+                    };
+                    if merged != Ty::Unknown {
+                        return Some(merged);
+                    }
+                } else {
+                    // Top-level un-annotated assignment: infer without locals.
+                    let locals: HashMap<String, Ty> = HashMap::new();
+                    let vt = crate::typeck::infer_expr_ty(value, &locals, ctx);
+                    if vt != Ty::Unknown {
+                        return Some(vt);
+                    }
+                }
+            }
+        }
+        // Recurse into nested statement bodies.
+        Stmt::If { then, elifs, else_, .. } => {
+            for stmt in then {
+                if let Some(ty) = check_stmt_for_binding(stmt, off, ctx, enclosing_func, enclosing_class) {
+                    return Some(ty);
+                }
+            }
+            for (_, body) in elifs {
+                for stmt in body {
+                    if let Some(ty) = check_stmt_for_binding(stmt, off, ctx, enclosing_func, enclosing_class) {
+                        return Some(ty);
+                    }
+                }
+            }
+            if let Some(body) = else_ {
+                for stmt in body {
+                    if let Some(ty) = check_stmt_for_binding(stmt, off, ctx, enclosing_func, enclosing_class) {
+                        return Some(ty);
+                    }
+                }
+            }
+        }
+        Stmt::While { body, .. } | Stmt::With { body, .. } => {
+            for stmt in body {
+                if let Some(ty) = check_stmt_for_binding(stmt, off, ctx, enclosing_func, enclosing_class) {
+                    return Some(ty);
+                }
+            }
+        }
+        Stmt::For { body, .. } => {
+            // Note: for-loop TARGET identifiers (`for x in ...`) have no
+            // per-target sub-span in the AST (only `Vec<String>`), so the
+            // declaration site of loop variables cannot be resolved by span
+            // matching. The loop body is still searched for nested bindings.
+            for stmt in body {
+                if let Some(ty) = check_stmt_for_binding(stmt, off, ctx, enclosing_func, enclosing_class) {
+                    return Some(ty);
+                }
+            }
+        }
+        Stmt::Try { body, handlers, else_, finally_, .. } => {
+            for stmt in body {
+                if let Some(ty) = check_stmt_for_binding(stmt, off, ctx, enclosing_func, enclosing_class) {
+                    return Some(ty);
+                }
+            }
+            for h in handlers {
+                for stmt in &h.body {
+                    if let Some(ty) = check_stmt_for_binding(stmt, off, ctx, enclosing_func, enclosing_class) {
+                        return Some(ty);
+                    }
+                }
+            }
+            if let Some(b) = else_ {
+                for stmt in b {
+                    if let Some(ty) = check_stmt_for_binding(stmt, off, ctx, enclosing_func, enclosing_class) {
+                        return Some(ty);
+                    }
+                }
+            }
+            if let Some(b) = finally_ {
+                for stmt in b {
+                    if let Some(ty) = check_stmt_for_binding(stmt, off, ctx, enclosing_func, enclosing_class) {
+                        return Some(ty);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    None
+}
+
+/// True when byte offset `off` falls within a span (end-inclusive, non-empty).
+/// Mirrors the containment semantics of `span_contains` for `Expr` spans.
+#[inline]
+fn span_offset_contains(s: crate::diag::Span, off: usize) -> bool {
+    s.end > s.start && off >= s.start && off <= s.end
 }
 
 /// Mirror of codegen's `prescan_types`, but POSITION-AWARE: only statements that
@@ -1555,5 +1778,123 @@ mod tests {
         let (module, ctx) = build(src);
         // `undefined_name` is not a param, local, func, or class.
         assert!(definition_at_position(&module, &ctx, src, 1, 11).is_none());
+    }
+
+    // ── binding_at_position (hover on declaration sites) ─────────────────────
+
+    #[test]
+    fn hover_annotated_assign_target_returns_annotation_type() {
+        // `total: int = add(2, 3)` — hover the `total` identifier (col 4).
+        let src = concat!(
+            "def add(a: int, b: int) -> int:\n",  // line 0
+            "    return a + b\n",                  // line 1
+            "def f() -> int:\n",                   // line 2
+            "    total: int = add(2, 3)\n",        // line 3
+            "    return total\n",                  // line 4
+        );
+        let (module, ctx) = build(src);
+        // `total` on line 3, col 4.
+        let ty = type_at_position(&module, &ctx, src, 3, 4);
+        assert_eq!(ty, Some(Ty::Int), "annotated target should return annotation type");
+    }
+
+    #[test]
+    fn hover_bare_assign_target_returns_inferred_type() {
+        // `n = 5` — hover the `n` identifier (col 4); type inferred from RHS.
+        let src = concat!(
+            "def f() -> int:\n",  // line 0
+            "    n = 5\n",        // line 1
+            "    return n\n",     // line 2
+        );
+        let (module, ctx) = build(src);
+        // `n` on line 1, col 4.
+        let ty = type_at_position(&module, &ctx, src, 1, 4);
+        assert_eq!(ty, Some(Ty::Int), "bare target should return inferred RHS type");
+    }
+
+    #[test]
+    fn hover_param_name_in_signature_returns_param_type() {
+        // `def f(a: int, b: int) -> int:` — hover on `a` in the signature.
+        // `def f(` = 6 chars, so `a` is at col 6.
+        let src = concat!(
+            "def f(a: int, b: int) -> int:\n",  // line 0
+            "    return a + b\n",               // line 1
+        );
+        let (module, ctx) = build(src);
+        // `a` on line 0, col 6.
+        let ty = type_at_position(&module, &ctx, src, 0, 6);
+        assert_eq!(ty, Some(Ty::Int), "hovering param `a` should return int");
+    }
+
+    #[test]
+    fn hover_second_param_name_in_signature() {
+        // `def f(a: int, b: str) -> str:` — hover on `b`.
+        // `def f(a: int, ` = 14 chars, so `b` is at col 14.
+        let src = concat!(
+            "def f(a: int, b: str) -> str:\n",  // line 0
+            "    return b\n",                   // line 1
+        );
+        let (module, ctx) = build(src);
+        // `b` on line 0, col 14.
+        let ty = type_at_position(&module, &ctx, src, 0, 14);
+        assert_eq!(ty, Some(Ty::Str), "hovering param `b` should return str");
+    }
+
+    #[test]
+    fn hover_self_param_in_method_returns_class_type() {
+        // `    def m(self) -> int:` — hover on `self` (col 10).
+        // `    def m(` = 10 chars, so `self` starts at col 10.
+        let src = concat!(
+            "class C:\n",                        // line 0
+            "    x: int\n",                      // line 1
+            "    def m(self) -> int:\n",         // line 2
+            "        return self.x\n",           // line 3
+        );
+        let (module, ctx) = build(src);
+        // `self` on line 2, col 10.
+        let ty = type_at_position(&module, &ctx, src, 2, 10);
+        assert_eq!(ty, Some(Ty::Class("C".to_string())), "hovering `self` should return the class type");
+    }
+
+    #[test]
+    fn hover_use_of_param_in_body_still_works() {
+        // Regression: expression USE path must still work after the refactor.
+        // `    return x + 1` — hover on `x` (col 11).
+        let src = "def f(x: int) -> int:\n    return x + 1\n";
+        let (module, ctx) = build(src);
+        let ty = type_at_position(&module, &ctx, src, 1, 11);
+        assert_eq!(ty, Some(Ty::Int), "USE of param should still resolve to int");
+    }
+
+    #[test]
+    fn hover_on_whitespace_returns_none() {
+        // Cursor between two functions on a blank line → no binding, no expr → None.
+        let src = concat!(
+            "def f() -> int:\n",  // line 0
+            "    return 1\n",     // line 1
+            "\n",                 // line 2  (blank)
+            "def g() -> int:\n",  // line 3
+            "    return 2\n",     // line 4
+        );
+        let (module, ctx) = build(src);
+        // Cursor on the blank line (line 2, col 0).
+        let ty = type_at_position(&module, &ctx, src, 2, 0);
+        assert_eq!(ty, None, "whitespace cursor should yield None");
+    }
+
+    #[test]
+    fn hover_annotated_assign_in_method() {
+        // `        result: str = "hello"` inside a method — hover on `result`.
+        // 8 spaces + `result` → `result` at col 8.
+        let src = concat!(
+            "class C:\n",                                  // line 0
+            "    def greet(self) -> str:\n",               // line 1
+            "        result: str = \"hello\"\n",           // line 2
+            "        return result\n",                     // line 3
+        );
+        let (module, ctx) = build(src);
+        // `result` on line 2, col 8.
+        let ty = type_at_position(&module, &ctx, src, 2, 8);
+        assert_eq!(ty, Some(Ty::Str), "annotated method-local target should return str");
     }
 }

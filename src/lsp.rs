@@ -177,6 +177,10 @@ impl LanguageServer for Backend {
                 )),
                 // We implement whole-document formatting.
                 document_formatting_provider: Some(OneOf::Left(true)),
+                // Hover: type-on-cursor (EPIC-LSP L6).
+                hover_provider: Some(HoverProviderCapability::Simple(true)),
+                // Go-to-definition: jump to declaration site (EPIC-LSP L6).
+                definition_provider: Some(OneOf::Left(true)),
                 ..Default::default()
             },
             ..Default::default()
@@ -247,6 +251,82 @@ impl LanguageServer for Backend {
             }
             // Comments present, or parse/format/re-parse failure: emit no edit
             // rather than corrupt the buffer.
+            None => Ok(None),
+        }
+    }
+
+    // ── Hover (EPIC-LSP L6) ───────────────────────────────────────────────────
+
+    async fn hover(&self, params: HoverParams) -> RpcResult<Option<Hover>> {
+        let tdp = params.text_document_position_params;
+        let uri = tdp.text_document.uri;
+        let position = tdp.position;
+
+        let text = match self.get_text(&uri) {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+
+        let (module, ctx) = match analysis::analyze_document(&text) {
+            Some(pair) => pair,
+            None => return Ok(None),
+        };
+
+        let ty = analysis::type_at_position(
+            &module,
+            &ctx,
+            &text,
+            position.line,
+            position.character,
+        );
+
+        match ty {
+            Some(t) => Ok(Some(Hover {
+                contents: HoverContents::Markup(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value: format!("```pyrst\n{}\n```", t),
+                }),
+                range: None,
+            })),
+            None => Ok(None),
+        }
+    }
+
+    // ── Go-to-definition (EPIC-LSP L6) ────────────────────────────────────────
+
+    async fn goto_definition(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> RpcResult<Option<GotoDefinitionResponse>> {
+        let tdp = params.text_document_position_params;
+        let uri = tdp.text_document.uri;
+        let position = tdp.position;
+
+        let text = match self.get_text(&uri) {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+
+        let (module, ctx) = match analysis::analyze_document(&text) {
+            Some(pair) => pair,
+            None => return Ok(None),
+        };
+
+        let span = analysis::definition_at_position(
+            &module,
+            &ctx,
+            &text,
+            position.line,
+            position.character,
+        );
+
+        match span {
+            Some(sp) => {
+                let (sl, sc) = analysis::byte_offset_to_position(&text, sp.start);
+                let (el, ec) = analysis::byte_offset_to_position(&text, sp.end);
+                let range = Range::new(Position::new(sl, sc), Position::new(el, ec));
+                Ok(Some(GotoDefinitionResponse::Scalar(Location::new(uri, range))))
+            }
             None => Ok(None),
         }
     }

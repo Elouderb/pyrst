@@ -88,6 +88,23 @@ pub fn analyze_str(src: &str) -> Vec<Diagnostic> {
         .collect()
 }
 
+/// Parse `src` and build a single-module [`TyCtx`], returning both on success.
+///
+/// This is the shared entry point for hover, go-to-definition, and (later)
+/// completion — all three need the same `(module, ctx)` pair that
+/// [`analyze_str`] builds internally.  Re-parsing per request is intentional:
+/// it is fast, stateless, and avoids any cache-invalidation complexity.
+///
+/// Returns `None` when the source cannot be parsed (e.g. a syntax error while
+/// the user is mid-edit).  Callers should treat `None` as "stay silent" rather
+/// than as an error.
+pub fn analyze_document(src: &str) -> Option<(crate::ast::Module, TyCtx)> {
+    let module = parser::parse(src).ok()?;
+    let mut ctx = TyCtx::new();
+    merge_ctx_from_module(&module, &mut ctx, true).ok()?;
+    Some((module, ctx))
+}
+
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
 /// Convert an `Error` into a `Diagnostic`, converting its span to 0-indexed
@@ -1203,6 +1220,36 @@ mod tests {
         // Must not panic or attempt to read a file.
         let diags = analyze_str(src);
         assert!(diags.is_empty());
+    }
+
+    // ── analyze_document (EPIC-LSP L6) ───────────────────────────────────────
+
+    #[test]
+    fn analyze_document_clean_program_returns_some() {
+        let src = "def f(x: int) -> int:\n    return x + 1\n";
+        let result = analyze_document(src);
+        assert!(result.is_some(), "clean program should yield Some((module, ctx))");
+        let (module, ctx) = result.unwrap();
+        // The module has exactly one top-level statement (the function).
+        assert_eq!(module.stmts.len(), 1);
+        // The TyCtx knows about `f`.
+        assert!(ctx.funcs.contains_key("f"), "TyCtx should contain fn `f`");
+    }
+
+    #[test]
+    fn analyze_document_parse_error_returns_none() {
+        let src = "def main(\n"; // unclosed paren
+        let result = analyze_document(src);
+        assert!(result.is_none(), "parse error should yield None");
+    }
+
+    #[test]
+    fn analyze_document_type_error_program_still_returns_some() {
+        // analyze_document builds the module + ctx regardless of type errors;
+        // type errors are the caller's concern (analyze_str, hover, etc.).
+        let src = "def main() -> None:\n    x: int = \"bad\"\n";
+        let result = analyze_document(src);
+        assert!(result.is_some(), "type-erroneous program still parses and yields Some");
     }
 
     // ── Navigation engine (EPIC-LSP L5) ───────────────────────────────────────

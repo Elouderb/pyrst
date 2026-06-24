@@ -5373,7 +5373,7 @@ pub fn emit_program(modules: &[(Module, String)], ctx: &TyCtx) -> Result<String>
     cg.build_poly_map();
 
     // Preamble — written once
-    cg.line("#![allow(unused_parens, unused_variables, unused_mut, dead_code)]");
+    cg.line("#![allow(unused_parens, unused_variables, unused_mut, dead_code, unused_imports)]");
     cg.line("use std::io::Write;");
     cg.line("");
     cg.line("fn __py_fmt_float(x: f64) -> String {");

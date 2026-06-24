@@ -46,14 +46,23 @@ pub struct Diagnostic {
 
 /// Parse and typecheck `src` without codegen, rustc, or filesystem access.
 ///
-/// Returns a `Vec<Diagnostic>` containing zero or one entries:
-/// - Empty on a clean program.
-/// - One entry for the first parse or type error encountered (fail-fast pipeline).
+/// Returns ALL top-level-item type errors as `Diagnostic`s (EPIC-LSP L4): a file
+/// with type errors in functions A, B, and method C.m yields three diagnostics,
+/// ordered top-to-bottom by source position. Parse errors are still reported
+/// one-at-a-time — the parser is fail-fast, so a syntax error short-circuits to
+/// a single diagnostic before any typechecking runs.
+///
+/// Returns an empty `Vec` on a clean program.
+///
+/// Within a single function/method, checking is still fail-fast (the first type
+/// error in that item), so at most one diagnostic is produced per top-level
+/// function or class. Full per-expression recovery is out of scope.
 ///
 /// `import` statements are **not** resolved; a program importing other modules
 /// may produce spurious unresolved-name diagnostics — acceptable for v1.
 pub fn analyze_str(src: &str) -> Vec<Diagnostic> {
-    // Step 1: parse.
+    // Step 1: parse. The parser is fail-fast — a syntax error short-circuits to
+    // exactly one diagnostic.
     let module = match parser::parse(src) {
         Ok(m) => m,
         Err(e) => return vec![diag_from_error(&e, src)],
@@ -61,18 +70,22 @@ pub fn analyze_str(src: &str) -> Vec<Diagnostic> {
 
     // Step 2: build a single-module TyCtx (builtins + this module's definitions).
     // We reuse the same `merge_ctx_from_module` the multi-file resolver uses so
-    // that function/class signatures are registered identically.
+    // that function/class signatures are registered identically. This pass is
+    // also fail-fast (it builds the signature table the per-body checks read).
     let mut ctx = TyCtx::new();
     // `is_root = true` so top-level `main()` is not filtered out.
     if let Err(e) = merge_ctx_from_module(&module, &mut ctx, true) {
         return vec![diag_from_error(&e, src)];
     }
 
-    // Step 3: typecheck function bodies.
-    match typeck::check_bodies(&module, &ctx) {
-        Ok(()) => vec![],
-        Err(e) => vec![diag_from_error(&e, src)],
-    }
+    // Step 3: collect EVERY top-level-item type error (one squiggle per failing
+    // function/method) and map each to an LSP diagnostic. `check_all` already
+    // sorts its errors by source position, so the diagnostics come out
+    // top-to-bottom.
+    typeck::check_all(&module, &ctx)
+        .iter()
+        .map(|e| diag_from_error(e, src))
+        .collect()
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
@@ -293,6 +306,87 @@ mod tests {
             "expected type error on 0-indexed line 1, got line {}",
             d.start.0
         );
+    }
+
+    // ── analyze_str: collect-all (EPIC-LSP L4) ────────────────────────────────
+
+    #[test]
+    fn two_functions_with_distinct_type_errors_yield_two_diagnostics() {
+        // Each function has its own type mismatch (str assigned to int-annotated
+        // local). Collect-all must report BOTH, not just the first.
+        let src = concat!(
+            "def f() -> None:\n",
+            "    a: int = \"s\"\n",
+            "\n",
+            "def g() -> None:\n",
+            "    b: int = \"t\"\n",
+        );
+        let diags = analyze_str(src);
+        assert_eq!(diags.len(), 2, "expected 2 diagnostics, got: {:?}", diags);
+        // Ordered top-to-bottom: f's error (line 1) before g's error (line 4).
+        assert!(
+            diags[0].start.0 < diags[1].start.0,
+            "diagnostics should be ordered by line, got starts {:?} and {:?}",
+            diags[0].start,
+            diags[1].start
+        );
+        assert_eq!(diags[0].start.0, 1, "first error on 0-indexed line 1");
+        assert_eq!(diags[1].start.0, 4, "second error on 0-indexed line 4");
+    }
+
+    #[test]
+    fn two_methods_with_type_errors_yield_two_diagnostics() {
+        // A class whose two methods each have a distinct type error → 2 squiggles.
+        let src = concat!(
+            "class C:\n",
+            "    def m1(self) -> None:\n",
+            "        a: int = \"s\"\n",
+            "    def m2(self) -> None:\n",
+            "        b: int = \"t\"\n",
+        );
+        let diags = analyze_str(src);
+        assert_eq!(diags.len(), 2, "expected 2 diagnostics, got: {:?}", diags);
+        assert!(
+            diags[0].start.0 < diags[1].start.0,
+            "diagnostics should be ordered by line, got starts {:?} and {:?}",
+            diags[0].start,
+            diags[1].start
+        );
+    }
+
+    #[test]
+    fn clean_module_yields_no_diagnostics_via_collect_all() {
+        let src = concat!(
+            "def f(x: int) -> int:\n",
+            "    return x + 1\n",
+            "\n",
+            "def g(y: int) -> int:\n",
+            "    return y * 2\n",
+        );
+        let diags = analyze_str(src);
+        assert!(diags.is_empty(), "expected no diagnostics, got: {:?}", diags);
+    }
+
+    #[test]
+    fn single_type_error_still_yields_one_diagnostic() {
+        // Unchanged single-error behavior: exactly one diagnostic.
+        let src = "def main() -> None:\n    x: int = \"s\"\n";
+        let diags = analyze_str(src);
+        assert_eq!(diags.len(), 1, "expected exactly 1 diagnostic, got: {:?}", diags);
+    }
+
+    #[test]
+    fn parse_error_still_yields_exactly_one_diagnostic() {
+        // The parser is fail-fast: even with later type errors a syntax error
+        // short-circuits to a single diagnostic.
+        let src = concat!(
+            "def f(\n",            // unclosed paren → parse error
+            "def g() -> None:\n",
+            "    b: int = \"t\"\n", // would be a type error, but never reached
+        );
+        let diags = analyze_str(src);
+        assert_eq!(diags.len(), 1, "expected exactly 1 parse diagnostic, got: {:?}", diags);
+        assert_eq!(diags[0].severity, Severity::Error);
     }
 
     // ── analyze_str: does not touch filesystem ────────────────────────────────

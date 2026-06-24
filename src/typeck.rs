@@ -900,123 +900,246 @@ pub fn check_bodies(m: &Module, ctx: &TyCtx) -> Result<()> {
     // accepted here and lowered via codegen's `escape_ident`.
     reject_reserved_idents(m)?;
 
-    // Second pass: type-check function bodies.
+    // Second pass: type-check each top-level item's body, fail-fast (first
+    // error stops the pass). The per-item work lives in `check_one_stmt` so the
+    // collecting entry point `check_all` can reuse it without changing this
+    // function's observable first-error-and-stop behavior (the CLI exit codes,
+    // EPIC-8 multi-file sourcing, and the 64 negative fixtures depend on it).
+    for s in &m.stmts {
+        check_one_stmt(s, ctx)?;
+    }
+    Ok(())
+}
+
+/// Collect EVERY top-level-item type error in `m` instead of stopping at the
+/// first (EPIC-LSP L4). Used by the LSP layer so the language server can surface
+/// one squiggle per failing top-level function / method rather than a single
+/// diagnostic per edit.
+///
+/// Semantics, contrasted with [`check_bodies`]:
+/// - Runs the SAME `reject_reserved_idents` module-wide pre-pass first. That
+///   pass is fail-fast by nature (a single reserved-identifier error for the
+///   whole module); if it fires, this returns exactly that one error and does
+///   not attempt per-item checks.
+/// - Otherwise checks each top-level item, pushing each failing item's error
+///   into the result `Vec` and CONTINUING to the next item (instead of
+///   `?`-bailing). The item GRANULARITY is one top-level function OR one method:
+///   a class with type errors in two different methods produces two errors. A
+///   per-class prelude failure (multiple inheritance, a bad field annotation)
+///   is one error and skips that class's methods, since those checks establish
+///   class-level invariants the method checks rely on.
+/// - Per-EXPRESSION recovery WITHIN a single function/method is not attempted —
+///   each item is still checked fail-fast (first error in that item), matching
+///   `check_bodies`' own per-item semantics. So at most one error is produced
+///   per function/method.
+/// - Errors are sorted by source position (span line, then col) so the caller
+///   can render diagnostics top-to-bottom.
+///
+/// Returns an empty `Vec` for a clean module.
+pub fn check_all(m: &Module, ctx: &TyCtx) -> Vec<Error> {
+    // Module-wide pre-pass: fail-fast, identical to `check_bodies`. A reserved
+    // identifier anywhere makes per-item checking meaningless, so surface that
+    // single error alone.
+    if let Err(e) = reject_reserved_idents(m) {
+        return vec![e];
+    }
+
+    let mut errors: Vec<Error> = Vec::new();
     for s in &m.stmts {
         match s {
             Stmt::Func(f) => {
-                // Reject unsupported decorators on top-level functions.
-                validate_decorators(&f.decorators, f.span)?;
-
-                let params: Vec<(String, Ty)> = f.params.iter()
-                    .filter(|p| p.name != "self")
-                    .map(|p| Ty::from_type_expr(&p.ty, p.span).map(|ty| (p.name.clone(), ty)))
-                    .collect::<Result<Vec<_>>>()?;
-                let by_ref_names: Vec<String> = f.params.iter()
-                    .filter(|p| p.name != "self" && p.by_ref)
-                    .map(|p| p.name.clone())
-                    .collect();
-                let ret = Ty::from_type_expr(&f.ret, f.span)?;
-                let mut env = FuncEnv::with_by_ref(ctx, &params, &by_ref_names, ret);
-                collect_returned_param_idents(&f.body, &env.params, &mut env.returned_params);
-                check_body(&f.body, &mut env)?;
+                if let Err(e) = check_one_func(f, ctx) {
+                    errors.push(e);
+                }
             }
             Stmt::Class(c) => {
-                // Reject multiple inheritance.
-                if c.bases.len() > 1 {
-                    return Err(Error::Type {
-                        span: c.span,
-                        msg: "multiple inheritance is not supported".to_string(),
-                    });
+                // The per-class prelude (multiple inheritance, field annotations)
+                // establishes invariants the method checks rely on; if it fails,
+                // record that one error and skip this class's methods.
+                if let Err(e) = check_class_prelude(c) {
+                    errors.push(e);
+                    continue;
                 }
-
-                // (EPIC-4 V2-c) Validate explicit class-FIELD annotations at
-                // `check` time. Field types are otherwise only lowered lazily at
-                // codegen (`build`), so a `Mut[T]` field annotation would slip past
-                // `pyrst check`. Running each field through `from_type_expr` here
-                // makes the existing `("Mut", _)` rejection arm fire at check time,
-                // so a class-field `Mut[T]` is an honest error in BOTH `check` and
-                // `build` (mode markers belong only on parameters).
-                for field in &c.fields {
-                    Ty::from_type_expr(&field.ty, field.span)?;
-                }
-
+                // Collect one error per failing method (the L4 method-level
+                // granularity), continuing past a failing method to the next.
                 for method in &c.methods {
-                    // Reject unsupported decorators on class methods.
-                    validate_decorators(&method.decorators, method.span)?;
-
-                    // `__bool__` is listed among the dunder-trait names in codegen
-                    // (so it is skipped by the inherent-methods loop) but has no
-                    // trait-impl arm, which would silently DROP a user-defined
-                    // `__bool__`. pyrst also has no working object-truthiness
-                    // lowering today: `bool(obj)` lowers numerically and an
-                    // `if obj:` / `while obj:` condition is not constrained to
-                    // `bool`, so a class instance in a truthiness position emits
-                    // invalid Rust regardless. Rather than mislead the user with a
-                    // silently-ignored method, reject `__bool__` honestly here (it
-                    // is then caught by both `check` and `build`). Lowering object
-                    // truthiness is a separate, larger feature.
-                    if method.name == "__bool__" {
-                        return Err(Error::Type {
-                            span: method.span,
-                            msg: "__bool__ is not yet supported (object truthiness is not lowered); \
-                                  define an explicit predicate method instead".to_string(),
-                        });
+                    if let Err(e) = check_one_method(c, method, ctx) {
+                        errors.push(e);
                     }
-
-                    // (EPIC-4 V2-c) `Mut[T]` is unsupported on a CONSTRUCTOR
-                    // parameter. The generated `new()` wrapper passes owned values
-                    // into `self.__init__(...)`, which would mismatch a `&mut T`
-                    // `__init__` signature — and a fresh `__inst` has no
-                    // caller-visible storage for a by-ref param to alias anyway.
-                    // Reject here so both `check` and `build` catch it cleanly
-                    // rather than silently mis-emitting.
-                    if method.name == "__init__" {
-                        if let Some(p) = method.params.iter().find(|p| p.by_ref) {
-                            return Err(Error::Type {
-                                span: method.span,
-                                msg: format!(
-                                    "Mut[T] is not supported on a constructor (`__init__`) parameter `{}`",
-                                    p.name
-                                ),
-                            });
-                        }
-                    }
-
-                    let mut params: Vec<(String, Ty)> = method.params.iter()
-                        .filter(|p| p.name != "self")
-                        .map(|p| Ty::from_type_expr(&p.ty, p.span).map(|ty| (p.name.clone(), ty)))
-                        .collect::<Result<Vec<_>>>()?;
-                    params.insert(0, ("self".into(), Ty::Class(c.name.clone())));
-                    let by_ref_names: Vec<String> = method.params.iter()
-                        .filter(|p| p.name != "self" && p.by_ref)
-                        .map(|p| p.name.clone())
-                        .collect();
-                    let ret = Ty::from_type_expr(&method.ret, method.span)?;
-                    let mut env = FuncEnv::with_by_ref(ctx, &params, &by_ref_names, ret);
-                    collect_returned_param_idents(&method.body, &env.params, &mut env.returned_params);
-                    check_body(&method.body, &mut env)?;
                 }
             }
-            // Import statements are resolved by the resolver and are
-            // intentionally not type-checked here (no body to check).
+            // Import statements have no body to check (resolved by the resolver).
             Stmt::Import { .. } => {}
             _ => {
-                // Silently accept a bare top-level `main()` call — it is the
-                // conventional pyrst entry-point idiom and is already driven by
-                // the synthetic Rust `fn main() { user_main(); }`.
-                if !is_bare_main_call(s) {
-                    let span = stmt_span(s);
-                    return Err(Error::Type {
-                        span,
-                        msg: "top-level statements other than function/class/import \
-                              definitions are not supported"
-                            .to_string(),
-                    });
+                if let Err(e) = check_top_level_other(s) {
+                    errors.push(e);
                 }
             }
         }
     }
+
+    // Order top-to-bottom by the error's source span (line, then col) so
+    // squiggles appear in reading order regardless of statement-iteration order.
+    errors.sort_by_key(|e| {
+        let span = error_span(e);
+        (span.line, span.col, span.start)
+    });
+    errors
+}
+
+/// Type-check a SINGLE top-level statement's body, fail-fast. Used by
+/// [`check_bodies`], which `?`-propagates the first error. Composes the same
+/// per-item helpers [`check_all`] uses, so the two entry points apply
+/// byte-identical per-item checks — only their continue-vs-stop policy differs.
+fn check_one_stmt(s: &Stmt, ctx: &TyCtx) -> Result<()> {
+    match s {
+        Stmt::Func(f) => check_one_func(f, ctx)?,
+        Stmt::Class(c) => {
+            check_class_prelude(c)?;
+            for method in &c.methods {
+                check_one_method(c, method, ctx)?;
+            }
+        }
+        // Import statements are resolved by the resolver and are
+        // intentionally not type-checked here (no body to check).
+        Stmt::Import { .. } => {}
+        _ => check_top_level_other(s)?,
+    }
     Ok(())
+}
+
+/// Type-check ONE top-level function (decorators + signature + body), fail-fast.
+fn check_one_func(f: &Func, ctx: &TyCtx) -> Result<()> {
+    // Reject unsupported decorators on top-level functions.
+    validate_decorators(&f.decorators, f.span)?;
+
+    let params: Vec<(String, Ty)> = f.params.iter()
+        .filter(|p| p.name != "self")
+        .map(|p| Ty::from_type_expr(&p.ty, p.span).map(|ty| (p.name.clone(), ty)))
+        .collect::<Result<Vec<_>>>()?;
+    let by_ref_names: Vec<String> = f.params.iter()
+        .filter(|p| p.name != "self" && p.by_ref)
+        .map(|p| p.name.clone())
+        .collect();
+    let ret = Ty::from_type_expr(&f.ret, f.span)?;
+    let mut env = FuncEnv::with_by_ref(ctx, &params, &by_ref_names, ret);
+    collect_returned_param_idents(&f.body, &env.params, &mut env.returned_params);
+    check_body(&f.body, &mut env)?;
+    Ok(())
+}
+
+/// Per-CLASS checks that run before (and gate) the method checks: multiple
+/// inheritance and explicit field-annotation validation. Fail-fast.
+fn check_class_prelude(c: &ClassDef) -> Result<()> {
+    // Reject multiple inheritance.
+    if c.bases.len() > 1 {
+        return Err(Error::Type {
+            span: c.span,
+            msg: "multiple inheritance is not supported".to_string(),
+        });
+    }
+
+    // (EPIC-4 V2-c) Validate explicit class-FIELD annotations at `check` time.
+    // Field types are otherwise only lowered lazily at codegen (`build`), so a
+    // `Mut[T]` field annotation would slip past `pyrst check`. Running each
+    // field through `from_type_expr` here makes the existing `("Mut", _)`
+    // rejection arm fire at check time, so a class-field `Mut[T]` is an honest
+    // error in BOTH `check` and `build` (mode markers belong only on params).
+    for field in &c.fields {
+        Ty::from_type_expr(&field.ty, field.span)?;
+    }
+    Ok(())
+}
+
+/// Type-check ONE method of class `c` (decorators + dunder restrictions +
+/// signature + body), fail-fast. The receiver type is `c`'s class type.
+fn check_one_method(c: &ClassDef, method: &Func, ctx: &TyCtx) -> Result<()> {
+    // Reject unsupported decorators on class methods.
+    validate_decorators(&method.decorators, method.span)?;
+
+    // `__bool__` is listed among the dunder-trait names in codegen (so it is
+    // skipped by the inherent-methods loop) but has no trait-impl arm, which
+    // would silently DROP a user-defined `__bool__`. pyrst also has no working
+    // object-truthiness lowering today: `bool(obj)` lowers numerically and an
+    // `if obj:` / `while obj:` condition is not constrained to `bool`, so a
+    // class instance in a truthiness position emits invalid Rust regardless.
+    // Rather than mislead the user with a silently-ignored method, reject
+    // `__bool__` honestly here (it is then caught by both `check` and `build`).
+    // Lowering object truthiness is a separate, larger feature.
+    if method.name == "__bool__" {
+        return Err(Error::Type {
+            span: method.span,
+            msg: "__bool__ is not yet supported (object truthiness is not lowered); \
+                  define an explicit predicate method instead".to_string(),
+        });
+    }
+
+    // (EPIC-4 V2-c) `Mut[T]` is unsupported on a CONSTRUCTOR parameter. The
+    // generated `new()` wrapper passes owned values into `self.__init__(...)`,
+    // which would mismatch a `&mut T` `__init__` signature — and a fresh
+    // `__inst` has no caller-visible storage for a by-ref param to alias anyway.
+    // Reject here so both `check` and `build` catch it cleanly rather than
+    // silently mis-emitting.
+    if method.name == "__init__" {
+        if let Some(p) = method.params.iter().find(|p| p.by_ref) {
+            return Err(Error::Type {
+                span: method.span,
+                msg: format!(
+                    "Mut[T] is not supported on a constructor (`__init__`) parameter `{}`",
+                    p.name
+                ),
+            });
+        }
+    }
+
+    let mut params: Vec<(String, Ty)> = method.params.iter()
+        .filter(|p| p.name != "self")
+        .map(|p| Ty::from_type_expr(&p.ty, p.span).map(|ty| (p.name.clone(), ty)))
+        .collect::<Result<Vec<_>>>()?;
+    params.insert(0, ("self".into(), Ty::Class(c.name.clone())));
+    let by_ref_names: Vec<String> = method.params.iter()
+        .filter(|p| p.name != "self" && p.by_ref)
+        .map(|p| p.name.clone())
+        .collect();
+    let ret = Ty::from_type_expr(&method.ret, method.span)?;
+    let mut env = FuncEnv::with_by_ref(ctx, &params, &by_ref_names, ret);
+    collect_returned_param_idents(&method.body, &env.params, &mut env.returned_params);
+    check_body(&method.body, &mut env)?;
+    Ok(())
+}
+
+/// Handle a top-level statement that is neither a function, class, nor import.
+/// Silently accepts a bare top-level `main()` call (the conventional pyrst
+/// entry-point idiom); rejects any other stray top-level statement. Fail-fast.
+fn check_top_level_other(s: &Stmt) -> Result<()> {
+    // A bare top-level `main()` call is the conventional pyrst entry-point idiom
+    // and is already driven by the synthetic Rust `fn main() { user_main(); }`.
+    if !is_bare_main_call(s) {
+        let span = stmt_span(s);
+        return Err(Error::Type {
+            span,
+            msg: "top-level statements other than function/class/import \
+                  definitions are not supported"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Innermost source [`Span`] of an [`Error`], unwrapping the EPIC-8 `Sourced`
+/// wrapper. Used by [`check_all`] to order collected errors top-to-bottom.
+/// Span-less variants (`Io`, `Codegen`, `Rustc`) fall back to `Span::DUMMY`,
+/// which sorts to the front (line/col/start all zero).
+fn error_span(e: &Error) -> Span {
+    match e {
+        Error::Lex { span, .. }
+        | Error::Parse { span, .. }
+        | Error::Type { span, .. }
+        | Error::ImportNotFound { span, .. }
+        | Error::CircularImport { span, .. } => *span,
+        Error::Sourced { inner, .. } => error_span(inner),
+        Error::Io(_) | Error::Codegen(_) | Error::Rustc(_) => Span::DUMMY,
+    }
 }
 
 /// Analyze which functions are actually called in a module.
@@ -5656,5 +5779,81 @@ class Derived(Base):
     #[test]
     fn display_class_name() {
         assert_eq!(format!("{}", Ty::Class("Dog".to_string())), "Dog");
+    }
+
+    // ── check_all: collect-all diagnostics (EPIC-LSP L4) ──────────────────────
+
+    #[test]
+    fn check_all_collects_two_function_errors_in_order() {
+        // Two top-level functions, each with a distinct type error. `check_all`
+        // must collect BOTH (unlike `check_bodies`, which stops at the first),
+        // ordered top-to-bottom by source position.
+        let src = "\
+def f() -> None:
+    a: int = \"s\"
+
+def g() -> None:
+    b: int = \"t\"
+";
+        let m = crate::parser::parse(src).expect("parse");
+        let ctx = ctx_from_module(&m);
+
+        // check_bodies stays fail-fast: exactly one error.
+        assert!(check_bodies(&m, &ctx).is_err(), "check_bodies must still fail-fast");
+
+        let errs = check_all(&m, &ctx);
+        assert_eq!(errs.len(), 2, "expected 2 collected errors, got: {:?}", errs);
+        // Ordered by span line.
+        let l0 = error_span(&errs[0]).line;
+        let l1 = error_span(&errs[1]).line;
+        assert!(l0 < l1, "errors must be ordered by line, got {l0} then {l1}");
+    }
+
+    #[test]
+    fn check_all_collects_two_method_errors() {
+        let src = "\
+class C:
+    def m1(self) -> None:
+        a: int = \"s\"
+    def m2(self) -> None:
+        b: int = \"t\"
+";
+        let m = crate::parser::parse(src).expect("parse");
+        let ctx = ctx_from_module(&m);
+        let errs = check_all(&m, &ctx);
+        assert_eq!(errs.len(), 2, "expected 2 collected method errors, got: {:?}", errs);
+        let l0 = error_span(&errs[0]).line;
+        let l1 = error_span(&errs[1]).line;
+        assert!(l0 < l1, "method errors must be ordered by line, got {l0} then {l1}");
+    }
+
+    #[test]
+    fn check_all_clean_module_is_empty() {
+        let src = "\
+def f(x: int) -> int:
+    return x + 1
+
+def g(y: int) -> int:
+    return y * 2
+";
+        let m = crate::parser::parse(src).expect("parse");
+        let ctx = ctx_from_module(&m);
+        let errs = check_all(&m, &ctx);
+        assert!(errs.is_empty(), "clean module must yield no errors, got: {:?}", errs);
+    }
+
+    #[test]
+    fn check_all_single_error_yields_one() {
+        let src = "\
+def f() -> None:
+    a: int = \"s\"
+
+def g(y: int) -> int:
+    return y * 2
+";
+        let m = crate::parser::parse(src).expect("parse");
+        let ctx = ctx_from_module(&m);
+        let errs = check_all(&m, &ctx);
+        assert_eq!(errs.len(), 1, "expected exactly 1 error, got: {:?}", errs);
     }
 }

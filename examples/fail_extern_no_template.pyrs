@@ -1,0 +1,12 @@
+# Negative: an `@extern` function whose body is NOT a single Rust-template
+# string literal must be rejected by `pyrst check` (and `pyrst build`). Here the
+# body is a normal statement (`return`), not the required template string, so the
+# binding is malformed and pyrst raises an honest type error rather than emitting
+# uncheckable Rust.
+
+@extern
+def bad(s: str) -> str:
+    return s
+
+def main() -> None:
+    print(bad("hi"))

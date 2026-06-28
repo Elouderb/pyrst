@@ -667,7 +667,11 @@ fn func_sig_to_ty(sig: &FuncSig) -> Ty {
 fn validate_decorators(decorators: &[String], span: Span) -> Result<()> {
     for dec in decorators {
         match dec.as_str() {
-            "staticmethod" | "property" | "dataclass" => {}
+            // `extern` declares a Rust-FFI binding (a bare `@extern` decorator
+            // over a `def` whose body is a single Rust-expression-template string
+            // literal). The body/typing of an `@extern` function are validated
+            // separately by `validate_extern_func`; here we only admit the name.
+            "staticmethod" | "property" | "dataclass" | "extern" => {}
             _ => {
                 return Err(Error::Type {
                     span,
@@ -676,6 +680,78 @@ fn validate_decorators(decorators: &[String], span: Span) -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+/// Validate a function carrying the `@extern` decorator (a Rust-FFI binding).
+///
+/// Phase 1 (std-only) contract — the binding AUTHOR declares the full boundary,
+/// because codegen cannot infer the Rust-side glue:
+///   (a) the body is EXACTLY ONE statement and it is a string literal — the Rust
+///       expression TEMPLATE with `{param}` substitution holes;
+///   (b) every (non-`self`) parameter AND the return type lower to a concrete,
+///       fully-known `Ty` (not `Ty::Unknown`); and
+///   (c) no parameter uses the by-reference `Mut[T]` mode (out of Phase-1 scope —
+///       template substitution emits params by value).
+///
+/// The TEMPLATE CONTENTS are deliberately NOT type-checked here: the string is
+/// opaque Rust (the FFI escape hatch), so a malformed template surfaces as a
+/// rustc error at `build` time, not a pyrst typeck error. The function's declared
+/// signature still registers in the ctx like any `def`, so CALL sites type-check
+/// through the normal path with no special-casing.
+fn validate_extern_func(f: &Func, ctx: &TyCtx) -> Result<()> {
+    // (a) body must be a single string-literal statement (the template).
+    let single_str = matches!(f.body.as_slice(), [Stmt::Expr(Expr::Str(_, _))]);
+    if !single_str {
+        return Err(Error::Type {
+            span: f.span,
+            msg: "`@extern` function body must be a single Rust-template string \
+                  literal (the Rust expression with `{param}` substitution holes)"
+                .to_string(),
+        });
+    }
+
+    // (c) by-reference (`Mut[T]`) params are out of Phase-1 @extern scope.
+    if let Some(p) = f.params.iter().find(|p| p.by_ref) {
+        return Err(Error::Type {
+            span: f.span,
+            msg: format!(
+                "`@extern` does not support the by-reference parameter `{}` \
+                 (`Mut[T]`); declare it by value",
+                p.name
+            ),
+        });
+    }
+
+    // (b) every non-self param + the return type must be fully typed (the parser
+    // already forces an annotation on each, so the only residual gap is a user
+    // annotation that lowers to `Ty::Unknown`, e.g. a multi-arm `Union`).
+    for p in f.params.iter().filter(|p| p.name != "self") {
+        let ty = Ty::from_type_expr(&p.ty, p.span)?;
+        if matches!(ty, Ty::Unknown) {
+            return Err(Error::Type {
+                span: f.span,
+                msg: format!(
+                    "`@extern` requires fully-typed params and return: parameter \
+                     `{}` has an unresolved type",
+                    p.name
+                ),
+            });
+        }
+    }
+    let ret = Ty::from_type_expr(&f.ret, f.span)?;
+    if matches!(ret, Ty::Unknown) {
+        return Err(Error::Type {
+            span: f.span,
+            msg: "`@extern` requires fully-typed params and return: the return \
+                  type is unresolved"
+                .to_string(),
+        });
+    }
+
+    // `ctx` is accepted for symmetry with the other per-function checks and to
+    // keep the door open for future cross-checks; Phase 1 needs no ctx lookups.
+    let _ = ctx;
     Ok(())
 }
 
@@ -1050,6 +1126,14 @@ fn check_one_func(f: &Func, ctx: &TyCtx) -> Result<()> {
     // Reject unsupported decorators on top-level functions.
     validate_decorators(&f.decorators, f.span)?;
 
+    // An `@extern` function is a Rust-FFI binding: its body is an opaque Rust
+    // template string, not pyrst statements. Validate the binding shape (single
+    // string-literal body + fully-typed signature) and STOP — there is no pyrst
+    // body to type-check, and the template is validated by rustc at build.
+    if f.decorators.iter().any(|d| d == "extern") {
+        return validate_extern_func(f, ctx);
+    }
+
     let params: Vec<(String, Ty)> = f.params.iter()
         .filter(|p| p.name != "self")
         .map(|p| Ty::from_type_expr(&p.ty, p.span).map(|ty| (p.name.clone(), ty)))
@@ -1093,6 +1177,19 @@ fn check_class_prelude(c: &ClassDef) -> Result<()> {
 fn check_one_method(c: &ClassDef, method: &Func, ctx: &TyCtx) -> Result<()> {
     // Reject unsupported decorators on class methods.
     validate_decorators(&method.decorators, method.span)?;
+
+    // `@extern` is a Phase-1 binding for TOP-LEVEL std functions only. On a
+    // method it would interact with the `self` receiver and by-reference mode
+    // decisions, which are out of scope; reject it honestly here so it is caught
+    // at both `check` and `build` rather than silently mis-emitted.
+    if method.decorators.iter().any(|d| d == "extern") {
+        return Err(Error::Type {
+            span: method.span,
+            msg: "`@extern` is not supported on a method (it is for top-level \
+                  functions only); declare it as a free function"
+                .to_string(),
+        });
+    }
 
     // `__bool__` is listed among the dunder-trait names in codegen (so it is
     // skipped by the inherent-methods loop) but has no trait-impl arm, which
@@ -6313,5 +6410,110 @@ def g(y: int) -> int:
         let ctx = ctx_from_module(&m);
         let errs = check_all(&m, &ctx);
         assert_eq!(errs.len(), 1, "expected exactly 1 error, got: {:?}", errs);
+    }
+
+    // =========================================================================
+    // Category — @extern (Rust-FFI binding) validation
+    // =========================================================================
+
+    #[test]
+    fn validate_decorators_accepts_extern() {
+        // The whitelist must admit `@extern` (the body/typing of an @extern fn
+        // are validated separately by validate_extern_func).
+        assert!(validate_decorators(&["extern".to_string()], Span::DUMMY).is_ok());
+    }
+
+    #[test]
+    fn validate_decorators_still_rejects_unknown() {
+        // Regression guard: a non-whitelisted decorator is still rejected.
+        assert!(validate_decorators(&["bogus".to_string()], Span::DUMMY).is_err());
+    }
+
+    #[test]
+    fn extern_good_binding_type_checks() {
+        // A well-formed @extern (single string-literal body, fully-typed sig)
+        // passes typeck, and its declared signature lets a normal call site
+        // type-check through the ordinary path (no special-casing).
+        let src = "\
+@extern
+def shout(s: str) -> str:
+    \"{s}.to_uppercase()\"
+
+def main() -> None:
+    print(shout(\"hi\"))
+";
+        let m = crate::parser::parse(src).expect("parse");
+        let ctx = ctx_from_module(&m);
+        let errs = check_all(&m, &ctx);
+        assert!(errs.is_empty(), "well-formed @extern + call site must type-check, got: {:?}", errs);
+    }
+
+    #[test]
+    fn extern_non_string_body_rejected() {
+        // An @extern whose body is a normal statement (not a template string)
+        // is an honest typeck error.
+        let src = "\
+@extern
+def bad(s: str) -> str:
+    return s
+";
+        let m = crate::parser::parse(src).expect("parse");
+        let ctx = ctx_from_module(&m);
+        let errs = check_all(&m, &ctx);
+        assert!(!errs.is_empty(), "@extern with a non-template body must be rejected");
+        assert!(
+            errs.iter().any(|e| matches!(e, Error::Type { msg, .. } if msg.contains("single Rust-template string literal"))),
+            "error must name the single-template-string requirement, got: {:?}", errs
+        );
+    }
+
+    #[test]
+    fn extern_multi_statement_body_rejected() {
+        // The body must be EXACTLY ONE statement; a leading docstring + template
+        // (two string-literal statements) is still rejected.
+        let src = "\
+@extern
+def bad(s: str) -> str:
+    \"doc\"
+    \"{s}.to_uppercase()\"
+";
+        let m = crate::parser::parse(src).expect("parse");
+        let ctx = ctx_from_module(&m);
+        let errs = check_all(&m, &ctx);
+        assert!(!errs.is_empty(), "@extern with a multi-statement body must be rejected");
+    }
+
+    #[test]
+    fn extern_method_rejected() {
+        // @extern is for top-level functions only; on a method it is rejected.
+        let src = "\
+class C:
+    x: int
+    @extern
+    def m(self) -> int:
+        \"{self}.x\"
+";
+        let m = crate::parser::parse(src).expect("parse");
+        let ctx = ctx_from_module(&m);
+        let errs = check_all(&m, &ctx);
+        assert!(!errs.is_empty(), "@extern on a method must be rejected");
+        assert!(
+            errs.iter().any(|e| matches!(e, Error::Type { msg, .. } if msg.contains("not supported on a method"))),
+            "error must name the method restriction, got: {:?}", errs
+        );
+    }
+
+    #[test]
+    fn extern_by_ref_param_rejected() {
+        // A by-reference (`Mut[T]`) param is out of Phase-1 @extern scope.
+        let src = "\
+@extern
+def bump(n: Mut[int]) -> int:
+    \"{n} + 1\"
+";
+        let m = crate::parser::parse(src).expect("parse");
+        let ctx = ctx_from_module(&m);
+        let errs = check_all(&m, &ctx);
+        assert!(!errs.is_empty(), "@extern with a Mut[T] param must be rejected");
     }
 }

@@ -1348,6 +1348,48 @@ impl<'a> Codegen<'a> {
         let ret = Ty::from_type_expr(&f.ret, f.span)?;
         let ret_s = self.rust_ty(&ret);
         let _ = write!(sig, ") -> {} {{", ret_s);
+
+        // (FFI Phase 1) An `@extern` function is a Rust-FFI binding: its body is a
+        // single string-literal holding a Rust EXPRESSION TEMPLATE, not pyrst
+        // statements. We reuse the signature built above (same param + return
+        // types), then emit the substituted template as the function's TAIL
+        // expression and SKIP all the pyrst-body machinery below (prescan /
+        // hoisting / by-ref bookkeeping / body-statement loop). typeck has already
+        // verified the body shape and that the signature is fully typed, so the
+        // body[0] string extraction below cannot fail for a checked program.
+        if f.decorators.iter().any(|d| d == "extern") {
+            self.line(&sig);
+            self.indent += 1;
+            let template = match f.body.first() {
+                Some(Stmt::Expr(Expr::Str(s, _))) => s.clone(),
+                // Defensive: `build` may be invoked without a prior `check`, so
+                // re-assert the body shape here rather than panic on a bad AST.
+                _ => {
+                    return Err(crate::diag::Error::Codegen(
+                        "`@extern` function body must be a single Rust-template \
+                         string literal"
+                            .to_string(),
+                    ))
+                }
+            };
+            // Substitute each `{param}` hole with the param's emitted Rust
+            // identifier (`escape_ident` matches how call sites would name it).
+            // `self` is skipped (an @extern free function has none). Phase 1 does
+            // NOT handle `{{`/`}}` literal-brace escaping — the template is a
+            // direct expression and bare braces are uncommon there; documented.
+            let mut emitted = template;
+            for p in f.params.iter().filter(|p| p.name != "self") {
+                let hole = format!("{{{}}}", p.name);
+                emitted = emitted.replace(&hole, &escape_ident(&p.name));
+            }
+            // Tail expression: no trailing `;`, so the template value is returned.
+            self.line(&emitted);
+            self.indent -= 1;
+            self.line("}");
+            self.line("");
+            return Ok(());
+        }
+
         self.line(&sig);
         self.indent += 1;
         // (EPIC-5) Track the active return type for Some/None wrapping in `return`.
@@ -5886,5 +5928,42 @@ mod tests {
             cg.rust_ty(&Ty::List(Box::new(Ty::Class("Animal".into())))),
             "Vec<Animal__>"
         );
+    }
+
+    // ── @extern (Rust-FFI binding) emission ───────────────────────────────────
+
+    #[test]
+    fn extern_emits_substituted_template_as_tail_expr() {
+        // An @extern function emits the signature built from its declared types
+        // plus the template string with each `{param}` substituted for the Rust
+        // param identifier, as the function's tail expression.
+        let src = "\
+@extern
+def shout(s: str) -> str:
+    \"{s}.to_uppercase()\"
+
+@extern
+def repeat_str(s: str, n: int) -> str:
+    \"{s}.repeat({n} as usize)\"
+
+@extern
+def ipow(base: int, exp: int) -> int:
+    \"({base}).pow({exp} as u32)\"
+";
+        let out = emit_src(src);
+        // Signature uses the rust_ty mapping (Str -> String, Int -> i64).
+        assert!(out.contains("fn shout(mut s: String) -> String {"),
+            "extern signature must reuse the normal type mapping; got:\n{}", out);
+        // The `{s}` hole is substituted with the emitted param identifier.
+        assert!(out.contains("s.to_uppercase()"),
+            "template `{{s}}` must be substituted to `s.to_uppercase()`; got:\n{}", out);
+        // Multi-hole template: both holes substituted, author glue preserved.
+        assert!(out.contains("s.repeat(n as usize)"),
+            "multi-hole template must substitute both params; got:\n{}", out);
+        assert!(out.contains("(base).pow(exp as u32)"),
+            "ipow template must substitute base/exp; got:\n{}", out);
+        // The unsubstituted brace form must NOT survive into the emitted Rust.
+        assert!(!out.contains("{s}.to_uppercase()"),
+            "the literal `{{s}}` hole must not leak into output; got:\n{}", out);
     }
 }

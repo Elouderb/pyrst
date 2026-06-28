@@ -1,0 +1,25 @@
+# Rust interop / FFI — Phase 1 (std functions).
+#
+# A bare `@extern` decorator over a `def` whose body is a single string literal
+# declares a binding to a Rust function. The string is a Rust EXPRESSION TEMPLATE
+# in which each `{param}` hole is replaced with that parameter's Rust identifier.
+# The binding author writes the boundary glue (`as usize`, `as u32`, ...). The
+# template is opaque Rust: pyrst registers the declared signature so call sites
+# type-check normally, and rustc validates the template body at build time.
+
+@extern
+def shout(s: str) -> str:
+    "{s}.to_uppercase()"
+
+@extern
+def repeat_str(s: str, n: int) -> str:
+    "{s}.repeat({n} as usize)"
+
+@extern
+def ipow(base: int, exp: int) -> int:
+    "({base}).pow({exp} as u32)"
+
+def main() -> None:
+    print(shout("hello"))        # HELLO
+    print(repeat_str("ab", 3))   # ababab
+    print(ipow(2, 10))           # 1024

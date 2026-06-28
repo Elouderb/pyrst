@@ -22,6 +22,11 @@ pub enum TypeExpr {
     Named(String),                            // int, str, MyClass, etc.
     Generic(String, Vec<TypeExpr>),           // list[int], dict[str, int], tuple[int, str]
     Tuple(Vec<TypeExpr>),                     // (int, str) — tuple type
+    /// A first-class function type written `Callable[[Arg, ...], Ret]`. The
+    /// `Vec` is the (possibly empty) argument-type list; the `Box` is the return
+    /// type. Lowered to `Ty::Func` by `from_type_expr` and emitted as
+    /// `Rc<dyn Fn(Arg, ...) -> Ret>` by codegen.
+    Func(Vec<TypeExpr>, Box<TypeExpr>),
     None_,
 }
 

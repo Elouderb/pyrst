@@ -19,6 +19,11 @@ pub enum Ty {
     Tuple(Vec<Ty>),
     Option(Box<Ty>),
     Class(String),
+    /// A first-class function value: `Func(arg_types, ret_type)`. Spelled
+    /// `Callable[[Arg, ...], Ret]` in source and lowered to
+    /// `Rc<dyn Fn(Arg, ...) -> Ret>` by codegen. Covers both named function
+    /// references used as values and (capturing) lambdas.
+    Func(Vec<Ty>, Box<Ty>),
     File,            // an open file handle (open() / `with open(...) as f`)
     Unknown,
 }
@@ -45,6 +50,14 @@ impl std::fmt::Display for Ty {
             }
             Ty::Option(t) => write!(f, "{} | None", t),
             Ty::Class(n)  => write!(f, "{}", n),
+            Ty::Func(args, ret) => {
+                write!(f, "Callable[[")?;
+                for (i, a) in args.iter().enumerate() {
+                    if i > 0 { write!(f, ", ")?; }
+                    write!(f, "{}", a)?;
+                }
+                write!(f, "], {}]", ret)
+            }
             Ty::File      => write!(f, "file"),
             Ty::Unknown   => write!(f, "unknown"),
         }
@@ -126,6 +139,13 @@ impl Ty {
             TypeExpr::Tuple(parts) => {
                 let tys = parts.iter().map(|p| Ty::from_type_expr(p, span)).collect::<Result<Vec<_>>>()?;
                 Ty::Tuple(tys)
+            }
+            // `Callable[[Arg, ...], Ret]` -> `Ty::Func`. Each argument type and
+            // the return type lower recursively (so a `Callable` nested inside a
+            // `Callable` argument/return also resolves).
+            TypeExpr::Func(args, ret) => {
+                let arg_tys = args.iter().map(|a| Ty::from_type_expr(a, span)).collect::<Result<Vec<_>>>()?;
+                Ty::Func(arg_tys, Box::new(Ty::from_type_expr(ret, span)?))
             }
         })
     }
@@ -614,7 +634,15 @@ impl<'a> FuncEnv<'a> {
     fn lookup(&self, name: &str) -> Option<Ty> {
         self.locals.get(name).cloned()
             .or_else(|| self.ctx.vars.get(name).cloned())
-            .or_else(|| self.ctx.funcs.get(name).map(|sig| sig.ret.clone()))
+            // A bare reference to a top-level function NAME (used as a value, not
+            // a call) resolves to its first-class function type `Ty::Func`. The
+            // CALL paths look the signature up directly (Call arm / emit_call)
+            // and never reach here for a name they recognize, so this only fires
+            // when the name appears in a value position (`g = inc`, `apply(inc)`,
+            // `{"k": inc}`). Builtins with a synthetic sig (print/len/...) are
+            // included; that is harmless — they are never used as values in the
+            // corpus, and a call still routes through the dedicated builtin arms.
+            .or_else(|| self.ctx.funcs.get(name).map(func_sig_to_ty))
             .or_else(|| {
                 if self.ctx.classes.contains_key(name) {
                     Some(Ty::Class(name.to_string()))
@@ -623,6 +651,15 @@ impl<'a> FuncEnv<'a> {
                 }
             })
     }
+}
+
+/// Build the first-class function type `Ty::Func(arg_types, ret)` for a resolved
+/// function signature — the type of the function NAME when used as a value.
+fn func_sig_to_ty(sig: &FuncSig) -> Ty {
+    Ty::Func(
+        sig.params.iter().map(|(_, t)| t.clone()).collect(),
+        Box::new(sig.ret.clone()),
+    )
 }
 
 /// Validate that every decorator name in `decorators` is in the supported whitelist.
@@ -1220,6 +1257,10 @@ fn collect_calls_from_expr(expr: &Expr, called: &mut std::collections::HashSet<S
         Expr::Call { callee, args, .. } => {
             if let Expr::Ident(name, _) = callee.as_ref() {
                 called.insert(name.clone());
+            } else {
+                // A non-name callee (`ops["f"](x)`, `(make_adder(5))(10)`) may
+                // itself reference functions — traverse it so they stay alive.
+                collect_calls_from_expr(callee, called);
             }
             for arg in args { collect_calls_from_expr(arg, called); }
         }
@@ -1286,6 +1327,15 @@ fn collect_calls_from_expr(expr: &Expr, called: &mut std::collections::HashSet<S
             collect_calls_from_expr(test, called);
             collect_calls_from_expr(body, called);
             collect_calls_from_expr(orelse, called);
+        }
+        // (first-class functions) A bare name in a VALUE position keeps the
+        // function it refers to alive for dead-code elimination. `inc`/`double`
+        // passed to `apply_to_all` or stored in a dict are never the callee of a
+        // `Call`, so without this they would be pruned as "uncalled" and their
+        // `Rc::new(inc)` reference would dangle. Inserting non-function local
+        // names too is harmless: `dead_funcs` is built from `ctx.funcs` keys only.
+        Expr::Ident(name, _) => {
+            called.insert(name.clone());
         }
         _ => {}
     }
@@ -1359,6 +1409,22 @@ fn types_compatible(val_ty: &Ty, declared_ty: &Ty, ctx: &TyCtx) -> bool {
         //    recursing into the inner type). Codegen wraps the bare value in
         //    `Some(...)` at the site.
         (a, Ty::Option(b)) if !matches!(a, Ty::Option(_) | Ty::NoneVal) => types_compatible(a, b, ctx),
+        // ── Function values ──────────────────────────────────────────────────
+        // A `Ty::Func` value fits a `Ty::Func` slot when the arities match and
+        // each argument type and the return type are compatible. Argument
+        // positions are CONTRAVARIANT in theory, but pyrst's function values are
+        // monomorphic (`Rc<dyn Fn(A) -> R>`) and the only inexact case in
+        // Increment 1 is an `Unknown` from an untyped lambda parameter / body,
+        // which `types_compatible` already treats as universally compatible in
+        // either direction. So a direction-agnostic per-position check is both
+        // sound for the supported cases and permissive for the Unknown ones
+        // (e.g. a lambda inferred `Callable[[unknown], unknown]` fills a declared
+        // `Callable[[int], int]`).
+        (Ty::Func(va, vr), Ty::Func(da, dr)) => {
+            va.len() == da.len()
+                && va.iter().zip(da.iter()).all(|(v, d)| types_compatible(v, d, ctx))
+                && types_compatible(vr, dr, ctx)
+        }
         // Otherwise not compatible
         _ => false,
     }
@@ -1524,6 +1590,7 @@ pub fn is_copy(ty: &Ty) -> bool {
         | Ty::Set(_)
         | Ty::Dict(_, _)
         | Ty::Class(_)
+        | Ty::Func(_, _)
         | Ty::NoneVal
         | Ty::File
         | Ty::Unknown => false,
@@ -2135,6 +2202,11 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
             .get(n.as_str())
             .or_else(|| ctx.vars.get(n.as_str()))
             .cloned()
+            // A bare top-level function name in a value position infers to its
+            // first-class `Ty::Func` type (`g = inc` -> g: Callable[[int],int]).
+            // Locals/vars shadow it (checked first). Call sites never reach this
+            // arm for the callee — `Expr::Call` resolves the name itself.
+            .or_else(|| ctx.funcs.get(n.as_str()).map(func_sig_to_ty))
             .unwrap_or(Ty::Unknown),
         Expr::UnOp { op: UnOp::Neg, expr, .. } => infer_expr_ty(expr, locals, ctx),
         Expr::UnOp { op: UnOp::Not, .. } => Ty::Bool,
@@ -2252,12 +2324,20 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
                         }
                     }
                     n => {
-                        // A class constructor yields an instance; otherwise look
-                        // up the user function's declared return type.
+                        // A class constructor yields an instance; a named user
+                        // function yields its declared return type; a func-VALUED
+                        // local/param/var (`f: Callable[[int],int]`) called as
+                        // `f(x)` yields the function value's return type.
                         if ctx.classes.contains_key(n) {
                             Ty::Class(n.to_string())
+                        } else if let Some(ret) = ctx.funcs.get(n).map(|s| s.ret.clone()) {
+                            ret
+                        } else if let Some(Ty::Func(_, ret)) =
+                            locals.get(n).or_else(|| ctx.vars.get(n))
+                        {
+                            (**ret).clone()
                         } else {
-                            ctx.funcs.get(n).map(|s| s.ret.clone()).unwrap_or(Ty::Unknown)
+                            Ty::Unknown
                         }
                     }
                 }
@@ -2286,7 +2366,14 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
                     builtin_method_ret(&recv, name)
                 }
             } else {
-                Ty::Unknown
+                // Calling a function VALUE whose callee is an arbitrary expression
+                // (a lambda, an indexed slot `ops["double"]`, an attr, ...). Infer
+                // the callee's type and, if it is a `Ty::Func`, surface its return
+                // type so `ops["double"](7)` and `(make_adder(5))(10)` are typed.
+                match infer_expr_ty(callee, locals, ctx) {
+                    Ty::Func(_, ret) => *ret,
+                    _ => Ty::Unknown,
+                }
             }
         }
         Expr::List(elems, _) => {
@@ -2411,6 +2498,19 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
                 list_ty @ Ty::List(_) => list_ty,
                 _ => Ty::Unknown,
             }
+        }
+        // A lambda is a first-class function value. Its parameters carry no
+        // annotation in pyrst, so each argument type is `Unknown`; the return
+        // type is the body's type with the parameter names bound to `Unknown`.
+        // The result `Callable[[unknown, ...], body_ty]` is permissive — it fills
+        // any `Callable` slot of matching arity (see `types_compatible`).
+        Expr::Lambda { params, body, .. } => {
+            let mut inner = locals.clone();
+            for (name, _) in params {
+                inner.insert(name.clone(), Ty::Unknown);
+            }
+            let ret = infer_expr_ty(body, &inner, ctx);
+            Ty::Func(vec![Ty::Unknown; params.len()], Box::new(ret))
         }
         _ => Ty::Unknown,
     }
@@ -3074,16 +3174,51 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                     } else if name == "super" && args.is_empty() && kwargs.is_empty() {
                         // super() returns Unknown type — the codegen handles super().method() specially
                         Ty::Unknown
-                    } else if let Some(_local_ty) = env.lookup(name) {
-                        // Variable call: could be a lambda or any callable
-                        // Check arguments but return Unknown for the result type
-                        for a in args {
-                            check_expr(a, env)?;
-                        }
+                    } else if let Some(local_ty) = env.lookup(name) {
+                        // Calling a function-VALUED local/param by bare name
+                        // (`f(x)` where `f: Callable[[int], int]`). Check the
+                        // arguments first (for their own errors), then — if the
+                        // value's type is a `Ty::Func` — enforce arity and per-arg
+                        // compatibility and yield its return type. A non-Func
+                        // callable value (untyped lambda binding, Unknown) stays
+                        // permissive (Unknown), exactly as before.
+                        let arg_tys = args.iter()
+                            .map(|a| check_expr(a, env))
+                            .collect::<Result<Vec<_>>>()?;
                         for (_, v) in kwargs {
                             check_expr(v, env)?;
                         }
-                        Ty::Unknown
+                        if let Ty::Func(param_tys, ret) = &local_ty {
+                            if args.len() != param_tys.len() {
+                                return Err(Error::Type {
+                                    span: *span,
+                                    msg: format!(
+                                        "function value `{}` takes {} argument(s), {} given",
+                                        name, param_tys.len(), args.len()
+                                    ),
+                                });
+                            }
+                            for (i, (arg_ty, param_ty)) in arg_tys.iter().zip(param_tys.iter()).enumerate() {
+                                let int_to_float =
+                                    matches!(arg_ty, Ty::Int) && matches!(param_ty, Ty::Float);
+                                if !int_to_float
+                                    && !matches!(arg_ty, Ty::Unknown)
+                                    && !matches!(param_ty, Ty::Unknown)
+                                    && !types_compatible(arg_ty, param_ty, env.ctx)
+                                {
+                                    return Err(Error::Type {
+                                        span: *span,
+                                        msg: format!(
+                                            "argument {} to `{}`: expected {}, found {}",
+                                            i + 1, name, param_ty, arg_ty
+                                        ),
+                                    });
+                                }
+                            }
+                            (**ret).clone()
+                        } else {
+                            Ty::Unknown
+                        }
                     } else {
                         return Err(Error::Type {
                             span: *span,
@@ -3202,20 +3337,24 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                             return Ok(builtin_method_ret(&obj_ty, name.as_str()));
                         }
                     }
-                    // Inline lambda call `(lambda x: body)(args)`: the call's
-                    // value type is the lambda body type. The Lambda arm now
-                    // returns that body type (instead of Unknown), so for an
-                    // immediately-invoked lambda we surface it to the caller
-                    // rather than degrading to Unknown. Other callees (e.g. a
-                    // variable holding a value) remain Unknown — this only widens
-                    // inference and never narrows types_compatible.
-                    let callee_ty = check_expr(callee, env)?;
-                    for a in args { check_expr(a, env)?; }
-                    if matches!(callee.as_ref(), Expr::Lambda { .. }) {
-                        callee_ty
+                    // Calling a function VALUE whose callee is an arbitrary
+                    // expression (not a bare name or method). Two cases:
+                    //  - An inline lambda `(lambda x: body)(args)`: the call's
+                    //    value type is the lambda BODY type (computed directly so
+                    //    it is unaffected by the Lambda arm now yielding Ty::Func).
+                    //  - Any other func-valued callee (`ops["double"](7)`,
+                    //    `(make_adder(5))(10)`): the result is the function value's
+                    //    return type, surfaced from its `Ty::Func`.
+                    let result = if let Expr::Lambda { params, body, .. } = callee.as_ref() {
+                        lambda_body_ty(params, body, env)?
                     } else {
-                        Ty::Unknown
-                    }
+                        match check_expr(callee, env)? {
+                            Ty::Func(_, ret) => *ret,
+                            _ => Ty::Unknown,
+                        }
+                    };
+                    for a in args { check_expr(a, env)?; }
+                    result
                 }
             }
         }
@@ -3338,28 +3477,45 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
             }
         }
         Expr::Lambda { params, body, .. } => {
-            let mut lambda_env = FuncEnv {
-                ctx: env.ctx,
-                locals: env.locals.clone(),
-                ret_ty: Ty::Unknown,
-                used_vars: env.used_vars.clone(),
-                params: std::collections::HashSet::new(),
-                reassigned_params: std::collections::HashSet::new(),
-                returned_params: std::collections::HashSet::new(),
-                by_ref_params: std::collections::HashSet::new(),
-            };
-            for (param_name, param_ty) in params {
-                let ty = lambda_param_ty(param_ty);
-                lambda_env.locals.insert(param_name.clone(), ty);
-            }
-            // The lambda's value type is its body type. For an inline call
-            // `(lambda x: x + 1)(5)` this lets the caller see a concrete type
-            // instead of Unknown. Lambda params are untyped here (no annotation
-            // syntax), so a param-dependent body still yields Unknown — which is
-            // sound and never narrows types_compatible.
-            check_expr(body, &mut lambda_env)?
+            // The lambda's value type is its first-class function type
+            // `Callable[[unknown, ...], body_ty]`. Checking the body in a child
+            // env (params bound to Unknown) both validates the body for its own
+            // errors and yields the return type. Returning a `Ty::Func` (rather
+            // than the bare body type) is what lets a lambda flow into a declared
+            // `Callable` slot — assignment, argument, return, and dict/list value.
+            // The two inline-call paths (the Ident-callee Lambda branch and the
+            // `_`-callee branch in the Call arm) compute the body type DIRECTLY,
+            // so they are unaffected by this change.
+            let body_ty = lambda_body_ty(params, body, env)?;
+            Ty::Func(vec![Ty::Unknown; params.len()], Box::new(body_ty))
         }
     })
+}
+
+/// Type-check a lambda body in a child environment with each parameter bound to
+/// `Unknown` (pyrst lambda params are unannotated), returning the body's type.
+/// Shared by the `Expr::Lambda` value arm (which wraps it in `Ty::Func`) and the
+/// inline-invocation call paths (which surface the body type as the call result).
+fn lambda_body_ty(
+    params: &[(String, TypeExpr)],
+    body: &Expr,
+    env: &mut FuncEnv,
+) -> Result<Ty> {
+    let mut lambda_env = FuncEnv {
+        ctx: env.ctx,
+        locals: env.locals.clone(),
+        ret_ty: Ty::Unknown,
+        used_vars: env.used_vars.clone(),
+        params: std::collections::HashSet::new(),
+        reassigned_params: std::collections::HashSet::new(),
+        returned_params: std::collections::HashSet::new(),
+        by_ref_params: std::collections::HashSet::new(),
+    };
+    for (param_name, param_ty) in params {
+        let ty = lambda_param_ty(param_ty);
+        lambda_env.locals.insert(param_name.clone(), ty);
+    }
+    check_expr(body, &mut lambda_env)
 }
 
 // =============================================================================
@@ -5769,6 +5925,131 @@ class Derived(Base):
     fn display_tuple_int_str() {
         let ty = Ty::Tuple(vec![Ty::Int, Ty::Str]);
         assert_eq!(format!("{}", ty), "tuple[int, str]");
+    }
+
+    // ---- First-class functions (Increment 1) ------------------------------
+
+    #[test]
+    fn display_func_callable() {
+        // Ty::Func renders as the source `Callable[[args], ret]` form.
+        let ty = Ty::Func(vec![Ty::Int], Box::new(Ty::Int));
+        assert_eq!(format!("{}", ty), "Callable[[int], int]");
+        let two = Ty::Func(vec![Ty::Int, Ty::Str], Box::new(Ty::Bool));
+        assert_eq!(format!("{}", two), "Callable[[int, str], bool]");
+        let nullary = Ty::Func(vec![], Box::new(Ty::Unit));
+        assert_eq!(format!("{}", nullary), "Callable[[], None]");
+    }
+
+    #[test]
+    fn from_type_expr_callable() {
+        // `Callable[[int], int]` lowers to Ty::Func([Int], Int).
+        let te = TypeExpr::Func(
+            vec![TypeExpr::Named("int".into())],
+            Box::new(TypeExpr::Named("int".into())),
+        );
+        let ty = Ty::from_type_expr(&te, Span::DUMMY).expect("Callable lowers");
+        assert_eq!(ty, Ty::Func(vec![Ty::Int], Box::new(Ty::Int)));
+    }
+
+    #[test]
+    fn func_name_used_as_value_infers_func_ty() {
+        // A bare reference to a top-level function name (used as a VALUE) infers
+        // to its first-class Ty::Func type, NOT its return type.
+        let src = "\
+def inc(x: int) -> int:
+    return x + 1
+
+def main() -> None:
+    g: Callable[[int], int] = inc
+    print(g(2))
+";
+        let m = crate::parser::parse(src).expect("parse");
+        let ctx = ctx_from_module(&m);
+        let locals = HashMap::new();
+        let ty = infer_expr_ty(&Expr::Ident("inc".into(), Span::DUMMY), &locals, &ctx);
+        assert_eq!(ty, Ty::Func(vec![Ty::Int], Box::new(Ty::Int)));
+    }
+
+    #[test]
+    fn func_compatibility_arity_args_ret() {
+        let ctx = TyCtx::new();
+        let int_to_int = Ty::Func(vec![Ty::Int], Box::new(Ty::Int));
+        // Exact match.
+        assert!(super::types_compatible(&int_to_int, &int_to_int, &ctx));
+        // An untyped-lambda value `Callable[[unknown], unknown]` fills a declared
+        // `Callable[[int], int]` (Unknown is universally compatible).
+        let unknown_fn = Ty::Func(vec![Ty::Unknown], Box::new(Ty::Unknown));
+        assert!(super::types_compatible(&unknown_fn, &int_to_int, &ctx));
+        // Arity mismatch is rejected.
+        let two_arg = Ty::Func(vec![Ty::Int, Ty::Int], Box::new(Ty::Int));
+        assert!(!super::types_compatible(&two_arg, &int_to_int, &ctx));
+        // Concrete return mismatch is rejected.
+        let int_to_str = Ty::Func(vec![Ty::Int], Box::new(Ty::Str));
+        assert!(!super::types_compatible(&int_to_str, &int_to_int, &ctx));
+        // Concrete arg mismatch is rejected.
+        let str_to_int = Ty::Func(vec![Ty::Str], Box::new(Ty::Int));
+        assert!(!super::types_compatible(&str_to_int, &int_to_int, &ctx));
+    }
+
+    #[test]
+    fn lambda_infers_func_ty() {
+        // A lambda value infers to Ty::Func with Unknown-typed params.
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        // lambda x: x  ->  Callable[[unknown], unknown]
+        let lam = Expr::Lambda {
+            params: vec![("x".into(), TypeExpr::Named("Any".into()))],
+            body: Box::new(Expr::Ident("x".into(), Span::DUMMY)),
+            span: Span::DUMMY,
+        };
+        let ty = check_expr(&lam, &mut env).expect("lambda checks");
+        assert_eq!(ty, Ty::Func(vec![Ty::Unknown], Box::new(Ty::Unknown)));
+    }
+
+    #[test]
+    fn higher_order_module_typechecks() {
+        // The full Increment-1 acceptance shape must type-check cleanly: a
+        // Callable param, a Callable return with a capturing lambda, a
+        // dict[str, Callable], and calls of function values.
+        let src = "\
+def inc(x: int) -> int:
+    return x + 1
+
+def apply_to_all(f: Callable[[int], int], xs: list[int]) -> list[int]:
+    out: list[int] = []
+    for x in xs:
+        out.append(f(x))
+    return out
+
+def make_adder(n: int) -> Callable[[int], int]:
+    return lambda x: x + n
+
+def main() -> None:
+    nums: list[int] = [1, 2, 3]
+    print(apply_to_all(inc, nums))
+    add5: Callable[[int], int] = make_adder(5)
+    print(add5(10))
+    ops: dict[str, Callable[[int], int]] = {\"inc\": inc}
+    print(ops[\"inc\"](7))
+";
+        let m = crate::parser::parse(src).expect("parse");
+        let ctx = ctx_from_module(&m);
+        let errs = check_all(&m, &ctx);
+        assert!(errs.is_empty(), "first-class fn module must type-check, got: {:?}", errs);
+    }
+
+    #[test]
+    fn func_value_call_arity_mismatch_rejected() {
+        // Calling a Callable-typed value with the wrong argument count is an
+        // honest typeck error (not a deferred rustc failure).
+        let src = "\
+def apply(f: Callable[[int], int]) -> int:
+    return f(1, 2)
+";
+        let m = crate::parser::parse(src).expect("parse");
+        let ctx = ctx_from_module(&m);
+        let errs = check_all(&m, &ctx);
+        assert!(!errs.is_empty(), "wrong-arity call of a function value must error");
     }
 
     #[test]

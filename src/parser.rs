@@ -787,47 +787,11 @@ impl Parser {
     }
 
     fn parse_type(&mut self) -> Result<TypeExpr> {
-        let mut ty = if matches!(self.peek(), Tok::None_) {
-            self.bump();
-            TypeExpr::None_
-        } else {
-            let name = self.expect_ident("type name")?;
-            if self.eat(&Tok::LBracket) {
-                let mut args = Vec::new();
-                if !matches!(self.peek(), Tok::RBracket) {
-                    loop {
-                        args.push(self.parse_type()?);
-                        if !self.eat(&Tok::Comma) { break; }
-                    }
-                }
-                self.expect(&Tok::RBracket, "generic type args")?;
-                TypeExpr::Generic(name, args)
-            } else {
-                TypeExpr::Named(name)
-            }
-        };
+        let mut ty = self.parse_type_atom()?;
 
         // Handle union syntax: T | U
         while self.eat(&Tok::Pipe) {
-            let rhs = if matches!(self.peek(), Tok::None_) {
-                self.bump();
-                TypeExpr::None_
-            } else {
-                let name = self.expect_ident("type name")?;
-                if self.eat(&Tok::LBracket) {
-                    let mut args = Vec::new();
-                    if !matches!(self.peek(), Tok::RBracket) {
-                        loop {
-                            args.push(self.parse_type()?);
-                            if !self.eat(&Tok::Comma) { break; }
-                        }
-                    }
-                    self.expect(&Tok::RBracket, "generic type args")?;
-                    TypeExpr::Generic(name, args)
-                } else {
-                    TypeExpr::Named(name)
-                }
-            };
+            let rhs = self.parse_type_atom()?;
 
             // Fold: T | None → Optional(T); None | T → Optional(T)
             ty = match (&ty, &rhs) {
@@ -838,6 +802,62 @@ impl Parser {
         }
 
         Ok(ty)
+    }
+
+    /// Parse a single (non-union) type term: `None`, a bare name, a generic
+    /// `name[args...]`, or the function type `Callable[[Arg, ...], Ret]`. Shared
+    /// by both sides of a `T | U` union so every form is accepted in either
+    /// position. Recurses through `parse_type` for nested args, so a `Callable`
+    /// may appear inside another generic (`dict[str, Callable[[int], int]]`).
+    fn parse_type_atom(&mut self) -> Result<TypeExpr> {
+        if matches!(self.peek(), Tok::None_) {
+            self.bump();
+            return Ok(TypeExpr::None_);
+        }
+        let name = self.expect_ident("type name")?;
+        // `Callable[[Arg, ...], Ret]`: the first bracketed element is itself a
+        // bracketed argument-type LIST, the second is the return type. This is a
+        // distinct shape from an ordinary `name[arg, ...]` generic (whose args
+        // are plain types), so it is parsed here rather than via the generic path.
+        if name == "Callable" {
+            return self.parse_callable_tail();
+        }
+        if self.eat(&Tok::LBracket) {
+            let mut args = Vec::new();
+            if !matches!(self.peek(), Tok::RBracket) {
+                loop {
+                    args.push(self.parse_type()?);
+                    if !self.eat(&Tok::Comma) { break; }
+                }
+            }
+            self.expect(&Tok::RBracket, "generic type args")?;
+            Ok(TypeExpr::Generic(name, args))
+        } else {
+            Ok(TypeExpr::Named(name))
+        }
+    }
+
+    /// Parse the part of a `Callable` type after the `Callable` name:
+    /// `[[Arg, ...], Ret]`. The leading `[` opens the Callable subscript; the
+    /// first element is a bracketed `[Arg, ...]` argument list (possibly empty);
+    /// after a comma comes the single return type; a closing `]` ends the
+    /// Callable. Produces `TypeExpr::Func(args, ret)`.
+    fn parse_callable_tail(&mut self) -> Result<TypeExpr> {
+        self.expect(&Tok::LBracket, "Callable type")?;
+        // The argument-type list `[Arg, ...]`.
+        self.expect(&Tok::LBracket, "Callable argument-type list")?;
+        let mut args = Vec::new();
+        if !matches!(self.peek(), Tok::RBracket) {
+            loop {
+                args.push(self.parse_type()?);
+                if !self.eat(&Tok::Comma) { break; }
+            }
+        }
+        self.expect(&Tok::RBracket, "Callable argument-type list")?;
+        self.expect(&Tok::Comma, "Callable return type")?;
+        let ret = self.parse_type()?;
+        self.expect(&Tok::RBracket, "Callable type")?;
+        Ok(TypeExpr::Func(args, Box::new(ret)))
     }
 
     fn eat_newline(&mut self) -> Result<()> {
@@ -1428,6 +1448,64 @@ mod tests {
         let src = "def f(x: int) -> int:\n    if x > 0:\n        return x\n    else:\n        return 0\n";
         let m = parse(src).unwrap();
         assert_eq!(m.stmts.len(), 1);
+    }
+
+    // ── First-class function types (Callable) ─────────────────────────────────
+
+    #[test]
+    fn parse_callable_param_and_return() {
+        // `Callable[[int], int]` must parse in both a parameter and a return
+        // annotation, producing `TypeExpr::Func([int], int)`.
+        let src = "def apply(f: Callable[[int], int], x: int) -> Callable[[int], int]:\n    return f\n";
+        let m = parse(src).unwrap();
+        let func = match &m.stmts[0] {
+            Stmt::Func(f) => f,
+            other => panic!("expected a function, got {:?}", other),
+        };
+        let int_to_int = TypeExpr::Func(
+            vec![TypeExpr::Named("int".into())],
+            Box::new(TypeExpr::Named("int".into())),
+        );
+        assert_eq!(func.params[0].ty, int_to_int, "Callable param must parse to TypeExpr::Func");
+        assert_eq!(func.ret, int_to_int, "Callable return must parse to TypeExpr::Func");
+    }
+
+    #[test]
+    fn parse_callable_nested_in_generic() {
+        // `dict[str, Callable[[int], int]]` must parse — the Callable form is
+        // accepted as a nested generic argument, not just at the top level.
+        let src = "def f(ops: dict[str, Callable[[int], int]]) -> None:\n    pass\n";
+        let m = parse(src).unwrap();
+        let func = match &m.stmts[0] {
+            Stmt::Func(f) => f,
+            other => panic!("expected a function, got {:?}", other),
+        };
+        let expected = TypeExpr::Generic(
+            "dict".into(),
+            vec![
+                TypeExpr::Named("str".into()),
+                TypeExpr::Func(
+                    vec![TypeExpr::Named("int".into())],
+                    Box::new(TypeExpr::Named("int".into())),
+                ),
+            ],
+        );
+        assert_eq!(func.params[0].ty, expected);
+    }
+
+    #[test]
+    fn parse_callable_no_args() {
+        // The empty argument list `Callable[[], R]` parses to Func([], R).
+        let src = "def f(g: Callable[[], int]) -> None:\n    pass\n";
+        let m = parse(src).unwrap();
+        let func = match &m.stmts[0] {
+            Stmt::Func(f) => f,
+            other => panic!("expected a function, got {:?}", other),
+        };
+        assert_eq!(
+            func.params[0].ty,
+            TypeExpr::Func(vec![], Box::new(TypeExpr::Named("int".into()))),
+        );
     }
 
     // ── AugAssign ────────────────────────────────────────────────────────────

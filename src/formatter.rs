@@ -535,6 +535,13 @@ impl Formatter {
                     .join(", ");
                 format!("({})", type_strs)
             }
+            TypeExpr::Func(args, ret) => {
+                let arg_strs = args.iter()
+                    .map(|a| self.format_type(a))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("Callable[[{}], {}]", arg_strs, self.format_type(ret))
+            }
             TypeExpr::None_ => "None".to_string(),
         }
     }

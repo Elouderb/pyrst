@@ -1,0 +1,23 @@
+def inc(x: int) -> int:
+    return x + 1
+
+def double(x: int) -> int:
+    return x * 2
+
+def apply_to_all(f: Callable[[int], int], xs: list[int]) -> list[int]:
+    out: list[int] = []
+    for x in xs:
+        out.append(f(x))
+    return out
+
+def make_adder(n: int) -> Callable[[int], int]:
+    return lambda x: x + n
+
+def main() -> None:
+    nums: list[int] = [1, 2, 3]
+    print(apply_to_all(inc, nums))
+    print(apply_to_all(double, nums))
+    add5: Callable[[int], int] = make_adder(5)
+    print(add5(10))
+    ops: dict[str, Callable[[int], int]] = {"inc": inc, "double": double}
+    print(ops["double"](7))

@@ -380,6 +380,21 @@ impl<'a> Codegen<'a> {
         }
     }
 
+    /// (first-class functions) True iff `ty` is a function type or a collection
+    /// whose element / value type is one — i.e. a slot of this type contains an
+    /// `Rc<dyn Fn>` position into which a bare function NAME or lambda must be
+    /// wrapped (`emit_into_func_slot`). When false the slot has no function
+    /// position and the legacy clone-on-use path is used unchanged.
+    fn ty_has_func(&self, ty: &Ty) -> bool {
+        match ty {
+            Ty::Func(..) => true,
+            Ty::List(e) | Ty::Set(e) | Ty::Option(e) => self.ty_has_func(e),
+            Ty::Dict(k, v) => self.ty_has_func(k) || self.ty_has_func(v),
+            Ty::Tuple(ts) => ts.iter().any(|t| self.ty_has_func(t)),
+            _ => false,
+        }
+    }
+
     /// If `e` is a constructor call `C(...)` for a user class `C`, return `C`.
     /// (Mirrors `infer_expr_ty`'s constructor recognition: a Call whose callee is
     /// a bare Ident registered in `ctx.classes`.) Used to disambiguate a RAW
@@ -521,6 +536,97 @@ impl<'a> Codegen<'a> {
         match slot {
             Some(t) if self.ty_has_poly_base(t) => self.emit_into_base_slot(arg, t),
             _ => self.emit_consuming(arg),
+        }
+    }
+
+    /// (first-class functions) Emit value expression `value` into a slot whose
+    /// declared type `expected` is `Ty::Func(arg_tys, ret)` — i.e. a
+    /// `Rc<dyn Fn(..) -> ..>` slot. Three shapes:
+    ///
+    ///  - A bare top-level function NAME used as a value: a Rust `fn` item
+    ///    coerces to `dyn Fn`, so emit `Rc::new(<name>) as Rc<dyn Fn(..)->..>`.
+    ///    The trailing `as` cast pins the type at the slot so an unannotated
+    ///    binding / collection element is still well-typed.
+    ///  - A LAMBDA: emit `Rc::new(move |x: A, y: B| body) as Rc<dyn Fn(..)->..>`.
+    ///    Capture-by-move closes over any enclosing variable (the `make_adder`
+    ///    closure captures `n`); the param TYPES come from the slot's `arg_tys`
+    ///    so the closure body type-checks without inference from a call site.
+    ///  - Anything else already of `Ty::Func` (a func-valued place, or a call
+    ///    that already returns `Rc<dyn Fn>`): clone-on-use, which is a cheap `Rc`
+    ///    refcount bump for a place and a pass-through for an owned temp.
+    fn emit_into_func_slot(&mut self, value: &Expr, expected: &Ty) -> Result<String> {
+        // A collection slot whose element / value type is a function
+        // (`list[Callable[..]]`, `dict[K, Callable[..]]`) wraps each element /
+        // value into the `Rc<dyn Fn>` slot — only when the source is the matching
+        // LITERAL (so the element types are known here); a non-literal collection
+        // is already `Rc<dyn Fn>`-typed and passes through via clone-on-use.
+        match expected {
+            Ty::List(elem) if matches!(**elem, Ty::Func(..)) => {
+                if let Expr::List(elems, _) = value {
+                    let mut parts = Vec::with_capacity(elems.len());
+                    for el in elems {
+                        parts.push(self.emit_into_func_slot(el, elem)?);
+                    }
+                    return Ok(format!("vec![{}]", parts.join(", ")));
+                }
+                return self.emit_consuming(value);
+            }
+            Ty::Dict(_k, vv) if matches!(**vv, Ty::Func(..)) => {
+                if let Expr::Dict(pairs, _) = value {
+                    if pairs.is_empty() {
+                        return Ok("::std::collections::HashMap::new()".to_string());
+                    }
+                    let mut inserts = Vec::with_capacity(pairs.len());
+                    for (k, v) in pairs {
+                        let ks = self.emit_consuming(k)?;
+                        let vs = self.emit_into_func_slot(v, vv)?;
+                        inserts.push(format!("({}, {})", ks, vs));
+                    }
+                    return Ok(format!(
+                        "vec![{}].into_iter().collect::<::std::collections::HashMap<_,_>>()",
+                        inserts.join(", ")
+                    ));
+                }
+                return self.emit_consuming(value);
+            }
+            _ => {}
+        }
+        let Ty::Func(arg_tys, _ret) = expected else {
+            return self.emit_consuming(value);
+        };
+        let rc_ty = self.rust_ty(expected);
+        match value {
+            // A function NAME used as a value (must be a known top-level function,
+            // not a local that happens to share the name — locals shadow and are
+            // already `Rc<dyn Fn>` values handled by the clone-on-use arm below).
+            Expr::Ident(n, _)
+                if self.ctx.funcs.contains_key(n.as_str())
+                    && !self.locals.contains_key(n.as_str()) =>
+            {
+                Ok(format!("::std::rc::Rc::new({}) as {}", escape_ident(n), rc_ty))
+            }
+            Expr::Lambda { params, body, .. } => {
+                // Annotate each closure param with the slot's argument type so the
+                // `move` closure is well-typed at a `dyn Fn` coercion (Rust cannot
+                // infer closure param types across the boxed-trait-object cast).
+                let param_strs: Vec<String> = params
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (name, _))| {
+                        let pty = arg_tys.get(i).cloned().unwrap_or(Ty::Unknown);
+                        format!("{}: {}", escape_ident(name), self.rust_ty(&pty))
+                    })
+                    .collect();
+                let body_s = self.emit_expr(body)?;
+                Ok(format!(
+                    "::std::rc::Rc::new(move |{}| {}) as {}",
+                    param_strs.join(", "),
+                    body_s,
+                    rc_ty
+                ))
+            }
+            // A func-valued place / call temp — Rc clone (value semantics) / passthrough.
+            _ => self.emit_consuming(value),
         }
     }
 
@@ -2371,10 +2477,16 @@ impl<'a> Codegen<'a> {
                     // (EPIC-5 C2-2b-i) `return dog` from a `-> Animal` function —
                     // a raw-struct value into a polymorphic-base `Animal__` return
                     // slot is WRAPPED in the right variant (replaces the C1 gate).
-                    // Non-polymorphic returns keep the uniform clone-on-use path: a
+                    // (first-class functions) `return lambda x: x + n` /
+                    // `return inc` from a `-> Callable[..]` function — wrap the
+                    // lambda/name into the `Rc<dyn Fn>` return slot. Non-poly,
+                    // non-func returns keep the uniform clone-on-use path: a
                     // non-Copy place (variable, field, index) is deep-cloned so the
                     // returned value is independent of the binding.
-                    let s = if self.ty_has_poly_base(&self.current_ret_ty) {
+                    let s = if matches!(self.current_ret_ty, Ty::Func(..)) {
+                        let ret_ty = self.current_ret_ty.clone();
+                        self.emit_into_func_slot(e, &ret_ty)?
+                    } else if self.ty_has_poly_base(&self.current_ret_ty) {
                         let ret_ty = self.current_ret_ty.clone();
                         self.emit_into_base_slot(e, &ret_ty)?
                     } else {
@@ -2406,8 +2518,13 @@ impl<'a> Codegen<'a> {
                             // (EPIC-5 C2-2b-i) `a: Animal = Account(...)` — a raw
                             // struct into a polymorphic-base `Animal__` slot is
                             // WRAPPED in the right variant (replaces the C1 gate).
-                            // Non-polymorphic slots keep the clone-on-use emission.
-                            let v = if self.ty_has_poly_base(&ty_obj) {
+                            // (first-class functions) `g: Callable[..] = inc` /
+                            // `= lambda ...` — wrap a function NAME or lambda into
+                            // the `Rc<dyn Fn>` slot. Non-poly, non-func slots keep
+                            // the clone-on-use emission.
+                            let v = if self.ty_has_func(&ty_obj) {
+                                self.emit_into_func_slot(value, &ty_obj)?
+                            } else if self.ty_has_poly_base(&ty_obj) {
                                 self.emit_into_base_slot(value, &ty_obj)?
                             } else {
                                 self.emit_consuming(value)?
@@ -3083,9 +3200,12 @@ impl<'a> Codegen<'a> {
                     }
                     // (EPIC-5 C2-2b-i) A raw-struct argument into a polymorphic-base
                     // parameter (`feed(dog)` where `feed(a: Animal)`) is WRAPPED in
-                    // the right `Animal__` variant (replaces the C1 gate). A
-                    // non-polymorphic param keeps the clone-on-use emission.
+                    // the right `Animal__` variant (replaces the C1 gate).
+                    // (first-class functions) A function NAME / lambda argument into
+                    // a `Callable[..]` parameter (`apply_to_all(inc, ..)`) is wrapped
+                    // into the `Rc<dyn Fn>` slot. Other params keep clone-on-use.
                     let s = match param_tys.get(i) {
+                        Some(pt @ Ty::Func(..)) => self.emit_into_func_slot(a, pt)?,
                         Some(pt) if self.ty_has_poly_base(pt) => self.emit_into_base_slot(a, pt)?,
                         _ => self.emit_consuming(a)?,
                     };
@@ -5076,6 +5196,17 @@ impl<'a> Codegen<'a> {
                 }
             }
             Ty::Option(inner) => format!("Option<{}>", self.rust_ty(inner)),
+            // A first-class function value lowers to a reference-counted boxed
+            // closure `Rc<dyn Fn(A, B) -> R>`. `Rc` is `Clone`, so it round-trips
+            // through pyrst's value semantics (clone-on-use = a cheap refcount
+            // bump that shares the same callable) and is storable in a list/dict,
+            // passable as an argument, and returnable. A `() -> R` return is
+            // omitted in Rust only for `()`, but writing `-> ()` is also valid and
+            // keeps the formatting uniform.
+            Ty::Func(args, ret) => {
+                let arg_strs = args.iter().map(|a| self.rust_ty(a)).collect::<Vec<_>>().join(", ");
+                format!("::std::rc::Rc<dyn Fn({}) -> {}>", arg_strs, self.rust_ty(ret))
+            }
             Ty::Class(n) => {
                 // (EPIC-5 C2-2b-i) Polymorphism activation. A class that is a
                 // polymorphic base (has ≥1 subclass in this unit) lowers to its

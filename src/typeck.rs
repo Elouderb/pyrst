@@ -1376,6 +1376,15 @@ fn collect_calls_from_expr(expr: &Expr, called: &mut std::collections::HashSet<S
         Expr::Call { callee, args, .. } => {
             if let Expr::Ident(name, _) = callee.as_ref() {
                 called.insert(name.clone());
+            } else if let Expr::Attr { obj, name, .. } = callee.as_ref() {
+                // A qualified module call `X.f(...)` lowers to a flat `f(...)`, so
+                // register `f` to keep the module function alive through dead-code
+                // elimination (otherwise it is pruned and codegen emits a call to a
+                // function that was never output -> rustc "cannot find function f").
+                // Harmless for a true method call (only over-keeps a same-named
+                // top-level function).
+                called.insert(name.clone());
+                collect_calls_from_expr(obj, called);
             } else {
                 // A non-name callee (`ops["f"](x)`, `(make_adder(5))(10)`) may
                 // itself reference functions — traverse it so they stay alive.

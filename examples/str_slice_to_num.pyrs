@@ -1,0 +1,7 @@
+def main() -> None:
+    s: str = "100200300"
+    a: int = int(s[0:3])
+    b: int = int(s[3:6])
+    c: float = float(s[6:9])
+    print(a + b)
+    print(c / 2.0)

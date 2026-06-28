@@ -29,8 +29,7 @@ def tokenize(src: str) -> list[Token]:
             start: int = i
             while i < n and (src[i].isdigit() or src[i] == "."):
                 i += 1
-            numstr: str = src[start:i]
-            tokens.append(Token("num", float(int(numstr))))
+            tokens.append(Token("num", float(src[start:i])))
         else:
             raise ValueError("unexpected character")
     tokens.append(Token("end", 0.0))

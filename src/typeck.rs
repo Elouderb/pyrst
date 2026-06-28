@@ -2400,6 +2400,18 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
                 _ => Ty::Unknown,
             }
         }
+        Expr::Slice { obj, .. } => {
+            // A slice yields the SAME container kind: str -> str (substring),
+            // list[T] -> list[T] (sublist). Without this arm a slice fell through
+            // to Unknown, so an inline `int(s[a:b])` / `float(s[a:b])` took the
+            // numeric-cast path and miscompiled (`String as i64`) — the oracle had
+            // an Index arm but no Slice arm.
+            match infer_expr_ty(obj, locals, ctx) {
+                Ty::Str => Ty::Str,
+                list_ty @ Ty::List(_) => list_ty,
+                _ => Ty::Unknown,
+            }
+        }
         _ => Ty::Unknown,
     }
 }

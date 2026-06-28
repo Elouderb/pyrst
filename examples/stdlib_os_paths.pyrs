@@ -1,0 +1,13 @@
+# Stdlib `os` path helpers (card 552d2c11): the embedded `os` module's Phase-1
+# path functions, exercised via the `from os import f` flat form. `os` is the
+# REAL embedded module (lib/os.pyrs -> include_str! -> src/stdlib.rs); there is
+# no local `os.pyrs` next to this file.
+#
+# Deterministic on the Linux test harness (pure path-string math, no filesystem
+# state): `join` uses the POSIX separator and `dirname` returns the parent path.
+from os import join, dirname
+
+
+def main() -> None:
+    print(join("a", "b"))            # a/b
+    print(dirname("/a/b/c.txt"))     # /a/b

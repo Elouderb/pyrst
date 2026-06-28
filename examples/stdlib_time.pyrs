@@ -1,0 +1,16 @@
+# Stdlib `time` (card 552d2c11): the embedded `time` module over std::time /
+# std::thread, via the `from time import f` flat form. `time` is embedded
+# (lib/time.pyrs -> include_str! -> src/stdlib.rs); no local `time.pyrs` here.
+#
+# DETERMINISTIC by design: exact clock values are never asserted. Instead we
+# prove BEHAVIOR — wall-clock time is positive, sleep(0.0) builds + runs, and a
+# monotonic perf_counter never goes backwards across a call.
+from time import time, sleep, perf_counter
+
+
+def main() -> None:
+    print(time() > 0.0)              # True
+    a: float = perf_counter()
+    sleep(0.0)
+    b: float = perf_counter()
+    print(b >= a)                    # True

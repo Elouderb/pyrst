@@ -1,0 +1,33 @@
+# pyrst standard library — time
+#
+# Phase-1 `time` module: `@extern` bindings over `std::time` and `std::thread`.
+# Embedded into the compiler binary via `include_str!` (see `src/stdlib.rs`), so
+# it travels with the binary and needs no filesystem install. Usable as either
+# `from time import time, sleep` or `import time; time.time()`.
+#
+# Notes:
+#   - `time()` is wall-clock seconds since the Unix epoch (a float), matching
+#     CPython's `time.time()`. It can move backwards if the system clock is
+#     adjusted, so for elapsed-time measurement prefer `perf_counter()`.
+#   - `perf_counter()` is a MONOTONIC high-resolution clock in seconds. It is
+#     anchored to a process-local `Instant` captured on first call (via a
+#     `OnceLock`), so successive calls are non-decreasing; only DIFFERENCES are
+#     meaningful (the absolute value has no defined zero across runs), exactly
+#     like CPython.
+#   - `sleep(secs)` suspends the current thread for `secs` seconds (fractional
+#     ok); `sleep(0.0)` is a valid no-op-ish yield.
+
+
+@extern
+def time() -> float:
+    "std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64()"
+
+
+@extern
+def perf_counter() -> float:
+    "{ static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new(); START.get_or_init(std::time::Instant::now).elapsed().as_secs_f64() }"
+
+
+@extern
+def sleep(secs: float) -> None:
+    "std::thread::sleep(std::time::Duration::from_secs_f64({secs}))"

@@ -1,0 +1,14 @@
+# Stdlib `statistics` (card 552d2c11): the embedded pure-pyrst `statistics`
+# module over list[float], via the `from statistics import f` flat form.
+# `statistics` is embedded (lib/statistics.pyrs -> include_str! ->
+# src/stdlib.rs); no local `statistics.pyrs` here.
+#
+# Deterministic: chosen inputs give exact, separator-independent float output.
+#   mean([1.0, 2.0, 3.0, 4.0])  = 10.0 / 4 = 2.5
+#   median([3.0, 1.0, 2.0])     = middle of sorted [1,2,3] = 2.0
+from statistics import mean, median
+
+
+def main() -> None:
+    print(mean([1.0, 2.0, 3.0, 4.0]))     # 2.5
+    print(median([3.0, 1.0, 2.0]))        # 2.0

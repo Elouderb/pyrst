@@ -1,0 +1,55 @@
+# pyrst standard library — operator
+#
+# Pure-pyrst function forms of the standard operators, so the operators become
+# first-class VALUES usable with higher-order functions (`reduce`, `map`, ...).
+# Embedded via `include_str!` (see `src/stdlib.rs`). Usable as either
+# `from operator import add` or `import operator; operator.add(2, 3)`.
+#
+# Phase-1 limit: int-specialized. pyrst generics are a later card, so these take
+# and return `int`. (A float/str overload set arrives with generics.) `mod` is
+# spelled `mod_` to stay clear of any reserved word; the others mirror CPython's
+# `operator` names.
+
+
+def add(a: int, b: int) -> int:
+    return a + b
+
+
+def sub(a: int, b: int) -> int:
+    return a - b
+
+
+def mul(a: int, b: int) -> int:
+    return a * b
+
+
+def floordiv(a: int, b: int) -> int:
+    return a // b
+
+
+def mod_(a: int, b: int) -> int:
+    return a % b
+
+
+def lt(a: int, b: int) -> bool:
+    return a < b
+
+
+def le(a: int, b: int) -> bool:
+    return a <= b
+
+
+def gt(a: int, b: int) -> bool:
+    return a > b
+
+
+def ge(a: int, b: int) -> bool:
+    return a >= b
+
+
+def eq(a: int, b: int) -> bool:
+    return a == b
+
+
+def ne(a: int, b: int) -> bool:
+    return a != b

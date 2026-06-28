@@ -1,0 +1,13 @@
+# Stdlib `operator` (card 552d2c11): the embedded pure-pyrst `operator` module's
+# int-specialized operator functions, via the `from operator import f` flat
+# form. `operator` is embedded (lib/operator.pyrs -> include_str! ->
+# src/stdlib.rs); no local `operator.pyrs` here.
+#
+# Deterministic: pure integer arithmetic / comparisons.
+from operator import add, mul, lt
+
+
+def main() -> None:
+    print(add(2, 3))     # 5
+    print(mul(4, 5))     # 20
+    print(lt(2, 3))      # True

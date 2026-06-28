@@ -23,6 +23,10 @@
 /// time, so this map is fully static (no filesystem read at runtime).
 pub const EMBEDDED_STDLIB: &[(&str, &str)] = &[
     ("os", include_str!("../lib/os.pyrs")),
+    ("time", include_str!("../lib/time.pyrs")),
+    ("operator", include_str!("../lib/operator.pyrs")),
+    ("functools", include_str!("../lib/functools.pyrs")),
+    ("statistics", include_str!("../lib/statistics.pyrs")),
 ];
 
 /// Look up an embedded stdlib module's source by NAME (e.g. `"os"`).

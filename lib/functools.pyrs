@@ -1,0 +1,22 @@
+# pyrst standard library — functools
+#
+# Pure-pyrst higher-order helpers built on pyrst's first-class functions.
+# Embedded via `include_str!` (see `src/stdlib.rs`). Usable as either
+# `from functools import reduce` or `import functools; functools.reduce(...)`.
+#
+# Phase-1 scope:
+#   - `reduce(f, xs, init)` folds `init` left-to-right over `xs` with the binary
+#     function `f` — `init = f(init, x)` for each `x`. The 3-arg form (explicit
+#     initial value) is the only one provided; the 2-arg form (no initializer)
+#     needs Optional/empty-sequence handling that is deferred.
+#   - int-specialized (pyrst generics are a later card): `f` is
+#     `Callable[[int, int], int]` and the sequence/accumulator are `int`.
+#   - `partial` is DEFERRED: it requires variadic argument capture, which pyrst
+#     does not model yet (see card 552d2c11 notes).
+
+
+def reduce(f: Callable[[int, int], int], xs: list[int], init: int) -> int:
+    acc: int = init
+    for x in xs:
+        acc = f(acc, x)
+    return acc

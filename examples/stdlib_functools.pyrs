@@ -1,0 +1,19 @@
+# Stdlib `functools.reduce` (card 552d2c11): the embedded pure-pyrst `functools`
+# module folding a list with a binary function, via the `from functools import
+# reduce` flat form. Both `functools` and `operator` are embedded
+# (lib/*.pyrs -> include_str! -> src/stdlib.rs); no local copies here.
+#
+# WORKING FORM: the binary function is passed as a flat-imported function VALUE
+# (`from operator import add; reduce(add, ...)`). A bare local function name and
+# a flat-imported name both lower to a first-class callable value; the qualified
+# REFERENCE form `operator.add` as a bare value does NOT lower (only the call
+# form `operator.add(x, y)` does), so reduce is fed the flat-imported `add`.
+#
+# Deterministic: reduce(add, [1, 2, 3, 4], 0) = ((((0+1)+2)+3)+4) = 10.
+from functools import reduce
+from operator import add
+
+
+def main() -> None:
+    nums: list[int] = [1, 2, 3, 4]
+    print(reduce(add, nums, 0))      # 10

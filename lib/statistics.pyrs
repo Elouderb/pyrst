@@ -1,0 +1,47 @@
+# pyrst standard library — statistics
+#
+# Pure-pyrst descriptive statistics over `list[float]`. Embedded via
+# `include_str!` (see `src/stdlib.rs`). Usable as either
+# `from statistics import mean` or `import statistics; statistics.mean(xs)`.
+#
+# Phase-1 notes:
+#   - float-specialized (pyrst generics are a later card): inputs are
+#     `list[float]`, results are `float`.
+#   - `variance` / `stdev` here are the POPULATION forms (divide by N), i.e. the
+#     mean of squared deviations and its square root. (CPython's `variance` is
+#     the SAMPLE form dividing by N-1; the sample variants arrive with a `ddof`
+#     argument in a later card.) Documented so the semantics are unambiguous.
+#   - `sqrt` is bound locally via `@extern` over Rust's `f64::sqrt` so `stdev`
+#     needs no `math` import.
+#   - Empty-input handling (CPython raises `StatisticsError`) is deferred; an
+#     empty list divides by zero (an `inf`/`nan`), matching pyrst's current
+#     numeric behavior rather than a typed exception.
+
+
+@extern
+def sqrt(x: float) -> float:
+    "({x}).sqrt()"
+
+
+def mean(xs: list[float]) -> float:
+    return sum(xs) / len(xs)
+
+
+def median(xs: list[float]) -> float:
+    ordered: list[float] = sorted(xs)
+    n: int = len(ordered)
+    if n % 2 == 0:
+        return (ordered[n // 2 - 1] + ordered[n // 2]) / 2.0
+    return ordered[n // 2]
+
+
+def variance(xs: list[float]) -> float:
+    m: float = mean(xs)
+    total: float = 0.0
+    for x in xs:
+        total = total + (x - m) * (x - m)
+    return total / len(xs)
+
+
+def stdev(xs: list[float]) -> float:
+    return sqrt(variance(xs))

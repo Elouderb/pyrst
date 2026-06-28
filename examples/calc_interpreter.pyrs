@@ -1,0 +1,118 @@
+class Token:
+    kind: str
+    value: float
+
+    def __init__(self, kind: str, value: float) -> None:
+        self.kind = kind
+        self.value = value
+
+
+def tokenize(src: str) -> list[Token]:
+    tokens: list[Token] = []
+    i: int = 0
+    n: int = len(src)
+    while i < n:
+        ch: str = src[i]
+        if ch == " ":
+            i += 1
+        elif ch == "(" or ch == ")" or ch == "+" or ch == "-" or ch == "/":
+            tokens.append(Token(ch, 0.0))
+            i += 1
+        elif ch == "*":
+            if i + 1 < n and src[i + 1] == "*":
+                tokens.append(Token("**", 0.0))
+                i += 2
+            else:
+                tokens.append(Token("*", 0.0))
+                i += 1
+        elif ch.isdigit():
+            start: int = i
+            while i < n and (src[i].isdigit() or src[i] == "."):
+                i += 1
+            numstr: str = src[start:i]
+            tokens.append(Token("num", float(int(numstr))))
+        else:
+            raise ValueError("unexpected character")
+    tokens.append(Token("end", 0.0))
+    return tokens
+
+
+class Parser:
+    tokens: list[Token]
+    pos: int
+
+    def __init__(self, tokens: list[Token]) -> None:
+        self.tokens = tokens
+        self.pos = 0
+
+    def peek(self) -> str:
+        return self.tokens[self.pos].kind
+
+    def advance(self) -> Token:
+        tok: Token = self.tokens[self.pos]
+        self.pos += 1
+        return tok
+
+    def parse_expr(self) -> float:
+        result: float = self.parse_term()
+        while self.peek() == "+" or self.peek() == "-":
+            op: str = self.advance().kind
+            rhs: float = self.parse_term()
+            if op == "+":
+                result = result + rhs
+            else:
+                result = result - rhs
+        return result
+
+    def parse_term(self) -> float:
+        result: float = self.parse_power()
+        while self.peek() == "*" or self.peek() == "/":
+            op: str = self.advance().kind
+            rhs: float = self.parse_power()
+            if op == "*":
+                result = result * rhs
+            else:
+                if rhs == 0.0:
+                    raise ValueError("division by zero")
+                result = result / rhs
+        return result
+
+    def parse_power(self) -> float:
+        base: float = self.parse_atom()
+        if self.peek() == "**":
+            self.advance()
+            exp: float = self.parse_power()
+            return base ** exp
+        return base
+
+    def parse_atom(self) -> float:
+        if self.peek() == "num":
+            return self.advance().value
+        if self.peek() == "-":
+            self.advance()
+            return -self.parse_atom()
+        if self.peek() == "(":
+            self.advance()
+            val: float = self.parse_expr()
+            if self.peek() != ")":
+                raise ValueError("expected )")
+            self.advance()
+            return val
+        raise ValueError("unexpected token")
+
+
+def evaluate(src: str) -> float:
+    parser: Parser = Parser(tokenize(src))
+    result: float = parser.parse_expr()
+    if parser.peek() != "end":
+        raise ValueError("trailing input")
+    return result
+
+
+def main() -> None:
+    exprs: list[str] = ["1 + 2 * 3", "(1 + 2) * 3", "2 ** 3 ** 2", "10 / 4", "-5 + 3"]
+    for e in exprs:
+        try:
+            print(e + " = " + str(evaluate(e)))
+        except ValueError:
+            print(e + " -> error")

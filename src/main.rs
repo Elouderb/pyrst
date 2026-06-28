@@ -9,6 +9,7 @@ mod codegen;
 mod driver;
 mod diag;
 mod resolver;
+mod stdlib;
 mod formatter;
 mod linter;
 mod repl;

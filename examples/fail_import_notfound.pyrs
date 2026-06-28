@@ -1,0 +1,9 @@
+# Negative (card f5cd1d10): importing a module that is NEITHER a local
+# `<dir>/notamodule.pyrs` file NOR an embedded stdlib module must be REJECTED
+# with `ImportNotFound`. This guards the embedded-stdlib resolution change:
+# adding the embedded lookup must not make unknown imports silently resolve.
+# Must be rejected by BOTH `pyrst check` and `pyrst build`.
+from notamodule import x
+
+def main() -> None:
+    print(x())

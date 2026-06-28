@@ -36,29 +36,18 @@ impl Resolver {
         }
     }
 
-    /// DFS traversal of the import graph starting from `root_path`.
+    /// DFS traversal of the import graph starting from a FILE on disk
+    /// (`abs_path`). Reads + normalizes the source, then hands off to
+    /// [`Resolver::process_module`] for the shared parse / recurse / cache work.
     /// After completion, `self.order` is in topological order.
     fn visit(&mut self, abs_path: PathBuf, base_dir: &Path, import_span: Span) -> Result<()> {
-        // Already processed (diamond import case)
+        // Cheap pre-check before reading the file: a module already finished or
+        // currently in-flight needs no re-read. (`process_module` re-checks under
+        // the post-read key, but for a file the key IS `abs_path`, so this also
+        // short-circuits the disk read on a diamond/cycle.)
         if self.order.contains(&abs_path) {
             return Ok(());
         }
-
-        // Circular import detection
-        if self.in_flight.contains(&abs_path) {
-            // Reconstruct cycle path
-            let cycle_start = self.dfs_stack.iter().position(|p| p == &abs_path).unwrap_or(0);
-            let cycle: Vec<String> = self.dfs_stack[cycle_start..]
-                .iter()
-                .chain(&[abs_path.clone()])
-                .map(|p| p.file_stem().unwrap_or_default().to_string_lossy().to_string())
-                .collect();
-            return Err(Error::CircularImport { cycle, span: import_span });
-        }
-
-        // Mark as in-flight
-        self.in_flight.insert(abs_path.clone());
-        self.dfs_stack.push(abs_path.clone());
 
         // Load and parse this file. Normalize line endings (CRLF / bare CR -> LF)
         // at the read site so the SAME `\n`-only text feeds both the lexer (spans)
@@ -76,6 +65,47 @@ impl Resolver {
                 }
             })?;
 
+        self.process_module(abs_path, src, base_dir, import_span)
+    }
+
+    /// Shared DFS body for a single module, given its module KEY (`key`) and
+    /// already-loaded `src`. Used by both [`Resolver::visit`] (file modules,
+    /// where `key` is the canonical on-disk path) and the embedded-stdlib path
+    /// (where `key` is a SYNTHETIC `<stdlib>/<name>.pyrs` path that exists only
+    /// for cycle-detection, caching, and diagnostics).
+    ///
+    /// `base_dir` is the directory against which THIS module's own `import`s are
+    /// resolved as local files (for a file module, its parent dir; for an
+    /// embedded module, the synthetic `<stdlib>` dir — which has no real files,
+    /// so local lookups there harmlessly miss and fall through to embedded).
+    fn process_module(
+        &mut self,
+        key: PathBuf,
+        src: String,
+        base_dir: &Path,
+        import_span: Span,
+    ) -> Result<()> {
+        // Already processed (diamond import case)
+        if self.order.contains(&key) {
+            return Ok(());
+        }
+
+        // Circular import detection
+        if self.in_flight.contains(&key) {
+            // Reconstruct cycle path
+            let cycle_start = self.dfs_stack.iter().position(|p| p == &key).unwrap_or(0);
+            let cycle: Vec<String> = self.dfs_stack[cycle_start..]
+                .iter()
+                .chain(&[key.clone()])
+                .map(|p| p.file_stem().unwrap_or_default().to_string_lossy().to_string())
+                .collect();
+            return Err(Error::CircularImport { cycle, span: import_span });
+        }
+
+        // Mark as in-flight
+        self.in_flight.insert(key.clone());
+        self.dfs_stack.push(key.clone());
+
         // EPIC-8: a parse error belongs to THIS file — pair its own source (and
         // path) so the snippet renders against the imported file, not the root.
         // Name the file ONLY when it was reached via an import (DFS depth > 1):
@@ -83,10 +113,10 @@ impl Resolver {
         // as before (no `in <file>` suffix), so the source is attached but the
         // file name is withheld for the root.
         let name_file = self.dfs_stack.len() > 1;
-        let render_path = if name_file { Some(abs_path.clone()) } else { None };
+        let render_path = if name_file { Some(key.clone()) } else { None };
         let mut m = crate::parser::parse(&src)
             .map_err(|e| e.with_render_source(render_path, &src))?;
-        m.source_path = Some(abs_path.clone());
+        m.source_path = Some(key.clone());
 
         // Recurse into this module's imports BEFORE adding self to order (post-order DFS)
         for stmt in &m.stmts {
@@ -94,31 +124,59 @@ impl Resolver {
                 // Phase 8: only use first component of dotted path (same-directory imports only)
                 let mod_name = &path[0];
 
-                // Skip standard library modules (math, dataclasses, etc.)
-                if matches!(mod_name.as_str(), "math" | "dataclasses" | "sys" | "os" | "json" | "re" | "collections" | "itertools") {
+                // Skip standard library modules that are NOT yet real modules
+                // (no codegen, no embedded source). `math`/`dataclasses` have
+                // dedicated handling elsewhere; the rest are silent no-ops until
+                // implemented. `os` is NOT here: it is a real embedded module
+                // (resolved below), so it must reach the resolution path.
+                if matches!(mod_name.as_str(), "math" | "dataclasses" | "sys" | "json" | "re" | "collections" | "itertools") {
                     continue;
                 }
 
+                // Resolution order: a LOCAL `<base_dir>/<mod>.pyrs` on disk
+                // SHADOWS an embedded stdlib module of the same name.
                 let dep_path = base_dir.join(format!("{}.pyrs", mod_name));
-
-                // Resolve to absolute path
-                let dep_abs = dep_path.canonicalize().map_err(|_| Error::ImportNotFound {
-                    path: mod_name.clone(),
-                    span: *span,
-                    importing_file: abs_path.display().to_string(),
-                })?;
-
-                self.visit(dep_abs, base_dir, *span)?;
+                if let Ok(dep_abs) = dep_path.canonicalize() {
+                    // Local file found.
+                    self.visit(dep_abs, base_dir, *span)?;
+                } else if let Some(embedded_src) = crate::stdlib::lookup(mod_name) {
+                    // No local file → resolve from the EMBEDDED stdlib. Use a
+                    // synthetic `<stdlib>/<mod>.pyrs` key so caching, cycle
+                    // detection, and diagnostics all work like a file module, and
+                    // resolve the embedded module's OWN imports against the same
+                    // synthetic stdlib dir (local-then-embedded, recursively).
+                    let stdlib_dir = stdlib_synthetic_dir();
+                    let dep_key = stdlib_dir.join(format!("{}.pyrs", mod_name));
+                    let dep_src = crate::lexer::normalize_line_endings(embedded_src);
+                    self.process_module(dep_key, dep_src, &stdlib_dir, *span)?;
+                } else {
+                    // Neither a local file nor an embedded module exists.
+                    return Err(Error::ImportNotFound {
+                        path: mod_name.clone(),
+                        span: *span,
+                        importing_file: key.display().to_string(),
+                    });
+                }
             }
         }
 
         // Post-order: add to order AFTER all dependencies are processed
         self.dfs_stack.pop();
-        self.in_flight.remove(&abs_path);
-        self.cache.insert(abs_path.clone(), (m, src));
-        self.order.push(abs_path);
+        self.in_flight.remove(&key);
+        self.cache.insert(key.clone(), (m, src));
+        self.order.push(key);
         Ok(())
     }
+}
+
+/// The SYNTHETIC base directory used as the module-key prefix for embedded
+/// stdlib modules. It is a marker path for caching / cycle detection /
+/// diagnostics only — it is never read from disk (embedded sources come from
+/// [`crate::stdlib`]). A `<stdlib>/<mod>.pyrs` local-file lookup against this dir
+/// therefore always misses, so an embedded module's own imports fall through to
+/// the embedded lookup, matching the root resolution order.
+fn stdlib_synthetic_dir() -> PathBuf {
+    PathBuf::from("<stdlib>")
 }
 
 /// Merge function/class signatures from a single module into a context.
@@ -290,5 +348,70 @@ class Account:
         // And `amt`'s type is the UNWRAPPED inner T (Account), not a Mut wrapper.
         assert!(matches!(sig.params[0].1, Ty::Class(ref c) if c == "Account"),
             "Mut[Account] param's type is the inner Account");
+    }
+
+    /// Write `src` to a uniquely-named temp `.pyrs` file in a fresh temp dir and
+    /// return its path. The dir is created so the file has no sibling modules
+    /// (so a `from os import …` cannot accidentally resolve to a LOCAL `os.pyrs`
+    /// and must go through the embedded stdlib).
+    fn temp_root(src: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "pyrst-resolver-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("main.pyrs");
+        std::fs::write(&path, src).unwrap();
+        path
+    }
+
+    /// Card f5cd1d10 acceptance: `from os import getenv` resolves through the
+    /// EMBEDDED stdlib (there is no local `os.pyrs`). The embedded `os` module
+    /// must parse, appear in the resolved program's modules, and have its
+    /// `@extern` `getenv` signature merged into the shared ctx so call sites
+    /// type-check.
+    #[test]
+    fn embedded_os_module_resolves_and_merges() {
+        let root = temp_root("from os import getenv\n\ndef main() -> None:\n    print(getenv(\"X\", \"y\"))\n");
+        let prog = resolve(&root).expect("`from os import getenv` must resolve via the embedded stdlib");
+
+        // The embedded `getenv` binding is registered in the merged ctx (so a
+        // call site type-checks) with its declared (str, str) -> str signature.
+        let sig = prog.ctx.funcs.get("getenv").expect("embedded os::getenv must be registered in ctx");
+        assert!(matches!(sig.ret, Ty::Str), "getenv returns str");
+        assert_eq!(sig.params.len(), 2, "getenv(key, default)");
+
+        // The embedded `os` module is part of the program, carrying a synthetic
+        // `<stdlib>/os.pyrs` source path for diagnostics/caching, and comes
+        // BEFORE the root (dependency-first topological order).
+        let os_mod = prog.modules.iter().find(|(m, _)| {
+            m.source_path.as_ref().map_or(false, |p| p.ends_with("os.pyrs"))
+        });
+        assert!(os_mod.is_some(), "the embedded os module must appear in the resolved modules");
+        assert_eq!(prog.modules.len(), 2, "exactly the root + the embedded os module");
+
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    /// Negative: importing a module that is neither a local file nor an embedded
+    /// stdlib module is rejected with `ImportNotFound` (the embedded lookup must
+    /// not make unknown imports silently resolve).
+    #[test]
+    fn unknown_import_is_not_found() {
+        let root = temp_root("from notamodule import x\n\ndef main() -> None:\n    print(x())\n");
+        // `ResolvedProgram` is not `Debug`, so match the Result directly rather
+        // than `expect_err` (which would require `Ok` to be printable).
+        match resolve(&root) {
+            Ok(_) => panic!("an unknown module must not resolve"),
+            Err(Error::ImportNotFound { path, .. }) => {
+                assert_eq!(path, "notamodule", "ImportNotFound must name the missing module");
+            }
+            Err(other) => panic!("expected ImportNotFound for `notamodule`, got: {:?}", other),
+        }
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 }

@@ -1,0 +1,16 @@
+# Embedded stdlib proof (card f5cd1d10): `os` is a REAL stdlib module, shipped
+# inside the compiler binary (lib/os.pyrs → include_str! → src/stdlib.rs), with
+# NO local `os.pyrs` next to this file. The resolver finds it in the embedded
+# stdlib and merges its `@extern` functions so they are callable here via the
+# `from os import f` form.
+#
+# Deterministic on the Linux test harness:
+#   - getenv of a name that is never set → the literal fallback string.
+#   - basename of a fixed POSIX path → the final component.
+# (getcwd / path joins are intentionally avoided — they depend on the run
+# directory and path separator.)
+from os import getenv, basename
+
+def main() -> None:
+    print(getenv("PYRST_DEFINITELY_UNSET_XYZ", "fallback"))
+    print(basename("/a/b/c.txt"))

@@ -1,0 +1,46 @@
+# pyrst standard library — os
+#
+# Starter `os` module: a handful of deterministic, Phase-1 `@extern` bindings
+# over Rust std (`std::env`, `std::path`, `std::fs`). This file is EMBEDDED into
+# the pyrst compiler binary via `include_str!` (see `src/stdlib.rs`), so it
+# travels with the binary and needs no filesystem install.
+#
+# Phase-1 limits (see docs/design/stdlib-outline.md):
+#   - Only `from os import f; f()` is supported. Qualified `os.f()` is a separate
+#     deferred card and is NOT available yet.
+#   - `str` is an owned `String` in pyrst, so std functions that take `&str` /
+#     `&Path` need the `&{p}` borrow glue in the template (the binding author
+#     writes the boundary glue; rustc validates the template at build time).
+#   - Errors: a Rust `Result` is unwrapped in the template here, so a failed
+#     `read_file` / `write_file` surfaces as a panic (a pyrst exception). A
+#     future nicety maps `Result` to `Optional[T]` / typed exceptions.
+
+
+@extern
+def getenv(key: str, default: str) -> str:
+    "std::env::var(&{key}).unwrap_or_else(|_| {default})"
+
+
+@extern
+def getcwd() -> str:
+    "std::env::current_dir().unwrap().to_string_lossy().into_owned()"
+
+
+@extern
+def basename(p: str) -> str:
+    "std::path::Path::new(&{p}).file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()"
+
+
+@extern
+def path_exists(p: str) -> bool:
+    "std::path::Path::new(&{p}).exists()"
+
+
+@extern
+def read_file(p: str) -> str:
+    "std::fs::read_to_string(&{p}).unwrap()"
+
+
+@extern
+def write_file(p: str, s: str) -> None:
+    "std::fs::write(&{p}, &{s}).unwrap()"

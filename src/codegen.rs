@@ -571,7 +571,7 @@ impl<'a> Codegen<'a> {
                 }
                 return self.emit_consuming(value);
             }
-            Ty::Dict(_k, vv) if matches!(**vv, Ty::Func(..)) => {
+            Ty::Dict(_k, vv) if self.ty_has_func(vv) => {
                 if let Expr::Dict(pairs, _) = value {
                     if pairs.is_empty() {
                         return Ok("::std::collections::HashMap::new()".to_string());
@@ -589,6 +589,37 @@ impl<'a> Codegen<'a> {
                 }
                 return self.emit_consuming(value);
             }
+            // A tuple slot with one or more function-typed positions
+            // (`tuple[Callable[..], int]`). Wrap each element into its own slot:
+            // a func position routes through `emit_into_func_slot` (recursively),
+            // a non-func position keeps the clone-on-use emission. Mirrors the
+            // single-element / multi-element tuple emission in `emit_expr`.
+            Ty::Tuple(elem_tys) if self.ty_has_func(expected) => {
+                if let Expr::Tuple(elems, _) = value {
+                    if elems.len() == elem_tys.len() {
+                        let mut parts = Vec::with_capacity(elems.len());
+                        for (el, et) in elems.iter().zip(elem_tys.iter()) {
+                            if self.ty_has_func(et) {
+                                parts.push(self.emit_into_func_slot(el, et)?);
+                            } else {
+                                parts.push(self.emit_consuming(el)?);
+                            }
+                        }
+                        return Ok(match parts.len() {
+                            1 => format!("({},)", parts[0]),
+                            _ => format!("({})", parts.join(", ")),
+                        });
+                    }
+                }
+                return self.emit_consuming(value);
+            }
+            // NOTE: there is intentionally NO `Ty::Set(Func)` arm. A pyrst `set`
+            // lowers to a Rust `HashSet`, which requires `Eq + Hash` elements;
+            // `Rc<dyn Fn>` (and `dyn Fn`) implement neither, so `HashSet<Rc<dyn
+            // Fn>>` cannot compile. `set[Callable[..]]` is therefore rejected at
+            // typeck (`require_hashable`), the same way `set[float]` is — so this
+            // arm is unreachable and a positive emission here would only produce
+            // known-uncompilable Rust.
             _ => {}
         }
         let Ty::Func(arg_tys, _ret) = expected else {
@@ -609,12 +640,24 @@ impl<'a> Codegen<'a> {
                 // Annotate each closure param with the slot's argument type so the
                 // `move` closure is well-typed at a `dyn Fn` coercion (Rust cannot
                 // infer closure param types across the boxed-trait-object cast).
+                // When the slot's argument type is `Unknown`, emit the param WITHOUT
+                // an annotation (let Rust infer) rather than `x: ()` — `rust_ty`
+                // lowers `Unknown` to `()`, and a unit-typed param would be wrong
+                // for any non-unit argument. Annotated `Callable` slots always have
+                // concrete arg types (from `from_type_expr`), so for Increment 1
+                // this is a defensive guard; it becomes load-bearing once a func
+                // value can flow from an inferred (Unknown-arg) context.
                 let param_strs: Vec<String> = params
                     .iter()
                     .enumerate()
                     .map(|(i, (name, _))| {
-                        let pty = arg_tys.get(i).cloned().unwrap_or(Ty::Unknown);
-                        format!("{}: {}", escape_ident(name), self.rust_ty(&pty))
+                        let name_e = escape_ident(name);
+                        match arg_tys.get(i) {
+                            Some(pty) if !matches!(pty, Ty::Unknown) => {
+                                format!("{}: {}", name_e, self.rust_ty(pty))
+                            }
+                            _ => name_e,
+                        }
                     })
                     .collect();
                 let body_s = self.emit_expr(body)?;
@@ -624,6 +667,18 @@ impl<'a> Codegen<'a> {
                     body_s,
                     rc_ty
                 ))
+            }
+            // A conditional `f if cond else g` into a function slot: wrap EACH
+            // branch into the same slot so a bare fn name / lambda in either arm
+            // becomes `Rc<dyn Fn>` (without this the arms fall to `emit_consuming`
+            // and emit bare fn names -> E0308). Both arms are already typed
+            // `Ty::Func` by typeck's branch unification, so each is a valid
+            // func-slot value.
+            Expr::IfExp { test, body, orelse, .. } => {
+                let t = self.emit_expr(test)?;
+                let b = self.emit_into_func_slot(body, expected)?;
+                let o = self.emit_into_func_slot(orelse, expected)?;
+                Ok(format!("(if {} {{ {} }} else {{ {} }})", t, b, o))
             }
             // A func-valued place / call temp — Rc clone (value semantics) / passthrough.
             _ => self.emit_consuming(value),
@@ -2578,12 +2633,25 @@ impl<'a> Codegen<'a> {
                         }
                     }
                 } else {
-                    let v = self.emit_consuming(value)?;
+                    let cur = self.locals.get(target).cloned().unwrap_or(Ty::Unknown);
+                    // (first-class functions) Reassigning a Callable-typed (or
+                    // func-containing collection-typed) local: a bare function NAME
+                    // / lambda / func-name-bearing literal on the RHS must be
+                    // wrapped into the `Rc<dyn Fn>` slot, exactly as in the
+                    // declaration branch. Without this, `f = double` would emit
+                    // `f = double.clone();` (a fn item has no `.clone() -> Rc<dyn
+                    // Fn>`) -> rustc E0308. An `IfExp` RHS (`f = inc if c else
+                    // double`) is handled by `emit_into_func_slot` recursing into
+                    // its arms via the IfExp case it shares with `emit_consuming`.
+                    let v = if self.ty_has_func(&cur) {
+                        self.emit_into_func_slot(value, &cur)?
+                    } else {
+                        self.emit_consuming(value)?
+                    };
                     // Python permits rebinding a name to a value of a different
                     // type. When that happens, emit a shadowing `let` (which
                     // always type-checks) instead of a plain reassignment.
                     let value_ty = self.type_of_expr(value);
-                    let cur = self.locals.get(target).cloned().unwrap_or(Ty::Unknown);
                     // (EPIC-6) Escape the emitted name (raw `target` stays map key).
                     let target_e = escape_ident(target);
                     if Self::types_conflict(&cur, &value_ty) {

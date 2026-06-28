@@ -1542,7 +1542,35 @@ fn require_hashable(ty: &Ty, span: Span, position: &str) -> Result<()> {
             ),
         });
     }
+    // (first-class functions) A function value is NOT a valid hashable element:
+    // it lowers to `Rc<dyn Fn(..) -> ..>`, and `dyn Fn` implements neither `Eq`
+    // nor `Hash`, so `HashSet<Rc<dyn Fn>>` / `HashMap<Rc<dyn Fn>, _>` cannot
+    // compile. Reject `set[Callable[..]]` and a Callable dict KEY here — the same
+    // honest typeck error as `set[float]` — rather than deferring an opaque rustc
+    // E0277. (A Callable dict VALUE is fine and is not routed through this check.)
+    if matches!(ty, Ty::Func(..)) {
+        return Err(Error::Type {
+            span,
+            msg: format!(
+                "{} type must be hashable; a function value (Callable) is not \
+                 supported here (Rc<dyn Fn> is not Eq/Hash, so HashSet/HashMap-key \
+                 of functions won't compile)",
+                position
+            ),
+        });
+    }
     Ok(())
+}
+
+/// (honest errors) True for a type that is KNOWN to be non-callable, so calling
+/// a value of this type is a genuine type error rather than a deferred rustc
+/// E0618. `Ty::Func` is callable; `Ty::Unknown` is the permissive escape hatch
+/// (an untyped value / `super()` / stdlib stand-in may be callable) and
+/// `Ty::Class` is left permissive too (a class instance may gain a `__call__` in
+/// a later increment). Everything else — primitives, collections, Option, File,
+/// the unit/None types — is definitively not callable.
+fn is_noncallable_ty(ty: &Ty) -> bool {
+    !matches!(ty, Ty::Func(..) | Ty::Unknown | Ty::Class(_))
 }
 
 // ── By-value parameter mutation detection helpers ─────────────────────────────
@@ -3216,6 +3244,16 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                                 }
                             }
                             (**ret).clone()
+                        } else if is_noncallable_ty(&local_ty) {
+                            // (honest errors) Calling a value of a KNOWN
+                            // non-callable type (`x: int = 5; x(3)`) is a type
+                            // error, not a deferred rustc E0618. `Unknown` and
+                            // `Class` stay permissive (escape hatch: a class
+                            // instance may be callable in a later increment).
+                            return Err(Error::Type {
+                                span: *span,
+                                msg: format!("`{}` of type {} is not callable", name, local_ty),
+                            });
                         } else {
                             Ty::Unknown
                         }
@@ -3348,8 +3386,27 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                     let result = if let Expr::Lambda { params, body, .. } = callee.as_ref() {
                         lambda_body_ty(params, body, env)?
                     } else {
-                        match check_expr(callee, env)? {
+                        let callee_ty = check_expr(callee, env)?;
+                        // (honest errors) Calling the result of an expression whose
+                        // type is a KNOWN non-callable (`xs[0](3)` where `xs:
+                        // list[int]`) is a type error, not a deferred rustc E0618.
+                        // `Unknown`/`Class` stay permissive. CRUCIAL EXCLUSION: an
+                        // `Expr::Attr` callee here is an UNRESOLVED method call
+                        // (`m.kind()`, `self.bump()`) that the method-dispatch block
+                        // above did not match and let fall through — `check_expr`
+                        // returns the method's RETURN type, not the callee's own
+                        // type, so the non-callable test would misfire on a method
+                        // that returns str/None/etc. Method calls are never the
+                        // value-call form this gate targets, so skip them.
+                        let is_method_callee = matches!(callee.as_ref(), Expr::Attr { .. });
+                        match callee_ty {
                             Ty::Func(_, ret) => *ret,
+                            ref t if !is_method_callee && is_noncallable_ty(t) => {
+                                return Err(Error::Type {
+                                    span: *span,
+                                    msg: format!("value of type {} is not callable", callee_ty),
+                                });
+                            }
                             _ => Ty::Unknown,
                         }
                     };
@@ -6050,6 +6107,114 @@ def apply(f: Callable[[int], int]) -> int:
         let ctx = ctx_from_module(&m);
         let errs = check_all(&m, &ctx);
         assert!(!errs.is_empty(), "wrong-arity call of a function value must error");
+    }
+
+    #[test]
+    fn call_noncallable_local_rejected() {
+        // HIGH-2: calling a value of a KNOWN non-callable type is an honest error.
+        let src = "\
+def main() -> None:
+    x: int = 5
+    print(x(3))
+";
+        let m = crate::parser::parse(src).expect("parse");
+        let ctx = ctx_from_module(&m);
+        let errs = check_all(&m, &ctx);
+        assert!(!errs.is_empty(), "calling an int must be a typeck error");
+    }
+
+    #[test]
+    fn call_noncallable_index_rejected() {
+        // HIGH-2: calling an indexed non-callable (`xs[0](3)`) is an honest error.
+        let src = "\
+def main() -> None:
+    xs: list[int] = [1, 2]
+    print(xs[0](3))
+";
+        let m = crate::parser::parse(src).expect("parse");
+        let ctx = ctx_from_module(&m);
+        let errs = check_all(&m, &ctx);
+        assert!(!errs.is_empty(), "calling an int element must be a typeck error");
+    }
+
+    #[test]
+    fn method_call_returning_str_not_rejected_as_noncallable() {
+        // HIGH-2 guard against over-rejection: a method call whose receiver method
+        // returns str/None must NOT be flagged "not callable" (the Attr callee is
+        // a method invocation, not a value-call).
+        let src = "\
+class Animal:
+    name: str
+    def speak(self) -> str:
+        return self.name
+
+def main() -> None:
+    a: Animal = Animal()
+    print(a.speak())
+";
+        let m = crate::parser::parse(src).expect("parse");
+        let ctx = ctx_from_module(&m);
+        let errs = check_all(&m, &ctx);
+        assert!(errs.is_empty(), "method call returning str must type-check, got: {:?}", errs);
+    }
+
+    #[test]
+    fn set_of_callable_rejected() {
+        // BLOCKER-3: a function value is not hashable (Rc<dyn Fn> is not Eq/Hash),
+        // so `set[Callable[..]]` is an honest typeck error — like `set[float]`.
+        let src = "\
+def inc(x: int) -> int:
+    return x + 1
+
+def main() -> None:
+    s: set[Callable[[int], int]] = {inc}
+    print(len(s))
+";
+        let m = crate::parser::parse(src).expect("parse");
+        let ctx = ctx_from_module(&m);
+        let errs = check_all(&m, &ctx);
+        assert!(!errs.is_empty(), "set[Callable] must be rejected (functions are not hashable)");
+    }
+
+    #[test]
+    fn dict_callable_key_rejected_value_ok() {
+        // A Callable dict KEY is rejected (non-hashable); a Callable dict VALUE is fine.
+        let bad = "\
+def inc(x: int) -> int:
+    return x + 1
+
+def main() -> None:
+    d: dict[Callable[[int], int], int] = {}
+    print(len(d))
+";
+        let m = crate::parser::parse(bad).expect("parse");
+        let ctx = ctx_from_module(&m);
+        assert!(!check_all(&m, &ctx).is_empty(), "Callable dict key must be rejected");
+
+        let ok = "\
+def inc(x: int) -> int:
+    return x + 1
+
+def main() -> None:
+    d: dict[str, Callable[[int], int]] = {\"inc\": inc}
+    print(d[\"inc\"](2))
+";
+        let m2 = crate::parser::parse(ok).expect("parse");
+        let ctx2 = ctx_from_module(&m2);
+        assert!(check_all(&m2, &ctx2).is_empty(), "Callable dict value must type-check");
+    }
+
+    #[test]
+    fn is_noncallable_ty_classification() {
+        // Func/Unknown/Class are permissive (callable or escape-hatch); everything
+        // else is definitively non-callable.
+        assert!(!is_noncallable_ty(&Ty::Func(vec![], Box::new(Ty::Unit))));
+        assert!(!is_noncallable_ty(&Ty::Unknown));
+        assert!(!is_noncallable_ty(&Ty::Class("Foo".into())));
+        for t in [Ty::Int, Ty::Float, Ty::Bool, Ty::Str, Ty::Unit,
+                  Ty::List(Box::new(Ty::Int)), Ty::Dict(Box::new(Ty::Str), Box::new(Ty::Int))] {
+            assert!(is_noncallable_ty(&t), "{} must be non-callable", t);
+        }
     }
 
     #[test]

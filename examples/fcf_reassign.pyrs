@@ -1,0 +1,14 @@
+def inc(x: int) -> int:
+    return x + 1
+
+def double(x: int) -> int:
+    return x * 2
+
+def main() -> None:
+    f: Callable[[int], int] = inc
+    print(f(10))
+    f = double
+    print(f(10))
+    use_double: bool = True
+    f = double if use_double else inc
+    print(f(10))

@@ -1,0 +1,7 @@
+def inc(x: int) -> int:
+    return x + 1
+
+def main() -> None:
+    t: tuple[Callable[[int], int], int] = (inc, 5)
+    print(t[0](10))
+    print(t[1])

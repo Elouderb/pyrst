@@ -705,8 +705,9 @@ fn validate_extern_func(f: &Func, ctx: &TyCtx) -> Result<()> {
     if !single_str {
         return Err(Error::Type {
             span: f.span,
-            msg: "`@extern` function body must be a single Rust-template string \
-                  literal (the Rust expression with `{param}` substitution holes)"
+            msg: "`@extern` function body must be a single PLAIN string literal — \
+                  the Rust expression template with `{param}` holes (not an f-string; \
+                  use a regular string and pyrst fills the `{param}` holes)"
                 .to_string(),
         });
     }
@@ -6515,5 +6516,21 @@ def bump(n: Mut[int]) -> int:
         let ctx = ctx_from_module(&m);
         let errs = check_all(&m, &ctx);
         assert!(!errs.is_empty(), "@extern with a Mut[T] param must be rejected");
+    }
+
+    #[test]
+    fn extern_union_param_rejected() {
+        // A param whose annotation lowers to Ty::Unknown (a multi-arm Union like
+        // `int | str`) must be rejected — @extern requires fully-typed params, since
+        // codegen can't infer the Rust-side boundary for an unknown type.
+        let src = "\
+@extern
+def bad(x: int | str) -> str:
+    \"{x}.to_string()\"
+";
+        let m = crate::parser::parse(src).expect("parse");
+        let ctx = ctx_from_module(&m);
+        let errs = check_all(&m, &ctx);
+        assert!(!errs.is_empty(), "@extern with a Union-typed param must be rejected");
     }
 }

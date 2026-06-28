@@ -1377,6 +1377,9 @@ impl<'a> Codegen<'a> {
             // `self` is skipped (an @extern free function has none). Phase 1 does
             // NOT handle `{{`/`}}` literal-brace escaping — the template is a
             // direct expression and bare braces are uncommon there; documented.
+            // A hole naming no param (a typo like `{nane}`) is left literal and
+            // surfaces as a rustc error (E0425) at build — intentional for the FFI
+            // escape hatch: the template is opaque Rust, validated by rustc.
             let mut emitted = template;
             for p in f.params.iter().filter(|p| p.name != "self") {
                 let hole = format!("{{{}}}", p.name);

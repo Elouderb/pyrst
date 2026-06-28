@@ -1,0 +1,9 @@
+def main() -> None:
+    x: float = 7.0
+    b: bool = True
+    print(str(x))
+    print(f"{x}")
+    print(str(3.5))
+    print(str(b))
+    print(str(False))
+    print(str(42))

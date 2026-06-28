@@ -3867,6 +3867,11 @@ impl<'a> Codegen<'a> {
                         "str" => {
                             let a = self.emit_expr(&args[0])?;
                             match self.type_of_expr(&args[0]) {
+                                // Match print/f-string formatting: a whole float is
+                                // "7.0" (Rust's `{}` would drop it to "7"), a bool is
+                                // "True"/"False" (not Rust's "true"/"false").
+                                Ty::Float => return Ok(Some(format!("__py_fmt_float({})", a))),
+                                Ty::Bool => return Ok(Some(format!("__py_fmt_bool({})", a))),
                                 Ty::List(_) | Ty::Set(_) | Ty::Dict(_, _) | Ty::Tuple(_) =>
                                     return Ok(Some(format!("({}).py_repr()", a))),
                                 _ => return Ok(Some(format!("format!(\"{{}}\" , {})", a))),

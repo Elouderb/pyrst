@@ -183,12 +183,42 @@ fn stdlib_synthetic_dir() -> PathBuf {
 /// Exposed as `pub(crate)` so `analysis.rs` can build a single-module TyCtx
 /// without touching the filesystem resolver.
 pub(crate) fn merge_ctx_from_module(m: &Module, ctx: &mut TyCtx, is_root: bool) -> Result<()> {
+    // Qualified-module-call support (card 81db88e0): a NON-ROOT (imported)
+    // module is addressable by NAME — its source-file stem — so `import X;
+    // X.f(args)` can resolve `f` against this module. The ROOT program's own
+    // functions are NOT a qualifiable module (you don't write `root.f()`), so we
+    // record nothing for the root. The stem comes from `m.source_path`, which the
+    // resolver always sets to the canonical on-disk path (file module) or the
+    // synthetic `<stdlib>/<name>.pyrs` key (embedded module) — both yield the
+    // right stem (e.g. "os"). On the LSP single-file path `merge_ctx_from_module`
+    // is called with `is_root = true`, so this branch never runs there and
+    // `module_funcs` stays empty (qualified calls don't resolve in the editor —
+    // the same gap the rest of the stdlib has; it does not crash).
+    let module_name: Option<String> = if is_root {
+        None
+    } else {
+        m.source_path
+            .as_ref()
+            .and_then(|p| p.file_stem())
+            .map(|s| s.to_string_lossy().into_owned())
+    };
+
     for s in &m.stmts {
         match s {
             Stmt::Func(f) => {
                 // Skip main() from non-root modules
                 if f.name == "main" && !is_root {
                     continue;
+                }
+                // Record this function as qualifiable via its module name (e.g.
+                // `os.basename`). FLAT `ctx.funcs` (below) still holds the actual
+                // signature under the bare name; `module_funcs` is only the
+                // module→names index the qualified-call paths consult.
+                if let Some(mod_name) = &module_name {
+                    ctx.module_funcs
+                        .entry(mod_name.clone())
+                        .or_default()
+                        .push(f.name.clone());
                 }
                 let params: Vec<(String, crate::typeck::Ty)> = f.params.iter()
                     .map(|p| crate::typeck::Ty::from_type_expr(&p.ty, p.span).map(|ty| (p.name.clone(), ty)))
@@ -393,6 +423,36 @@ class Account:
         });
         assert!(os_mod.is_some(), "the embedded os module must appear in the resolved modules");
         assert_eq!(prog.modules.len(), 2, "exactly the root + the embedded os module");
+
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    /// Card 81db88e0: qualified module calls. `import os` must make the embedded
+    /// `os` module's functions QUALIFIABLE by name — i.e. `ctx.module_funcs["os"]`
+    /// lists the module's top-level functions (so `os.basename(...)` resolves),
+    /// while the FLAT `ctx.funcs` still holds the actual signatures. The ROOT
+    /// program's own functions must NOT appear in `module_funcs` (you don't write
+    /// `root.f()`).
+    #[test]
+    fn imported_module_functions_are_qualifiable_root_is_not() {
+        let root = temp_root("import os\n\ndef main() -> None:\n    print(os.basename(\"/a/b.txt\"))\n");
+        let prog = resolve(&root).expect("`import os` must resolve via the embedded stdlib");
+
+        // The embedded os module is registered as a qualifiable module name, and
+        // its functions are listed (so `os.basename` / `os.getenv` resolve).
+        let os_fns = prog.ctx.module_funcs.get("os")
+            .expect("os must be a tracked qualifiable module");
+        assert!(os_fns.iter().any(|n| n == "basename"), "os.basename must be qualifiable");
+        assert!(os_fns.iter().any(|n| n == "getenv"), "os.getenv must be qualifiable");
+
+        // The flat signature still lives in ctx.funcs (codegen emits the flat name).
+        assert!(prog.ctx.funcs.contains_key("basename"), "flat basename sig must exist");
+
+        // The ROOT module name is not a qualifiable module: only imported modules
+        // are keyed in module_funcs, and `main` is the root's own function.
+        for (_mod, fns) in &prog.ctx.module_funcs {
+            assert!(!fns.iter().any(|n| n == "main"), "root main() must not be a qualifiable module function");
+        }
 
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }

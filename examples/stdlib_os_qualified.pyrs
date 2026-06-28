@@ -1,0 +1,16 @@
+# Qualified module calls (card 81db88e0): `import os` binds the module NAME, and
+# `os.f(args)` calls the embedded stdlib `os` module's function `f` by qualified
+# name. Until this card, only `from os import f; f()` worked; `import os; os.f()`
+# reported `undefined name os`. `os` is the REAL embedded module (lib/os.pyrs →
+# include_str! → src/stdlib.rs); there is no local `os.pyrs` next to this file.
+#
+# Deterministic on the test harness:
+#   - getenv of a name that is never set → the literal fallback string.
+#   - basename of a fixed POSIX path → the final path component.
+# (getcwd / path joins are intentionally avoided — they depend on the run
+# directory and the path separator.)
+import os
+
+def main() -> None:
+    print(os.getenv("PYRST_UNSET_ABC", "fb"))
+    print(os.basename("/x/y/z.txt"))

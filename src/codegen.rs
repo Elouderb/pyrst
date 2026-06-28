@@ -3408,6 +3408,28 @@ impl<'a> Codegen<'a> {
                         }
                     }
 
+                    // Qualified module call `X.f(args)` for a REAL imported module
+                    // (card 81db88e0). When X is a tracked module name and f is one
+                    // of its functions, lower the call to the FLAT function `f(args)`
+                    // — every imported module's functions are merged into `ctx.funcs`
+                    // under their bare name, so the flat call resolves at codegen and
+                    // build. We re-dispatch through `emit_call` with a synthesized
+                    // `Ident(f)` callee so the regular function-call machinery
+                    // (Optional/by-ref/default-argument coercion) applies uniformly,
+                    // exactly as if the user had written `from X import f; f(args)`.
+                    // This GENERALIZES the hardcoded math arm above; `math` is never
+                    // a tracked module (resolver skip-lists it), so it keeps using
+                    // that arm. NOTE: flat emission means a cross-module same-name
+                    // collision is unresolved (stdlib uses distinct names;
+                    // per-module namespacing `X__f` is a later refinement).
+                    if let Expr::Ident(modname, _) = obj.as_ref() {
+                        if self.ctx.module_funcs.get(modname).is_some_and(|fns| fns.iter().any(|n| n == name)) {
+                            let span = callee.span();
+                            let flat_callee: Box<Expr> = Box::new(Expr::Ident(name.clone(), span));
+                            return Ok(Some(self.emit_call(&flat_callee, args, &[])?));
+                        }
+                    }
+
                     // Check for static method calls: ClassName.method(args)
                     if let Expr::Ident(class_name, _) = obj.as_ref() {
                         if let Some(class_def) = self.ctx.classes.get(class_name.as_str()) {
@@ -5968,5 +5990,64 @@ def ipow(base: int, exp: int) -> int:
         // The unsubstituted brace form must NOT survive into the emitted Rust.
         assert!(!out.contains("{s}.to_uppercase()"),
             "the literal `{{s}}` hole must not leak into output; got:\n{}", out);
+    }
+
+    // ── Qualified module calls — `import X; X.f(args)` (card 81db88e0) ─────────
+
+    /// A `TyCtx` modeling `import os`: the flat `basename` signature is in
+    /// `ctx.funcs`, and `module_funcs["os"]` lists it (resolver-equivalent).
+    fn ctx_with_os() -> TyCtx {
+        let mut ctx = TyCtx::new();
+        ctx.funcs.insert("basename".into(), crate::typeck::FuncSig {
+            params: vec![("p".into(), Ty::Str)],
+            param_defaults: vec![None],
+            param_by_ref: vec![],
+            ret: Ty::Str,
+        });
+        ctx.module_funcs.insert("os".into(), vec!["basename".into()]);
+        ctx
+    }
+
+    #[test]
+    fn qualified_module_call_lowers_to_flat_call() {
+        // `os.basename("/a/b.txt")` must lower to the FLAT Rust call
+        // `basename("/a/b.txt".to_string())` — the module qualifier is dropped
+        // (every imported module's functions are merged flat) and the call goes
+        // through the regular function-call path (string literal owned via
+        // `.to_string()`), exactly as `from os import basename; basename(...)`.
+        let ctx = ctx_with_os();
+        let mut cg = Codegen::new(&ctx);
+        let callee: Box<Expr> = Box::new(Expr::Attr {
+            obj: Box::new(Expr::Ident("os".into(), Span::DUMMY)),
+            name: "basename".into(),
+            span: Span::DUMMY,
+        });
+        let args = vec![Expr::Str("/a/b.txt".into(), Span::DUMMY)];
+        let out = cg.emit_method_call_on_attr(&callee, &args)
+            .expect("emit must succeed")
+            .expect("a tracked module call must be handled by emit_method_call_on_attr");
+        assert!(out.starts_with("basename("),
+            "module qualifier must be dropped, emitting a flat call; got: {}", out);
+        assert!(!out.contains("os"),
+            "the `os` qualifier must not appear in the emitted call; got: {}", out);
+    }
+
+    #[test]
+    fn math_qualified_call_still_uses_hardcoded_arm() {
+        // COEXISTENCE: `math` is never in module_funcs, so the general path does
+        // not fire; `math.sqrt(x)` keeps emitting via the hardcoded math arm.
+        let ctx = TyCtx::new(); // empty module_funcs
+        let mut cg = Codegen::new(&ctx);
+        let callee: Box<Expr> = Box::new(Expr::Attr {
+            obj: Box::new(Expr::Ident("math".into(), Span::DUMMY)),
+            name: "sqrt".into(),
+            span: Span::DUMMY,
+        });
+        let args = vec![Expr::Float(16.0, Span::DUMMY)];
+        let out = cg.emit_method_call_on_attr(&callee, &args)
+            .expect("emit must succeed")
+            .expect("math.sqrt must be handled by the hardcoded arm");
+        assert!(out.contains(".sqrt()"),
+            "math.sqrt must lower to the Rust `.sqrt()` method; got: {}", out);
     }
 }

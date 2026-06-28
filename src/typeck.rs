@@ -170,6 +170,27 @@ pub struct TyCtx {
     pub funcs: HashMap<String, FuncSig>,
     pub classes: HashMap<String, ClassDef>,
     pub vars: HashMap<String, Ty>,
+    /// Qualified-module-call support: an IMPORTED file/stdlib module's NAME (its
+    /// source-file stem, e.g. `"os"`) → the names of the top-level functions that
+    /// module defines. Populated by `merge_ctx_from_module` for NON-ROOT modules
+    /// only (the root program's own functions are not a qualifiable module). It
+    /// lets `import X; X.f(args)` resolve: a `Call` whose callee is
+    /// `Attr{Ident(X), f}` with `X` a key here and `f` in its list is typed and
+    /// lowered exactly like a flat call to `f` (whose signature lives in `funcs`).
+    ///
+    /// `funcs` stays FLAT (every module's functions merged under their bare name)
+    /// — codegen emits the flat name. CONSEQUENCE: a cross-module same-name
+    /// collision (two imported modules each defining `f`) is unresolved here;
+    /// stdlib modules use distinct names, and per-module namespacing (`X__f`) is a
+    /// later refinement. `math` is deliberately absent: it is skip-listed by the
+    /// resolver and never becomes a real module, so `math.sqrt(x)` keeps using its
+    /// dedicated hardcoded handling in codegen/typeck and never reaches this path.
+    ///
+    /// Empty on the LSP single-file path (`analysis.rs` merges with
+    /// `is_root = true`), so qualified calls don't resolve in the editor — the
+    /// same gap the rest of the stdlib already has there; the call simply stays
+    /// `Unknown` and does not crash.
+    pub module_funcs: HashMap<String, Vec<String>>,
 }
 
 impl TyCtx {
@@ -280,7 +301,7 @@ impl TyCtx {
         vars.insert("dict".into(), Ty::Dict(Box::new(Ty::Str), Box::new(Ty::Unknown)));
         vars.insert("set".into(), Ty::Set(Box::new(Ty::Unknown)));
 
-        Self { funcs, classes: HashMap::new(), vars }
+        Self { funcs, classes: HashMap::new(), vars, module_funcs: HashMap::new() }
     }
 
     pub fn get_all_fields(&self, class_name: &str) -> Vec<crate::ast::Param> {
@@ -2468,6 +2489,18 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
                     }
                 }
             } else if let Expr::Attr { obj, name, .. } = callee.as_ref() {
+                // Qualified module call `X.f(args)` for a REAL imported module
+                // (card 81db88e0): when X is a tracked module and f is one of its
+                // functions, the call's type is f's declared return type — exactly
+                // as if `f(args)` were called by its flat name. This GENERALIZES
+                // the hardcoded math arm below; `math` is never in `module_funcs`
+                // (resolver skip-lists it), so `math.sqrt(x)` still falls through
+                // to that arm.
+                if let Expr::Ident(modname, _) = obj.as_ref() {
+                    if ctx.module_funcs.get(modname).is_some_and(|fns| fns.iter().any(|n| n == name)) {
+                        return ctx.funcs.get(name).map(|s| s.ret.clone()).unwrap_or(Ty::Unknown);
+                    }
+                }
                 // Math module return types.
                 if let Expr::Ident(modname, _) = obj.as_ref() {
                     if modname == "math" {
@@ -3364,6 +3397,74 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 }
                 // Method call: e.g., p.magnitude() — callee is Attr
                 _ => {
+                    // Qualified module call `X.f(args)` for a REAL imported module
+                    // (card 81db88e0). When the callee is `Attr{Ident(X), f}` and X
+                    // is a tracked module name, this is NOT a method call: it is a
+                    // call to module X's function `f`, whose signature lives FLAT in
+                    // `ctx.funcs` under the bare name. We type it exactly like a flat
+                    // call to `f` (arity + per-arg compatibility + return), which
+                    // GENERALIZES the hardcoded math arm. `math` is never a tracked
+                    // module (resolver skip-lists it), so `math.sqrt(x)` is unaffected
+                    // and continues through the fallthrough below to its codegen
+                    // special-casing. A qualified call to a name the module does NOT
+                    // define is an honest error here, not a silently-Unknown call.
+                    if let Expr::Attr { obj, name, span: attr_span } = callee.as_ref() {
+                        if let Expr::Ident(modname, _) = obj.as_ref() {
+                            if let Some(mod_fns) = env.ctx.module_funcs.get(modname) {
+                                if mod_fns.iter().any(|n| n == name) {
+                                    // f is defined by module X — resolve its flat sig.
+                                    let sig = env.ctx.funcs.get(name).cloned().ok_or_else(|| Error::Type {
+                                        span: *attr_span,
+                                        msg: format!("module `{}` function `{}` has no signature", modname, name),
+                                    })?;
+                                    // Arity (positional only; module @extern fns are
+                                    // not variadic and take no kwargs).
+                                    let expected = sig.params.len();
+                                    let got = args.len() + kwargs.len();
+                                    let required = sig.param_defaults.iter().take_while(|d| d.is_none()).count();
+                                    if got < required || got > expected {
+                                        return Err(Error::Type {
+                                            span: *span,
+                                            msg: format!(
+                                                "function `{}.{}` takes {} argument(s), {} given",
+                                                modname, name, expected, got
+                                            ),
+                                        });
+                                    }
+                                    // Per-arg concrete-type compatibility (int->float
+                                    // coercion allowed), mirroring the flat-call arm.
+                                    for (i, a) in args.iter().enumerate() {
+                                        let arg_ty = check_expr(a, env)?;
+                                        if let Some((_, param_ty)) = sig.params.get(i) {
+                                            let int_to_float =
+                                                matches!(arg_ty, Ty::Int) && matches!(param_ty, Ty::Float);
+                                            if !int_to_float
+                                                && !matches!(arg_ty, Ty::Unknown)
+                                                && !matches!(param_ty, Ty::Unknown)
+                                                && !types_compatible(&arg_ty, param_ty, env.ctx)
+                                            {
+                                                return Err(Error::Type {
+                                                    span: *span,
+                                                    msg: format!(
+                                                        "argument {} to `{}.{}`: expected {}, found {}",
+                                                        i + 1, modname, name, param_ty, arg_ty
+                                                    ),
+                                                });
+                                            }
+                                        }
+                                    }
+                                    for (_, v) in kwargs { check_expr(v, env)?; }
+                                    return Ok(sig.ret.clone());
+                                } else {
+                                    // X IS a tracked module but defines no such `f`.
+                                    return Err(Error::Type {
+                                        span: *attr_span,
+                                        msg: format!("module `{}` has no function `{}`", modname, name),
+                                    });
+                                }
+                            }
+                        }
+                    }
                     if let Expr::Attr { obj, name, .. } = callee.as_ref() {
                         let obj_ty = check_expr(obj, env)?;
                         if let Ty::Class(class_name) = &obj_ty {
@@ -6532,5 +6633,91 @@ def bad(x: int | str) -> str:
         let ctx = ctx_from_module(&m);
         let errs = check_all(&m, &ctx);
         assert!(!errs.is_empty(), "@extern with a Union-typed param must be rejected");
+    }
+
+    // =========================================================================
+    // Qualified module calls — `import X; X.f(args)` (card 81db88e0)
+    // =========================================================================
+
+    /// Build a TyCtx that models `import os` having merged the embedded `os`
+    /// module: its functions live FLAT in `ctx.funcs` (under bare names) and the
+    /// module→funcs index `module_funcs["os"]` lists them. Mirrors what the
+    /// resolver produces for a non-root module.
+    fn ctx_with_os_module() -> TyCtx {
+        let mut ctx = TyCtx::new();
+        ctx.funcs.insert("basename".into(), FuncSig {
+            params: vec![("p".into(), Ty::Str)],
+            param_defaults: vec![None],
+            param_by_ref: vec![],
+            ret: Ty::Str,
+        });
+        ctx.funcs.insert("getenv".into(), FuncSig {
+            params: vec![("key".into(), Ty::Str), ("default".into(), Ty::Str)],
+            param_defaults: vec![None, None],
+            param_by_ref: vec![],
+            ret: Ty::Str,
+        });
+        ctx.module_funcs.insert("os".into(), vec!["basename".into(), "getenv".into()]);
+        ctx
+    }
+
+    #[test]
+    fn qualified_module_call_types_as_function_return() {
+        // `os.basename("/x/y/z.txt")` resolves via module_funcs to the flat
+        // `basename` signature and types as its return type (str), NOT Unknown.
+        let ctx = ctx_with_os_module();
+        let mut env = make_env(&ctx);
+        let call = method_call(ident("os"), "basename", vec![str_lit("/x/y/z.txt")]);
+        assert_eq!(check_expr(&call, &mut env).unwrap(), Ty::Str);
+    }
+
+    #[test]
+    fn qualified_module_call_inference_oracle_agrees() {
+        // The inference oracle (infer_expr_ty) must agree with check_expr: a
+        // qualified module call infers the function's declared return type.
+        let ctx = ctx_with_os_module();
+        let locals = std::collections::HashMap::new();
+        let call = method_call(ident("os"), "getenv", vec![str_lit("K"), str_lit("D")]);
+        assert_eq!(infer_expr_ty(&call, &locals, &ctx), Ty::Str);
+    }
+
+    #[test]
+    fn qualified_call_to_unknown_module_function_is_honest_error() {
+        // `os.nope(...)` — os IS a tracked module but defines no `nope`. This is a
+        // hard typeck error, not a silently-Unknown call deferred to rustc.
+        let ctx = ctx_with_os_module();
+        let mut env = make_env(&ctx);
+        let call = method_call(ident("os"), "nope", vec![str_lit("x")]);
+        assert_type_err(check_expr(&call, &mut env), "has no function");
+    }
+
+    #[test]
+    fn qualified_module_call_checks_arity() {
+        // `os.basename()` with no args is rejected (basename takes 1 required arg).
+        let ctx = ctx_with_os_module();
+        let mut env = make_env(&ctx);
+        let call = method_call(ident("os"), "basename", vec![]);
+        assert_type_err(check_expr(&call, &mut env), "argument(s)");
+    }
+
+    #[test]
+    fn qualified_module_call_checks_arg_types() {
+        // `os.basename(42)` — basename expects str, gets int → honest error.
+        let ctx = ctx_with_os_module();
+        let mut env = make_env(&ctx);
+        let call = method_call(ident("os"), "basename", vec![int_lit(42)]);
+        assert_type_err(check_expr(&call, &mut env), "expected str");
+    }
+
+    #[test]
+    fn math_qualified_call_untouched_by_module_path() {
+        // COEXISTENCE: `math` is NOT in module_funcs (resolver skip-lists it), so
+        // the general qualified-module path never fires for it. `math.sqrt(x)`
+        // keeps hitting its dedicated hardcoded handling — here the inference
+        // oracle's math arm types it as float (not the module path's Unknown).
+        let ctx = TyCtx::new(); // empty module_funcs — math is not a real module
+        let locals = std::collections::HashMap::new();
+        let call = method_call(ident("math"), "sqrt", vec![float_lit(16.0)]);
+        assert_eq!(infer_expr_ty(&call, &locals, &ctx), Ty::Float);
     }
 }

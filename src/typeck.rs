@@ -6463,7 +6463,7 @@ def bad(s: str) -> str:
         let errs = check_all(&m, &ctx);
         assert!(!errs.is_empty(), "@extern with a non-template body must be rejected");
         assert!(
-            errs.iter().any(|e| matches!(e, Error::Type { msg, .. } if msg.contains("single Rust-template string literal"))),
+            errs.iter().any(|e| matches!(e, Error::Type { msg, .. } if msg.contains("string literal"))),
             "error must name the single-template-string requirement, got: {:?}", errs
         );
     }

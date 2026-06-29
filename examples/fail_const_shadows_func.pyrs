@@ -1,0 +1,13 @@
+# Negative fixture (honest-errors): a module constant whose NAME duplicates a
+# function name must be REJECTED by `pyrst check` (not deferred to a rustc E0618
+# at `build`). Constants and functions share a FLAT namespace — a call `my_fn()`
+# would otherwise route to the mangled const and miscompile. The honest typeck
+# error names the clash and tells the user to rename one.
+
+my_fn: float = 3.14
+
+def my_fn() -> float:
+    return 2.71
+
+def main() -> None:
+    print(my_fn())

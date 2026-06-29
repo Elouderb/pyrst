@@ -845,6 +845,14 @@ fn is_bare_main_call(s: &Stmt) -> bool {
 /// first parameter of a method) is recognized and exempted below.
 const RUST_NON_RAW_KEYWORDS: &[&str] = &["crate", "self", "super", "Self"];
 
+/// Reserved codegen identifier prefix. Module-level constants lower to Rust
+/// `const __pyrst_const_<name>` (see codegen's `mangle_const`), so a USER
+/// identifier literally named `__pyrst_const_x` would collide with the mangled
+/// const for `x`. The prefix is reserved for compiler-generated names; reject it
+/// honestly at typeck rather than risk a silent clash. (No real program uses
+/// this prefix; it exists only to make the mangling collision-proof.)
+const RESERVED_CODEGEN_PREFIX: &str = "__pyrst_const_";
+
 fn reject_if_reserved(name: &str, span: Span, role: &str) -> Result<()> {
     if RUST_NON_RAW_KEYWORDS.contains(&name) {
         return Err(Error::Type {
@@ -855,6 +863,16 @@ fn reject_if_reserved(name: &str, span: Span, role: &str) -> Result<()> {
                  lower it. Rename it (other Rust keywords like `type`/`loop` are \
                  escaped automatically and need no change).",
                 name, role, name
+            ),
+        });
+    }
+    if name.starts_with(RESERVED_CODEGEN_PREFIX) {
+        return Err(Error::Type {
+            span,
+            msg: format!(
+                "`{}` cannot be used as a {} name: the `{}` prefix is reserved for \
+                 compiler-generated identifiers (module-constant lowering). Rename it.",
+                name, role, RESERVED_CODEGEN_PREFIX
             ),
         });
     }
@@ -1335,8 +1353,41 @@ fn check_top_level_other(s: &Stmt, ctx: &TyCtx) -> Result<()> {
     // print, or any other stray statement is still an honest error. The declared
     // type must be valid AND match the literal (so `x: int = "s"` is rejected,
     // and an invalid annotation like `set[float]` is rejected by `from_type_expr`).
-    if let Stmt::Assign { ty: Some(t), value, span, .. } = s {
+    if let Stmt::Assign { target, ty: Some(t), value, span } = s {
         if is_const_literal(value) {
+            // The const NAME must not be a Rust non-raw keyword nor use the
+            // reserved compiler-generated prefix (the mangled-const namespace).
+            reject_if_reserved(target, *span, "module constant")?;
+            // (Honest-errors) The module-const namespace is FLAT — codegen emits
+            // one top-level Rust `const __pyrst_const_<name>` and rewrites bare /
+            // qualified references to it. A const whose name DUPLICATES a function
+            // (built-in OR user/stdlib, any module — `ctx.funcs` is the merged flat
+            // table) or a class is ambiguous: a call `name()` would route to the
+            // const and miscompile (E0618). Reject it honestly at `check` time
+            // rather than deferring the clash to rustc at `build`. This single
+            // check at the const site catches the symmetric pair regardless of
+            // source order (ctx is fully merged before checking) and the
+            // cross-module case (flat table).
+            if ctx.funcs.contains_key(target) {
+                return Err(Error::Type {
+                    span: *span,
+                    msg: format!(
+                        "module constant `{}` clashes with a function of the same name; \
+                         rename one (constants and functions share a flat namespace)",
+                        target
+                    ),
+                });
+            }
+            if ctx.classes.contains_key(target) {
+                return Err(Error::Type {
+                    span: *span,
+                    msg: format!(
+                        "module constant `{}` clashes with a class of the same name; \
+                         rename one (constants and classes share a flat namespace)",
+                        target
+                    ),
+                });
+            }
             let declared = Ty::from_type_expr(t, *span)?;
             let lit_ty = const_literal_ty(value).unwrap_or(Ty::Unknown);
             if !types_compatible(&lit_ty, &declared, ctx) {
@@ -3493,12 +3544,12 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                     // is a tracked module name, this is NOT a method call: it is a
                     // call to module X's function `f`, whose signature lives FLAT in
                     // `ctx.funcs` under the bare name. We type it exactly like a flat
-                    // call to `f` (arity + per-arg compatibility + return), which
-                    // GENERALIZES the hardcoded math arm. `math` is never a tracked
-                    // module (resolver skip-lists it), so `math.sqrt(x)` is unaffected
-                    // and continues through the fallthrough below to its codegen
-                    // special-casing. A qualified call to a name the module does NOT
-                    // define is an honest error here, not a silently-Unknown call.
+                    // call to `f` (arity + per-arg compatibility + return). `math`
+                    // is now a real embedded module, so `math.sqrt(x)` resolves
+                    // through here like any other module's function. A qualified
+                    // call to a name the module does NOT define is an honest error
+                    // here (see the unknown-qualified-call rejection below), not a
+                    // silently-Unknown call.
                     if let Expr::Attr { obj, name, span: attr_span } = callee.as_ref() {
                         if let Expr::Ident(modname, _) = obj.as_ref() {
                             if let Some(mod_fns) = env.ctx.module_funcs.get(modname) {
@@ -3718,6 +3769,29 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                     if let Some((_, ty)) = consts.iter().find(|(c, _)| c == name) {
                         return Ok(ty.clone());
                     }
+                }
+                // (Honest-errors) `X.attr` (non-call) where X is a KNOWN imported
+                // module (it has tracked functions or constants) but `attr` is
+                // neither a constant nor a function of X is an UNKNOWN ATTRIBUTE.
+                // Reject it honestly at `check` rather than letting it fall to
+                // Ty::Unknown and miscompile at `build` (e.g. `math.inf` — inf/nan
+                // are not pyrst constants — would emit a bare `math` and fail rustc
+                // E0425). Mirrors the unknown-qualified-FUNCTION rejection on the
+                // call path. A known constant returned above; a function name
+                // (used as a value) is a separate, deferred feature and is left to
+                // fall through unchanged.
+                let is_known_module = env.ctx.module_funcs.contains_key(modname)
+                    || env.ctx.module_consts.contains_key(modname);
+                let is_module_func = env
+                    .ctx
+                    .module_funcs
+                    .get(modname)
+                    .is_some_and(|fns| fns.iter().any(|f| f == name));
+                if is_known_module && !is_module_func {
+                    return Err(Error::Type {
+                        span: *span,
+                        msg: format!("module `{}` has no attribute `{}`", modname, name),
+                    });
                 }
             }
             let obj_ty = check_expr(obj, env)?;
@@ -6847,5 +6921,46 @@ def bad(x: int | str) -> str:
             span: Span::DUMMY,
         };
         assert_eq!(infer_expr_ty(&attr, &locals, &ctx), Ty::Float);
+    }
+
+    /// BLOCKER-1 (honest-errors): a module constant whose NAME duplicates a
+    /// function is rejected at `check` (constants and functions share a flat
+    /// namespace; otherwise the call would route to the mangled const and
+    /// miscompile as rustc E0618). The single check at the const site catches the
+    /// pair regardless of source order.
+    #[test]
+    fn module_const_clashing_with_function_is_rejected() {
+        let src = "\
+my_fn: float = 3.14
+
+def my_fn() -> float:
+    return 2.71
+";
+        let m = crate::parser::parse(src).expect("parse");
+        let ctx = ctx_from_module(&m);
+        let errs = check_all(&m, &ctx);
+        assert!(
+            errs.iter().any(|e| matches!(e, Error::Type { msg, .. } if msg.contains("clashes with a function"))),
+            "a const named like a function must be an honest error; got: {:?}", errs
+        );
+    }
+
+    /// BLOCKER-2 (honest-errors): an UNKNOWN attribute on a KNOWN embedded module
+    /// (non-call) is rejected at `check` (`math.inf` — not a pyrst constant —
+    /// otherwise emits a bare `math` and fails rustc E0425), while a REAL const
+    /// (`math.pi`) still type-checks.
+    #[test]
+    fn unknown_attr_on_known_module_is_rejected() {
+        let mut ctx = TyCtx::new();
+        ctx.module_funcs.insert("math".into(), vec!["sqrt".into()]);
+        ctx.module_consts.insert("math".into(), vec![("pi".into(), Ty::Float)]);
+        // Unknown attribute `inf` on the known `math` module -> honest error.
+        let mut env = make_env(&ctx);
+        let bad = Expr::Attr { obj: Box::new(ident("math")), name: "inf".into(), span: Span::DUMMY };
+        assert_type_err(check_expr(&bad, &mut env), "has no attribute `inf`");
+        // A real const still resolves.
+        let mut env2 = make_env(&ctx);
+        let good = Expr::Attr { obj: Box::new(ident("math")), name: "pi".into(), span: Span::DUMMY };
+        assert_eq!(check_expr(&good, &mut env2).expect("math.pi ok"), Ty::Float);
     }
 }

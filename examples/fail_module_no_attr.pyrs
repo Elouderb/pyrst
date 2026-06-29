@@ -1,0 +1,12 @@
+# Negative fixture (honest-errors): an UNKNOWN ATTRIBUTE on a KNOWN embedded
+# module must be REJECTED by `pyrst check` (not deferred to a rustc E0425 at
+# `build`). `math.inf` is not a pyrst constant (inf/nan have no literal form and
+# were not migrated), so referencing it as a non-call attribute on the known
+# `math` module is an honest "module `math` has no attribute `inf`" error —
+# mirroring the unknown-qualified-FUNCTION rejection on the call path.
+
+import math
+
+
+def main() -> None:
+    print(math.inf > 1.0)

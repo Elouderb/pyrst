@@ -125,11 +125,12 @@ impl Resolver {
                 let mod_name = &path[0];
 
                 // Skip standard library modules that are NOT yet real modules
-                // (no codegen, no embedded source). `math`/`dataclasses` have
-                // dedicated handling elsewhere; the rest are silent no-ops until
-                // implemented. `os` is NOT here: it is a real embedded module
-                // (resolved below), so it must reach the resolution path.
-                if matches!(mod_name.as_str(), "math" | "dataclasses" | "sys" | "json" | "re" | "collections" | "itertools") {
+                // (no codegen, no embedded source). `dataclasses` has dedicated
+                // handling elsewhere; the rest are silent no-ops until
+                // implemented. `os`/`math` are NOT here: they are real embedded
+                // modules (`lib/os.pyrs`, `lib/math.pyrs`, resolved below), so
+                // they must reach the resolution path.
+                if matches!(mod_name.as_str(), "dataclasses" | "sys" | "json" | "re" | "collections" | "itertools") {
                     continue;
                 }
 
@@ -276,12 +277,29 @@ pub(crate) fn merge_ctx_from_module(m: &Module, ctx: &mut TyCtx, is_root: bool) 
                     });
                 }
             }
-            Stmt::Assign { target, ty: Some(t), span, .. } => {
+            Stmt::Assign { target, ty: Some(t), value, span } => {
                 // Register module-level annotated globals with their concrete type
                 // (ported from typeck::check_module). Propagate errors so that
                 // invalid annotations (e.g. set[float]) are rejected at typeck.
+                // This also makes a BARE reference to a module-level constant
+                // resolve inside its defining module (it lands in `ctx.vars`).
                 let resolved = crate::typeck::Ty::from_type_expr(t, *span)?;
-                ctx.vars.insert(target.clone(), resolved);
+                ctx.vars.insert(target.clone(), resolved.clone());
+                // MODULE CONSTANTS (mirror of `module_funcs`): when the value is a
+                // const literal (int/float/str/bool) and this is a NON-ROOT
+                // (imported) module, record `(name, type)` under the module name so
+                // a qualified `X.CONST` access resolves (e.g. `math.pi`). The root
+                // program is not a qualifiable module (you don't write `root.X`),
+                // so the root's own consts are reachable only by their bare name
+                // (via `ctx.vars` above), never as `root.CONST`.
+                if let Some(mod_name) = &module_name {
+                    if crate::typeck::is_const_literal(value) {
+                        ctx.module_consts
+                            .entry(mod_name.clone())
+                            .or_default()
+                            .push((target.clone(), resolved));
+                    }
+                }
             }
             Stmt::Import { .. } => {}
             _ => {}

@@ -1,0 +1,118 @@
+# pyrst standard library — math
+#
+# Real pyrst stdlib module (no longer hardcoded in codegen). Embedded via
+# `include_str!` (see `src/stdlib.rs`). Usable as either
+# `from math import sqrt` or `import math; math.sqrt(x)`.
+#
+# Two pieces, both general-purpose language features that math merely dogfoods:
+#   - MODULE-LEVEL CONSTANTS: `pi`/`e`/`tau` are top-level annotated-literal
+#     constants (`NAME: float = <literal>`). The f64 literals below ARE the exact
+#     IEEE-754 doubles for PI / E / TAU (same bit patterns as Rust's
+#     `std::f64::consts::{PI,E,TAU}`), so `math.pi` keeps its previous value.
+#   - @extern FUNCTION WRAPPERS over Rust's `f64` methods. Each body is a single
+#     Rust expression template (`{x}` is substituted with the param) emitted as
+#     the function's tail expression — matching the templates the former
+#     hardcoded codegen arm produced.
+#
+# Phase-1 notes:
+#   - float-specialized: arguments and results are `float` (pyrst generics are a
+#     later card). Pass floats (`math.sqrt(16.0)`); pyrst does not implicitly
+#     widen an int argument to a float parameter, so `math.sqrt(16)` is a type
+#     error — write `16.0`.
+#   - `floor`/`ceil`/`trunc` return `float` (Rust's `f64::floor` etc. yield
+#     `f64`), matching the previous hardcoded behavior; CPython returns `int`.
+#     An int-returning form arrives with a later overload/generics card.
+#   - `log(x)` is the natural log (Rust `f64::ln`). A two-argument
+#     `log(x, base)` form needs overloading and is deferred; use `log2`/`log10`
+#     for the common bases.
+#   - `inf` / `nan` are NOT provided: pyrst has no infinity / NaN LITERAL, so
+#     they cannot be expressed as annotated-literal constants (the only module
+#     constant form). They are deferred until pyrst grows such literals (or a
+#     `float("inf")` form). Likewise `fabs`/`atan2`/`degrees`/`radians`/
+#     `isnan`/`isinf`/`isfinite` are not yet migrated — add them as @extern
+#     wrappers when a program needs them.
+
+
+pi: float = 3.141592653589793
+e: float = 2.718281828459045
+tau: float = 6.283185307179586
+
+
+@extern
+def sqrt(x: float) -> float:
+    "({x}).sqrt()"
+
+
+@extern
+def floor(x: float) -> float:
+    "({x}).floor()"
+
+
+@extern
+def ceil(x: float) -> float:
+    "({x}).ceil()"
+
+
+@extern
+def trunc(x: float) -> float:
+    "({x}).trunc()"
+
+
+@extern
+def exp(x: float) -> float:
+    "({x}).exp()"
+
+
+@extern
+def log(x: float) -> float:
+    "({x}).ln()"
+
+
+@extern
+def log2(x: float) -> float:
+    "({x}).log2()"
+
+
+@extern
+def log10(x: float) -> float:
+    "({x}).log10()"
+
+
+@extern
+def sin(x: float) -> float:
+    "({x}).sin()"
+
+
+@extern
+def cos(x: float) -> float:
+    "({x}).cos()"
+
+
+@extern
+def tan(x: float) -> float:
+    "({x}).tan()"
+
+
+@extern
+def asin(x: float) -> float:
+    "({x}).asin()"
+
+
+@extern
+def acos(x: float) -> float:
+    "({x}).acos()"
+
+
+@extern
+def atan(x: float) -> float:
+    "({x}).atan()"
+
+
+@extern
+def pow(x: float, y: float) -> float:
+    "({x}).powf({y})"
+
+
+@extern
+def hypot(x: float, y: float) -> float:
+    "({x}).hypot({y})"

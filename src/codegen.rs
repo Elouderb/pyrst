@@ -71,11 +71,20 @@ pub struct Codegen<'a> {
     /// empty everywhere else (a regular base-typed param IS the enum and DOES
     /// lower). `self` is exempt structurally, so it is never added here.
     concrete_struct_params: std::collections::HashSet<String>,
+    /// Names of module-level STRING constants. A str const lowers to a Rust
+    /// `const NAME: &str` (a `String` is not const-constructible), so a REFERENCE
+    /// to it — bare `CONST` or qualified `X.CONST` — must emit `NAME.to_string()`
+    /// to recover pyrst's `str == Rust String` value type. int/float/bool consts
+    /// are `Copy` and need no such fix-up, so only str-const names live here.
+    /// Populated by `emit_program` from every module's const declarations before
+    /// emission; empty on paths that build a `Codegen` directly (no module
+    /// constants there).
+    const_strs: std::collections::HashSet<String>,
 }
 
 impl<'a> Codegen<'a> {
     pub fn new(ctx: &'a TyCtx) -> Self {
-        Self { ctx, out: String::new(), indent: 0, locals: HashMap::new(), declared: Default::default(), current_class: None, current_ret_ty: Ty::Unit, dead_funcs: Default::default(), mut_self: HashMap::new(), by_ref_locals: Default::default(), poly_map: HashMap::new(), concrete_struct_params: Default::default() }
+        Self { ctx, out: String::new(), indent: 0, locals: HashMap::new(), declared: Default::default(), current_class: None, current_ret_ty: Ty::Unit, dead_funcs: Default::default(), mut_self: HashMap::new(), by_ref_locals: Default::default(), poly_map: HashMap::new(), concrete_struct_params: Default::default(), const_strs: Default::default() }
     }
 
     pub fn with_dead_funcs(mut self, dead: std::collections::HashSet<String>) -> Self {
@@ -775,16 +784,63 @@ impl<'a> Codegen<'a> {
                 ) {
                     return Ok(());
                 }
+                // A module-level constant (`NAME: T = <literal>`) is already
+                // emitted as a top-level Rust `const` by the prepass in
+                // `emit_program` (which runs before any function so call sites
+                // resolve), so it is a recognised no-op here.
+                if crate::typeck::is_module_const_decl(other) {
+                    return Ok(());
+                }
                 // Any other unsupported top-level statement is an honest error.
                 // This arm is a backstop; typeck's check_bodies fires the same
                 // rejection earlier (at `pyrst check` time).
                 Err(crate::diag::Error::Codegen(
                     "top-level statements other than function/class/import \
-                     definitions are not supported"
+                     definitions (and module-level constants `NAME: T = <literal>`) \
+                     are not supported"
                         .to_string(),
                 ))
             }
         }
+    }
+
+    /// Emit a MODULE-LEVEL CONSTANT (`NAME: T = <literal>`) as a top-level Rust
+    /// `const`. Called by `emit_program`'s prepass for every statement that
+    /// [`crate::typeck::is_module_const_decl`] accepts, so the value is always one
+    /// of the four primitive literals.
+    ///
+    /// int/float/bool lower to `const NAME: <i64|f64|bool> = <value>;` — all
+    /// `Copy`, so a bare reference (`CONST`) or qualified reference (`X.CONST`)
+    /// uses the name directly. A `str` constant lowers to `const NAME: &str =
+    /// "...";` (a `String` is not const-constructible), so REFERENCES to a str
+    /// const emit `NAME.to_string()` to preserve pyrst's `str == Rust String`
+    /// value semantics (see the `Expr::Attr`/`Expr::Ident` const arms).
+    ///
+    /// The const name is the bare declared name (the namespace is FLAT, mirroring
+    /// `module_funcs`); `escape_ident` keeps a keyword-named const compiling.
+    fn emit_const_decl(&mut self, s: &Stmt) -> Result<()> {
+        let Stmt::Assign { target, value, .. } = s else {
+            return Err(crate::diag::Error::Codegen(
+                "emit_const_decl called on a non-assignment".to_string(),
+            ));
+        };
+        let name = escape_ident(target);
+        let decl = match value {
+            Expr::Int(n, _) => format!("const {}: i64 = {};", name, n),
+            // Suffix `f64` so a whole-number float literal (`6.0` formats as
+            // "6") is still a valid f64 const initializer (`6f64`), and a
+            // fractional one (`3.14`) stays `3.14f64`.
+            Expr::Float(f, _) => format!("const {}: f64 = {}f64;", name, f),
+            Expr::Bool(b, _) => format!("const {}: bool = {};", name, b),
+            Expr::Str(st, _) => format!("const {}: &str = {:?};", name, st),
+            _ => {
+                return Err(crate::diag::Error::Codegen(
+                    "module constant value must be an int/float/str/bool literal".to_string(),
+                ))
+            }
+        };
+        self.line(&decl);
+        Ok(())
     }
 
     /// Whether an lvalue / receiver chain bottoms out at the `self` receiver —
@@ -3272,6 +3328,23 @@ impl<'a> Codegen<'a> {
 
                 if let Some(__s) = self.emit_method_call_on_attr(callee, args)? { return Ok(__s); }
 
+                self.emit_plain_func_call(callee, args, kwargs)
+    }
+
+    /// Emit a REGULAR function call (not a builtin / constructor / super /
+    /// method) — the tail of [`Codegen::emit_call`]. Split out so the qualified
+    /// module-call re-dispatch can reach it DIRECTLY: a flat module function
+    /// whose name COLLIDES with a builtin (e.g. `math.pow` vs the builtin `pow`)
+    /// must call the module function, not the builtin, so it must NOT re-enter
+    /// `emit_builtin_call`. This applies the same Optional / by-ref /
+    /// default-argument coercion as a bare flat call.
+    #[allow(clippy::borrowed_box)]
+    fn emit_plain_func_call(
+        &mut self,
+        callee: &Box<Expr>,
+        args: &[Expr],
+        kwargs: &[(String, Expr)],
+    ) -> Result<String> {
                 // Regular function call (not a class).
                 // (EPIC-5) Look up the callee signature so an argument flowing
                 // into an `Optional[T]` parameter is wrapped (`Some(..)` for a
@@ -3372,42 +3445,6 @@ impl<'a> Codegen<'a> {
     ) -> Result<Option<String>> {
                 // Method call with attribute callee — handle method name remapping
                 if let Expr::Attr { obj, name, .. } = callee.as_ref() {
-                    // Math module functions
-                    if let Expr::Ident(modname, _) = obj.as_ref() {
-                        if modname == "math" {
-                            let parts: Result<Vec<_>> = args.iter().map(|a| self.emit_consuming(a)).collect();
-                            let parts = parts?;
-                            let a0 = parts.get(0).map(|s| s.as_str()).unwrap_or("0.0");
-                            let a1 = parts.get(1).map(|s| s.as_str()).unwrap_or("0.0");
-                            return Ok(Some(match name.as_str() {
-                                "sqrt"     => format!("({} as f64).sqrt()", a0),
-                                "floor"    => format!("({} as f64).floor()", a0),
-                                "ceil"     => format!("({} as f64).ceil()", a0),
-                                "trunc"    => format!("({} as f64).trunc()", a0),
-                                "fabs" | "abs" => format!("({} as f64).abs()", a0),
-                                "exp"      => format!("({} as f64).exp()", a0),
-                                "log"      => if parts.len() == 2 { format!("({} as f64).log({} as f64)", a0, a1) } else { format!("({} as f64).ln()", a0) },
-                                "log2"     => format!("({} as f64).log2()", a0),
-                                "log10"    => format!("({} as f64).log10()", a0),
-                                "sin"      => format!("({} as f64).sin()", a0),
-                                "cos"      => format!("({} as f64).cos()", a0),
-                                "tan"      => format!("({} as f64).tan()", a0),
-                                "asin"     => format!("({} as f64).asin()", a0),
-                                "acos"     => format!("({} as f64).acos()", a0),
-                                "atan"     => format!("({} as f64).atan()", a0),
-                                "atan2"    => format!("({} as f64).atan2({} as f64)", a0, a1),
-                                "pow"      => format!("({} as f64).powf({} as f64)", a0, a1),
-                                "hypot"    => format!("({} as f64).hypot({} as f64)", a0, a1),
-                                "degrees"  => format!("({} as f64).to_degrees()", a0),
-                                "radians"  => format!("({} as f64).to_radians()", a0),
-                                "isnan"    => format!("({} as f64).is_nan()", a0),
-                                "isinf"    => format!("({} as f64).is_infinite()", a0),
-                                "isfinite" => format!("({} as f64).is_finite()", a0),
-                                _ => return Err(crate::diag::Error::Codegen(format!("unknown math function: math.{}", name))),
-                            }));
-                        }
-                    }
-
                     // Qualified module call `X.f(args)` for a REAL imported module
                     // (card 81db88e0). When X is a tracked module name and f is one
                     // of its functions, lower the call to the FLAT function `f(args)`
@@ -3417,16 +3454,22 @@ impl<'a> Codegen<'a> {
                     // `Ident(f)` callee so the regular function-call machinery
                     // (Optional/by-ref/default-argument coercion) applies uniformly,
                     // exactly as if the user had written `from X import f; f(args)`.
-                    // This GENERALIZES the hardcoded math arm above; `math` is never
-                    // a tracked module (resolver skip-lists it), so it keeps using
-                    // that arm. NOTE: flat emission means a cross-module same-name
-                    // collision is unresolved (stdlib uses distinct names;
-                    // per-module namespacing `X__f` is a later refinement).
+                    // `math` is now a REAL embedded module (`lib/math.pyrs`), so
+                    // `math.sqrt(x)` flows through here too (its @extern `sqrt`
+                    // is merged into `module_funcs`/`ctx.funcs`); the former
+                    // hardcoded math call-arm is gone. We re-dispatch through
+                    // `emit_plain_func_call` (NOT `emit_call`) so a module
+                    // function whose flat name COLLIDES with a builtin — e.g.
+                    // `math.pow` vs the builtin `pow` — calls the MODULE function,
+                    // not the builtin int-pow. NOTE: flat emission means a
+                    // cross-module same-name collision between two modules is
+                    // unresolved (stdlib uses distinct names; per-module
+                    // namespacing `X__f` is a later refinement).
                     if let Expr::Ident(modname, _) = obj.as_ref() {
                         if self.ctx.module_funcs.get(modname).is_some_and(|fns| fns.iter().any(|n| n == name)) {
                             let span = callee.span();
                             let flat_callee: Box<Expr> = Box::new(Expr::Ident(name.clone(), span));
-                            return Ok(Some(self.emit_call(&flat_callee, args, &[])?));
+                            return Ok(Some(self.emit_plain_func_call(&flat_callee, args, &[])?));
                         }
                     }
 
@@ -4845,21 +4888,40 @@ impl<'a> Codegen<'a> {
             // through to `emit_expr(callee)` here), so escaping once here keeps
             // def and every use in sync. `self` is not a keyword and passes
             // through unchanged (legitimate receiver).
-            Expr::Ident(n, _) => escape_ident(n),
+            Expr::Ident(n, _) => {
+                // A bare reference to a module-level STR constant must recover a
+                // `String` from the `&str` const (see `const_strs`). A local
+                // shadowing the const name keeps the local's value (consts are
+                // global, locals win), matching normal name resolution.
+                if self.const_strs.contains(n) && !self.locals.contains_key(n) {
+                    format!("{}.to_string()", escape_ident(n))
+                } else {
+                    escape_ident(n)
+                }
+            }
             Expr::Call { callee, args, kwargs, .. } => {
                 self.emit_call(callee, args, kwargs)?
             }
             Expr::Attr { obj, name, .. } => {
-                // Math module constants
+                // Qualified MODULE CONSTANT `X.CONST` for a REAL imported module:
+                // when X is a tracked module and CONST is one of its module-level
+                // constants, lower to the FLAT Rust `const CONST` (the const
+                // namespace is flat, mirroring qualified module CALLS). A str
+                // const recovers a `String` from its `&str` const. This
+                // GENERALIZES the former hardcoded `math.pi`/`math.e`/`math.tau`
+                // arm — `math` is now a real embedded module (`lib/math.pyrs`),
+                // so its constants flow through here like any other module's.
                 if let Expr::Ident(modname, _) = obj.as_ref() {
-                    if modname == "math" {
-                        return Ok(match name.as_str() {
-                            "pi"  => "::std::f64::consts::PI".to_string(),
-                            "e"   => "::std::f64::consts::E".to_string(),
-                            "tau" => "::std::f64::consts::TAU".to_string(),
-                            "inf" => "f64::INFINITY".to_string(),
-                            "nan" => "f64::NAN".to_string(),
-                            _ => return Err(crate::diag::Error::Codegen(format!("unknown math constant: {}", name))),
+                    if self
+                        .ctx
+                        .module_consts
+                        .get(modname)
+                        .is_some_and(|cs| cs.iter().any(|(c, _)| c == name))
+                    {
+                        return Ok(if self.const_strs.contains(name) {
+                            format!("{}.to_string()", escape_ident(name))
+                        } else {
+                            escape_ident(name)
                         });
                     }
                 }
@@ -5644,7 +5706,7 @@ pub fn emit_program(modules: &[(Module, String)], ctx: &TyCtx) -> Result<String>
     cg.build_poly_map();
 
     // Preamble — written once
-    cg.line("#![allow(unused_parens, unused_variables, unused_mut, dead_code, unused_imports)]");
+    cg.line("#![allow(unused_parens, unused_variables, unused_mut, dead_code, unused_imports, non_upper_case_globals)]");
     cg.line("use std::io::Write;");
     cg.line("");
     cg.line("fn __py_fmt_float(x: f64) -> String {");
@@ -5689,6 +5751,24 @@ pub fn emit_program(modules: &[(Module, String)], ctx: &TyCtx) -> Result<String>
     cg.line(FILE_PRELUDE);
     cg.line("");
     cg.line("// ----- user code -----");
+
+    // Module-level CONSTANTS prepass: emit every `NAME: T = <literal>` as a
+    // top-level Rust `const` BEFORE any function so a const referenced inside a
+    // function (bare `CONST` or qualified `X.CONST`) always resolves, regardless
+    // of source order across modules. `emit_top_stmt` treats these assigns as a
+    // no-op (they are emitted here), so each const is emitted exactly once.
+    for (m, _src) in modules {
+        for s in &m.stmts {
+            if crate::typeck::is_module_const_decl(s) {
+                // Record str consts BEFORE emitting bodies so references
+                // (bare `CONST` / qualified `X.CONST`) lower to `NAME.to_string()`.
+                if let Stmt::Assign { target, value: Expr::Str(..), .. } = s {
+                    cg.const_strs.insert(target.clone());
+                }
+                cg.emit_const_decl(s)?;
+            }
+        }
+    }
 
     // Emit all modules in order (imports first, root last)
     for (m, _src) in modules {
@@ -6033,10 +6113,20 @@ def ipow(base: int, exp: int) -> int:
     }
 
     #[test]
-    fn math_qualified_call_still_uses_hardcoded_arm() {
-        // COEXISTENCE: `math` is never in module_funcs, so the general path does
-        // not fire; `math.sqrt(x)` keeps emitting via the hardcoded math arm.
-        let ctx = TyCtx::new(); // empty module_funcs
+    fn math_qualified_call_lowers_to_flat_call() {
+        // `math` is now a REAL embedded module: `math.sqrt(x)` flows through the
+        // GENERAL qualified-module path and lowers to the FLAT Rust call
+        // `sqrt((16.0f64))` (the `@extern` `sqrt` wrapper is merged flat) — the
+        // former hardcoded math arm is gone, so the `math` qualifier is dropped
+        // exactly like any other module's call.
+        let mut ctx = TyCtx::new();
+        ctx.funcs.insert("sqrt".into(), crate::typeck::FuncSig {
+            params: vec![("x".into(), Ty::Float)],
+            param_defaults: vec![None],
+            param_by_ref: vec![],
+            ret: Ty::Float,
+        });
+        ctx.module_funcs.insert("math".into(), vec!["sqrt".into()]);
         let mut cg = Codegen::new(&ctx);
         let callee: Box<Expr> = Box::new(Expr::Attr {
             obj: Box::new(Expr::Ident("math".into(), Span::DUMMY)),
@@ -6046,8 +6136,47 @@ def ipow(base: int, exp: int) -> int:
         let args = vec![Expr::Float(16.0, Span::DUMMY)];
         let out = cg.emit_method_call_on_attr(&callee, &args)
             .expect("emit must succeed")
-            .expect("math.sqrt must be handled by the hardcoded arm");
-        assert!(out.contains(".sqrt()"),
-            "math.sqrt must lower to the Rust `.sqrt()` method; got: {}", out);
+            .expect("a tracked module call must be handled by emit_method_call_on_attr");
+        assert!(out.starts_with("sqrt("),
+            "module qualifier must be dropped, emitting a flat call; got: {}", out);
+        assert!(!out.contains("math"),
+            "the `math` qualifier must not appear in the emitted call; got: {}", out);
+    }
+
+    #[test]
+    fn module_constant_lowers_to_flat_const_name() {
+        // A qualified module constant `math.pi` (a non-call attribute) lowers to
+        // the FLAT const name `pi` (a top-level `const pi: f64` is emitted by the
+        // prepass). The former hardcoded `::std::f64::consts::PI` arm is gone.
+        let mut ctx = TyCtx::new();
+        ctx.module_consts.insert("math".into(), vec![("pi".into(), Ty::Float)]);
+        let mut cg = Codegen::new(&ctx);
+        let attr = Expr::Attr {
+            obj: Box::new(Expr::Ident("math".into(), Span::DUMMY)),
+            name: "pi".into(),
+            span: Span::DUMMY,
+        };
+        let out = cg.emit_expr(&attr).expect("emit must succeed");
+        assert_eq!(out, "pi", "math.pi must lower to the flat const name; got: {}", out);
+    }
+
+    #[test]
+    fn module_const_decl_emits_top_level_const() {
+        // A module-level `NAME: T = <literal>` emits a top-level Rust `const`.
+        // int/float/bool are typed Copy consts; a str const is a `&str` const.
+        let src = "\
+PI: float = 3.14
+COUNT: int = 7
+GREETING: str = \"hi\"
+FLAG: bool = True
+
+def main() -> None:
+    print(PI)
+";
+        let out = emit_src(src);
+        assert!(out.contains("const PI: f64 = 3.14f64;"), "float const; got:\n{}", out);
+        assert!(out.contains("const COUNT: i64 = 7;"), "int const; got:\n{}", out);
+        assert!(out.contains("const GREETING: &str = \"hi\";"), "str const; got:\n{}", out);
+        assert!(out.contains("const FLAG: bool = true;"), "bool const; got:\n{}", out);
     }
 }

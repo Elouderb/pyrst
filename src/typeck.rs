@@ -191,6 +191,21 @@ pub struct TyCtx {
     /// same gap the rest of the stdlib already has there; the call simply stays
     /// `Unknown` and does not crash.
     pub module_funcs: HashMap<String, Vec<String>>,
+    /// Module-level CONSTANTS support (mirror of `module_funcs`): an IMPORTED
+    /// file/stdlib module's NAME → its top-level annotated-literal constants as
+    /// `(const-name, type)` pairs. Populated by `merge_ctx_from_module` for
+    /// NON-ROOT modules only, for an annotated assign `NAME: T = <literal>`
+    /// (int/float/str/bool). It lets `import X; X.CONST` resolve: an
+    /// `Attr{Ident(X), CONST}` (a non-call) where `X` is a key here and `CONST`
+    /// is in its list is typed as the const's `T` and lowered to the FLAT Rust
+    /// `const CONST`. A BARE `CONST` inside the defining module resolves through
+    /// `vars` (the same annotated-assign arm also registers it there).
+    ///
+    /// Like `module_funcs`, the const NAMESPACE is FLAT: codegen emits one
+    /// top-level `const CONST` per module-level constant, so a cross-module
+    /// same-name collision is unresolved (stdlib uses distinct names). Empty on
+    /// the LSP single-file path for the same reason as `module_funcs`.
+    pub module_consts: HashMap<String, Vec<(String, Ty)>>,
 }
 
 impl TyCtx {
@@ -301,7 +316,7 @@ impl TyCtx {
         vars.insert("dict".into(), Ty::Dict(Box::new(Ty::Str), Box::new(Ty::Unknown)));
         vars.insert("set".into(), Ty::Set(Box::new(Ty::Unknown)));
 
-        Self { funcs, classes: HashMap::new(), vars, module_funcs: HashMap::new() }
+        Self { funcs, classes: HashMap::new(), vars, module_funcs: HashMap::new(), module_consts: HashMap::new() }
     }
 
     pub fn get_all_fields(&self, class_name: &str) -> Vec<crate::ast::Param> {
@@ -1106,7 +1121,7 @@ pub fn check_all(m: &Module, ctx: &TyCtx) -> Vec<Error> {
             // Import statements have no body to check (resolved by the resolver).
             Stmt::Import { .. } => {}
             _ => {
-                if let Err(e) = check_top_level_other(s) {
+                if let Err(e) = check_top_level_other(s, ctx) {
                     errors.push(e);
                 }
             }
@@ -1138,7 +1153,7 @@ fn check_one_stmt(s: &Stmt, ctx: &TyCtx) -> Result<()> {
         // Import statements are resolved by the resolver and are
         // intentionally not type-checked here (no body to check).
         Stmt::Import { .. } => {}
-        _ => check_top_level_other(s)?,
+        _ => check_top_level_other(s, ctx)?,
     }
     Ok(())
 }
@@ -1264,22 +1279,86 @@ fn check_one_method(c: &ClassDef, method: &Func, ctx: &TyCtx) -> Result<()> {
     Ok(())
 }
 
+/// Whether `e` is a CONST LITERAL eligible for a module-level constant: a bare
+/// int / float / str / bool literal. Negative numbers parse as `UnOp{Neg, ...}`
+/// and const EXPRESSIONS (`2 * pi`) are out of scope for v1 — only the four
+/// primitive literal forms qualify. Shared by typeck (relaxed top-level check),
+/// the resolver (`module_consts` population), and codegen (`const` emission) so
+/// the three never drift on what "a module constant" means.
+pub(crate) fn is_const_literal(e: &Expr) -> bool {
+    matches!(
+        e,
+        Expr::Int(..) | Expr::Float(..) | Expr::Str(..) | Expr::Bool(..)
+    )
+}
+
+/// Whether `s` is a legal MODULE-LEVEL CONSTANT declaration: a top-level
+/// ANNOTATED assignment `NAME: T = <literal>` whose value is a const literal
+/// (see [`is_const_literal`]). This is the SOLE top-level statement form (beyond
+/// function/class/import) that the EPIC-6 relaxation legalizes — an UNANNOTATED
+/// `x = 5`, a call, a print, or an annotated assign to a NON-literal value all
+/// stay rejected.
+pub(crate) fn is_module_const_decl(s: &Stmt) -> bool {
+    matches!(
+        s,
+        Stmt::Assign { ty: Some(_), value, .. } if is_const_literal(value)
+    )
+}
+
+/// The static [`Ty`] of a const LITERAL (the four forms [`is_const_literal`]
+/// admits). Returns `None` for any other expression.
+fn const_literal_ty(e: &Expr) -> Option<Ty> {
+    match e {
+        Expr::Int(..) => Some(Ty::Int),
+        Expr::Float(..) => Some(Ty::Float),
+        Expr::Str(..) => Some(Ty::Str),
+        Expr::Bool(..) => Some(Ty::Bool),
+        _ => None,
+    }
+}
+
 /// Handle a top-level statement that is neither a function, class, nor import.
 /// Silently accepts a bare top-level `main()` call (the conventional pyrst
-/// entry-point idiom); rejects any other stray top-level statement. Fail-fast.
-fn check_top_level_other(s: &Stmt) -> Result<()> {
+/// entry-point idiom) AND a module-level annotated-literal constant declaration
+/// (`NAME: T = <literal>`, the EPIC-6-A relaxation that lets a module hold
+/// constants like `math.pi`); rejects any other stray top-level statement.
+/// Fail-fast.
+fn check_top_level_other(s: &Stmt, ctx: &TyCtx) -> Result<()> {
     // A bare top-level `main()` call is the conventional pyrst entry-point idiom
     // and is already driven by the synthetic Rust `fn main() { user_main(); }`.
-    if !is_bare_main_call(s) {
-        let span = stmt_span(s);
-        return Err(Error::Type {
-            span,
-            msg: "top-level statements other than function/class/import \
-                  definitions are not supported"
-                .to_string(),
-        });
+    if is_bare_main_call(s) {
+        return Ok(());
     }
-    Ok(())
+    // A module-level constant (`NAME: T = <literal>`) is the narrow EPIC-6-A
+    // relaxation: it is the ONLY assignment form accepted at top level — an
+    // unannotated assign, an annotated assign to a non-literal value, a call, a
+    // print, or any other stray statement is still an honest error. The declared
+    // type must be valid AND match the literal (so `x: int = "s"` is rejected,
+    // and an invalid annotation like `set[float]` is rejected by `from_type_expr`).
+    if let Stmt::Assign { ty: Some(t), value, span, .. } = s {
+        if is_const_literal(value) {
+            let declared = Ty::from_type_expr(t, *span)?;
+            let lit_ty = const_literal_ty(value).unwrap_or(Ty::Unknown);
+            if !types_compatible(&lit_ty, &declared, ctx) {
+                return Err(Error::Type {
+                    span: *span,
+                    msg: format!(
+                        "type mismatch in module constant: declared {}, got {}",
+                        declared, lit_ty
+                    ),
+                });
+            }
+            return Ok(());
+        }
+    }
+    let span = stmt_span(s);
+    Err(Error::Type {
+        span,
+        msg: "top-level statements other than function/class/import \
+              definitions (and module-level constants `NAME: T = <literal>`) \
+              are not supported"
+            .to_string(),
+    })
 }
 
 /// Innermost source [`Span`] of an [`Error`], unwrapping the EPIC-8 `Sourced`
@@ -2407,6 +2486,18 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
             }
         }
         Expr::Attr { obj, name, .. } => {
+            // Qualified MODULE CONSTANT `X.CONST` for a REAL imported module:
+            // when X is a tracked module and CONST is one of its module-level
+            // constants, the access has the const's declared type. GENERALIZES
+            // the former hardcoded `math.pi` typing — `math` is now a real
+            // embedded module whose consts are tracked here.
+            if let Expr::Ident(modname, _) = obj.as_ref() {
+                if let Some(consts) = ctx.module_consts.get(modname) {
+                    if let Some((_, ty)) = consts.iter().find(|(c, _)| c == name) {
+                        return ty.clone();
+                    }
+                }
+            }
             // D7: resolve the field inheritance-aware via `get_all_fields`
             // (codegen reads `c.fields` directly and misses inherited fields).
             if let Ty::Class(cls) = infer_expr_ty(obj, locals, ctx) {
@@ -2501,22 +2592,13 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
                 // Qualified module call `X.f(args)` for a REAL imported module
                 // (card 81db88e0): when X is a tracked module and f is one of its
                 // functions, the call's type is f's declared return type — exactly
-                // as if `f(args)` were called by its flat name. This GENERALIZES
-                // the hardcoded math arm below; `math` is never in `module_funcs`
-                // (resolver skip-lists it), so `math.sqrt(x)` still falls through
-                // to that arm.
+                // as if `f(args)` were called by its flat name. `math` is now a
+                // real embedded module (`lib/math.pyrs`), so `math.sqrt(x)` flows
+                // through here (its @extern `sqrt` lives in `module_funcs`); the
+                // former hardcoded math return-typing arm is gone.
                 if let Expr::Ident(modname, _) = obj.as_ref() {
                     if ctx.module_funcs.get(modname).is_some_and(|fns| fns.iter().any(|n| n == name)) {
                         return ctx.funcs.get(name).map(|s| s.ret.clone()).unwrap_or(Ty::Unknown);
-                    }
-                }
-                // Math module return types.
-                if let Expr::Ident(modname, _) = obj.as_ref() {
-                    if modname == "math" {
-                        return match name.as_str() {
-                            "isnan" | "isinf" | "isfinite" => Ty::Bool,
-                            _ => Ty::Float,
-                        };
                     }
                 }
                 // Class methods use their declared return; builtin receivers
@@ -3624,6 +3706,20 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
             }
         }
         Expr::Attr { obj, name, span } => {
+            // Qualified MODULE CONSTANT `X.CONST` for a REAL imported module:
+            // when X is a tracked module and CONST is one of its module-level
+            // constants, the access type-checks as the const's declared type.
+            // GENERALIZES the former hardcoded `math.pi` handling (where `math`
+            // was a Ty::Unknown placeholder and `math.pi` silently stayed
+            // Unknown); `math` is now a real embedded module whose consts are
+            // tracked in `module_consts`.
+            if let Expr::Ident(modname, _) = obj.as_ref() {
+                if let Some(consts) = env.ctx.module_consts.get(modname) {
+                    if let Some((_, ty)) = consts.iter().find(|(c, _)| c == name) {
+                        return Ok(ty.clone());
+                    }
+                }
+            }
             let obj_ty = check_expr(obj, env)?;
             if let Ty::Class(class_name) = &obj_ty {
                 if let Some(_class_def) = env.ctx.classes.get(class_name.as_str()) {
@@ -6719,14 +6815,37 @@ def bad(x: int | str) -> str:
     }
 
     #[test]
-    fn math_qualified_call_untouched_by_module_path() {
-        // COEXISTENCE: `math` is NOT in module_funcs (resolver skip-lists it), so
-        // the general qualified-module path never fires for it. `math.sqrt(x)`
-        // keeps hitting its dedicated hardcoded handling — here the inference
-        // oracle's math arm types it as float (not the module path's Unknown).
-        let ctx = TyCtx::new(); // empty module_funcs — math is not a real module
+    fn math_qualified_call_resolves_via_module_path() {
+        // `math` is now a REAL embedded module (`lib/math.pyrs`): its @extern
+        // `sqrt` is merged FLAT into `ctx.funcs` and indexed in
+        // `module_funcs["math"]`, so `math.sqrt(x)` types as `sqrt`'s declared
+        // return (float) through the GENERAL qualified-module path — no hardcoded
+        // math arm. (Models what the resolver produces for the math module.)
+        let mut ctx = TyCtx::new();
+        ctx.funcs.insert("sqrt".into(), FuncSig {
+            params: vec![("x".into(), Ty::Float)],
+            param_defaults: vec![None],
+            param_by_ref: vec![],
+            ret: Ty::Float,
+        });
+        ctx.module_funcs.insert("math".into(), vec!["sqrt".into()]);
         let locals = std::collections::HashMap::new();
         let call = method_call(ident("math"), "sqrt", vec![float_lit(16.0)]);
         assert_eq!(infer_expr_ty(&call, &locals, &ctx), Ty::Float);
+    }
+
+    #[test]
+    fn math_constant_resolves_via_module_consts() {
+        // `math.pi` (a NON-call attribute) types as float through the general
+        // `module_consts` path — the former hardcoded `math.pi` typing is gone.
+        let mut ctx = TyCtx::new();
+        ctx.module_consts.insert("math".into(), vec![("pi".into(), Ty::Float)]);
+        let locals = std::collections::HashMap::new();
+        let attr = Expr::Attr {
+            obj: Box::new(ident("math")),
+            name: "pi".into(),
+            span: Span::DUMMY,
+        };
+        assert_eq!(infer_expr_ty(&attr, &locals, &ctx), Ty::Float);
     }
 }

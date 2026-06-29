@@ -1,11 +1,18 @@
-# Negative fixture: a top-level assignment statement (not inside any function
-# or class) must be rejected by both `pyrst check` and `pyrst build` with an
-# honest error — not silently dropped.
+# Negative fixture: an UNANNOTATED top-level assignment statement (not inside
+# any function or class) must be rejected by both `pyrst check` and `pyrst build`
+# with an honest error — not silently dropped.
+#
+# DELIBERATE SEMANTIC CHANGE (card 08a32eb5): an ANNOTATED top-level constant
+# (`x: int = 5`) is now LEGAL — it declares a module-level constant (the EPIC-6-A
+# relaxation that lets a module hold constants like `math.pi`). This fixture was
+# previously `x: int = 5`; it now uses the UNANNOTATED form `x = 5`, which stays
+# rejected: only an annotated-literal constant is accepted at top level, never a
+# bare unannotated assignment, a call, a print, or any other stray statement.
 
 def helper() -> int:
     return 42
 
-x: int = 5   # top-level assignment — not supported
+x = 5   # unannotated top-level assignment — still not supported
 
 def main() -> None:
     pass

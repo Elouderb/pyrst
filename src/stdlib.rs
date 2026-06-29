@@ -12,10 +12,11 @@
 //! always SHADOWS an embedded module of the same name (the resolver tries the
 //! local path first).
 //!
-//! Phase-1 scope: only modules backed by `@extern` over Rust std are embedded
-//! here. `math` is intentionally NOT embedded — it stays hardcoded in codegen
-//! because `import math; math.sqrt(x)` uses qualified `module.fn()` calls, which
-//! file/embedded modules do not yet support (deferred to a separate card).
+//! Phase-1 scope: modules backed by `@extern` over Rust std (and/or pure-pyrst
+//! helpers and module-level constants). `math` is now a REAL embedded module
+//! (`lib/math.pyrs`): qualified `import math; math.sqrt(x)` calls resolve via
+//! the general qualified-call path, and `math.pi`/`e`/`tau` are module-level
+//! constants — the former hardcoded-in-codegen `math` arms have been removed.
 
 /// Embedded stdlib modules: `(module_name, module_source)`.
 ///
@@ -27,6 +28,7 @@ pub const EMBEDDED_STDLIB: &[(&str, &str)] = &[
     ("operator", include_str!("../lib/operator.pyrs")),
     ("functools", include_str!("../lib/functools.pyrs")),
     ("statistics", include_str!("../lib/statistics.pyrs")),
+    ("math", include_str!("../lib/math.pyrs")),
 ];
 
 /// Look up an embedded stdlib module's source by NAME (e.g. `"os"`).
@@ -61,7 +63,18 @@ mod tests {
     #[test]
     fn unknown_module_is_not_embedded() {
         assert!(lookup("notamodule").is_none());
-        // `math` is deliberately NOT embedded (it stays hardcoded in codegen).
-        assert!(lookup("math").is_none());
+    }
+
+    /// `math` is now a REAL embedded module (`lib/math.pyrs`): its source is
+    /// baked in, defines the @extern `sqrt` wrapper, and carries the module-level
+    /// `pi` constant. (It was previously hardcoded in codegen and deliberately
+    /// absent here; this asserts the migration.)
+    #[test]
+    fn math_module_is_embedded() {
+        let src = lookup("math").expect("`math` must now be an embedded stdlib module");
+        assert!(!src.trim().is_empty(), "embedded math source must be non-empty");
+        assert!(src.contains("def sqrt"), "math must define sqrt");
+        assert!(src.contains("@extern"), "math function bindings must be @extern");
+        assert!(src.contains("pi: float"), "math must define the pi constant");
     }
 }

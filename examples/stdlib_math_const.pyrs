@@ -1,0 +1,14 @@
+# Module-level constants + the migrated `math` stdlib module (card 08a32eb5).
+#
+# `math.pi` / `math.e` / `math.tau` are MODULE-LEVEL CONSTANTS resolved via the
+# general `X.CONST` qualified-attribute path (no longer hardcoded in codegen),
+# and `math.sqrt(2.0)` is a real `@extern` function in `lib/math.pyrs`. This
+# exercises both halves of the feature against the dogfooded math module.
+import math
+
+
+def main() -> None:
+    print(math.pi)
+    print(math.e)
+    print(math.tau)
+    print(math.sqrt(2.0))

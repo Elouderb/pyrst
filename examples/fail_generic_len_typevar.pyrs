@@ -1,0 +1,8 @@
+# Sweep: a shape-consuming builtin (`len`/`sum`/`sorted`/`min`/`max`/`reversed`/
+# `any`/`all`/`enumerate`/`zip`/`list`/`set`/...) iterates/sizes its argument. A
+# bare type variable has no such bound — honest typeck error (E0599 otherwise).
+def f[T](t: T) -> int:
+    return len(t)
+
+def main() -> None:
+    print(f([1, 2, 3]))

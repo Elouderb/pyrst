@@ -1,0 +1,8 @@
+# Sweep: destructuring a bare type variable (`a, b = t` where t: T) needs the
+# value to have a known tuple shape — T is opaque. Honest typeck error.
+def f[T](t: T) -> int:
+    a, b = t
+    return 0
+
+def main() -> None:
+    print(f((1, 2)))

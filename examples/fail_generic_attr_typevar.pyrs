@@ -1,0 +1,7 @@
+# Sweep: accessing an attribute of a bare type variable (`t.x` where t: T) is
+# rejected — T is opaque with no known fields (E0609 otherwise).
+def f[T](t: T) -> int:
+    return t.x
+
+def main() -> None:
+    print(f(5))

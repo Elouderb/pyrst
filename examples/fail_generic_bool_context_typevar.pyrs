@@ -1,0 +1,11 @@
+# Sweep: a bare type variable in a boolean context (`if t:` / `while t:` /
+# `assert t`) needs truthiness, which a generic value lacks in v1. Honest typeck
+# error. (A narrowing guard `if x is not None:` is a Bool-typed BinOp and is
+# unaffected.)
+def f[T](t: T) -> int:
+    if t:
+        return 1
+    return 0
+
+def main() -> None:
+    print(f(5))

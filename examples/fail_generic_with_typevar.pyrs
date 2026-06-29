@@ -1,0 +1,10 @@
+# Sweep: a `with t as r:` context manager needs the enter/exit protocol (a
+# concrete file handle in pyrst). A bare type variable is opaque — honest typeck
+# error instead of a deferred rustc failure.
+def f[T](t: T) -> int:
+    with t as r:
+        print(1)
+    return 0
+
+def main() -> None:
+    print(f(open("x", "w")))

@@ -1,0 +1,10 @@
+# Sweep: a comprehension iterates its source. Iterating a bare type variable
+# (`[1 for x in t]` where t: T) needs an IntoIterator bound — T is opaque. The
+# Stmt::For gate did not cover the comprehension iter path; this is now an honest
+# typeck error (E0599 otherwise). Covers list/set/dict comprehensions uniformly.
+def f[T](t: T) -> int:
+    ys: list[int] = [1 for x in t]
+    return len(ys)
+
+def main() -> None:
+    print(f([1, 2, 3]))

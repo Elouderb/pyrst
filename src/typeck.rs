@@ -2633,7 +2633,10 @@ fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
     match s {
         Stmt::Pass(_) | Stmt::Break(_) | Stmt::Continue(_) => Ok(()),
         Stmt::Assert { cond, msg, .. } => {
-            check_expr(cond, env)?;
+            let cond_ty = check_expr(cond, env)?;
+            // Generics v1: `assert t` puts a bare type variable in a boolean
+            // context (needs truthiness) — rejected like `if t:`.
+            reject_typevar_op(&cond_ty, "use as a condition", cond.span())?;
             if let Some(m) = msg { check_expr(m, env)?; }
             Ok(())
         }
@@ -2773,8 +2776,13 @@ fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             reject_typevar_op(&val_ty, "apply an operator to", *span)?;
             Ok(())
         }
-        Stmt::Unpack { targets, value, .. } => {
+        Stmt::Unpack { targets, value, span } => {
             let val_ty = check_expr(value, env)?;
+            // Generics v1: destructuring a bare type variable (`a, b = t` where
+            // `t: T`) needs the value to have a known tuple SHAPE — a `T` is
+            // opaque, so this is an honest error (it would otherwise emit a
+            // tuple-pattern bind against an opaque `T` and fail rustc).
+            reject_typevar_op(&val_ty, "unpack", *span)?;
             let elem_tys = match &val_ty {
                 Ty::Tuple(tys) => tys.clone(),
                 _ => vec![Ty::Unknown; targets.len()],
@@ -2786,7 +2794,12 @@ fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             Ok(())
         }
         Stmt::If { cond, then, elifs, else_, .. } => {
-            check_expr(cond, env)?;
+            let cond_ty = check_expr(cond, env)?;
+            // Generics v1: a bare type variable in a boolean context (`if t:`)
+            // needs truthiness, which a generic value lacks (no Bool coercion in
+            // v1). A narrowing guard (`if x is not None:`) is a `BinOp` typed
+            // Bool, so it is never a bare `TypeVar` and is unaffected.
+            reject_typevar_op(&cond_ty, "use as a condition", cond.span())?;
             // (EPIC-5) None-guard narrowing. For `if x is not None:` the THEN
             // branch sees `x: T` (the non-None payload); for `if x is None:` the
             // ELSE branch sees `x: T`. `x` must be a local typed `Option(T)`.
@@ -2810,7 +2823,8 @@ fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
                 }
             }
             for (c, b) in elifs {
-                check_expr(c, env)?;
+                let c_ty = check_expr(c, env)?;
+                reject_typevar_op(&c_ty, "use as a condition", c.span())?;
                 check_body(b, env)?;
             }
             // ELSE branch: narrowed iff the guard is `is None` (so the else is the
@@ -2831,7 +2845,10 @@ fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             Ok(())
         }
         Stmt::While { cond, body, .. } => {
-            check_expr(cond, env)?;
+            let cond_ty = check_expr(cond, env)?;
+            // Generics v1: a bare type variable as a loop condition (`while t:`)
+            // needs truthiness — rejected (see the `if` arm).
+            reject_typevar_op(&cond_ty, "use as a condition", cond.span())?;
             check_body(body, env)
         }
         Stmt::For { targets, iter, body, span } => {
@@ -2888,6 +2905,11 @@ fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
         }
         Stmt::With { ctx_expr, as_name, body, .. } => {
             let ctx_ty = check_expr(ctx_expr, env)?;
+            // Generics v1: a `with t as r:` context manager needs the
+            // enter/exit protocol (in pyrst, a concrete `file` handle). A bare
+            // type variable is opaque — reject it honestly (it would otherwise
+            // emit context-manager glue against an opaque `T` and fail rustc).
+            reject_typevar_op(&ctx_ty, "use as a context manager", ctx_expr.span())?;
             // Bound name is block-scoped in codegen; save/restore so a stale type
             // does not leak past the block (mirrors the for-loop handling).
             let saved = as_name.as_ref().map(|n| (n.clone(), env.locals.get(n).cloned()));
@@ -3829,6 +3851,12 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
         }
         Expr::ListComp { elt, targets, iter, cond, .. } => {
             let iter_ty = check_expr(iter, env)?;
+            // Generics v1: a comprehension iterates its source, so iterating a bare
+            // type variable needs an `IntoIterator` bound (E0599 otherwise).
+            // (The element-type match below falls through to a concrete type for
+            // an opaque iterable, hiding the gap from `check` — so reject here,
+            // mirroring the `Stmt::For` gate.)
+            reject_typevar_op(&iter_ty, "iterate over", iter.span())?;
             let elem_ty = match &iter_ty {
                 Ty::List(inner) => *inner.clone(),
                 Ty::Set(inner) => *inner.clone(),
@@ -3862,6 +3890,12 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
         }
         Expr::SetComp { elt, targets, iter, cond, span } => {
             let iter_ty = check_expr(iter, env)?;
+            // Generics v1: a comprehension iterates its source, so iterating a bare
+            // type variable needs an `IntoIterator` bound (E0599 otherwise).
+            // (The element-type match below falls through to a concrete type for
+            // an opaque iterable, hiding the gap from `check` — so reject here,
+            // mirroring the `Stmt::For` gate.)
+            reject_typevar_op(&iter_ty, "iterate over", iter.span())?;
             let elem_ty = match &iter_ty {
                 Ty::List(inner) => *inner.clone(),
                 Ty::Set(inner) => *inner.clone(),
@@ -3897,6 +3931,12 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
         }
         Expr::DictComp { key, val, targets, iter, cond, span } => {
             let iter_ty = check_expr(iter, env)?;
+            // Generics v1: a comprehension iterates its source, so iterating a bare
+            // type variable needs an `IntoIterator` bound (E0599 otherwise).
+            // (The element-type match below falls through to a concrete type for
+            // an opaque iterable, hiding the gap from `check` — so reject here,
+            // mirroring the `Stmt::For` gate.)
+            reject_typevar_op(&iter_ty, "iterate over", iter.span())?;
             let elem_ty = match &iter_ty {
                 Ty::List(inner) => *inner.clone(),
                 Ty::Set(inner) => *inner.clone(),
@@ -4070,6 +4110,10 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                         // `min(a, b)` falls through to the generic path below and
                         // stays Unknown (Rust's std::cmp::min already resolves it).
                         let arg_ty = check_expr(&args[0], env)?;
+                        // Generics v1: `min`/`max` iterate the argument (and order
+                        // its elements) — a bare type variable has neither
+                        // IntoIterator nor Ord, so reject it honestly here.
+                        reject_typevar_op(&arg_ty, "consume the contents of", *span)?;
                         for (_, v) in kwargs {
                             check_expr(v, env)?;
                         }
@@ -4081,6 +4125,9 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                         // enumerate(iterable[, start]) -> List(Tuple(Int, elem))
                         // Check all args/kwargs for their own errors first.
                         let arg0_ty = check_expr(&args[0], env)?;
+                        // Generics v1: enumerate iterates its argument — a bare
+                        // type variable has no IntoIterator bound.
+                        reject_typevar_op(&arg0_ty, "consume the contents of", *span)?;
                         for a in &args[1..] {
                             check_expr(a, env)?;
                         }
@@ -4104,6 +4151,9 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                         let mut any_unknown = false;
                         for a in args {
                             let ty = check_expr(a, env)?;
+                            // Generics v1: zip iterates each argument — a bare type
+                            // variable has no IntoIterator bound.
+                            reject_typevar_op(&ty, "consume the contents of", *span)?;
                             match ty {
                                 Ty::List(inner) | Ty::Set(inner) => elem_tys.push(*inner),
                                 Ty::Str => elem_tys.push(Ty::Str),
@@ -4219,14 +4269,26 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                                 });
                             }
                             let arg_ty = check_expr(a, env)?;
-                            // Generics v1: a builtin that must FORMAT/stringify its
-                            // argument (`print`/`str`/`repr`/`ascii`) cannot accept a
-                            // bare type variable — formatting needs a `Display`/`Debug`
-                            // bound, out of v1 scope. (`first([...])` etc. are fine:
-                            // their RESULT is concrete after unification; only a BARE
-                            // `T` value reaches here as `Ty::TypeVar`.)
+                            // Generics v1: a builtin that uses the SHAPE of its
+                            // argument cannot accept a bare type variable, since
+                            // the v1 `T: Clone` bound provides none of the needed
+                            // traits. Two families:
+                            //  - FORMAT (`print`/`str`/`repr`/`ascii`) needs
+                            //    Display/Debug;
+                            //  - SHAPE-CONSUMING (`len`/`sum`/`sorted`/`reversed`/
+                            //    `any`/`all`/`list`/`tuple`/`set`/`dict`/
+                            //    `enumerate`/`zip`/`reversed`) iterate/index/sum the
+                            //    argument (IntoIterator / Add / etc.).
+                            // (`first([...])` etc. are fine: their RESULT is
+                            // concrete after unification; only a BARE `T` value
+                            // reaches here as `Ty::TypeVar`.)
                             if matches!(name.as_str(), "print" | "str" | "repr" | "ascii") {
-                                reject_typevar_op(&arg_ty, "print", *span)?;
+                                reject_typevar_op(&arg_ty, "format", *span)?;
+                            } else if matches!(name.as_str(),
+                                "len" | "sum" | "sorted" | "reversed" | "any" | "all"
+                                | "list" | "tuple" | "set" | "dict" | "enumerate" | "zip")
+                            {
+                                reject_typevar_op(&arg_ty, "consume the contents of", *span)?;
                             }
                             // Concrete-only positional arg-type check (skip variadic builtins).
                             // Only fires when BOTH param and arg types are concrete and
@@ -4593,6 +4655,11 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 }
             }
             let obj_ty = check_expr(obj, env)?;
+            // Generics v1: accessing an attribute of a bare type variable
+            // (`t.x` where `t: T`) is rejected — `T` is opaque, with no known
+            // fields/attributes (E0609 otherwise). A method CALL on a type var is
+            // rejected separately in the Call arm.
+            reject_typevar_op(&obj_ty, "access an attribute of", *span)?;
             if let Ty::Class(class_name) = &obj_ty {
                 if let Some(_class_def) = env.ctx.classes.get(class_name.as_str()) {
                     // Check field access (including inherited fields).

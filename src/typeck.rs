@@ -4627,8 +4627,11 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 _ => Ty::Unknown,
             }
         }
-        Expr::Slice { obj, start, stop, step, .. } => {
+        Expr::Slice { obj, start, stop, step, span } => {
             let obj_ty = check_expr(obj, env)?;
+            // Generics v1: a bare type variable is OPAQUE — slicing it (`t[a:b]`)
+            // needs a slice/Index bound and is rejected (mirrors the Index arm).
+            reject_typevar_op(&obj_ty, "slice", *span)?;
             // Validate slice indices are integers
             for e in &[start.as_ref(), stop.as_ref(), step.as_ref()] {
                 if let Some(e) = e {

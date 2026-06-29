@@ -1,0 +1,8 @@
+# B3: `x += x` on a type-var target desugars to `x = x + x`, an operator on a
+# generic value (E0368 otherwise). Honest typeck error at `check`.
+def inc[T](x: T) -> T:
+    x += x
+    return x
+
+def main() -> None:
+    print(inc(5))

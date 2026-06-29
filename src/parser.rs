@@ -394,19 +394,27 @@ impl Parser {
         // empty `def f[]()` is rejected — a type-param clause must declare at
         // least one variable. Methods (parsed via this same `parse_def`) may NOT
         // be generic in v1: see the per-call-site guard in `parse_class`.
-        let mut type_params = Vec::new();
+        let mut type_params: Vec<String> = Vec::new();
         if self.eat(&Tok::LBracket) {
             loop {
-                type_params.push(self.expect_ident("type parameter")?);
+                let tp_span = self.peek_span();
+                let tp = self.expect_ident("type parameter")?;
+                // Reject a DUPLICATE type variable (`def f[T, T](..)`). Two Rust
+                // generic params of the same name are an E0403 in the generated
+                // crate; catch it here as an honest parse error so it fails at
+                // `check`, not `build`. (`expect_ident` already rejects an empty
+                // `[]` — it errors on the closing `]` before this loop can record
+                // an empty list — so a non-empty clause is guaranteed here.)
+                if type_params.iter().any(|existing| existing == &tp) {
+                    return Err(Error::Parse {
+                        span: tp_span,
+                        msg: format!("duplicate type parameter `{}`", tp),
+                    });
+                }
+                type_params.push(tp);
                 if !self.eat(&Tok::Comma) { break; }
             }
             self.expect(&Tok::RBracket, "type parameter list")?;
-            if type_params.is_empty() {
-                return Err(Error::Parse {
-                    span: self.peek_span(),
-                    msg: "type parameter list `[...]` must declare at least one type variable".into(),
-                });
-            }
         }
         self.expect(&Tok::LParen, "def")?;
         let mut params = Vec::new();

@@ -1,0 +1,13 @@
+# B6: matching a bare type variable against a LITERAL pattern (`case 0:`) lowers
+# to a Rust literal match that needs PartialEq on T (E0369 otherwise). Honest
+# typeck error. (A wildcard/capture-only match on a T needs no comparison and is
+# allowed — not exercised here.)
+def m[T](x: T) -> int:
+    match x:
+        case 0:
+            return 10
+        case _:
+            return 20
+
+def main() -> None:
+    print(m(0))

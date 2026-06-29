@@ -1,0 +1,7 @@
+# B4: two type parameters of the same name (`def f[T, T](..)`) are an E0403 in
+# the generated Rust. The parser rejects the duplicate honestly at `check`.
+def dup[T, T](a: T) -> T:
+    return a
+
+def main() -> None:
+    print(dup(5))

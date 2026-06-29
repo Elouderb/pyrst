@@ -1,0 +1,10 @@
+# B2: iterating a bare type variable (`for it in xs` where xs: T) needs an
+# IntoIterator bound — T is opaque. Honest typeck error, not a deferred E0599.
+def go[T](xs: T) -> int:
+    n: int = 0
+    for it in xs:
+        n = n + 1
+    return n
+
+def main() -> None:
+    print(go([1, 2, 3]))

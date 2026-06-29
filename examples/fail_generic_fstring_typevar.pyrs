@@ -1,0 +1,8 @@
+# B1: an f-string FORMATS each interpolation via Display. A bare type variable
+# (`f"{x}"` where x: T) has no Display bound in generics v1, so this would be an
+# E0277 in the generated crate. It must be an honest typeck error at `check`.
+def fmt[T](x: T) -> str:
+    return f"{x}"
+
+def main() -> None:
+    print(fmt(5))

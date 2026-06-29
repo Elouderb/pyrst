@@ -2098,6 +2098,20 @@ fn reject_typevar_op(ty: &Ty, op_desc: &str, span: Span) -> Result<()> {
     Ok(())
 }
 
+/// Generics v1: whether a `match` arm pattern DISCRIMINATES — i.e. it compares the
+/// subject against a value and therefore needs `PartialEq` on the subject's type.
+/// A `Literal` pattern (and an `Or` containing one) discriminates; a `Wildcard` or
+/// a `Capture` (bare binding) does not. Used to decide whether matching a bare
+/// type variable is an honest error (a wildcard/capture-only match on a `T` needs
+/// no comparison and stays legal).
+fn pattern_discriminates(p: &MatchPattern) -> bool {
+    match p {
+        MatchPattern::Literal(_) => true,
+        MatchPattern::Wildcard | MatchPattern::Capture(_) => false,
+        MatchPattern::Or(alts) => alts.iter().any(pattern_discriminates),
+    }
+}
+
 /// (EPIC-5) Recognize a None-guard condition of the form `x is None` /
 /// `x is not None` on a plain local name. Returns `(name, is_not_none)` where
 /// `is_not_none` is true for `is not None` (the branch in which `x` is the
@@ -2224,6 +2238,24 @@ fn require_hashable(ty: &Ty, span: Span, position: &str) -> Result<()> {
                  supported here (Rc<dyn Fn> is not Eq/Hash, so HashSet/HashMap-key \
                  of functions won't compile)",
                 position
+            ),
+        });
+    }
+    // Generics v1: a bare type variable is OPAQUE — it carries no `Hash`/`Eq`
+    // bound (v1 emits only `T: Clone`), so a `set[T]` / `dict[T, _]` element or
+    // key, a `{a, b}` set literal of type-var values, or a `{k: v}` dict whose
+    // KEY is a type var would compile to an uninstantiable `HashSet<T>` /
+    // `HashMap<T, _>` (E0277). Reject it honestly here so all six hashable-element
+    // call sites (set/dict literals, set/dict annotations, set/dict
+    // comprehensions) are covered uniformly at `check`.
+    if let Ty::TypeVar(name) = ty {
+        return Err(Error::Type {
+            span,
+            msg: format!(
+                "{} type must be hashable; a value of generic type `{}` is not \
+                 supported here (a type parameter has no Hash/Eq bound in generics \
+                 v1, so HashSet<{}>/HashMap<{}, _> won't compile)",
+                position, name, name, name
             ),
         });
     }
@@ -2730,7 +2762,15 @@ fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
                     msg: format!("undefined variable `{}`", target),
                 });
             }
-            check_expr(value, env)?;
+            // Generics v1: `x += y` desugars to `x = x <op> y`, so an augmented
+            // assignment whose TARGET (or RHS) is a bare type variable applies an
+            // operator to a generic value — needs a bound (E0368 otherwise).
+            // Reject it honestly here, mirroring the `Expr::BinOp` op-on-`T` gate.
+            if let Some(target_ty) = env.locals.get(target.as_str()).cloned() {
+                reject_typevar_op(&target_ty, "apply an operator to", *span)?;
+            }
+            let val_ty = check_expr(value, env)?;
+            reject_typevar_op(&val_ty, "apply an operator to", *span)?;
             Ok(())
         }
         Stmt::Unpack { targets, value, .. } => {
@@ -2794,8 +2834,14 @@ fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             check_expr(cond, env)?;
             check_body(body, env)
         }
-        Stmt::For { targets, iter, body, .. } => {
+        Stmt::For { targets, iter, body, span } => {
             let iter_ty = check_expr(iter, env)?;
+            // Generics v1: iterating a bare type variable (`for it in xs` where
+            // `xs: T`) needs an `IntoIterator` bound — `T` is opaque, with no
+            // `.iter()`. Reject it honestly (E0599 otherwise). Iterating a
+            // `list[T]`/`dict[K, V]` whose ELEMENT is a type var is fine and
+            // yields the element/key type below.
+            reject_typevar_op(&iter_ty, "iterate over", *span)?;
             // Determine element type from iterator type
             let elem_ty = match &iter_ty {
                 Ty::List(inner) => *inner.clone(),
@@ -2861,8 +2907,19 @@ fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             check_expr(target, env)?;
             Ok(())
         }
-        Stmt::Match { subject, arms, .. } => {
-            check_expr(subject, env)?;
+        Stmt::Match { subject, arms, span } => {
+            let subject_ty = check_expr(subject, env)?;
+            // Generics v1: matching a bare type variable against a LITERAL pattern
+            // (`case 0:` / `case "x":`) lowers to a Rust literal match, which needs
+            // `PartialEq` on the subject (E0369 otherwise). A match whose arms are
+            // ALL wildcard/capture patterns needs no comparison and is fine. Reject
+            // only when the subject is a type var AND at least one arm discriminates
+            // on a literal — an honest error instead of a deferred rustc failure.
+            if matches!(subject_ty, Ty::TypeVar(_))
+                && arms.iter().any(|arm| pattern_discriminates(&arm.pattern))
+            {
+                reject_typevar_op(&subject_ty, "match on a literal pattern against", *span)?;
+            }
             for arm in arms {
                 // Check guard if present
                 if let Some(guard) = &arm.guard {
@@ -3736,7 +3793,21 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
         Expr::Int(_, _) => Ty::Int,
         Expr::Float(_, _) => Ty::Float,
         Expr::Str(_, _) => Ty::Str,
-        Expr::FStr(_, _) => Ty::Str,
+        Expr::FStr(parts, span) => {
+            // Visit each interpolation: an f-string FORMATS each `{expr}` via the
+            // value's `Display`, so a bare type variable (`f"{x}"` where `x: T`)
+            // would lower to an E0277 in the generated crate. Reject it honestly
+            // here — the same restriction as `print`/`str` (a generic value cannot
+            // be formatted without a bound). Checking the sub-exprs also surfaces
+            // any of their own errors, which the previous `=> Ty::Str` arm skipped.
+            for part in parts {
+                if let FStrPart::Interp(expr, _) = part {
+                    let t = check_expr(expr, env)?;
+                    reject_typevar_op(&t, "format (in an f-string)", *span)?;
+                }
+            }
+            Ty::Str
+        }
         Expr::Bool(_, _) => Ty::Bool,
         Expr::Tuple(elems, _) => {
             let tys = elems.iter().map(|e| check_expr(e, env)).collect::<Result<Vec<_>>>()?;

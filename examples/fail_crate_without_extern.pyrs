@@ -1,0 +1,12 @@
+# NEGATIVE (Rust interop Phase 2): `@crate` is only meaningful on an `@extern`
+# binding (it declares the crate the binding's Rust template needs). On a normal
+# pyrst function it would pull the program onto the Cargo build path while never
+# using the crate — a confusing cargo error. Rejected at typeck with a clear
+# message, at both `check` and `build`.
+@crate("regex", "1")
+def helper(x: int) -> int:
+    return x + 1
+
+
+def main() -> None:
+    print(helper(41))

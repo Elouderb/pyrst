@@ -1327,6 +1327,20 @@ fn check_one_func(f: &Func, ctx: &TyCtx) -> Result<()> {
     // Reject unsupported decorators on top-level functions.
     validate_decorators(&f.decorators, f.span)?;
 
+    // `@crate(...)` (a declared external-crate dependency) is only meaningful on
+    // an `@extern` binding — it tells the driver which crate the binding's Rust
+    // template needs. Without `@extern` it would still pull the program onto the
+    // Cargo build path while emitting a normal pyrst body that never uses the
+    // crate, surfacing as a confusing cargo error. Reject it honestly here.
+    if !f.crate_deps.is_empty() && !f.decorators.iter().any(|d| d == "extern") {
+        return Err(Error::Type {
+            span: f.span,
+            msg: "`@crate` can only be used on `@extern` functions (it declares the \
+                  crate an `@extern` binding's Rust template depends on)"
+                .to_string(),
+        });
+    }
+
     // An `@extern` function is a Rust-FFI binding: its body is an opaque Rust
     // template string, not pyrst statements. Validate the binding shape (single
     // string-literal body + fully-typed signature) and STOP — there is no pyrst
@@ -1467,6 +1481,18 @@ fn check_class_prelude(c: &ClassDef, ctx: &TyCtx) -> Result<()> {
 fn check_one_method(c: &ClassDef, method: &Func, ctx: &TyCtx) -> Result<()> {
     // Reject unsupported decorators on class methods.
     validate_decorators(&method.decorators, method.span)?;
+
+    // `@crate` is tied to `@extern`, and `@extern` is not supported on methods
+    // (rejected below), so a `@crate` on a method can never be valid — reject it
+    // with the same message as the free-function path for a consistent error.
+    if !method.crate_deps.is_empty() {
+        return Err(Error::Type {
+            span: method.span,
+            msg: "`@crate` can only be used on `@extern` functions (it declares the \
+                  crate an `@extern` binding's Rust template depends on)"
+                .to_string(),
+        });
+    }
 
     // `@extern` is a Phase-1 binding for TOP-LEVEL std functions only. On a
     // method it would interact with the `self` receiver and by-reference mode
@@ -9248,6 +9274,49 @@ def bad(s: str) -> str:
             errs.iter().any(|e| matches!(e, Error::Type { msg, .. } if msg.contains("string literal"))),
             "error must name the single-template-string requirement, got: {:?}", errs
         );
+    }
+
+    /// MEDIUM fix: `@crate` on a function WITHOUT `@extern` is a typeck error
+    /// (it would otherwise pull the program onto the Cargo build path while the
+    /// crate is never used). A normal pyrst body is present, so this is purely the
+    /// decorator-pairing check firing.
+    #[test]
+    fn crate_without_extern_rejected() {
+        let src = "\
+@crate(\"regex\", \"1\")
+def helper(x: int) -> int:
+    return x + 1
+
+def main() -> None:
+    print(helper(41))
+";
+        let m = crate::parser::parse(src).expect("parse");
+        let ctx = ctx_from_module(&m);
+        let errs = check_all(&m, &ctx);
+        assert!(
+            errs.iter().any(|e| matches!(e, Error::Type { msg, .. }
+                if msg.contains("`@crate` can only be used on `@extern`"))),
+            "`@crate` without `@extern` must be rejected, got: {:?}", errs
+        );
+    }
+
+    /// The legitimate pairing — `@crate` stacked over `@extern` — still
+    /// type-checks (the MEDIUM-fix guard must not break the real `re` shape).
+    #[test]
+    fn crate_with_extern_type_checks() {
+        let src = "\
+@crate(\"regex\", \"1\")
+@extern
+def is_match(pattern: str, text: str) -> bool:
+    \"regex::Regex::new(&{pattern}).unwrap().is_match(&{text})\"
+
+def main() -> None:
+    print(is_match(\"[0-9]+\", \"abc123\"))
+";
+        let m = crate::parser::parse(src).expect("parse");
+        let ctx = ctx_from_module(&m);
+        let errs = check_all(&m, &ctx);
+        assert!(errs.is_empty(), "@crate + @extern must type-check, got: {:?}", errs);
     }
 
     #[test]

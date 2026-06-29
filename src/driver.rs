@@ -16,6 +16,11 @@ pub fn check(path: &Path) -> Result<()> {
         crate::typeck::check_bodies(m, &prog.ctx)
             .map_err(|e| e.with_render_source(render_path, src))?;
     }
+    // Surface a conflicting-`@crate` declaration (the same crate pinned to two
+    // versions) at CHECK time too, not only at build — it is a whole-program
+    // property the per-module body checks above cannot see, and reporting it here
+    // means `pyrst check` rejects it rather than deferring to a `build`-only error.
+    collect_crate_deps(&prog.modules)?;
     eprintln!("ok: {} module(s) typecheck", prog.modules.len());
     Ok(())
 }
@@ -40,7 +45,7 @@ pub fn build(path: &Path) -> Result<()> {
             .map_err(|e| e.with_render_source(render_path, src))?;
     }
     let rust = crate::codegen::emit_program(&prog.modules, &prog.ctx)?;
-    let crates = collect_crate_deps(&prog.modules);
+    let crates = collect_crate_deps(&prog.modules)?;
 
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("a");
     let cwd = std::env::current_dir()?;
@@ -92,31 +97,47 @@ pub fn build(path: &Path) -> Result<()> {
 /// stays on the single-file rustc path.
 ///
 /// `@crate` decorators live on `def`s, so we scan both top-level functions and
-/// class methods. If the same crate name is declared twice (e.g. two `re`
-/// helpers each carrying `@crate("regex", "1")`), the FIRST version wins and
-/// later duplicates are ignored — a single crate cannot appear twice in
-/// `[dependencies]`.
-fn collect_crate_deps(modules: &[(crate::ast::Module, String)]) -> Vec<(String, String)> {
+/// class methods. A crate declared MORE THAN ONCE with the SAME version dedups
+/// to a single `[dependencies]` line (this is the real `re` shape: four wrappers
+/// each carry `@crate("regex", "1")`). A crate declared with TWO DIFFERENT
+/// versions is a CONFLICT — `[dependencies]` cannot list a crate twice and we
+/// must not silently pick one — so it is reported as an honest error naming both
+/// versions.
+fn collect_crate_deps(modules: &[(crate::ast::Module, String)]) -> Result<Vec<(String, String)>> {
     use crate::ast::Stmt;
-    let mut seen = std::collections::HashSet::new();
+    // Preserve first-declaration order in `deps`; `seen` maps name -> the version
+    // already recorded so a later declaration can be checked for agreement.
+    let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut deps: Vec<(String, String)> = Vec::new();
-    let mut push = |name: &str, version: &str| {
-        if seen.insert(name.to_string()) {
-            deps.push((name.to_string(), version.to_string()));
+    let mut push = |name: &str, version: &str| -> Result<()> {
+        match seen.get(name) {
+            None => {
+                seen.insert(name.to_string(), version.to_string());
+                deps.push((name.to_string(), version.to_string()));
+            }
+            Some(prev) if prev == version => { /* same name+version: dedup, no-op */ }
+            Some(prev) => {
+                return Err(Error::Rustc(format!(
+                    "conflicting @crate declarations for `{}`: `{}` vs `{}` — a crate \
+                     can only be declared with one version",
+                    name, prev, version
+                )));
+            }
         }
+        Ok(())
     };
     for (m, _src) in modules {
         for stmt in &m.stmts {
             match stmt {
                 Stmt::Func(f) => {
                     for (name, version) in &f.crate_deps {
-                        push(name, version);
+                        push(name, version)?;
                     }
                 }
                 Stmt::Class(c) => {
                     for method in &c.methods {
                         for (name, version) in &method.crate_deps {
-                            push(name, version);
+                            push(name, version)?;
                         }
                     }
                 }
@@ -124,7 +145,7 @@ fn collect_crate_deps(modules: &[(crate::ast::Module, String)]) -> Vec<(String, 
             }
         }
     }
-    deps
+    Ok(deps)
 }
 
 /// Build `rust` as a CARGO PROJECT depending on `crates`, copying the produced
@@ -149,10 +170,15 @@ fn build_cargo_project(
 ) -> Result<()> {
     // The cargo crate name must be a valid Rust identifier; the source stem can
     // contain characters cargo rejects (`-` is fine, but `.`/spaces are not), so
-    // sanitize to a safe fixed name. The OUTPUT binary still lands at `bin_path`
-    // (named after the stem) via the copy below, so this internal name is never
-    // user-visible.
-    let pkg_name = "pyrst_program";
+    // we use a safe fixed prefix. The name is made UNIQUE PER PROCESS: the shared
+    // target dir is reused across builds for dependency caching, so two
+    // concurrent `pyrst build`s would otherwise both produce
+    // `release/pyrst_program` and could clobber each other's binary between the
+    // cargo build and the `fs::copy` below. A per-pid package name gives each
+    // build its own `release/<pkg>` artifact, so the copy never races. The OUTPUT
+    // binary still lands at `bin_path` (named after the stem) via the copy below,
+    // so this internal name is never user-visible.
+    let pkg_name = format!("pyrst_program_{}", std::process::id());
 
     let proj_dir = std::env::temp_dir().join(format!("pyrst-cargo-{}-{}", stem, std::process::id()));
     let src_dir = proj_dir.join("src");
@@ -198,8 +224,8 @@ fn build_cargo_project(
     }
 
     // Copy the produced binary to the requested output path. Cargo names it after
-    // the package (`pyrst_program`), so map that back to the user's `<stem>` name.
-    let produced_name = if cfg!(windows) { format!("{}.exe", pkg_name) } else { pkg_name.to_string() };
+    // the (per-pid unique) package, so map that back to the user's `<stem>` name.
+    let produced_name = if cfg!(windows) { format!("{}.exe", pkg_name) } else { pkg_name.clone() };
     let produced = target_dir.join("release").join(&produced_name);
     std::fs::copy(&produced, bin_path).map_err(|e| {
         Error::Rustc(format!(
@@ -452,29 +478,42 @@ mod crate_dep_tests {
     #[test]
     fn collect_crate_deps_empty_without_crate_decorator() {
         let mods = modules_from("def main() -> None:\n    pass\n");
-        assert!(collect_crate_deps(&mods).is_empty());
+        assert!(collect_crate_deps(&mods).unwrap().is_empty());
     }
 
     /// `@crate` deps are collected from top-level `@extern` functions.
     #[test]
     fn collect_crate_deps_gathers_top_level_funcs() {
         let src = "@crate(\"regex\", \"1\")\n@extern\ndef is_match(p: str, t: str) -> bool:\n    \"true\"\n\ndef main() -> None:\n    pass\n";
-        let deps = collect_crate_deps(&modules_from(src));
+        let deps = collect_crate_deps(&modules_from(src)).unwrap();
         assert_eq!(deps, vec![("regex".to_string(), "1".to_string())]);
     }
 
-    /// The SAME crate declared on multiple functions is deduped by name (first
-    /// version wins) — a crate cannot appear twice in `[dependencies]`. This is
-    /// the real `re` shape: four wrappers each carry `@crate("regex", "1")`.
+    /// The SAME crate+version declared on multiple functions dedups to one
+    /// `[dependencies]` line — a crate cannot appear twice. This is the real `re`
+    /// shape: four wrappers each carry `@crate("regex", "1")`.
     #[test]
-    fn collect_crate_deps_dedups_by_name() {
+    fn collect_crate_deps_dedups_same_name_and_version() {
         let src = "\
 @crate(\"regex\", \"1\")\n@extern\ndef a(p: str) -> bool:\n    \"true\"\n
 @crate(\"regex\", \"1\")\n@extern\ndef b(p: str) -> bool:\n    \"true\"\n
 def main() -> None:\n    pass\n";
-        let deps = collect_crate_deps(&modules_from(src));
+        let deps = collect_crate_deps(&modules_from(src)).unwrap();
         assert_eq!(deps, vec![("regex".to_string(), "1".to_string())],
-            "the same crate declared twice must appear once");
+            "the same crate+version declared twice must appear once");
+    }
+
+    /// The same crate name declared with DIFFERENT versions is a conflict — an
+    /// honest error naming both versions, never a silent pick of one.
+    #[test]
+    fn collect_crate_deps_rejects_conflicting_versions() {
+        let src = "\
+@crate(\"regex\", \"1\")\n@extern\ndef a(p: str) -> bool:\n    \"true\"\n
+@crate(\"regex\", \"2\")\n@extern\ndef b(p: str) -> bool:\n    \"true\"\n
+def main() -> None:\n    pass\n";
+        let err = collect_crate_deps(&modules_from(src)).unwrap_err().to_string();
+        assert!(err.contains("conflicting @crate declarations for `regex`"), "got: {}", err);
+        assert!(err.contains('1') && err.contains('2'), "error must name both versions: {}", err);
     }
 }
 

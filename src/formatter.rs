@@ -176,6 +176,10 @@ impl Formatter {
                     self.writeln("return");
                 }
             }
+            Stmt::Yield(e, _) => {
+                let e_str = self.format_expr(e)?;
+                self.writeln(&format!("yield {}", e_str));
+            }
             Stmt::Pass(_) => self.writeln("pass"),
             Stmt::Break(_) => self.writeln("break"),
             Stmt::Continue(_) => self.writeln("continue"),

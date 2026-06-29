@@ -85,11 +85,21 @@ pub struct Codegen<'a> {
     /// `.to_string()` to recover pyrst's `str == Rust String` value type.
     /// int/float/bool consts are `Copy` and need no such fix-up.
     const_strs: std::collections::HashSet<String>,
+    /// Generators (EAGER v1): true while emitting a function whose body contains
+    /// `yield`. Such a function is lowered to one that declares
+    /// `let mut __gen: Vec<T> = Vec::new();` at the top, lowers each `yield x` to
+    /// `__gen.push(x);`, and returns `__gen` (both at end-of-body fall-off and at
+    /// any bare `return`, which means "stop collecting"). Saved/restored per
+    /// function like `current_ret_ty`. EAGER LIMITATION: an INFINITE generator
+    /// (`while True: yield ...`) collects forever and hangs / OOMs at runtime —
+    /// true lazy iteration (a state-machine / `impl Iterator` transform) is an
+    /// explicit follow-up; v1 is faithful for FINITE generators (the common case).
+    in_generator: bool,
 }
 
 impl<'a> Codegen<'a> {
     pub fn new(ctx: &'a TyCtx) -> Self {
-        Self { ctx, out: String::new(), indent: 0, locals: HashMap::new(), declared: Default::default(), current_class: None, current_ret_ty: Ty::Unit, dead_funcs: Default::default(), mut_self: HashMap::new(), by_ref_locals: Default::default(), poly_map: HashMap::new(), concrete_struct_params: Default::default(), const_names: Default::default(), const_strs: Default::default() }
+        Self { ctx, out: String::new(), indent: 0, locals: HashMap::new(), declared: Default::default(), current_class: None, current_ret_ty: Ty::Unit, dead_funcs: Default::default(), mut_self: HashMap::new(), by_ref_locals: Default::default(), poly_map: HashMap::new(), concrete_struct_params: Default::default(), const_names: Default::default(), const_strs: Default::default(), in_generator: false }
     }
 
     pub fn with_dead_funcs(mut self, dead: std::collections::HashSet<String>) -> Self {
@@ -1460,6 +1470,22 @@ impl<'a> Codegen<'a> {
         self.indent += 1;
         // (EPIC-5) Track the active return type for Some/None wrapping in `return`.
         let saved_ret_ty = std::mem::replace(&mut self.current_ret_ty, ret.clone());
+        // Generators (EAGER v1): a function whose body contains `yield` collects
+        // its yielded values into a `Vec<T>` and returns it. typeck has already
+        // verified the signature is `Iterator[T]` (which lowered `ret` to
+        // `Ty::List(T)` -> a `Vec<T>` Rust return), so detecting the `yield` in
+        // the body is enough to switch on the desugar here. The flag is
+        // saved/restored so a nested function never inherits it.
+        let is_generator =
+            crate::typeck::body_contains_yield(&f.body) && matches!(ret, Ty::List(_));
+        let saved_in_generator = std::mem::replace(&mut self.in_generator, is_generator);
+        if is_generator {
+            // The accumulator the lowered `yield`s push into and the function
+            // returns. Typed to the Rust return type (`Vec<T>`) so an empty
+            // generator and element inference both resolve without annotation
+            // churn. See the `Stmt::Yield` arm in `emit_stmt`.
+            self.line(&format!("let mut __gen: {} = Vec::new();", ret_s));
+        }
         // (EPIC-4 V2-c) Track this function's by-reference (`&mut T`) param
         // bindings so a forwarded-by-reference arg that names one emits an
         // explicit reborrow (`&mut *x`) instead of a double `&mut` (E0596).
@@ -1517,6 +1543,13 @@ impl<'a> Codegen<'a> {
         for s in &f.body {
             self.emit_stmt(s)?;
         }
+        // Generators: fall-off-the-end returns the collected Vec. (A bare
+        // `return` inside the body also lowers to `return __gen;` via emit_stmt,
+        // so collection stops there; this final return covers the normal path
+        // where control reaches the end of the body.)
+        if is_generator {
+            self.line("return __gen;");
+        }
         self.indent -= 1;
         self.line("}");
         self.line("");
@@ -1526,6 +1559,7 @@ impl<'a> Codegen<'a> {
         self.declared.clear();
         self.current_ret_ty = saved_ret_ty;
         self.by_ref_locals = saved_by_ref;
+        self.in_generator = saved_in_generator;
         Ok(())
     }
 
@@ -2649,7 +2683,25 @@ impl<'a> Codegen<'a> {
                     }
                 }
             }
-            Stmt::Return(None, _) => self.line("return;"),
+            Stmt::Return(None, _) => {
+                // In a generator a bare `return` stops collection and hands back
+                // the values gathered so far. Elsewhere it is a plain `return;`.
+                if self.in_generator {
+                    self.line("return __gen;");
+                } else {
+                    self.line("return;");
+                }
+            }
+            Stmt::Yield(e, _) => {
+                // EAGER generator desugar: `yield x` -> push x onto the collected
+                // Vec. `emit_consuming` deep-clones a non-Copy place so the pushed
+                // value is independent of the binding (pyrst value semantics), and
+                // a Copy element (int/bool/float) is pushed by value. The
+                // accumulator `__gen` and the trailing `return __gen;` are emitted
+                // by `emit_func` for any function whose body contains a `yield`.
+                let s = self.emit_consuming(e)?;
+                self.line(&format!("__gen.push({});", s));
+            }
             Stmt::Return(Some(e), _) => {
                 // (EPIC-5) In an Option-returning function, wrap the value:
                 // `None` -> `return None;`, a bare T -> `return Some(T);`, an

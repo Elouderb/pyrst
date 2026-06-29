@@ -111,6 +111,16 @@ impl Ty {
                     Ty::Dict(Box::new(key), Box::new(Ty::from_type_expr(v, span)?))
                 }
                 ("tuple", args) => Ty::Tuple(args.iter().map(|a| Ty::from_type_expr(a, span)).collect::<Result<Vec<_>>>()?),
+                // `Iterator[T]` is the declared return type of a GENERATOR (a
+                // function whose body contains `yield`). In pyrst's EAGER v1 a
+                // generator runs to completion collecting its yielded values into
+                // a `Vec<T>` and returns it, so `Iterator[T]` lowers to the same
+                // internal type as `list[T]` — every existing list machinery
+                // (for-loop / comprehension element typing, `Vec<T>` codegen)
+                // applies unchanged. Generator-ness is tracked separately (by the
+                // presence of `Stmt::Yield`) and drives the honest-error checks +
+                // the Vec-collect desugar; the element typing is just `list[T]`.
+                ("Iterator", [t]) => Ty::List(Box::new(Ty::from_type_expr(t, span)?)),
                 ("Optional", [t]) => Ty::Option(Box::new(Ty::from_type_expr(t, span)?)),
                 ("Union", args) => {
                     let non_none: Vec<_> = args.iter()
@@ -648,6 +658,13 @@ struct FuncEnv<'a> {
     /// backstop (AttrAssign / IndexAssign / mutating method-call) must NOT fire
     /// for these names.
     by_ref_params: std::collections::HashSet<String>,
+    /// Generators: true when the function being checked has a `yield` in its
+    /// body. A generator MUST be declared `Iterator[T]` (so `ret_ty` is the
+    /// `Ty::List(T)` that `Iterator[T]` lowers to). When set, a `yield x` checks
+    /// `x` against the element type `T`, a bare `return` is allowed even though
+    /// `ret_ty` is not `Unit` (it ends collection early), and a `return <value>`
+    /// is rejected (generators yield values, they do not return one).
+    is_generator: bool,
 }
 
 impl<'a> FuncEnv<'a> {
@@ -664,7 +681,7 @@ impl<'a> FuncEnv<'a> {
             param_set.insert(name.clone());
         }
         let by_ref_params = by_ref_names.iter().cloned().collect();
-        FuncEnv { ctx, locals, ret_ty, used_vars, params: param_set, reassigned_params: std::collections::HashSet::new(), returned_params: std::collections::HashSet::new(), by_ref_params }
+        FuncEnv { ctx, locals, ret_ty, used_vars, params: param_set, reassigned_params: std::collections::HashSet::new(), returned_params: std::collections::HashSet::new(), by_ref_params, is_generator: false }
     }
 
     fn lookup(&self, name: &str) -> Option<Ty> {
@@ -811,7 +828,7 @@ fn stmt_span(s: &Stmt) -> Span {
         | Stmt::AttrAssign { span, .. }
         | Stmt::IndexAssign { span, .. }
         | Stmt::Import { span, .. } => *span,
-        Stmt::Return(_, span) | Stmt::Pass(span) | Stmt::Break(span) | Stmt::Continue(span) => *span,
+        Stmt::Return(_, span) | Stmt::Yield(_, span) | Stmt::Pass(span) | Stmt::Break(span) | Stmt::Continue(span) => *span,
         Stmt::Func(f) => f.span,
         Stmt::Class(c) => c.span,
     }
@@ -1199,9 +1216,39 @@ fn check_one_func(f: &Func, ctx: &TyCtx) -> Result<()> {
         .collect();
     let ret = Ty::from_type_expr(&f.ret, f.span)?;
     let mut env = FuncEnv::with_by_ref(ctx, &params, &by_ref_names, ret);
+    env.is_generator = check_generator_signature(&f.body, &f.ret, f.span)?;
     collect_returned_param_idents(&f.body, &env.params, &mut env.returned_params);
     check_body(&f.body, &mut env)?;
     Ok(())
+}
+
+/// Whether the function/method whose body is `body` and declared return type is
+/// `ret` is a GENERATOR, validating its signature in the process:
+///   * a body containing `yield` MUST be declared `Iterator[T]` (honest error
+///     otherwise — a generator that is not typed as an iterator);
+///   * a body WITHOUT `yield` is never a generator, even if declared
+///     `Iterator[T]` (such a function would just return a `list[T]`, which is
+///     fine — no `yield`, no special handling).
+/// Returns `Ok(true)` iff the function is a (well-formed) generator.
+fn check_generator_signature(body: &[Stmt], ret: &TypeExpr, span: Span) -> Result<bool> {
+    if !body_contains_yield(body) {
+        return Ok(false);
+    }
+    if !is_iterator_type_expr(ret) {
+        return Err(Error::Type {
+            span,
+            msg: "a generator (a function whose body uses `yield`) must be \
+                  declared to return `Iterator[T]`"
+                .to_string(),
+        });
+    }
+    Ok(true)
+}
+
+/// Whether a declared return annotation is `Iterator[T]` (the generator return
+/// form). Spelled as a single-argument `Generic("Iterator", [T])` by the parser.
+fn is_iterator_type_expr(t: &TypeExpr) -> bool {
+    matches!(t, TypeExpr::Generic(name, args) if name == "Iterator" && args.len() == 1)
 }
 
 /// Per-CLASS checks that run before (and gate) the method checks: multiple
@@ -1292,6 +1339,7 @@ fn check_one_method(c: &ClassDef, method: &Func, ctx: &TyCtx) -> Result<()> {
         .collect();
     let ret = Ty::from_type_expr(&method.ret, method.span)?;
     let mut env = FuncEnv::with_by_ref(ctx, &params, &by_ref_names, ret);
+    env.is_generator = check_generator_signature(&method.body, &method.ret, method.span)?;
     collect_returned_param_idents(&method.body, &env.params, &mut env.returned_params);
     check_body(&method.body, &mut env)?;
     Ok(())
@@ -1346,6 +1394,17 @@ fn check_top_level_other(s: &Stmt, ctx: &TyCtx) -> Result<()> {
     // and is already driven by the synthetic Rust `fn main() { user_main(); }`.
     if is_bare_main_call(s) {
         return Ok(());
+    }
+    // `yield` outside any function is an honest error (there is no generator to
+    // collect into). Caught here with a specific message rather than the generic
+    // "top-level statements ... are not supported" fall-through below.
+    if let Stmt::Yield(_, span) = s {
+        return Err(Error::Type {
+            span: *span,
+            msg: "`yield` outside a function is not allowed (it is only valid \
+                  inside a generator function declared `Iterator[T]`)"
+                .to_string(),
+        });
     }
     // A module-level constant (`NAME: T = <literal>`) is the narrow EPIC-6-A
     // relaxation: it is the ONLY assignment form accepted at top level — an
@@ -1982,6 +2041,39 @@ fn collect_returned_param_idents_stmt(
     }
 }
 
+/// Whether a function body (a flat `[Stmt]`) contains a `yield` ANYWHERE in its
+/// own control flow — directly or nested inside if/while/for/try/with/match
+/// blocks — making the enclosing function a GENERATOR. Nested `def`/`class`
+/// bodies are NOT descended: a `yield` inside an inner function makes THAT inner
+/// function the generator, not the outer one (mirrors `collect_returned_param_idents`).
+pub fn body_contains_yield(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(stmt_contains_yield)
+}
+
+fn stmt_contains_yield(s: &Stmt) -> bool {
+    match s {
+        Stmt::Yield(..) => true,
+        Stmt::If { then, elifs, else_, .. } => {
+            body_contains_yield(then)
+                || elifs.iter().any(|(_, b)| body_contains_yield(b))
+                || else_.as_ref().is_some_and(|b| body_contains_yield(b))
+        }
+        Stmt::While { body, .. } => body_contains_yield(body),
+        Stmt::For { body, .. } => body_contains_yield(body),
+        Stmt::Try { body, handlers, else_, finally_, .. } => {
+            body_contains_yield(body)
+                || handlers.iter().any(|h| body_contains_yield(&h.body))
+                || else_.as_ref().is_some_and(|b| body_contains_yield(b))
+                || finally_.as_ref().is_some_and(|b| body_contains_yield(b))
+        }
+        Stmt::With { body, .. } => body_contains_yield(body),
+        Stmt::Match { arms, .. } => arms.iter().any(|arm| body_contains_yield(&arm.body)),
+        // A nested function/class owns its own yields.
+        Stmt::Func(_) | Stmt::Class(_) => false,
+        _ => false,
+    }
+}
+
 /// Walk an expression and collect any top-level Ident that is a known param.
 /// We stay shallow (just check the expression itself and direct sub-expressions
 /// of Tuple/IfExp) to avoid spurious suppression from `return [xs]` or similar.
@@ -2038,7 +2130,9 @@ fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             }
         }
         Stmt::Return(None, span) => {
-            if env.ret_ty != Ty::Unit {
+            // In a GENERATOR a bare `return` ends value collection early — it is
+            // always allowed regardless of the declared `Iterator[T]` return.
+            if !env.is_generator && env.ret_ty != Ty::Unit {
                 return Err(Error::Type {
                     span: *span,
                     msg: format!("bare return in function declared to return {}", env.ret_ty),
@@ -2047,12 +2141,56 @@ fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             Ok(())
         }
         Stmt::Return(Some(e), span) => {
+            // A generator yields values; it does NOT return one. `return <value>`
+            // inside a generator is an honest error (use `yield`, or a bare
+            // `return` to stop early).
+            if env.is_generator {
+                // Still type-check the expression so its own errors surface.
+                let _ = check_expr(e, env)?;
+                return Err(Error::Type {
+                    span: *span,
+                    msg: "a generator cannot `return` a value (it `yield`s values); \
+                          use a bare `return` to stop early"
+                        .to_string(),
+                });
+            }
             let ty = check_expr(e, env)?;
             if !types_compatible(&ty, &env.ret_ty, env.ctx) {
                 return Err(Error::Type {
                     span: *span,
                     msg: format!("return type mismatch: expected {}, found {}", env.ret_ty, ty),
                 });
+            }
+            Ok(())
+        }
+        Stmt::Yield(e, span) => {
+            // `yield` is only meaningful inside a generator. `check_one_func` /
+            // `check_one_method` set `env.is_generator` from the body + a valid
+            // `Iterator[T]` return, so a `yield` that reaches here in a
+            // non-generator env means the enclosing function is NOT typed as an
+            // iterator (the signature check already errored) — but a defensive
+            // honest error here covers any path that builds a `FuncEnv` directly.
+            let yielded = check_expr(e, env)?;
+            if !env.is_generator {
+                return Err(Error::Type {
+                    span: *span,
+                    msg: "`yield` is only valid inside a generator function \
+                          declared to return `Iterator[T]`"
+                        .to_string(),
+                });
+            }
+            // The element type is the inner `T` of the `Iterator[T]` return,
+            // which lowered to `Ty::List(T)`. The yielded value must match `T`.
+            if let Ty::List(elem) = &env.ret_ty {
+                if !types_compatible(&yielded, elem, env.ctx) {
+                    return Err(Error::Type {
+                        span: *span,
+                        msg: format!(
+                            "yield type mismatch: generator yields {}, found {}",
+                            elem, yielded
+                        ),
+                    });
+                }
             }
             Ok(())
         }
@@ -3045,6 +3183,9 @@ fn lambda_ret_with_elem(
                 reassigned_params: std::collections::HashSet::new(),
                 returned_params: std::collections::HashSet::new(),
                 by_ref_params: std::collections::HashSet::new(),
+                // A lambda body is a single expression and can never contain a
+                // `yield` statement, so it is never a generator.
+                is_generator: false,
             };
             // Bind every param: the first to the iterable element type, the
             // rest to their declared type or Unknown (map/filter pass a single
@@ -3110,6 +3251,11 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 reassigned_params: env.reassigned_params.clone(),
                 returned_params: env.returned_params.clone(),
                 by_ref_params: env.by_ref_params.clone(),
+                // A comprehension lives inside the current function; inherit its
+                // generator status so the bare-return / yield rules stay coherent
+                // (a `yield` cannot appear inside a comprehension expression, but
+                // propagating keeps the env honest).
+                is_generator: env.is_generator,
             };
             bind_comp_targets(targets, elem_ty, &mut inner_env.locals);
             if let Some(c) = cond { check_expr(c, &mut inner_env)?; }
@@ -3133,6 +3279,11 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 reassigned_params: env.reassigned_params.clone(),
                 returned_params: env.returned_params.clone(),
                 by_ref_params: env.by_ref_params.clone(),
+                // A comprehension lives inside the current function; inherit its
+                // generator status so the bare-return / yield rules stay coherent
+                // (a `yield` cannot appear inside a comprehension expression, but
+                // propagating keeps the env honest).
+                is_generator: env.is_generator,
             };
             bind_comp_targets(targets, elem_ty, &mut inner_env.locals);
             if let Some(c) = cond { check_expr(c, &mut inner_env)?; }
@@ -3159,6 +3310,11 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 reassigned_params: env.reassigned_params.clone(),
                 returned_params: env.returned_params.clone(),
                 by_ref_params: env.by_ref_params.clone(),
+                // A comprehension lives inside the current function; inherit its
+                // generator status so the bare-return / yield rules stay coherent
+                // (a `yield` cannot appear inside a comprehension expression, but
+                // propagating keeps the env honest).
+                is_generator: env.is_generator,
             };
             bind_comp_targets(targets, elem_ty, &mut inner_env.locals);
             if let Some(c) = cond { check_expr(c, &mut inner_env)?; }
@@ -3945,6 +4101,8 @@ fn lambda_body_ty(
         reassigned_params: std::collections::HashSet::new(),
         returned_params: std::collections::HashSet::new(),
         by_ref_params: std::collections::HashSet::new(),
+        // A lambda body is a single expression — never a generator.
+        is_generator: false,
     };
     for (param_name, param_ty) in params {
         let ty = lambda_param_ty(param_ty);

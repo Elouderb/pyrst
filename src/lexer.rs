@@ -56,6 +56,7 @@ pub enum Tok {
     Ident(String),
     Def,
     Return,
+    Yield,
     If,
     Elif,
     Else,
@@ -527,6 +528,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
             let tok = match text {
                 "def" => Tok::Def,
                 "return" => Tok::Return,
+                "yield" => Tok::Yield,
                 "if" => Tok::If,
                 "elif" => Tok::Elif,
                 "else" => Tok::Else,

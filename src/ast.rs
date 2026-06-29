@@ -96,6 +96,13 @@ pub enum Stmt {
     AugAssign { target: String, op: BinOp, value: Expr, span: Span },
     Unpack { targets: Vec<String>, value: Expr, span: Span },
     Return(Option<Expr>, Span),
+    /// `yield <expr>` as a STATEMENT. A function whose body contains any
+    /// `Stmt::Yield` is a GENERATOR: typeck requires it to be declared
+    /// `Iterator[T]` and codegen lowers it EAGERLY — each `yield x` becomes a
+    /// `__gen.push(x)` into a `Vec<T>` that the function collects and returns
+    /// (see `Codegen::emit_func`). `yield` as an expression, `yield from`, and
+    /// `send` are intentionally out of scope.
+    Yield(Expr, Span),
     If { cond: Expr, then: Vec<Stmt>, elifs: Vec<(Expr, Vec<Stmt>)>, else_: Option<Vec<Stmt>>, span: Span },
     While { cond: Expr, body: Vec<Stmt>, span: Span },
     For { targets: Vec<String>, iter: Expr, body: Vec<Stmt>, span: Span },

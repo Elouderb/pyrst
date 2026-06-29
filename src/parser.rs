@@ -14,7 +14,9 @@
 //!
 //! Implemented beyond the early v0 subset: for, match, decorators,
 //! multi-target/unpack assignment, comprehensions (list/set/dict), lambdas,
-//! with, and try/except. Not yet supported: generators/`yield`, `async`.
+//! with, try/except, and `yield` statements (EAGER generators — see
+//! `Stmt::Yield`). Not yet supported: `yield` as an expression, `yield from`,
+//! `async`.
 
 use crate::ast::*;
 use crate::diag::{Error, Result, Span};
@@ -128,6 +130,17 @@ impl Parser {
                 let val = if matches!(self.peek(), Tok::Newline) { None } else { Some(self.parse_expr()?) };
                 self.eat_newline()?;
                 Ok(Stmt::Return(val, span))
+            }
+            Tok::Yield => {
+                // `yield <expr>` as a statement (the value is mandatory — a bare
+                // `yield` yielding None and `yield from` are out of scope). The
+                // function containing it is treated as a generator downstream
+                // (typeck requires `Iterator[T]`; codegen collects into a Vec).
+                let span = self.peek_span();
+                self.bump();
+                let val = self.parse_expr()?;
+                self.eat_newline()?;
+                Ok(Stmt::Yield(val, span))
             }
             Tok::At => {
                 // Collect decorators before def

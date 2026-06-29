@@ -269,6 +269,10 @@ impl Linter {
                     self.check_expr(e);
                 }
             }
+            Stmt::Yield(e, _) => {
+                // The yielded expression uses its variables like any other.
+                self.check_expr(e);
+            }
             Stmt::Expr(e) => {
                 self.check_expr(e);
             }

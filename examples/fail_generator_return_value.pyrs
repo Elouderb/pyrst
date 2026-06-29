@@ -1,0 +1,10 @@
+# Negative: a generator yields values; it does NOT return one. A `return <value>`
+# inside a generator is an honest error (use `yield`, or a bare `return` to stop
+# collecting early).
+def gen() -> Iterator[int]:
+    yield 1
+    return 5
+
+def main() -> None:
+    for x in gen():
+        print(x)

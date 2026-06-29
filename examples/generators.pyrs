@@ -1,0 +1,24 @@
+# Generators (`yield`) — EAGER v1.
+#
+# A function whose body uses `yield` is a GENERATOR and must be declared to
+# return `Iterator[T]` (the yielded element type). In this first version the
+# generator runs to completion, collecting every yielded value into a list, and
+# returns it; a `for` loop or comprehension then iterates that result. This is
+# faithful for FINITE generators (the common case). An INFINITE generator
+# (`while True: yield ...`) would collect forever and hang at runtime — true
+# lazy iteration is an explicit follow-up.
+def squares(n: int) -> Iterator[int]:
+    i: int = 0
+    while i < n:
+        yield i * i
+        i = i + 1
+
+def main() -> None:
+    for s in squares(4):
+        print(s)                                  # 0 / 1 / 4 / 9
+    total: int = 0
+    for s in squares(3):
+        total = total + s
+    print(total)                                  # 5
+    doubled: list[int] = [x * 2 for x in squares(3)]
+    print(doubled)                                # [0, 2, 8]

@@ -1,0 +1,4 @@
+# Negative: `yield` outside any function is an honest error — there is no
+# generator to collect into. `yield` is only valid inside a generator function
+# declared to return `Iterator[T]`.
+yield 1

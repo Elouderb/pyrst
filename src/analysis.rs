@@ -349,6 +349,7 @@ fn walk_stmt<'a>(
         Stmt::Unpack { value, .. } => walk_expr(value, off, &[], func, class, best),
         Stmt::Return(Some(e), _) => walk_expr(e, off, &[], func, class, best),
         Stmt::Return(None, _) => {}
+        Stmt::Yield(e, _) => walk_expr(e, off, &[], func, class, best),
         Stmt::If { cond, then, elifs, else_, .. } => {
             walk_expr(cond, off, &[], func, class, best);
             walk_stmts(then, off, func, class, best);
@@ -1215,7 +1216,7 @@ fn stmt_span(s: &Stmt) -> crate::diag::Span {
         | Stmt::Import { span, .. }
         | Stmt::AttrAssign { span, .. }
         | Stmt::IndexAssign { span, .. } => *span,
-        Stmt::Return(_, span) => *span,
+        Stmt::Return(_, span) | Stmt::Yield(_, span) => *span,
         Stmt::Func(f) => f.span,
         Stmt::Class(c) => c.span,
     }
@@ -1808,6 +1809,7 @@ fn collect_stmt_tokens<'a>(
         Stmt::Unpack { value, .. } => collect_expr_tokens(value, ctx, src, func, class, out),
         Stmt::Return(Some(e), _) => collect_expr_tokens(e, ctx, src, func, class, out),
         Stmt::Return(None, _) => {}
+        Stmt::Yield(e, _) => collect_expr_tokens(e, ctx, src, func, class, out),
         Stmt::If { cond, then, elifs, else_, .. } => {
             collect_expr_tokens(cond, ctx, src, func, class, out);
             for st in then {

@@ -1,0 +1,13 @@
+# Mutating a CAPTURED enclosing variable from inside a nested `def` is rejected:
+# closures capture by value (`move` + clone), so the assignment would not
+# propagate to the enclosing scope. Honest error — assign to a local inside the
+# nested function, or return the new value instead.
+def counter(start: int) -> Callable[[int], int]:
+    def bump(x: int) -> int:
+        start = start + x
+        return start
+    return bump
+
+def main() -> None:
+    c: Callable[[int], int] = counter(10)
+    print(c(5))

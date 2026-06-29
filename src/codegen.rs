@@ -3366,11 +3366,142 @@ impl<'a> Codegen<'a> {
                     self.line("}");
                 }
             }
-            Stmt::Func(_) | Stmt::Class(_) => {
-                // Nested functions/classes — punt.
-                self.line("// TODO: nested function/class");
+            // (first-class functions, Increment 2) A NESTED `def` lowers to a
+            // NAMED local closure `let <name> = Rc::new(move |..| { <block> }) as
+            // Rc<dyn Fn(..) -> Ret>;`. typeck has already registered it as a
+            // `Ty::Func` local, rejected self-recursion / captured mutation /
+            // nested generics+generators, and checked the body with the enclosing
+            // scope visible — so here we only emit the closure and record the
+            // local so later parent statements (`return <name>` / `<name>(args)`)
+            // resolve it as a func-valued place.
+            Stmt::Func(f) => self.emit_nested_def(f)?,
+            Stmt::Class(_) => {
+                // Nested classes — punt.
+                self.line("// TODO: nested class");
             }
         }
+        Ok(())
+    }
+
+    /// (first-class functions, Increment 2) Emit a NESTED `def` as a named local
+    /// closure bound with `let`. The closure is `move` (it captures every
+    /// referenced enclosing variable BY VALUE — Rust moves a captured binding into
+    /// the closure; pyrst's value semantics make that the right default, and a
+    /// captured non-`Copy` value the closure keeps using is the closure's own
+    /// copy). Its body is the def's full STATEMENT BLOCK — the key difference from
+    /// a lambda (a single expression): we reuse the SAME body-emission machinery
+    /// as a top-level `fn` (prescan → hoist → `emit_stmt` loop), so the def's
+    /// `return`s become the closure's returns and all statement forms are
+    /// supported. The bound name is a `Rc<dyn Fn(..)>` local, so a later
+    /// `<name>(args)` / `return <name>` flows through the existing func-value paths
+    /// (clone-on-use = a cheap `Rc` refcount bump), exactly like a `Callable`
+    /// param or a lambda-bound local.
+    fn emit_nested_def(&mut self, f: &Func) -> Result<()> {
+        // Lower the nested signature. The nested def's annotations are scoped to
+        // the ENCLOSING function's generic type params (typeck used the same
+        // scope), so a `T` named in a nested annotation lowers to the same Rust
+        // generic the enclosing `fn` declares.
+        let param_tys: Vec<Ty> = f.params.iter()
+            .map(|p| Ty::from_type_expr(&p.ty, p.span))
+            .collect::<Result<Vec<_>>>()?;
+        let ret = Ty::from_type_expr(&f.ret, f.span)?;
+        let func_ty = Ty::Func(param_tys.clone(), Box::new(ret.clone()));
+        let rc_ty = self.rust_ty(&func_ty);
+
+        // Closure parameter list: `name: T` per param. A by-value closure param is
+        // bound `mut` (matching `fn` params) so the body may mutate it / its
+        // fields in place; unused-mut is allowed in the generated crate.
+        let mut param_strs = Vec::with_capacity(f.params.len());
+        for (p, pty) in f.params.iter().zip(param_tys.iter()) {
+            param_strs.push(format!("mut {}: {}", escape_ident(&p.name), self.rust_ty(pty)));
+        }
+        let name_e = escape_ident(&f.name);
+        let ret_s = self.rust_ty(&ret);
+
+        // Open the binding + closure. The `-> Ret` is always written (uniform with
+        // a `() -> ()` unit nested def); the block body follows on its own lines.
+        self.line(&format!(
+            "let {} = ::std::rc::Rc::new(move |{}| -> {} {{",
+            name_e,
+            param_strs.join(", "),
+            ret_s
+        ));
+        self.indent += 1;
+
+        // --- enter the nested scope ------------------------------------------------
+        // Save every piece of per-function emission state so the nested closure's
+        // body emits in its OWN context and the enclosing function's context is
+        // restored verbatim afterwards.
+        //
+        // locals/declared: the closure CAPTURES the enclosing locals (already in
+        // `self.locals`), so we KEEP them visible and overlay the nested params.
+        // We snapshot both so the nested params / nested locals never leak back to
+        // the parent. `declared` starts EMPTY for the closure body (a fresh Rust
+        // scope: nothing is `let`-declared yet), and is restored to the parent's
+        // set on exit.
+        let saved_locals = self.locals.clone();
+        let saved_declared = std::mem::take(&mut self.declared);
+        let saved_ret_ty = std::mem::replace(&mut self.current_ret_ty, ret.clone());
+        // A nested def owns its own control flow: a `return`/`break`/`continue` in
+        // it is local to the closure (or its own loops), never an escape from an
+        // enclosing `try:` body. Suspend both try-escape flags (typeck also
+        // forbade `yield` here, so `in_generator` is irrelevant, but we reset it
+        // for safety/symmetry with `emit_func`).
+        let saved_try_return = std::mem::replace(&mut self.try_return_escape, false);
+        let saved_try_loopctl = std::mem::replace(&mut self.try_loopctl_escape, false);
+        let saved_in_generator = std::mem::replace(&mut self.in_generator, false);
+        // The closure's by-reference locals start empty (nested defs take no
+        // `Mut[T]` params in this increment); save+restore mirrors `emit_func`.
+        let saved_by_ref = std::mem::take(&mut self.by_ref_locals);
+
+        // Overlay the nested params onto the captured locals (a param SHADOWS a
+        // captured enclosing name of the same identifier).
+        for (p, pty) in f.params.iter().zip(param_tys.iter()) {
+            self.locals.insert(p.name.clone(), pty.clone());
+        }
+
+        // Same body pipeline as `emit_func`: forward type inference, then hoist
+        // block-first-assigned locals to the (closure) scope top, then emit the
+        // statements. `prescan_types` / `collect_hoistable` do not descend into a
+        // doubly-nested def, so they stay scoped to THIS closure's own body.
+        self.prescan_types(&f.body);
+        let mut block_assigned = std::collections::HashSet::new();
+        let mut unpack_targets = std::collections::HashSet::new();
+        Self::collect_hoistable(&f.body, 0, &mut block_assigned, &mut unpack_targets);
+        let params: std::collections::HashSet<&str> = f.params.iter().map(|p| p.name.as_str()).collect();
+        let mut hoist: Vec<String> = block_assigned.into_iter()
+            .filter(|n| !unpack_targets.contains(n) && !params.contains(n.as_str()) && !self.declared.contains(n))
+            .collect();
+        hoist.sort();
+        for hname in hoist {
+            let ty = self.locals.get(&hname).cloned().unwrap_or(Ty::Unknown);
+            if let Some(def) = self.default_val(&ty) {
+                self.line(&format!("let mut {}: {} = {};", escape_ident(&hname), self.rust_ty(&ty), def));
+                self.declared.insert(hname);
+            }
+        }
+        for s in &f.body {
+            self.emit_stmt(s)?;
+        }
+
+        // --- leave the nested scope ------------------------------------------------
+        self.locals = saved_locals;
+        self.declared = saved_declared;
+        self.current_ret_ty = saved_ret_ty;
+        self.try_return_escape = saved_try_return;
+        self.try_loopctl_escape = saved_try_loopctl;
+        self.in_generator = saved_in_generator;
+        self.by_ref_locals = saved_by_ref;
+
+        self.indent -= 1;
+        self.line(&format!("}}) as {};", rc_ty));
+
+        // Record the nested def as a func-valued local + declared name in the
+        // ENCLOSING scope, so the rest of the parent body resolves `<name>` as an
+        // `Rc<dyn Fn>` place (clone-on-use for a return/argument, direct call for
+        // `<name>(args)`). Define-before-use: every reference follows this point.
+        self.locals.insert(f.name.clone(), func_ty);
+        self.declared.insert(f.name.clone());
         Ok(())
     }
 

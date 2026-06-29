@@ -3018,7 +3018,249 @@ fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             }
             Ok(())
         }
-        Stmt::Func(_) | Stmt::Class(_) => Ok(()), // Nested — punt in v0.
+        // (first-class functions, Increment 2) A NESTED `def` lowers to a NAMED
+        // local closure. Register it as a `Ty::Func` local in the ENCLOSING scope
+        // (so it is callable / returnable / passable like any Callable value) and
+        // type-check its body with the enclosing locals + params VISIBLE (lexical
+        // capture) plus its own params. Define-before-use: it is in scope from
+        // here onward, exactly like a local assignment. A nested `class` is still
+        // out of scope (punted).
+        Stmt::Func(f) => check_nested_def(f, env),
+        Stmt::Class(_) => Ok(()), // Nested class — punt in v0.
+    }
+}
+
+/// (first-class functions, Increment 2) Type-check a NESTED `def` and register it
+/// as a named `Ty::Func` LOCAL in the enclosing function environment `env`.
+///
+/// A nested def lowers (in codegen) to a `move` closure `Rc<dyn Fn(..) -> Ret>`
+/// bound to a `let <name>`; here we establish the matching type discipline:
+///  - the nested def's signature becomes a `Ty::Func(param_tys, ret)` local so
+///    `<name>(args)` type-checks and the value can be returned / passed / stored;
+///  - the body is checked in a FRESH `FuncEnv` whose locals start as the
+///    enclosing locals (LEXICAL CAPTURE) plus the nested params, with the nested
+///    def's own return type and the same generic type-parameter scope;
+///  - the all-paths-return / honest-missing-return gate applies to the body too.
+///
+/// SOUNDNESS GATES (Increment 2 scope), each an honest error rather than emitting
+/// broken Rust:
+///  - SELF-RECURSION is rejected: a Rust closure cannot name itself in its own
+///    initializer, so a nested def that calls its own name cannot be lowered.
+///  - MUTATING A CAPTURED enclosing variable is rejected: capture is by value
+///    (`move` + clone), so an assignment to a captured (non-param, non-local)
+///    name would silently fail to propagate to the enclosing scope.
+///  - NESTED GENERICS and NESTED GENERATORS (a `yield` in the nested body) are
+///    rejected: a closure has no place for Rust generic params, and the eager
+///    generator desugar targets a `fn` return slot, not a closure.
+///  - Decorators on a nested def are not supported.
+fn check_nested_def(f: &Func, env: &mut FuncEnv) -> Result<()> {
+    if !f.decorators.is_empty() {
+        return Err(Error::Type {
+            span: f.span,
+            msg: "decorators on a nested function are not supported".to_string(),
+        });
+    }
+    if !f.type_params.is_empty() {
+        return Err(Error::Type {
+            span: f.span,
+            msg: "a nested function cannot declare type parameters (generics are \
+                  only supported on top-level functions)"
+                .to_string(),
+        });
+    }
+    if body_contains_yield(&f.body) {
+        return Err(Error::Type {
+            span: f.span,
+            msg: "a nested function cannot be a generator (`yield` is only \
+                  supported in a top-level function or method)"
+                .to_string(),
+        });
+    }
+
+    // SELF-RECURSION: a Rust closure cannot reference itself in its own scope, so
+    // a nested def that calls its own name cannot be lowered. Reject it honestly.
+    let mut called = std::collections::HashSet::new();
+    for s in &f.body {
+        collect_calls_from_stmt(s, &mut called);
+    }
+    if called.contains(&f.name) {
+        return Err(Error::Type {
+            span: f.span,
+            msg: format!(
+                "recursive nested function `{}` is not supported \
+                 (a nested closure cannot call itself — use a top-level function)",
+                f.name
+            ),
+        });
+    }
+
+    // Lower the nested signature (scoped to the ENCLOSING function's type params,
+    // so a nested def inside a generic function may still name them in annotations
+    // — they are opaque type variables there, never bound by the nested def).
+    let tp = env.type_param_list();
+    let params: Vec<(String, Ty)> = f.params.iter()
+        .map(|p| Ty::from_type_expr_scoped(&p.ty, p.span, &tp).map(|ty| (p.name.clone(), ty)))
+        .collect::<Result<Vec<_>>>()?;
+    let ret = Ty::from_type_expr_scoped(&f.ret, f.span, &tp)?;
+
+    // The nested def's PARAM names: assignments to these inside the body are the
+    // closure's own bindings (fine), NOT captured-variable mutations.
+    let nested_param_names: std::collections::HashSet<&str> =
+        f.params.iter().map(|p| p.name.as_str()).collect();
+
+    // MUTATE-CAPTURED gate: capture is by value (`move` + clone), so an assignment
+    // to a name that is VISIBLE in the enclosing scope but is neither a nested
+    // param nor a nested-local would not propagate to the enclosing scope. Reject
+    // it honestly. A nested-local (a name first BOUND inside the body) is allowed;
+    // we seed `nested_locals` with the params and grow it as we scan assignments,
+    // so an assignment to a fresh name (a new nested local) is never flagged.
+    {
+        let mut nested_locals: std::collections::HashSet<String> =
+            nested_param_names.iter().map(|s| s.to_string()).collect();
+        reject_captured_mutation(&f.body, env, &mut nested_locals)?;
+    }
+
+    // Register the nested def as a callable local in the ENCLOSING scope BEFORE
+    // checking the body, so a LATER nested def (or a recursive-looking forward
+    // reference, already rejected above) sees it, and so the enclosing body can
+    // call/return/pass it from this point onward (define-before-use).
+    env.locals.insert(f.name.clone(), Ty::Func(
+        params.iter().map(|(_, t)| t.clone()).collect(),
+        Box::new(ret.clone()),
+    ));
+
+    // Check the nested body in a FRESH environment that CAPTURES the enclosing
+    // locals (every enclosing param/local/earlier-nested-def is visible) and adds
+    // the nested params on top (nested params SHADOW an enclosing name of the
+    // same identifier). The nested def's return type drives its own `return`
+    // checks and missing-return gate.
+    let mut nested_env = FuncEnv::with_by_ref(env.ctx, &params, &[], ret);
+    // Lexical capture: start from the enclosing locals, then overlay the nested
+    // params (so a param shadows a captured name).
+    for (k, v) in &env.locals {
+        nested_env.locals.entry(k.clone()).or_insert_with(|| v.clone());
+    }
+    // The nested params must keep their own (possibly shadowing) types.
+    for (name, ty) in &params {
+        nested_env.locals.insert(name.clone(), ty.clone());
+    }
+    // Carry the enclosing generic type-parameter scope so an op on a captured
+    // type-var value is still rejected by the same gate inside the nested body.
+    nested_env.type_params = env.type_params.clone();
+    collect_returned_param_idents(&f.body, &nested_env.params, &mut nested_env.returned_params);
+    check_body(&f.body, &mut nested_env)?;
+    check_all_paths_return(&f.body, &nested_env, &f.name, f.span)?;
+    Ok(())
+}
+
+/// (first-class functions, Increment 2) Walk a nested def's body and reject any
+/// assignment to a CAPTURED enclosing variable — a name that is visible in the
+/// enclosing scope `env` but is not one of the nested def's own bindings
+/// (`nested_locals`, seeded with its params and grown as new locals are bound).
+/// Capture is by value (`move` + clone), so such a mutation would not propagate
+/// to the enclosing scope; rejecting it keeps the by-value capture honest.
+///
+/// A bare `Stmt::Assign`/`Unpack` to a FRESH name introduces a new nested local
+/// (recorded in `nested_locals`), so it is never flagged. An assignment to a name
+/// already in `nested_locals` is the closure mutating its OWN binding — allowed.
+/// In-place mutations (`AttrAssign`/`IndexAssign`/`AugAssign`) whose ROOT names a
+/// captured variable are also rejected (they mutate the captured value's interior).
+fn reject_captured_mutation(
+    stmts: &[Stmt],
+    env: &FuncEnv,
+    nested_locals: &mut std::collections::HashSet<String>,
+) -> Result<()> {
+    // True when `name` is a captured enclosing variable (visible in `env` but not
+    // a nested-local binding). Top-level functions / classes resolved via the
+    // enclosing env's `lookup` are NOT plain locals (they are global callables),
+    // so reassigning such a name is a separate concern — we only police names that
+    // are enclosing LOCALS (params/locals of the outer function).
+    let is_captured = |name: &str, locals: &std::collections::HashSet<String>| {
+        !locals.contains(name) && env.locals.contains_key(name)
+    };
+    for s in stmts {
+        match s {
+            Stmt::Assign { target, span, .. } => {
+                if is_captured(target, nested_locals) {
+                    return Err(captured_mutation_err(target, *span));
+                }
+                // A fresh assignment binds a new nested local (shadows capture).
+                nested_locals.insert(target.clone());
+            }
+            Stmt::Unpack { targets, span, .. } => {
+                for t in targets {
+                    if is_captured(t, nested_locals) {
+                        return Err(captured_mutation_err(t, *span));
+                    }
+                }
+                for t in targets { nested_locals.insert(t.clone()); }
+            }
+            Stmt::AugAssign { target, span, .. } => {
+                if is_captured(target, nested_locals) {
+                    return Err(captured_mutation_err(target, *span));
+                }
+            }
+            Stmt::AttrAssign { obj, span, .. } => {
+                if let Some(root) = root_ident(obj) {
+                    if is_captured(root, nested_locals) {
+                        return Err(captured_mutation_err(root, *span));
+                    }
+                }
+            }
+            Stmt::IndexAssign { obj, span, .. } => {
+                if let Some(root) = root_ident(obj) {
+                    if is_captured(root, nested_locals) {
+                        return Err(captured_mutation_err(root, *span));
+                    }
+                }
+            }
+            // Recurse into nested control-flow blocks. A name first bound inside a
+            // block is conservatively treated as a nested local from then on
+            // (pyrst hoists block-locals to function scope), which is sound for
+            // the gate: it only ever makes the check MORE permissive for the
+            // closure's own names, never admitting a captured-variable mutation.
+            Stmt::If { then, elifs, else_, .. } => {
+                reject_captured_mutation(then, env, nested_locals)?;
+                for (_, b) in elifs { reject_captured_mutation(b, env, nested_locals)?; }
+                if let Some(b) = else_ { reject_captured_mutation(b, env, nested_locals)?; }
+            }
+            Stmt::While { body, .. } | Stmt::With { body, .. } => {
+                reject_captured_mutation(body, env, nested_locals)?;
+            }
+            Stmt::For { targets, body, .. } => {
+                for t in targets { nested_locals.insert(t.clone()); }
+                reject_captured_mutation(body, env, nested_locals)?;
+            }
+            Stmt::Try { body, handlers, else_, finally_, .. } => {
+                reject_captured_mutation(body, env, nested_locals)?;
+                for h in handlers {
+                    if let Some(n) = &h.exc_name { nested_locals.insert(n.clone()); }
+                    reject_captured_mutation(&h.body, env, nested_locals)?;
+                }
+                if let Some(b) = else_ { reject_captured_mutation(b, env, nested_locals)?; }
+                if let Some(b) = finally_ { reject_captured_mutation(b, env, nested_locals)?; }
+            }
+            Stmt::Match { arms, .. } => {
+                for arm in arms { reject_captured_mutation(&arm.body, env, nested_locals)?; }
+            }
+            // A doubly-nested def owns its OWN capture analysis (checked when its
+            // enclosing nested def is checked); don't descend here.
+            Stmt::Func(_) | Stmt::Class(_) => {}
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn captured_mutation_err(name: &str, span: Span) -> Error {
+    Error::Type {
+        span,
+        msg: format!(
+            "nested function cannot mutate the captured variable `{}` \
+             (closures capture by value; assign to a local inside the nested \
+             function, or return the new value instead)",
+            name
+        ),
     }
 }
 

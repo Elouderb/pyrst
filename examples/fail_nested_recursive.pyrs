@@ -1,0 +1,13 @@
+# A self-recursive nested `def` is rejected: a Rust closure cannot reference
+# itself in its own scope, so it cannot be lowered. Honest error — use a
+# top-level function for recursion.
+def make_fact() -> Callable[[int], int]:
+    def fact(n: int) -> int:
+        if n <= 1:
+            return 1
+        return n * fact(n - 1)
+    return fact
+
+def main() -> None:
+    f: Callable[[int], int] = make_fact()
+    print(f(5))

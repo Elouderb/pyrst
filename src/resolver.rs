@@ -249,6 +249,11 @@ pub(crate) fn merge_ctx_from_module(m: &Module, ctx: &mut TyCtx, is_root: bool) 
                 // functions are inserted (a plain `def` is absent).
                 if !f.type_params.is_empty() {
                     ctx.generic_funcs.insert(f.name.clone(), f.type_params.clone());
+                    // Generics v2: store the full body so `infer_func_typevar_bounds`
+                    // can recompute a CALLEE's required bounds for transitive
+                    // propagation (a generic `f` calling a generic `g` folds `g`'s
+                    // bounds into `f`'s clause). Only generic functions are stored.
+                    ctx.generic_func_bodies.insert(f.name.clone(), f.clone());
                 }
             }
             Stmt::Class(c) => {

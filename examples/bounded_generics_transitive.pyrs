@@ -1,0 +1,42 @@
+# Generics v2: TRANSITIVE bound propagation. When a generic function passes one
+# of its type variables into another generic function, the callee's inferred
+# trait bounds FOLD INTO the caller's clause — so a chain of generic forwarders
+# all carry the bound the leaf operation requires. Without propagation this was a
+# silent check-passes / build-fails (the caller's `T` only had `Clone`, but the
+# callee needed e.g. PartialEq, so rustc rejected the generated crate).
+#
+# leaf op -> bound, propagated up every hop:
+def eq2[T](a: T, b: T) -> bool:
+    return a == b                 # leaf: infers T: PartialEq
+
+def cmp2[T](a: T, b: T) -> bool:
+    return a > b                  # leaf: infers T: PartialOrd
+
+# one-hop: forwards a, b: T into eq2 -> inherits PartialEq
+def same[T](a: T, b: T) -> bool:
+    return eq2(a, b)
+
+# multi-hop chain: top -> mid -> cmp2, all inherit PartialOrd
+def mid[T](a: T, b: T) -> bool:
+    return cmp2(a, b)
+
+def top[T](a: T, b: T) -> bool:
+    return mid(a, b)
+
+# container element propagation: passes list[T] into a callee needing Hash+Eq
+def to_set[U](xs: list[U]) -> set[U]:
+    out: set[U] = set()
+    for x in xs:
+        out.add(x)
+    return out
+
+def count_unique[T](xs: list[T]) -> int:
+    return len(to_set(xs))
+
+def main() -> None:
+    print(same(2, 2))             # True
+    print(same(2, 3))             # False
+    print(top(7, 3))              # True   (7 > 3)
+    print(top(3, 7))              # False
+    print(count_unique([1, 1, 2, 3, 3]))   # 3
+    print(count_unique(["a", "a", "b"]))   # 2

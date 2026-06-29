@@ -256,6 +256,18 @@ pub struct TyCtx {
     /// fast-path off the non-generic hot path (`funcs` lookups stay unchanged for
     /// the 99% non-generic case).
     pub generic_funcs: HashMap<String, Vec<String>>,
+    /// Generics v2 (transitive bound propagation): generic function NAME → its
+    /// full `Func` AST body. Populated by the resolver alongside `generic_funcs`
+    /// (ONLY generic top-level functions; a plain `def` and methods are absent).
+    /// `infer_func_typevar_bounds` needs a callee's BODY — not just its signature
+    /// — to recompute the trait bounds the callee requires, so that when a
+    /// generic `f` passes one of its type vars into a generic `g`, `g`'s inferred
+    /// bounds for that position FOLD INTO `f`'s own bound set (the fixed point
+    /// over the generic call graph). Without the body here, `f`'s clause would be
+    /// missing `g`'s bound and the generated crate would fail rustc (the
+    /// silent-build-fail this field closes). `TyCtx` is built once per program
+    /// (never cheap-cloned in a hot path), so storing the bodies is acceptable.
+    pub generic_func_bodies: HashMap<String, Func>,
 }
 
 impl TyCtx {
@@ -366,7 +378,7 @@ impl TyCtx {
         vars.insert("dict".into(), Ty::Dict(Box::new(Ty::Str), Box::new(Ty::Unknown)));
         vars.insert("set".into(), Ty::Set(Box::new(Ty::Unknown)));
 
-        Self { funcs, classes: HashMap::new(), vars, module_funcs: HashMap::new(), module_consts: HashMap::new(), generic_funcs: HashMap::new() }
+        Self { funcs, classes: HashMap::new(), vars, module_funcs: HashMap::new(), module_consts: HashMap::new(), generic_funcs: HashMap::new(), generic_func_bodies: HashMap::new() }
     }
 
     pub fn get_all_fields(&self, class_name: &str) -> Vec<crate::ast::Param> {
@@ -2188,31 +2200,121 @@ pub fn binop_typevar_bound(op: BinOp) -> Option<TypeVarBound> {
     }
 }
 
+/// A per-type-variable bound map: `TypeVar name -> {bounds}`.
+type BoundMap = std::collections::BTreeMap<String, std::collections::BTreeSet<TypeVarBound>>;
+
+/// A transitive-propagation EDGE captured at a generic CALL inside a generic
+/// function: `(caller_tv, callee_name, callee_tv)` means "this function's type
+/// variable `caller_tv` flows into generic function `callee_name`'s type
+/// parameter `callee_tv`", so whatever bounds `callee_name` requires on
+/// `callee_tv` must ALSO be required on `caller_tv`. Folded by the fixed point in
+/// `infer_func_typevar_bounds`.
+type PropEdge = (String, String, String);
+
 /// Generics v2: infer the per-TYPE-VARIABLE Rust trait-bound set for one generic
-/// function by walking its body and signature, mirroring EXACTLY the SUPPORTED
-/// ops that the typeck op-sites now ALLOW on a bare `T` (and never anything the
-/// op-sites still reject). The returned map is `TypeVar -> {bounds}`; every
-/// declared type parameter is present with at least `Clone` (pyrst value
-/// semantics). Codegen reads this map to emit the generic clause
-/// `fn f<T: Clone + PartialOrd, ...>(..)`.
+/// function, INCLUDING bounds propagated transitively from generic functions it
+/// calls. The returned map is `TypeVar -> {bounds}`; every declared type
+/// parameter is present with at least `Clone` (pyrst value semantics). Codegen
+/// reads this map to emit the generic clause `fn f<T: Clone + PartialOrd, ..>`.
 ///
-/// This is a SELF-CONTAINED walk (it does not thread `FuncEnv`): it seeds a
-/// `locals: name -> Ty` map from the params (scoped-lowered with `f.type_params`,
-/// so a `T` param is `Ty::TypeVar("T")`), then uses the shared `infer_expr_ty`
-/// to type each operand — the same inference codegen's `type_of_expr` uses — so
+/// Two layers:
+///  1. DIRECT bounds — `direct_func_typevar_bounds` walks the body/signature and
+///     records the bound each SUPPORTED op on a bare `T` requires (comparison ->
+///     PartialOrd, `+ - *` -> Add/Sub/Mul, Display contexts -> Display, set/dict
+///     element/key -> Hash + Eq), mirroring exactly the typeck op-sites.
+///  2. TRANSITIVE propagation — when `f` passes one of its type vars `T` into a
+///     generic callee `g`'s parameter `U` (e.g. `dedup(a, b)` where `a, b: T`
+///     bind `g`'s `U`), `g`'s required bounds on `U` FOLD INTO `T`. This is the
+///     fixed point over the whole generic call graph: repeatedly union callee
+///     bounds into callers along the captured edges until nothing changes.
+///
+/// CYCLES (a generic calling itself, or mutual generic recursion) are handled by
+/// the fixed point itself — a self-edge `T -> (f, T)` unions `f`'s own current
+/// `T` bounds into `T` (a no-op once stable), and the loop terminates because the
+/// bound lattice is finite and monotonically growing (each pass only ADDS bounds;
+/// it stops the first pass that adds none). Closing this gap turns the former
+/// silent check-passes/build-fails transitive call into a correct clause.
+///
+/// `ctx.generic_func_bodies` supplies every generic callee's body, so a callee's
+/// direct bounds can be recomputed here. A non-generic `f` (empty `type_params`)
+/// returns an empty map and costs one early return — the hot path is unaffected.
+pub fn infer_func_typevar_bounds(f: &Func, ctx: &TyCtx) -> BoundMap {
+    if f.type_params.is_empty() {
+        return BoundMap::new();
+    }
+    // Build the working set: `f` plus every generic function reachable via
+    // `ctx.generic_func_bodies` (the call graph is small; we just take them all,
+    // since propagation only flows along edges that actually exist). `f` itself
+    // may or may not be registered in `ctx` (tests build a func without a ctx
+    // entry), so insert it explicitly under its own name.
+    let mut direct: std::collections::HashMap<String, BoundMap> = std::collections::HashMap::new();
+    let mut edges: std::collections::HashMap<String, Vec<PropEdge>> = std::collections::HashMap::new();
+    direct.insert(f.name.clone(), direct_func_typevar_bounds(f, ctx));
+    edges.insert(f.name.clone(), collect_prop_edges(f, ctx));
+    for (name, body) in &ctx.generic_func_bodies {
+        direct.entry(name.clone()).or_insert_with(|| direct_func_typevar_bounds(body, ctx));
+        edges.entry(name.clone()).or_insert_with(|| collect_prop_edges(body, ctx));
+    }
+
+    // Fixed point: start from the direct bounds, then fold callee bounds into
+    // callers along every edge until a full pass adds nothing. Monotone + finite
+    // lattice => terminates; cycles are absorbed (a repeated union is idempotent).
+    let mut result = direct.clone();
+    loop {
+        let mut changed = false;
+        // Iterate caller functions in a stable order for determinism.
+        let callers: Vec<String> = {
+            let mut v: Vec<String> = edges.keys().cloned().collect();
+            v.sort();
+            v
+        };
+        for caller in &callers {
+            let caller_edges = edges.get(caller).cloned().unwrap_or_default();
+            for (caller_tv, callee, callee_tv) in &caller_edges {
+                // The bounds the callee currently requires on the bound position.
+                let inherited: Vec<TypeVarBound> = result
+                    .get(callee)
+                    .and_then(|m| m.get(callee_tv))
+                    .map(|s| s.iter().copied().collect())
+                    .unwrap_or_default();
+                if inherited.is_empty() {
+                    continue;
+                }
+                let entry = result
+                    .entry(caller.clone())
+                    .or_default()
+                    .entry(caller_tv.clone())
+                    .or_default();
+                for b in inherited {
+                    if entry.insert(b) {
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    // Defensive: ensure every declared type param of `f` is present with `Clone`
+    // even if it was never used by any op (so codegen always emits a clause).
+    let mut out = result.remove(&f.name).unwrap_or_default();
+    for tp in &f.type_params {
+        out.entry(tp.clone()).or_default().insert(TypeVarBound::Clone);
+    }
+    out
+}
+
+/// The DIRECT (non-propagated) bound map for one generic function: a self-
+/// contained walk of its body and signature that records the bound each
+/// SUPPORTED op on a bare `T` requires. It seeds `locals: name -> Ty` from the
+/// params (scoped-lowered, so a `T` param is `Ty::TypeVar("T")`) and uses the
+/// shared `infer_expr_ty` — the same inference codegen's `type_of_expr` uses — so
 /// typeck, codegen, and this pass agree on which operands are type variables.
-/// `ctx` is the program type context (for `infer_expr_ty`).
-///
-/// Soundness note: the bound set is the UNION over every supported op site, so a
-/// `T` used by both `a > b` and `print(a)` gets `{Clone, PartialOrd, Display}`.
-/// A non-generic function (empty `type_params`) returns an empty map and costs
-/// one early-return — the non-generic hot path is unaffected.
-pub fn infer_func_typevar_bounds(
-    f: &Func,
-    ctx: &TyCtx,
-) -> std::collections::BTreeMap<String, std::collections::BTreeSet<TypeVarBound>> {
-    use std::collections::{BTreeMap, BTreeSet};
-    let mut bounds: BTreeMap<String, BTreeSet<TypeVarBound>> = BTreeMap::new();
+/// Transitive bounds from generic calls are added separately by the fixed point.
+fn direct_func_typevar_bounds(f: &Func, ctx: &TyCtx) -> BoundMap {
+    let mut bounds = BoundMap::new();
     if f.type_params.is_empty() {
         return bounds;
     }
@@ -2239,6 +2341,271 @@ pub fn infer_func_typevar_bounds(
     }
     infer_bounds_body(&f.body, &mut locals, ctx, &mut bounds);
     bounds
+}
+
+/// Collect the transitive-propagation EDGES for one generic function `f`: for
+/// every CALL to a generic callee `g` inside `f`'s body where an argument's type
+/// is one of `f`'s own type variables `T` and that argument position binds `g`'s
+/// type parameter `U`, emit `(T, g, U)`. The fixed point in
+/// `infer_func_typevar_bounds` then folds `g`'s bounds on `U` into `T`.
+///
+/// Argument→callee-param mapping reuses the SAME shape as the call-site
+/// unification (`unify_typevar`): a scalar `T` flows into a scalar `U`, and a
+/// container `list[T]` / `set[T]` / `dict[T, _]` / `tuple[T, ..]` flows its
+/// element/key var into the matching position of the callee's declared param.
+/// Mixed/positional-only and `Unknown` args contribute no edge (no type var to
+/// propagate).
+fn collect_prop_edges(f: &Func, ctx: &TyCtx) -> Vec<PropEdge> {
+    if f.type_params.is_empty() {
+        return Vec::new();
+    }
+    let mut locals: HashMap<String, Ty> = HashMap::new();
+    for p in f.params.iter().filter(|p| p.name != "self") {
+        if let Ok(ty) = Ty::from_type_expr_scoped(&p.ty, p.span, &f.type_params) {
+            locals.insert(p.name.clone(), ty);
+        }
+    }
+    let mut edges: Vec<PropEdge> = Vec::new();
+    collect_prop_edges_body(&f.body, &mut locals, ctx, &mut edges);
+    // De-duplicate (a callee called twice yields the same edge).
+    edges.sort();
+    edges.dedup();
+    edges
+}
+
+fn collect_prop_edges_body(
+    body: &[Stmt],
+    locals: &mut HashMap<String, Ty>,
+    ctx: &TyCtx,
+    edges: &mut Vec<PropEdge>,
+) {
+    for s in body {
+        collect_prop_edges_stmt(s, locals, ctx, edges);
+    }
+}
+
+fn collect_prop_edges_stmt(
+    s: &Stmt,
+    locals: &mut HashMap<String, Ty>,
+    ctx: &TyCtx,
+    edges: &mut Vec<PropEdge>,
+) {
+    // Reuse the bounds walk's local-tracking shape so `infer_expr_ty` stays
+    // accurate; we only care about Call expressions, found by recursing on every
+    // sub-expression below.
+    match s {
+        Stmt::Expr(e) | Stmt::Return(Some(e), _) | Stmt::Yield(e, _) => {
+            collect_prop_edges_expr(e, locals, ctx, edges);
+        }
+        Stmt::Assign { target, value, .. } => {
+            collect_prop_edges_expr(value, locals, ctx, edges);
+            let t = infer_expr_ty(value, locals, ctx);
+            locals.insert(target.clone(), t);
+        }
+        Stmt::AugAssign { value, .. } => collect_prop_edges_expr(value, locals, ctx, edges),
+        Stmt::Unpack { targets, value, .. } => {
+            collect_prop_edges_expr(value, locals, ctx, edges);
+            let vt = infer_expr_ty(value, locals, ctx);
+            if let Ty::Tuple(elems) = &vt {
+                for (i, t) in targets.iter().enumerate() {
+                    locals.insert(t.clone(), elems.get(i).cloned().unwrap_or(Ty::Unknown));
+                }
+            } else {
+                for t in targets {
+                    locals.insert(t.clone(), Ty::Unknown);
+                }
+            }
+        }
+        Stmt::Return(None, _) | Stmt::Pass(_) | Stmt::Break(_) | Stmt::Continue(_)
+        | Stmt::Import { .. } => {}
+        Stmt::If { cond, then, elifs, else_, .. } => {
+            collect_prop_edges_expr(cond, locals, ctx, edges);
+            collect_prop_edges_body(then, locals, ctx, edges);
+            for (c, b) in elifs {
+                collect_prop_edges_expr(c, locals, ctx, edges);
+                collect_prop_edges_body(b, locals, ctx, edges);
+            }
+            if let Some(b) = else_ {
+                collect_prop_edges_body(b, locals, ctx, edges);
+            }
+        }
+        Stmt::While { cond, body, .. } => {
+            collect_prop_edges_expr(cond, locals, ctx, edges);
+            collect_prop_edges_body(body, locals, ctx, edges);
+        }
+        Stmt::For { targets, iter, body, .. } => {
+            collect_prop_edges_expr(iter, locals, ctx, edges);
+            let elem = match infer_expr_ty(iter, locals, ctx) {
+                Ty::List(inner) | Ty::Set(inner) => *inner,
+                Ty::Str => Ty::Str,
+                _ => Ty::Unknown,
+            };
+            if targets.len() == 1 {
+                locals.insert(targets[0].clone(), elem);
+            } else if let Ty::Tuple(elems) = &elem {
+                for (i, t) in targets.iter().enumerate() {
+                    locals.insert(t.clone(), elems.get(i).cloned().unwrap_or(Ty::Unknown));
+                }
+            } else {
+                for t in targets {
+                    locals.insert(t.clone(), Ty::Unknown);
+                }
+            }
+            collect_prop_edges_body(body, locals, ctx, edges);
+        }
+        Stmt::Assert { cond, msg, .. } => {
+            collect_prop_edges_expr(cond, locals, ctx, edges);
+            if let Some(m) = msg {
+                collect_prop_edges_expr(m, locals, ctx, edges);
+            }
+        }
+        Stmt::Raise { exc, .. } => {
+            if let Some(e) = exc {
+                collect_prop_edges_expr(e, locals, ctx, edges);
+            }
+        }
+        Stmt::Try { body, handlers, else_, finally_, .. } => {
+            collect_prop_edges_body(body, locals, ctx, edges);
+            for h in handlers {
+                collect_prop_edges_body(&h.body, locals, ctx, edges);
+            }
+            if let Some(b) = else_ {
+                collect_prop_edges_body(b, locals, ctx, edges);
+            }
+            if let Some(b) = finally_ {
+                collect_prop_edges_body(b, locals, ctx, edges);
+            }
+        }
+        Stmt::With { ctx_expr, body, .. } => {
+            collect_prop_edges_expr(ctx_expr, locals, ctx, edges);
+            collect_prop_edges_body(body, locals, ctx, edges);
+        }
+        Stmt::Del { target, .. } => collect_prop_edges_expr(target, locals, ctx, edges),
+        Stmt::Match { subject, arms, .. } => {
+            collect_prop_edges_expr(subject, locals, ctx, edges);
+            for a in arms {
+                if let Some(g) = &a.guard {
+                    collect_prop_edges_expr(g, locals, ctx, edges);
+                }
+                collect_prop_edges_body(&a.body, locals, ctx, edges);
+            }
+        }
+        Stmt::AttrAssign { obj, value, .. } => {
+            collect_prop_edges_expr(obj, locals, ctx, edges);
+            collect_prop_edges_expr(value, locals, ctx, edges);
+        }
+        Stmt::IndexAssign { obj, idx, value, .. } => {
+            collect_prop_edges_expr(obj, locals, ctx, edges);
+            collect_prop_edges_expr(idx, locals, ctx, edges);
+            collect_prop_edges_expr(value, locals, ctx, edges);
+        }
+        Stmt::Func(_) | Stmt::Class(_) => {}
+    }
+}
+
+fn collect_prop_edges_expr(
+    e: &Expr,
+    locals: &HashMap<String, Ty>,
+    ctx: &TyCtx,
+    edges: &mut Vec<PropEdge>,
+) {
+    if let Expr::Call { callee, args, .. } = e {
+        if let Expr::Ident(callee_name, _) = callee.as_ref() {
+            // Only a GENERIC callee can carry bounds to propagate.
+            if let Some(callee_tps) = ctx.generic_funcs.get(callee_name) {
+                if let Some(sig) = ctx.funcs.get(callee_name) {
+                    for (i, arg) in args.iter().enumerate() {
+                        let arg_ty = infer_expr_ty(arg, locals, ctx);
+                        if let Some((_, decl)) = sig.params.get(i) {
+                            // Map the caller's type var(s) inside `arg_ty` to the
+                            // callee's type param(s) at the matching structural
+                            // position of the declared param `decl`.
+                            map_typevar_edges(&arg_ty, decl, callee_name, callee_tps, edges);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Recurse into every sub-expression so a call nested anywhere is found.
+    for sub in expr_children(e) {
+        collect_prop_edges_expr(sub, locals, ctx, edges);
+    }
+}
+
+/// Structurally align a caller argument type `arg` (which may be / contain
+/// `Ty::TypeVar(caller_tv)`) against the callee's declared param type `decl`
+/// (which may be / contain `Ty::TypeVar(callee_tv)`), emitting an edge
+/// `(caller_tv, callee, callee_tv)` for each position where a caller type var
+/// lines up with a callee type param. Mirrors `unify_typevar`'s shape so the
+/// propagation graph matches the actual call-site binding.
+fn map_typevar_edges(
+    arg: &Ty,
+    decl: &Ty,
+    callee: &str,
+    callee_tps: &[String],
+    edges: &mut Vec<PropEdge>,
+) {
+    match (arg, decl) {
+        (Ty::TypeVar(caller_tv), Ty::TypeVar(callee_tv)) if callee_tps.iter().any(|t| t == callee_tv) => {
+            edges.push((caller_tv.clone(), callee.to_string(), callee_tv.clone()));
+        }
+        (Ty::List(a), Ty::List(d)) | (Ty::Set(a), Ty::Set(d)) | (Ty::Option(a), Ty::Option(d)) => {
+            map_typevar_edges(a, d, callee, callee_tps, edges);
+        }
+        (Ty::Dict(ak, av), Ty::Dict(dk, dv)) => {
+            map_typevar_edges(ak, dk, callee, callee_tps, edges);
+            map_typevar_edges(av, dv, callee, callee_tps, edges);
+        }
+        (Ty::Tuple(aa), Ty::Tuple(dd)) if aa.len() == dd.len() => {
+            for (a, d) in aa.iter().zip(dd.iter()) {
+                map_typevar_edges(a, d, callee, callee_tps, edges);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The immediate child expressions of `e` (for the generic-call edge walk). Kept
+/// local and total so `collect_prop_edges_expr` recurses without missing a nest.
+fn expr_children(e: &Expr) -> Vec<&Expr> {
+    match e {
+        Expr::Int(..) | Expr::Float(..) | Expr::Str(..) | Expr::Bool(..)
+        | Expr::None_(_) | Expr::Ident(..) => vec![],
+        Expr::FStr(parts, _) => parts.iter().filter_map(|p| match p {
+            FStrPart::Interp(e, _) => Some(e),
+            FStrPart::Lit(_) => None,
+        }).collect(),
+        Expr::List(es, _) | Expr::Tuple(es, _) | Expr::Set(es, _) => es.iter().collect(),
+        Expr::Dict(pairs, _) => pairs.iter().flat_map(|(k, v)| [k, v]).collect(),
+        Expr::ListComp { elt, iter, cond, .. } | Expr::SetComp { elt, iter, cond, .. } => {
+            let mut v: Vec<&Expr> = vec![elt.as_ref(), iter.as_ref()];
+            if let Some(c) = cond { v.push(c.as_ref()); }
+            v
+        }
+        Expr::DictComp { key, val, iter, cond, .. } => {
+            let mut v: Vec<&Expr> = vec![key.as_ref(), val.as_ref(), iter.as_ref()];
+            if let Some(c) = cond { v.push(c.as_ref()); }
+            v
+        }
+        Expr::Call { callee, args, kwargs, .. } => {
+            let mut v: Vec<&Expr> = vec![callee.as_ref()];
+            v.extend(args.iter());
+            v.extend(kwargs.iter().map(|(_, e)| e));
+            v
+        }
+        Expr::Attr { obj, .. } => vec![obj.as_ref()],
+        Expr::Index { obj, idx, .. } => vec![obj.as_ref(), idx.as_ref()],
+        Expr::Slice { obj, start, stop, step, .. } => {
+            let mut v = vec![obj.as_ref()];
+            for o in [start, stop, step].into_iter().flatten() { v.push(o.as_ref()); }
+            v
+        }
+        Expr::BinOp { lhs, rhs, .. } => vec![lhs.as_ref(), rhs.as_ref()],
+        Expr::UnOp { expr, .. } => vec![expr.as_ref()],
+        Expr::Lambda { body, .. } => vec![body.as_ref()],
+        Expr::IfExp { test, body, orelse, .. } => vec![test.as_ref(), body.as_ref(), orelse.as_ref()],
+    }
 }
 
 /// Record `Hash + Eq` for every type variable that appears as a SET ELEMENT or
@@ -7799,16 +8166,26 @@ def deposit(account: Mut[Account], amt: int) -> None:
         }
         for s in &m.stmts {
             if let Stmt::Func(f) = s {
+                // Lower param/return with the function's own type params in scope
+                // so a generic `f`'s signature carries `Ty::TypeVar` (mirroring the
+                // resolver's scoped lowering — `from_type_expr` alone would treat
+                // `T` as an unknown class and break generic unification in tests).
                 ctx.funcs.insert(f.name.clone(), FuncSig {
                     params: f.params.iter().filter(|p| p.name != "self")
-                        .map(|p| (p.name.clone(), Ty::from_type_expr(&p.ty, p.span).unwrap_or(Ty::Unknown)))
+                        .map(|p| (p.name.clone(), Ty::from_type_expr_scoped(&p.ty, p.span, &f.type_params).unwrap_or(Ty::Unknown)))
                         .collect(),
                     param_defaults: f.params.iter().filter(|p| p.name != "self")
                         .map(|p| p.default.clone()).collect(),
                     param_by_ref: f.params.iter().filter(|p| p.name != "self")
                         .map(|p| p.by_ref).collect(),
-                    ret: Ty::from_type_expr(&f.ret, f.span).unwrap_or(Ty::Unknown),
+                    ret: Ty::from_type_expr_scoped(&f.ret, f.span, &f.type_params).unwrap_or(Ty::Unknown),
                 });
+                // Generics: register the type-param list and (v2) the body so the
+                // transitive-bound fixed point can recurse through generic calls.
+                if !f.type_params.is_empty() {
+                    ctx.generic_funcs.insert(f.name.clone(), f.type_params.clone());
+                    ctx.generic_func_bodies.insert(f.name.clone(), f.clone());
+                }
             }
         }
         ctx
@@ -9130,6 +9507,85 @@ def my_fn() -> float:
             _ => None,
         }).expect("generic func");
         infer_func_typevar_bounds(f, &ctx)
+    }
+
+    /// Infer the (propagated) bound set for the generic function NAMED `name`.
+    fn bounds_of_named_func(src: &str, name: &str) -> std::collections::BTreeMap<
+        String,
+        std::collections::BTreeSet<TypeVarBound>,
+    > {
+        let m = crate::parser::parse(src).expect("parse");
+        let ctx = ctx_from_module(&m);
+        let f = m.stmts.iter().find_map(|s| match s {
+            Stmt::Func(f) if f.name == name => Some(f),
+            _ => None,
+        }).expect("named func");
+        infer_func_typevar_bounds(f, &ctx)
+    }
+
+    #[test]
+    fn transitive_one_hop_propagates_bound() {
+        // `use_it` forwards its `T` into `dedup`, which needs PartialEq.
+        let src = "def dedup[T](a: T, b: T) -> bool:\n    return a == b\n\ndef use_it[T](a: T, b: T) -> bool:\n    return dedup(a, b)\n";
+        let b = bounds_of_named_func(src, "use_it");
+        assert!(b["T"].contains(&TypeVarBound::PartialEq),
+            "use_it.T must inherit PartialEq from dedup, got {:?}", b["T"]);
+    }
+
+    #[test]
+    fn transitive_multi_hop_chain_propagates() {
+        // top -> mid -> base; base needs PartialOrd -> all three carry it.
+        let src = "def base[T](a: T, b: T) -> bool:\n    return a > b\n\ndef mid[T](a: T, b: T) -> bool:\n    return base(a, b)\n\ndef top[T](a: T, b: T) -> bool:\n    return mid(a, b)\n";
+        for name in ["base", "mid", "top"] {
+            let b = bounds_of_named_func(src, name);
+            assert!(b["T"].contains(&TypeVarBound::PartialOrd),
+                "{}.T must carry PartialOrd, got {:?}", name, b["T"]);
+        }
+    }
+
+    #[test]
+    fn transitive_nonbounded_callee_adds_no_bound() {
+        // `wrap` forwards into the identity `ident`, which needs only Clone.
+        let src = "def ident[T](x: T) -> T:\n    return x\n\ndef wrap[T](x: T) -> T:\n    return ident(x)\n";
+        let b = bounds_of_named_func(src, "wrap");
+        assert_eq!(b["T"].iter().copied().collect::<Vec<_>>(), vec![TypeVarBound::Clone],
+            "wrap.T must stay Clone-only, got {:?}", b["T"]);
+    }
+
+    #[test]
+    fn transitive_self_recursion_terminates() {
+        // A generic recursing on itself + a leaf `==` must converge to PartialEq.
+        let src = "def rec[T](a: T, b: T, n: int) -> bool:\n    if n <= 0:\n        return a == b\n    return rec(a, b, n - 1)\n";
+        let b = bounds_of_named_func(src, "rec");
+        assert!(b["T"].contains(&TypeVarBound::PartialEq));
+        assert!(b["T"].contains(&TypeVarBound::Clone));
+    }
+
+    #[test]
+    fn transitive_mutual_recursion_converges() {
+        // ping <-> pong cycle; the `==` in ping must propagate to BOTH.
+        let src = "def ping[T](a: T, b: T, n: int) -> bool:\n    if n <= 0:\n        return a == b\n    return pong(a, b, n - 1)\n\ndef pong[T](a: T, b: T, n: int) -> bool:\n    return ping(a, b, n - 1)\n";
+        assert!(bounds_of_named_func(src, "ping")["T"].contains(&TypeVarBound::PartialEq));
+        assert!(bounds_of_named_func(src, "pong")["T"].contains(&TypeVarBound::PartialEq));
+    }
+
+    #[test]
+    fn transitive_container_element_propagation() {
+        // `count_unique` passes list[T] into `to_set` (needs Hash+Eq on element).
+        let src = "def to_set[U](xs: list[U]) -> set[U]:\n    out: set[U] = set()\n    for x in xs:\n        out.add(x)\n    return out\n\ndef count_unique[T](xs: list[T]) -> int:\n    return len(to_set(xs))\n";
+        let b = bounds_of_named_func(src, "count_unique");
+        assert!(b["T"].contains(&TypeVarBound::Hash), "got {:?}", b["T"]);
+        assert!(b["T"].contains(&TypeVarBound::Eq), "got {:?}", b["T"]);
+    }
+
+    #[test]
+    fn transitive_repro_check_and_build_consistent() {
+        // The lead's repro: BOTH check AND the inferred clause must now agree
+        // (use_it carries PartialEq), so the program is build-sound.
+        let src = "def dedup[T](a: T, b: T) -> bool:\n    return a == b\n\ndef use_it[T](a: T, b: T) -> bool:\n    return dedup(a, b)\n\ndef main() -> None:\n    print(use_it(1, 1))\n";
+        assert!(check_src(src).is_ok(), "repro must still typecheck");
+        let b = bounds_of_named_func(src, "use_it");
+        assert!(b["T"].contains(&TypeVarBound::PartialEq));
     }
 
     #[test]

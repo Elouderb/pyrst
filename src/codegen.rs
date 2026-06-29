@@ -1402,19 +1402,38 @@ impl<'a> Codegen<'a> {
         } else {
             f.name.clone()
         };
-        // Generics v1 (PEP 695): a parametric generic function emits a Rust
-        // generic-parameter clause `<T: Clone, U: Clone>` right after the name.
-        // The `Clone` bound covers pyrst's value-semantics clone-on-use (a
-        // type-var value is non-Copy — `is_copy(TypeVar)` is false — so it is
-        // cloned wherever a Copy value would be used directly). A non-generic
-        // function has an empty `type_params` and emits no clause. Methods are
-        // never generic in v1 (parser-rejected), so this only matters for free
-        // functions, but the code is uniform.
+        // Generics v2 (PEP 695): a parametric generic function emits a Rust
+        // generic-parameter clause `<T: Clone + PartialOrd, U: Clone + Display>`
+        // right after the name. The bound set per type variable is the UNION of:
+        //   - `Clone` (always — pyrst value-semantics clone-on-use; a type-var
+        //     value is non-Copy, `is_copy(TypeVar)` is false, so it is cloned
+        //     wherever a Copy value would be used directly), plus
+        //   - every bound INFERRED from the body by `infer_func_typevar_bounds`
+        //     (comparison -> PartialOrd, equality -> PartialEq, arithmetic ->
+        //     Add/Sub/Mul/Div/Rem<Output=T>, Display contexts -> Display, set
+        //     element / dict key -> Hash + Eq).
+        // The same inference drives the typeck op-sites that now ACCEPT these ops
+        // on a bare `T`, so the emitted bounds always cover exactly the ops the
+        // body performs. A non-generic function has an empty `type_params` and
+        // emits no clause. Methods are never generic in v1 (parser-rejected), so
+        // this only matters for free functions, but the code is uniform.
         let generics = if f.type_params.is_empty() {
             String::new()
         } else {
+            let inferred = crate::typeck::infer_func_typevar_bounds(f, self.ctx);
             let bounds = f.type_params.iter()
-                .map(|t| format!("{}: Clone", t))
+                .map(|t| {
+                    // Preserve the declared type-param ORDER for the clause; within
+                    // each var the bounds emit in `TypeVarBound`'s canonical order
+                    // (Clone first) via the BTreeSet iteration.
+                    let mut set = inferred.get(t).cloned().unwrap_or_default();
+                    set.insert(crate::typeck::TypeVarBound::Clone);
+                    let parts = set.iter()
+                        .map(|b| b.rust_bound(t))
+                        .collect::<Vec<_>>()
+                        .join(" + ");
+                    format!("{}: {}", t, parts)
+                })
                 .collect::<Vec<_>>()
                 .join(", ");
             format!("<{}>", bounds)
@@ -5616,7 +5635,11 @@ impl<'a> Codegen<'a> {
                     }
                 }
 
-                // Handle division - always returns float in Python
+                // Handle division - always returns float in Python.
+                // (Generics v2 does NOT admit `/` on a bare `T`: pyrst `/` is true
+                // float division, which Rust's `Div` does not reproduce for an
+                // integer `T` — so typeck rejects `T / T` and only concrete
+                // operands ever reach here.)
                 if *op == BinOp::Div {
                     let l = self.emit_expr(lhs)?;
                     let r = self.emit_expr(rhs)?;

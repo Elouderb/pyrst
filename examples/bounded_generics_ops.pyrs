@@ -1,0 +1,27 @@
+# Generics v2: broader coverage of the inferred op -> bound mappings.
+#   `-` -> Sub<Output=T>, `*` -> Mul<Output=T>
+#   `==` -> PartialEq (result bool),  f-string / str() -> Display
+# (`/` `%` `//` `**` stay rejected on a bare T — Python vs Rust semantics differ.)
+def diff[T](a: T, b: T) -> T:
+    return a - b                  # Sub<Output = T>
+
+def prod[T](a: T, b: T) -> T:
+    return a * b                  # Mul<Output = T>
+
+def same[T](a: T, b: T) -> bool:
+    return a == b                 # PartialEq, result bool
+
+def label[T](x: T) -> str:
+    return f"[{x}]"               # f-string Display
+
+def describe[T](x: T) -> str:
+    return str(x)                 # str() Display
+
+def main() -> None:
+    print(diff(10, 3))            # 7
+    print(prod(4, 5))             # 20
+    print(same(2, 2))             # True
+    print(same(2, 3))             # False
+    print(label(99))              # [99]
+    print(label("hi"))            # [hi]
+    print(describe(3.5))          # 3.5

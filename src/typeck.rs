@@ -2089,13 +2089,508 @@ fn reject_typevar_op(ty: &Ty, op_desc: &str, span: Span) -> Result<()> {
             span,
             msg: format!(
                 "cannot {} a value of generic type `{}` \
-                 (operations on a type parameter require trait bounds, \
-                 which are not supported in generics v1)",
+                 (this operation on a type parameter is not supported — \
+                 generics v2 infers bounds only for comparison, equality, \
+                 arithmetic, Display, and Hash)",
                 op_desc, name
             ),
         });
     }
     Ok(())
+}
+
+/// Generics v2: a Rust trait bound INFERRED from an operation performed on a
+/// bare type variable inside a generic function body. The SUPPORTED subset of
+/// ops on a `T` no longer rejects (v1) but instead records the trait the
+/// generated Rust needs, which codegen emits in the generic clause
+/// (`fn f<T: Clone + PartialOrd>(..)`). The set is the union of every bound
+/// inferred for that `T` across the whole body, plus an always-present `Clone`
+/// (pyrst value semantics clone-on-use). `Ord`-style variants emit `<Output =
+/// T>` where the arithmetic trait requires it.
+///
+/// The variant ORDER is the canonical emission order (derive of `Ord` is
+/// intentional) so the generated clause is deterministic and `Clone` leads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TypeVarBound {
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Add,
+    Sub,
+    Mul,
+    Display,
+}
+
+impl TypeVarBound {
+    /// The Rust trait-bound text for this inferred bound, given the type-var
+    /// name `t` (needed for the `<Output = T>` on arithmetic traits so the
+    /// result of `T + T` is `T`, matching pyrst's same-type arithmetic rule).
+    pub fn rust_bound(self, t: &str) -> String {
+        match self {
+            TypeVarBound::Clone => "Clone".to_string(),
+            TypeVarBound::PartialEq => "PartialEq".to_string(),
+            TypeVarBound::Eq => "std::cmp::Eq".to_string(),
+            TypeVarBound::Hash => "std::hash::Hash".to_string(),
+            TypeVarBound::PartialOrd => "PartialOrd".to_string(),
+            TypeVarBound::Add => format!("std::ops::Add<Output = {}>", t),
+            TypeVarBound::Sub => format!("std::ops::Sub<Output = {}>", t),
+            TypeVarBound::Mul => format!("std::ops::Mul<Output = {}>", t),
+            TypeVarBound::Display => "std::fmt::Display".to_string(),
+        }
+    }
+}
+
+/// Generics v2: the SINGLE SOURCE OF TRUTH mapping a binary operator on two
+/// values of the SAME type variable (`T op T`) to the Rust trait bound it
+/// requires — or `None` when the op on a bare `T` is NOT supported in v2 and
+/// must stay an honest `reject_typevar_op` rejection.
+///
+/// Supported (op -> bound, result type computed by the BinOp arm):
+///   - `< > <= >=`     -> `PartialOrd`  (result `bool`)
+///   - `== !=`         -> `PartialEq`   (result `bool`)
+///   - `+ - * / %`     -> `Add`/`Sub`/`Mul`/`Div`/`Rem` (`<Output = T>`, result `T`)
+/// STILL REJECTED on a bare `T` (return `None`): `in`/`not in` (membership),
+/// `is`/`is not`, boolean `and`/`or`, bitwise/shift, `**` (Pow), `//` (FloorDiv)
+/// — no clean single-trait mapping with a known result type for an opaque `T`.
+///
+/// BOTH typeck (to decide allow-vs-reject and type the result) and codegen (to
+/// build the clause) consult this function, so the "what's supported" decision
+/// can never drift between the two layers.
+pub fn binop_typevar_bound(op: BinOp) -> Option<TypeVarBound> {
+    match op {
+        BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => Some(TypeVarBound::PartialOrd),
+        BinOp::Eq | BinOp::Ne => Some(TypeVarBound::PartialEq),
+        // Arithmetic `+ - *` map FAITHFULLY: Rust's `Add`/`Sub`/`Mul` on the
+        // numeric types pyrst supports compute the same result as Python, and
+        // `<Output = T>` makes `T op T -> T` exactly the same-type rule. The
+        // result is `T`.
+        BinOp::Add => Some(TypeVarBound::Add),
+        BinOp::Sub => Some(TypeVarBound::Sub),
+        BinOp::Mul => Some(TypeVarBound::Mul),
+        // INTENTIONALLY NOT MAPPED — these stay rejected on a bare `T` because no
+        // single Rust trait reproduces pyrst's Python semantics for an opaque `T`:
+        //   - `/`  : pyrst `/` is TRUE division (always Float, e.g. 5/2 == 2.5);
+        //            Rust `Div` on an integer `T` truncates (5/2 == 2). A
+        //            `Div<Output = T>` bound would silently miscompile integer
+        //            division, so `/` on a bare `T` is NOT supported in v2.
+        //   - `%`  : pyrst `%` is DIVISOR-signed (Python), Rust `Rem` is
+        //            dividend-signed — they disagree for negative operands, so
+        //            `Rem` is not a faithful lowering of a bare `T % T`.
+        //   - `//` / `**` : lowered via int-specific helpers (`__py_floordiv` /
+        //            `__py_ipow`) with no clean single-trait generic form.
+        // Mixed `T op concrete` (e.g. `x + 1`) also stays rejected — only the
+        // same-`T` shape is admitted.
+        BinOp::Div | BinOp::Mod | BinOp::FloorDiv | BinOp::Pow => None,
+        // Everything else on a bare `T` stays rejected in v2.
+        _ => None,
+    }
+}
+
+/// Generics v2: infer the per-TYPE-VARIABLE Rust trait-bound set for one generic
+/// function by walking its body and signature, mirroring EXACTLY the SUPPORTED
+/// ops that the typeck op-sites now ALLOW on a bare `T` (and never anything the
+/// op-sites still reject). The returned map is `TypeVar -> {bounds}`; every
+/// declared type parameter is present with at least `Clone` (pyrst value
+/// semantics). Codegen reads this map to emit the generic clause
+/// `fn f<T: Clone + PartialOrd, ...>(..)`.
+///
+/// This is a SELF-CONTAINED walk (it does not thread `FuncEnv`): it seeds a
+/// `locals: name -> Ty` map from the params (scoped-lowered with `f.type_params`,
+/// so a `T` param is `Ty::TypeVar("T")`), then uses the shared `infer_expr_ty`
+/// to type each operand — the same inference codegen's `type_of_expr` uses — so
+/// typeck, codegen, and this pass agree on which operands are type variables.
+/// `ctx` is the program type context (for `infer_expr_ty`).
+///
+/// Soundness note: the bound set is the UNION over every supported op site, so a
+/// `T` used by both `a > b` and `print(a)` gets `{Clone, PartialOrd, Display}`.
+/// A non-generic function (empty `type_params`) returns an empty map and costs
+/// one early-return — the non-generic hot path is unaffected.
+pub fn infer_func_typevar_bounds(
+    f: &Func,
+    ctx: &TyCtx,
+) -> std::collections::BTreeMap<String, std::collections::BTreeSet<TypeVarBound>> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut bounds: BTreeMap<String, BTreeSet<TypeVarBound>> = BTreeMap::new();
+    if f.type_params.is_empty() {
+        return bounds;
+    }
+    // Every declared type parameter carries at least `Clone` (clone-on-use).
+    for tp in &f.type_params {
+        bounds.entry(tp.clone()).or_default().insert(TypeVarBound::Clone);
+    }
+    // Seed locals from the (scoped-lowered) param types. A param annotation that
+    // FAILS to lower (it cannot for a checked program — typeck already lowered
+    // it) is skipped defensively rather than panicking.
+    let mut locals: HashMap<String, Ty> = HashMap::new();
+    for p in f.params.iter().filter(|p| p.name != "self") {
+        if let Ok(ty) = Ty::from_type_expr_scoped(&p.ty, p.span, &f.type_params) {
+            // A `set[T]` / `dict[T, _]` param annotation needs `Hash + Eq` on `T`
+            // (the container is `HashSet<T>` / `HashMap<T, _>`).
+            record_hashable_typevars(&ty, &mut bounds);
+            locals.insert(p.name.clone(), ty);
+        }
+    }
+    // A `set[T]` / `dict[T, _]` RETURN annotation needs `Hash + Eq` on `T` too
+    // (e.g. the dedup-into-`set[T]` case).
+    if let Ok(ret) = Ty::from_type_expr_scoped(&f.ret, f.span, &f.type_params) {
+        record_hashable_typevars(&ret, &mut bounds);
+    }
+    infer_bounds_body(&f.body, &mut locals, ctx, &mut bounds);
+    bounds
+}
+
+/// Record `Hash + Eq` for every type variable that appears as a SET ELEMENT or
+/// DICT KEY anywhere inside `ty` (the only hashable positions). A `dict` VALUE is
+/// not hashable, so only its key is scanned; nested containers recurse.
+fn record_hashable_typevars(
+    ty: &Ty,
+    bounds: &mut std::collections::BTreeMap<String, std::collections::BTreeSet<TypeVarBound>>,
+) {
+    match ty {
+        Ty::Set(elem) => {
+            if let Ty::TypeVar(n) = elem.as_ref() {
+                add_bound(bounds, n, TypeVarBound::Hash);
+                add_bound(bounds, n, TypeVarBound::Eq);
+            }
+            record_hashable_typevars(elem, bounds);
+        }
+        Ty::Dict(k, v) => {
+            if let Ty::TypeVar(n) = k.as_ref() {
+                add_bound(bounds, n, TypeVarBound::Hash);
+                add_bound(bounds, n, TypeVarBound::Eq);
+            }
+            record_hashable_typevars(k, bounds);
+            record_hashable_typevars(v, bounds);
+        }
+        Ty::List(inner) | Ty::Option(inner) => record_hashable_typevars(inner, bounds),
+        Ty::Tuple(elems) => elems.iter().for_each(|e| record_hashable_typevars(e, bounds)),
+        _ => {}
+    }
+}
+
+/// Add `bound` to `name`'s set (always also keeping `Clone`, which the seed
+/// already inserted). Helper to keep the call sites terse.
+fn add_bound(
+    bounds: &mut std::collections::BTreeMap<String, std::collections::BTreeSet<TypeVarBound>>,
+    name: &str,
+    bound: TypeVarBound,
+) {
+    let e = bounds.entry(name.to_string()).or_default();
+    e.insert(TypeVarBound::Clone);
+    e.insert(bound);
+}
+
+/// Walk a statement block, updating `locals` (so `infer_expr_ty` stays accurate
+/// for later statements) and collecting type-var bounds from every expression.
+fn infer_bounds_body(
+    body: &[Stmt],
+    locals: &mut HashMap<String, Ty>,
+    ctx: &TyCtx,
+    bounds: &mut std::collections::BTreeMap<String, std::collections::BTreeSet<TypeVarBound>>,
+) {
+    for s in body {
+        infer_bounds_stmt(s, locals, ctx, bounds);
+    }
+}
+
+fn infer_bounds_stmt(
+    s: &Stmt,
+    locals: &mut HashMap<String, Ty>,
+    ctx: &TyCtx,
+    bounds: &mut std::collections::BTreeMap<String, std::collections::BTreeSet<TypeVarBound>>,
+) {
+    match s {
+        Stmt::Expr(e) | Stmt::Return(Some(e), _) | Stmt::Yield(e, _) => {
+            infer_bounds_expr(e, locals, ctx, bounds);
+        }
+        Stmt::Assign { target, value, .. } => {
+            infer_bounds_expr(value, locals, ctx, bounds);
+            let t = infer_expr_ty(value, locals, ctx);
+            locals.insert(target.clone(), t);
+        }
+        Stmt::AugAssign { value, .. } => {
+            // `x += y` on a bare `T` is STILL REJECTED by typeck (aug-assign is
+            // not in the v2 supported set), so an aug-assign never contributes a
+            // type-var bound; only the RHS sub-expressions are scanned for nested
+            // supported ops.
+            infer_bounds_expr(value, locals, ctx, bounds);
+        }
+        Stmt::Unpack { targets, value, .. } => {
+            infer_bounds_expr(value, locals, ctx, bounds);
+            let vt = infer_expr_ty(value, locals, ctx);
+            if let Ty::Tuple(elems) = &vt {
+                for (i, t) in targets.iter().enumerate() {
+                    locals.insert(t.clone(), elems.get(i).cloned().unwrap_or(Ty::Unknown));
+                }
+            } else {
+                for t in targets {
+                    locals.insert(t.clone(), Ty::Unknown);
+                }
+            }
+        }
+        Stmt::Return(None, _) | Stmt::Pass(_) | Stmt::Break(_) | Stmt::Continue(_)
+        | Stmt::Import { .. } => {}
+        Stmt::If { cond, then, elifs, else_, .. } => {
+            infer_bounds_expr(cond, locals, ctx, bounds);
+            infer_bounds_body(then, locals, ctx, bounds);
+            for (c, b) in elifs {
+                infer_bounds_expr(c, locals, ctx, bounds);
+                infer_bounds_body(b, locals, ctx, bounds);
+            }
+            if let Some(b) = else_ {
+                infer_bounds_body(b, locals, ctx, bounds);
+            }
+        }
+        Stmt::While { cond, body, .. } => {
+            infer_bounds_expr(cond, locals, ctx, bounds);
+            infer_bounds_body(body, locals, ctx, bounds);
+        }
+        Stmt::For { targets, iter, body, .. } => {
+            infer_bounds_expr(iter, locals, ctx, bounds);
+            // Bind loop targets to the element type so a `print(item)` of a
+            // type-var element infers Display. Iterating a bare `T` is rejected
+            // by typeck, so the iterable is always a concrete container here.
+            let elem = match infer_expr_ty(iter, locals, ctx) {
+                Ty::List(inner) | Ty::Set(inner) => *inner,
+                Ty::Str => Ty::Str,
+                _ => Ty::Unknown,
+            };
+            if targets.len() == 1 {
+                locals.insert(targets[0].clone(), elem);
+            } else if let Ty::Tuple(elems) = &elem {
+                for (i, t) in targets.iter().enumerate() {
+                    locals.insert(t.clone(), elems.get(i).cloned().unwrap_or(Ty::Unknown));
+                }
+            } else {
+                for t in targets {
+                    locals.insert(t.clone(), Ty::Unknown);
+                }
+            }
+            infer_bounds_body(body, locals, ctx, bounds);
+        }
+        Stmt::Assert { cond, msg, .. } => {
+            infer_bounds_expr(cond, locals, ctx, bounds);
+            if let Some(m) = msg {
+                infer_bounds_expr(m, locals, ctx, bounds);
+            }
+        }
+        Stmt::Raise { exc, .. } => {
+            if let Some(e) = exc {
+                infer_bounds_expr(e, locals, ctx, bounds);
+            }
+        }
+        Stmt::Try { body, handlers, else_, finally_, .. } => {
+            infer_bounds_body(body, locals, ctx, bounds);
+            for h in handlers {
+                infer_bounds_body(&h.body, locals, ctx, bounds);
+            }
+            if let Some(b) = else_ {
+                infer_bounds_body(b, locals, ctx, bounds);
+            }
+            if let Some(b) = finally_ {
+                infer_bounds_body(b, locals, ctx, bounds);
+            }
+        }
+        Stmt::With { ctx_expr, body, .. } => {
+            infer_bounds_expr(ctx_expr, locals, ctx, bounds);
+            infer_bounds_body(body, locals, ctx, bounds);
+        }
+        Stmt::Del { target, .. } => infer_bounds_expr(target, locals, ctx, bounds),
+        Stmt::Match { subject, arms, .. } => {
+            infer_bounds_expr(subject, locals, ctx, bounds);
+            for a in arms {
+                if let Some(g) = &a.guard {
+                    infer_bounds_expr(g, locals, ctx, bounds);
+                }
+                infer_bounds_body(&a.body, locals, ctx, bounds);
+            }
+        }
+        Stmt::AttrAssign { obj, value, .. } => {
+            infer_bounds_expr(obj, locals, ctx, bounds);
+            infer_bounds_expr(value, locals, ctx, bounds);
+        }
+        Stmt::IndexAssign { obj, idx, value, .. } => {
+            infer_bounds_expr(obj, locals, ctx, bounds);
+            infer_bounds_expr(idx, locals, ctx, bounds);
+            infer_bounds_expr(value, locals, ctx, bounds);
+        }
+        // A nested `def`/`class` is its own generic scope (nested generic defs are
+        // parser-rejected, and a nested non-generic def cannot reference the
+        // outer `T` as a bound op since typeck scopes type params per function);
+        // no outer-`T` bound flows out of it.
+        Stmt::Func(_) | Stmt::Class(_) => {}
+    }
+}
+
+/// Collect type-var bounds from one expression. Each arm mirrors a typeck op-site
+/// that NOW SUPPORTS a bare `T`: BinOp (`binop_typevar_bound`), Display contexts
+/// (`print`/`str`/`repr`/`ascii` + f-strings), and hashable positions (set/dict
+/// literals + comprehensions). Sub-expressions always recurse so a supported op
+/// nested anywhere (e.g. `print(a + b)`) is found.
+fn infer_bounds_expr(
+    e: &Expr,
+    locals: &HashMap<String, Ty>,
+    ctx: &TyCtx,
+    bounds: &mut std::collections::BTreeMap<String, std::collections::BTreeSet<TypeVarBound>>,
+) {
+    match e {
+        Expr::BinOp { op, lhs, rhs, .. } => {
+            // `T op T` (same variable) with a mapped bound -> record it. Anything
+            // else with a type-var operand is rejected by typeck and never reaches
+            // a successful build, so recording nothing for it is correct.
+            let lt = infer_expr_ty(lhs, locals, ctx);
+            let rt = infer_expr_ty(rhs, locals, ctx);
+            if let (Ty::TypeVar(a), Ty::TypeVar(b)) = (&lt, &rt) {
+                if a == b {
+                    if let Some(bound) = binop_typevar_bound(*op) {
+                        add_bound(bounds, a, bound);
+                    }
+                }
+            }
+            infer_bounds_expr(lhs, locals, ctx, bounds);
+            infer_bounds_expr(rhs, locals, ctx, bounds);
+        }
+        Expr::FStr(parts, _) => {
+            for part in parts {
+                if let FStrPart::Interp(expr, _) = part {
+                    if let Ty::TypeVar(n) = infer_expr_ty(expr, locals, ctx) {
+                        add_bound(bounds, &n, TypeVarBound::Display);
+                    }
+                    infer_bounds_expr(expr, locals, ctx, bounds);
+                }
+            }
+        }
+        Expr::Call { callee, args, kwargs, .. } => {
+            // `print`/`str`/`repr`/`ascii` of a bare `T` -> Display.
+            if let Expr::Ident(n, _) = callee.as_ref() {
+                if matches!(n.as_str(), "print" | "str" | "repr" | "ascii") {
+                    for a in args {
+                        if let Ty::TypeVar(tn) = infer_expr_ty(a, locals, ctx) {
+                            add_bound(bounds, &tn, TypeVarBound::Display);
+                        }
+                    }
+                }
+            }
+            infer_bounds_expr(callee, locals, ctx, bounds);
+            for a in args {
+                infer_bounds_expr(a, locals, ctx, bounds);
+            }
+            for (_, v) in kwargs {
+                infer_bounds_expr(v, locals, ctx, bounds);
+            }
+        }
+        Expr::Set(elems, _) => {
+            for el in elems {
+                if let Ty::TypeVar(n) = infer_expr_ty(el, locals, ctx) {
+                    add_bound(bounds, &n, TypeVarBound::Hash);
+                    add_bound(bounds, &n, TypeVarBound::Eq);
+                }
+                infer_bounds_expr(el, locals, ctx, bounds);
+            }
+        }
+        Expr::Dict(pairs, _) => {
+            for (k, v) in pairs {
+                if let Ty::TypeVar(n) = infer_expr_ty(k, locals, ctx) {
+                    add_bound(bounds, &n, TypeVarBound::Hash);
+                    add_bound(bounds, &n, TypeVarBound::Eq);
+                }
+                infer_bounds_expr(k, locals, ctx, bounds);
+                infer_bounds_expr(v, locals, ctx, bounds);
+            }
+        }
+        Expr::SetComp { elt, targets, iter, cond, .. } => {
+            // Bind comprehension targets to the iterable element type so an `elt`
+            // referencing a type-var element is detected; then the produced
+            // element (if a type var) needs Hash + Eq for the `HashSet<T>`.
+            let mut inner = locals.clone();
+            bind_comp_targets_for_bounds(targets, iter, &mut inner, ctx);
+            if let Ty::TypeVar(n) = infer_expr_ty(elt, &inner, ctx) {
+                add_bound(bounds, &n, TypeVarBound::Hash);
+                add_bound(bounds, &n, TypeVarBound::Eq);
+            }
+            infer_bounds_expr(iter, locals, ctx, bounds);
+            infer_bounds_expr(elt, &inner, ctx, bounds);
+            if let Some(c) = cond {
+                infer_bounds_expr(c, &inner, ctx, bounds);
+            }
+        }
+        Expr::DictComp { key, val, targets, iter, cond, .. } => {
+            let mut inner = locals.clone();
+            bind_comp_targets_for_bounds(targets, iter, &mut inner, ctx);
+            if let Ty::TypeVar(n) = infer_expr_ty(key, &inner, ctx) {
+                add_bound(bounds, &n, TypeVarBound::Hash);
+                add_bound(bounds, &n, TypeVarBound::Eq);
+            }
+            infer_bounds_expr(iter, locals, ctx, bounds);
+            infer_bounds_expr(key, &inner, ctx, bounds);
+            infer_bounds_expr(val, &inner, ctx, bounds);
+            if let Some(c) = cond {
+                infer_bounds_expr(c, &inner, ctx, bounds);
+            }
+        }
+        Expr::ListComp { elt, targets, iter, cond, .. } => {
+            let mut inner = locals.clone();
+            bind_comp_targets_for_bounds(targets, iter, &mut inner, ctx);
+            infer_bounds_expr(iter, locals, ctx, bounds);
+            infer_bounds_expr(elt, &inner, ctx, bounds);
+            if let Some(c) = cond {
+                infer_bounds_expr(c, &inner, ctx, bounds);
+            }
+        }
+        Expr::UnOp { expr, .. } => infer_bounds_expr(expr, locals, ctx, bounds),
+        Expr::List(elems, _) | Expr::Tuple(elems, _) => {
+            elems.iter().for_each(|e| infer_bounds_expr(e, locals, ctx, bounds));
+        }
+        Expr::Attr { obj, .. } => infer_bounds_expr(obj, locals, ctx, bounds),
+        Expr::Index { obj, idx, .. } => {
+            infer_bounds_expr(obj, locals, ctx, bounds);
+            infer_bounds_expr(idx, locals, ctx, bounds);
+        }
+        Expr::Slice { obj, start, stop, step, .. } => {
+            infer_bounds_expr(obj, locals, ctx, bounds);
+            for o in [start, stop, step].into_iter().flatten() {
+                infer_bounds_expr(o, locals, ctx, bounds);
+            }
+        }
+        Expr::IfExp { test, body, orelse, .. } => {
+            infer_bounds_expr(test, locals, ctx, bounds);
+            infer_bounds_expr(body, locals, ctx, bounds);
+            infer_bounds_expr(orelse, locals, ctx, bounds);
+        }
+        Expr::Lambda { body, .. } => infer_bounds_expr(body, locals, ctx, bounds),
+        // Leaves carry no nested op.
+        Expr::Int(..) | Expr::Float(..) | Expr::Str(..) | Expr::Bool(..)
+        | Expr::None_(_) | Expr::Ident(..) => {}
+    }
+}
+
+/// Bind comprehension loop targets to the iterable's element type for the
+/// bound-inference walk (mirror of the typeck `bind_comp_targets`, kept local so
+/// the bounds pass stays self-contained).
+fn bind_comp_targets_for_bounds(
+    targets: &[String],
+    iter: &Expr,
+    locals: &mut HashMap<String, Ty>,
+    ctx: &TyCtx,
+) {
+    let elem = match infer_expr_ty(iter, locals, ctx) {
+        Ty::List(inner) | Ty::Set(inner) => *inner,
+        Ty::Str => Ty::Str,
+        _ => Ty::Unknown,
+    };
+    if targets.len() == 1 {
+        locals.insert(targets[0].clone(), elem);
+    } else if let Ty::Tuple(elems) = &elem {
+        for (i, t) in targets.iter().enumerate() {
+            locals.insert(t.clone(), elems.get(i).cloned().unwrap_or(Ty::Unknown));
+        }
+    } else {
+        for t in targets {
+            locals.insert(t.clone(), Ty::Unknown);
+        }
+    }
 }
 
 /// Generics v1: whether a `match` arm pattern DISCRIMINATES — i.e. it compares the
@@ -2241,24 +2736,14 @@ fn require_hashable(ty: &Ty, span: Span, position: &str) -> Result<()> {
             ),
         });
     }
-    // Generics v1: a bare type variable is OPAQUE — it carries no `Hash`/`Eq`
-    // bound (v1 emits only `T: Clone`), so a `set[T]` / `dict[T, _]` element or
-    // key, a `{a, b}` set literal of type-var values, or a `{k: v}` dict whose
-    // KEY is a type var would compile to an uninstantiable `HashSet<T>` /
-    // `HashMap<T, _>` (E0277). Reject it honestly here so all six hashable-element
-    // call sites (set/dict literals, set/dict annotations, set/dict
-    // comprehensions) are covered uniformly at `check`.
-    if let Ty::TypeVar(name) = ty {
-        return Err(Error::Type {
-            span,
-            msg: format!(
-                "{} type must be hashable; a value of generic type `{}` is not \
-                 supported here (a type parameter has no Hash/Eq bound in generics \
-                 v1, so HashSet<{}>/HashMap<{}, _> won't compile)",
-                position, name, name, name
-            ),
-        });
-    }
+    // Generics v2: a bare type variable in a hashable position (`set[T]` /
+    // `dict[T, _]` element or key, a `{a, b}` set literal of type-var values, or
+    // a `{k: v}` dict whose KEY is a type var) is now LEGAL — it INFERS a
+    // `Hash + Eq` bound on `T` (collected by `infer_func_typevar_bounds`,
+    // emitted in the generic clause), so the generated `HashSet<T>` /
+    // `HashMap<T, _>` is instantiable. No rejection here; the bound inference
+    // covers all six hashable-element sites (set/dict literals, set/dict
+    // annotations, set/dict comprehensions).
     Ok(())
 }
 
@@ -4057,17 +4542,16 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
         Expr::Int(_, _) => Ty::Int,
         Expr::Float(_, _) => Ty::Float,
         Expr::Str(_, _) => Ty::Str,
-        Expr::FStr(parts, span) => {
+        Expr::FStr(parts, _span) => {
             // Visit each interpolation: an f-string FORMATS each `{expr}` via the
-            // value's `Display`, so a bare type variable (`f"{x}"` where `x: T`)
-            // would lower to an E0277 in the generated crate. Reject it honestly
-            // here — the same restriction as `print`/`str` (a generic value cannot
-            // be formatted without a bound). Checking the sub-exprs also surfaces
-            // any of their own errors, which the previous `=> Ty::Str` arm skipped.
+            // value's `Display`. Generics v2: a bare type variable (`f"{x}"` where
+            // `x: T`) is now LEGAL — it infers a `Display` bound on `T` (collected
+            // by `infer_func_typevar_bounds`, emitted in the generic clause), so
+            // the generated `format!("{}", x)` is well-typed. Checking the
+            // sub-exprs still surfaces any of THEIR own errors.
             for part in parts {
                 if let FStrPart::Interp(expr, _) = part {
-                    let t = check_expr(expr, env)?;
-                    reject_typevar_op(&t, "format (in an f-string)", *span)?;
+                    check_expr(expr, env)?;
                 }
             }
             Ty::Str
@@ -4511,22 +4995,22 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                                 });
                             }
                             let arg_ty = check_expr(a, env)?;
-                            // Generics v1: a builtin that uses the SHAPE of its
-                            // argument cannot accept a bare type variable, since
-                            // the v1 `T: Clone` bound provides none of the needed
-                            // traits. Two families:
-                            //  - FORMAT (`print`/`str`/`repr`/`ascii`) needs
-                            //    Display/Debug;
+                            // A builtin that uses the SHAPE of its argument cannot
+                            // accept a bare type variable from the `T: Clone` bound
+                            // alone. Two families differ in v2:
+                            //  - FORMAT (`print`/`str`/`repr`/`ascii`): generics v2
+                            //    INFERS a `Display` bound on `T` (collected by
+                            //    `infer_func_typevar_bounds`), so a bare `T` is now
+                            //    LEGAL here — no rejection.
                             //  - SHAPE-CONSUMING (`len`/`sum`/`sorted`/`reversed`/
                             //    `any`/`all`/`list`/`tuple`/`set`/`dict`/
-                            //    `enumerate`/`zip`/`reversed`) iterate/index/sum the
-                            //    argument (IntoIterator / Add / etc.).
+                            //    `enumerate`/`zip`) iterate/index/sum the argument
+                            //    (IntoIterator / Add / etc.) — beyond v2, so a bare
+                            //    `T` STAYS an honest rejection.
                             // (`first([...])` etc. are fine: their RESULT is
                             // concrete after unification; only a BARE `T` value
                             // reaches here as `Ty::TypeVar`.)
-                            if matches!(name.as_str(), "print" | "str" | "repr" | "ascii") {
-                                reject_typevar_op(&arg_ty, "format", *span)?;
-                            } else if matches!(name.as_str(),
+                            if matches!(name.as_str(),
                                 "len" | "sum" | "sorted" | "reversed" | "any" | "all"
                                 | "list" | "tuple" | "set" | "dict" | "enumerate" | "zip")
                             {
@@ -4963,17 +5447,28 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
         Expr::BinOp { op, lhs, rhs, span } => {
             let l = check_expr(lhs, env)?;
             let r = check_expr(rhs, env)?;
-            // Generics v1: a binary operator on a bare type variable
-            // (arithmetic, comparison, membership, ...) needs a trait bound and
-            // is rejected honestly. The description distinguishes comparison from
-            // arithmetic so the message reads naturally.
+            // Generics v2: a SUPPORTED binary operator on two values of the SAME
+            // type variable (`T op T`) is now LEGAL — codegen emits the inferred
+            // trait bound (`PartialOrd` / `PartialEq` / `Add<Output=T>` / ...) in
+            // the generic clause. An UNSUPPORTED op on a bare `T` (membership,
+            // boolean, bitwise, `**`, `//`), or a MIXED `T op concrete` /
+            // `T op differentU`, stays an honest rejection. The `op_desc`
+            // distinguishes comparison from arithmetic so the message reads
+            // naturally.
             let op_desc = match op {
                 BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => "compare",
                 BinOp::In | BinOp::NotIn => "test membership of",
                 _ => "apply an operator to",
             };
-            reject_typevar_op(&l, op_desc, *span)?;
-            reject_typevar_op(&r, op_desc, *span)?;
+            // The single supported shape is `T op T` of the SAME variable with a
+            // mapped bound. Recognise it first; anything else with a TypeVar
+            // operand falls through to the v1 rejection.
+            let same_typevar = matches!((&l, &r), (Ty::TypeVar(a), Ty::TypeVar(b)) if a == b);
+            let supported_typevar_op = same_typevar && binop_typevar_bound(*op).is_some();
+            if !supported_typevar_op {
+                reject_typevar_op(&l, op_desc, *span)?;
+                reject_typevar_op(&r, op_desc, *span)?;
+            }
             // (EPIC-5) Reject using a raw `Optional[T]` operand without narrowing.
             // An Option only supports identity/equality testing against `None`
             // (`is` / `is not` / `==` / `!=`); any other operator (arithmetic,
@@ -4991,6 +5486,18 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                          use `if x is not None:` to obtain the inner value before applying `{:?}`",
                         op
                     ),
+                });
+            }
+            // Generics v2: type the result of a SUPPORTED `T op T`. Comparison /
+            // equality yield `bool`; the supported arithmetic ops (`+ - *`) yield
+            // `T` (the same-type rule, matching the emitted `Add`/`Sub`/`Mul<Output
+            // = T>` bound). This explicit redirect fires ONLY for the recognised
+            // same-`T` shape; concrete operands keep the Python rules below.
+            if supported_typevar_op {
+                return Ok(match op {
+                    BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => Ty::Bool,
+                    // Add/Sub/Mul on `T op T` -> `T`.
+                    _ => l,
                 });
             }
             match op {
@@ -8605,6 +9112,171 @@ def my_fn() -> float:
             "def f() -> int:\n    try:\n        print(\"x\")\n    except ValueError:\n        return 0\n",
         );
         assert_type_err_unit(r, "may reach the end without returning a value");
+    }
+
+    // -------------------------------------------------------------------------
+    // Generics v2: bounded generics — op -> bound inference + still-rejected ops
+    // -------------------------------------------------------------------------
+
+    /// Infer the bound set for the FIRST generic function in `src`.
+    fn bounds_of_first_func(src: &str) -> std::collections::BTreeMap<
+        String,
+        std::collections::BTreeSet<TypeVarBound>,
+    > {
+        let m = crate::parser::parse(src).expect("parse");
+        let ctx = ctx_from_module(&m);
+        let f = m.stmts.iter().find_map(|s| match s {
+            Stmt::Func(f) if !f.type_params.is_empty() => Some(f),
+            _ => None,
+        }).expect("generic func");
+        infer_func_typevar_bounds(f, &ctx)
+    }
+
+    #[test]
+    fn binop_bound_mapping_supported_ops() {
+        // Comparison -> PartialOrd; equality -> PartialEq; +,-,* -> Add/Sub/Mul.
+        assert_eq!(binop_typevar_bound(BinOp::Lt), Some(TypeVarBound::PartialOrd));
+        assert_eq!(binop_typevar_bound(BinOp::Ge), Some(TypeVarBound::PartialOrd));
+        assert_eq!(binop_typevar_bound(BinOp::Eq), Some(TypeVarBound::PartialEq));
+        assert_eq!(binop_typevar_bound(BinOp::Ne), Some(TypeVarBound::PartialEq));
+        assert_eq!(binop_typevar_bound(BinOp::Add), Some(TypeVarBound::Add));
+        assert_eq!(binop_typevar_bound(BinOp::Sub), Some(TypeVarBound::Sub));
+        assert_eq!(binop_typevar_bound(BinOp::Mul), Some(TypeVarBound::Mul));
+    }
+
+    #[test]
+    fn binop_bound_mapping_unsupported_ops_stay_none() {
+        // `/ % // **`, membership, boolean, bitwise stay rejected (None).
+        for op in [BinOp::Div, BinOp::Mod, BinOp::FloorDiv, BinOp::Pow,
+                   BinOp::In, BinOp::NotIn, BinOp::And, BinOp::Or,
+                   BinOp::BitAnd, BinOp::BitOr, BinOp::BitXor,
+                   BinOp::LShift, BinOp::RShift, BinOp::Is, BinOp::IsNot] {
+            assert_eq!(binop_typevar_bound(op), None, "op {:?} must stay unsupported", op);
+        }
+    }
+
+    #[test]
+    fn rust_bound_renders_output_clause_for_arithmetic() {
+        assert_eq!(TypeVarBound::Add.rust_bound("T"), "std::ops::Add<Output = T>");
+        assert_eq!(TypeVarBound::Sub.rust_bound("U"), "std::ops::Sub<Output = U>");
+        assert_eq!(TypeVarBound::PartialOrd.rust_bound("T"), "PartialOrd");
+        assert_eq!(TypeVarBound::Display.rust_bound("T"), "std::fmt::Display");
+        assert_eq!(TypeVarBound::Hash.rust_bound("T"), "std::hash::Hash");
+        assert_eq!(TypeVarBound::Eq.rust_bound("T"), "std::cmp::Eq");
+    }
+
+    #[test]
+    fn infers_partialord_for_comparison() {
+        let b = bounds_of_first_func(
+            "def maximum[T](a: T, b: T) -> T:\n    if a > b:\n        return a\n    return b\n",
+        );
+        let t = &b["T"];
+        assert!(t.contains(&TypeVarBound::Clone));
+        assert!(t.contains(&TypeVarBound::PartialOrd));
+        assert!(!t.contains(&TypeVarBound::Display));
+    }
+
+    #[test]
+    fn infers_add_for_arithmetic() {
+        let b = bounds_of_first_func("def total[T](a: T, b: T) -> T:\n    return a + b\n");
+        assert!(b["T"].contains(&TypeVarBound::Add));
+    }
+
+    #[test]
+    fn infers_display_for_print_and_fstring() {
+        let p = bounds_of_first_func("def show[T](x: T) -> None:\n    print(x)\n");
+        assert!(p["T"].contains(&TypeVarBound::Display));
+        let f = bounds_of_first_func("def label[T](x: T) -> str:\n    return f\"[{x}]\"\n");
+        assert!(f["T"].contains(&TypeVarBound::Display));
+    }
+
+    #[test]
+    fn infers_hash_eq_for_set_literal_and_annotation() {
+        let b = bounds_of_first_func(
+            "def s[T](a: T, b: T) -> set[T]:\n    x: set[T] = {a, b}\n    return x\n",
+        );
+        assert!(b["T"].contains(&TypeVarBound::Hash));
+        assert!(b["T"].contains(&TypeVarBound::Eq));
+    }
+
+    #[test]
+    fn bounds_union_across_multiple_ops() {
+        // A `T` used by both `>` and `print` collects BOTH bounds.
+        let b = bounds_of_first_func(
+            "def f[T](a: T, b: T) -> T:\n    print(a)\n    if a > b:\n        return a\n    return b\n",
+        );
+        let t = &b["T"];
+        assert!(t.contains(&TypeVarBound::Clone));
+        assert!(t.contains(&TypeVarBound::PartialOrd));
+        assert!(t.contains(&TypeVarBound::Display));
+    }
+
+    #[test]
+    fn nongeneric_func_has_no_bounds() {
+        let m = crate::parser::parse("def f(a: int) -> int:\n    return a + 1\n").expect("parse");
+        let ctx = ctx_from_module(&m);
+        let f = m.stmts.iter().find_map(|s| match s { Stmt::Func(f) => Some(f), _ => None }).unwrap();
+        assert!(infer_func_typevar_bounds(f, &ctx).is_empty());
+    }
+
+    // -- v2 ACCEPTS the now-supported ops (were v1 rejections) ----------------
+
+    #[test]
+    fn v2_accepts_comparison_on_typevar() {
+        assert!(check_src(
+            "def m[T](a: T, b: T) -> T:\n    if a > b:\n        return a\n    return b\n",
+        ).is_ok());
+    }
+
+    #[test]
+    fn v2_accepts_same_typevar_arithmetic() {
+        assert!(check_src("def t[T](a: T, b: T) -> T:\n    return a + b\n").is_ok());
+    }
+
+    #[test]
+    fn v2_accepts_print_and_set_of_typevar() {
+        assert!(check_src("def s[T](x: T) -> None:\n    print(x)\n").is_ok());
+        assert!(check_src(
+            "def d[T](a: T, b: T) -> set[T]:\n    return {a, b}\n",
+        ).is_ok());
+    }
+
+    // -- v2 STILL REJECTS the unsupported ops (soundness preservation) --------
+
+    #[test]
+    fn v2_rejects_mixed_typevar_concrete_arithmetic() {
+        // `T + concrete` has no sound result type / single-trait bound -> reject.
+        assert_type_err_unit(
+            check_src("def f[T](a: T) -> T:\n    return a + 1\n"),
+            "this operation on a type parameter is not supported",
+        );
+    }
+
+    #[test]
+    fn v2_rejects_true_division_on_typevar() {
+        // `/` is true float division in pyrst; Rust `Div` truncates ints -> reject.
+        assert_type_err_unit(
+            check_src("def f[T](a: T, b: T) -> T:\n    return a / b\n"),
+            "this operation on a type parameter is not supported",
+        );
+    }
+
+    #[test]
+    fn v2_rejects_membership_on_typevar() {
+        assert_type_err_unit(
+            check_src("def f[T](a: T, b: T) -> bool:\n    return a in b\n"),
+            "this operation on a type parameter is not supported",
+        );
+    }
+
+    #[test]
+    fn v2_still_rejects_index_iterate_attr_on_typevar() {
+        // Spot-check the ops that MUST stay rejected in v2.
+        assert!(check_src("def f[T](t: T) -> int:\n    return t[0]\n").is_err());
+        assert!(check_src("def f[T](t: T) -> int:\n    n: int = 0\n    for x in t:\n        n = n + 1\n    return n\n").is_err());
+        assert!(check_src("def f[T](t: T) -> int:\n    return t.x\n").is_err());
+        assert!(check_src("def f[T](t: T) -> int:\n    if t:\n        return 1\n    return 0\n").is_err());
+        assert!(check_src("def f[T](t: T) -> int:\n    return len(t)\n").is_err());
     }
 
     /// Assert a `Result<()>` is a Type error whose message contains `fragment`.

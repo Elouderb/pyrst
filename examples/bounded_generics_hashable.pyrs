@@ -1,0 +1,17 @@
+# Generics v2: a bare type variable used as a SET ELEMENT / DICT KEY infers a
+# `Hash + Eq` bound on `T` (so the generated `HashSet<T>` / `HashMap<T, _>` is
+# instantiable) instead of rejecting as in v1. Each function below performs the
+# hashable op DIRECTLY on its own `T`, so the inferred `T: Hash + Eq` bound is
+# emitted on the same function and Rust monomorphization resolves it per call.
+def count_distinct[T](a: T, b: T, c: T) -> int:
+    s: set[T] = {a, b, c}         # set literal of T -> infers `T: Hash + Eq`
+    return len(s)
+
+def make_set[T](a: T, b: T) -> set[T]:
+    return {a, b}                 # set[T] return -> infers `T: Hash + Eq`
+
+def main() -> None:
+    print(count_distinct(1, 2, 2))        # 2
+    print(count_distinct(1, 2, 3))        # 3
+    print(count_distinct("x", "x", "x"))  # 1
+    print(len(make_set("a", "b")))        # 2

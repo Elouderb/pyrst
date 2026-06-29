@@ -1,0 +1,13 @@
+# Generics v2: a SUPPORTED operator (`+`) is admitted ONLY for `T op T` of the
+# SAME type variable, where the result type and the inferred bound are both
+# `T`. A MIXED `T op concrete` (here `a + 1`, a type variable plus an `int`) has
+# no sound result type for an opaque `T` and no single-trait bound that pins the
+# RHS type, so it stays an honest typeck error — NOT a deferred rustc E0277.
+# (This replaces the v1 `fail_generic_op_on_typevar` fixture, whose `a + b` body
+# tested a SAME-`T` `+` that generics v2 now LEGALLY infers as `Add<Output=T>`;
+# the rejection guarantee it protected lives on here for the mixed case.)
+def addone[T](a: T) -> T:
+    return a + 1
+
+def main() -> None:
+    print(addone(5))

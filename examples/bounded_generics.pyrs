@@ -1,0 +1,24 @@
+# Generics v2: BOUNDED generics. A SUPPORTED operation on a bare type variable
+# `T` no longer rejects (as in v1) but INFERS the Rust trait bound the operation
+# needs, types the result, and emits the bound in the generated generic clause
+# (`fn maximum<T: Clone + PartialOrd>(..)`). Rust monomorphization instantiates
+# each call; a call with a type that does not satisfy the bound is caught at the
+# pyrst call site (concrete-arg op check) or at build.
+def maximum[T](a: T, b: T) -> T:
+    if a > b:                     # `>` on T -> infers `T: PartialOrd`, result bool
+        return a
+    return b
+
+def total[T](a: T, b: T) -> T:
+    return a + b                  # `+` on T -> infers `T: Add<Output = T>`, result T
+
+def show[T](x: T) -> None:
+    print(x)                      # print(T) -> infers `T: Display`
+
+def main() -> None:
+    print(maximum(3, 7))          # 7
+    print(maximum("a", "z"))      # z
+    print(total(2, 3))            # 5
+    print(total(1.5, 2.5))        # 4.0
+    show(42)                      # 42
+    show("hi")                    # hi

@@ -3442,13 +3442,17 @@ impl<'a> Codegen<'a> {
                 // flow `match`'s catch-all becomes `unreachable!()` (when a flow
                 // match is emitted), or a trailing `unreachable!()` is appended
                 // (when no flow match is emitted, e.g. a returning `finally`).
+                // Mirrors typeck's `stmt_definitely_returns` Try arm EXACTLY (incl.
+                // the vacuously-true empty-handlers case, so a `try: return v
+                // finally: ...` with no `except` is recognized as all-returning and
+                // its NORMAL fall-through is diverged below — otherwise it would
+                // type-check yet fail rustc with an implicit `()` tail).
                 let try_returns = {
                     use crate::typeck::block_definitely_returns as bdr;
                     if finally_.as_ref().is_some_and(|f| bdr(f)) {
                         true
                     } else {
-                        !handlers.is_empty()
-                            && handlers.iter().all(|h| bdr(&h.body))
+                        handlers.iter().all(|h| bdr(&h.body))
                             && (bdr(body) || else_.as_ref().is_some_and(|e| bdr(e)))
                     }
                 };

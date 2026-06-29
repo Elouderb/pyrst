@@ -2190,15 +2190,20 @@ fn stmt_definitely_returns(s: &Stmt) -> bool {
         // `return`/`break`/`continue` out of the catch_unwind closure (see
         // `Codegen::emit_try`): a returning try body really returns from the
         // function, so no implicit `()` falls off the end (no rustc E0317/E0308).
-        // A try with NO handlers and no returning finally cannot guarantee a
-        // return (an unmatched exception re-raises, but a normal completion of a
-        // non-returning body falls through), so it stays `false` — conservative.
+        //
+        // EMPTY handlers (a `try/finally` with no `except`): `handlers.all(..)`
+        // is VACUOUSLY true, so the rule reduces to `body_returns || else_returns`
+        // — which is exactly right. A `try: return v finally: ...` always runs the
+        // body's `return` (an exception in a handler-less body re-raises and
+        // diverges, never falling through), so it definitely returns; a
+        // `try: <falls through> finally: <no return>` (no handler, no returning
+        // finally, body does not return) still evaluates to `false` and stays an
+        // honest error.
         Stmt::Try { body, handlers, else_, finally_, .. } => {
             if finally_.as_ref().is_some_and(|f| block_definitely_returns(f)) {
                 true
             } else {
-                !handlers.is_empty()
-                    && handlers.iter().all(|h| block_definitely_returns(&h.body))
+                handlers.iter().all(|h| block_definitely_returns(&h.body))
                     && (block_definitely_returns(body)
                         || else_.as_ref().is_some_and(|e| block_definitely_returns(e)))
             }
@@ -7621,6 +7626,33 @@ def my_fn() -> float:
     fn bdr_try_no_handlers_returning_finally_returns() {
         let s = try_stmt(vec![Stmt::Pass(Span::DUMMY)], vec![], None, Some(vec![ret_val()]));
         assert!(block_definitely_returns(&[s]));
+    }
+
+    #[test]
+    fn bdr_try_finally_no_except_returning_body_returns() {
+        // `try: return v finally: <non-returning>` (NO except handler): the body's
+        // return always runs, finally runs, then the return takes effect. The
+        // empty-handler case is vacuously all-return, so this must be accepted.
+        let s = try_stmt(
+            vec![ret_val()],
+            vec![],
+            None,
+            Some(vec![Stmt::Expr(call_fn("print", vec![str_lit("c")]))]),
+        );
+        assert!(block_definitely_returns(&[s]));
+    }
+
+    #[test]
+    fn bdr_try_finally_no_except_nonreturning_body_falls_through() {
+        // `try: <falls through> finally: <non-returning>` with no handler still
+        // falls off the end -> stays an honest error (soundness boundary).
+        let s = try_stmt(
+            vec![Stmt::Pass(Span::DUMMY)],
+            vec![],
+            None,
+            Some(vec![Stmt::Expr(call_fn("print", vec![str_lit("c")]))]),
+        );
+        assert!(!block_definitely_returns(&[s]));
     }
 
     #[test]

@@ -1,0 +1,24 @@
+# A `try/finally` with NO `except` handler whose body returns is a common
+# cleanup pattern. The all-paths-return gate must ACCEPT it (the body's return
+# always runs; finally runs first; then the return takes effect), and codegen
+# must make the all-returning try DIVERGE so the function compiles. (card 57274b36)
+
+# finally (no except) runs the cleanup, then the body's return takes effect:
+# prints "cleanup" then returns 5. No trailing return needed.
+def f() -> int:
+    try:
+        return 5
+    finally:
+        print("cleanup")
+
+# the body's return value is computed before finally runs; finally cannot change
+# it here (it does not return), so g() returns 21 after printing "done".
+def g(x: int) -> int:
+    try:
+        return x * 3
+    finally:
+        print("done")
+
+def main() -> None:
+    print(f())
+    print(g(7))

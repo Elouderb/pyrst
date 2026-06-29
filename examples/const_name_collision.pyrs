@@ -1,0 +1,29 @@
+# Regression: module-const NAME mangling (card 08a32eb5 follow-up).
+#
+# A module const lowers to a top-level Rust `const`. A lowercase const name
+# (`k`, `i`, `v`) would, WITHOUT mangling, become a Rust CONSTANT PATTERN at any
+# pattern position in the generated crate — the dict-repr closure `|(k, v)|`, a
+# `for i in ...` target, a match arm — silently capturing that name as the const
+# (rustc E0308 / E0425). Each const here is emitted as `__pyrst_const_<name>` and
+# referenced by that mangled name, so it can never collide:
+#   - `k` / `v` collide with the runtime PyRepr dict closure `|(k, v)|`.
+#   - `i` collides with the `for i in range(3)` loop target below (the loop var
+#     shadows the const INSIDE the loop; the const is read again AFTER it).
+k: int = 100
+v: str = "vee"
+i: int = 99
+
+
+def main() -> None:
+    # `k`/`v` are read while a dict (whose PyRepr uses a `|(k, v)|` closure) is
+    # also printed, proving the const names don't bind into that closure.
+    d: dict[str, int] = {"a": 1, "b": 2}
+    print(d)
+    print(k)
+    print(v)
+    # `i` const read, then a loop reusing `i` as its target (the loop var shadows
+    # the const inside the loop), then the const read again after the loop.
+    print(i)
+    for i in range(3):
+        print(i)
+    print(i)

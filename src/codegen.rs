@@ -71,20 +71,25 @@ pub struct Codegen<'a> {
     /// empty everywhere else (a regular base-typed param IS the enum and DOES
     /// lower). `self` is exempt structurally, so it is never added here.
     concrete_struct_params: std::collections::HashSet<String>,
-    /// Names of module-level STRING constants. A str const lowers to a Rust
-    /// `const NAME: &str` (a `String` is not const-constructible), so a REFERENCE
-    /// to it — bare `CONST` or qualified `X.CONST` — must emit `NAME.to_string()`
-    /// to recover pyrst's `str == Rust String` value type. int/float/bool consts
-    /// are `Copy` and need no such fix-up, so only str-const names live here.
-    /// Populated by `emit_program` from every module's const declarations before
-    /// emission; empty on paths that build a `Codegen` directly (no module
-    /// constants there).
+    /// Names of ALL module-level constants (any type). A reference to a module
+    /// const — bare `CONST` (when not shadowed by a local) or qualified
+    /// `X.CONST` — must emit the MANGLED Rust name (`mangle_const`), never the
+    /// bare pyrst name, so a lowercase const cannot become a Rust const-pattern
+    /// in a closure/`for`/`match` position. Populated by `emit_program` from
+    /// every module's const declarations before emission; empty on paths that
+    /// build a `Codegen` directly (no module constants there).
+    const_names: std::collections::HashSet<String>,
+    /// Names of module-level STRING constants (a subset of `const_names`). A str
+    /// const lowers to a Rust `const NAME: &str` (a `String` is not
+    /// const-constructible), so a reference to it must additionally append
+    /// `.to_string()` to recover pyrst's `str == Rust String` value type.
+    /// int/float/bool consts are `Copy` and need no such fix-up.
     const_strs: std::collections::HashSet<String>,
 }
 
 impl<'a> Codegen<'a> {
     pub fn new(ctx: &'a TyCtx) -> Self {
-        Self { ctx, out: String::new(), indent: 0, locals: HashMap::new(), declared: Default::default(), current_class: None, current_ret_ty: Ty::Unit, dead_funcs: Default::default(), mut_self: HashMap::new(), by_ref_locals: Default::default(), poly_map: HashMap::new(), concrete_struct_params: Default::default(), const_strs: Default::default() }
+        Self { ctx, out: String::new(), indent: 0, locals: HashMap::new(), declared: Default::default(), current_class: None, current_ret_ty: Ty::Unit, dead_funcs: Default::default(), mut_self: HashMap::new(), by_ref_locals: Default::default(), poly_map: HashMap::new(), concrete_struct_params: Default::default(), const_names: Default::default(), const_strs: Default::default() }
     }
 
     pub fn with_dead_funcs(mut self, dead: std::collections::HashSet<String>) -> Self {
@@ -809,22 +814,24 @@ impl<'a> Codegen<'a> {
     /// [`crate::typeck::is_module_const_decl`] accepts, so the value is always one
     /// of the four primitive literals.
     ///
-    /// int/float/bool lower to `const NAME: <i64|f64|bool> = <value>;` — all
-    /// `Copy`, so a bare reference (`CONST`) or qualified reference (`X.CONST`)
-    /// uses the name directly. A `str` constant lowers to `const NAME: &str =
-    /// "...";` (a `String` is not const-constructible), so REFERENCES to a str
-    /// const emit `NAME.to_string()` to preserve pyrst's `str == Rust String`
-    /// value semantics (see the `Expr::Attr`/`Expr::Ident` const arms).
+    /// The Rust identifier is MANGLED via [`mangle_const`] (`__pyrst_const_<name>`)
+    /// so a lowercase const name (e.g. `k`/`i`/`e`) cannot be captured as a Rust
+    /// CONSTANT PATTERN in any closure/`for`/`match` pattern position in the
+    /// generated crate (which would silently miscompile, rustc E0308). The same
+    /// mangled name is emitted at every reference site.
     ///
-    /// The const name is the bare declared name (the namespace is FLAT, mirroring
-    /// `module_funcs`); `escape_ident` keeps a keyword-named const compiling.
+    /// int/float/bool lower to `const <mangled>: <i64|f64|bool> = <value>;` — all
+    /// `Copy`, so a reference uses the mangled name directly. A `str` constant
+    /// lowers to `const <mangled>: &str = "...";` (a `String` is not
+    /// const-constructible), so REFERENCES to a str const append `.to_string()`
+    /// to preserve pyrst's `str == Rust String` value semantics.
     fn emit_const_decl(&mut self, s: &Stmt) -> Result<()> {
         let Stmt::Assign { target, value, .. } = s else {
             return Err(crate::diag::Error::Codegen(
                 "emit_const_decl called on a non-assignment".to_string(),
             ));
         };
-        let name = escape_ident(target);
+        let name = mangle_const(target);
         let decl = match value {
             Expr::Int(n, _) => format!("const {}: i64 = {};", name, n),
             // Suffix `f64` so a whole-number float literal (`6.0` formats as
@@ -2535,6 +2542,11 @@ impl<'a> Codegen<'a> {
                 Stmt::For { targets, iter, body, .. } => {
                     // Register the loop variable's type so the body sees it (e.g.
                     // a `Temp` element's float fields aren't mistyped as Int).
+                    // SCOPED to the loop body via save/restore: registering it
+                    // function-wide would mask a MODULE CONST of the same name at
+                    // statements OUTSIDE the loop (the loop var does not leak into
+                    // Rust scope anyway), making `print(i)` next to a const `i`
+                    // resolve to a (non-existent) local instead of the const.
                     if targets.len() == 1 {
                         let elem = match self.type_of_expr(iter) {
                             Ty::List(inner) | Ty::Set(inner) => *inner,
@@ -2543,9 +2555,16 @@ impl<'a> Codegen<'a> {
                             Ty::Str => Ty::Str,
                             _ => Ty::Int, // range / unknown iterables yield ints
                         };
+                        let saved = self.locals.get(&targets[0]).cloned();
                         self.locals.entry(targets[0].clone()).or_insert(elem);
+                        self.prescan_types(body);
+                        match saved {
+                            Some(ty) => { self.locals.insert(targets[0].clone(), ty); }
+                            None => { self.locals.remove(targets[0].as_str()); }
+                        }
+                    } else {
+                        self.prescan_types(body);
                     }
-                    self.prescan_types(body);
                 }
                 Stmt::While { body, .. } | Stmt::With { body, .. } => {
                     self.prescan_types(body);
@@ -2556,11 +2575,25 @@ impl<'a> Codegen<'a> {
                         // Bind exc_name as Str before scanning the handler body so
                         // that `len(e)` on a handler-bound exception yields char-count
                         // (Ty::Str path) rather than byte-count (Ty::Unknown path).
-                        // Mirrors typeck.rs line 748-750.
-                        if let Some(name) = &h.exc_name {
+                        // SCOPED to the handler body (save/restore): the binding
+                        // does not leak past the handler in pyrst, and a function-
+                        // wide registration would mask a same-named MODULE CONST at
+                        // statements outside the handler (e.g. a const `e` read
+                        // before/after an `except ... as e`).
+                        let saved = if let Some(name) = &h.exc_name {
+                            let prev = self.locals.get(name).cloned();
                             self.locals.insert(name.clone(), Ty::Str);
-                        }
+                            Some((name.clone(), prev))
+                        } else {
+                            None
+                        };
                         self.prescan_types(&h.body);
+                        if let Some((name, prev)) = saved {
+                            match prev {
+                                Some(ty) => { self.locals.insert(name, ty); }
+                                None => { self.locals.remove(name.as_str()); }
+                            }
+                        }
                     }
                     if let Some(b) = else_ { self.prescan_types(b); }
                     if let Some(b) = finally_ { self.prescan_types(b); }
@@ -2977,29 +3010,43 @@ impl<'a> Codegen<'a> {
 
                 // Register the loop variable's type so the body sees it. Reuse the
                 // iterable type resolved above: list/set yield the element type, a
-                // dict yields its KEY type, and a str yields 1-char strings (Str).
+                // dict yields its KEY type, str yields 1-char strings (Str), and a
+                // range yields Int. The loop var must be registered as a LOCAL even
+                // when its element type is unknown (fallback Unknown), because the
+                // for-pattern binding SHADOWS any module const of the same name:
+                // the body must reference the loop variable, not mangle the name to
+                // the const (`for i in range(3)` with a module const `i`).
                 let loop_elem_ty = match &for_iter_ty {
-                    Ty::List(inner) | Ty::Set(inner) => Some((**inner).clone()),
-                    Ty::Dict(key, _) => Some((**key).clone()),
-                    Ty::Str => Some(Ty::Str),
-                    _ => None,
+                    Ty::List(inner) | Ty::Set(inner) => (**inner).clone(),
+                    Ty::Dict(key, _) => (**key).clone(),
+                    Ty::Str => Ty::Str,
+                    _ if is_range => Ty::Int,
+                    _ => Ty::Unknown,
                 };
                 if targets.len() == 1 {
-                    if let Some(elem) = loop_elem_ty {
-                        let saved = self.locals.get(&targets[0]).cloned();
-                        self.locals.insert(targets[0].clone(), elem);
-                        for s in body { self.emit_stmt(s)?; }
-                        if let Some(ty) = saved {
-                            self.locals.insert(targets[0].clone(), ty);
-                        } else {
-                            self.locals.remove(targets[0].as_str());
-                        }
+                    let saved = self.locals.get(&targets[0]).cloned();
+                    self.locals.insert(targets[0].clone(), loop_elem_ty);
+                    for s in body { self.emit_stmt(s)?; }
+                    if let Some(ty) = saved {
+                        self.locals.insert(targets[0].clone(), ty);
                     } else {
-                        for s in body { self.emit_stmt(s)?; }
+                        self.locals.remove(targets[0].as_str());
                     }
                 } else {
-                    // Multiple targets (tuple unpacking) - skip type registration for now
+                    // Multiple targets (tuple unpacking): register each as a local
+                    // (Unknown type) for the body's duration so each shadows any
+                    // same-named module const, then restore.
+                    let saved: Vec<(String, Option<Ty>)> = targets.iter()
+                        .map(|t| (t.clone(), self.locals.get(t).cloned()))
+                        .collect();
+                    for t in targets { self.locals.insert(t.clone(), Ty::Unknown); }
                     for s in body { self.emit_stmt(s)?; }
+                    for (t, prev) in saved {
+                        match prev {
+                            Some(ty) => { self.locals.insert(t, ty); }
+                            None => { self.locals.remove(t.as_str()); }
+                        }
+                    }
                 }
 
                 self.indent -= 1;
@@ -3267,16 +3314,32 @@ impl<'a> Codegen<'a> {
                             self.line(&format!("}} else if {} {{", cond));
                         }
                         self.indent += 1;
-                        if let Some(name) = &h.exc_name {
-                            // (EPIC-6) `except E as <name>:` binds a user local;
-                            // escape it and the suppression read so a keyword name
-                            // (`except ValueError as type:`) compiles. Body uses
-                            // resolve to the same escaped form.
+                        // (EPIC-6) `except E as <name>:` binds a user local; escape
+                        // it and the suppression read so a keyword name compiles.
+                        // Register it as a SCOPED local (Str) for the handler body
+                        // so a same-named MODULE CONST is shadowed only INSIDE the
+                        // handler — without this scoping, a bare reference to a
+                        // const-named exc binding (e.g. `except ... as e` next to a
+                        // const `e`) would mangle to the const, and conversely a
+                        // const read outside the handler must still resolve to the
+                        // const. Save/restore around the body.
+                        let exc_saved = if let Some(name) = &h.exc_name {
                             let name_e = escape_ident(name);
                             self.line(&format!("let {} = __exc_msg.clone();", name_e));
                             self.line(&format!("let _ = &{};", name_e));
-                        }
+                            let prev = self.locals.get(name).cloned();
+                            self.locals.insert(name.clone(), Ty::Str);
+                            Some((name.clone(), prev))
+                        } else {
+                            None
+                        };
                         for s in &h.body { self.emit_stmt(s)?; }
+                        if let Some((name, prev)) = exc_saved {
+                            match prev {
+                                Some(ty) => { self.locals.insert(name, ty); }
+                                None => { self.locals.remove(name.as_str()); }
+                            }
+                        }
                         self.line("::std::option::Option::None");
                         self.indent -= 1;
                     }
@@ -4889,12 +4952,19 @@ impl<'a> Codegen<'a> {
             // def and every use in sync. `self` is not a keyword and passes
             // through unchanged (legitimate receiver).
             Expr::Ident(n, _) => {
-                // A bare reference to a module-level STR constant must recover a
-                // `String` from the `&str` const (see `const_strs`). A local
-                // shadowing the const name keeps the local's value (consts are
-                // global, locals win), matching normal name resolution.
-                if self.const_strs.contains(n) && !self.locals.contains_key(n) {
-                    format!("{}.to_string()", escape_ident(n))
+                // A bare reference to a MODULE CONSTANT emits its MANGLED Rust
+                // name (`mangle_const`) — never the bare pyrst name — so the const
+                // can't be captured as a Rust const-pattern. A local shadowing the
+                // const name keeps the local's value (locals win, matching normal
+                // name resolution), so the mangling only applies when `n` is NOT a
+                // local. A str const additionally recovers a `String` from its
+                // `&str` const.
+                if self.const_names.contains(n) && !self.locals.contains_key(n) {
+                    if self.const_strs.contains(n) {
+                        format!("{}.to_string()", mangle_const(n))
+                    } else {
+                        mangle_const(n)
+                    }
                 } else {
                     escape_ident(n)
                 }
@@ -4905,12 +4975,13 @@ impl<'a> Codegen<'a> {
             Expr::Attr { obj, name, .. } => {
                 // Qualified MODULE CONSTANT `X.CONST` for a REAL imported module:
                 // when X is a tracked module and CONST is one of its module-level
-                // constants, lower to the FLAT Rust `const CONST` (the const
-                // namespace is flat, mirroring qualified module CALLS). A str
-                // const recovers a `String` from its `&str` const. This
-                // GENERALIZES the former hardcoded `math.pi`/`math.e`/`math.tau`
-                // arm — `math` is now a real embedded module (`lib/math.pyrs`),
-                // so its constants flow through here like any other module's.
+                // constants, lower to the MANGLED Rust `const __pyrst_const_CONST`
+                // (the const namespace is flat, mirroring qualified module CALLS;
+                // the mangling prevents const-pattern capture). A str const
+                // recovers a `String` from its `&str` const. This GENERALIZES the
+                // former hardcoded `math.pi`/`math.e`/`math.tau` arm — `math` is
+                // now a real embedded module (`lib/math.pyrs`), so its constants
+                // flow through here like any other module's.
                 if let Expr::Ident(modname, _) = obj.as_ref() {
                     if self
                         .ctx
@@ -4919,9 +4990,9 @@ impl<'a> Codegen<'a> {
                         .is_some_and(|cs| cs.iter().any(|(c, _)| c == name))
                     {
                         return Ok(if self.const_strs.contains(name) {
-                            format!("{}.to_string()", escape_ident(name))
+                            format!("{}.to_string()", mangle_const(name))
                         } else {
-                            escape_ident(name)
+                            mangle_const(name)
                         });
                     }
                 }
@@ -5478,6 +5549,21 @@ pub fn escape_ident(name: &str) -> String {
     }
 }
 
+/// Mangle a MODULE-LEVEL CONSTANT's pyrst name into the Rust identifier emitted
+/// for it. Module consts lower to top-level Rust `const` items, and a lowercase
+/// const name (e.g. `k`, `i`, `e`) would otherwise be a CONSTANT PATTERN at any
+/// pattern position in the generated crate — a closure arg `|(k, v)|`, a
+/// `for i in ...` target, a `match` arm binding — silently capturing that name
+/// as the const instead of a fresh binding (rustc E0308, a miscompile). The
+/// `__pyrst_const_` prefix is reserved (no user/runtime/pattern identifier uses
+/// it) so the emitted name can never collide. Applied IDENTICALLY at the const
+/// definition AND at every reference (bare `CONST` and qualified `X.CONST`); a
+/// missed site is a def/use mismatch. The pyrst-level name is unchanged in
+/// typeck and diagnostics — only the emitted Rust identifier is mangled.
+pub fn mangle_const(name: &str) -> String {
+    format!("__pyrst_const_{}", name)
+}
+
 /// Build a comprehension closure-parameter pattern from its loop target(s),
 /// escaping each name (EPIC-6). A single target is a bare binding; multiple
 /// targets (tuple-unpacking, e.g. `for k, v in d.items()`) form a tuple pattern
@@ -5760,10 +5846,14 @@ pub fn emit_program(modules: &[(Module, String)], ctx: &TyCtx) -> Result<String>
     for (m, _src) in modules {
         for s in &m.stmts {
             if crate::typeck::is_module_const_decl(s) {
-                // Record str consts BEFORE emitting bodies so references
-                // (bare `CONST` / qualified `X.CONST`) lower to `NAME.to_string()`.
-                if let Stmt::Assign { target, value: Expr::Str(..), .. } = s {
-                    cg.const_strs.insert(target.clone());
+                // Record const names BEFORE emitting bodies so every reference
+                // (bare `CONST` / qualified `X.CONST`) lowers to the MANGLED name,
+                // and str consts additionally get `.to_string()`.
+                if let Stmt::Assign { target, value, .. } = s {
+                    cg.const_names.insert(target.clone());
+                    if matches!(value, Expr::Str(..)) {
+                        cg.const_strs.insert(target.clone());
+                    }
                 }
                 cg.emit_const_decl(s)?;
             }
@@ -6144,10 +6234,12 @@ def ipow(base: int, exp: int) -> int:
     }
 
     #[test]
-    fn module_constant_lowers_to_flat_const_name() {
+    fn module_constant_lowers_to_mangled_const_name() {
         // A qualified module constant `math.pi` (a non-call attribute) lowers to
-        // the FLAT const name `pi` (a top-level `const pi: f64` is emitted by the
-        // prepass). The former hardcoded `::std::f64::consts::PI` arm is gone.
+        // the MANGLED const name `__pyrst_const_pi` (the prepass emits a top-level
+        // `const __pyrst_const_pi: f64`). Mangling prevents a lowercase const from
+        // being captured as a Rust const-pattern. The former hardcoded
+        // `::std::f64::consts::PI` arm is gone.
         let mut ctx = TyCtx::new();
         ctx.module_consts.insert("math".into(), vec![("pi".into(), Ty::Float)]);
         let mut cg = Codegen::new(&ctx);
@@ -6157,13 +6249,15 @@ def ipow(base: int, exp: int) -> int:
             span: Span::DUMMY,
         };
         let out = cg.emit_expr(&attr).expect("emit must succeed");
-        assert_eq!(out, "pi", "math.pi must lower to the flat const name; got: {}", out);
+        assert_eq!(out, "__pyrst_const_pi", "math.pi must lower to the mangled const name; got: {}", out);
     }
 
     #[test]
-    fn module_const_decl_emits_top_level_const() {
-        // A module-level `NAME: T = <literal>` emits a top-level Rust `const`.
-        // int/float/bool are typed Copy consts; a str const is a `&str` const.
+    fn module_const_decl_emits_mangled_top_level_const() {
+        // A module-level `NAME: T = <literal>` emits a top-level Rust `const` with
+        // a MANGLED name (`__pyrst_const_<name>`). int/float/bool are typed Copy
+        // consts; a str const is a `&str` const. The bare reference `print(PI)`
+        // also uses the mangled name.
         let src = "\
 PI: float = 3.14
 COUNT: int = 7
@@ -6174,9 +6268,39 @@ def main() -> None:
     print(PI)
 ";
         let out = emit_src(src);
-        assert!(out.contains("const PI: f64 = 3.14f64;"), "float const; got:\n{}", out);
-        assert!(out.contains("const COUNT: i64 = 7;"), "int const; got:\n{}", out);
-        assert!(out.contains("const GREETING: &str = \"hi\";"), "str const; got:\n{}", out);
-        assert!(out.contains("const FLAG: bool = true;"), "bool const; got:\n{}", out);
+        assert!(out.contains("const __pyrst_const_PI: f64 = 3.14f64;"), "float const; got:\n{}", out);
+        assert!(out.contains("const __pyrst_const_COUNT: i64 = 7;"), "int const; got:\n{}", out);
+        assert!(out.contains("const __pyrst_const_GREETING: &str = \"hi\";"), "str const; got:\n{}", out);
+        assert!(out.contains("const __pyrst_const_FLAG: bool = true;"), "bool const; got:\n{}", out);
+        // The bare reference resolves to the mangled name too (def/use match).
+        assert!(out.contains("__pyrst_const_PI"), "bare ref uses mangled name; got:\n{}", out);
+    }
+
+    #[test]
+    fn lowercase_const_does_not_capture_pattern_var() {
+        // Regression: a lowercase module const `i` alongside `for i in range(3)`.
+        // The const is emitted MANGLED (so it can't be a const-pattern), the loop
+        // var `i` is a FRESH binding inside the loop, and the const read AFTER the
+        // loop resolves back to the mangled const (the loop var does not leak).
+        let src = "\
+i: int = 99
+
+def main() -> None:
+    for i in range(3):
+        print(i)
+    print(i)
+";
+        let out = emit_src(src);
+        // The const is mangled at its definition.
+        assert!(out.contains("const __pyrst_const_i: i64 = 99;"),
+            "const i emitted mangled; got:\n{}", out);
+        // The loop target is the bare `i` (a fresh Rust binding), and the body
+        // prints that bare loop var — NOT the mangled const.
+        assert!(out.contains("for i in"), "loop target is bare i; got:\n{}", out);
+        assert!(out.contains("println!(\"{}\" , i)"),
+            "in-loop reference is the loop var (bare i); got:\n{}", out);
+        // The post-loop read resolves to the mangled const (loop var out of scope).
+        assert!(out.contains("println!(\"{}\" , __pyrst_const_i)"),
+            "post-loop reference is the mangled const; got:\n{}", out);
     }
 }

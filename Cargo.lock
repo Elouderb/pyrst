@@ -227,7 +227,7 @@ dependencies = [
 
 [[package]]
 name = "pyrst"
-version = "0.0.19"
+version = "0.0.20"
 dependencies = [
  "tokio",
  "tower-lsp-server",

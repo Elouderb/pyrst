@@ -3000,8 +3000,21 @@ impl<'a> Codegen<'a> {
                 self.line("}");
             }
             Stmt::While { cond, body, .. } => {
-                let c = self.emit_expr(cond)?;
-                self.line(&format!("while {} {{", c));
+                // `while True:` (the LITERAL `True` condition) lowers to Rust
+                // `loop { ... }`, NOT `while true { ... }`. Rust's `while true`
+                // has type `()` and does NOT diverge, so an always-returning
+                // `while True` function would leave an implicit `()` tail and
+                // fail rustc E0308. `loop` diverges (its type is `!` unless a
+                // `break` carries a value), so such a function compiles; `break`
+                // and `continue` inside still behave identically. This mirrors
+                // typeck's missing-return gate, which treats a break-free
+                // `while True` as diverging. Any other condition stays `while`.
+                if matches!(cond, Expr::Bool(true, _)) {
+                    self.line("loop {");
+                } else {
+                    let c = self.emit_expr(cond)?;
+                    self.line(&format!("while {} {{", c));
+                }
                 self.indent += 1;
                 for s in body { self.emit_stmt(s)?; }
                 self.indent -= 1;

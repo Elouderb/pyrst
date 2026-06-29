@@ -1225,6 +1225,35 @@ fn check_one_func(f: &Func, ctx: &TyCtx) -> Result<()> {
     env.is_generator = check_generator_signature(&f.body, &f.ret, f.span)?;
     collect_returned_param_idents(&f.body, &env.params, &mut env.returned_params);
     check_body(&f.body, &mut env)?;
+    check_all_paths_return(&f.body, &env, &f.name, f.span)?;
+    Ok(())
+}
+
+/// MISSING-RETURN GATE: a function whose declared return type is NON-UNIT (not
+/// `None`/`Unit`) and that is NOT a generator must return a value (or diverge)
+/// on EVERY control-flow path. Otherwise control can fall off the end of the
+/// body and codegen emits an implicit `()` tail, which rustc rejects (E0308) —
+/// a silent miscompile that breaches the honest-errors invariant. Catching it
+/// here turns that into a clean `pyrst check` error.
+///
+/// Exemptions:
+/// - `-> None`/Unit functions implicitly return `()`; nothing to enforce.
+/// - Generators (`Iterator[T]` + a `yield` in the body) implicitly return their
+///   eagerly-collected `Vec<T>` (codegen appends `return __pyrst_gen_acc;`), so
+///   falling off the end is correct for them.
+fn check_all_paths_return(body: &[Stmt], env: &FuncEnv, name: &str, span: Span) -> Result<()> {
+    if env.is_generator || env.ret_ty == Ty::Unit {
+        return Ok(());
+    }
+    if !block_definitely_returns(body) {
+        return Err(Error::Type {
+            span,
+            msg: format!(
+                "function `{}` declared to return `{}` may reach the end without returning a value",
+                name, env.ret_ty
+            ),
+        });
+    }
     Ok(())
 }
 
@@ -1347,6 +1376,7 @@ fn check_one_method(c: &ClassDef, method: &Func, ctx: &TyCtx) -> Result<()> {
     env.is_generator = check_generator_signature(&method.body, &method.ret, method.span)?;
     collect_returned_param_idents(&method.body, &env.params, &mut env.returned_params);
     check_body(&method.body, &mut env)?;
+    check_all_paths_return(&method.body, &env, &method.name, method.span)?;
     Ok(())
 }
 
@@ -2074,6 +2104,112 @@ fn stmt_contains_yield(s: &Stmt) -> bool {
         Stmt::With { body, .. } => body_contains_yield(body),
         Stmt::Match { arms, .. } => arms.iter().any(|arm| body_contains_yield(&arm.body)),
         // A nested function/class owns its own yields.
+        Stmt::Func(_) | Stmt::Class(_) => false,
+        _ => false,
+    }
+}
+
+/// Whether a block (a flat `[Stmt]`) DEFINITELY returns a value or diverges on
+/// every control-flow path — i.e. control can never "fall off the end" of the
+/// block. Used by the missing-return gate ([`check_one_func`] /
+/// [`check_one_method`]) so a non-unit, non-generator function that can reach
+/// the end of its body without a `return <value>` is an honest type error
+/// rather than a silent rustc E0308 miscompile.
+///
+/// The analysis is driven by the block's LAST statement: an unconditional
+/// earlier `return`/`raise` makes the rest dead code, but in practice such code
+/// is itself terminated by that statement, so a last-statement rule covers the
+/// real cases without a full liveness pass. This is intentionally CONSERVATIVE
+/// — when unsure (e.g. a possibly-non-exhaustive `match`, or any `for` / bounded
+/// `while`), it returns `false`, which can only ever ask the user to add an
+/// explicit `return`; it never accepts a body that might fall through.
+///
+/// Per-statement (on the last statement):
+/// - `return <value>` or bare `return` -> definitely returns.
+/// - `raise ...` -> diverges (counts as definitely-returns).
+/// - `if`/`elif`/`else` -> only when there IS an `else` AND every branch (the
+///   `then` block, every `elif` block, and the `else` block) definitely returns.
+///   No `else` -> `false` (the implicit empty else falls through).
+/// - `while True:` (the LITERAL `True` condition) whose body has no reachable
+///   `break` -> diverges (matches codegen lowering `while True` to Rust `loop`).
+///   Any other `while`, and every `for`, -> `false` (the loop may run zero times
+///   or exit normally).
+/// - `match` -> only when it is exhaustive (a `_`/capture arm makes it total)
+///   AND every arm body definitely returns; otherwise `false`.
+/// - anything else -> `false`.
+pub fn block_definitely_returns(stmts: &[Stmt]) -> bool {
+    match stmts.last() {
+        Some(s) => stmt_definitely_returns(s),
+        None => false,
+    }
+}
+
+fn stmt_definitely_returns(s: &Stmt) -> bool {
+    match s {
+        // An explicit `return` (with or without a value) terminates the path.
+        // A bare `return` in a non-unit function is itself a separate honest
+        // error (see the `Stmt::Return(None, _)` arm in `check_stmt`), but for
+        // control-flow purposes it still does not fall off the end.
+        Stmt::Return(..) => true,
+        // `raise` diverges — control never continues past it.
+        Stmt::Raise { .. } => true,
+        // An `if` only covers all paths when there is an `else` and EVERY branch
+        // (then, each elif, else) definitely returns. No `else` -> the implicit
+        // empty else falls through, so the `if` cannot guarantee a return.
+        Stmt::If { then, elifs, else_: Some(else_block), .. } => {
+            block_definitely_returns(then)
+                && elifs.iter().all(|(_, b)| block_definitely_returns(b))
+                && block_definitely_returns(else_block)
+        }
+        Stmt::If { else_: None, .. } => false,
+        // `while True:` with no reachable `break` is an infinite loop (codegen
+        // lowers it to Rust `loop`, which diverges). Any other while/for may be
+        // skipped or exit, so it cannot guarantee a return.
+        Stmt::While { cond, body, .. } => {
+            matches!(cond, Expr::Bool(true, _)) && !body_has_reachable_break(body)
+        }
+        // A `match` covers all paths only when it is exhaustive (a wildcard or
+        // bare-capture arm makes it total) AND every arm body definitely returns.
+        // When exhaustiveness is uncertain, treat as falling through.
+        Stmt::Match { arms, .. } => {
+            arms.iter().any(|arm| {
+                matches!(arm.pattern, MatchPattern::Wildcard | MatchPattern::Capture(_))
+                    && arm.guard.is_none()
+            }) && arms.iter().all(|arm| block_definitely_returns(&arm.body))
+        }
+        _ => false,
+    }
+}
+
+/// Whether `stmts` contains a `break` that would break out of the loop whose
+/// body these statements are — i.e. a `break` reachable at this loop level. A
+/// `break` nested inside an INNER `while`/`for` targets that inner loop, not
+/// this one, so inner loops are not descended for breaks. Nested `def`/`class`
+/// bodies are likewise not descended. `if`/`match`/`with`/`try` blocks ARE
+/// descended because a `break` inside them still escapes this loop.
+fn body_has_reachable_break(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(stmt_has_reachable_break)
+}
+
+fn stmt_has_reachable_break(s: &Stmt) -> bool {
+    match s {
+        Stmt::Break(_) => true,
+        Stmt::If { then, elifs, else_, .. } => {
+            body_has_reachable_break(then)
+                || elifs.iter().any(|(_, b)| body_has_reachable_break(b))
+                || else_.as_ref().is_some_and(|b| body_has_reachable_break(b))
+        }
+        Stmt::Match { arms, .. } => arms.iter().any(|arm| body_has_reachable_break(&arm.body)),
+        Stmt::With { body, .. } => body_has_reachable_break(body),
+        Stmt::Try { body, handlers, else_, finally_, .. } => {
+            body_has_reachable_break(body)
+                || handlers.iter().any(|h| body_has_reachable_break(&h.body))
+                || else_.as_ref().is_some_and(|b| body_has_reachable_break(b))
+                || finally_.as_ref().is_some_and(|b| body_has_reachable_break(b))
+        }
+        // An inner loop captures its own `break`; do not descend into it.
+        Stmt::While { .. } | Stmt::For { .. } => false,
+        // A nested function/class owns its own control flow.
         Stmt::Func(_) | Stmt::Class(_) => false,
         _ => false,
     }
@@ -7125,5 +7261,364 @@ def my_fn() -> float:
         let mut env2 = make_env(&ctx);
         let good = Expr::Attr { obj: Box::new(ident("math")), name: "pi".into(), span: Span::DUMMY };
         assert_eq!(check_expr(&good, &mut env2).expect("math.pi ok"), Ty::Float);
+    }
+
+    // -------------------------------------------------------------------------
+    // Missing-return gate (card adcbe706): block_definitely_returns + the
+    // all-paths-return check applied to non-unit, non-generator functions.
+    // -------------------------------------------------------------------------
+
+    // --- block_definitely_returns: direct rule coverage ---
+
+    fn ret_val() -> Stmt { Stmt::Return(Some(int_lit(1)), Span::DUMMY) }
+    fn raise_stmt() -> Stmt { Stmt::Raise { exc: Some(call_fn("ValueError", vec![str_lit("x")])), span: Span::DUMMY } }
+
+    #[test]
+    fn bdr_return_value_returns() {
+        assert!(block_definitely_returns(&[ret_val()]));
+    }
+
+    #[test]
+    fn bdr_bare_return_returns() {
+        // A bare `return` still terminates the path (it is a separate honest
+        // error in a non-unit fn, but for control-flow it does not fall through).
+        assert!(block_definitely_returns(&[Stmt::Return(None, Span::DUMMY)]));
+    }
+
+    #[test]
+    fn bdr_raise_diverges() {
+        assert!(block_definitely_returns(&[raise_stmt()]));
+    }
+
+    #[test]
+    fn bdr_pass_does_not_return() {
+        assert!(!block_definitely_returns(&[Stmt::Pass(Span::DUMMY)]));
+    }
+
+    #[test]
+    fn bdr_empty_block_does_not_return() {
+        assert!(!block_definitely_returns(&[]));
+    }
+
+    #[test]
+    fn bdr_driven_by_last_statement() {
+        // An expr followed by a return -> returns; a return followed by pass ->
+        // last stmt is pass -> does not (last-statement-driven, as documented).
+        assert!(block_definitely_returns(&[Stmt::Pass(Span::DUMMY), ret_val()]));
+        assert!(!block_definitely_returns(&[ret_val(), Stmt::Pass(Span::DUMMY)]));
+    }
+
+    #[test]
+    fn bdr_if_with_else_all_branches_return() {
+        let s = Stmt::If {
+            cond: bool_lit(true),
+            then: vec![ret_val()],
+            elifs: vec![],
+            else_: Some(vec![ret_val()]),
+            span: Span::DUMMY,
+        };
+        assert!(block_definitely_returns(&[s]));
+    }
+
+    #[test]
+    fn bdr_if_no_else_does_not_return() {
+        let s = Stmt::If {
+            cond: bool_lit(true),
+            then: vec![ret_val()],
+            elifs: vec![],
+            else_: None,
+            span: Span::DUMMY,
+        };
+        assert!(!block_definitely_returns(&[s]));
+    }
+
+    #[test]
+    fn bdr_if_else_one_branch_falls_through() {
+        // then returns, else is a `pass` -> not all paths return.
+        let s = Stmt::If {
+            cond: bool_lit(true),
+            then: vec![ret_val()],
+            elifs: vec![],
+            else_: Some(vec![Stmt::Pass(Span::DUMMY)]),
+            span: Span::DUMMY,
+        };
+        assert!(!block_definitely_returns(&[s]));
+    }
+
+    #[test]
+    fn bdr_if_elif_else_all_return() {
+        let s = Stmt::If {
+            cond: bool_lit(true),
+            then: vec![ret_val()],
+            elifs: vec![(bool_lit(false), vec![ret_val()])],
+            else_: Some(vec![ret_val()]),
+            span: Span::DUMMY,
+        };
+        assert!(block_definitely_returns(&[s]));
+    }
+
+    #[test]
+    fn bdr_if_elif_branch_falls_through() {
+        // The elif body does NOT return -> the whole if does not.
+        let s = Stmt::If {
+            cond: bool_lit(true),
+            then: vec![ret_val()],
+            elifs: vec![(bool_lit(false), vec![Stmt::Pass(Span::DUMMY)])],
+            else_: Some(vec![ret_val()]),
+            span: Span::DUMMY,
+        };
+        assert!(!block_definitely_returns(&[s]));
+    }
+
+    #[test]
+    fn bdr_while_true_no_break_diverges() {
+        let s = Stmt::While {
+            cond: bool_lit(true),
+            body: vec![ret_val()],
+            span: Span::DUMMY,
+        };
+        assert!(block_definitely_returns(&[s]));
+    }
+
+    #[test]
+    fn bdr_while_true_with_break_does_not_diverge() {
+        // A reachable `break` means the loop can exit -> not guaranteed to return.
+        let s = Stmt::While {
+            cond: bool_lit(true),
+            body: vec![Stmt::Break(Span::DUMMY)],
+            span: Span::DUMMY,
+        };
+        assert!(!block_definitely_returns(&[s]));
+    }
+
+    #[test]
+    fn bdr_while_true_break_inside_if_does_not_diverge() {
+        // A `break` nested in an `if` still escapes this loop.
+        let s = Stmt::While {
+            cond: bool_lit(true),
+            body: vec![Stmt::If {
+                cond: bool_lit(true),
+                then: vec![Stmt::Break(Span::DUMMY)],
+                elifs: vec![],
+                else_: None,
+                span: Span::DUMMY,
+            }],
+            span: Span::DUMMY,
+        };
+        assert!(!block_definitely_returns(&[s]));
+    }
+
+    #[test]
+    fn bdr_while_true_break_in_inner_loop_still_diverges() {
+        // A `break` in an INNER loop targets that inner loop, not this one, so
+        // the outer `while True` is still infinite.
+        let s = Stmt::While {
+            cond: bool_lit(true),
+            body: vec![Stmt::While {
+                cond: bool_lit(true),
+                body: vec![Stmt::Break(Span::DUMMY)],
+                span: Span::DUMMY,
+            }],
+            span: Span::DUMMY,
+        };
+        assert!(block_definitely_returns(&[s]));
+    }
+
+    #[test]
+    fn bdr_while_nonliteral_cond_does_not_diverge() {
+        // `while <other>:` may run zero times / exit normally.
+        let s = Stmt::While {
+            cond: ident("c"),
+            body: vec![ret_val()],
+            span: Span::DUMMY,
+        };
+        assert!(!block_definitely_returns(&[s]));
+    }
+
+    #[test]
+    fn bdr_while_false_does_not_diverge() {
+        let s = Stmt::While {
+            cond: bool_lit(false),
+            body: vec![ret_val()],
+            span: Span::DUMMY,
+        };
+        assert!(!block_definitely_returns(&[s]));
+    }
+
+    #[test]
+    fn bdr_for_does_not_diverge() {
+        let s = Stmt::For {
+            targets: vec!["x".into()],
+            iter: call_fn("range", vec![int_lit(3)]),
+            body: vec![ret_val()],
+            span: Span::DUMMY,
+        };
+        assert!(!block_definitely_returns(&[s]));
+    }
+
+    #[test]
+    fn bdr_match_exhaustive_all_arms_return() {
+        let s = Stmt::Match {
+            subject: ident("x"),
+            arms: vec![
+                MatchArm { pattern: MatchPattern::Literal(int_lit(0)), guard: None, body: vec![ret_val()] },
+                MatchArm { pattern: MatchPattern::Wildcard, guard: None, body: vec![ret_val()] },
+            ],
+            span: Span::DUMMY,
+        };
+        assert!(block_definitely_returns(&[s]));
+    }
+
+    #[test]
+    fn bdr_match_without_wildcard_does_not_return() {
+        // No wildcard/capture arm -> exhaustiveness unknown -> conservative false.
+        let s = Stmt::Match {
+            subject: ident("x"),
+            arms: vec![
+                MatchArm { pattern: MatchPattern::Literal(int_lit(0)), guard: None, body: vec![ret_val()] },
+                MatchArm { pattern: MatchPattern::Literal(int_lit(1)), guard: None, body: vec![ret_val()] },
+            ],
+            span: Span::DUMMY,
+        };
+        assert!(!block_definitely_returns(&[s]));
+    }
+
+    #[test]
+    fn bdr_match_wildcard_arm_falls_through() {
+        // Exhaustive but one arm body does not return -> whole match does not.
+        let s = Stmt::Match {
+            subject: ident("x"),
+            arms: vec![
+                MatchArm { pattern: MatchPattern::Literal(int_lit(0)), guard: None, body: vec![ret_val()] },
+                MatchArm { pattern: MatchPattern::Wildcard, guard: None, body: vec![Stmt::Pass(Span::DUMMY)] },
+            ],
+            span: Span::DUMMY,
+        };
+        assert!(!block_definitely_returns(&[s]));
+    }
+
+    #[test]
+    fn bdr_match_guarded_wildcard_is_not_total() {
+        // A wildcard arm with a guard may not match -> not exhaustive.
+        let s = Stmt::Match {
+            subject: ident("x"),
+            arms: vec![
+                MatchArm {
+                    pattern: MatchPattern::Wildcard,
+                    guard: Some(bool_lit(true)),
+                    body: vec![ret_val()],
+                },
+            ],
+            span: Span::DUMMY,
+        };
+        assert!(!block_definitely_returns(&[s]));
+    }
+
+    // --- End-to-end gate via check_bodies (the real `check` path) ---
+
+    fn check_src(src: &str) -> Result<()> {
+        let m = crate::parser::parse(src).expect("parse");
+        let ctx = ctx_from_module(&m);
+        check_bodies(&m, &ctx)
+    }
+
+    #[test]
+    fn gate_rejects_pass_body_nonunit() {
+        let r = check_src("def f() -> int:\n    pass\n");
+        assert_type_err_unit(r, "may reach the end without returning a value");
+    }
+
+    #[test]
+    fn gate_rejects_if_no_else_nonunit() {
+        let r = check_src("def f(c: bool) -> int:\n    if c:\n        return 1\n");
+        assert_type_err_unit(r, "may reach the end without returning a value");
+    }
+
+    #[test]
+    fn gate_rejects_list_return_pass_body() {
+        let r = check_src("def f() -> list[int]:\n    pass\n");
+        assert_type_err_unit(r, "may reach the end without returning a value");
+    }
+
+    #[test]
+    fn gate_accepts_if_else_both_return() {
+        let r = check_src("def f(c: bool) -> int:\n    if c:\n        return 1\n    else:\n        return 2\n");
+        assert!(r.is_ok(), "if/else both-return must pass: {:?}", r);
+    }
+
+    #[test]
+    fn gate_accepts_raise_only() {
+        let r = check_src("def f() -> int:\n    raise ValueError(\"x\")\n");
+        assert!(r.is_ok(), "raise-only must pass: {:?}", r);
+    }
+
+    #[test]
+    fn gate_accepts_trailing_return_after_if() {
+        let r = check_src("def f(c: bool) -> int:\n    if c:\n        return 1\n    return 2\n");
+        assert!(r.is_ok(), "trailing return must pass: {:?}", r);
+    }
+
+    #[test]
+    fn gate_accepts_none_pass() {
+        // `-> None` (Unit) functions implicitly return () — exempt.
+        let r = check_src("def f() -> None:\n    pass\n");
+        assert!(r.is_ok(), "-> None pass must pass: {:?}", r);
+    }
+
+    #[test]
+    fn gate_accepts_while_true_return() {
+        let r = check_src("def f() -> int:\n    while True:\n        return 1\n");
+        assert!(r.is_ok(), "while True: return must pass: {:?}", r);
+    }
+
+    #[test]
+    fn gate_exempts_generator_falling_off_end() {
+        // A generator (yield + Iterator[T]) implicitly returns its collected Vec;
+        // falling off the end is correct, so the gate must NOT fire.
+        let r = check_src("def g(n: int) -> Iterator[int]:\n    i: int = 0\n    while i < n:\n        yield i\n        i = i + 1\n");
+        assert!(r.is_ok(), "generator must be exempt from missing-return gate: {:?}", r);
+    }
+
+    #[test]
+    fn gate_accepts_iterator_return_without_yield() {
+        // A non-generator Iterator[int] (no yield) that returns a value passes.
+        let r = check_src("def empty() -> Iterator[int]:\n    return []\n");
+        assert!(r.is_ok(), "non-generator Iterator[T] with return must pass: {:?}", r);
+    }
+
+    #[test]
+    fn gate_applies_to_methods() {
+        let r = check_src(
+            "class C:\n    def __init__(self) -> None:\n        pass\n    def m(self) -> int:\n        pass\n",
+        );
+        assert_type_err_unit(r, "may reach the end without returning a value");
+    }
+
+    #[test]
+    fn gate_accepts_method_returning_on_all_paths() {
+        let r = check_src(
+            "class C:\n    def __init__(self) -> None:\n        pass\n    def m(self, c: bool) -> int:\n        if c:\n            return 1\n        else:\n            return 2\n",
+        );
+        assert!(r.is_ok(), "method returning on all paths must pass: {:?}", r);
+    }
+
+    #[test]
+    fn gate_accepts_match_exhaustive_all_return() {
+        let r = check_src(
+            "def f(x: int) -> int:\n    match x:\n        case 0:\n            return 10\n        case _:\n            return 20\n",
+        );
+        assert!(r.is_ok(), "exhaustive match returning on all arms must pass: {:?}", r);
+    }
+
+    /// Assert a `Result<()>` is a Type error whose message contains `fragment`.
+    fn assert_type_err_unit(r: Result<()>, fragment: &str) {
+        match r {
+            Err(Error::Type { msg, .. }) => assert!(
+                msg.contains(fragment),
+                "expected error containing {:?}, got msg: {:?}", fragment, msg
+            ),
+            Err(other) => panic!("expected Type error, got {:?}", other),
+            Ok(()) => panic!("expected Type error, got Ok(())"),
+        }
     }
 }

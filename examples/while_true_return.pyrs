@@ -1,0 +1,24 @@
+# POSITIVE: `while True:` that always returns. The literal-`True` condition is
+# lowered to Rust `loop { ... }` (NOT `while true`, which does not diverge), so a
+# function whose only path is an always-returning `while True` compiles and runs.
+# typeck's missing-return gate treats a break-free `while True` as diverging, so
+# this passes `check`; codegen's `loop` lowering makes it pass `build` + run.
+def first_positive() -> int:
+    while True:
+        return 1
+
+
+# `break`/`continue` still work inside the lowered `loop`: this counts up to 3
+# using a break, then returns the value after the loop.
+def count_to_three() -> int:
+    i: int = 0
+    while True:
+        if i >= 3:
+            break
+        i = i + 1
+    return i
+
+
+def main() -> None:
+    print(first_positive())                       # 1
+    print(count_to_three())                       # 3

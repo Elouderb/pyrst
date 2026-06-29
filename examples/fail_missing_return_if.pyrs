@@ -1,0 +1,11 @@
+# NEGATIVE: an `if` with no `else` does not cover all control-flow paths. When
+# `c` is false, control falls off the end of this `-> int` function without
+# returning a value — an honest type error (was a silent rustc E0308 miscompile).
+# Adding an `else: return ...` or a trailing `return ...` would make it valid.
+def f(c: bool) -> int:
+    if c:
+        return 1
+
+
+def main() -> None:
+    print(f(True))

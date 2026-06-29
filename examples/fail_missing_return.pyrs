@@ -1,0 +1,10 @@
+# NEGATIVE: a non-unit function that can fall off the end without returning a
+# value is an honest type error (was a silent rustc E0308 miscompile — it passed
+# `pyrst check` then failed `pyrst build`). The body is just `pass`, so control
+# reaches the end of a `-> int` function without any `return <value>`.
+def f() -> int:
+    pass
+
+
+def main() -> None:
+    print(f())

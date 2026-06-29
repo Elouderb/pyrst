@@ -1,0 +1,22 @@
+# POSITIVE: a function declared `Iterator[T]` is only a GENERATOR when its body
+# uses `yield`. With no `yield`, it is an ordinary function returning a `list[T]`
+# — and because it has an explicit `return <value>` on every path, it passes the
+# missing-return gate (it is NOT exempt as a generator, but it does return a
+# value, so the check is satisfied). Lowers to a normal `Vec<i64>` return.
+def empty() -> Iterator[int]:
+    return []
+
+
+def small(c: bool) -> Iterator[int]:
+    if c:
+        return [1, 2, 3]
+    else:
+        return []
+
+
+def main() -> None:
+    e: list[int] = empty()
+    print(len(e))                                 # 0
+    s: list[int] = small(True)
+    print(s)                                      # [1, 2, 3]
+    print(sum(small(True)))                       # 6

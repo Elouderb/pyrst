@@ -1,0 +1,18 @@
+# Stdlib `string`: the embedded pure-pyrst `string` module — module-level
+# constants (`ascii_lowercase`, `digits`) accessed by qualified name, plus the
+# `capwords` helper. `string` is embedded (lib/string.pyrs -> include_str! ->
+# src/stdlib.rs); there is no local `string.pyrs` next to this file.
+#
+# Both import forms are exercised across the stdlib goldens: this one uses the
+# qualified `import string; string.X` form (constants + function); the flat
+# `from string import capwords` form is covered by the module's own resolution
+# and the other goldens' `from` imports.
+#
+# Deterministic: fixed constants and a fixed input string.
+import string
+
+
+def main() -> None:
+    print(string.ascii_lowercase)        # abcdefghijklmnopqrstuvwxyz
+    print(string.digits)                 # 0123456789
+    print(string.capwords("hello world foo"))   # Hello World Foo

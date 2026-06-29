@@ -1,0 +1,85 @@
+# pyrst standard library — heapq
+#
+# Pure-pyrst binary MIN-heap over a `list[T]` whose elements are ordered (the
+# `<` operator on `T` infers `T: PartialOrd` — generics v2). The list itself IS
+# the heap (as in CPython): index 0 is the smallest element, children of `i` are
+# at `2*i+1` and `2*i+2`. Embedded via `include_str!` (see `src/stdlib.rs`).
+# Usable as either `from heapq import heappush` or
+# `import heapq; heapq.heappush(h, x)`.
+#
+# Public API:
+#   - `heappush(heap, item)` — push `item`, restoring the heap invariant.
+#   - `heappop(heap)`        — remove and return the smallest element.
+#   - `heapify(x)`           — rearrange `x` into a heap in place, O(n).
+# All three take the heap as a `Mut[list[T]]` by-reference param and mutate it
+# in place (CPython mutates the list argument too).
+#
+# Implementation notes:
+#   - Standard sift-up (push) / sift-down (pop, heapify) on the array.
+#   - IMPORTANT codegen constraint: when a `Mut[list[T]]` is passed to a helper,
+#     any OTHER argument that reads the same list (e.g. `len(heap) - 1`) must be
+#     hoisted into a local FIRST — passing `len(heap)` inline alongside the
+#     `&mut heap` reference triggers a Rust borrow conflict (E0502). Hence the
+#     `last_index` / `n` locals below.
+#   - `nlargest` / `nsmallest` / `heappushpop` / `heapreplace` are DEFERRED to a
+#     later batch.
+
+
+def _swap[T](heap: Mut[list[T]], i: int, j: int) -> None:
+    tmp: T = heap[i]
+    heap[i] = heap[j]
+    heap[j] = tmp
+
+
+def _sift_up[T](heap: Mut[list[T]], pos: int) -> None:
+    child: int = pos
+    while child > 0:
+        parent: int = (child - 1) // 2
+        if heap[child] < heap[parent]:
+            _swap(heap, child, parent)
+            child = parent
+        else:
+            return
+
+
+def _sift_down[T](heap: Mut[list[T]], pos: int) -> None:
+    n: int = len(heap)
+    root: int = pos
+    while True:
+        left: int = 2 * root + 1
+        right: int = 2 * root + 2
+        smallest: int = root
+        if left < n and heap[left] < heap[smallest]:
+            smallest = left
+        if right < n and heap[right] < heap[smallest]:
+            smallest = right
+        if smallest == root:
+            return
+        _swap(heap, root, smallest)
+        root = smallest
+
+
+def heappush[T](heap: Mut[list[T]], item: T) -> None:
+    heap.append(item)
+    last_index: int = len(heap) - 1
+    _sift_up(heap, last_index)
+
+
+def heappop[T](heap: Mut[list[T]]) -> T:
+    last: T = heap.pop()
+    n: int = len(heap)
+    if n == 0:
+        # The heap had a single element; `last` is it.
+        return last
+    result: T = heap[0]
+    heap[0] = last
+    _sift_down(heap, 0)
+    return result
+
+
+def heapify[T](x: Mut[list[T]]) -> None:
+    n: int = len(x)
+    i: int = n // 2 - 1
+    while i >= 0:
+        _sift_down(x, i)
+        i = i - 1

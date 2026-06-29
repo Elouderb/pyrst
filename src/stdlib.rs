@@ -33,6 +33,17 @@ pub const EMBEDDED_STDLIB: &[(&str, &str)] = &[
     // declares `@crate("regex", "1")`), so importing it routes `build` through
     // the Cargo-project path. The other embedded modules use only Rust std.
     ("re", include_str!("../lib/re.pyrs")),
+    // Tier-2 batch: pure-pyrst modules built on generics (functions + inferred
+    // bounds) and module-level constants. `string` is constants + a str helper;
+    // `bisect`/`heapq` are generic algorithms over `list[T]` (PartialOrd via
+    // `<`), with the mutating variants taking a `Mut[list[T]]` by-ref param;
+    // `collections` provides `Counter`/`most_common` over hashable `T`. None
+    // need an external crate (Rust std only), so importing them stays on the
+    // single-file build path.
+    ("string", include_str!("../lib/string.pyrs")),
+    ("bisect", include_str!("../lib/bisect.pyrs")),
+    ("heapq", include_str!("../lib/heapq.pyrs")),
+    ("collections", include_str!("../lib/collections.pyrs")),
 ];
 
 /// Look up an embedded stdlib module's source by NAME (e.g. `"os"`).

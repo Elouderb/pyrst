@@ -1,0 +1,30 @@
+# Stdlib `bisect`: the embedded pure-pyrst `bisect` module — binary-search
+# insertion points (`bisect_left`/`bisect_right`) and in-place sorted insertion
+# (`insort` over a `Mut[list[int]]`). Generic over an ordered `T` (PartialOrd via
+# `<`); here instantiated at `int`. `bisect` is embedded (lib/bisect.pyrs ->
+# include_str! -> src/stdlib.rs); no local `bisect.pyrs` next to this file.
+#
+# Uses the flat `from bisect import ...` form. NOTE: the qualified
+# `import bisect; bisect.bisect_left(a, x)` form does NOT type-check today —
+# the qualified module-call path does not yet instantiate a callee's type
+# parameter `T`, so it reports `expected list[T], found list[int]`. The flat
+# `from`-import form DOES instantiate generics and is the supported way to call
+# these generic stdlib functions until that compiler gap is closed. (The
+# non-generic `string` module works via BOTH forms — see stdlib_string.pyrs.)
+#
+# Deterministic:
+#   bisect_left([1,3,5,7], 5)  = 2  (before the existing 5)
+#   bisect_right([1,3,5,7], 5) = 3  (after the existing 5)
+#   insort 4, then 0, then 8 into [1,3,5,7] -> [0, 1, 3, 4, 5, 7, 8]
+from bisect import bisect_left, bisect_right, insort
+
+
+def main() -> None:
+    a: list[int] = [1, 3, 5, 7]
+    print(bisect_left(a, 5))             # 2
+    print(bisect_right(a, 5))            # 3
+    b: list[int] = [1, 3, 5, 7]
+    insort(b, 4)
+    insort(b, 0)
+    insort(b, 8)
+    print(b)                             # [0, 1, 3, 4, 5, 7, 8]

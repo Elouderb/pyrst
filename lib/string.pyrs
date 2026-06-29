@@ -1,0 +1,46 @@
+# pyrst standard library — string
+#
+# Pure-pyrst string constants and helpers. Embedded via `include_str!` (see
+# `src/stdlib.rs`). Usable as either `from string import capwords` or
+# `import string; string.capwords(s)`, and the constants as `string.digits`.
+#
+# Two pieces, both ordinary language features `string` merely dogfoods:
+#   - MODULE-LEVEL CONSTANTS: top-level annotated string literals
+#     (`NAME: str = "..."`). The values below are CPython's exact `string.*`
+#     constants (same characters and order), so `string.ascii_lowercase` etc.
+#     match Python.
+#   - PURE-PYRST HELPER: `capwords` splits on whitespace, capitalizes each word,
+#     and rejoins with a single space — using only str methods (`split`,
+#     `capitalize`, `join`).
+#
+# Phase notes:
+#   - `capwords(s, sep)` in CPython takes an optional separator; pyrst has no
+#     default-argument / overload support yet, so only the whitespace-splitting
+#     1-argument form is provided. `s.split()` (no argument) splits on runs of
+#     whitespace and drops empty fields; the words are rejoined with a single
+#     space — matching `capwords` with the default `sep=None`. A `sep` form
+#     arrives with default-argument support.
+#   - `whitespace` is DEFERRED: CPython's value is `' \t\n\r\x0b\x0c'`, which
+#     includes the vertical tab (\x0b) and form feed (\x0c). pyrst string
+#     literals support only the escapes `\n \t \r \\ \' \" \0` (no `\xNN` hex
+#     escape — see src/lexer.rs), so the exact value cannot be expressed. Rather
+#     than ship a silently-wrong constant, `whitespace` waits for `\x` escapes.
+#     The seven other constants below are fully expressible and match CPython.
+#   - `Template` / `Formatter` (classes) are out of scope for this batch.
+
+
+ascii_lowercase: str = "abcdefghijklmnopqrstuvwxyz"
+ascii_uppercase: str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+ascii_letters: str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+digits: str = "0123456789"
+hexdigits: str = "0123456789abcdefABCDEF"
+octdigits: str = "01234567"
+punctuation: str = "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~"
+
+
+def capwords(s: str) -> str:
+    words: list[str] = s.split()
+    capped: list[str] = []
+    for w in words:
+        capped.append(w.capitalize())
+    return " ".join(capped)

@@ -1,0 +1,26 @@
+# Stdlib `collections`: the embedded pure-pyrst `collections` module — `Counter`
+# (count occurrences into a `dict[T, int]`) and `most_common` (top-N (element,
+# count) pairs, ordered by count DESCENDING). Generic over a hashable `T`
+# (Hash + Eq, inferred from dict-key use), here at `str`. `collections` is
+# embedded (lib/collections.pyrs -> include_str! -> src/stdlib.rs); it was also
+# removed from the resolver skip-list so the import resolves. No local
+# `collections.pyrs` next to this file.
+#
+# Uses the flat `from collections import ...` form.
+#
+# Deterministic — dict iteration order is unspecified, so the golden does NOT
+# print the whole dict. `most_common` imposes a count-descending order, but a
+# TIE among the selected top-N would be order-dependent. The input is therefore
+# chosen so the top two counts are DISTINCT (a=3 > b=2), making the selected
+# slice fully deterministic; the only tie (the unselected c=1) never enters the
+# result. A specific key lookup additionally pins an individual count:
+#   Counter(["a","b","a","c","a","b"]) -> {a:3, b:2, c:1}
+#   counts["a"]            = 3
+#   most_common(counts, 2) = [('a', 3), ('b', 2)]
+from collections import Counter, most_common
+
+
+def main() -> None:
+    counts: dict[str, int] = Counter(["a", "b", "a", "c", "a", "b"])
+    print(counts["a"])                   # 3
+    print(most_common(counts, 2))        # [('a', 3), ('b', 2)]

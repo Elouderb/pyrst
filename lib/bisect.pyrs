@@ -1,0 +1,88 @@
+# pyrst standard library — bisect
+#
+# Pure-pyrst binary-search insertion points and sorted insertion over a
+# `list[T]` whose elements are ordered (the `<` operator on `T` infers the
+# `T: PartialOrd` bound — generics v2). Embedded via `include_str!` (see
+# `src/stdlib.rs`). Usable as either `from bisect import bisect_left` or
+# `import bisect; bisect.bisect_left(a, x)`.
+#
+# Semantics (matching CPython):
+#   - `bisect_left(a, x)`  → leftmost index where `x` can be inserted to keep
+#     `a` sorted (before any existing entries equal to `x`).
+#   - `bisect_right(a, x)` → rightmost such index (after existing entries equal
+#     to `x`). `bisect` is an alias of `bisect_right`.
+#   - `insort_left` / `insort` insert `x` in place (the list is a `Mut[list[T]]`
+#     by-reference param, so the caller's list is mutated) at the corresponding
+#     index, keeping it sorted. `insort` aliases `insort_right`.
+#
+# Phase notes:
+#   - The optional `lo` / `hi` bounding arguments are DEFERRED (they need
+#     default arguments). The whole-list form is provided.
+#   - `T: PartialOrd` is inferred from the `<` comparisons on `T`; no explicit
+#     bound syntax is needed.
+
+
+def bisect_left[T](a: list[T], x: T) -> int:
+    lo: int = 0
+    hi: int = len(a)
+    while lo < hi:
+        mid: int = (lo + hi) // 2
+        if a[mid] < x:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo
+
+
+def bisect_right[T](a: list[T], x: T) -> int:
+    lo: int = 0
+    hi: int = len(a)
+    while lo < hi:
+        mid: int = (lo + hi) // 2
+        if x < a[mid]:
+            hi = mid
+        else:
+            lo = mid + 1
+    return lo
+
+
+# `bisect` is the conventional alias of `bisect_right`.
+def bisect[T](a: list[T], x: T) -> int:
+    return bisect_right(a, x)
+
+
+def insort_left[T](a: Mut[list[T]], x: T) -> None:
+    lo: int = 0
+    hi: int = len(a)
+    while lo < hi:
+        mid: int = (lo + hi) // 2
+        if a[mid] < x:
+            lo = mid + 1
+        else:
+            hi = mid
+    a.insert(lo, x)
+
+
+def insort_right[T](a: Mut[list[T]], x: T) -> None:
+    lo: int = 0
+    hi: int = len(a)
+    while lo < hi:
+        mid: int = (lo + hi) // 2
+        if x < a[mid]:
+            hi = mid
+        else:
+            lo = mid + 1
+    a.insert(lo, x)
+
+
+# `insort` is the conventional alias of `insort_right`.
+def insort[T](a: Mut[list[T]], x: T) -> None:
+    lo: int = 0
+    hi: int = len(a)
+    while lo < hi:
+        mid: int = (lo + hi) // 2
+        if x < a[mid]:
+            hi = mid
+        else:
+            lo = mid + 1
+    a.insert(lo, x)

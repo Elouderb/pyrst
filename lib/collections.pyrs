@@ -1,0 +1,55 @@
+# pyrst standard library — collections
+#
+# Pure-pyrst counting helpers over a `list[T]` whose elements are hashable (used
+# as dict keys, so the `T: Hash + Eq` bound is inferred — generics v2). Embedded
+# via `include_str!` (see `src/stdlib.rs`). Usable as either
+# `from collections import Counter` or `import collections;
+# collections.Counter(items)`.
+#
+# Public API:
+#   - `Counter(items)`        → a `dict[T, int]` mapping each distinct element to
+#     its number of occurrences. (CPython's `Counter` is a dict SUBCLASS; pyrst
+#     has no generic-class subclassing yet, so this batch models the counts as a
+#     plain `dict[T, int]`, which is what the useful operations need.)
+#   - `most_common(counts, n)` → the `n` highest-count `(element, count)` pairs as
+#     a `list[tuple[T, int]]`, ordered by count DESCENDING. This gives a
+#     DETERMINISTIC ordering even though dict iteration order is unspecified.
+#
+# Implementation notes:
+#   - `Counter` increments via `counts.get(it, 0) + 1` rather than an `if it in
+#     counts` membership test: generics v2 infers bounds for comparison,
+#     equality, arithmetic, Display and Hash, but NOT for the `in` (contains)
+#     operator on a bare type parameter, so the `.get`-with-default form is the
+#     one that type-checks for a generic key.
+#   - `most_common` does a repeated max-selection (O(n*k) for k=n results), which
+#     is fine for the small n typical of "top-N" queries and keeps the ordering
+#     deterministic and the bound requirements minimal (only `>` on the int
+#     counts, no ordering bound on the keys themselves).
+#   - `deque` / `defaultdict` / `namedtuple` / `OrderedDict` are DEFERRED: they
+#     are generic CLASSES, which are a later batch.
+
+
+def Counter[T](items: list[T]) -> dict[T, int]:
+    counts: dict[T, int] = {}
+    for it in items:
+        counts[it] = counts.get(it, 0) + 1
+    return counts
+
+
+def most_common[T](counts: dict[T, int], n: int) -> list[tuple[T, int]]:
+    pairs: list[tuple[T, int]] = []
+    for k, v in counts.items():
+        pairs.append((k, v))
+    result: list[tuple[T, int]] = []
+    taken: int = 0
+    while taken < n and len(pairs) > 0:
+        best: int = 0
+        scan: int = 1
+        while scan < len(pairs):
+            if pairs[scan][1] > pairs[best][1]:
+                best = scan
+            scan = scan + 1
+        result.append(pairs[best])
+        pairs.pop(best)
+        taken = taken + 1
+    return result

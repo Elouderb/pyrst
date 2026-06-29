@@ -6,7 +6,10 @@
 # removed from the resolver skip-list so the import resolves. No local
 # `collections.pyrs` next to this file.
 #
-# Uses the flat `from collections import ...` form.
+# Uses the idiomatic QUALIFIED `import collections; collections.f(...)` form. The
+# qualified module-call path runs the SAME generic call-site unification as the
+# flat `from collections import ...` form, so the generic hashable `T` callee
+# instantiates correctly (T=str, inferred from the list-of-str argument).
 #
 # Deterministic — dict iteration order is unspecified, so the golden does NOT
 # print the whole dict. `most_common` imposes a count-descending order, but a
@@ -17,10 +20,10 @@
 #   Counter(["a","b","a","c","a","b"]) -> {a:3, b:2, c:1}
 #   counts["a"]            = 3
 #   most_common(counts, 2) = [('a', 3), ('b', 2)]
-from collections import Counter, most_common
+import collections
 
 
 def main() -> None:
-    counts: dict[str, int] = Counter(["a", "b", "a", "c", "a", "b"])
-    print(counts["a"])                   # 3
-    print(most_common(counts, 2))        # [('a', 3), ('b', 2)]
+    counts: dict[str, int] = collections.Counter(["a", "b", "a", "c", "a", "b"])
+    print(counts["a"])                              # 3
+    print(collections.most_common(counts, 2))       # [('a', 3), ('b', 2)]

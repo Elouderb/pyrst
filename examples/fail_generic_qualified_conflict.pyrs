@@ -1,0 +1,12 @@
+# Qualified generic call: the unification that runs for the flat form
+# (`heappush(h, x)`) now runs for the QUALIFIED form (`heapq.heappush(h, x)`)
+# too. So a conflicting type-parameter binding is an honest typeck error in the
+# qualified form as well: `heappush(heap: Mut[list[T]], item: T)` called on a
+# `list[str]` heap with an `int` item forces T=str AND T=int -> conflict, rejected
+# at `check` (not deferred to rustc).
+import heapq
+
+
+def main() -> None:
+    h: list[str] = []
+    heapq.heappush(h, 5)

@@ -2214,6 +2214,81 @@ fn infer_generic_call_result(
     Ok(Some(res.ret))
 }
 
+/// PURE codegen-oracle result type for a (possibly generic) call to `name` whose
+/// signature is `sig` and whose argument types are `arg_tys`. Mirrors the
+/// CHECKING path's substitution but never errors: on a non-generic callee, or a
+/// conflict/uninferable case (which the checking path already rejects), it falls
+/// back to the declared return. Shared by the FLAT and QUALIFIED oracle arms so
+/// codegen sees the same concrete result type for `swap(5,"x")` and
+/// `heapq.heappop(h)` regardless of call form.
+fn oracle_generic_call_ret(name: &str, sig: &FuncSig, arg_tys: &[Ty], ctx: &TyCtx) -> Ty {
+    match ctx.generic_funcs.get(name) {
+        Some(tps) if !tps.is_empty() => {
+            resolve_generic_call(&sig.params, &sig.ret, tps, arg_tys).ret
+        }
+        _ => sig.ret.clone(),
+    }
+}
+
+/// Per-argument TYPE compatibility + RESULT-type resolution for a resolved
+/// function signature, shared by the FLAT (`f(args)`) and QUALIFIED (`X.f(args)`)
+/// call paths so both treat a GENERIC callee identically (card: qualified generic
+/// calls). `arg_tys` are the already-checked positional argument types;
+/// `sig` is the callee's flat signature (whose `params`/`ret` carry `Ty::TypeVar`
+/// when the callee is generic); `lookup_name` is the BARE function name used to
+/// consult `ctx.generic_funcs`/`ctx.funcs` for generic unification; `diag_label`
+/// is how the function is named in diagnostics (`"heappush"` for a flat call,
+/// `"heapq.heappush"` for a qualified one).
+///
+/// Behaviour:
+/// - A CONCRETE param (no type variable) is checked with `types_compatible`
+///   (int→float coercion allowed, `Unknown` permissive) — an incompatible
+///   argument is an honest "argument N to `f`: expected X, found Y".
+/// - A param that IS or CONTAINS a type variable is SKIPPED here; structural
+///   unification validates it instead.
+/// - When the callee is GENERIC, `infer_generic_call_result` unifies the
+///   type-var-bearing params against `arg_tys` (consistency-checked) and returns
+///   the SUBSTITUTED concrete return type; a conflicting binding or an
+///   uninferable type parameter is surfaced as an honest error. Otherwise the
+///   declared return type is returned unchanged.
+///
+/// NOTE: this does NOT do arity, by-reference place checks, or shape-consuming
+/// builtin checks — those are call-path-specific and stay at the call sites. It
+/// covers exactly the generic-vs-concrete arg typing and the result type, which
+/// is the logic that must NOT differ between the flat and qualified forms.
+fn check_call_arg_types_and_result(
+    lookup_name: &str,
+    diag_label: &str,
+    sig: &FuncSig,
+    arg_tys: &[Ty],
+    ctx: &TyCtx,
+    span: Span,
+) -> Result<Ty> {
+    for (i, arg_ty) in arg_tys.iter().enumerate() {
+        if let Some((_, param_ty)) = sig.params.get(i) {
+            let int_to_float = matches!(arg_ty, Ty::Int) && matches!(param_ty, Ty::Float);
+            if !int_to_float
+                && !matches!(arg_ty, Ty::Unknown)
+                && !matches!(param_ty, Ty::Unknown)
+                && !contains_typevar(param_ty)
+                && !types_compatible(arg_ty, param_ty, ctx)
+            {
+                return Err(Error::Type {
+                    span,
+                    msg: format!(
+                        "argument {} to `{}`: expected {}, found {}",
+                        i + 1, diag_label, param_ty, arg_ty
+                    ),
+                });
+            }
+        }
+    }
+    // GENERIC callee: unify + substitute the return type (and surface
+    // conflicting / uninferable type parameters). Non-generic: declared return.
+    Ok(infer_generic_call_result(lookup_name, arg_tys, ctx, span)?
+        .unwrap_or_else(|| sig.ret.clone()))
+}
+
 // ── Generics v2: generic-CLASS instantiation + member substitution ───────────
 //
 // A generic class `class Box[T]:` carries its type parameters as `ClassDef.
@@ -4799,22 +4874,12 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
                             // `tuple[str, int]`. This is what lets codegen pick the
                             // right print-formatting and variable types for a
                             // generic call's RESULT (the result is always concrete
-                            // after substitution). On any conflict/uninferable case
-                            // (which the checking path rejects) fall back to the raw
-                            // declared return so this pure oracle never errors.
-                            if ctx.generic_funcs.get(n).is_some_and(|tps| !tps.is_empty()) {
-                                let arg_tys: Vec<Ty> = args.iter()
-                                    .map(|a| infer_expr_ty(a, locals, ctx))
-                                    .collect();
-                                let res = resolve_generic_call(
-                                    &sig.params, &sig.ret,
-                                    ctx.generic_funcs.get(n).map(|v| v.as_slice()).unwrap_or(&[]),
-                                    &arg_tys,
-                                );
-                                res.ret
-                            } else {
-                                sig.ret.clone()
-                            }
+                            // after substitution). Shared with the qualified arm via
+                            // `oracle_generic_call_ret`, which never errors.
+                            let arg_tys: Vec<Ty> = args.iter()
+                                .map(|a| infer_expr_ty(a, locals, ctx))
+                                .collect();
+                            oracle_generic_call_ret(n, sig, &arg_tys, ctx)
                         } else if let Some(Ty::Func(_, ret)) =
                             locals.get(n).or_else(|| ctx.vars.get(n))
                         {
@@ -4834,7 +4899,20 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
                 // former hardcoded math return-typing arm is gone.
                 if let Expr::Ident(modname, _) = obj.as_ref() {
                     if ctx.module_funcs.get(modname).is_some_and(|fns| fns.iter().any(|n| n == name)) {
-                        return ctx.funcs.get(name).map(|s| s.ret.clone()).unwrap_or(Ty::Unknown);
+                        // Generics v1: a QUALIFIED generic stdlib call
+                        // (`heapq.heappop(h)`) substitutes its inferred type args so
+                        // codegen sees a CONCRETE result type — the same handling as
+                        // the flat form, via the shared `oracle_generic_call_ret`. A
+                        // non-generic module fn returns its declared type unchanged.
+                        return match ctx.funcs.get(name) {
+                            Some(sig) => {
+                                let arg_tys: Vec<Ty> = args.iter()
+                                    .map(|a| infer_expr_ty(a, locals, ctx))
+                                    .collect();
+                                oracle_generic_call_ret(name, sig, &arg_tys, ctx)
+                            }
+                            None => Ty::Unknown,
+                        };
                     }
                 }
                 // Class methods use their declared return; builtin receivers
@@ -5934,30 +6012,26 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                                             ),
                                         });
                                     }
-                                    // Per-arg concrete-type compatibility (int->float
-                                    // coercion allowed), mirroring the flat-call arm.
-                                    for (i, a) in args.iter().enumerate() {
-                                        let arg_ty = check_expr(a, env)?;
-                                        if let Some((_, param_ty)) = sig.params.get(i) {
-                                            let int_to_float =
-                                                matches!(arg_ty, Ty::Int) && matches!(param_ty, Ty::Float);
-                                            if !int_to_float
-                                                && !matches!(arg_ty, Ty::Unknown)
-                                                && !matches!(param_ty, Ty::Unknown)
-                                                && !types_compatible(&arg_ty, param_ty, env.ctx)
-                                            {
-                                                return Err(Error::Type {
-                                                    span: *span,
-                                                    msg: format!(
-                                                        "argument {} to `{}.{}`: expected {}, found {}",
-                                                        i + 1, modname, name, param_ty, arg_ty
-                                                    ),
-                                                });
-                                            }
-                                        }
-                                    }
+                                    // Per-arg type-check + result resolution via the
+                                    // SHARED helper, so a qualified call to a GENERIC
+                                    // imported function (`heapq.heappush(h, 5)`) runs
+                                    // the SAME call-site unification as the flat form
+                                    // (`heappush(h, 5)`): a `list[T]` param accepts a
+                                    // `list[int]` arg (T=int), the return type is
+                                    // substituted, and conflicting/uninferable type
+                                    // parameters are honest errors here too. A
+                                    // non-generic qualified call (`string.capwords`)
+                                    // is unchanged — concrete params are still checked
+                                    // and the declared return is returned.
+                                    let arg_tys = args.iter()
+                                        .map(|a| check_expr(a, env))
+                                        .collect::<Result<Vec<_>>>()?;
+                                    let diag_label = format!("{}.{}", modname, name);
+                                    let result = check_call_arg_types_and_result(
+                                        name, &diag_label, &sig, &arg_tys, env.ctx, *span,
+                                    )?;
                                     for (_, v) in kwargs { check_expr(v, env)?; }
-                                    return Ok(sig.ret.clone());
+                                    return Ok(result);
                                 } else {
                                     // X IS a tracked module but defines no such `f`.
                                     return Err(Error::Type {

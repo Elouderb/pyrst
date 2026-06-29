@@ -25,6 +25,18 @@ pub enum Ty {
     /// references used as values and (capturing) lambdas.
     Func(Vec<Ty>, Box<Ty>),
     File,            // an open file handle (open() / `with open(...) as f`)
+    /// Generics v1: a BOUND type variable inside a parametric generic function,
+    /// e.g. the `T` in `def f[T](x: T) -> T`. It is produced ONLY by the scoped
+    /// annotation lowering (`from_type_expr_scoped`) when a name matches one of
+    /// the enclosing function's declared `type_params`; a type name that is not a
+    /// declared param stays a `Ty::Class`/builtin exactly as before. A `TypeVar`
+    /// is OPAQUE in a function body (only move/clone/assign/return/pass/container
+    /// index+store are allowed — see `reject_typevar_ops`); at a CALL site it is
+    /// unified against the actual argument type and SUBSTITUTED away, so it never
+    /// reaches a concrete call's result type. Codegen emits it as the Rust
+    /// generic parameter name (`rust_ty` -> the bare name) and `is_copy` is false
+    /// (clone-on-use, matching the `T: Clone` bound emitted on the `fn`).
+    TypeVar(String),
     Unknown,
 }
 
@@ -59,6 +71,7 @@ impl std::fmt::Display for Ty {
                 write!(f, "], {}]", ret)
             }
             Ty::File      => write!(f, "file"),
+            Ty::TypeVar(n) => write!(f, "{}", n),
             Ty::Unknown   => write!(f, "unknown"),
         }
     }
@@ -79,26 +92,42 @@ impl Ty {
     /// discard any error (codegen, type-inference fallbacks) may pass
     /// `Span::DUMMY` since the error never reaches the user.
     pub fn from_type_expr(t: &TypeExpr, span: Span) -> Result<Ty> {
+        Ty::from_type_expr_scoped(t, span, &[])
+    }
+
+    /// Generics v1: like [`from_type_expr`], but a bare type NAME that matches one
+    /// of `type_params` lowers to `Ty::TypeVar(name)` instead of `Ty::Class(name)`.
+    /// `type_params` is the enclosing generic function's declared type-variable
+    /// set (empty for every non-generic context, where this is identical to
+    /// `from_type_expr`). The scope threads through every nested element type, so
+    /// `list[T]`, `tuple[A, B]`, `dict[K, V]`, `Optional[T]`, and
+    /// `Callable[[T], T]` all resolve their type-var components. A name NOT in
+    /// `type_params` is unaffected (stays a builtin / `Ty::Class`).
+    pub fn from_type_expr_scoped(t: &TypeExpr, span: Span, type_params: &[String]) -> Result<Ty> {
         Ok(match t {
             TypeExpr::None_ => Ty::Unit,
             TypeExpr::Named(n) => {
                 let stripped = n.trim_matches('\'').trim_matches('"');
-                match stripped {
-                    "int" => Ty::Int,
-                    "float" => Ty::Float,
-                    "bool" => Ty::Bool,
-                    "str" => Ty::Str,
-                    other => Ty::Class(other.to_string()),
+                if type_params.iter().any(|tp| tp == stripped) {
+                    Ty::TypeVar(stripped.to_string())
+                } else {
+                    match stripped {
+                        "int" => Ty::Int,
+                        "float" => Ty::Float,
+                        "bool" => Ty::Bool,
+                        "str" => Ty::Str,
+                        other => Ty::Class(other.to_string()),
+                    }
                 }
             }
             TypeExpr::Generic(n, args) => match (n.as_str(), args.as_slice()) {
-                ("list", [t]) => Ty::List(Box::new(Ty::from_type_expr(t, span)?)),
+                ("list", [t]) => Ty::List(Box::new(Ty::from_type_expr_scoped(t, span, type_params)?)),
                 ("set", [t]) => {
                     // A declared `set[float]` resolves to Set(Float), which
                     // codegen would emit as the uncompilable `HashSet<f64>`.
                     // Reject it at the resolver so vars, params, and returns are
                     // covered uniformly — even when initialized with `set()`.
-                    let elem = Ty::from_type_expr(t, span)?;
+                    let elem = Ty::from_type_expr_scoped(t, span, type_params)?;
                     require_hashable(&elem, span, "set element")?;
                     Ty::Set(Box::new(elem))
                 }
@@ -106,11 +135,11 @@ impl Ty {
                     // A declared `dict[float, _]` resolves to Dict(Float, _) ->
                     // uncompilable `HashMap<f64, _>`. Reject the KEY only; float
                     // values are fine.
-                    let key = Ty::from_type_expr(k, span)?;
+                    let key = Ty::from_type_expr_scoped(k, span, type_params)?;
                     require_hashable(&key, span, "dict key")?;
-                    Ty::Dict(Box::new(key), Box::new(Ty::from_type_expr(v, span)?))
+                    Ty::Dict(Box::new(key), Box::new(Ty::from_type_expr_scoped(v, span, type_params)?))
                 }
-                ("tuple", args) => Ty::Tuple(args.iter().map(|a| Ty::from_type_expr(a, span)).collect::<Result<Vec<_>>>()?),
+                ("tuple", args) => Ty::Tuple(args.iter().map(|a| Ty::from_type_expr_scoped(a, span, type_params)).collect::<Result<Vec<_>>>()?),
                 // `Iterator[T]` is the declared return type of a GENERATOR (a
                 // function whose body contains `yield`). In pyrst's EAGER v1 a
                 // generator runs to completion collecting its yielded values into
@@ -120,14 +149,14 @@ impl Ty {
                 // applies unchanged. Generator-ness is tracked separately (by the
                 // presence of `Stmt::Yield`) and drives the honest-error checks +
                 // the Vec-collect desugar; the element typing is just `list[T]`.
-                ("Iterator", [t]) => Ty::List(Box::new(Ty::from_type_expr(t, span)?)),
-                ("Optional", [t]) => Ty::Option(Box::new(Ty::from_type_expr(t, span)?)),
+                ("Iterator", [t]) => Ty::List(Box::new(Ty::from_type_expr_scoped(t, span, type_params)?)),
+                ("Optional", [t]) => Ty::Option(Box::new(Ty::from_type_expr_scoped(t, span, type_params)?)),
                 ("Union", args) => {
                     let non_none: Vec<_> = args.iter()
                         .filter(|a| !matches!(a, TypeExpr::None_))
                         .collect();
                     if non_none.len() == 1 {
-                        Ty::Option(Box::new(Ty::from_type_expr(non_none[0], span)?))
+                        Ty::Option(Box::new(Ty::from_type_expr_scoped(non_none[0], span, type_params)?))
                     } else {
                         Ty::Unknown
                     }
@@ -147,15 +176,15 @@ impl Ty {
                 }),
             },
             TypeExpr::Tuple(parts) => {
-                let tys = parts.iter().map(|p| Ty::from_type_expr(p, span)).collect::<Result<Vec<_>>>()?;
+                let tys = parts.iter().map(|p| Ty::from_type_expr_scoped(p, span, type_params)).collect::<Result<Vec<_>>>()?;
                 Ty::Tuple(tys)
             }
             // `Callable[[Arg, ...], Ret]` -> `Ty::Func`. Each argument type and
             // the return type lower recursively (so a `Callable` nested inside a
             // `Callable` argument/return also resolves).
             TypeExpr::Func(args, ret) => {
-                let arg_tys = args.iter().map(|a| Ty::from_type_expr(a, span)).collect::<Result<Vec<_>>>()?;
-                Ty::Func(arg_tys, Box::new(Ty::from_type_expr(ret, span)?))
+                let arg_tys = args.iter().map(|a| Ty::from_type_expr_scoped(a, span, type_params)).collect::<Result<Vec<_>>>()?;
+                Ty::Func(arg_tys, Box::new(Ty::from_type_expr_scoped(ret, span, type_params)?))
             }
         })
     }
@@ -216,6 +245,17 @@ pub struct TyCtx {
     /// same-name collision is unresolved (stdlib uses distinct names). Empty on
     /// the LSP single-file path for the same reason as `module_funcs`.
     pub module_consts: HashMap<String, Vec<(String, Ty)>>,
+    /// Generics v1: function NAME → its declared PEP 695 type-parameter list
+    /// (`def f[T, U](...)` -> `["T", "U"]`). ONLY generic functions appear here;
+    /// a plain `def` is absent. Populated by the resolver alongside `funcs`. The
+    /// matching `FuncSig` in `funcs` already has its `params`/`ret` lowered with
+    /// these names as `Ty::TypeVar` (scoped lowering), so call-site unification
+    /// reads the structure from the sig and consults THIS map for the full
+    /// declared set — needed to detect a type param that no argument can infer
+    /// (the "cannot infer type parameter `T`" error) and to keep the unification
+    /// fast-path off the non-generic hot path (`funcs` lookups stay unchanged for
+    /// the 99% non-generic case).
+    pub generic_funcs: HashMap<String, Vec<String>>,
 }
 
 impl TyCtx {
@@ -326,7 +366,7 @@ impl TyCtx {
         vars.insert("dict".into(), Ty::Dict(Box::new(Ty::Str), Box::new(Ty::Unknown)));
         vars.insert("set".into(), Ty::Set(Box::new(Ty::Unknown)));
 
-        Self { funcs, classes: HashMap::new(), vars, module_funcs: HashMap::new(), module_consts: HashMap::new() }
+        Self { funcs, classes: HashMap::new(), vars, module_funcs: HashMap::new(), module_consts: HashMap::new(), generic_funcs: HashMap::new() }
     }
 
     pub fn get_all_fields(&self, class_name: &str) -> Vec<crate::ast::Param> {
@@ -665,6 +705,12 @@ struct FuncEnv<'a> {
     /// `ret_ty` is not `Unit` (it ends collection early), and a `return <value>`
     /// is rejected (generators yield values, they do not return one).
     is_generator: bool,
+    /// Generics v1: the enclosing function's declared type-parameter names. A
+    /// param bound to a `Ty::TypeVar` in this set is OPAQUE inside the body —
+    /// `reject_typevar_op` turns any operation on it that needs a trait bound
+    /// (arithmetic, comparison, `print`, calling a method, ...) into an honest
+    /// error. Empty for every non-generic function/method/lambda.
+    type_params: std::collections::HashSet<String>,
 }
 
 impl<'a> FuncEnv<'a> {
@@ -681,7 +727,14 @@ impl<'a> FuncEnv<'a> {
             param_set.insert(name.clone());
         }
         let by_ref_params = by_ref_names.iter().cloned().collect();
-        FuncEnv { ctx, locals, ret_ty, used_vars, params: param_set, reassigned_params: std::collections::HashSet::new(), returned_params: std::collections::HashSet::new(), by_ref_params, is_generator: false }
+        FuncEnv { ctx, locals, ret_ty, used_vars, params: param_set, reassigned_params: std::collections::HashSet::new(), returned_params: std::collections::HashSet::new(), by_ref_params, is_generator: false, type_params: std::collections::HashSet::new() }
+    }
+
+    /// The enclosing generic function's declared type-parameter names as a
+    /// `Vec<String>` for `from_type_expr_scoped`. Empty for non-generic
+    /// functions (so scoped lowering there is identical to the plain path).
+    fn type_param_list(&self) -> Vec<String> {
+        self.type_params.iter().cloned().collect()
     }
 
     fn lookup(&self, name: &str) -> Option<Ty> {
@@ -1212,16 +1265,20 @@ fn check_one_func(f: &Func, ctx: &TyCtx) -> Result<()> {
         return validate_extern_func(f, ctx);
     }
 
+    // Generics v1: param/return annotations naming a declared type parameter
+    // lower to `Ty::TypeVar` (scoped lowering). Empty `type_params` => identical
+    // to the non-generic path.
     let params: Vec<(String, Ty)> = f.params.iter()
         .filter(|p| p.name != "self")
-        .map(|p| Ty::from_type_expr(&p.ty, p.span).map(|ty| (p.name.clone(), ty)))
+        .map(|p| Ty::from_type_expr_scoped(&p.ty, p.span, &f.type_params).map(|ty| (p.name.clone(), ty)))
         .collect::<Result<Vec<_>>>()?;
     let by_ref_names: Vec<String> = f.params.iter()
         .filter(|p| p.name != "self" && p.by_ref)
         .map(|p| p.name.clone())
         .collect();
-    let ret = Ty::from_type_expr(&f.ret, f.span)?;
+    let ret = Ty::from_type_expr_scoped(&f.ret, f.span, &f.type_params)?;
     let mut env = FuncEnv::with_by_ref(ctx, &params, &by_ref_names, ret);
+    env.type_params = f.type_params.iter().cloned().collect();
     env.is_generator = check_generator_signature(&f.body, &f.ret, f.span)?;
     collect_returned_param_idents(&f.body, &env.params, &mut env.returned_params);
     check_body(&f.body, &mut env)?;
@@ -1782,6 +1839,265 @@ fn types_compatible(val_ty: &Ty, declared_ty: &Ty, ctx: &TyCtx) -> bool {
     }
 }
 
+// ── Generics v1: call-site unification + substitution ────────────────────────
+//
+// When a parametric generic function `def f[T, U](..)` is called, each declared
+// parameter type (which may CONTAIN `Ty::TypeVar`s) is structurally unified
+// against the corresponding actual argument type, accumulating a substitution
+// `{T -> concrete}`. A type variable that appears in more than one position must
+// bind CONSISTENTLY; substituting the result into the declared return type gives
+// the call's concrete result type. The same machinery is consumed by BOTH the
+// error-checking `check_expr` Call arm and the codegen-facing `infer_expr_ty`
+// oracle (via `infer_generic_call_result`), so the two never drift on what a
+// generic call returns.
+
+/// Structurally UNIFY a declared parameter type `declared` (which may contain
+/// `Ty::TypeVar`s drawn from `type_params`) against the actual argument type
+/// `actual`, recording each variable's binding in `subst`. Returns `Err(msg)` on
+/// a CONFLICTING binding for some `T` (e.g. `int` then `str`); the message names
+/// the variable and the two conflicting types.
+///
+/// Soundness notes:
+/// - A `TypeVar` binds to the FIRST concrete `actual` seen, then every later
+///   occurrence must AGREE. `Ty::Unknown` on the actual side is permissive (it
+///   neither binds nor conflicts) so untyped values never spuriously fail.
+/// - Recursion descends ONLY through matching structure (`List`/`List`,
+///   `Tuple`/`Tuple` of equal arity, `Dict`/`Dict`, `Option`/`Option`,
+///   `Func`/`Func` of equal arity). A structural MISMATCH where the declared
+///   side contains no type variable is NOT an error here — it is left to the
+///   caller's existing `types_compatible` check, which already produces the
+///   canonical "argument N: expected X, found Y" diagnostic. A mismatch where the
+///   declared side IS (or contains) a bare type variable simply binds the whole
+///   actual to that variable (e.g. `T` against `list[int]` binds `T=list[int]`).
+fn unify_typevar(
+    declared: &Ty,
+    actual: &Ty,
+    type_params: &[String],
+    subst: &mut HashMap<String, Ty>,
+) -> std::result::Result<(), String> {
+    match declared {
+        Ty::TypeVar(name) => {
+            // Only a name that is actually in scope as a type parameter binds.
+            // (Defensive: every TypeVar reaching here is in `type_params` by
+            // construction, but this keeps the function total either way.)
+            if !type_params.iter().any(|tp| tp == name) {
+                return Ok(());
+            }
+            // An `Unknown` actual carries no information — do not bind to it
+            // (binding `T=Unknown` would poison later consistency checks).
+            if matches!(actual, Ty::Unknown) {
+                return Ok(());
+            }
+            match subst.get(name) {
+                None => {
+                    subst.insert(name.clone(), actual.clone());
+                    Ok(())
+                }
+                Some(existing) if existing == actual => Ok(()),
+                // A previously-bound variable seen with an `Unknown` later is
+                // fine (keep the concrete binding); only two CONCRETE, differing
+                // types conflict.
+                Some(_) if matches!(actual, Ty::Unknown) => Ok(()),
+                Some(existing) => Err(format!(
+                    "conflicting types for type parameter `{}`: {} vs {}",
+                    name, existing, actual
+                )),
+            }
+        }
+        // Descend through matching container structure so nested type vars bind
+        // (`list[T]` vs `list[int]` -> T=int; `dict[K, V]` vs `dict[str, int]`
+        // -> K=str, V=int; `tuple[A, B]` vs `tuple[int, str]` -> A=int, B=str).
+        Ty::List(d) => match actual {
+            Ty::List(a) => unify_typevar(d, a, type_params, subst),
+            _ => Ok(()),
+        },
+        Ty::Set(d) => match actual {
+            Ty::Set(a) => unify_typevar(d, a, type_params, subst),
+            _ => Ok(()),
+        },
+        Ty::Dict(dk, dv) => match actual {
+            Ty::Dict(ak, av) => {
+                unify_typevar(dk, ak, type_params, subst)?;
+                unify_typevar(dv, av, type_params, subst)
+            }
+            _ => Ok(()),
+        },
+        Ty::Option(d) => match actual {
+            Ty::Option(a) => unify_typevar(d, a, type_params, subst),
+            _ => Ok(()),
+        },
+        Ty::Tuple(ds) => match actual {
+            Ty::Tuple(as_) if ds.len() == as_.len() => {
+                for (d, a) in ds.iter().zip(as_.iter()) {
+                    unify_typevar(d, a, type_params, subst)?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        },
+        Ty::Func(dargs, dret) => match actual {
+            Ty::Func(aargs, aret) if dargs.len() == aargs.len() => {
+                for (d, a) in dargs.iter().zip(aargs.iter()) {
+                    unify_typevar(d, a, type_params, subst)?;
+                }
+                unify_typevar(dret, aret, type_params, subst)
+            }
+            _ => Ok(()),
+        },
+        // A concrete declared type contributes no binding; compatibility of
+        // concrete positions is the caller's `types_compatible` concern.
+        _ => Ok(()),
+    }
+}
+
+/// Apply a `{TypeVar -> Ty}` substitution to `ty`, replacing every bound type
+/// variable with its concrete type and recursing through containers. An UNBOUND
+/// type variable (one absent from `subst`) is left as-is — the caller decides
+/// whether that is an "uninferable" error.
+fn substitute_typevars(ty: &Ty, subst: &HashMap<String, Ty>) -> Ty {
+    match ty {
+        Ty::TypeVar(name) => subst.get(name).cloned().unwrap_or_else(|| ty.clone()),
+        Ty::List(inner) => Ty::List(Box::new(substitute_typevars(inner, subst))),
+        Ty::Set(inner) => Ty::Set(Box::new(substitute_typevars(inner, subst))),
+        Ty::Dict(k, v) => Ty::Dict(
+            Box::new(substitute_typevars(k, subst)),
+            Box::new(substitute_typevars(v, subst)),
+        ),
+        Ty::Option(inner) => Ty::Option(Box::new(substitute_typevars(inner, subst))),
+        Ty::Tuple(parts) => Ty::Tuple(parts.iter().map(|p| substitute_typevars(p, subst)).collect()),
+        Ty::Func(args, ret) => Ty::Func(
+            args.iter().map(|a| substitute_typevars(a, subst)).collect(),
+            Box::new(substitute_typevars(ret, subst)),
+        ),
+        _ => ty.clone(),
+    }
+}
+
+/// True if `ty` mentions any `Ty::TypeVar` (used to decide whether a return type
+/// still has unsubstituted variables after unification).
+fn contains_typevar(ty: &Ty) -> bool {
+    match ty {
+        Ty::TypeVar(_) => true,
+        Ty::List(inner) | Ty::Set(inner) | Ty::Option(inner) => contains_typevar(inner),
+        Ty::Dict(k, v) => contains_typevar(k) || contains_typevar(v),
+        Ty::Tuple(parts) => parts.iter().any(contains_typevar),
+        Ty::Func(args, ret) => args.iter().any(contains_typevar) || contains_typevar(ret),
+        _ => false,
+    }
+}
+
+/// The result of unifying a generic call's declared param types against its
+/// actual argument types: the SUBSTITUTED return type plus the accumulated
+/// substitution. Shared by the checking path (which surfaces the errors) and the
+/// inference oracle (which only needs the substituted return type).
+struct GenericCallResolution {
+    /// Declared return type with every inferred type variable substituted away.
+    ret: Ty,
+    /// Names of declared type parameters that NO argument position could bind.
+    uninferable: Vec<String>,
+    /// First conflicting-binding error message, if any.
+    conflict: Option<String>,
+}
+
+/// Run unification for a generic function call. `params`/`ret` are the declared
+/// signature types (containing `Ty::TypeVar`), `type_params` the declared
+/// type-variable set, and `arg_tys` the actual argument types (positional,
+/// already type-checked). Pure: surfaces conflicts and uninferable params for the
+/// caller to report, and returns the substituted return type (still containing
+/// any uninferable variables, which the caller treats as an error).
+fn resolve_generic_call(
+    params: &[(String, Ty)],
+    ret: &Ty,
+    type_params: &[String],
+    arg_tys: &[Ty],
+) -> GenericCallResolution {
+    let mut subst: HashMap<String, Ty> = HashMap::new();
+    let mut conflict: Option<String> = None;
+    for ((_, decl), actual) in params.iter().zip(arg_tys.iter()) {
+        if let Err(msg) = unify_typevar(decl, actual, type_params, &mut subst) {
+            conflict = Some(msg);
+            break;
+        }
+    }
+    let uninferable: Vec<String> = type_params
+        .iter()
+        .filter(|tp| !subst.contains_key(*tp))
+        .cloned()
+        .collect();
+    GenericCallResolution {
+        ret: substitute_typevars(ret, &subst),
+        uninferable,
+        conflict,
+    }
+}
+
+/// Compute the concrete RESULT TYPE of a call to the generic function `name`
+/// given its already-resolved argument types `arg_tys`. Returns:
+/// - `Ok(Some(ty))` — the substituted return type for a successful unification;
+/// - `Ok(None)` — `name` is not a generic function (caller uses its plain path);
+/// - `Err(..)` — a conflicting binding or an uninferable type parameter, with an
+///   honest diagnostic pointing at `span`.
+///
+/// This is the SINGLE entry point both `check_expr` and `infer_expr_ty` use, so
+/// the error-checking and codegen-inference views of a generic call agree.
+fn infer_generic_call_result(
+    name: &str,
+    arg_tys: &[Ty],
+    ctx: &TyCtx,
+    span: Span,
+) -> Result<Option<Ty>> {
+    let type_params = match ctx.generic_funcs.get(name) {
+        Some(tps) if !tps.is_empty() => tps,
+        _ => return Ok(None),
+    };
+    let sig = match ctx.funcs.get(name) {
+        Some(s) => s,
+        None => return Ok(None),
+    };
+    let res = resolve_generic_call(&sig.params, &sig.ret, type_params, arg_tys);
+    if let Some(msg) = res.conflict {
+        return Err(Error::Type { span, msg });
+    }
+    if let Some(missing) = res.uninferable.first() {
+        return Err(Error::Type {
+            span,
+            msg: format!(
+                "cannot infer type parameter `{}` of generic function `{}` from its arguments \
+                 (explicit type arguments are not supported)",
+                missing, name
+            ),
+        });
+    }
+    Ok(Some(res.ret))
+}
+
+/// Generics v1 — the OPS-ON-`T` restriction. A bound type variable is PARAMETRIC
+/// (opaque): inside a generic function a value of type `Ty::TypeVar` may be
+/// moved, cloned, assigned, returned, passed to another generic, and stored
+/// in / read from a container — but it may NOT be OPERATED ON, because any
+/// operation (arithmetic, comparison, indexing, calling a method, `print`, ...)
+/// would require a trait bound that v1 does not support. This turns such an
+/// operation into an HONEST typeck error instead of a confusing rustc error
+/// (e.g. "cannot add `T` to `T`") on the generated crate.
+///
+/// `ty` is the operand's type, `op_desc` names the operation for the diagnostic
+/// (e.g. "apply `+` to", "compare", "index", "call a method on", "print").
+/// A non-`TypeVar` `ty` is always Ok (the operation proceeds normally).
+fn reject_typevar_op(ty: &Ty, op_desc: &str, span: Span) -> Result<()> {
+    if let Ty::TypeVar(name) = ty {
+        return Err(Error::Type {
+            span,
+            msg: format!(
+                "cannot {} a value of generic type `{}` \
+                 (operations on a type parameter require trait bounds, \
+                 which are not supported in generics v1)",
+                op_desc, name
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// (EPIC-5) Recognize a None-guard condition of the form `x is None` /
 /// `x is not None` on a plain local name. Returns `(name, is_not_none)` where
 /// `is_not_none` is true for `is not None` (the branch in which `x` is the
@@ -1973,6 +2289,9 @@ pub fn is_copy(ty: &Ty) -> bool {
         | Ty::Func(_, _)
         | Ty::NoneVal
         | Ty::File
+        // A bound type variable is non-Copy: codegen emits a `T: Clone` bound and
+        // clones on use, so a type-var value behaves like any owned value.
+        | Ty::TypeVar(_)
         | Ty::Unknown => false,
     }
 }
@@ -2372,12 +2691,18 @@ fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
         }
         Stmt::Assign { target, ty, value, span } => {
             let val_ty = check_expr(value, env)?;
+            // Generics v1: a local annotation `y: T` inside a generic function
+            // resolves `T` to the same `Ty::TypeVar` the params/return use, so an
+            // assignment of a type-var value to a type-var-annotated local
+            // type-checks (move/clone/assign-to-T-var is allowed). The scope is
+            // the enclosing function's type params (empty everywhere else).
+            let tp = env.type_param_list();
             let declared = match ty {
-                Some(t) => Ty::from_type_expr(t, *span)?,
+                Some(t) => Ty::from_type_expr_scoped(t, *span, &tp)?,
                 None => val_ty.clone(),
             };
             if let Some(t) = ty {
-                let explicit = Ty::from_type_expr(t, *span)?;
+                let explicit = Ty::from_type_expr_scoped(t, *span, &tp)?;
                 if !types_compatible(&val_ty, &explicit, env.ctx) {
                     return Err(Error::Type {
                         span: *span,
@@ -2938,8 +3263,30 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
                         // `f(x)` yields the function value's return type.
                         if ctx.classes.contains_key(n) {
                             Ty::Class(n.to_string())
-                        } else if let Some(ret) = ctx.funcs.get(n).map(|s| s.ret.clone()) {
-                            ret
+                        } else if let Some(sig) = ctx.funcs.get(n) {
+                            // Generics v1: for a generic call, infer the concrete
+                            // result by unifying the declared param types against
+                            // the argument types — so `first([10, 20])` infers
+                            // `int` (not `T`) and `swap(5, "x")` infers
+                            // `tuple[str, int]`. This is what lets codegen pick the
+                            // right print-formatting and variable types for a
+                            // generic call's RESULT (the result is always concrete
+                            // after substitution). On any conflict/uninferable case
+                            // (which the checking path rejects) fall back to the raw
+                            // declared return so this pure oracle never errors.
+                            if ctx.generic_funcs.get(n).is_some_and(|tps| !tps.is_empty()) {
+                                let arg_tys: Vec<Ty> = args.iter()
+                                    .map(|a| infer_expr_ty(a, locals, ctx))
+                                    .collect();
+                                let res = resolve_generic_call(
+                                    &sig.params, &sig.ret,
+                                    ctx.generic_funcs.get(n).map(|v| v.as_slice()).unwrap_or(&[]),
+                                    &arg_tys,
+                                );
+                                res.ret
+                            } else {
+                                sig.ret.clone()
+                            }
                         } else if let Some(Ty::Func(_, ret)) =
                             locals.get(n).or_else(|| ctx.vars.get(n))
                         {
@@ -3358,6 +3705,10 @@ fn lambda_ret_with_elem(
                 // A lambda body is a single expression and can never contain a
                 // `yield` statement, so it is never a generator.
                 is_generator: false,
+                // A lambda introduces its own (untyped) parameters; the enclosing
+                // function's type variables are not in scope for the lambda's own
+                // params, so this stays empty.
+                type_params: std::collections::HashSet::new(),
             };
             // Bind every param: the first to the iterable element type, the
             // rest to their declared type or Unknown (map/filter pass a single
@@ -3428,6 +3779,10 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 // (a `yield` cannot appear inside a comprehension expression, but
                 // propagating keeps the env honest).
                 is_generator: env.is_generator,
+                // Inherit the enclosing generic function's type parameters so a
+                // comprehension body inside a generic function keeps the
+                // ops-on-`T` restriction.
+                type_params: env.type_params.clone(),
             };
             bind_comp_targets(targets, elem_ty, &mut inner_env.locals);
             if let Some(c) = cond { check_expr(c, &mut inner_env)?; }
@@ -3456,6 +3811,10 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 // (a `yield` cannot appear inside a comprehension expression, but
                 // propagating keeps the env honest).
                 is_generator: env.is_generator,
+                // Inherit the enclosing generic function's type parameters so a
+                // comprehension body inside a generic function keeps the
+                // ops-on-`T` restriction.
+                type_params: env.type_params.clone(),
             };
             bind_comp_targets(targets, elem_ty, &mut inner_env.locals);
             if let Some(c) = cond { check_expr(c, &mut inner_env)?; }
@@ -3487,6 +3846,10 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 // (a `yield` cannot appear inside a comprehension expression, but
                 // propagating keeps the env honest).
                 is_generator: env.is_generator,
+                // Inherit the enclosing generic function's type parameters so a
+                // comprehension body inside a generic function keeps the
+                // ops-on-`T` restriction.
+                type_params: env.type_params.clone(),
             };
             bind_comp_targets(targets, elem_ty, &mut inner_env.locals);
             if let Some(c) = cond { check_expr(c, &mut inner_env)?; }
@@ -3751,6 +4114,15 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                         let sig_params = sig.params.clone();
                         let sig_by_ref = sig.param_by_ref.clone();
                         let sig_ret = sig.ret.clone();
+                        // Generics v1: is this a parametric generic function? Its
+                        // type-var-bearing params are validated by call-site
+                        // UNIFICATION (below), not the concrete `types_compatible`
+                        // check, so a `T` param accepts any argument type while a
+                        // CONCRETE param of a generic function is still checked.
+                        let is_generic = env.ctx.generic_funcs
+                            .get(name.as_str())
+                            .is_some_and(|tps| !tps.is_empty());
+                        let mut arg_tys: Vec<Ty> = Vec::with_capacity(args.len());
                         for (i, a) in args.iter().enumerate() {
                             // EPIC-4 V2: an argument bound to a by-reference
                             // (`Mut[T]`) param must be a PLACE — an lvalue we can
@@ -3776,9 +4148,20 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                                 });
                             }
                             let arg_ty = check_expr(a, env)?;
+                            // Generics v1: a builtin that must FORMAT/stringify its
+                            // argument (`print`/`str`/`repr`/`ascii`) cannot accept a
+                            // bare type variable — formatting needs a `Display`/`Debug`
+                            // bound, out of v1 scope. (`first([...])` etc. are fine:
+                            // their RESULT is concrete after unification; only a BARE
+                            // `T` value reaches here as `Ty::TypeVar`.)
+                            if matches!(name.as_str(), "print" | "str" | "repr" | "ascii") {
+                                reject_typevar_op(&arg_ty, "print", *span)?;
+                            }
                             // Concrete-only positional arg-type check (skip variadic builtins).
                             // Only fires when BOTH param and arg types are concrete and
                             // incompatible. Int->Float is explicitly allowed (Python coercion).
+                            // A param that IS (or contains) a type variable is skipped
+                            // here — unification validates it structurally afterwards.
                             if !variadic {
                                 if let Some((_, param_ty)) = sig_params.get(i) {
                                     let int_to_float =
@@ -3786,6 +4169,7 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                                     if !int_to_float
                                         && !matches!(arg_ty, Ty::Unknown)
                                         && !matches!(param_ty, Ty::Unknown)
+                                        && !contains_typevar(param_ty)
                                         && !types_compatible(&arg_ty, param_ty, env.ctx)
                                     {
                                         return Err(Error::Type {
@@ -3798,8 +4182,19 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                                     }
                                 }
                             }
+                            arg_tys.push(arg_ty);
                         }
-                        sig_ret
+                        if is_generic {
+                            // Unify the declared (type-var-bearing) params against
+                            // the actual argument types: surfaces a conflicting
+                            // binding ("conflicting types for type parameter `T`")
+                            // or an uninferable type parameter, and yields the
+                            // SUBSTITUTED concrete return type for this call.
+                            infer_generic_call_result(name, &arg_tys, env.ctx, *span)?
+                                .unwrap_or(sig_ret)
+                        } else {
+                            sig_ret
+                        }
                     } else if name == "super" && args.is_empty() && kwargs.is_empty() {
                         // super() returns Unknown type — the codegen handles super().method() specially
                         Ty::Unknown
@@ -3937,6 +4332,10 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                     }
                     if let Expr::Attr { obj, name, .. } = callee.as_ref() {
                         let obj_ty = check_expr(obj, env)?;
+                        // Generics v1: calling a method on a bare type variable
+                        // (`t.foo()` where `t: T`) needs a trait bound and is
+                        // rejected — `T` is opaque, with no known methods.
+                        reject_typevar_op(&obj_ty, "call a method on", *span)?;
                         if let Ty::Class(class_name) = &obj_ty {
                             let key = format!("{}.{}", class_name, name);
                             if let Some(sig) = env.ctx.funcs.get(&key).cloned() {
@@ -4142,9 +4541,14 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
             }
             Ty::Unknown
         }
-        Expr::Index { obj, idx, .. } => {
+        Expr::Index { obj, idx, span } => {
             let obj_ty = check_expr(obj, env)?;
             check_expr(idx, env)?;
+            // Generics v1: a bare type variable is OPAQUE — it is not known to be
+            // a container, so indexing it (`t[i]`) needs a bound and is rejected.
+            // (Indexing a `list[T]`/`dict[K, V]` whose ELEMENT is a type var is
+            // fine — that yields the element type below.)
+            reject_typevar_op(&obj_ty, "index", *span)?;
             match obj_ty {
                 Ty::List(inner) => *inner,
                 Ty::Dict(_, v) => *v,
@@ -4176,6 +4580,17 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
         Expr::BinOp { op, lhs, rhs, span } => {
             let l = check_expr(lhs, env)?;
             let r = check_expr(rhs, env)?;
+            // Generics v1: a binary operator on a bare type variable
+            // (arithmetic, comparison, membership, ...) needs a trait bound and
+            // is rejected honestly. The description distinguishes comparison from
+            // arithmetic so the message reads naturally.
+            let op_desc = match op {
+                BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => "compare",
+                BinOp::In | BinOp::NotIn => "test membership of",
+                _ => "apply an operator to",
+            };
+            reject_typevar_op(&l, op_desc, *span)?;
+            reject_typevar_op(&r, op_desc, *span)?;
             // (EPIC-5) Reject using a raw `Optional[T]` operand without narrowing.
             // An Option only supports identity/equality testing against `None`
             // (`is` / `is not` / `==` / `!=`); any other operator (arithmetic,
@@ -4231,8 +4646,11 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 }
             }
         }
-        Expr::UnOp { op, expr, .. } => {
+        Expr::UnOp { op, expr, span } => {
             let t = check_expr(expr, env)?;
+            // Generics v1: a unary operator on a bare type variable is rejected
+            // (needs `Neg`/`Not` bounds, out of v1 scope).
+            reject_typevar_op(&t, "apply a unary operator to", *span)?;
             match op {
                 UnOp::Not => Ty::Bool,
                 UnOp::Neg => t,
@@ -4275,6 +4693,8 @@ fn lambda_body_ty(
         by_ref_params: std::collections::HashSet::new(),
         // A lambda body is a single expression — never a generator.
         is_generator: false,
+        // A lambda's params are its own; enclosing type variables don't apply.
+        type_params: std::collections::HashSet::new(),
     };
     for (param_name, param_ty) in params {
         let ty = lambda_param_ty(param_ty);

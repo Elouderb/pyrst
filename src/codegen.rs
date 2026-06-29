@@ -1402,7 +1402,24 @@ impl<'a> Codegen<'a> {
         } else {
             f.name.clone()
         };
-        let mut sig = format!("fn {}(", name);
+        // Generics v1 (PEP 695): a parametric generic function emits a Rust
+        // generic-parameter clause `<T: Clone, U: Clone>` right after the name.
+        // The `Clone` bound covers pyrst's value-semantics clone-on-use (a
+        // type-var value is non-Copy — `is_copy(TypeVar)` is false — so it is
+        // cloned wherever a Copy value would be used directly). A non-generic
+        // function has an empty `type_params` and emits no clause. Methods are
+        // never generic in v1 (parser-rejected), so this only matters for free
+        // functions, but the code is uniform.
+        let generics = if f.type_params.is_empty() {
+            String::new()
+        } else {
+            let bounds = f.type_params.iter()
+                .map(|t| format!("{}: Clone", t))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("<{}>", bounds)
+        };
+        let mut sig = format!("fn {}{}(", name, generics);
         let mut first = true;
         // Static methods don't get self; regular methods take &self or &mut self based on whether they modify self.
         if let Some(cls) = method_of {
@@ -1425,7 +1442,7 @@ impl<'a> Codegen<'a> {
         for p in f.params.iter().filter(|p| p.name != "self") {
             if !first { sig.push_str(", "); }
             first = false;
-            let pty = self.rust_ty(&Ty::from_type_expr(&p.ty, p.span)?);
+            let pty = self.rust_ty(&Ty::from_type_expr_scoped(&p.ty, p.span, &f.type_params)?);
             if p.by_ref {
                 // (EPIC-4 V2-c) An opt-in by-reference param (`Mut[T]`) becomes
                 // `name: &mut T`. The callee's mutations persist to the caller,
@@ -1443,7 +1460,7 @@ impl<'a> Codegen<'a> {
                 let _ = write!(sig, "mut {}: {}", escape_ident(&p.name), pty);
             }
         }
-        let ret = Ty::from_type_expr(&f.ret, f.span)?;
+        let ret = Ty::from_type_expr_scoped(&f.ret, f.span, &f.type_params)?;
         let ret_s = self.rust_ty(&ret);
         let _ = write!(sig, ") -> {} {{", ret_s);
 
@@ -5780,6 +5797,12 @@ impl<'a> Codegen<'a> {
                 }
             }
             Ty::File => "PyFile".into(),
+            // Generics v1: a bound type variable lowers to its bare Rust generic
+            // parameter name (e.g. `T`). The enclosing `fn` declares it as
+            // `<T: Clone>` (see `emit_func`), so the name is in scope wherever a
+            // param/return/local of type `T` is emitted; monomorphization at the
+            // call site fills it in.
+            Ty::TypeVar(n) => n.clone(),
             Ty::Unknown => "()".into(),
         }
     }

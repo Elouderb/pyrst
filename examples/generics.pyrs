@@ -1,0 +1,15 @@
+def first[T](xs: list[T]) -> T:
+    return xs[0]
+
+def last[T](xs: list[T]) -> T:
+    return xs[len(xs) - 1]
+
+def swap[A, B](a: A, b: B) -> tuple[B, A]:
+    return (b, a)
+
+def main() -> None:
+    print(first([10, 20, 30]))        # 10
+    print(first(["x", "y"]))          # x   (SAME fn, T=str — monomorphization)
+    print(last([1, 2, 3]))            # 3
+    r: tuple[str, int] = swap(5, "hi")
+    print(r)                          # ('hi', 5)

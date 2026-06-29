@@ -221,14 +221,18 @@ pub(crate) fn merge_ctx_from_module(m: &Module, ctx: &mut TyCtx, is_root: bool) 
                         .or_default()
                         .push(f.name.clone());
                 }
+                // Generics v1: lower this function's annotations with its declared
+                // type parameters in scope, so a `T`/`list[T]`/`tuple[A, B]` param
+                // or return resolves to `Ty::TypeVar` in the stored signature.
+                // Empty `type_params` => identical to the non-generic path.
                 let params: Vec<(String, crate::typeck::Ty)> = f.params.iter()
-                    .map(|p| crate::typeck::Ty::from_type_expr(&p.ty, p.span).map(|ty| (p.name.clone(), ty)))
+                    .map(|p| crate::typeck::Ty::from_type_expr_scoped(&p.ty, p.span, &f.type_params).map(|ty| (p.name.clone(), ty)))
                     .collect::<crate::diag::Result<Vec<_>>>()?;
                 ctx.funcs.insert(f.name.clone(), crate::typeck::FuncSig {
                     params,
                     // A return annotation carries no span of its own; point at the
                     // function definition so a bad `-> ...` still gets a real caret.
-                    ret: crate::typeck::Ty::from_type_expr(&f.ret, f.span)?,
+                    ret: crate::typeck::Ty::from_type_expr_scoped(&f.ret, f.span, &f.type_params)?,
                     param_defaults: f.params.iter()
                         .filter(|p| p.name != "self")
                         .map(|p| p.default.clone())
@@ -240,6 +244,12 @@ pub(crate) fn merge_ctx_from_module(m: &Module, ctx: &mut TyCtx, is_root: bool) 
                         .map(|p| p.by_ref)
                         .collect(),
                 });
+                // Generics v1: record the declared type-parameter list so call
+                // sites can unify and detect uninferable parameters. Only generic
+                // functions are inserted (a plain `def` is absent).
+                if !f.type_params.is_empty() {
+                    ctx.generic_funcs.insert(f.name.clone(), f.type_params.clone());
+                }
             }
             Stmt::Class(c) => {
                 let mut c = c.clone();

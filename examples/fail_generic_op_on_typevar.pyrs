@@ -1,0 +1,9 @@
+# A bound type variable is PARAMETRIC (opaque): operating on a bare `T` value —
+# here applying `+` to two values of generic type `T` — needs a trait bound,
+# which generics v1 does not support. This is an honest typeck error ("cannot
+# apply an operator to a value of generic type `T`"), not a deferred rustc error.
+def add[T](a: T, b: T) -> T:
+    return a + b
+
+def main() -> None:
+    print(add(1, 2))

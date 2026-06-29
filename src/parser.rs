@@ -387,6 +387,27 @@ impl Parser {
         let span = self.peek_span();
         self.expect(&Tok::Def, "def")?;
         let name = self.expect_ident("function name")?;
+        // Generics v1 (PEP 695): an optional type-parameter clause `[T, U, ...]`
+        // sits between the function NAME and the `(` of the parameter list. Each
+        // entry is a bare identifier (a type-variable name); bounds/defaults
+        // (`[T: Bound]`, `[T = int]`) are out of scope for v1 and not parsed. An
+        // empty `def f[]()` is rejected — a type-param clause must declare at
+        // least one variable. Methods (parsed via this same `parse_def`) may NOT
+        // be generic in v1: see the per-call-site guard in `parse_class`.
+        let mut type_params = Vec::new();
+        if self.eat(&Tok::LBracket) {
+            loop {
+                type_params.push(self.expect_ident("type parameter")?);
+                if !self.eat(&Tok::Comma) { break; }
+            }
+            self.expect(&Tok::RBracket, "type parameter list")?;
+            if type_params.is_empty() {
+                return Err(Error::Parse {
+                    span: self.peek_span(),
+                    msg: "type parameter list `[...]` must declare at least one type variable".into(),
+                });
+            }
+        }
         self.expect(&Tok::LParen, "def")?;
         let mut params = Vec::new();
         if !matches!(self.peek(), Tok::RParen) {
@@ -407,7 +428,7 @@ impl Parser {
         };
         self.expect(&Tok::Colon, "def")?;
         let body = self.parse_block()?;
-        Ok(Func { name, params, ret, body, span, is_method: false, decorators: vec![] })
+        Ok(Func { name, params, ret, body, span, is_method: false, decorators: vec![], type_params })
     }
 
     fn parse_param(&mut self) -> Result<Param> {
@@ -461,6 +482,7 @@ impl Parser {
             match self.peek() {
                 Tok::Def => {
                     let mut m = self.parse_def()?;
+                    reject_generic_method(&m)?;
                     m.is_method = true;
                     methods.push(m);
                 }
@@ -501,6 +523,7 @@ impl Parser {
                     while matches!(self.peek(), Tok::Newline) { self.bump(); }
                     if matches!(self.peek(), Tok::Def) {
                         let mut m = self.parse_def()?;
+                        reject_generic_method(&m)?;
                         m.is_method = true;
                         m.decorators = decorators;
                         methods.push(m);
@@ -1425,6 +1448,24 @@ impl Parser {
             }),
         }
     }
+}
+
+/// Generics v1 is restricted to FREE functions. A method that carries a PEP 695
+/// type-parameter clause (`def m[T](self, ...)`) is rejected at parse time — a
+/// generic METHOD would interact with the `self` receiver, per-class
+/// polymorphism, and value-semantics decisions that are out of v1 scope. Free
+/// generic functions cover the feature; a generic helper can always be written
+/// at module level instead.
+fn reject_generic_method(m: &Func) -> Result<()> {
+    if !m.type_params.is_empty() {
+        return Err(Error::Parse {
+            span: m.span,
+            msg: "generic methods are not supported (type parameters are only \
+                   allowed on free functions); declare it as a free function"
+                .into(),
+        });
+    }
+    Ok(())
 }
 
 fn tok_name(t: &Tok) -> &'static str {

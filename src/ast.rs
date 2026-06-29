@@ -54,6 +54,15 @@ pub struct Func {
     pub span: Span,
     pub is_method: bool,
     pub decorators: Vec<String>,
+    /// Generics v1 (PEP 695): the declared type parameters of a parametric
+    /// generic function, e.g. `["T", "U"]` for `def f[T, U](...)`. EMPTY for a
+    /// non-generic `def`. A name in this list is a BOUND type variable inside the
+    /// function: param/return annotations naming it lower to `Ty::TypeVar(name)`
+    /// (scoped lowering), call sites unify it against the actual argument types,
+    /// and codegen emits it as a Rust generic parameter `name: Clone`. Only
+    /// top-level `def`s may declare type params in v1 (methods stay
+    /// non-generic — the parser rejects a clause on a method).
+    pub type_params: Vec<String>,
 }
 
 #[derive(Debug, Clone)]

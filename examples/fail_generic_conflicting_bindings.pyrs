@@ -1,0 +1,10 @@
+# A type variable that appears in two parameter positions must bind to the SAME
+# concrete type. Calling `pair(1, "x")` would require T = int AND T = str, which
+# is a conflicting binding — an honest typeck error ("conflicting types for type
+# parameter `T`: int vs str"). This must be rejected at `check` (typeck), not
+# deferred to rustc.
+def pair[T](a: T, b: T) -> tuple[T, T]:
+    return (a, b)
+
+def main() -> None:
+    print(pair(1, "x"))

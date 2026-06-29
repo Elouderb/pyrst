@@ -862,13 +862,18 @@ fn is_bare_main_call(s: &Stmt) -> bool {
 /// first parameter of a method) is recognized and exempted below.
 const RUST_NON_RAW_KEYWORDS: &[&str] = &["crate", "self", "super", "Self"];
 
-/// Reserved codegen identifier prefix. Module-level constants lower to Rust
-/// `const __pyrst_const_<name>` (see codegen's `mangle_const`), so a USER
-/// identifier literally named `__pyrst_const_x` would collide with the mangled
-/// const for `x`. The prefix is reserved for compiler-generated names; reject it
-/// honestly at typeck rather than risk a silent clash. (No real program uses
-/// this prefix; it exists only to make the mangling collision-proof.)
-const RESERVED_CODEGEN_PREFIX: &str = "__pyrst_const_";
+/// Reserved codegen identifier prefix. The compiler lowers several internal
+/// constructs to Rust identifiers under the `__pyrst_` namespace: module-level
+/// constants become `const __pyrst_const_<name>` (see codegen's `mangle_const`),
+/// and a generator's eager accumulator is `__pyrst_gen_acc` (see codegen's
+/// `emit_func`). A USER identifier sharing this prefix could collide with one of
+/// those generated names and silently miscompile (e.g. a generator local named
+/// `__pyrst_gen_acc`, or `__pyrst_const_x` aliasing the mangled const for `x`).
+/// The WHOLE `__pyrst_` prefix is therefore reserved for compiler-generated
+/// names and rejected honestly at typeck rather than risking a silent clash. (No
+/// real program uses this prefix; it exists only to make the lowering
+/// collision-proof and to keep future internals safe by construction.)
+const RESERVED_CODEGEN_PREFIX: &str = "__pyrst_";
 
 fn reject_if_reserved(name: &str, span: Span, role: &str) -> Result<()> {
     if RUST_NON_RAW_KEYWORDS.contains(&name) {
@@ -888,7 +893,8 @@ fn reject_if_reserved(name: &str, span: Span, role: &str) -> Result<()> {
             span,
             msg: format!(
                 "`{}` cannot be used as a {} name: the `{}` prefix is reserved for \
-                 compiler-generated identifiers (module-constant lowering). Rename it.",
+                 compiler-generated identifiers (e.g. module-constant lowering and \
+                 generator accumulators). Rename it.",
                 name, role, RESERVED_CODEGEN_PREFIX
             ),
         });
@@ -1223,13 +1229,12 @@ fn check_one_func(f: &Func, ctx: &TyCtx) -> Result<()> {
 }
 
 /// Whether the function/method whose body is `body` and declared return type is
-/// `ret` is a GENERATOR, validating its signature in the process:
-///   * a body containing `yield` MUST be declared `Iterator[T]` (honest error
-///     otherwise — a generator that is not typed as an iterator);
-///   * a body WITHOUT `yield` is never a generator, even if declared
-///     `Iterator[T]` (such a function would just return a `list[T]`, which is
-///     fine — no `yield`, no special handling).
-/// Returns `Ok(true)` iff the function is a (well-formed) generator.
+/// `ret` is a GENERATOR, validating its signature in the process. A body
+/// containing `yield` MUST be declared `Iterator[T]` (honest error otherwise — a
+/// generator that is not typed as an iterator). A body WITHOUT `yield` is never a
+/// generator, even if declared `Iterator[T]` (such a function just returns a
+/// `list[T]`, which is fine — no `yield`, no special handling). Returns
+/// `Ok(true)` iff the function is a (well-formed) generator.
 fn check_generator_signature(body: &[Stmt], ret: &TypeExpr, span: Span) -> Result<bool> {
     if !body_contains_yield(body) {
         return Ok(false);

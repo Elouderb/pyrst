@@ -87,10 +87,13 @@ pub struct Codegen<'a> {
     const_strs: std::collections::HashSet<String>,
     /// Generators (EAGER v1): true while emitting a function whose body contains
     /// `yield`. Such a function is lowered to one that declares
-    /// `let mut __gen: Vec<T> = Vec::new();` at the top, lowers each `yield x` to
-    /// `__gen.push(x);`, and returns `__gen` (both at end-of-body fall-off and at
-    /// any bare `return`, which means "stop collecting"). Saved/restored per
-    /// function like `current_ret_ty`. EAGER LIMITATION: an INFINITE generator
+    /// `let mut __pyrst_gen_acc: Vec<T> = Vec::new();` at the top, lowers each
+    /// `yield x` to `__pyrst_gen_acc.push(x);`, and returns `__pyrst_gen_acc`
+    /// (both at end-of-body fall-off and at any bare `return`, which means "stop
+    /// collecting"). The accumulator lives under the reserved `__pyrst_` prefix
+    /// (typeck's `reject_if_reserved` blocks user identifiers with that prefix) so
+    /// it can never be shadowed by a user local. Saved/restored per function like
+    /// `current_ret_ty`. EAGER LIMITATION: an INFINITE generator
     /// (`while True: yield ...`) collects forever and hangs / OOMs at runtime —
     /// true lazy iteration (a state-machine / `impl Iterator` transform) is an
     /// explicit follow-up; v1 is faithful for FINITE generators (the common case).
@@ -1483,8 +1486,10 @@ impl<'a> Codegen<'a> {
             // The accumulator the lowered `yield`s push into and the function
             // returns. Typed to the Rust return type (`Vec<T>`) so an empty
             // generator and element inference both resolve without annotation
-            // churn. See the `Stmt::Yield` arm in `emit_stmt`.
-            self.line(&format!("let mut __gen: {} = Vec::new();", ret_s));
+            // churn. The `__pyrst_` prefix is reserved (typeck rejects user
+            // identifiers under it), so this name can never collide with a user
+            // local. See the `Stmt::Yield` arm in `emit_stmt`.
+            self.line(&format!("let mut __pyrst_gen_acc: {} = Vec::new();", ret_s));
         }
         // (EPIC-4 V2-c) Track this function's by-reference (`&mut T`) param
         // bindings so a forwarded-by-reference arg that names one emits an
@@ -1544,11 +1549,11 @@ impl<'a> Codegen<'a> {
             self.emit_stmt(s)?;
         }
         // Generators: fall-off-the-end returns the collected Vec. (A bare
-        // `return` inside the body also lowers to `return __gen;` via emit_stmt,
-        // so collection stops there; this final return covers the normal path
-        // where control reaches the end of the body.)
+        // `return` inside the body also lowers to `return __pyrst_gen_acc;` via
+        // emit_stmt, so collection stops there; this final return covers the
+        // normal path where control reaches the end of the body.)
         if is_generator {
-            self.line("return __gen;");
+            self.line("return __pyrst_gen_acc;");
         }
         self.indent -= 1;
         self.line("}");
@@ -2687,7 +2692,7 @@ impl<'a> Codegen<'a> {
                 // In a generator a bare `return` stops collection and hands back
                 // the values gathered so far. Elsewhere it is a plain `return;`.
                 if self.in_generator {
-                    self.line("return __gen;");
+                    self.line("return __pyrst_gen_acc;");
                 } else {
                     self.line("return;");
                 }
@@ -2697,10 +2702,11 @@ impl<'a> Codegen<'a> {
                 // Vec. `emit_consuming` deep-clones a non-Copy place so the pushed
                 // value is independent of the binding (pyrst value semantics), and
                 // a Copy element (int/bool/float) is pushed by value. The
-                // accumulator `__gen` and the trailing `return __gen;` are emitted
-                // by `emit_func` for any function whose body contains a `yield`.
+                // accumulator `__pyrst_gen_acc` and the trailing
+                // `return __pyrst_gen_acc;` are emitted by `emit_func` for any
+                // function whose body contains a `yield`.
                 let s = self.emit_consuming(e)?;
-                self.line(&format!("__gen.push({});", s));
+                self.line(&format!("__pyrst_gen_acc.push({});", s));
             }
             Stmt::Return(Some(e), _) => {
                 // (EPIC-5) In an Option-returning function, wrap the value:

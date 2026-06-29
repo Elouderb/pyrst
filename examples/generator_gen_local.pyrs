@@ -1,0 +1,15 @@
+# Regression: a generator may use a user local named `__gen` — it is its OWN
+# variable, entirely separate from the compiler's eager accumulator (which is the
+# reserved `__pyrst_gen_acc`). Before the accumulator was renamed, a local named
+# `__gen` shadowed the accumulator and silently miscompiled (rustc E0599/E0308).
+def gen_squares(n: int) -> Iterator[int]:
+    __gen: int = 0
+    while __gen < n:
+        yield __gen * __gen
+        __gen = __gen + 1
+
+def main() -> None:
+    for x in gen_squares(4):
+        print(x)                                  # 0 / 1 / 4 / 9
+    collected: list[int] = [v for v in gen_squares(3)]
+    print(collected)                              # [0, 1, 4]

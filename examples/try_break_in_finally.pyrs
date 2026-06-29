@@ -1,0 +1,7 @@
+def main() -> None:
+    for i in range(5):
+        try:
+            print(i)
+        finally:
+            if i == 2:
+                break

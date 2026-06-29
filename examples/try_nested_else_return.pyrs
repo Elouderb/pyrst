@@ -1,0 +1,13 @@
+def f() -> int:
+    try:
+        try:
+            x: int = 5
+        except KeyError:
+            return -1
+        else:
+            return x + 100
+    except ValueError:
+        return -2
+
+def main() -> None:
+    print(f())

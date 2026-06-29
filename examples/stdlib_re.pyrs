@@ -1,0 +1,17 @@
+# Rust interop Phase 2 proof (card 4cbf44bd): `re` is a REAL embedded stdlib
+# module (lib/re.pyrs -> include_str! -> src/stdlib.rs) backed by the EXTERNAL
+# `regex` crate. Importing it makes `build` route through the Cargo-project path
+# (Cargo.toml with `regex = "1"` + `cargo build --release`) instead of the
+# single-file `rustc` path used by every crate-free program. There is no local
+# `re.pyrs` next to this file; the resolver finds the embedded module.
+#
+# Deterministic: pure pattern math over fixed inputs, no filesystem/clock state.
+import re
+
+
+def main() -> None:
+    print(re.is_match("[0-9]+", "abc123"))         # True
+    print(re.is_match("^x", "abc"))                # False
+    print(re.find_all("[0-9]+", "a1b22c333"))      # ['1', '22', '333']
+    print(re.replace_all("[0-9]", "#", "a1b2c3"))  # a#b#c#
+    print(re.split("[ ]+", "a b  c"))              # ['a', 'b', 'c']

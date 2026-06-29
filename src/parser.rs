@@ -145,6 +145,10 @@ impl Parser {
             Tok::At => {
                 // Collect decorators before def
                 let mut decorators = Vec::new();
+                // Rust-interop Phase 2: parsed `@crate("name", "version")` args,
+                // collected alongside the bare decorator names and attached to the
+                // `Func` below. Each entry is a (crate_name, version) pair.
+                let mut crate_deps: Vec<(String, String)> = Vec::new();
                 while matches!(self.peek(), Tok::At) {
                     self.bump(); // consume '@'
                     let mut deco_name = String::new();
@@ -162,8 +166,16 @@ impl Parser {
                             break;
                         }
                     }
-                    // Skip decorator arguments e.g. @decorator(arg)
-                    if matches!(self.peek(), Tok::LParen) {
+                    // `@crate("name", "version")` (Rust interop Phase 2) is the one
+                    // decorator whose ARGUMENTS are meaningful: parse exactly two
+                    // string literals and record the (name, version) dependency.
+                    // Every other decorator keeps the generic paren-skipper below,
+                    // which discards args (the historical behavior).
+                    if deco_name == "crate" {
+                        let dep = self.parse_crate_decorator_args()?;
+                        crate_deps.push(dep);
+                    } else if matches!(self.peek(), Tok::LParen) {
+                        // Skip decorator arguments e.g. @decorator(arg)
                         let mut depth = 1i32;
                         self.bump();
                         while depth > 0 && !matches!(self.peek(), Tok::Eof) {
@@ -182,6 +194,7 @@ impl Parser {
                     Tok::Def => {
                         let mut f = self.parse_def()?;
                         f.decorators = decorators;
+                        f.crate_deps = crate_deps;
                         Ok(Stmt::Func(f))
                     }
                     Tok::Class => {
@@ -436,7 +449,7 @@ impl Parser {
         };
         self.expect(&Tok::Colon, "def")?;
         let body = self.parse_block()?;
-        Ok(Func { name, params, ret, body, span, is_method: false, decorators: vec![], type_params })
+        Ok(Func { name, params, ret, body, span, is_method: false, decorators: vec![], crate_deps: vec![], type_params })
     }
 
     fn parse_param(&mut self) -> Result<Param> {
@@ -946,6 +959,37 @@ impl Parser {
             Err(Error::Parse {
                 span: self.peek_span(),
                 msg: format!("expected identifier ({}), found {:?}", ctx, self.peek()),
+            })
+        }
+    }
+
+    /// Parse the argument list of a `@crate("name", "version")` decorator
+    /// (Rust interop Phase 2), with the leading `crate` identifier already
+    /// consumed. The contract is exactly TWO string-literal arguments — the
+    /// crate name and a Cargo version requirement — so anything else (missing
+    /// parens, a non-string arg, the wrong arity) is a parse error pointing at
+    /// the offending token. Returns the `(name, version)` pair.
+    fn parse_crate_decorator_args(&mut self) -> Result<(String, String)> {
+        self.expect(&Tok::LParen, "@crate requires `(\"name\", \"version\")`")?;
+        let name = self.expect_str_arg("@crate crate name")?;
+        self.expect(&Tok::Comma, "@crate requires a version after the crate name")?;
+        let version = self.expect_str_arg("@crate version")?;
+        self.expect(&Tok::RParen, "@crate takes exactly two string arguments")?;
+        Ok((name, version))
+    }
+
+    /// Consume one plain string-literal token and return its value, or a parse
+    /// error pointing at the token that was found instead. Used by
+    /// [`parse_crate_decorator_args`] so each `@crate` argument is required to be
+    /// a literal string (not an identifier, number, or expression).
+    fn expect_str_arg(&mut self, ctx: &str) -> Result<String> {
+        if let Tok::Str(s) = self.peek().clone() {
+            self.bump();
+            Ok(s)
+        } else {
+            Err(Error::Parse {
+                span: self.peek_span(),
+                msg: format!("expected a string literal ({}), found {:?}", ctx, self.peek()),
             })
         }
     }
@@ -1771,6 +1815,50 @@ mod tests {
             assert_eq!(*op, BinOp::Pow);
         } else {
             panic!("expected BinOp::Pow");
+        }
+    }
+
+    // ── @crate decorator (Rust interop Phase 2) ──────────────────────────────
+
+    /// `@crate("name", "version")` stacked over `@extern`: both decorator names
+    /// land in `decorators` (so the allowlist admits `crate`), and the parsed
+    /// (name, version) pair is recorded in `crate_deps`.
+    #[test]
+    fn parse_crate_decorator_collects_dep_and_stacks_with_extern() {
+        let src = "@crate(\"regex\", \"1\")\n@extern\ndef is_match(p: str, t: str) -> bool:\n    \"true\"\n";
+        let m = parse(src).unwrap();
+        let f = match &m.stmts[0] {
+            Stmt::Func(f) => f,
+            other => panic!("expected a Func, got {:?}", other),
+        };
+        assert_eq!(f.decorators, vec!["crate".to_string(), "extern".to_string()]);
+        assert_eq!(f.crate_deps, vec![("regex".to_string(), "1".to_string())]);
+    }
+
+    /// A `def` with no `@crate` decorator has an EMPTY `crate_deps` (the common
+    /// case — every crate-free program keeps the single-file rustc build path).
+    #[test]
+    fn parse_def_without_crate_has_empty_crate_deps() {
+        let m = parse("@extern\ndef upper(s: str) -> str:\n    \"{s}.to_uppercase()\"\n").unwrap();
+        let f = match &m.stmts[0] {
+            Stmt::Func(f) => f,
+            other => panic!("expected a Func, got {:?}", other),
+        };
+        assert!(f.crate_deps.is_empty(), "crate_deps must be empty without @crate");
+    }
+
+    /// `@crate` requires EXACTLY two string-literal args: one arg, a non-string
+    /// arg, and three args each surface a parse error (not a silently-discarded
+    /// decorator).
+    #[test]
+    fn parse_crate_decorator_rejects_bad_arity_and_non_string_args() {
+        for bad in [
+            "@crate(\"regex\")\ndef f() -> None:\n    pass\n",          // one arg
+            "@crate(\"regex\", 1)\ndef f() -> None:\n    pass\n",       // non-string version
+            "@crate(\"regex\", \"1\", \"x\")\ndef f() -> None:\n    pass\n", // three args
+            "@crate\ndef f() -> None:\n    pass\n",                      // missing parens
+        ] {
+            assert!(parse(bad).is_err(), "expected parse error for: {:?}", bad);
         }
     }
 }

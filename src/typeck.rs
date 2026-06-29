@@ -841,7 +841,13 @@ fn validate_decorators(decorators: &[String], span: Span) -> Result<()> {
             // over a `def` whose body is a single Rust-expression-template string
             // literal). The body/typing of an `@extern` function are validated
             // separately by `validate_extern_func`; here we only admit the name.
-            "staticmethod" | "property" | "dataclass" | "extern" => {}
+            //
+            // `crate` (Rust interop Phase 2) declares an external-crate dependency
+            // via `@crate("name", "version")`. It is pure build metadata with no
+            // body effect — the parser has already validated its two string-literal
+            // args and recorded them in `Func::crate_deps`; here we only admit the
+            // name so it is not rejected as unknown.
+            "staticmethod" | "property" | "dataclass" | "extern" | "crate" => {}
             _ => {
                 return Err(Error::Type {
                     span,

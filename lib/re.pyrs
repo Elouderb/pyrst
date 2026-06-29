@@ -1,0 +1,43 @@
+# pyrst standard library — re (regular expressions)
+#
+# Rust interop Phase 2 (card 4cbf44bd): the PROOF that pyrst's `@extern` bindings
+# work over an EXTERNAL CRATE, not just Rust std. This module declares a
+# dependency on the `regex` crate via `@crate("regex", "1")`; when a program
+# imports `re`, the driver collects that dependency and builds the program as a
+# Cargo project (instead of single-file `rustc`) so `regex` is fetched and
+# linked. This file is EMBEDDED into the compiler binary via `include_str!`
+# (see `src/stdlib.rs`), so it ships with the binary and needs no install.
+#
+# Scope (Phase 2): thin `@extern` wrappers that return SIMPLE types (bool, str,
+# list[str]) — there is NO `Match` object. Each wrapper compiles a fresh
+# `regex::Regex` from the pattern and applies one operation. As elsewhere in the
+# stdlib, pyrst `str` is an owned `String`, so each `&str`/pattern argument needs
+# the `&{x}` borrow glue, and string outputs are `.to_string()`/`.into_owned()`'d
+# back to owned `String`s. A malformed pattern unwraps to a panic (a pyrst
+# exception) — mirroring the `os` module's `.unwrap()` error contract.
+#
+# Only the `from re import f; f(...)` flat form is exercised by the golden.
+
+
+@crate("regex", "1")
+@extern
+def is_match(pattern: str, text: str) -> bool:
+    "regex::Regex::new(&{pattern}).unwrap().is_match(&{text})"
+
+
+@crate("regex", "1")
+@extern
+def find_all(pattern: str, text: str) -> list[str]:
+    "regex::Regex::new(&{pattern}).unwrap().find_iter(&{text}).map(|m| m.as_str().to_string()).collect::<Vec<String>>()"
+
+
+@crate("regex", "1")
+@extern
+def replace_all(pattern: str, repl: str, text: str) -> str:
+    "regex::Regex::new(&{pattern}).unwrap().replace_all(&{text}, {repl}.as_str()).into_owned()"
+
+
+@crate("regex", "1")
+@extern
+def split(pattern: str, text: str) -> list[str]:
+    "regex::Regex::new(&{pattern}).unwrap().split(&{text}).map(|s| s.to_string()).collect::<Vec<String>>()"

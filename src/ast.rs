@@ -54,6 +54,18 @@ pub struct Func {
     pub span: Span,
     pub is_method: bool,
     pub decorators: Vec<String>,
+    /// Rust-interop Phase 2: external-crate dependencies declared on this `def`
+    /// via the `@crate("name", "version")` decorator, as `(name, version)`
+    /// pairs in source order. EMPTY for a function with no `@crate` decorator
+    /// (the overwhelming common case). The parser validates each `@crate` takes
+    /// exactly two string-literal args and records them here; it carries no body
+    /// effect. The driver collects the UNION (deduped by crate name) of these
+    /// across every reachable module (root + embedded stdlib) to decide whether a
+    /// program needs the Cargo-project build path and, if so, which dependencies
+    /// to write into the generated `Cargo.toml`. A bare `@crate` decorator name
+    /// still lands in `decorators` (so `validate_decorators` admits it); the
+    /// parsed args live here.
+    pub crate_deps: Vec<(String, String)>,
     /// Generics v1 (PEP 695): the declared type parameters of a parametric
     /// generic function, e.g. `["T", "U"]` for `def f[T, U](...)`. EMPTY for a
     /// non-generic `def`. A name in this list is a BOUND type variable inside the

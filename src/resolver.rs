@@ -127,10 +127,13 @@ impl Resolver {
                 // Skip standard library modules that are NOT yet real modules
                 // (no codegen, no embedded source). `dataclasses` has dedicated
                 // handling elsewhere; the rest are silent no-ops until
-                // implemented. `os`/`math` are NOT here: they are real embedded
-                // modules (`lib/os.pyrs`, `lib/math.pyrs`, resolved below), so
-                // they must reach the resolution path.
-                if matches!(mod_name.as_str(), "dataclasses" | "sys" | "json" | "re" | "collections" | "itertools") {
+                // implemented. `os`/`math`/`re` are NOT here: they are real
+                // embedded modules (`lib/os.pyrs`, `lib/math.pyrs`, `lib/re.pyrs`,
+                // resolved below), so they must reach the resolution path. `re`
+                // (Rust interop Phase 2) is backed by the external `regex` crate.
+                // `json` stays skipped: its `JsonValue` type design is a separate,
+                // deferred card.
+                if matches!(mod_name.as_str(), "dataclasses" | "sys" | "json" | "collections" | "itertools") {
                     continue;
                 }
 

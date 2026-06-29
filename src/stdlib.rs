@@ -29,6 +29,10 @@ pub const EMBEDDED_STDLIB: &[(&str, &str)] = &[
     ("functools", include_str!("../lib/functools.pyrs")),
     ("statistics", include_str!("../lib/statistics.pyrs")),
     ("math", include_str!("../lib/math.pyrs")),
+    // Rust interop Phase 2: `re` is backed by the external `regex` crate (it
+    // declares `@crate("regex", "1")`), so importing it routes `build` through
+    // the Cargo-project path. The other embedded modules use only Rust std.
+    ("re", include_str!("../lib/re.pyrs")),
 ];
 
 /// Look up an embedded stdlib module's source by NAME (e.g. `"os"`).
@@ -63,6 +67,22 @@ mod tests {
     #[test]
     fn unknown_module_is_not_embedded() {
         assert!(lookup("notamodule").is_none());
+    }
+
+    /// Rust interop Phase 2: `re` is a REAL embedded module backed by the
+    /// external `regex` crate. Its source is baked in, declares the crate
+    /// dependency via `@crate("regex", "1")`, and defines the four `@extern`
+    /// wrappers — the signal that importing `re` routes `build` through the
+    /// Cargo-project path.
+    #[test]
+    fn re_module_is_embedded_and_declares_regex_crate() {
+        let src = lookup("re").expect("`re` must be an embedded stdlib module");
+        assert!(!src.trim().is_empty(), "embedded re source must be non-empty");
+        assert!(src.contains("@crate(\"regex\", \"1\")"), "re must declare the regex crate");
+        assert!(src.contains("@extern"), "re bindings must be @extern");
+        for f in ["def is_match", "def find_all", "def replace_all", "def split"] {
+            assert!(src.contains(f), "re must define {}", f);
+        }
     }
 
     /// `math` is now a REAL embedded module (`lib/math.pyrs`): its source is

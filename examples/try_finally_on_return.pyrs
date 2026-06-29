@@ -1,0 +1,38 @@
+# `finally` runs on EVERY exit from a try: a return from the try body, a break
+# out of an enclosing loop, and a caught exception — and it runs BEFORE the
+# return/break actually takes effect (Python semantics). (card 57274b36)
+
+# finally runs, THEN the body's return takes effect (prints "finally-return",
+# then 7 — never 99).
+def returns_from_body() -> int:
+    try:
+        return 7
+    finally:
+        print("finally-return")
+    return 99
+
+# finally runs on each iteration before the break escapes the loop.
+def breaks_out() -> None:
+    i: int = 0
+    while i < 3:
+        try:
+            if i == 1:
+                break
+            print("loop " + str(i))
+        finally:
+            print("finally-loop " + str(i))
+        i = i + 1
+
+# finally runs after a caught exception.
+def caught() -> None:
+    try:
+        raise ValueError("boom")
+    except ValueError as e:
+        print("caught: " + e)
+    finally:
+        print("finally-exc")
+
+def main() -> None:
+    print(returns_from_body())
+    breaks_out()
+    caught()

@@ -1,0 +1,42 @@
+# A `return` inside a `try` body returns from the FUNCTION, not just the
+# catch_unwind closure that lowers the body (the core fix of card 57274b36).
+# Before the fix this silently printed 99; it must print 7.
+def f() -> int:
+    try:
+        return 7
+    except ValueError:
+        return 0
+    return 99
+
+# A `return` inside a NESTED loop within a try body also escapes the function
+# (loops do not capture returns), so this returns 1, never reaching `return 99`.
+def g() -> int:
+    try:
+        for i in range(5):
+            if i == 1:
+                return i
+    except ValueError:
+        return -1
+    return 99
+
+# An Option-returning function: a try-body `return None` / `return v` is wrapped
+# correctly as it escapes the closure.
+def first_even(xs: list[int]) -> int | None:
+    try:
+        for x in xs:
+            if x % 2 == 0:
+                return x
+        return None
+    except ValueError:
+        return None
+
+def main() -> None:
+    print(f())
+    print(g())
+    nums: list[int] = [1, 3, 4, 7]
+    found: int | None = first_even(nums)
+    if found is not None:
+        print(found)
+    none_found: int | None = first_even([1, 3, 5])
+    if none_found is None:
+        print("no even")

@@ -1,0 +1,46 @@
+# `break` / `continue` inside a `try` body (within a loop) must escape the
+# catch_unwind closure and act on the ENCLOSING loop — before the fix these were
+# rustc E0267 "break inside a closure". (card 57274b36)
+
+# break at i == 2 -> prints 0, 1
+def with_break() -> None:
+    i: int = 0
+    while i < 5:
+        try:
+            if i == 2:
+                break
+            print(i)
+        except ValueError:
+            print("err")
+        i = i + 1
+
+# continue at i == 2 -> skips 2, prints 0, 1, 3, 4
+def with_continue() -> None:
+    for i in range(5):
+        try:
+            if i == 2:
+                continue
+            print(i)
+        except ValueError:
+            print("err")
+
+# don't-descend: a `break` inside a NESTED loop targets the INNER loop, not the
+# loop enclosing the try. Each outer iteration prints 0 (inner breaks at j == 1)
+# then "outer <i>".
+def nested() -> None:
+    for i in range(3):
+        try:
+            for j in range(10):
+                if j == 1:
+                    break
+                print(j)
+        except ValueError:
+            print("err")
+        print("outer " + str(i))
+
+def main() -> None:
+    with_break()
+    print("--")
+    with_continue()
+    print("--")
+    nested()

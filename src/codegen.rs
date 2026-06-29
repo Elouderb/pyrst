@@ -98,11 +98,33 @@ pub struct Codegen<'a> {
     /// true lazy iteration (a state-machine / `impl Iterator` transform) is an
     /// explicit follow-up; v1 is faithful for FINITE generators (the common case).
     in_generator: bool,
+    /// (try/except control flow) True while emitting the BODY of a `try:` —
+    /// the statements that run inside the `catch_unwind` closure. Because that
+    /// body is a Rust closure, a plain `return` would return from the CLOSURE
+    /// (silently dropping the value) rather than the enclosing function. When
+    /// this flag is set, a `return <v>` is lowered to
+    /// `return __PyrstTryFlow::Return(<v>);` so the value is threaded OUT of the
+    /// closure and re-issued as a real function `return` after the try lowering
+    /// (and after any `finally`). It STAYS set through a nested loop body (a
+    /// `return` inside an inner loop still escapes the function), and is
+    /// suspended only inside a nested `def` (saved/restored by `emit_func`),
+    /// whose `return` is local to that function. Saved/restored around the try
+    /// body in `emit_try`.
+    try_return_escape: bool,
+    /// (try/except control flow) True while emitting the BODY of a `try:` AT THE
+    /// TRY-BODY LOOP LEVEL — i.e. a `break`/`continue` here targets the loop
+    /// ENCLOSING the try, so it must thread out of the catch_unwind closure as
+    /// `return __PyrstTryFlow::Break;` / `::Continue;`. Unlike `try_return_escape`
+    /// this is SUSPENDED inside a nested `while`/`for` body (where a
+    /// break/continue targets that inner loop and is a real Rust break/continue)
+    /// as well as inside a nested `def`. Saved/restored around the try body, the
+    /// nested-loop bodies, and (via `emit_func`) nested functions.
+    try_loopctl_escape: bool,
 }
 
 impl<'a> Codegen<'a> {
     pub fn new(ctx: &'a TyCtx) -> Self {
-        Self { ctx, out: String::new(), indent: 0, locals: HashMap::new(), declared: Default::default(), current_class: None, current_ret_ty: Ty::Unit, dead_funcs: Default::default(), mut_self: HashMap::new(), by_ref_locals: Default::default(), poly_map: HashMap::new(), concrete_struct_params: Default::default(), const_names: Default::default(), const_strs: Default::default(), in_generator: false }
+        Self { ctx, out: String::new(), indent: 0, locals: HashMap::new(), declared: Default::default(), current_class: None, current_ret_ty: Ty::Unit, dead_funcs: Default::default(), mut_self: HashMap::new(), by_ref_locals: Default::default(), poly_map: HashMap::new(), concrete_struct_params: Default::default(), const_names: Default::default(), const_strs: Default::default(), in_generator: false, try_return_escape: false, try_loopctl_escape: false }
     }
 
     pub fn with_dead_funcs(mut self, dead: std::collections::HashSet<String>) -> Self {
@@ -1482,6 +1504,15 @@ impl<'a> Codegen<'a> {
         let is_generator =
             crate::typeck::body_contains_yield(&f.body) && matches!(ret, Ty::List(_));
         let saved_in_generator = std::mem::replace(&mut self.in_generator, is_generator);
+        // (try/except control flow) A nested `def` owns its own control flow:
+        // a `return`/`break`/`continue` inside it is local to that function (or
+        // its own loops), NOT an escape from an enclosing `try:` body. Suspend
+        // both try-escape flags for the duration of this function's emission so
+        // a nested def emitted while the parent was lowering a try body lowers
+        // its `return` as a plain `return`, not `__PyrstTryFlow::Return`. Saved
+        // and restored like `current_ret_ty` / `in_generator`.
+        let saved_try_return_escape = std::mem::replace(&mut self.try_return_escape, false);
+        let saved_try_loopctl_escape = std::mem::replace(&mut self.try_loopctl_escape, false);
         if is_generator {
             // The accumulator the lowered `yield`s push into and the function
             // returns. Typed to the Rust return type (`Vec<T>`) so an empty
@@ -1565,6 +1596,8 @@ impl<'a> Codegen<'a> {
         self.current_ret_ty = saved_ret_ty;
         self.by_ref_locals = saved_by_ref;
         self.in_generator = saved_in_generator;
+        self.try_return_escape = saved_try_return_escape;
+        self.try_loopctl_escape = saved_try_loopctl_escape;
         Ok(())
     }
 
@@ -2645,8 +2678,26 @@ impl<'a> Codegen<'a> {
     fn emit_stmt(&mut self, s: &Stmt) -> Result<()> {
         match s {
             Stmt::Pass(_) => self.line("// pass"),
-            Stmt::Break(_) => self.line("break;"),
-            Stmt::Continue(_) => self.line("continue;"),
+            Stmt::Break(_) => {
+                // (try/except control flow) A `break` at the try-body loop level
+                // must escape the catch_unwind closure (it targets the loop that
+                // ENCLOSES the try); thread it out as a flow signal that the
+                // surrounding lowering re-issues as a real `break` after finally.
+                // Inside a nested loop the flag is suspended, so it emits a plain
+                // Rust `break;` targeting that inner loop.
+                if self.try_loopctl_escape {
+                    self.line("return __PyrstTryFlow::Break;");
+                } else {
+                    self.line("break;");
+                }
+            }
+            Stmt::Continue(_) => {
+                if self.try_loopctl_escape {
+                    self.line("return __PyrstTryFlow::Continue;");
+                } else {
+                    self.line("continue;");
+                }
+            }
             Stmt::Assert { cond, msg, .. } => {
                 let c = self.emit_expr(cond)?;
                 match msg {
@@ -2691,8 +2742,21 @@ impl<'a> Codegen<'a> {
             Stmt::Return(None, _) => {
                 // In a generator a bare `return` stops collection and hands back
                 // the values gathered so far. Elsewhere it is a plain `return;`.
+                // (try/except control flow) Inside a try body the value must
+                // escape the catch_unwind closure: wrap it in
+                // `__PyrstTryFlow::Return(..)` (the function's Rust return type R
+                // is `()` for a Unit function, `Vec<T>` for a generator), which
+                // the try lowering re-issues as a real `return` after `finally`.
+                // The generator accumulator is CLONED (not moved) so the Normal
+                // fall-through path still owns it for its trailing return.
                 if self.in_generator {
-                    self.line("return __pyrst_gen_acc;");
+                    if self.try_return_escape {
+                        self.line("return __PyrstTryFlow::Return(__pyrst_gen_acc.clone());");
+                    } else {
+                        self.line("return __pyrst_gen_acc;");
+                    }
+                } else if self.try_return_escape {
+                    self.line("return __PyrstTryFlow::Return(());");
                 } else {
                     self.line("return;");
                 }
@@ -2717,9 +2781,20 @@ impl<'a> Codegen<'a> {
                     // before coerce_to_option wraps the result in `Some(..)`.
                     let s = self.emit_consuming(e)?;
                     let wrapped = self.coerce_to_option(s, e, &self.current_ret_ty);
-                    self.line(&format!("return {};", wrapped));
+                    // (try/except control flow) escape the value out of the try
+                    // closure when emitting the try body; otherwise a plain return.
+                    if self.try_return_escape {
+                        self.line(&format!("return __PyrstTryFlow::Return({});", wrapped));
+                    } else {
+                        self.line(&format!("return {};", wrapped));
+                    }
                 } else if matches!(e, Expr::None_(_)) {
-                    self.line("return;");
+                    // `return None` in a non-Option function == a bare `return;`.
+                    if self.try_return_escape {
+                        self.line("return __PyrstTryFlow::Return(());");
+                    } else {
+                        self.line("return;");
+                    }
                 } else {
                     // (EPIC-5 C2-2b-i) `return dog` from a `-> Animal` function —
                     // a raw-struct value into a polymorphic-base `Animal__` return
@@ -2739,7 +2814,14 @@ impl<'a> Codegen<'a> {
                     } else {
                         self.emit_consuming(e)?
                     };
-                    self.line(&format!("return {};", s));
+                    // (try/except control flow) thread the (already coerced)
+                    // value out of the catch_unwind closure when emitting the try
+                    // body; otherwise issue the plain function return as before.
+                    if self.try_return_escape {
+                        self.line(&format!("return __PyrstTryFlow::Return({});", s));
+                    } else {
+                        self.line(&format!("return {};", s));
+                    }
                 }
             }
             Stmt::Expr(e) => {
@@ -3016,7 +3098,15 @@ impl<'a> Codegen<'a> {
                     self.line(&format!("while {} {{", c));
                 }
                 self.indent += 1;
+                // (try/except control flow, don't-descend) A `break`/`continue`
+                // inside THIS loop targets THIS loop, so suspend the try-body
+                // loop-control escape for the loop body (emit real Rust
+                // break/continue). `try_return_escape` is NOT suspended: a
+                // `return` inside a loop that sits in a try body must still
+                // escape the catch_unwind closure.
+                let saved_loopctl = std::mem::replace(&mut self.try_loopctl_escape, false);
                 for s in body { self.emit_stmt(s)?; }
+                self.try_loopctl_escape = saved_loopctl;
                 self.indent -= 1;
                 self.line("}");
             }
@@ -3079,6 +3169,13 @@ impl<'a> Codegen<'a> {
                 self.line(&format!("for {} in {} {{", pat, iter_expr));
                 self.indent += 1;
 
+                // (try/except control flow, don't-descend) break/continue inside
+                // this for-loop target THIS loop, so suspend the try-body
+                // loop-control escape for the body (real Rust break/continue).
+                // `try_return_escape` is intentionally left alone — a `return`
+                // inside a for-loop within a try body still escapes the closure.
+                let saved_loopctl_for = std::mem::replace(&mut self.try_loopctl_escape, false);
+
                 // Register the loop variable's type so the body sees it. Reuse the
                 // iterable type resolved above: list/set yield the element type, a
                 // dict yields its KEY type, str yields 1-char strings (Str), and a
@@ -3119,6 +3216,7 @@ impl<'a> Codegen<'a> {
                         }
                     }
                 }
+                self.try_loopctl_escape = saved_loopctl_for;
 
                 self.indent -= 1;
                 self.line("}");
@@ -3286,12 +3384,74 @@ impl<'a> Codegen<'a> {
                 // with a non-zero exit code.
                 self.line("let __prev_hook = ::std::panic::take_hook();");
                 self.line("::std::panic::set_hook(::std::boxed::Box::new(|_| {}));");
-                self.line("let __try_result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {");
+                // (try/except control flow) The try BODY runs inside a closure, so
+                // a `return`/`break`/`continue` cannot directly leave the enclosing
+                // function/loop. The closure instead returns a `__PyrstTryFlow<R>`
+                // (R = the enclosing function's Rust return type): escaping control
+                // flow in the body is lowered to `return __PyrstTryFlow::Return(v)`
+                // / `::Break` / `::Continue` (see the `Stmt::Return`/`Break`/
+                // `Continue` arms gated on `try_return_escape`/`try_loopctl_escape`),
+                // and the closure's tail is `__PyrstTryFlow::Normal`. The signal is
+                // re-issued as a real `return`/`break`/`continue` AFTER the try
+                // lowering (and after `finally`) so all of finally / else / handler
+                // dispatch still run on every exit. `try_return_escape` stays set
+                // through nested loops (a `return` there still escapes the function)
+                // but `try_loopctl_escape` is suspended inside nested loops/defs.
+                let flow_ty = format!("__PyrstTryFlow<{}>", self.rust_ty(&self.current_ret_ty));
+                self.line(&format!(
+                    "let __try_result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| -> {} {{",
+                    flow_ty
+                ));
                 self.indent += 1;
+                let saved_ret_escape = std::mem::replace(&mut self.try_return_escape, true);
+                let saved_loopctl_escape = std::mem::replace(&mut self.try_loopctl_escape, true);
                 for s in body { self.emit_stmt(s)?; }
+                self.try_return_escape = saved_ret_escape;
+                self.try_loopctl_escape = saved_loopctl_escape;
+                self.line("__PyrstTryFlow::Normal");
                 self.indent -= 1;
                 self.line("}));");
                 self.line("::std::panic::set_hook(__prev_hook); // restore before any re-raise");
+
+                // Whether the body can actually emit an escaping break / continue
+                // at the try-body level — drives whether the post-lowering flow
+                // match emits a real `break` / `continue` arm. (Emitting one when
+                // none can occur would put `break`/`continue` outside any loop and
+                // fail rustc even though unreachable; emitting one when a break is
+                // present but the try is NOT in a loop is the honest E0268 the user
+                // should see.)
+                let body_breaks = try_body_has_loopctl(body, /*want_break=*/ true);
+                let body_continues = try_body_has_loopctl(body, /*want_break=*/ false);
+                // The flow holder, threaded out of the Ok arm and acted on after
+                // `finally`. Only declared/used when the body can escape.
+                let body_returns = body_has_try_level_return(body);
+                let emit_flow = body_returns || body_breaks || body_continues;
+                if emit_flow {
+                    self.line(&format!("let mut __pyrst_flow: {} = __PyrstTryFlow::Normal;", flow_ty));
+                }
+
+                // (try/except-as-value, BUG 2) Whether this `try` definitely
+                // returns on EVERY path — the same rule typeck's all-paths-return
+                // gate uses (`stmt_definitely_returns`'s Try arm): a returning
+                // `finally`, or every handler returns AND (the body returns OR a
+                // returning `else`). When true, the lowering's NORMAL fall-through
+                // is genuinely unreachable, so the generated block must DIVERGE
+                // rather than fall off with an implicit `()` (which would make a
+                // function whose last statement is such a try fail rustc E0308 /
+                // E0317). We make the block's tail expression diverge below: the
+                // flow `match`'s catch-all becomes `unreachable!()` (when a flow
+                // match is emitted), or a trailing `unreachable!()` is appended
+                // (when no flow match is emitted, e.g. a returning `finally`).
+                let try_returns = {
+                    use crate::typeck::block_definitely_returns as bdr;
+                    if finally_.as_ref().is_some_and(|f| bdr(f)) {
+                        true
+                    } else {
+                        !handlers.is_empty()
+                            && handlers.iter().all(|h| bdr(&h.body))
+                            && (bdr(body) || else_.as_ref().is_some_and(|e| bdr(e)))
+                    }
+                };
 
                 // Whether any handler can catch every exception type.
                 let has_catch_all = handlers.iter().any(|h| {
@@ -3315,12 +3475,25 @@ impl<'a> Codegen<'a> {
                 self.line("let __reraise: ::std::option::Option<::std::boxed::Box<dyn ::std::any::Any + ::std::marker::Send>> = match __try_result {");
                 self.indent += 1;
 
-                // Success path: run the `else` body (if any), then no re-raise.
-                self.line("::std::result::Result::Ok(__ok) => {");
+                // Success path (no exception): the closure handed back a flow
+                // signal. The `else` body runs ONLY when the body fell through
+                // normally (Python: `else` runs iff the try body completed without
+                // exception AND without return/break/continue). The signal is then
+                // stashed so the post-`finally` match can act on a Return/Break/
+                // Continue. No re-raise on this path.
+                self.line("::std::result::Result::Ok(__flow) => {");
                 self.indent += 1;
-                self.line("let _ = __ok;");
                 if let Some(else_body) = else_ {
+                    self.line("if let __PyrstTryFlow::Normal = &__flow {");
+                    self.indent += 1;
                     for s in else_body { self.emit_stmt(s)?; }
+                    self.indent -= 1;
+                    self.line("}");
+                }
+                if emit_flow {
+                    self.line("__pyrst_flow = __flow;");
+                } else {
+                    self.line("let _ = __flow;");
                 }
                 self.line("::std::option::Option::None");
                 self.indent -= 1;
@@ -3436,6 +3609,47 @@ impl<'a> Codegen<'a> {
                 // Print the exception message to stderr first so the user sees a
                 // useful error; resume_unwind then aborts with a non-zero exit code.
                 self.line("if let ::std::option::Option::Some(__p) = __reraise { if let ::std::option::Option::Some(ref __msg) = __reraise_msg { eprintln!(\"{}\", __msg); } ::std::panic::resume_unwind(__p); }");
+
+                // (try/except control flow) Now that `finally` has run and any
+                // unmatched exception has been re-raised, act on a control-flow
+                // signal that escaped the try body: re-issue it as a real function
+                // `return` / loop `break` / loop `continue`. A `Break`/`Continue`
+                // arm is emitted only when the body can actually produce it (so a
+                // loop-free try with only `return` does not put a stray `break`
+                // outside a loop), and a `Continue` arm is omitted likewise. The
+                // `Return(__v) => return __v` arm is always valid: `__v: R`.
+                if emit_flow {
+                    self.line("match __pyrst_flow {");
+                    self.indent += 1;
+                    self.line("__PyrstTryFlow::Return(__v) => return __v,");
+                    if body_breaks {
+                        self.line("__PyrstTryFlow::Break => break,");
+                    }
+                    if body_continues {
+                        self.line("__PyrstTryFlow::Continue => continue,");
+                    }
+                    // Normal (and any non-produced variant) falls through past the
+                    // try. When the try definitely returns on every path, Normal is
+                    // unreachable and the catch-all DIVERGES so the whole try block
+                    // (a Rust block-as-statement) has type `!` instead of `()` —
+                    // letting a function whose last statement is this try compile.
+                    if try_returns {
+                        self.line("_ => unreachable!()");
+                    } else {
+                        self.line("_ => {}");
+                    }
+                    self.indent -= 1;
+                    self.line("}");
+                } else if try_returns {
+                    // No body-level escape, but the try still definitely returns
+                    // (a returning `finally`, or returning handlers + a returning
+                    // `else`). Those returns were emitted as REAL `return`s outside
+                    // the catch_unwind closure, so control never actually reaches
+                    // here — but rustc cannot see that and would type the block by
+                    // its `()` re-raise tail. A trailing `unreachable!()` (the
+                    // block's tail expression, no `;`) gives the block type `!`.
+                    self.line("unreachable!()");
+                }
 
                 self.indent -= 1;
                 self.line("}");
@@ -5647,6 +5861,84 @@ fn comp_target_pat(targets: &[String]) -> String {
     }
 }
 
+/// Whether `stmts` contains a `return` that, inside a `try:` body, must escape
+/// the catch_unwind closure as a function return. Unlike loop-control, a
+/// `return` inside a NESTED `while`/`for` STILL escapes the function (loops do
+/// not capture returns), so those ARE descended; only a nested `def`/`class`
+/// (which owns its own returns) is not. Used by `emit_try` to decide whether to
+/// declare the flow holder and emit the `Return(v) => return v` arm.
+fn body_has_try_level_return(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(stmt_has_try_level_return)
+}
+
+fn stmt_has_try_level_return(s: &Stmt) -> bool {
+    match s {
+        Stmt::Return(..) => true,
+        Stmt::If { then, elifs, else_, .. } => {
+            body_has_try_level_return(then)
+                || elifs.iter().any(|(_, b)| body_has_try_level_return(b))
+                || else_.as_ref().is_some_and(|b| body_has_try_level_return(b))
+        }
+        Stmt::Match { arms, .. } => arms.iter().any(|arm| body_has_try_level_return(&arm.body)),
+        Stmt::With { body, .. } => body_has_try_level_return(body),
+        // A `return` inside an inner loop still leaves the function.
+        Stmt::While { body, .. } | Stmt::For { body, .. } => body_has_try_level_return(body),
+        Stmt::Try { body, handlers, else_, finally_, .. } => {
+            body_has_try_level_return(body)
+                || handlers.iter().any(|h| body_has_try_level_return(&h.body))
+                || else_.as_ref().is_some_and(|b| body_has_try_level_return(b))
+                || finally_.as_ref().is_some_and(|b| body_has_try_level_return(b))
+        }
+        // A nested function/class owns its own returns.
+        Stmt::Func(_) | Stmt::Class(_) => false,
+        _ => false,
+    }
+}
+
+/// Whether `stmts` contains a `break` (when `want_break`) / `continue` (when
+/// `!want_break`) that, at the TRY-BODY level, would target the loop ENCLOSING
+/// the `try:` — i.e. an escaping loop-control statement that `emit_try` must
+/// re-issue after the try lowering. The descent rule mirrors codegen's
+/// don't-descend handling and typeck's `body_has_reachable_break`: `if` / `match`
+/// / `with` / nested `try` blocks ARE descended (a break/continue inside them
+/// still escapes the try body), but an inner `while`/`for` is NOT descended (its
+/// break/continue targets that inner loop) and a nested `def`/`class` owns its
+/// own control flow. Used to decide whether `emit_try`'s post-lowering flow
+/// `match` emits a real `break`/`continue` arm — emitting one only when the body
+/// can actually produce that signal keeps a `break` out of a try that is not
+/// inside a loop (which would be an honest rustc E0268, preserved) from turning
+/// every loop-free try into a spurious build failure.
+fn try_body_has_loopctl(stmts: &[Stmt], want_break: bool) -> bool {
+    stmts.iter().any(|s| stmt_has_loopctl(s, want_break))
+}
+
+fn stmt_has_loopctl(s: &Stmt, want_break: bool) -> bool {
+    match s {
+        Stmt::Break(_) => want_break,
+        Stmt::Continue(_) => !want_break,
+        Stmt::If { then, elifs, else_, .. } => {
+            try_body_has_loopctl(then, want_break)
+                || elifs.iter().any(|(_, b)| try_body_has_loopctl(b, want_break))
+                || else_.as_ref().is_some_and(|b| try_body_has_loopctl(b, want_break))
+        }
+        Stmt::Match { arms, .. } => {
+            arms.iter().any(|arm| try_body_has_loopctl(&arm.body, want_break))
+        }
+        Stmt::With { body, .. } => try_body_has_loopctl(body, want_break),
+        Stmt::Try { body, handlers, else_, finally_, .. } => {
+            try_body_has_loopctl(body, want_break)
+                || handlers.iter().any(|h| try_body_has_loopctl(&h.body, want_break))
+                || else_.as_ref().is_some_and(|b| try_body_has_loopctl(b, want_break))
+                || finally_.as_ref().is_some_and(|b| try_body_has_loopctl(b, want_break))
+        }
+        // An inner loop captures its own break/continue; do not descend.
+        Stmt::While { .. } | Stmt::For { .. } => false,
+        // A nested function/class owns its own control flow.
+        Stmt::Func(_) | Stmt::Class(_) => false,
+        _ => false,
+    }
+}
+
 /// upstream as the catch-all `true` arm). The builtin hierarchy is only two
 /// levels deep, so each base's transitive closure is written out directly.
 fn exc_descendants(base: &str) -> Vec<&'static str> {
@@ -5863,7 +6155,13 @@ pub fn emit_program(modules: &[(Module, String)], ctx: &TyCtx) -> Result<String>
     cg.build_poly_map();
 
     // Preamble — written once
-    cg.line("#![allow(unused_parens, unused_variables, unused_mut, dead_code, unused_imports, non_upper_case_globals)]");
+    // `unreachable_code` is allowed because the try/except control-flow lowering
+    // emits a `__PyrstTryFlow::Normal` sentinel as the catch_unwind closure's
+    // tail; when the try body always returns/raises (e.g. `try: return 7`), that
+    // sentinel is legitimately unreachable. It is a structural artifact of the
+    // generated wrapper, not a user mistake — the same reason `dead_code` /
+    // `unused_variables` are already suppressed for generated code.
+    cg.line("#![allow(unused_parens, unused_variables, unused_mut, dead_code, unused_imports, non_upper_case_globals, unreachable_code)]");
     cg.line("use std::io::Write;");
     cg.line("");
     cg.line("fn __py_fmt_float(x: f64) -> String {");
@@ -5904,6 +6202,11 @@ pub fn emit_program(modules: &[(Module, String)], ctx: &TyCtx) -> Result<String>
     cg.line("    if exp < 0 { panic!(\"negative exponent for integer ** integer\"); }");
     cg.line("    base.pow(exp as u32)");
     cg.line("}");
+    // (try/except control flow) Signal a try BODY's escaping control flow out of
+    // the catch_unwind closure: `Return(R)` carries the enclosing function's
+    // return value, `Break`/`Continue` re-target the loop enclosing the try, and
+    // `Normal` means the body fell through (so `else` runs). See `emit_try`.
+    cg.line("enum __PyrstTryFlow<R> { Normal, Return(R), Break, Continue }");
     cg.line(REPR_PRELUDE);
     cg.line(FILE_PRELUDE);
     cg.line("");

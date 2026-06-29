@@ -2177,6 +2177,32 @@ fn stmt_definitely_returns(s: &Stmt) -> bool {
                     && arm.guard.is_none()
             }) && arms.iter().all(|arm| block_definitely_returns(&arm.body))
         }
+        // A `try` definitely returns on every path iff:
+        //   (a) there IS a `finally` that definitely returns (it runs on every
+        //       exit and itself diverges, so nothing after the try is reachable),
+        //   OR
+        //   (b) every `except` handler definitely returns AND the value path is
+        //       covered: the try BODY definitely returns, OR there is an `else`
+        //       that definitely returns (the `else` runs exactly when the body
+        //       completed normally, so a returning `else` covers the no-exception
+        //       path while the returning handlers cover the exception paths).
+        // This is now SOUND because the exception codegen threads a try-body
+        // `return`/`break`/`continue` out of the catch_unwind closure (see
+        // `Codegen::emit_try`): a returning try body really returns from the
+        // function, so no implicit `()` falls off the end (no rustc E0317/E0308).
+        // A try with NO handlers and no returning finally cannot guarantee a
+        // return (an unmatched exception re-raises, but a normal completion of a
+        // non-returning body falls through), so it stays `false` — conservative.
+        Stmt::Try { body, handlers, else_, finally_, .. } => {
+            if finally_.as_ref().is_some_and(|f| block_definitely_returns(f)) {
+                true
+            } else {
+                !handlers.is_empty()
+                    && handlers.iter().all(|h| block_definitely_returns(&h.body))
+                    && (block_definitely_returns(body)
+                        || else_.as_ref().is_some_and(|e| block_definitely_returns(e)))
+            }
+        }
         _ => false,
     }
 }
@@ -7514,6 +7540,100 @@ def my_fn() -> float:
         assert!(!block_definitely_returns(&[s]));
     }
 
+    // --- block_definitely_returns: Stmt::Try arm (card 57274b36) ---
+
+    fn handler(returns: bool) -> ExceptHandler {
+        ExceptHandler {
+            exc_type: Some("ValueError".into()),
+            exc_name: None,
+            body: if returns { vec![ret_val()] } else { vec![Stmt::Pass(Span::DUMMY)] },
+            span: Span::DUMMY,
+        }
+    }
+
+    fn try_stmt(
+        body: Vec<Stmt>,
+        handlers: Vec<ExceptHandler>,
+        else_: Option<Vec<Stmt>>,
+        finally_: Option<Vec<Stmt>>,
+    ) -> Stmt {
+        Stmt::Try { body, handlers, else_, finally_, span: Span::DUMMY }
+    }
+
+    #[test]
+    fn bdr_try_body_and_handler_return() {
+        let s = try_stmt(vec![ret_val()], vec![handler(true)], None, None);
+        assert!(block_definitely_returns(&[s]));
+    }
+
+    #[test]
+    fn bdr_try_handler_does_not_return_falls_through() {
+        let s = try_stmt(vec![ret_val()], vec![handler(false)], None, None);
+        assert!(!block_definitely_returns(&[s]));
+    }
+
+    #[test]
+    fn bdr_try_body_falls_through_no_else() {
+        let s = try_stmt(vec![Stmt::Pass(Span::DUMMY)], vec![handler(true)], None, None);
+        assert!(!block_definitely_returns(&[s]));
+    }
+
+    #[test]
+    fn bdr_try_else_returns_covers_normal_path() {
+        let s = try_stmt(
+            vec![Stmt::Pass(Span::DUMMY)],
+            vec![handler(true)],
+            Some(vec![ret_val()]),
+            None,
+        );
+        assert!(block_definitely_returns(&[s]));
+    }
+
+    #[test]
+    fn bdr_try_else_does_not_return_falls_through() {
+        let s = try_stmt(
+            vec![Stmt::Pass(Span::DUMMY)],
+            vec![handler(true)],
+            Some(vec![Stmt::Pass(Span::DUMMY)]),
+            None,
+        );
+        assert!(!block_definitely_returns(&[s]));
+    }
+
+    #[test]
+    fn bdr_try_finally_returns_covers_everything() {
+        let s = try_stmt(
+            vec![Stmt::Pass(Span::DUMMY)],
+            vec![handler(false)],
+            None,
+            Some(vec![ret_val()]),
+        );
+        assert!(block_definitely_returns(&[s]));
+    }
+
+    #[test]
+    fn bdr_try_no_handlers_no_finally_does_not_return() {
+        let s = try_stmt(vec![Stmt::Pass(Span::DUMMY)], vec![], None, None);
+        assert!(!block_definitely_returns(&[s]));
+    }
+
+    #[test]
+    fn bdr_try_no_handlers_returning_finally_returns() {
+        let s = try_stmt(vec![Stmt::Pass(Span::DUMMY)], vec![], None, Some(vec![ret_val()]));
+        assert!(block_definitely_returns(&[s]));
+    }
+
+    #[test]
+    fn bdr_try_multiple_handlers_one_falls_through() {
+        let s = try_stmt(
+            vec![ret_val()],
+            vec![handler(true), handler(false)],
+            None,
+            None,
+        );
+        assert!(!block_definitely_returns(&[s]));
+    }
+
     // --- End-to-end gate via check_bodies (the real `check` path) ---
 
     fn check_src(src: &str) -> Result<()> {
@@ -7608,6 +7728,48 @@ def my_fn() -> float:
             "def f(x: int) -> int:\n    match x:\n        case 0:\n            return 10\n        case _:\n            return 20\n",
         );
         assert!(r.is_ok(), "exhaustive match returning on all arms must pass: {:?}", r);
+    }
+
+    // --- try/except all-paths-return acceptance (card 57274b36, Part 2) ---
+
+    #[test]
+    fn gate_accepts_try_body_and_handler_return() {
+        let r = check_src(
+            "def f(x: int) -> int:\n    try:\n        return 10 // x\n    except ZeroDivisionError:\n        return 0\n",
+        );
+        assert!(r.is_ok(), "try body+handler both-return must pass: {:?}", r);
+    }
+
+    #[test]
+    fn gate_accepts_try_handlers_and_else_return() {
+        let r = check_src(
+            "def f(x: int) -> int:\n    try:\n        y: int = 100 // x\n    except ZeroDivisionError:\n        return -1\n    else:\n        return y\n",
+        );
+        assert!(r.is_ok(), "try handlers+else return must pass: {:?}", r);
+    }
+
+    #[test]
+    fn gate_accepts_try_finally_returns() {
+        let r = check_src(
+            "def f() -> int:\n    try:\n        print(\"x\")\n    finally:\n        return 5\n",
+        );
+        assert!(r.is_ok(), "try finally-return must pass: {:?}", r);
+    }
+
+    #[test]
+    fn gate_rejects_try_handler_not_returning() {
+        let r = check_src(
+            "def f(x: int) -> int:\n    try:\n        return 1\n    except ValueError:\n        print(\"oops\")\n",
+        );
+        assert_type_err_unit(r, "may reach the end without returning a value");
+    }
+
+    #[test]
+    fn gate_rejects_try_body_falls_through_no_else() {
+        let r = check_src(
+            "def f() -> int:\n    try:\n        print(\"x\")\n    except ValueError:\n        return 0\n",
+        );
+        assert_type_err_unit(r, "may reach the end without returning a value");
     }
 
     /// Assert a `Result<()>` is a Type error whose message contains `fragment`.

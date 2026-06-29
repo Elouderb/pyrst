@@ -1,0 +1,7 @@
+finally-return
+7
+loop 0
+finally-loop 0
+finally-loop 1
+caught: boom
+finally-exc

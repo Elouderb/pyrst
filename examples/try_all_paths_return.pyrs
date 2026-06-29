@@ -1,0 +1,34 @@
+# A try whose every path returns is now ACCEPTED by the all-paths-return gate
+# and produces sound code (no trailing `return` needed). This is only safe
+# because the exception codegen threads a try-body return out of the closure and
+# makes an all-returning try block DIVERGE (card 57274b36, Part 2).
+
+# body returns, handler returns; no trailing statement.
+def safe_div(a: int, b: int) -> int:
+    try:
+        return a // b
+    except ZeroDivisionError:
+        return 0
+
+# handlers return + else returns (body falls through); no trailing statement.
+def parse_or(x: int) -> int:
+    try:
+        y: int = 100 // x
+    except ZeroDivisionError:
+        return -1
+    else:
+        return y
+
+# a returning `finally` covers every path (and wins over the body return).
+def always_five() -> int:
+    try:
+        return 7
+    finally:
+        return 5
+
+def main() -> None:
+    print(safe_div(10, 2))
+    print(safe_div(10, 0))
+    print(parse_or(4))
+    print(parse_or(0))
+    print(always_five())

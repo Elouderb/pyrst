@@ -631,7 +631,7 @@ fn build_locals_for_func<'a>(
         // Seed `self` for methods (mirrors codegen.rs:1209).
         if let Some(c) = path.class {
             if f.params.iter().any(|p| p.name == "self") {
-                locals.insert("self".to_string(), Ty::Class(c.name.clone()));
+                locals.insert("self".to_string(), Ty::Class(c.name.clone(), vec![]));
             }
         }
         // Seed parameters from their annotations (mirrors codegen.rs:1212-1217).
@@ -701,7 +701,7 @@ fn check_stmt_for_binding(
                     if p.name == "self" {
                         // `self` hover → the enclosing class type.
                         return enclosing_class
-                            .map(|c| Ty::Class(c.name.clone()));
+                            .map(|c| Ty::Class(c.name.clone(), vec![]));
                     }
                     return Ty::from_type_expr(&p.ty, p.span).ok();
                 }
@@ -740,7 +740,7 @@ fn check_stmt_for_binding(
                     // Seed self for methods.
                     if let Some(c) = enclosing_class {
                         if f.params.iter().any(|p| p.name == "self") {
-                            locals.insert("self".to_string(), Ty::Class(c.name.clone()));
+                            locals.insert("self".to_string(), Ty::Class(c.name.clone(), vec![]));
                         }
                     }
                     // Seed params.
@@ -1060,7 +1060,7 @@ fn resolve_attr(
     if let Some(f) = path.func {
         if let Some(c) = path.class {
             if f.params.iter().any(|p| p.name == "self") {
-                locals.insert("self".to_string(), Ty::Class(c.name.clone()));
+                locals.insert("self".to_string(), Ty::Class(c.name.clone(), vec![]));
             }
         }
         for p in &f.params {
@@ -1076,7 +1076,7 @@ fn resolve_attr(
 
     let recv = crate::typeck::infer_expr_ty(obj, &locals, ctx);
     let class_name = match recv {
-        Ty::Class(c) => c,
+        Ty::Class(c, _) => c,
         _ => return None,
     };
 
@@ -1355,7 +1355,7 @@ fn collect_methods_rec(
 
 /// Fields + methods of the class `ty` resolves to, for `obj.` member completion.
 ///
-/// When `ty` is `Ty::Class(name)`: returns its FIELDS (inheritance-aware via
+/// When `ty` is `Ty::Class(name, _)`: returns its FIELDS (inheritance-aware via
 /// `TyCtx::get_all_fields`; `label = name`, `detail = ": <type>"`,
 /// `kind = Field`) followed by its METHODS (inheritance-aware; `label = name`,
 /// `detail = "(params) -> ret"`, `kind = Method`). For any non-class type
@@ -1367,7 +1367,7 @@ fn collect_methods_rec(
 /// shadows a base method via `collect_methods`).
 pub fn member_completions(ty: &Ty, ctx: &TyCtx) -> Vec<Completion> {
     let class_name = match ty {
-        Ty::Class(n) => n.clone(),
+        Ty::Class(n, _) => n.clone(),
         _ => return Vec::new(),
     };
     if !ctx.classes.contains_key(&class_name) {
@@ -2122,7 +2122,7 @@ fn classify_attr(
     if let Some(f) = func {
         if let Some(c) = class {
             if f.params.iter().any(|p| p.name == "self") {
-                locals.insert("self".to_string(), Ty::Class(c.name.clone()));
+                locals.insert("self".to_string(), Ty::Class(c.name.clone(), vec![]));
             }
         }
         for p in &f.params {
@@ -2137,7 +2137,7 @@ fn classify_attr(
     }
 
     let recv = crate::typeck::infer_expr_ty(obj, &locals, ctx);
-    if let Ty::Class(class_name) = recv {
+    if let Ty::Class(class_name, _) = recv {
         if ctx.get_method(&class_name, name).is_some() {
             return SemTokKind::Method;
         }
@@ -2578,7 +2578,7 @@ mod tests {
         let (module, ctx) = build(src);
         // `return c.x` on line 5; `c` (the receiver) is at col 11.
         let ty = type_at_position(&module, &ctx, src, 5, 11);
-        assert_eq!(ty, Some(Ty::Class("C".to_string())));
+        assert_eq!(ty, Some(Ty::Class("C".to_string(), vec![])));
     }
 
     #[test]
@@ -2777,7 +2777,7 @@ mod tests {
         let (module, ctx) = build(src);
         // `self` on line 2, col 10.
         let ty = type_at_position(&module, &ctx, src, 2, 10);
-        assert_eq!(ty, Some(Ty::Class("C".to_string())), "hovering `self` should return the class type");
+        assert_eq!(ty, Some(Ty::Class("C".to_string(), vec![])), "hovering `self` should return the class type");
     }
 
     #[test]
@@ -2840,7 +2840,7 @@ mod tests {
             "        return self.name\n",
         );
         let (_module, ctx) = build(src);
-        let cs = member_completions(&Ty::Class("P".to_string()), &ctx);
+        let cs = member_completions(&Ty::Class("P".to_string(), vec![]), &ctx);
         // Exactly 3 completions: 2 fields + 1 method.
         assert_eq!(cs.len(), 3, "expected 3 completions, got: {:?}", cs);
 
@@ -2873,7 +2873,7 @@ mod tests {
             "        pass\n",
         );
         let (_module, ctx) = build(src);
-        let cs = member_completions(&Ty::Class("Derived".to_string()), &ctx);
+        let cs = member_completions(&Ty::Class("Derived".to_string(), vec![]), &ctx);
         // Inherited field + method present.
         let bf = find(&cs, "base_field").expect("inherited field");
         assert_eq!(bf.kind, CompletionKind::Field);
@@ -2894,7 +2894,7 @@ mod tests {
             "list has no class members"
         );
         // A class name that doesn't exist → empty (no panic).
-        assert!(member_completions(&Ty::Class("Nope".into()), &ctx).is_empty());
+        assert!(member_completions(&Ty::Class("Nope".into(), vec![]), &ctx).is_empty());
     }
 
     // ── Autocomplete: completion_context ──────────────────────────────────────

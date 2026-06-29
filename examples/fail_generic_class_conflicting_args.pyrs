@@ -1,0 +1,17 @@
+# A generic-CLASS constructor whose two arguments bind the SAME class type var
+# `T` to INCONSISTENT concrete types (`int` then `str`). Unifying `__init__`'s
+# scoped param types against the argument types surfaces the conflict — the same
+# honest "conflicting types for type parameter `T`" error the generic-FUNCTION
+# call path reports, since both reuse `unify_typevar`.
+#
+# EXPECTED: typeck error — conflicting types for type parameter `T`: int vs str.
+class Same[T]:
+    a: T
+    b: T
+    def __init__(self, x: T, y: T) -> None:
+        self.a = x
+        self.b = y
+
+def main() -> None:
+    s: Same[int] = Same(1, "two")
+    print(s.a)

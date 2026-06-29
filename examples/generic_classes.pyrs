@@ -1,0 +1,22 @@
+class Box[T]:
+    value: T
+    def __init__(self, v: T) -> None:
+        self.value = v
+    def get(self) -> T:
+        return self.value
+
+class Pair[A, B]:
+    first: A
+    second: B
+    def __init__(self, a: A, b: B) -> None:
+        self.first = a
+        self.second = b
+
+def main() -> None:
+    b: Box[int] = Box(5)
+    print(b.get())            # 5
+    bs: Box[str] = Box("hi")
+    print(bs.get())           # hi  (SAME class, T=str — monomorphization)
+    p: Pair[int, str] = Pair(1, "x")
+    print(p.first)            # 1
+    print(p.second)           # x

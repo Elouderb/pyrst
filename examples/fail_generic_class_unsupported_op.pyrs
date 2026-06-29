@@ -1,0 +1,18 @@
+# A method of a generic class performs an UNSUPPORTED op (membership `in`) on a
+# bare class type var `T`. Inside a generic class's method body the class type
+# params are in scope exactly as in a generic function, so the op is an honest
+# typeck rejection (v2 infers bounds only for comparison, equality, arithmetic,
+# Display, and Hash — membership has no faithful single-trait mapping for an
+# opaque `T`).
+#
+# EXPECTED: typeck error — cannot test membership of a value of generic type `T`.
+class Bad[T]:
+    v: T
+    def __init__(self, x: T) -> None:
+        self.v = x
+    def weird(self) -> bool:
+        return self.v in self.v
+
+def main() -> None:
+    b: Bad[int] = Bad(1)
+    print(b.weird())

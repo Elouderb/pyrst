@@ -18,7 +18,17 @@ pub enum Ty {
     Dict(Box<Ty>, Box<Ty>),
     Tuple(Vec<Ty>),
     Option(Box<Ty>),
-    Class(String),
+    /// A user class instance type. The `String` is the class NAME; the `Vec<Ty>`
+    /// is its TYPE ARGUMENTS, which is EMPTY for a non-generic class (or a bare,
+    /// not-yet-instantiated class name) and carries the inferred/declared args for
+    /// a generic-class instance — e.g. `Box(5)` infers `Class("Box", [Int])` and
+    /// `b: Pair[int, str]` declares `Class("Pair", [Int, Str])`. The args are the
+    /// substitution for the class's `type_params`, in declaration order: method
+    /// calls and field reads on the instance substitute them into the (type-var-
+    /// bearing) method signature / field type. For a non-generic class the Vec is
+    /// always empty, so `Class("Point", [])` is byte-for-byte the old `Class(n)`
+    /// behaviour (equality, hashing, Display, rust_ty all collapse to the name).
+    Class(String, Vec<Ty>),
     /// A first-class function value: `Func(arg_types, ret_type)`. Spelled
     /// `Callable[[Arg, ...], Ret]` in source and lowered to
     /// `Rc<dyn Fn(Arg, ...) -> Ret>` by codegen. Covers both named function
@@ -61,7 +71,18 @@ impl std::fmt::Display for Ty {
                 write!(f, "]")
             }
             Ty::Option(t) => write!(f, "{} | None", t),
-            Ty::Class(n)  => write!(f, "{}", n),
+            Ty::Class(n, args) => {
+                write!(f, "{}", n)?;
+                if !args.is_empty() {
+                    write!(f, "[")?;
+                    for (i, a) in args.iter().enumerate() {
+                        if i > 0 { write!(f, ", ")?; }
+                        write!(f, "{}", a)?;
+                    }
+                    write!(f, "]")?;
+                }
+                Ok(())
+            }
             Ty::Func(args, ret) => {
                 write!(f, "Callable[[")?;
                 for (i, a) in args.iter().enumerate() {
@@ -96,7 +117,7 @@ impl Ty {
     }
 
     /// Generics v1: like [`from_type_expr`], but a bare type NAME that matches one
-    /// of `type_params` lowers to `Ty::TypeVar(name)` instead of `Ty::Class(name)`.
+    /// of `type_params` lowers to `Ty::TypeVar(name)` instead of `Ty::Class(name, _)`.
     /// `type_params` is the enclosing generic function's declared type-variable
     /// set (empty for every non-generic context, where this is identical to
     /// `from_type_expr`). The scope threads through every nested element type, so
@@ -116,7 +137,7 @@ impl Ty {
                         "float" => Ty::Float,
                         "bool" => Ty::Bool,
                         "str" => Ty::Str,
-                        other => Ty::Class(other.to_string()),
+                        other => Ty::Class(other.to_string(), vec![]),
                     }
                 }
             }
@@ -170,10 +191,23 @@ impl Ty {
                     span,
                     msg: "Mut[...] is only valid on a parameter".to_string(),
                 }),
-                (other, _) => return Err(Error::Type {
-                    span,
-                    msg: format!("unknown generic type `{}`", other),
-                }),
+                // Generics v2 (generic CLASSES): a `Name[Arg, ...]` whose head is
+                // not a builtin generic is read as a parametrized USER-CLASS
+                // instance type `Ty::Class("Box", [Int])`. This mirrors the bare
+                // `Named` arm, which already lowers an unknown name to
+                // `Ty::Class(name, [])` permissively (a name that is not really a
+                // class fails later at field/method resolution, never here) — the
+                // resolver has no `ctx` to consult, so validity is checked at the
+                // use site, not at lowering. The arg types lower recursively with
+                // the same `type_params` scope, so `Box[T]` inside a generic
+                // function and `Pair[int, str]` both resolve their components.
+                (other, generic_args) => Ty::Class(
+                    other.to_string(),
+                    generic_args
+                        .iter()
+                        .map(|a| Ty::from_type_expr_scoped(a, span, type_params))
+                        .collect::<Result<Vec<_>>>()?,
+                ),
             },
             TypeExpr::Tuple(parts) => {
                 let tys = parts.iter().map(|p| Ty::from_type_expr_scoped(p, span, type_params)).collect::<Result<Vec<_>>>()?;
@@ -268,6 +302,18 @@ pub struct TyCtx {
     /// silent-build-fail this field closes). `TyCtx` is built once per program
     /// (never cheap-cloned in a hot path), so storing the bodies is acceptable.
     pub generic_func_bodies: HashMap<String, Func>,
+    /// Generics v2 (generic CLASSES): class NAME → its declared PEP 695
+    /// type-parameter list (`class Box[T]:` -> `["T"]`, `class Pair[A, B]:` ->
+    /// `["A", "B"]`). ONLY generic classes appear here; a plain `class` is
+    /// absent. Populated by the resolver alongside `classes`. The names index
+    /// the `Vec<Ty>` carried by a `Ty::Class(name, args)` instance — position `i`
+    /// of `args` is the binding for `type_params[i]`. The substitution helpers
+    /// (`class_type_subst`) zip this list against an instance's args to turn a
+    /// method signature's / field's `Ty::TypeVar(T)` into the instance's concrete
+    /// arg. Empty for the LSP single-file path until the resolver runs, exactly
+    /// like `generic_funcs`; method/field resolution then degrades to the
+    /// non-substituted (type-var-bearing) signature, never a crash.
+    pub generic_classes: HashMap<String, Vec<String>>,
 }
 
 impl TyCtx {
@@ -378,7 +424,7 @@ impl TyCtx {
         vars.insert("dict".into(), Ty::Dict(Box::new(Ty::Str), Box::new(Ty::Unknown)));
         vars.insert("set".into(), Ty::Set(Box::new(Ty::Unknown)));
 
-        Self { funcs, classes: HashMap::new(), vars, module_funcs: HashMap::new(), module_consts: HashMap::new(), generic_funcs: HashMap::new(), generic_func_bodies: HashMap::new() }
+        Self { funcs, classes: HashMap::new(), vars, module_funcs: HashMap::new(), module_consts: HashMap::new(), generic_funcs: HashMap::new(), generic_func_bodies: HashMap::new(), generic_classes: HashMap::new() }
     }
 
     pub fn get_all_fields(&self, class_name: &str) -> Vec<crate::ast::Param> {
@@ -429,15 +475,21 @@ impl TyCtx {
                 // one ever fail, we surface it as method-not-found (`None`) rather
                 // than silently DROPPING a param (the old `.filter_map(...ok())`) or
                 // fabricating `Ty::Unknown` for the return — never a corrupt FuncSig.
+                // Generics v2: lower the method signature with the CLASS's type
+                // parameters in scope, so a class type var `T` in a param/return
+                // becomes `Ty::TypeVar("T")` (matching the resolver's scoped
+                // registration). A non-generic class has empty `type_params`, so
+                // this is identical to the old unscoped lowering. Call sites on a
+                // concrete `Ty::Class(name, args)` substitute the args afterwards.
                 let params: Vec<(String, Ty)> = match method.params.iter()
                     .filter(|p| p.name != "self")
-                    .map(|p| Ty::from_type_expr(&p.ty, p.span).map(|ty| (p.name.clone(), ty)))
+                    .map(|p| Ty::from_type_expr_scoped(&p.ty, p.span, &class_def.type_params).map(|ty| (p.name.clone(), ty)))
                     .collect::<Result<Vec<_>>>()
                 {
                     Ok(ps) => ps,
                     Err(_) => return None,
                 };
-                let ret = match Ty::from_type_expr(&method.ret, method.span) {
+                let ret = match Ty::from_type_expr_scoped(&method.ret, method.span, &class_def.type_params) {
                     Ok(ty) => ty,
                     Err(_) => return None,
                 };
@@ -763,7 +815,7 @@ impl<'a> FuncEnv<'a> {
             .or_else(|| self.ctx.funcs.get(name).map(func_sig_to_ty))
             .or_else(|| {
                 if self.ctx.classes.contains_key(name) {
-                    Some(Ty::Class(name.to_string()))
+                    Some(Ty::Class(name.to_string(), vec![]))
                 } else {
                     None
                 }
@@ -1212,7 +1264,7 @@ pub fn check_all(m: &Module, ctx: &TyCtx) -> Vec<Error> {
                 // The per-class prelude (multiple inheritance, field annotations)
                 // establishes invariants the method checks rely on; if it fails,
                 // record that one error and skip this class's methods.
-                if let Err(e) = check_class_prelude(c) {
+                if let Err(e) = check_class_prelude(c, ctx) {
                     errors.push(e);
                     continue;
                 }
@@ -1251,7 +1303,7 @@ fn check_one_stmt(s: &Stmt, ctx: &TyCtx) -> Result<()> {
     match s {
         Stmt::Func(f) => check_one_func(f, ctx)?,
         Stmt::Class(c) => {
-            check_class_prelude(c)?;
+            check_class_prelude(c, ctx)?;
             for method in &c.methods {
                 check_one_method(c, method, ctx)?;
             }
@@ -1356,7 +1408,7 @@ fn is_iterator_type_expr(t: &TypeExpr) -> bool {
 
 /// Per-CLASS checks that run before (and gate) the method checks: multiple
 /// inheritance and explicit field-annotation validation. Fail-fast.
-fn check_class_prelude(c: &ClassDef) -> Result<()> {
+fn check_class_prelude(c: &ClassDef, ctx: &TyCtx) -> Result<()> {
     // Reject multiple inheritance.
     if c.bases.len() > 1 {
         return Err(Error::Type {
@@ -1365,14 +1417,41 @@ fn check_class_prelude(c: &ClassDef) -> Result<()> {
         });
     }
 
+    // Generics v2 (DEFERRED): a generic class participating in INHERITANCE is not
+    // yet supported. The companion-enum dispatch codegen for a polymorphic base
+    // (`B__::B(x) => x.get()`) does not thread the base's type parameters, so a
+    // generic base/derived pair type-checks but emits Rust referencing an
+    // undefined `T` (a silent check-pass / build-fail). Reject it honestly at
+    // `check` — covering both directions: a generic class that DECLARES a base,
+    // and a (generic or not) class whose base is a generic class. The core
+    // single-class generics (Box / Pair) have no bases and are unaffected.
+    if !c.bases.is_empty() {
+        let base_is_generic = c.bases.iter().any(|b| {
+            ctx.generic_classes.get(b).is_some_and(|tps| !tps.is_empty())
+        });
+        if !c.type_params.is_empty() || base_is_generic {
+            return Err(Error::Type {
+                span: c.span,
+                msg: "generic classes with inheritance are not yet supported \
+                      (a generic class may not declare a base, and a class may not \
+                      inherit from a generic class)"
+                    .to_string(),
+            });
+        }
+    }
+
     // (EPIC-4 V2-c) Validate explicit class-FIELD annotations at `check` time.
     // Field types are otherwise only lowered lazily at codegen (`build`), so a
     // `Mut[T]` field annotation would slip past `pyrst check`. Running each
     // field through `from_type_expr` here makes the existing `("Mut", _)`
     // rejection arm fire at check time, so a class-field `Mut[T]` is an honest
     // error in BOTH `check` and `build` (mode markers belong only on params).
+    // Generics v2: lower field annotations with the class's type parameters in
+    // scope, so a generic field `value: T` lowers to `Ty::TypeVar("T")` (a valid
+    // field type for a generic class) rather than the bogus `Ty::Class("T", [])`.
+    // A non-generic class has empty `type_params`, identical to the legacy path.
     for field in &c.fields {
-        Ty::from_type_expr(&field.ty, field.span)?;
+        Ty::from_type_expr_scoped(&field.ty, field.span, &c.type_params)?;
     }
     Ok(())
 }
@@ -1431,17 +1510,27 @@ fn check_one_method(c: &ClassDef, method: &Func, ctx: &TyCtx) -> Result<()> {
         }
     }
 
+    // Generics v2: the class's type parameters are SCOPED TO THE METHOD BODY —
+    // a param/return naming one (`v: T`, `-> T`) lowers to `Ty::TypeVar(T)`
+    // (scoped lowering), and `self` is typed `Ty::Class(name, [TypeVar(T), ..])`
+    // so a field read `self.value: T` substitutes the identity `{T -> T}` and
+    // stays `T`. The class type vars also go into `env.type_params`, so an
+    // UNSUPPORTED op on a bare `T` is rejected here exactly like in a generic
+    // function (and a supported op infers its bound for codegen). A non-generic
+    // class has empty `type_params` => identical to the legacy unscoped path.
     let mut params: Vec<(String, Ty)> = method.params.iter()
         .filter(|p| p.name != "self")
-        .map(|p| Ty::from_type_expr(&p.ty, p.span).map(|ty| (p.name.clone(), ty)))
+        .map(|p| Ty::from_type_expr_scoped(&p.ty, p.span, &c.type_params).map(|ty| (p.name.clone(), ty)))
         .collect::<Result<Vec<_>>>()?;
-    params.insert(0, ("self".into(), Ty::Class(c.name.clone())));
+    let self_args: Vec<Ty> = c.type_params.iter().map(|tp| Ty::TypeVar(tp.clone())).collect();
+    params.insert(0, ("self".into(), Ty::Class(c.name.clone(), self_args)));
     let by_ref_names: Vec<String> = method.params.iter()
         .filter(|p| p.name != "self" && p.by_ref)
         .map(|p| p.name.clone())
         .collect();
-    let ret = Ty::from_type_expr(&method.ret, method.span)?;
+    let ret = Ty::from_type_expr_scoped(&method.ret, method.span, &c.type_params)?;
     let mut env = FuncEnv::with_by_ref(ctx, &params, &by_ref_names, ret);
+    env.type_params = c.type_params.iter().cloned().collect();
     env.is_generator = check_generator_signature(&method.body, &method.ret, method.span)?;
     collect_returned_param_idents(&method.body, &env.params, &mut env.returned_params);
     check_body(&method.body, &mut env)?;
@@ -1784,7 +1873,7 @@ fn types_compatible(val_ty: &Ty, declared_ty: &Ty, ctx: &TyCtx) -> bool {
         // are not in `ctx.classes`, so exception subtyping stays an honest error.
         // NOTE: typeck ACCEPTS this here; codegen still rejects it via the
         // honest gate (EPIC-5 C1-C) until the C2 companion-enum codegen lands.
-        (Ty::Class(d), Ty::Class(b)) if is_subclass(d, b, ctx) => true,
+        (Ty::Class(d, _), Ty::Class(b, _)) if is_subclass(d, b, ctx) => true,
         // Unknown is compatible with anything
         (Ty::Unknown, _) | (_, Ty::Unknown) => true,
         // List with Unknown elements compatible with any List
@@ -1986,16 +2075,26 @@ fn substitute_typevars(ty: &Ty, subst: &HashMap<String, Ty>) -> Ty {
 }
 
 /// True if `ty` mentions any `Ty::TypeVar` (used to decide whether a return type
-/// still has unsubstituted variables after unification).
-fn contains_typevar(ty: &Ty) -> bool {
+/// still has unsubstituted variables after unification). Recurses through every
+/// container AND a `Ty::Class`'s type args, so a `Box[T]`-typed field is detected
+/// too. Public so codegen can ask "does this field need a non-Default placeholder"
+/// (a generic-class field of type-var type has no Rust `Default`).
+pub fn ty_contains_typevar(ty: &Ty) -> bool {
     match ty {
         Ty::TypeVar(_) => true,
-        Ty::List(inner) | Ty::Set(inner) | Ty::Option(inner) => contains_typevar(inner),
-        Ty::Dict(k, v) => contains_typevar(k) || contains_typevar(v),
-        Ty::Tuple(parts) => parts.iter().any(contains_typevar),
-        Ty::Func(args, ret) => args.iter().any(contains_typevar) || contains_typevar(ret),
+        Ty::List(inner) | Ty::Set(inner) | Ty::Option(inner) => ty_contains_typevar(inner),
+        Ty::Dict(k, v) => ty_contains_typevar(k) || ty_contains_typevar(v),
+        Ty::Tuple(parts) => parts.iter().any(ty_contains_typevar),
+        Ty::Func(args, ret) => args.iter().any(ty_contains_typevar) || ty_contains_typevar(ret),
+        Ty::Class(_, args) => args.iter().any(ty_contains_typevar),
         _ => false,
     }
+}
+
+/// Internal alias kept for the existing call sites (generic-function return-type
+/// inference) — identical behaviour to [`ty_contains_typevar`].
+fn contains_typevar(ty: &Ty) -> bool {
+    ty_contains_typevar(ty)
 }
 
 /// The result of unifying a generic call's declared param types against its
@@ -2081,6 +2180,131 @@ fn infer_generic_call_result(
         });
     }
     Ok(Some(res.ret))
+}
+
+// ── Generics v2: generic-CLASS instantiation + member substitution ───────────
+//
+// A generic class `class Box[T]:` carries its type parameters as `ClassDef.
+// type_params` (registered in `ctx.generic_classes`). An INSTANCE is typed
+// `Ty::Class("Box", [arg, ...])`, the args positionally bound to the class's
+// type params. Two operations make that work end to end:
+//   - INSTANTIATION: at `Box(5)` the class args are INFERRED by unifying the
+//     scoped `__init__` parameter types (which contain the class type vars)
+//     against the constructor argument types — the SAME `unify_typevar` /
+//     `substitute_typevars` machinery the generic functions use.
+//   - MEMBER ACCESS: `b.get()` / `b.value` on a `Ty::Class("Box", [int])`
+//     SUBSTITUTES `{T -> int}` into the (type-var-bearing) method-return / field
+//     type, so the member access is concrete.
+
+/// Build the `{type_param -> arg}` substitution for a generic-class INSTANCE
+/// `Ty::Class(name, args)`. Returns an empty map for a non-generic class, an
+/// arg-less bare class name, or when the class is not registered in
+/// `ctx.generic_classes` — in every one of those cases member access falls back
+/// to the unsubstituted signature, which is exactly the legacy behaviour. The
+/// args are zipped positionally against the declared type-param names; a length
+/// mismatch (an under/over-applied annotation) binds only the common prefix,
+/// leaving any surplus type var unsubstituted (it then surfaces as a `TypeVar`
+/// the caller treats as unresolved — never a panic).
+fn class_type_subst(ty: &Ty, ctx: &TyCtx) -> HashMap<String, Ty> {
+    let mut subst = HashMap::new();
+    if let Ty::Class(name, args) = ty {
+        if !args.is_empty() {
+            if let Some(params) = ctx.generic_classes.get(name) {
+                for (p, a) in params.iter().zip(args.iter()) {
+                    subst.insert(p.clone(), a.clone());
+                }
+            }
+        }
+    }
+    subst
+}
+
+/// Substitute a generic-class instance's type args into a member type `member`
+/// (a method return / param type or a field type that may contain the class's
+/// `Ty::TypeVar`s). `instance` is the receiver's `Ty::Class(name, args)`; for a
+/// non-generic / arg-less receiver the substitution is empty and `member` is
+/// returned unchanged (the universal non-generic path). Reuses the same
+/// `substitute_typevars` used by generic functions, so the two never drift.
+fn subst_class_member(member: &Ty, instance: &Ty, ctx: &TyCtx) -> Ty {
+    let subst = class_type_subst(instance, ctx);
+    if subst.is_empty() {
+        member.clone()
+    } else {
+        substitute_typevars(member, &subst)
+    }
+}
+
+/// Generics v2: INFER a generic class's type arguments at a constructor call.
+/// Given the class `name`, its constructor argument types `arg_tys`, and the
+/// `ctx`, returns the instance type `Ty::Class(name, [arg_for_T, ...])` with the
+/// class's type params resolved by unifying the scoped `__init__` parameter
+/// types against `arg_tys`.
+///
+/// - For a NON-generic class (absent from `ctx.generic_classes`) returns the
+///   plain `Ty::Class(name, [])` — the legacy result, so every existing
+///   constructor call is byte-for-byte unchanged.
+/// - A type param that NO `__init__` position can bind stays unresolved; it is
+///   filled with `Ty::Unknown` so the instance is still usable (permissive — the
+///   pure inference oracle never errors). The checking path enforces consistency
+///   separately via the same unification surfacing a conflict.
+fn infer_class_instantiation(name: &str, arg_tys: &[Ty], ctx: &TyCtx) -> Ty {
+    let type_params = match ctx.generic_classes.get(name) {
+        Some(tps) if !tps.is_empty() => tps,
+        _ => return Ty::Class(name.to_string(), vec![]),
+    };
+    // The scoped `__init__` parameter types (containing the class type vars).
+    let init_key = format!("{}.__init__", name);
+    let init_params: Vec<Ty> = ctx
+        .funcs
+        .get(&init_key)
+        .map(|sig| sig.params.iter().map(|(_, t)| t.clone()).collect())
+        .unwrap_or_default();
+    let mut subst: HashMap<String, Ty> = HashMap::new();
+    for (decl, actual) in init_params.iter().zip(arg_tys.iter()) {
+        // Ignore a conflict here (the checking path reports it); this oracle is
+        // permissive and only needs the best-effort binding.
+        let _ = unify_typevar(decl, actual, type_params, &mut subst);
+    }
+    let args: Vec<Ty> = type_params
+        .iter()
+        .map(|tp| subst.get(tp).cloned().unwrap_or(Ty::Unknown))
+        .collect();
+    Ty::Class(name.to_string(), args)
+}
+
+/// Generics v2: the checking-path counterpart of [`infer_class_instantiation`].
+/// Performs the same `__init__` unification but SURFACES a conflicting binding
+/// (the same `T = int then str` inconsistency `resolve_generic_call` reports for
+/// functions) and an ARITY mismatch against `__init__` as an honest typeck
+/// error at `span`. Returns the inferred instance type on success. A non-generic
+/// class takes the early return and is unaffected.
+fn check_class_instantiation(
+    name: &str,
+    arg_tys: &[Ty],
+    ctx: &TyCtx,
+    span: Span,
+) -> Result<Ty> {
+    let type_params = match ctx.generic_classes.get(name) {
+        Some(tps) if !tps.is_empty() => tps,
+        _ => return Ok(Ty::Class(name.to_string(), vec![])),
+    };
+    let init_key = format!("{}.__init__", name);
+    if let Some(sig) = ctx.funcs.get(&init_key) {
+        let init_params: Vec<Ty> = sig.params.iter().map(|(_, t)| t.clone()).collect();
+        let mut subst: HashMap<String, Ty> = HashMap::new();
+        for (decl, actual) in init_params.iter().zip(arg_tys.iter()) {
+            if let Err(msg) = unify_typevar(decl, actual, type_params, &mut subst) {
+                return Err(Error::Type { span, msg });
+            }
+        }
+        let args: Vec<Ty> = type_params
+            .iter()
+            .map(|tp| subst.get(tp).cloned().unwrap_or(Ty::Unknown))
+            .collect();
+        Ok(Ty::Class(name.to_string(), args))
+    } else {
+        Ok(Ty::Class(name.to_string(), vec![]))
+    }
 }
 
 /// Generics v1 — the OPS-ON-`T` restriction. A bound type variable is PARAMETRIC
@@ -2304,6 +2528,62 @@ pub fn infer_func_typevar_bounds(f: &Func, ctx: &TyCtx) -> BoundMap {
         out.entry(tp.clone()).or_default().insert(TypeVarBound::Clone);
     }
     out
+}
+
+/// Generics v2: infer the per-TYPE-VARIABLE Rust trait-bound set for one generic
+/// CLASS, by walking the bodies and signatures of ALL its methods. Reuses the
+/// SAME `infer_bounds_body` / `record_hashable_typevars` machinery as the
+/// generic-function path, so the "what op needs what bound" decision can never
+/// drift between functions, classes, and the typeck op-sites. The returned map
+/// is `class type var -> {bounds}`; every declared class type param is present
+/// with at least `Clone` (pyrst value semantics), so codegen always emits a
+/// well-formed `impl<T: Clone + ..>` clause.
+///
+/// Each method is seeded exactly as it is type-checked: `self` is typed
+/// `Ty::Class(name, [TypeVar(T), ..])` and each non-self param is scope-lowered
+/// with the class type params (a `v: T` param is `Ty::TypeVar("T")`), so an op
+/// on a field/param/return of type `T` records its bound. Field annotations are
+/// scanned too: a `set[T]` / `dict[T, _]` field needs `Hash + Eq` on `T`. Method
+/// transitive propagation into generic FREE functions is intentionally not
+/// modelled here (a method calling a generic free function with a class `T` is a
+/// rare stretch case — see the deferred notes); the direct ops cover Box/Pair
+/// and the comparison/arith/Display/Hash subset the spec requires.
+///
+/// A NON-generic class (empty `type_params`) returns an empty map and costs one
+/// early return — the non-generic emission path is untouched.
+pub fn infer_class_typevar_bounds(c: &ClassDef, ctx: &TyCtx) -> BoundMap {
+    let mut bounds = BoundMap::new();
+    if c.type_params.is_empty() {
+        return bounds;
+    }
+    // Every class type parameter carries at least `Clone` (clone-on-use).
+    for tp in &c.type_params {
+        bounds.entry(tp.clone()).or_default().insert(TypeVarBound::Clone);
+    }
+    // A `set[T]` / `dict[T, _]` FIELD makes the struct hold a `HashSet<T>` /
+    // `HashMap<T, _>`, which requires `Hash + Eq` on `T`.
+    for field in &c.fields {
+        if let Ok(ty) = Ty::from_type_expr_scoped(&field.ty, field.span, &c.type_params) {
+            record_hashable_typevars(&ty, &mut bounds);
+        }
+    }
+    // Walk every method body with the same locals seeding typeck uses.
+    let self_args: Vec<Ty> = c.type_params.iter().map(|tp| Ty::TypeVar(tp.clone())).collect();
+    for m in &c.methods {
+        let mut locals: HashMap<String, Ty> = HashMap::new();
+        locals.insert("self".to_string(), Ty::Class(c.name.clone(), self_args.clone()));
+        for p in m.params.iter().filter(|p| p.name != "self") {
+            if let Ok(ty) = Ty::from_type_expr_scoped(&p.ty, p.span, &c.type_params) {
+                record_hashable_typevars(&ty, &mut bounds);
+                locals.insert(p.name.clone(), ty);
+            }
+        }
+        if let Ok(ret) = Ty::from_type_expr_scoped(&m.ret, m.span, &c.type_params) {
+            record_hashable_typevars(&ret, &mut bounds);
+        }
+        infer_bounds_body(&m.body, &mut locals, ctx, &mut bounds);
+    }
+    bounds
 }
 
 /// The DIRECT (non-propagated) bound map for one generic function: a self-
@@ -3007,7 +3287,7 @@ fn unify_branch_types(a: Ty, b: Ty, ctx: &TyCtx) -> Option<Ty> {
     // (EPIC-5 C2-2b-i) Two classes are "related" for unification when one derives
     // from the other OR they share a common user-declared ancestor (sibling
     // subclasses unify at that ancestor — `Dog` & `Cat` meet at `Animal`).
-    let class_related = matches!((&a, &b), (Ty::Class(x), Ty::Class(y))
+    let class_related = matches!((&a, &b), (Ty::Class(x, _), Ty::Class(y, _))
         if is_subclass(x, y, ctx) || is_subclass(y, x, ctx)
             || nearest_common_ancestor(x, y, ctx).is_some());
     if !class_related && !types_compatible(&a, &b, ctx) {
@@ -3024,15 +3304,15 @@ fn unify_branch_types(a: Ty, b: Ty, ctx: &TyCtx) -> Option<Ty> {
         // verified the pair is related (in EITHER direction, since it is checked
         // both ways below). For unrelated classes neither `is_subclass` holds and
         // the equal-name case fell through to the default `=> a` arm unchanged.
-        (Ty::Class(da), Ty::Class(db)) if da != db && is_subclass(da, db, ctx) => b, // a derives from b -> b is base
-        (Ty::Class(da), Ty::Class(db)) if da != db && is_subclass(db, da, ctx) => a, // b derives from a -> a is base
+        (Ty::Class(da, _), Ty::Class(db, _)) if da != db && is_subclass(da, db, ctx) => b, // a derives from b -> b is base
+        (Ty::Class(da, _), Ty::Class(db, _)) if da != db && is_subclass(db, da, ctx) => a, // b derives from a -> a is base
         // (EPIC-5 C2-2b-i) Two SIBLING subclasses unify to their nearest common
         // ancestor (`Dog` & `Cat` -> `Animal`). Reached only when neither is a
         // subclass of the other but a common ancestor exists (the `class_related`
         // guard above admitted the pair).
-        (Ty::Class(da), Ty::Class(db)) if da != db => {
+        (Ty::Class(da, _), Ty::Class(db, _)) if da != db => {
             match nearest_common_ancestor(da, db, ctx) {
-                Some(anc) => Ty::Class(anc),
+                Some(anc) => Ty::Class(anc, vec![]),
                 None => a, // defensive: guard already ensured one exists
             }
         }
@@ -3122,7 +3402,7 @@ fn require_hashable(ty: &Ty, span: Span, position: &str) -> Result<()> {
 /// a later increment). Everything else — primitives, collections, Option, File,
 /// the unit/None types — is definitively not callable.
 fn is_noncallable_ty(ty: &Ty) -> bool {
-    !matches!(ty, Ty::Func(..) | Ty::Unknown | Ty::Class(_))
+    !matches!(ty, Ty::Func(..) | Ty::Unknown | Ty::Class(_, _))
 }
 
 // ── By-value parameter mutation detection helpers ─────────────────────────────
@@ -3169,7 +3449,7 @@ pub fn is_copy(ty: &Ty) -> bool {
         | Ty::List(_)
         | Ty::Set(_)
         | Ty::Dict(_, _)
-        | Ty::Class(_)
+        | Ty::Class(_, _)
         | Ty::Func(_, _)
         | Ty::NoneVal
         | Ty::File
@@ -3833,7 +4113,7 @@ fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             // If the base is a known user class, the assigned field must exist on
             // it (including inherited fields) — `a.b.c = v` with no field `c` is a
             // type error, not a deferred-to-rustc one.
-            if let Ty::Class(class_name) = &obj_ty {
+            if let Ty::Class(class_name, _) = &obj_ty {
                 if env.ctx.classes.contains_key(class_name.as_str()) {
                     let has_field = env.ctx.get_all_fields(class_name.as_str())
                         .iter().any(|f| &f.name == attr);
@@ -4315,7 +4595,7 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
                 BinOp::Div => Ty::Float,
                 BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Mod | BinOp::FloorDiv => {
                     // Operator overloading: a class lhs uses its dunder return type.
-                    if let Ty::Class(cls) = &l {
+                    if let Ty::Class(cls, _) = &l {
                         let dunder = match op {
                             BinOp::Add => Some("__add__"),
                             BinOp::Sub => Some("__sub__"),
@@ -4359,10 +4639,19 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
             }
             // D7: resolve the field inheritance-aware via `get_all_fields`
             // (codegen reads `c.fields` directly and misses inherited fields).
-            if let Ty::Class(cls) = infer_expr_ty(obj, locals, ctx) {
+            let recv = infer_expr_ty(obj, locals, ctx);
+            if let Ty::Class(cls, _) = &recv {
                 let all_fields = ctx.get_all_fields(cls.as_str());
                 if let Some(f) = all_fields.iter().find(|f| f.name == *name) {
-                    return Ty::from_type_expr(&f.ty, f.span).unwrap_or(Ty::Unknown);
+                    // Generics v2: scope the field annotation with the class's
+                    // type params (`value: T` -> `TypeVar(T)`) and substitute the
+                    // receiver instance's args (`Box[int]` -> `{T -> int}`) so the
+                    // oracle types `b.value` concretely (drives codegen var typing
+                    // and print formatting). Non-generic class => empty subst =>
+                    // identical to the old unscoped result.
+                    let tps = ctx.classes.get(cls.as_str()).map(|c| c.type_params.as_slice()).unwrap_or(&[]);
+                    let field_ty = Ty::from_type_expr_scoped(&f.ty, f.span, tps).unwrap_or(Ty::Unknown);
+                    return subst_class_member(&field_ty, &recv, ctx);
                 }
             }
             Ty::Unknown
@@ -4435,7 +4724,15 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
                         // local/param/var (`f: Callable[[int],int]`) called as
                         // `f(x)` yields the function value's return type.
                         if ctx.classes.contains_key(n) {
-                            Ty::Class(n.to_string())
+                            // Generics v2: for a generic class, INFER its type args
+                            // from the constructor argument types (`Box(5)` ->
+                            // `Box[int]`), matching the checking path so codegen
+                            // sees the same concrete instance type. A non-generic
+                            // class yields the legacy `Ty::Class(n, [])`.
+                            let arg_tys: Vec<Ty> = args.iter()
+                                .map(|a| infer_expr_ty(a, locals, ctx))
+                                .collect();
+                            infer_class_instantiation(n, &arg_tys, ctx)
                         } else if let Some(sig) = ctx.funcs.get(n) {
                             // Generics v1: for a generic call, infer the concrete
                             // result by unifying the declared param types against
@@ -4487,8 +4784,13 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
                 // `builtin_method_ret` so the two never drift and chained calls
                 // resolve.
                 let recv = infer_expr_ty(obj, locals, ctx);
-                if let Ty::Class(cls) = &recv {
-                    ctx.get_method(cls, name).map(|s| s.ret.clone()).unwrap_or(Ty::Unknown)
+                if let Ty::Class(cls, _) = &recv {
+                    // Generics v2: substitute the receiver instance's type args
+                    // into the method's (type-var-bearing) return, so a generic
+                    // method call types concretely for codegen (`b.get(): int`).
+                    ctx.get_method(cls, name)
+                        .map(|s| subst_class_member(&s.ret, &recv, ctx))
+                        .unwrap_or(Ty::Unknown)
                 } else if let Some(t) = dict_get_ret(&recv, name, args.len()) {
                     // dict.get is arg-count-aware: get(k) -> Optional[V],
                     // get(k, default) -> V (see dict_get_ret).
@@ -4566,7 +4868,7 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
             if let Ty::List(ref inner) | Ty::Set(ref inner) = iter_ty {
                 match elt.as_ref() {
                     Expr::Attr { name, .. } => {
-                        if let Ty::Class(cls) = inner.as_ref() {
+                        if let Ty::Class(cls, _) = inner.as_ref() {
                             if let Some(c) = ctx.classes.get(cls.as_str()) {
                                 if let Some(f) = c.fields.iter().find(|f| f.name == *name) {
                                     if let Ok(ty) = Ty::from_type_expr(&f.ty, f.span) {
@@ -4578,7 +4880,7 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
                     }
                     Expr::Call { callee, .. } => {
                         if let Expr::Attr { name, .. } = callee.as_ref() {
-                            if let Ty::Class(cls) = inner.as_ref() {
+                            if let Ty::Class(cls, _) = inner.as_ref() {
                                 if let Some(method_sig) = ctx.get_method(cls.as_str(), name) {
                                     return Ty::Set(Box::new(method_sig.ret.clone()));
                                 }
@@ -4596,7 +4898,7 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
             let iter_ty = infer_expr_ty(iter, locals, ctx);
             let field_ty = |e: &Expr| -> Ty {
                 if let Expr::Attr { name, .. } = e {
-                    if let Ty::Class(ref cls) = iter_ty {
+                    if let Ty::Class(ref cls, _) = iter_ty {
                         if let Some(c) = ctx.classes.get(cls.as_str()) {
                             if let Some(f) = c.fields.iter().find(|f| f.name == *name) {
                                 return Ty::from_type_expr(&f.ty, f.span).unwrap_or(Ty::Unknown);
@@ -4782,7 +5084,7 @@ fn infer_comp_elt_type_with_var(
             } else {
                 infer_comp_elt_type_with_var(obj, loop_var_ty, loop_var_name, ctx)
             };
-            if let Ty::Class(cls) = obj_ty {
+            if let Ty::Class(cls, _) = obj_ty {
                 if let Some(c) = ctx.classes.get(cls.as_str()) {
                     if let Some(f) = c.fields.iter().find(|f| f.name == *name) {
                         return Ty::from_type_expr(&f.ty, f.span).unwrap_or(Ty::Unknown);
@@ -4803,7 +5105,7 @@ fn infer_comp_elt_type_with_var(
                 } else {
                     infer_comp_elt_type_with_var(obj, loop_var_ty, loop_var_name, ctx)
                 };
-                if let Ty::Class(cls) = obj_ty {
+                if let Ty::Class(cls, _) = obj_ty {
                     if let Some(method_sig) = ctx.get_method(cls.as_str(), name) {
                         return method_sig.ret.clone();
                     }
@@ -4834,7 +5136,7 @@ fn infer_comp_elt_type_with_var(
 /// Resolve a lambda parameter's annotation to a `Ty`. Lambda params are
 /// untyped in the surface syntax; the parser records the placeholder
 /// `TypeExpr::Named("Any")`. That sentinel must resolve to `Ty::Unknown` (not
-/// the bogus `Ty::Class("Any")` the generic resolver would produce), so a
+/// the bogus `Ty::Class("Any", vec![])` the generic resolver would produce), so a
 /// param-dependent lambda body stays permissive instead of spuriously typing as
 /// a nonexistent class.
 fn lambda_param_ty(param_ty: &TypeExpr) -> Ty {
@@ -5176,6 +5478,29 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
             }
         }
         Expr::Call { callee, args, kwargs, span } => {
+            // Generics v2 (generic CLASSES): an EXPLICIT type-argument constructor
+            // `Box[int](5)` parses as a CALL whose callee is `Box[int]` — an
+            // `Index` of the class name. pyrst infers a generic class's type args
+            // from `__init__` (`Box(5)` -> `Box[int]`), and the `Box[int]` callee
+            // would otherwise be (mis)read as a list-index expression that
+            // type-checks but emits broken Rust. Reject it honestly here, pointing
+            // at the supported inferred form. (A genuine index-then-call like
+            // `ops["double"](7)` has a non-class base and is unaffected.)
+            if let Expr::Index { obj, .. } = callee.as_ref() {
+                if let Expr::Ident(cls, _) = obj.as_ref() {
+                    if env.ctx.classes.contains_key(cls.as_str()) {
+                        return Err(Error::Type {
+                            span: *span,
+                            msg: format!(
+                                "explicit type arguments on a constructor are not supported: \
+                                 write `{}(...)` and let the type arguments be inferred from the \
+                                 constructor arguments",
+                                cls
+                            ),
+                        });
+                    }
+                }
+            }
             // Check if this is a class constructor or function call.
             match callee.as_ref() {
                 Expr::Ident(name, _) => {
@@ -5191,10 +5516,20 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                             }
                             check_expr(val, env)?;
                         }
+                        // Generics v2: collect the positional argument types and,
+                        // for a GENERIC class, infer its type arguments by unifying
+                        // `__init__`'s scoped param types against them
+                        // (`Box(5)` -> `Box[int]`). A conflicting binding
+                        // (`Pair(1, 1)` against `Pair[A, B]` is fine; an
+                        // inconsistent same-var binding is reported) surfaces as an
+                        // honest error at `span`. A non-generic class takes the
+                        // early return inside the helper and yields the legacy
+                        // `Ty::Class(name, [])` — unchanged behaviour.
+                        let mut arg_tys = Vec::with_capacity(args.len());
                         for a in args {
-                            check_expr(a, env)?;
+                            arg_tys.push(check_expr(a, env)?);
                         }
-                        Ty::Class(name.clone())
+                        check_class_instantiation(name, &arg_tys, env.ctx, *span)?
                     } else if (name == "min" || name == "max") && args.len() == 1 {
                         // Single-iterable min/max: the result is the element type
                         // of the list/set argument. A `key=`/other kwarg may also
@@ -5562,7 +5897,7 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                         // (`t.foo()` where `t: T`) needs a trait bound and is
                         // rejected — `T` is opaque, with no known methods.
                         reject_typevar_op(&obj_ty, "call a method on", *span)?;
-                        if let Ty::Class(class_name) = &obj_ty {
+                        if let Ty::Class(class_name, _) = &obj_ty {
                             let key = format!("{}.{}", class_name, name);
                             if let Some(sig) = env.ctx.funcs.get(&key).cloned() {
                                 // (EPIC-4 V2-c) Enforce the by-reference (`Mut[T]`)
@@ -5594,7 +5929,14 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                                     }
                                 }
                                 for a in args { check_expr(a, env)?; }
-                                return Ok(sig.ret.clone());
+                                // Generics v2: the registered sig's return may
+                                // contain the class's type vars (`get(self) -> T`).
+                                // Substitute the RECEIVER instance's type args
+                                // (`b: Box[int]` -> `{T -> int}`) so the call types
+                                // concretely (`b.get(): int`). A non-generic / arg-
+                                // less receiver yields an empty subst and returns
+                                // the ret unchanged.
+                                return Ok(subst_class_member(&sig.ret, &obj_ty, env.ctx));
                             }
                         }
                         // (a) Builtin method existence — only on concrete Str/List/Set/Dict.
@@ -5753,16 +6095,25 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
             // fields/attributes (E0609 otherwise). A method CALL on a type var is
             // rejected separately in the Call arm.
             reject_typevar_op(&obj_ty, "access an attribute of", *span)?;
-            if let Ty::Class(class_name) = &obj_ty {
-                if let Some(_class_def) = env.ctx.classes.get(class_name.as_str()) {
+            if let Ty::Class(class_name, _) = &obj_ty {
+                if let Some(class_def) = env.ctx.classes.get(class_name.as_str()) {
                     // Check field access (including inherited fields).
                     let all_fields = env.ctx.get_all_fields(class_name.as_str());
                     if let Some(field) = all_fields.iter().find(|f| &f.name == name) {
-                        return Ty::from_type_expr(&field.ty, *span);
+                        // Generics v2: lower the field annotation with the class's
+                        // type params in scope (`value: T` -> `Ty::TypeVar(T)`),
+                        // then substitute the RECEIVER instance's type args
+                        // (`b: Box[int]` -> `{T -> int}`) so `b.value: int`. A
+                        // non-generic class scopes/substitutes with an empty set,
+                        // identical to the legacy `from_type_expr` result.
+                        let field_ty = Ty::from_type_expr_scoped(&field.ty, *span, &class_def.type_params)?;
+                        return Ok(subst_class_member(&field_ty, &obj_ty, env.ctx));
                     }
-                    // Check method access (including inherited methods).
+                    // Check method access (including inherited methods). A bare
+                    // method reference's return type substitutes the receiver's
+                    // type args too (parity with the method-CALL arm).
                     if let Some(method) = env.ctx.get_method(class_name.as_str(), name) {
-                        return Ok(method.ret.clone());
+                        return Ok(subst_class_member(&method.ret, &obj_ty, env.ctx));
                     }
                     return Err(Error::Type {
                         span: *span,
@@ -5878,7 +6229,7 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                     match (&l, &r) {
                         // Operator overloading: a class lhs dispatches to the
                         // declared return type of its dunder (__add__/__sub__/__mul__).
-                        (Ty::Class(cls), _) => {
+                        (Ty::Class(cls, _), _) => {
                             let dunder = match op {
                                 BinOp::Add => Some("__add__"),
                                 BinOp::Sub => Some("__sub__"),
@@ -6162,7 +6513,7 @@ mod tests {
         assert!(types_compatible(&Ty::NoneVal, &Ty::Option(Box::new(Ty::Int))));
         assert!(types_compatible(
             &Ty::NoneVal,
-            &Ty::Option(Box::new(Ty::Class("Point".into())))
+            &Ty::Option(Box::new(Ty::Class("Point".into(), vec![])))
         ));
     }
 
@@ -6176,7 +6527,7 @@ mod tests {
         assert!(!types_compatible(&Ty::Unit, &Ty::Option(Box::new(Ty::Int))));
         assert!(!types_compatible(
             &Ty::Unit,
-            &Ty::Option(Box::new(Ty::Class("Point".into())))
+            &Ty::Option(Box::new(Ty::Class("Point".into(), vec![])))
         ));
     }
 
@@ -6192,8 +6543,8 @@ mod tests {
         // A bare T auto-wraps into Optional[T].
         assert!(types_compatible(&Ty::Int, &Ty::Option(Box::new(Ty::Int))));
         assert!(types_compatible(
-            &Ty::Class("Point".into()),
-            &Ty::Option(Box::new(Ty::Class("Point".into())))
+            &Ty::Class("Point".into(), vec![]),
+            &Ty::Option(Box::new(Ty::Class("Point".into(), vec![])))
         ));
     }
 
@@ -6359,16 +6710,16 @@ mod tests {
     #[test]
     fn compat_class_same() {
         assert!(types_compatible(
-            &Ty::Class("Foo".into()),
-            &Ty::Class("Foo".into())
+            &Ty::Class("Foo".into(), vec![]),
+            &Ty::Class("Foo".into(), vec![])
         ));
     }
 
     #[test]
     fn compat_class_different_false() {
         assert!(!types_compatible(
-            &Ty::Class("Foo".into()),
-            &Ty::Class("Bar".into())
+            &Ty::Class("Foo".into(), vec![]),
+            &Ty::Class("Bar".into(), vec![])
         ));
     }
 
@@ -6385,6 +6736,7 @@ mod tests {
             methods: vec![],
             is_dataclass: false,
             span: Span::DUMMY,
+            type_params: vec![],
         }
     }
 
@@ -6453,13 +6805,13 @@ mod tests {
         let ctx = subtype_ctx();
         // A Derived value satisfies a Base slot (direct and transitive).
         assert!(super::types_compatible(
-            &Ty::Class("Dog".into()),
-            &Ty::Class("Animal".into()),
+            &Ty::Class("Dog".into(), vec![]),
+            &Ty::Class("Animal".into(), vec![]),
             &ctx
         ));
         assert!(super::types_compatible(
-            &Ty::Class("Cat".into()),
-            &Ty::Class("Animal".into()),
+            &Ty::Class("Cat".into(), vec![]),
+            &Ty::Class("Animal".into(), vec![]),
             &ctx
         ));
     }
@@ -6469,8 +6821,8 @@ mod tests {
         let ctx = subtype_ctx();
         // The reverse (Base value into a Derived slot) is NOT compatible.
         assert!(!super::types_compatible(
-            &Ty::Class("Animal".into()),
-            &Ty::Class("Dog".into()),
+            &Ty::Class("Animal".into(), vec![]),
+            &Ty::Class("Dog".into(), vec![]),
             &ctx
         ));
     }
@@ -6479,14 +6831,14 @@ mod tests {
     fn types_compatible_rejects_unrelated_classes() {
         let ctx = subtype_ctx();
         assert!(!super::types_compatible(
-            &Ty::Class("Rock".into()),
-            &Ty::Class("Animal".into()),
+            &Ty::Class("Rock".into(), vec![]),
+            &Ty::Class("Animal".into(), vec![]),
             &ctx
         ));
         // Sibling-ish but unrelated by inheritance.
         assert!(!super::types_compatible(
-            &Ty::Class("Animal".into()),
-            &Ty::Class("Rock".into()),
+            &Ty::Class("Animal".into(), vec![]),
+            &Ty::Class("Rock".into(), vec![]),
             &ctx
         ));
     }
@@ -6496,8 +6848,8 @@ mod tests {
         let ctx = subtype_ctx();
         // MyErr is not is_subclass of the builtin Exception -> incompatible.
         assert!(!super::types_compatible(
-            &Ty::Class("MyErr".into()),
-            &Ty::Class("Exception".into()),
+            &Ty::Class("MyErr".into(), vec![]),
+            &Ty::Class("Exception".into(), vec![]),
             &ctx
         ));
     }
@@ -6507,17 +6859,17 @@ mod tests {
         let ctx = subtype_ctx();
         // Both orderings unify to the BASE (wider) class, not the first-seen one.
         assert_eq!(
-            unify_branch_types(Ty::Class("Dog".into()), Ty::Class("Animal".into()), &ctx),
-            Some(Ty::Class("Animal".into()))
+            unify_branch_types(Ty::Class("Dog".into(), vec![]), Ty::Class("Animal".into(), vec![]), &ctx),
+            Some(Ty::Class("Animal".into(), vec![]))
         );
         assert_eq!(
-            unify_branch_types(Ty::Class("Animal".into()), Ty::Class("Dog".into()), &ctx),
-            Some(Ty::Class("Animal".into()))
+            unify_branch_types(Ty::Class("Animal".into(), vec![]), Ty::Class("Dog".into(), vec![]), &ctx),
+            Some(Ty::Class("Animal".into(), vec![]))
         );
         // Transitive: Cat & Animal -> Animal.
         assert_eq!(
-            unify_branch_types(Ty::Class("Cat".into()), Ty::Class("Animal".into()), &ctx),
-            Some(Ty::Class("Animal".into()))
+            unify_branch_types(Ty::Class("Cat".into(), vec![]), Ty::Class("Animal".into(), vec![]), &ctx),
+            Some(Ty::Class("Animal".into(), vec![]))
         );
     }
 
@@ -6526,7 +6878,7 @@ mod tests {
         let ctx = subtype_ctx();
         // Unrelated classes do not unify (no common slot in C1).
         assert_eq!(
-            unify_branch_types(Ty::Class("Rock".into()), Ty::Class("Animal".into()), &ctx),
+            unify_branch_types(Ty::Class("Rock".into(), vec![]), Ty::Class("Animal".into(), vec![]), &ctx),
             None
         );
     }
@@ -6560,16 +6912,16 @@ mod tests {
         // (EPIC-5 C2-2b-i) `[Dog(), Cat()]` -> the literal's element type is the
         // common base `Animal`, in EITHER element order.
         assert_eq!(
-            unify_branch_types(Ty::Class("Dog".into()), Ty::Class("Cat".into()), &ctx),
-            Some(Ty::Class("Animal".into()))
+            unify_branch_types(Ty::Class("Dog".into(), vec![]), Ty::Class("Cat".into(), vec![]), &ctx),
+            Some(Ty::Class("Animal".into(), vec![]))
         );
         assert_eq!(
-            unify_branch_types(Ty::Class("Cat".into()), Ty::Class("Dog".into()), &ctx),
-            Some(Ty::Class("Animal".into()))
+            unify_branch_types(Ty::Class("Cat".into(), vec![]), Ty::Class("Dog".into(), vec![]), &ctx),
+            Some(Ty::Class("Animal".into(), vec![]))
         );
         // A class with no common ancestor with `Dog` still does NOT unify.
         assert_eq!(
-            unify_branch_types(Ty::Class("Dog".into()), Ty::Class("Rock".into()), &ctx),
+            unify_branch_types(Ty::Class("Dog".into(), vec![]), Ty::Class("Rock".into(), vec![]), &ctx),
             None
         );
     }
@@ -6578,8 +6930,8 @@ mod tests {
     fn unify_branch_types_same_class_unchanged() {
         let ctx = subtype_ctx();
         assert_eq!(
-            unify_branch_types(Ty::Class("Dog".into()), Ty::Class("Dog".into()), &ctx),
-            Some(Ty::Class("Dog".into()))
+            unify_branch_types(Ty::Class("Dog".into(), vec![]), Ty::Class("Dog".into(), vec![]), &ctx),
+            Some(Ty::Class("Dog".into(), vec![]))
         );
     }
 
@@ -7872,7 +8224,7 @@ mod tests {
             Ty::List(Box::new(Ty::Int)),
             Ty::Set(Box::new(Ty::Int)),
             Ty::Dict(Box::new(Ty::Str), Box::new(Ty::Int)),
-            Ty::Class("Point".into()),
+            Ty::Class("Point".into(), vec![]),
         ];
         for t in cases {
             assert!(!is_copy(&t), "{t:?} must be non-Copy");
@@ -7909,7 +8261,7 @@ mod tests {
         assert!(is_copy(&Ty::Option(Box::new(Ty::Tuple(vec![Ty::Int, Ty::Bool])))));
         // Option<non-Copy> is non-Copy.
         assert!(!is_copy(&Ty::Option(Box::new(Ty::Str))));
-        assert!(!is_copy(&Ty::Option(Box::new(Ty::Class("Point".into())))));
+        assert!(!is_copy(&Ty::Option(Box::new(Ty::Class("Point".into(), vec![])))));
     }
 
     // =========================================================================
@@ -8363,7 +8715,7 @@ class Derived(Base):
     fn display_dict_str_animal() {
         let ty = Ty::Dict(
             Box::new(Ty::Str),
-            Box::new(Ty::Class("Animal".to_string())),
+            Box::new(Ty::Class("Animal".to_string(), vec![])),
         );
         assert_eq!(format!("{}", ty), "dict[str, Animal]");
     }
@@ -8605,7 +8957,7 @@ def main() -> None:
         // else is definitively non-callable.
         assert!(!is_noncallable_ty(&Ty::Func(vec![], Box::new(Ty::Unit))));
         assert!(!is_noncallable_ty(&Ty::Unknown));
-        assert!(!is_noncallable_ty(&Ty::Class("Foo".into())));
+        assert!(!is_noncallable_ty(&Ty::Class("Foo".into(), vec![])));
         for t in [Ty::Int, Ty::Float, Ty::Bool, Ty::Str, Ty::Unit,
                   Ty::List(Box::new(Ty::Int)), Ty::Dict(Box::new(Ty::Str), Box::new(Ty::Int))] {
             assert!(is_noncallable_ty(&t), "{} must be non-callable", t);
@@ -8617,7 +8969,7 @@ def main() -> None:
         // list[dict[str, Animal]]
         let ty = Ty::List(Box::new(Ty::Dict(
             Box::new(Ty::Str),
-            Box::new(Ty::Class("Animal".to_string())),
+            Box::new(Ty::Class("Animal".to_string(), vec![])),
         )));
         assert_eq!(format!("{}", ty), "list[dict[str, Animal]]");
     }
@@ -8631,7 +8983,7 @@ def main() -> None:
 
     #[test]
     fn display_class_name() {
-        assert_eq!(format!("{}", Ty::Class("Dog".to_string())), "Dog");
+        assert_eq!(format!("{}", Ty::Class("Dog".to_string(), vec![])), "Dog");
     }
 
     // ── check_all: collect-all diagnostics (EPIC-LSP L4) ──────────────────────

@@ -470,6 +470,28 @@ impl Parser {
         let span = self.peek_span();
         self.expect(&Tok::Class, "class")?;
         let name = self.expect_ident("class name")?;
+        // Generics v2 (PEP 695): an optional type-parameter clause `[T, U, ...]`
+        // sits between the class NAME and the `(` of the base list (or the `:`).
+        // Mirrors the `def f[T, U](..)` parsing exactly: each entry is a bare
+        // identifier (a type-variable name); bounds/defaults (`[T: Bound]`,
+        // `[T = int]`) are out of scope and not parsed; duplicates are rejected;
+        // an empty `class C[]:` is rejected by `expect_ident` erroring on the `]`.
+        let mut type_params: Vec<String> = Vec::new();
+        if self.eat(&Tok::LBracket) {
+            loop {
+                let tp_span = self.peek_span();
+                let tp = self.expect_ident("type parameter")?;
+                if type_params.iter().any(|existing| existing == &tp) {
+                    return Err(Error::Parse {
+                        span: tp_span,
+                        msg: format!("duplicate type parameter `{}`", tp),
+                    });
+                }
+                type_params.push(tp);
+                if !self.eat(&Tok::Comma) { break; }
+            }
+            self.expect(&Tok::RBracket, "type parameter list")?;
+        }
         let mut bases = Vec::new();
         if self.eat(&Tok::LParen) {
             if !matches!(self.peek(), Tok::RParen) {
@@ -555,7 +577,7 @@ impl Parser {
             }
         }
         self.expect(&Tok::Dedent, "class body")?;
-        Ok(ClassDef { name, bases, fields, methods, is_dataclass: false, span })
+        Ok(ClassDef { name, bases, fields, methods, is_dataclass: false, span, type_params })
     }
 
     fn parse_try(&mut self) -> Result<Stmt> {

@@ -260,6 +260,14 @@ pub(crate) fn merge_ctx_from_module(m: &Module, ctx: &mut TyCtx, is_root: bool) 
                 let mut c = c.clone();
                 crate::typeck::extract_init_fields(&mut c);
                 ctx.classes.insert(c.name.clone(), c.clone());
+                // Generics v2 (generic CLASSES): record the declared type-param
+                // names so substitution sites can zip them against an instance's
+                // `Ty::Class(name, args)`. ONLY a generic class (non-empty
+                // `type_params`) is registered — a plain class stays absent, so
+                // the non-generic hot path is byte-for-byte unchanged.
+                if !c.type_params.is_empty() {
+                    ctx.generic_classes.insert(c.name.clone(), c.type_params.clone());
+                }
                 // Register method signatures
                 for m_fn in &c.methods {
                     let method_name = format!("{}.{}", c.name, m_fn.name);
@@ -274,13 +282,21 @@ pub(crate) fn merge_ctx_from_module(m: &Module, ctx: &mut TyCtx, is_root: bool) 
                     // call-site by-ref logic started reading it (this card). No
                     // existing reader consumed method-keyed `params` (only `.ret`),
                     // so aligning here is non-breaking.
+                    // Generics v2: lower the method signature with the CLASS's
+                    // type parameters in scope, so a field/param/return naming a
+                    // class type var `T` lowers to `Ty::TypeVar("T")` (not the
+                    // bogus `Ty::Class("T", [])`). For a non-generic class
+                    // `type_params` is empty, so this is identical to the old
+                    // unscoped `from_type_expr` and the non-generic path is
+                    // unaffected. A call site on a concrete `Ty::Class(name, args)`
+                    // instance substitutes the args back in (see typeck).
                     let method_params: Vec<(String, crate::typeck::Ty)> = m_fn.params.iter()
                         .filter(|p| p.name != "self")
-                        .map(|p| crate::typeck::Ty::from_type_expr(&p.ty, p.span).map(|ty| (p.name.clone(), ty)))
+                        .map(|p| crate::typeck::Ty::from_type_expr_scoped(&p.ty, p.span, &c.type_params).map(|ty| (p.name.clone(), ty)))
                         .collect::<crate::diag::Result<Vec<_>>>()?;
                     ctx.funcs.insert(method_name, crate::typeck::FuncSig {
                         params: method_params,
-                        ret: crate::typeck::Ty::from_type_expr(&m_fn.ret, m_fn.span)?,
+                        ret: crate::typeck::Ty::from_type_expr_scoped(&m_fn.ret, m_fn.span, &c.type_params)?,
                         param_defaults: m_fn.params.iter()
                             .filter(|p| p.name != "self")
                             .map(|p| p.default.clone())
@@ -409,7 +425,7 @@ class Account:
         assert!(!sig.param_by_ref[1], "note (second real param) is by-value");
 
         // And `amt`'s type is the UNWRAPPED inner T (Account), not a Mut wrapper.
-        assert!(matches!(sig.params[0].1, Ty::Class(ref c) if c == "Account"),
+        assert!(matches!(sig.params[0].1, Ty::Class(ref c, _) if c == "Account"),
             "Mut[Account] param's type is the inner Account");
     }
 

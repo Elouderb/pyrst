@@ -1,0 +1,21 @@
+# A generic class whose method OPERATES on the class type var `T` with a
+# SUPPORTED op (comparison). Reusing the generic-FUNCTION bound machinery, the
+# compiler infers `T: PartialOrd` and emits `impl<T: Clone + PartialOrd>
+# MaxBox<T>`. `Clone` is always present (pyrst value semantics). Instantiated at
+# `int` and at `str`, the SAME class is monomorphized to two concrete impls.
+class MaxBox[T]:
+    a: T
+    b: T
+    def __init__(self, x: T, y: T) -> None:
+        self.a = x
+        self.b = y
+    def bigger(self) -> T:
+        if self.a > self.b:
+            return self.a
+        return self.b
+
+def main() -> None:
+    mi: MaxBox[int] = MaxBox(3, 7)
+    print(mi.bigger())          # 7
+    ms: MaxBox[str] = MaxBox("apple", "pear")
+    print(ms.bigger())          # pear

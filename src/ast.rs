@@ -81,6 +81,20 @@ pub struct ClassDef {
     pub methods: Vec<Func>,
     pub is_dataclass: bool,
     pub span: Span,
+    /// Generics v2 (PEP 695): the declared type parameters of a parametric
+    /// generic CLASS, e.g. `["T"]` for `class Box[T]:` or `["A", "B"]` for
+    /// `class Pair[A, B]:`. EMPTY for a non-generic class. A name in this list is
+    /// a BOUND type variable SCOPED TO THE WHOLE CLASS: it is visible in every
+    /// field annotation and every method param/return annotation, where it lowers
+    /// to `Ty::TypeVar(name)` (scoped lowering) instead of `Ty::Class(name)`. At a
+    /// constructor call (`Box(5)`) the class's type arguments are inferred by
+    /// unifying `__init__`'s param types against the actual arg types, producing a
+    /// `Ty::Class("Box", [int])`; method calls and field reads on such an instance
+    /// substitute the recorded args into the (type-var-bearing) signature/field
+    /// type. Codegen emits the class as `struct Box<T> { .. }` +
+    /// `impl<T: Clone + ..> Box<T> { .. }`, with the per-`T` bounds inferred from
+    /// the ops the methods perform (reusing the generic-FUNCTION bound machinery).
+    pub type_params: Vec<String>,
 }
 
 #[derive(Debug, Clone)]

@@ -120,11 +120,22 @@ pub struct Codegen<'a> {
     /// as well as inside a nested `def`. Saved/restored around the try body, the
     /// nested-loop bodies, and (via `emit_func`) nested functions.
     try_loopctl_escape: bool,
+    /// Generics v2 (generic CLASSES): the type parameters of the class whose
+    /// `impl<T, ..> Box<T> { .. }` block is CURRENTLY being emitted (`["T"]` for
+    /// `Box`). A method emitted inside that block references `T` from the IMPL
+    /// header, so its own param/return annotations must lower with these names in
+    /// scope (a `v: T` becomes the Rust `T`) but must NOT re-declare them as a
+    /// per-method generic clause. `emit_func` threads this set into
+    /// `from_type_expr_scoped` and suppresses the per-method clause when the
+    /// method has no type params of its own. EMPTY everywhere except inside a
+    /// generic class's impl block (saved/restored around it), so non-generic
+    /// classes and free functions are byte-for-byte unchanged.
+    current_class_type_params: Vec<String>,
 }
 
 impl<'a> Codegen<'a> {
     pub fn new(ctx: &'a TyCtx) -> Self {
-        Self { ctx, out: String::new(), indent: 0, locals: HashMap::new(), declared: Default::default(), current_class: None, current_ret_ty: Ty::Unit, dead_funcs: Default::default(), mut_self: HashMap::new(), by_ref_locals: Default::default(), poly_map: HashMap::new(), concrete_struct_params: Default::default(), const_names: Default::default(), const_strs: Default::default(), in_generator: false, try_return_escape: false, try_loopctl_escape: false }
+        Self { ctx, out: String::new(), indent: 0, locals: HashMap::new(), declared: Default::default(), current_class: None, current_ret_ty: Ty::Unit, dead_funcs: Default::default(), mut_self: HashMap::new(), by_ref_locals: Default::default(), poly_map: HashMap::new(), concrete_struct_params: Default::default(), const_names: Default::default(), const_strs: Default::default(), in_generator: false, try_return_escape: false, try_loopctl_escape: false, current_class_type_params: Vec::new() }
     }
 
     pub fn with_dead_funcs(mut self, dead: std::collections::HashSet<String>) -> Self {
@@ -145,7 +156,7 @@ impl<'a> Codegen<'a> {
         match ty {
             Ty::Int | Ty::Float | Ty::Bool | Ty::Str | Ty::Unit => true,
             Ty::List(_) | Ty::Set(_) | Ty::Dict(_, _) | Ty::Option(_) => true,
-            Ty::Class(n) => {
+            Ty::Class(n, _) => {
                 // (EPIC-5 C2-3) A polymorphic base lowers (via `rust_ty`) to its
                 // companion enum `n__`, a data-variant enum that CANNOT derive
                 // `Default` (emit_companion_enum is `#[derive(Clone, Debug)]`
@@ -193,7 +204,7 @@ impl<'a> Codegen<'a> {
             Ty::Float => "0.0f64".to_string(),
             Ty::Bool => "false".to_string(),
             Ty::Str => "String::new()".to_string(),
-            Ty::Class(n) => {
+            Ty::Class(n, _) => {
                 let all_copy = self.ctx.get_all_fields(n).iter().all(|f| {
                     Ty::from_type_expr(&f.ty, f.span).map(|t| self.is_copy_type(&t)).unwrap_or(false)
                 });
@@ -250,9 +261,9 @@ impl<'a> Codegen<'a> {
             Ty::Set(_) => "::std::collections::HashSet::new()".to_string(),
             Ty::Dict(_, _) => "::std::collections::HashMap::new()".to_string(),
             Ty::Option(_) => "None".to_string(),
-            Ty::Class(n) => {
+            Ty::Class(n, _) => {
                 // Only derive Default when all fields support it (mirrors emit_class).
-                if self.type_has_default(&Ty::Class(n.clone())) {
+                if self.type_has_default(&Ty::Class(n.clone(), vec![])) {
                     "Default::default()".to_string()
                 } else {
                     return None;  // Not hoistable — no Default impl available.
@@ -421,7 +432,7 @@ impl<'a> Codegen<'a> {
     /// used unchanged (keeps every non-polymorphic example byte-for-byte stable).
     fn ty_has_poly_base(&self, ty: &Ty) -> bool {
         match ty {
-            Ty::Class(n) => self.is_polymorphic_base(n),
+            Ty::Class(n, _) => self.is_polymorphic_base(n),
             Ty::List(e) | Ty::Set(e) | Ty::Option(e) => self.ty_has_poly_base(e),
             Ty::Dict(k, v) => self.ty_has_poly_base(k) || self.ty_has_poly_base(v),
             Ty::Tuple(ts) => ts.iter().any(|t| self.ty_has_poly_base(t)),
@@ -468,7 +479,7 @@ impl<'a> Codegen<'a> {
     fn emit_into_base_slot(&mut self, value: &Expr, expected: &Ty) -> Result<String> {
         match expected {
             // Scalar polymorphic-base slot `B__`.
-            Ty::Class(b) if self.is_polymorphic_base(b) => {
+            Ty::Class(b, _) if self.is_polymorphic_base(b) => {
                 // A constructor `C(...)` is a RAW struct temp -> wrap as variant C.
                 if let Some(ctor) = self.constructor_class(value) {
                     let inner = self.emit_consuming(value)?;
@@ -476,7 +487,7 @@ impl<'a> Codegen<'a> {
                 }
                 let et = self.type_of_expr(value);
                 match &et {
-                    Ty::Class(c) if self.is_polymorphic_base(c) => {
+                    Ty::Class(c, _) if self.is_polymorphic_base(c) => {
                         if c == b {
                             // Already a `B__` value (a base-typed place) -> pass through.
                             self.emit_consuming(value)
@@ -498,7 +509,7 @@ impl<'a> Codegen<'a> {
                     }
                     // A concrete / non-polymorphic value whose type is `B` or a
                     // (leaf) subclass of `B` -> RAW struct -> wrap as variant `et`.
-                    Ty::Class(c) => {
+                    Ty::Class(c, _) => {
                         let inner = self.emit_consuming(value)?;
                         Ok(format!("{}__::{}({})", b, c, inner))
                     }
@@ -1020,7 +1031,7 @@ impl<'a> Codegen<'a> {
                     Expr::Ident(n, _) => self.ctx.funcs.get(n.as_str())
                         .map(|s| s.param_by_ref.clone()).unwrap_or_default(),
                     Expr::Attr { obj, name, .. } => {
-                        if let Ty::Class(cls) = self.type_of_expr(obj.as_ref()) {
+                        if let Ty::Class(cls, _) = self.type_of_expr(obj.as_ref()) {
                             self.ctx.get_method(&cls, name)
                                 .map(|s| s.param_by_ref.clone()).unwrap_or_default()
                         } else {
@@ -1438,6 +1449,24 @@ impl<'a> Codegen<'a> {
                 .join(", ");
             format!("<{}>", bounds)
         };
+        // Generics v2 (generic CLASSES): the type-var names IN SCOPE for lowering
+        // this function's param/return annotations = its own `type_params` PLUS,
+        // when it is a method of a generic class, the class's type params (which
+        // the enclosing `impl<T, ..> Box<T>` block declares). A method has empty
+        // `f.type_params`, so for a generic class's method this is exactly the
+        // class params; for a free function or a non-generic class's method it is
+        // just `f.type_params` (the class list is empty), so the legacy path is
+        // unchanged. The per-method generic CLAUSE above still uses only
+        // `f.type_params`, so the class params are NOT re-declared on the method.
+        let mut scope: Vec<String> = f.type_params.clone();
+        if method_of.is_some() {
+            for tp in &self.current_class_type_params {
+                if !scope.contains(tp) {
+                    scope.push(tp.clone());
+                }
+            }
+        }
+
         let mut sig = format!("fn {}{}(", name, generics);
         let mut first = true;
         // Static methods don't get self; regular methods take &self or &mut self based on whether they modify self.
@@ -1461,7 +1490,7 @@ impl<'a> Codegen<'a> {
         for p in f.params.iter().filter(|p| p.name != "self") {
             if !first { sig.push_str(", "); }
             first = false;
-            let pty = self.rust_ty(&Ty::from_type_expr_scoped(&p.ty, p.span, &f.type_params)?);
+            let pty = self.rust_ty(&Ty::from_type_expr_scoped(&p.ty, p.span, &scope)?);
             if p.by_ref {
                 // (EPIC-4 V2-c) An opt-in by-reference param (`Mut[T]`) becomes
                 // `name: &mut T`. The callee's mutations persist to the caller,
@@ -1479,7 +1508,7 @@ impl<'a> Codegen<'a> {
                 let _ = write!(sig, "mut {}: {}", escape_ident(&p.name), pty);
             }
         }
-        let ret = Ty::from_type_expr_scoped(&f.ret, f.span, &f.type_params)?;
+        let ret = Ty::from_type_expr_scoped(&f.ret, f.span, &scope)?;
         let ret_s = self.rust_ty(&ret);
         let _ = write!(sig, ") -> {} {{", ret_s);
 
@@ -1571,14 +1600,24 @@ impl<'a> Codegen<'a> {
         }
 
         // Populate locals from parameters
-        // Register self with its class type if this is a method
+        // Register self with its class type if this is a method. Generics v2: for
+        // a generic class, type `self` as `Ty::Class(cls, [TypeVar(T), ..])` so a
+        // field read `self.value` resolves through the type-var-bearing field/
+        // method machinery and types as the class's `T` (which `rust_ty` lowers to
+        // the impl's generic `T`). A non-generic class has empty
+        // `current_class_type_params`, so `self` is the plain `Ty::Class(cls, [])`.
         if let Some(cls) = method_of {
-            self.locals.insert("self".to_string(), Ty::Class(cls.to_string()));
+            let self_args: Vec<Ty> = self.current_class_type_params.iter()
+                .map(|tp| Ty::TypeVar(tp.clone()))
+                .collect();
+            self.locals.insert("self".to_string(), Ty::Class(cls.to_string(), self_args));
         }
 
         for p in &f.params {
             if p.name != "self" {
-                let ty = Ty::from_type_expr(&p.ty, p.span)?;
+                // Generics v2: scope param-local types with the in-scope type vars
+                // (own + enclosing generic class) so a `v: T` local is `TypeVar(T)`.
+                let ty = Ty::from_type_expr_scoped(&p.ty, p.span, &scope)?;
                 self.locals.insert(p.name.clone(), ty);
             }
         }
@@ -1717,7 +1756,7 @@ impl<'a> Codegen<'a> {
         // without it (Python `==` on such a struct is then honestly unavailable
         // — consistent with cross-variant equality being absent on the enum).
         let field_blocks_eq = all_fields.iter().any(|f| {
-            matches!(Ty::from_type_expr(&f.ty, f.span), Ok(Ty::Class(ref n))
+            matches!(Ty::from_type_expr(&f.ty, f.span), Ok(Ty::Class(ref n, _))
                 if self.is_polymorphic_base(n) && !self.companion_enum_has_partial_eq(n))
         });
         let pe = if has_eq || field_blocks_eq { "" } else { ", PartialEq" };
@@ -1736,11 +1775,30 @@ impl<'a> Codegen<'a> {
         } else {
             format!("#[derive(Clone, Debug{})]", pe)
         };
+        // Generics v2 (generic CLASSES): the type-parameter clauses threaded
+        // through this class's struct + impl + method emission.
+        //   - `struct_generics` = `<T, U>` on the STRUCT declaration (no bounds:
+        //     `struct Box<T> { value: T }`).
+        //   - `impl_generics`   = `<T: Clone + ..>` on the IMPL header, carrying
+        //     the bounds inferred from the ops the methods perform on `T`
+        //     (reusing the generic-FUNCTION bound machinery via
+        //     `infer_class_typevar_bounds`).
+        //   - `ty_args`         = `<T, U>` after the type name in the impl head
+        //     and in trait-impl heads (`impl<T> Box<T>`).
+        // All three are empty for a non-generic class, so its emission is
+        // byte-for-byte unchanged. While the impl block is open we set
+        // `current_class_type_params` so method sigs and field lowering see the
+        // class type vars in scope (a `v: T` lowers to the Rust `T`).
+        let (struct_generics, impl_generics, ty_args) = self.class_generic_clauses(c);
+
         self.line(&derives);
-        self.line(&format!("struct {} {{", c.name));
+        self.line(&format!("struct {}{} {{", c.name, struct_generics));
         self.indent += 1;
         for f in &all_fields {
-            let ty = Ty::from_type_expr(&f.ty, f.span)?;
+            // Generics v2: scope the field annotation with the class type params
+            // so a `value: T` field lowers to the Rust generic `T` (not a `T`
+            // struct). Empty for a non-generic class.
+            let ty = Ty::from_type_expr_scoped(&f.ty, f.span, &c.type_params)?;
             // (EPIC-6) Escape a keyword field name in the struct definition; every
             // field read/write/init escapes the same way so they stay in sync.
             self.line(&format!("{}: {},", escape_ident(&f.name), self.rust_ty(&ty)));
@@ -1750,6 +1808,8 @@ impl<'a> Codegen<'a> {
         self.line("");
 
         self.current_class = Some(c.name.clone());
+        // In scope for every method/field lowering until the end of emit_class.
+        let saved_class_tps = std::mem::replace(&mut self.current_class_type_params, c.type_params.clone());
 
         // Dunder methods that become Rust trait impls instead of regular methods.
         let dunder_trait_names = DUNDER_TRAIT_NAMES;
@@ -1766,7 +1826,9 @@ impl<'a> Codegen<'a> {
             m.name != "__init__" && !dunder_trait_names.contains(&m.name.as_str())) || has_lt;
 
         if has_init || has_regular_methods || (is_dataclass && !has_init) {
-            self.line(&format!("impl {} {{", c.name));
+            // Generics v2: `impl<T: Clone + ..> Box<T> { .. }`. Bounds clause +
+            // type-args; both empty for a non-generic class (`impl Point { .. }`).
+            self.line(&format!("impl{} {}{} {{", impl_generics, c.name, ty_args));
             self.indent += 1;
 
             // Emit new() constructor when __init__ is defined.
@@ -1775,7 +1837,9 @@ impl<'a> Codegen<'a> {
                     let non_self: Vec<_> = init_fn.params.iter().filter(|p| p.name != "self").collect();
                     let param_strs: Result<Vec<_>> = non_self.iter()
                         .map(|p| {
-                            let ty = Ty::from_type_expr(&p.ty, p.span)?;
+                            // Generics v2: scope `__init__`'s params so `v: T`
+                            // becomes the impl's generic `T`.
+                            let ty = Ty::from_type_expr_scoped(&p.ty, p.span, &c.type_params)?;
                             // (EPIC-6) new()'s params + their forwarded uses below
                             // escape identically.
                             Ok(format!("{}: {}", escape_ident(&p.name), self.rust_ty(&ty)))
@@ -1783,18 +1847,53 @@ impl<'a> Codegen<'a> {
                         .collect();
                     let param_strs = param_strs?;
                     let param_names: Vec<_> = non_self.iter().map(|p| escape_ident(&p.name)).collect();
+                    // Generics v2: a field of type-var type (`value: T`) has NO Rust
+                    // `Default` (we don't bound `T: Default` — that would reject a
+                    // `Box[NonDefault]`), so the zero-then-`__init__` placeholder
+                    // `Default::default()` won't compile. For a GENERIC class we seed
+                    // each placeholder from the `__init__` param the field is directly
+                    // assigned (`self.value = v` -> `value: v.clone()`); `T: Clone` is
+                    // always bounded, and `__init__` then runs as usual (it just
+                    // re-assigns). A field NOT directly param-assigned (computed in
+                    // `__init__`) keeps `zeroed_default` — for Box/Pair every field is
+                    // param-assigned, so this is exact. The non-generic path is
+                    // unaffected (`type_params` empty => the map is empty => the old
+                    // `zeroed_default` branch is taken for every field, byte-for-byte).
+                    let init_field_params = if c.type_params.is_empty() {
+                        std::collections::HashMap::new()
+                    } else {
+                        Self::init_field_param_map(&init_fn)
+                    };
                     let defaults: Vec<String> = all_fields.iter().map(|f| {
-                        let ty = Ty::from_type_expr(&f.ty, f.span).unwrap_or(Ty::Unknown);
-                        // Use zeroed_default which handles Copy classes that don't
-                        // implement Default (unlike a plain Default::default() call).
-                        let dv = self.zeroed_default(&ty);
+                        let ty = Ty::from_type_expr_scoped(&f.ty, f.span, &c.type_params).unwrap_or(Ty::Unknown);
+                        // A type-var-bearing field with a known init param: clone that
+                        // param as the placeholder. Otherwise the legacy zeroed default.
+                        let dv = if crate::typeck::ty_contains_typevar(&ty) {
+                            if let Some(param) = init_field_params.get(&f.name) {
+                                format!("{}.clone()", escape_ident(param))
+                            } else {
+                                self.zeroed_default(&ty)
+                            }
+                        } else {
+                            // Use zeroed_default which handles Copy classes that don't
+                            // implement Default (unlike a plain Default::default() call).
+                            self.zeroed_default(&ty)
+                        };
                         // (EPIC-6) Escape a keyword field name in the struct-literal
                         // initializer (matches the escaped struct field def).
                         format!("{}: {}", escape_ident(&f.name), dv)
                     }).collect();
+                    // The throwaway struct literal: a NON-generic class names the
+                    // struct directly (`Vector { .. }`) — byte-for-byte the legacy
+                    // emission. A GENERIC class uses `Self { .. }` so the literal
+                    // resolves to `Box<T>` WITHOUT writing explicit type args (Rust
+                    // infers `T` once `__init__` fills the `T`-typed field). Keeping
+                    // the non-generic case on `c.name` preserves byte-identity for
+                    // every existing class.
+                    let inst_ty = if c.type_params.is_empty() { c.name.clone() } else { "Self".to_string() };
                     self.line(&format!("fn new({}) -> Self {{", param_strs.join(", ")));
                     self.indent += 1;
-                    self.line(&format!("let mut __inst = {} {{ {} }};", c.name, defaults.join(", ")));
+                    self.line(&format!("let mut __inst = {} {{ {} }};", inst_ty, defaults.join(", ")));
                     self.line(&format!("__inst.__init__({});", param_names.join(", ")));
                     self.line("__inst");
                     self.indent -= 1;
@@ -1862,8 +1961,8 @@ impl<'a> Codegen<'a> {
                     if m.name == "__lt__" {
                         self.line(&format!("fn __lt_impl(&self, other: &{}) -> bool {{", c.name));
                         self.indent += 1;
-                        self.locals.insert("self".into(), Ty::Class(c.name.clone()));
-                        self.locals.insert("other".into(), Ty::Class(c.name.clone()));
+                        self.locals.insert("self".into(), Ty::Class(c.name.clone(), vec![]));
+                        self.locals.insert("other".into(), Ty::Class(c.name.clone(), vec![]));
                         // `other: &c.name` is the CONCRETE struct here — exempt it
                         // from base-field-read lowering (C2-2b-i).
                         self.concrete_struct_params.insert("other".into());
@@ -1914,7 +2013,7 @@ impl<'a> Codegen<'a> {
                     self.indent += 1;
                     self.line("fn fmt(&self, __f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {");
                     self.indent += 1;
-                    self.locals.insert("self".into(), Ty::Class(c.name.clone()));
+                    self.locals.insert("self".into(), Ty::Class(c.name.clone(), vec![]));
                     let body = &m.body;
                     let split_at = if body.is_empty() { 0 } else { body.len() - 1 };
                     for s in &body[..split_at] { self.emit_stmt(s)?; }
@@ -1935,15 +2034,15 @@ impl<'a> Codegen<'a> {
                 "__add__" => {
                     let other_param = m.params.iter().find(|p| p.name == "other");
                     let other_ty = other_param
-                        .map(|p| Ty::from_type_expr(&p.ty, p.span).unwrap_or(Ty::Class(c.name.clone())))
-                        .unwrap_or(Ty::Class(c.name.clone()));
-                    let ret_ty = Ty::from_type_expr(&m.ret, m.span).unwrap_or(Ty::Class(c.name.clone()));
+                        .map(|p| Ty::from_type_expr(&p.ty, p.span).unwrap_or(Ty::Class(c.name.clone(), vec![])))
+                        .unwrap_or(Ty::Class(c.name.clone(), vec![]));
+                    let ret_ty = Ty::from_type_expr(&m.ret, m.span).unwrap_or(Ty::Class(c.name.clone(), vec![]));
                     self.line(&format!("impl ::std::ops::Add<{}> for {} {{", self.rust_ty(&other_ty), c.name));
                     self.indent += 1;
                     self.line(&format!("type Output = {};", self.rust_ty(&ret_ty)));
                     self.line(&format!("fn add(self, other: {}) -> {} {{", self.rust_ty(&other_ty), self.rust_ty(&ret_ty)));
                     self.indent += 1;
-                    self.locals.insert("self".into(), Ty::Class(c.name.clone()));
+                    self.locals.insert("self".into(), Ty::Class(c.name.clone(), vec![]));
                     self.locals.insert("other".into(), other_ty);
                     for s in &m.body { self.emit_stmt(s)?; }
                     self.locals.remove("self");
@@ -1959,8 +2058,8 @@ impl<'a> Codegen<'a> {
                     self.indent += 1;
                     self.line(&format!("fn eq(&self, other: &{}) -> bool {{", c.name));
                     self.indent += 1;
-                    self.locals.insert("self".into(), Ty::Class(c.name.clone()));
-                    self.locals.insert("other".into(), Ty::Class(c.name.clone()));
+                    self.locals.insert("self".into(), Ty::Class(c.name.clone(), vec![]));
+                    self.locals.insert("other".into(), Ty::Class(c.name.clone(), vec![]));
                     // `other: &c.name` is the CONCRETE struct here — exempt it
                     // from base-field-read lowering (C2-2b-i).
                     self.concrete_struct_params.insert("other".into());
@@ -1977,15 +2076,15 @@ impl<'a> Codegen<'a> {
                 "__sub__" => {
                     let other_param = m.params.iter().find(|p| p.name == "other");
                     let other_ty = other_param
-                        .map(|p| Ty::from_type_expr(&p.ty, p.span).unwrap_or(Ty::Class(c.name.clone())))
-                        .unwrap_or(Ty::Class(c.name.clone()));
-                    let ret_ty = Ty::from_type_expr(&m.ret, m.span).unwrap_or(Ty::Class(c.name.clone()));
+                        .map(|p| Ty::from_type_expr(&p.ty, p.span).unwrap_or(Ty::Class(c.name.clone(), vec![])))
+                        .unwrap_or(Ty::Class(c.name.clone(), vec![]));
+                    let ret_ty = Ty::from_type_expr(&m.ret, m.span).unwrap_or(Ty::Class(c.name.clone(), vec![]));
                     self.line(&format!("impl ::std::ops::Sub<{}> for {} {{", self.rust_ty(&other_ty), c.name));
                     self.indent += 1;
                     self.line(&format!("type Output = {};", self.rust_ty(&ret_ty)));
                     self.line(&format!("fn sub(self, other: {}) -> {} {{", self.rust_ty(&other_ty), self.rust_ty(&ret_ty)));
                     self.indent += 1;
-                    self.locals.insert("self".into(), Ty::Class(c.name.clone()));
+                    self.locals.insert("self".into(), Ty::Class(c.name.clone(), vec![]));
                     self.locals.insert("other".into(), other_ty);
                     for s in &m.body { self.emit_stmt(s)?; }
                     self.locals.remove("self");
@@ -1999,15 +2098,15 @@ impl<'a> Codegen<'a> {
                 "__mul__" => {
                     let other_param = m.params.iter().find(|p| p.name == "other");
                     let other_ty = other_param
-                        .map(|p| Ty::from_type_expr(&p.ty, p.span).unwrap_or(Ty::Class(c.name.clone())))
-                        .unwrap_or(Ty::Class(c.name.clone()));
-                    let ret_ty = Ty::from_type_expr(&m.ret, m.span).unwrap_or(Ty::Class(c.name.clone()));
+                        .map(|p| Ty::from_type_expr(&p.ty, p.span).unwrap_or(Ty::Class(c.name.clone(), vec![])))
+                        .unwrap_or(Ty::Class(c.name.clone(), vec![]));
+                    let ret_ty = Ty::from_type_expr(&m.ret, m.span).unwrap_or(Ty::Class(c.name.clone(), vec![]));
                     self.line(&format!("impl ::std::ops::Mul<{}> for {} {{", self.rust_ty(&other_ty), c.name));
                     self.indent += 1;
                     self.line(&format!("type Output = {};", self.rust_ty(&ret_ty)));
                     self.line(&format!("fn mul(self, other: {}) -> {} {{", self.rust_ty(&other_ty), self.rust_ty(&ret_ty)));
                     self.indent += 1;
-                    self.locals.insert("self".into(), Ty::Class(c.name.clone()));
+                    self.locals.insert("self".into(), Ty::Class(c.name.clone(), vec![]));
                     self.locals.insert("other".into(), other_ty);
                     for s in &m.body { self.emit_stmt(s)?; }
                     self.locals.remove("self");
@@ -2019,13 +2118,13 @@ impl<'a> Codegen<'a> {
                     self.line("");
                 }
                 "__neg__" => {
-                    let ret_ty = Ty::from_type_expr(&m.ret, m.span).unwrap_or(Ty::Class(c.name.clone()));
+                    let ret_ty = Ty::from_type_expr(&m.ret, m.span).unwrap_or(Ty::Class(c.name.clone(), vec![]));
                     self.line(&format!("impl ::std::ops::Neg for {} {{", c.name));
                     self.indent += 1;
                     self.line(&format!("type Output = {};", self.rust_ty(&ret_ty)));
                     self.line(&format!("fn neg(self) -> {} {{", self.rust_ty(&ret_ty)));
                     self.indent += 1;
-                    self.locals.insert("self".into(), Ty::Class(c.name.clone()));
+                    self.locals.insert("self".into(), Ty::Class(c.name.clone(), vec![]));
                     for s in &m.body { self.emit_stmt(s)?; }
                     self.locals.remove("self");
                     self.indent -= 1;
@@ -2053,7 +2152,72 @@ impl<'a> Codegen<'a> {
         }
 
         self.current_class = None;
+        self.current_class_type_params = saved_class_tps;
         Ok(())
+    }
+
+    /// Generics v2 (generic CLASSES): build the three type-parameter clause
+    /// strings threaded through a class's emission, for the class `c`:
+    ///   - `.0` STRUCT generics `<T, U>` (no bounds) for `struct Box<T> { .. }`;
+    ///   - `.1` IMPL bounds clause `<T: Clone + PartialOrd, ..>` for the impl
+    ///     header, the per-`T` bounds inferred from the ops the methods perform
+    ///     (reusing `infer_class_typevar_bounds`, the class analogue of the
+    ///     generic-function bound inference); and
+    ///   - `.2` the type-args `<T, U>` that follow the type name in the impl head
+    ///     (`impl<..> Box<T>`).
+    /// All three are the EMPTY string for a non-generic class, so its struct/impl
+    /// emit byte-for-byte as before. The bound emission order matches `emit_func`:
+    /// declared type-param order across vars, `TypeVarBound`'s canonical order
+    /// (Clone first) within each var.
+    fn class_generic_clauses(&self, c: &ClassDef) -> (String, String, String) {
+        if c.type_params.is_empty() {
+            return (String::new(), String::new(), String::new());
+        }
+        let struct_generics = format!("<{}>", c.type_params.join(", "));
+        let ty_args = format!("<{}>", c.type_params.join(", "));
+        let inferred = crate::typeck::infer_class_typevar_bounds(c, self.ctx);
+        let bounds = c.type_params.iter()
+            .map(|t| {
+                let mut set = inferred.get(t).cloned().unwrap_or_default();
+                set.insert(crate::typeck::TypeVarBound::Clone);
+                let parts = set.iter()
+                    .map(|b| b.rust_bound(t))
+                    .collect::<Vec<_>>()
+                    .join(" + ");
+                format!("{}: {}", t, parts)
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let impl_generics = format!("<{}>", bounds);
+        (struct_generics, impl_generics, ty_args)
+    }
+
+    /// Generics v2 (generic CLASSES): map each field directly assigned a bare
+    /// `__init__` PARAMETER (`self.value = v`) to that parameter NAME, so the
+    /// generic `new()` can seed a type-var field's struct-literal slot with the
+    /// argument it will receive (`value: v.clone()`) instead of an unavailable
+    /// `Default::default()`. Only the simple `self.<attr> = <Ident>` shape is
+    /// recorded; a field computed by any other expression is omitted (it then
+    /// falls back to `zeroed_default` — fine, because such a field is not of
+    /// type-var type for the Box/Pair shape this targets). Used ONLY on the generic
+    /// path, so the non-generic constructor is untouched.
+    fn init_field_param_map(init_fn: &Func) -> std::collections::HashMap<String, String> {
+        let param_names: std::collections::HashSet<&str> = init_fn.params.iter()
+            .filter(|p| p.name != "self")
+            .map(|p| p.name.as_str())
+            .collect();
+        let mut map = std::collections::HashMap::new();
+        for stmt in &init_fn.body {
+            if let Stmt::AttrAssign { obj, attr, value, .. } = stmt {
+                let is_self = matches!(obj.as_ref(), Expr::Ident(n, _) if n == "self");
+                if let (true, Expr::Ident(p, _)) = (is_self, value) {
+                    if param_names.contains(p.as_str()) {
+                        map.insert(attr.clone(), p.clone());
+                    }
+                }
+            }
+        }
+        map
     }
 
     /// (EPIC-5 C2-2a) Emit the closed-set companion enum + method-dispatch impl +
@@ -2356,7 +2520,7 @@ impl<'a> Codegen<'a> {
     fn is_property_access(&self, obj: &Expr, name: &str) -> bool {
         if let Expr::Ident(var, _) = obj {
             self.locals.get(var.as_str()).cloned()
-                .and_then(|ty| if let Ty::Class(cn) = ty {
+                .and_then(|ty| if let Ty::Class(cn, _) = ty {
                     self.ctx.classes.get(&cn).map(|cd|
                         cd.methods.iter().any(|m|
                             m.name.as_str() == name
@@ -2534,12 +2698,12 @@ impl<'a> Codegen<'a> {
     fn list_poly_base(&self, elems: &[Expr]) -> Option<String> {
         if elems.is_empty() { return None; }
         let mut acc = match self.type_of_expr(&elems[0]) {
-            Ty::Class(n) => n,
+            Ty::Class(n, _) => n,
             _ => return None,
         };
         for e in &elems[1..] {
             let cn = match self.type_of_expr(e) {
-                Ty::Class(n) => n,
+                Ty::Class(n, _) => n,
                 _ => return None,
             };
             acc = if crate::typeck::is_subclass(&cn, &acc, self.ctx) {
@@ -3308,7 +3472,7 @@ impl<'a> Codegen<'a> {
                 if !matches!(obj.as_ref(),
                              Expr::Ident(n, _) if n == "self"
                                  || self.concrete_struct_params.contains(n)) {
-                    if let Ty::Class(b) = self.type_of_expr(obj) {
+                    if let Ty::Class(b, _) = self.type_of_expr(obj) {
                         if self.is_polymorphic_base(&b) {
                             return Err(crate::diag::Error::Codegen(format!(
                                 "writing field `{}` through a polymorphic-base `{}` variable \
@@ -4058,7 +4222,7 @@ impl<'a> Codegen<'a> {
                     // the base's signature, and `obj_s.name(..)` resolves to the
                     // companion enum `cls__`'s dispatch method — identical to the
                     // pre-existing EPIC-5 lowering.
-                    if let Ty::Class(cls) = self.type_of_expr(obj.as_ref()) {
+                    if let Ty::Class(cls, _) = self.type_of_expr(obj.as_ref()) {
                         if self.ctx.get_method(&cls, name).is_some() {
                             return self.emit_user_method_call(&obj_s, &cls, name, args, &parts).map(Some);
                         }
@@ -4421,7 +4585,7 @@ impl<'a> Codegen<'a> {
                     // a by-ref param; otherwise the original by-value `parts`
                     // (clone-on-use) is used unchanged.
                     let method_by_ref: Vec<bool> =
-                        if let Ty::Class(cls) = self.type_of_expr(obj.as_ref()) {
+                        if let Ty::Class(cls, _) = self.type_of_expr(obj.as_ref()) {
                             self.ctx.get_method(&cls, name)
                                 .map(|sig| sig.param_by_ref.clone())
                                 .unwrap_or_default()
@@ -4846,7 +5010,7 @@ impl<'a> Codegen<'a> {
                                     if let Expr::Attr { name, .. } = body.as_ref() {
                                         // Lambda body is field access - check the field type
                                         if let Ty::List(ref elem_ty) = list_ty {
-                                            if let Ty::Class(cls) = elem_ty.as_ref() {
+                                            if let Ty::Class(cls, _) = elem_ty.as_ref() {
                                                 if let Some(c) = self.ctx.classes.get(cls.as_str()) {
                                                     if let Some(f) = c.fields.iter().find(|f| &f.name == name) {
                                                         Ty::from_type_expr(&f.ty, f.span).unwrap_or(Ty::Unknown)
@@ -4866,7 +5030,7 @@ impl<'a> Codegen<'a> {
                                         // Lambda body is a method call - check method return type
                                         if let Expr::Attr { name, .. } = callee.as_ref() {
                                             if let Ty::List(ref elem_ty) = list_ty {
-                                                if let Ty::Class(cls) = elem_ty.as_ref() {
+                                                if let Ty::Class(cls, _) = elem_ty.as_ref() {
                                                     if let Some(method_sig) = self.ctx.get_method(cls.as_str(), name) {
                                                         method_sig.ret.clone()
                                                     } else {
@@ -5280,7 +5444,7 @@ impl<'a> Codegen<'a> {
                 // `B__` places passes through element-wise. (list+list `+` CONCAT
                 // element wrapping stays a documented C2-3 gap — not handled here.)
                 if let Some(base) = self.list_poly_base(elems) {
-                    let base_ty = Ty::Class(base);
+                    let base_ty = Ty::Class(base, vec![]);
                     let mut parts = Vec::with_capacity(elems.len());
                     for e in elems { parts.push(self.emit_into_base_slot(e, &base_ty)?); }
                     return Ok(format!("vec![{}]", parts.join(", ")));
@@ -5465,7 +5629,7 @@ impl<'a> Codegen<'a> {
                                     Expr::Ident(n, _) if n == "self"
                                         || self.concrete_struct_params.contains(n))
                     && matches!(&self.type_of_expr(obj),
-                                Ty::Class(b) if self.is_polymorphic_base(b)) {
+                                Ty::Class(b, _) if self.is_polymorphic_base(b)) {
                     // (EPIC-5 C2-2b-i) FIELD READ through a polymorphic-base var
                     // (a local/param/field whose static type is a polymorphic base).
                     // The receiver is Rust `B__` (an enum with no fields), so a
@@ -5935,7 +6099,18 @@ impl<'a> Codegen<'a> {
                 let arg_strs = args.iter().map(|a| self.rust_ty(a)).collect::<Vec<_>>().join(", ");
                 format!("::std::rc::Rc<dyn Fn({}) -> {}>", arg_strs, self.rust_ty(ret))
             }
-            Ty::Class(n) => {
+            Ty::Class(n, args) => {
+                // Generics v2 (generic CLASSES): a parametrized instance type
+                // `Ty::Class("Box", [Int])` lowers to `Box<i64>` — the class's
+                // Rust struct/impl carry a `<T, ..>` clause (see `emit_class`), and
+                // every arg position lowers recursively. A generic class is never a
+                // polymorphic base (generic-class inheritance is out of scope), so
+                // the two paths don't overlap; the args-empty branch below is the
+                // unchanged legacy lowering (plain `n` / companion enum `n__`).
+                if !args.is_empty() {
+                    let arg_strs = args.iter().map(|a| self.rust_ty(a)).collect::<Vec<_>>().join(", ");
+                    return format!("{}<{}>", n, arg_strs);
+                }
                 // (EPIC-5 C2-2b-i) Polymorphism activation. A class that is a
                 // polymorphic base (has ≥1 subclass in this unit) lowers to its
                 // companion enum `n__` — emitted by emit_companion_enum with
@@ -6460,6 +6635,7 @@ mod tests {
             methods: vec![],
             is_dataclass: false,
             span: Span::DUMMY,
+            type_params: vec![],
         }
     }
 
@@ -6669,13 +6845,13 @@ mod tests {
         cg.build_poly_map();
         assert!(cg.is_polymorphic_base("Animal"));
         // Polymorphic base -> companion enum.
-        assert_eq!(cg.rust_ty(&Ty::Class("Animal".into())), "Animal__");
+        assert_eq!(cg.rust_ty(&Ty::Class("Animal".into(), vec![])), "Animal__");
         // Sub-less / leaf classes stay their plain value-struct name.
-        assert_eq!(cg.rust_ty(&Ty::Class("Rock".into())), "Rock");
-        assert_eq!(cg.rust_ty(&Ty::Class("Dog".into())), "Dog");
+        assert_eq!(cg.rust_ty(&Ty::Class("Rock".into(), vec![])), "Rock");
+        assert_eq!(cg.rust_ty(&Ty::Class("Dog".into(), vec![])), "Dog");
         // A list of a polymorphic base is Vec<Animal__> (the element type flips too).
         assert_eq!(
-            cg.rust_ty(&Ty::List(Box::new(Ty::Class("Animal".into())))),
+            cg.rust_ty(&Ty::List(Box::new(Ty::Class("Animal".into(), vec![])))),
             "Vec<Animal__>"
         );
     }

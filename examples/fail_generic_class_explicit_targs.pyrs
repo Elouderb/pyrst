@@ -1,0 +1,18 @@
+# Explicit type-argument construction `Box[int](5)` is NOT supported: a generic
+# class infers its type arguments from `__init__` (`Box(5)` -> `Box[int]`), and
+# the `Box[int]` callee would otherwise be misread as a list-index expression.
+# Rejected honestly at typeck, pointing at the supported inferred form, instead of
+# type-checking and then emitting broken Rust.
+#
+# EXPECTED: typeck error — explicit type arguments on a constructor are not
+# supported; write `Box(...)`.
+class Box[T]:
+    value: T
+    def __init__(self, v: T) -> None:
+        self.value = v
+    def get(self) -> T:
+        return self.value
+
+def main() -> None:
+    b: Box[int] = Box[int](5)
+    print(b.get())

@@ -1,0 +1,21 @@
+# Generic classes combined with INHERITANCE are not yet supported (a deferred
+# follow-on). The companion-enum dispatch codegen for a polymorphic base does not
+# thread the base's type parameters, so a generic base/derived pair would
+# type-check but emit Rust referencing an undefined `T`. Rejected honestly at
+# typeck (both `check` and `build`) rather than silently miscompiling.
+#
+# EXPECTED: typeck error — generic classes with inheritance are not yet supported.
+class Base[T]:
+    v: T
+    def __init__(self, x: T) -> None:
+        self.v = x
+    def get(self) -> T:
+        return self.v
+
+class Derived[T](Base):
+    def __init__(self, x: T) -> None:
+        self.v = x
+
+def main() -> None:
+    d: Derived[int] = Derived(4)
+    print(d.get())

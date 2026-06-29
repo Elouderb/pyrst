@@ -1,0 +1,19 @@
+# A generic-class constructor called with the WRONG NUMBER of arguments. The
+# type args are inferred by unifying `__init__`'s scoped param types against the
+# constructor arguments via `.zip()`, which stops at the shorter list — so an
+# extra (or missing) argument would otherwise be silently dropped and leak to a
+# rustc E0061 at build. `check_class_instantiation` validates the argument count
+# against `__init__`'s `[required, total]` range and rejects the mismatch as an
+# honest typeck error (caught at both `check` and `build`).
+#
+# EXPECTED: typeck error — `Box.__init__` takes 1 argument(s) but 3 were given.
+class Box[T]:
+    value: T
+    def __init__(self, v: T) -> None:
+        self.value = v
+    def get(self) -> T:
+        return self.value
+
+def main() -> None:
+    b: Box[int] = Box(5, 6, 7)
+    print(b.get())

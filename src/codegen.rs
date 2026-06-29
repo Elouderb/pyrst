@@ -1811,6 +1811,21 @@ impl<'a> Codegen<'a> {
         // In scope for every method/field lowering until the end of emit_class.
         let saved_class_tps = std::mem::replace(&mut self.current_class_type_params, c.type_params.clone());
 
+        // Generics v2: the RECEIVER TYPE for `self` / `other` inside this class's
+        // methods and dunder impls. For a generic class it is `Box<T>` (so field
+        // reads resolve the type-var-bearing field types and a `&Box` param spells
+        // `&Box<T>` — without the `<T>` rustc raises E0107 "missing generics");
+        // for a non-generic class it is the bare struct name `Point`, so every
+        // existing dunder impl is byte-for-byte unchanged.
+        let recv_ty_str = format!("{}{}", c.name, ty_args);
+        // The `Ty` typing for a `self`/`other` local — carries the class's type
+        // params as type vars for a generic class (drives field-read lowering),
+        // empty args for a non-generic class (the legacy `Ty::Class(name, [])`).
+        let self_class_ty = Ty::Class(
+            c.name.clone(),
+            c.type_params.iter().map(|tp| Ty::TypeVar(tp.clone())).collect(),
+        );
+
         // Dunder methods that become Rust trait impls instead of regular methods.
         let dunder_trait_names = DUNDER_TRAIT_NAMES;
 
@@ -1959,10 +1974,13 @@ impl<'a> Codegen<'a> {
                 if dunder_trait_names.contains(&m.name.as_str()) {
                     // Special handling for __lt__: emit as __lt_impl (own or inherited).
                     if m.name == "__lt__" {
-                        self.line(&format!("fn __lt_impl(&self, other: &{}) -> bool {{", c.name));
+                        // Inside the inherent `impl<..> Box<T>` block: the receiver
+                        // type is `Box<T>` (`recv_ty_str`); the impl header already
+                        // declares `<T>`, so the helper takes no clause of its own.
+                        self.line(&format!("fn __lt_impl(&self, other: &{}) -> bool {{", recv_ty_str));
                         self.indent += 1;
-                        self.locals.insert("self".into(), Ty::Class(c.name.clone(), vec![]));
-                        self.locals.insert("other".into(), Ty::Class(c.name.clone(), vec![]));
+                        self.locals.insert("self".into(), self_class_ty.clone());
+                        self.locals.insert("other".into(), self_class_ty.clone());
                         // `other: &c.name` is the CONCRETE struct here — exempt it
                         // from base-field-read lowering (C2-2b-i).
                         self.concrete_struct_params.insert("other".into());
@@ -2009,11 +2027,11 @@ impl<'a> Codegen<'a> {
         for m in &c_methods {
             match m.name.as_str() {
                 "__str__" | "__repr__" if Some(m.name.as_str()) == display_source => {
-                    self.line(&format!("impl ::std::fmt::Display for {} {{", c.name));
+                    self.line(&format!("impl{} ::std::fmt::Display for {} {{", impl_generics, recv_ty_str));
                     self.indent += 1;
                     self.line("fn fmt(&self, __f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {");
                     self.indent += 1;
-                    self.locals.insert("self".into(), Ty::Class(c.name.clone(), vec![]));
+                    self.locals.insert("self".into(), self_class_ty.clone());
                     let body = &m.body;
                     let split_at = if body.is_empty() { 0 } else { body.len() - 1 };
                     for s in &body[..split_at] { self.emit_stmt(s)?; }
@@ -2034,15 +2052,17 @@ impl<'a> Codegen<'a> {
                 "__add__" => {
                     let other_param = m.params.iter().find(|p| p.name == "other");
                     let other_ty = other_param
-                        .map(|p| Ty::from_type_expr(&p.ty, p.span).unwrap_or(Ty::Class(c.name.clone(), vec![])))
+                        .map(|p| Ty::from_type_expr_scoped(&p.ty, p.span, &c.type_params).unwrap_or(Ty::Class(c.name.clone(), vec![])))
                         .unwrap_or(Ty::Class(c.name.clone(), vec![]));
-                    let ret_ty = Ty::from_type_expr(&m.ret, m.span).unwrap_or(Ty::Class(c.name.clone(), vec![]));
-                    self.line(&format!("impl ::std::ops::Add<{}> for {} {{", self.rust_ty(&other_ty), c.name));
+                    let ret_ty = Ty::from_type_expr_scoped(&m.ret, m.span, &c.type_params).unwrap_or(Ty::Class(c.name.clone(), vec![]));
+                    let other_s = self.dunder_operand_rust_ty(&other_ty, &c.name, &self_class_ty);
+                    let ret_s = self.dunder_operand_rust_ty(&ret_ty, &c.name, &self_class_ty);
+                    self.line(&format!("impl{} ::std::ops::Add<{}> for {} {{", impl_generics, other_s, recv_ty_str));
                     self.indent += 1;
-                    self.line(&format!("type Output = {};", self.rust_ty(&ret_ty)));
-                    self.line(&format!("fn add(self, other: {}) -> {} {{", self.rust_ty(&other_ty), self.rust_ty(&ret_ty)));
+                    self.line(&format!("type Output = {};", ret_s));
+                    self.line(&format!("fn add(self, other: {}) -> {} {{", other_s, ret_s));
                     self.indent += 1;
-                    self.locals.insert("self".into(), Ty::Class(c.name.clone(), vec![]));
+                    self.locals.insert("self".into(), self_class_ty.clone());
                     self.locals.insert("other".into(), other_ty);
                     for s in &m.body { self.emit_stmt(s)?; }
                     self.locals.remove("self");
@@ -2054,12 +2074,12 @@ impl<'a> Codegen<'a> {
                     self.line("");
                 }
                 "__eq__" => {
-                    self.line(&format!("impl ::std::cmp::PartialEq for {} {{", c.name));
+                    self.line(&format!("impl{} ::std::cmp::PartialEq for {} {{", impl_generics, recv_ty_str));
                     self.indent += 1;
-                    self.line(&format!("fn eq(&self, other: &{}) -> bool {{", c.name));
+                    self.line(&format!("fn eq(&self, other: &{}) -> bool {{", recv_ty_str));
                     self.indent += 1;
-                    self.locals.insert("self".into(), Ty::Class(c.name.clone(), vec![]));
-                    self.locals.insert("other".into(), Ty::Class(c.name.clone(), vec![]));
+                    self.locals.insert("self".into(), self_class_ty.clone());
+                    self.locals.insert("other".into(), self_class_ty.clone());
                     // `other: &c.name` is the CONCRETE struct here — exempt it
                     // from base-field-read lowering (C2-2b-i).
                     self.concrete_struct_params.insert("other".into());
@@ -2076,15 +2096,17 @@ impl<'a> Codegen<'a> {
                 "__sub__" => {
                     let other_param = m.params.iter().find(|p| p.name == "other");
                     let other_ty = other_param
-                        .map(|p| Ty::from_type_expr(&p.ty, p.span).unwrap_or(Ty::Class(c.name.clone(), vec![])))
+                        .map(|p| Ty::from_type_expr_scoped(&p.ty, p.span, &c.type_params).unwrap_or(Ty::Class(c.name.clone(), vec![])))
                         .unwrap_or(Ty::Class(c.name.clone(), vec![]));
-                    let ret_ty = Ty::from_type_expr(&m.ret, m.span).unwrap_or(Ty::Class(c.name.clone(), vec![]));
-                    self.line(&format!("impl ::std::ops::Sub<{}> for {} {{", self.rust_ty(&other_ty), c.name));
+                    let ret_ty = Ty::from_type_expr_scoped(&m.ret, m.span, &c.type_params).unwrap_or(Ty::Class(c.name.clone(), vec![]));
+                    let other_s = self.dunder_operand_rust_ty(&other_ty, &c.name, &self_class_ty);
+                    let ret_s = self.dunder_operand_rust_ty(&ret_ty, &c.name, &self_class_ty);
+                    self.line(&format!("impl{} ::std::ops::Sub<{}> for {} {{", impl_generics, other_s, recv_ty_str));
                     self.indent += 1;
-                    self.line(&format!("type Output = {};", self.rust_ty(&ret_ty)));
-                    self.line(&format!("fn sub(self, other: {}) -> {} {{", self.rust_ty(&other_ty), self.rust_ty(&ret_ty)));
+                    self.line(&format!("type Output = {};", ret_s));
+                    self.line(&format!("fn sub(self, other: {}) -> {} {{", other_s, ret_s));
                     self.indent += 1;
-                    self.locals.insert("self".into(), Ty::Class(c.name.clone(), vec![]));
+                    self.locals.insert("self".into(), self_class_ty.clone());
                     self.locals.insert("other".into(), other_ty);
                     for s in &m.body { self.emit_stmt(s)?; }
                     self.locals.remove("self");
@@ -2098,15 +2120,17 @@ impl<'a> Codegen<'a> {
                 "__mul__" => {
                     let other_param = m.params.iter().find(|p| p.name == "other");
                     let other_ty = other_param
-                        .map(|p| Ty::from_type_expr(&p.ty, p.span).unwrap_or(Ty::Class(c.name.clone(), vec![])))
+                        .map(|p| Ty::from_type_expr_scoped(&p.ty, p.span, &c.type_params).unwrap_or(Ty::Class(c.name.clone(), vec![])))
                         .unwrap_or(Ty::Class(c.name.clone(), vec![]));
-                    let ret_ty = Ty::from_type_expr(&m.ret, m.span).unwrap_or(Ty::Class(c.name.clone(), vec![]));
-                    self.line(&format!("impl ::std::ops::Mul<{}> for {} {{", self.rust_ty(&other_ty), c.name));
+                    let ret_ty = Ty::from_type_expr_scoped(&m.ret, m.span, &c.type_params).unwrap_or(Ty::Class(c.name.clone(), vec![]));
+                    let other_s = self.dunder_operand_rust_ty(&other_ty, &c.name, &self_class_ty);
+                    let ret_s = self.dunder_operand_rust_ty(&ret_ty, &c.name, &self_class_ty);
+                    self.line(&format!("impl{} ::std::ops::Mul<{}> for {} {{", impl_generics, other_s, recv_ty_str));
                     self.indent += 1;
-                    self.line(&format!("type Output = {};", self.rust_ty(&ret_ty)));
-                    self.line(&format!("fn mul(self, other: {}) -> {} {{", self.rust_ty(&other_ty), self.rust_ty(&ret_ty)));
+                    self.line(&format!("type Output = {};", ret_s));
+                    self.line(&format!("fn mul(self, other: {}) -> {} {{", other_s, ret_s));
                     self.indent += 1;
-                    self.locals.insert("self".into(), Ty::Class(c.name.clone(), vec![]));
+                    self.locals.insert("self".into(), self_class_ty.clone());
                     self.locals.insert("other".into(), other_ty);
                     for s in &m.body { self.emit_stmt(s)?; }
                     self.locals.remove("self");
@@ -2118,13 +2142,14 @@ impl<'a> Codegen<'a> {
                     self.line("");
                 }
                 "__neg__" => {
-                    let ret_ty = Ty::from_type_expr(&m.ret, m.span).unwrap_or(Ty::Class(c.name.clone(), vec![]));
-                    self.line(&format!("impl ::std::ops::Neg for {} {{", c.name));
+                    let ret_ty = Ty::from_type_expr_scoped(&m.ret, m.span, &c.type_params).unwrap_or(Ty::Class(c.name.clone(), vec![]));
+                    let ret_s = self.dunder_operand_rust_ty(&ret_ty, &c.name, &self_class_ty);
+                    self.line(&format!("impl{} ::std::ops::Neg for {} {{", impl_generics, recv_ty_str));
                     self.indent += 1;
-                    self.line(&format!("type Output = {};", self.rust_ty(&ret_ty)));
-                    self.line(&format!("fn neg(self) -> {} {{", self.rust_ty(&ret_ty)));
+                    self.line(&format!("type Output = {};", ret_s));
+                    self.line(&format!("fn neg(self) -> {} {{", ret_s));
                     self.indent += 1;
-                    self.locals.insert("self".into(), Ty::Class(c.name.clone(), vec![]));
+                    self.locals.insert("self".into(), self_class_ty.clone());
                     for s in &m.body { self.emit_stmt(s)?; }
                     self.locals.remove("self");
                     self.indent -= 1;
@@ -2134,9 +2159,9 @@ impl<'a> Codegen<'a> {
                     self.line("");
                 }
                 "__lt__" => {
-                    self.line(&format!("impl ::std::cmp::PartialOrd for {} {{", c.name));
+                    self.line(&format!("impl{} ::std::cmp::PartialOrd for {} {{", impl_generics, recv_ty_str));
                     self.indent += 1;
-                    self.line(&format!("fn partial_cmp(&self, other: &{}) -> Option<::std::cmp::Ordering> {{", c.name));
+                    self.line(&format!("fn partial_cmp(&self, other: &{}) -> Option<::std::cmp::Ordering> {{", recv_ty_str));
                     self.indent += 1;
                     self.line("if self.__lt_impl(other) { Some(::std::cmp::Ordering::Less) }");
                     self.line("else if other.__lt_impl(self) { Some(::std::cmp::Ordering::Greater) }");
@@ -2190,6 +2215,24 @@ impl<'a> Codegen<'a> {
             .join(", ");
         let impl_generics = format!("<{}>", bounds);
         (struct_generics, impl_generics, ty_args)
+    }
+
+    /// Generics v2 (generic CLASSES): the Rust type string for a DUNDER operand /
+    /// return type. A dunder like `__add__(self, other: Box) -> Box` annotates the
+    /// operand and result with the BARE class name, which lowers to
+    /// `Ty::Class("Box", [])` and would `rust_ty` to `Box` — but inside a generic
+    /// class's `impl<T> .. for Box<T>` that bare `Box` is E0107 ("missing
+    /// generics"). When `ty` is exactly THIS class with no args, substitute the
+    /// class's own type args (`Box<T>`); otherwise (a concrete other-type operand,
+    /// or a non-generic class) defer to the normal `rust_ty`. `self_ty` is the
+    /// already-built `Ty::Class(name, [TypeVar..])` for the class.
+    fn dunder_operand_rust_ty(&self, ty: &Ty, class_name: &str, self_ty: &Ty) -> String {
+        if let Ty::Class(n, args) = ty {
+            if n == class_name && args.is_empty() {
+                return self.rust_ty(self_ty);
+            }
+        }
+        self.rust_ty(ty)
     }
 
     /// Generics v2 (generic CLASSES): map each field directly assigned a bare
@@ -6646,6 +6689,81 @@ mod tests {
             ctx.classes.insert(name.to_string(), class_def(name, bases));
         }
         ctx
+    }
+
+    #[test]
+    fn generic_class_dunder_impl_carries_type_args() {
+        // Regression (BLOCKER-1): a DUNDER on a generic class must emit the trait
+        // impl for `Box<T>` (with the `<T: ..>` clause), not the bare `Box` —
+        // otherwise rustc raises E0107 "missing generics for struct Box". Here a
+        // `Box[T]` with `__eq__` must produce `impl<T: ..> ::std::cmp::PartialEq
+        // for Box<T>` and a `&Box<T>` `other` param. We assert on the emitted
+        // Rust source (the same string `build` feeds rustc).
+        let src = "\
+class Box[T]:
+    value: T
+    def __init__(self, v: T) -> None:
+        self.value = v
+    def __eq__(self, other: Box) -> bool:
+        return self.value == other.value
+
+def main() -> None:
+    print(Box(5) == Box(5))
+";
+        let rust = crate::driver::compile_str(src).expect("compile_str must succeed");
+        // The PartialEq impl head must name `Box<T>`, never the bare `Box`.
+        assert!(
+            rust.contains("::std::cmp::PartialEq for Box<T>"),
+            "PartialEq impl must be for `Box<T>`, got:\n{}",
+            rust
+        );
+        // It must carry a generic clause with at least Clone + PartialEq.
+        assert!(
+            rust.contains("impl<T: Clone + PartialEq> ::std::cmp::PartialEq for Box<T>"),
+            "PartialEq impl must carry the inferred `<T: Clone + PartialEq>` clause, got:\n{}",
+            rust
+        );
+        // The `other` param must be `&Box<T>`, never `&Box`.
+        assert!(
+            rust.contains("fn eq(&self, other: &Box<T>)"),
+            "eq's `other` param must be `&Box<T>`, got:\n{}",
+            rust
+        );
+        // And the bare-name regression must be ABSENT.
+        assert!(
+            !rust.contains("PartialEq for Box {") && !rust.contains("other: &Box)"),
+            "the bare-name (no <T>) dunder emission must not appear, got:\n{}",
+            rust
+        );
+    }
+
+    #[test]
+    fn non_generic_class_dunder_unchanged() {
+        // The dunder fix is gated on `!type_params.is_empty()`: a NON-generic
+        // class with `__eq__` must still emit the bare `impl ::std::cmp::PartialEq
+        // for Point` (no `<T>`), byte-for-byte as before.
+        let src = "\
+class Point:
+    x: int
+    def __init__(self, x: int) -> None:
+        self.x = x
+    def __eq__(self, other: Point) -> bool:
+        return self.x == other.x
+
+def main() -> None:
+    print(Point(1) == Point(1))
+";
+        let rust = crate::driver::compile_str(src).expect("compile_str must succeed");
+        assert!(
+            rust.contains("impl ::std::cmp::PartialEq for Point {"),
+            "non-generic PartialEq impl must stay the bare `for Point`, got:\n{}",
+            rust
+        );
+        assert!(
+            rust.contains("fn eq(&self, other: &Point)"),
+            "non-generic eq's `other` must stay `&Point`, got:\n{}",
+            rust
+        );
     }
 
     #[test]

@@ -2273,11 +2273,14 @@ fn infer_class_instantiation(name: &str, arg_tys: &[Ty], ctx: &TyCtx) -> Ty {
 }
 
 /// Generics v2: the checking-path counterpart of [`infer_class_instantiation`].
-/// Performs the same `__init__` unification but SURFACES a conflicting binding
-/// (the same `T = int then str` inconsistency `resolve_generic_call` reports for
-/// functions) and an ARITY mismatch against `__init__` as an honest typeck
-/// error at `span`. Returns the inferred instance type on success. A non-generic
-/// class takes the early return and is unaffected.
+/// Performs the same `__init__` unification but SURFACES two honest typeck errors
+/// at `span`: (1) an ARITY mismatch — the constructor argument count is outside
+/// `__init__`'s `[required, total]` range (required = the leading run of
+/// non-defaulted params), which the `.zip()` unification would otherwise drop and
+/// leak to a rustc E0061; and (2) a CONFLICTING binding for a class type
+/// variable (the same `T = int then str` inconsistency `resolve_generic_call`
+/// reports for functions). Returns the inferred instance type on success. A
+/// non-generic class takes the early return and is unaffected.
 fn check_class_instantiation(
     name: &str,
     arg_tys: &[Ty],
@@ -2291,6 +2294,29 @@ fn check_class_instantiation(
     let init_key = format!("{}.__init__", name);
     if let Some(sig) = ctx.funcs.get(&init_key) {
         let init_params: Vec<Ty> = sig.params.iter().map(|(_, t)| t.clone()).collect();
+        // ARITY: the `.zip()` below stops at the shorter of params/args, so a
+        // wrong COUNT would otherwise be silently accepted and leak to a rustc
+        // E0061 at build. `__init__`'s `params`/`param_defaults` are self-EXCLUSIVE
+        // and index-aligned (resolver STEP 0). A trailing run of defaulted params
+        // is optional, so the accepted count is `[required, expected]` — the same
+        // rule the free-function call-arity check uses.
+        let expected = init_params.len();
+        let required = sig.param_defaults.iter().take_while(|d| d.is_none()).count();
+        let got = arg_tys.len();
+        if got < required || got > expected {
+            let arg_desc = if required == expected {
+                format!("{}", expected)
+            } else {
+                format!("{} to {}", required, expected)
+            };
+            return Err(Error::Type {
+                span,
+                msg: format!(
+                    "`{}.__init__` takes {} argument(s) but {} {} given",
+                    name, arg_desc, got, if got == 1 { "was" } else { "were" }
+                ),
+            });
+        }
         let mut subst: HashMap<String, Ty> = HashMap::new();
         for (decl, actual) in init_params.iter().zip(arg_tys.iter()) {
             if let Err(msg) = unify_typevar(decl, actual, type_params, &mut subst) {
@@ -4871,8 +4897,14 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
                         if let Ty::Class(cls, _) = inner.as_ref() {
                             if let Some(c) = ctx.classes.get(cls.as_str()) {
                                 if let Some(f) = c.fields.iter().find(|f| f.name == *name) {
-                                    if let Ok(ty) = Ty::from_type_expr(&f.ty, f.span) {
-                                        return Ty::Set(Box::new(ty));
+                                    // Generics v2: scope the field with the class's
+                                    // type params (`value: T` -> `TypeVar(T)`) then
+                                    // substitute the element instance's args
+                                    // (`Box[int]` -> `{T -> int}`), so a comp over a
+                                    // generic-class element infers the concrete
+                                    // field type. Non-generic class => no-op.
+                                    if let Ok(ty) = Ty::from_type_expr_scoped(&f.ty, f.span, &c.type_params) {
+                                        return Ty::Set(Box::new(subst_class_member(&ty, inner, ctx)));
                                     }
                                 }
                             }
@@ -4882,7 +4914,9 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
                         if let Expr::Attr { name, .. } = callee.as_ref() {
                             if let Ty::Class(cls, _) = inner.as_ref() {
                                 if let Some(method_sig) = ctx.get_method(cls.as_str(), name) {
-                                    return Ty::Set(Box::new(method_sig.ret.clone()));
+                                    // Substitute the element instance's type args
+                                    // into the (scoped) method return.
+                                    return Ty::Set(Box::new(subst_class_member(&method_sig.ret, inner, ctx)));
                                 }
                             }
                         }
@@ -4901,7 +4935,11 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
                     if let Ty::Class(ref cls, _) = iter_ty {
                         if let Some(c) = ctx.classes.get(cls.as_str()) {
                             if let Some(f) = c.fields.iter().find(|f| f.name == *name) {
-                                return Ty::from_type_expr(&f.ty, f.span).unwrap_or(Ty::Unknown);
+                                // Generics v2: scope + substitute the field type
+                                // against the generic-class instance (mirrors the
+                                // non-comprehension field-access path).
+                                let ty = Ty::from_type_expr_scoped(&f.ty, f.span, &c.type_params).unwrap_or(Ty::Unknown);
+                                return subst_class_member(&ty, &iter_ty, ctx);
                             }
                         }
                     }
@@ -5084,10 +5122,15 @@ fn infer_comp_elt_type_with_var(
             } else {
                 infer_comp_elt_type_with_var(obj, loop_var_ty, loop_var_name, ctx)
             };
-            if let Ty::Class(cls, _) = obj_ty {
+            if let Ty::Class(cls, _) = &obj_ty {
                 if let Some(c) = ctx.classes.get(cls.as_str()) {
                     if let Some(f) = c.fields.iter().find(|f| f.name == *name) {
-                        return Ty::from_type_expr(&f.ty, f.span).unwrap_or(Ty::Unknown);
+                        // Generics v2: scope the field with the class's type params
+                        // and substitute the loop-var instance's args, so
+                        // `[item.value for item in boxes]` over `list[Box[int]]`
+                        // infers `int` (not the bare `T`). Non-generic class: no-op.
+                        let ty = Ty::from_type_expr_scoped(&f.ty, f.span, &c.type_params).unwrap_or(Ty::Unknown);
+                        return subst_class_member(&ty, &obj_ty, ctx);
                     }
                 }
             }
@@ -5105,9 +5148,11 @@ fn infer_comp_elt_type_with_var(
                 } else {
                     infer_comp_elt_type_with_var(obj, loop_var_ty, loop_var_name, ctx)
                 };
-                if let Ty::Class(cls, _) = obj_ty {
+                if let Ty::Class(cls, _) = &obj_ty {
                     if let Some(method_sig) = ctx.get_method(cls.as_str(), name) {
-                        return method_sig.ret.clone();
+                        // Substitute the loop-var instance's type args into the
+                        // (scoped) method return.
+                        return subst_class_member(&method_sig.ret, &obj_ty, ctx);
                     }
                 }
             }
@@ -8501,17 +8546,23 @@ def deposit(account: Mut[Account], amt: int) -> None:
                 let mut c = c.clone();
                 extract_init_fields(&mut c);
                 ctx.classes.insert(c.name.clone(), c.clone());
+                // Generics v2: register a generic class's type params + scope its
+                // method sigs with them, mirroring the real resolver so
+                // generic-class tests exercise the production code path.
+                if !c.type_params.is_empty() {
+                    ctx.generic_classes.insert(c.name.clone(), c.type_params.clone());
+                }
                 for mf in &c.methods {
                     let key = format!("{}.{}", c.name, mf.name);
                     ctx.funcs.insert(key, FuncSig {
                         params: mf.params.iter().filter(|p| p.name != "self")
-                            .map(|p| (p.name.clone(), Ty::from_type_expr(&p.ty, p.span).unwrap_or(Ty::Unknown)))
+                            .map(|p| (p.name.clone(), Ty::from_type_expr_scoped(&p.ty, p.span, &c.type_params).unwrap_or(Ty::Unknown)))
                             .collect(),
                         param_defaults: mf.params.iter().filter(|p| p.name != "self")
                             .map(|p| p.default.clone()).collect(),
                         param_by_ref: mf.params.iter().filter(|p| p.name != "self")
                             .map(|p| p.by_ref).collect(),
-                        ret: Ty::from_type_expr(&mf.ret, mf.span).unwrap_or(Ty::Unknown),
+                        ret: Ty::from_type_expr_scoped(&mf.ret, mf.span, &c.type_params).unwrap_or(Ty::Unknown),
                     });
                 }
             }
@@ -8669,6 +8720,82 @@ class Box:
             "both annotated params must be resolved (none dropped)"
         );
         assert_eq!(sig.ret, Ty::Int, "the return annotation must lower to Int");
+    }
+
+    #[test]
+    fn generic_class_wrong_arity_is_honest_check_error() {
+        // Regression (BLOCKER-2): a generic-class constructor called with the
+        // wrong NUMBER of arguments must be an honest typeck error, not a silent
+        // check-pass that leaks to a rustc E0061 at build. `Box[T].__init__` takes
+        // one arg; `Box(5, 6, 7)` supplies three.
+        let src = "\
+class Box[T]:
+    value: T
+    def __init__(self, v: T) -> None:
+        self.value = v
+    def get(self) -> T:
+        return self.value
+
+def main() -> None:
+    b: Box[int] = Box(5, 6, 7)
+    print(b.get())
+";
+        let m = crate::parser::parse(src).expect("parse");
+        let ctx = ctx_from_module(&m);
+        let errs = check_all(&m, &ctx);
+        assert!(
+            errs.iter().any(|e| format!("{:?}", e).contains("takes 1 argument")),
+            "wrong-arity generic constructor must be rejected with an arity error, got: {:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn generic_class_correct_arity_type_checks() {
+        // The arity gate must NOT over-reject: the correct argument count
+        // type-checks and infers the instance type args from `__init__`.
+        let src = "\
+class Box[T]:
+    value: T
+    def __init__(self, v: T) -> None:
+        self.value = v
+    def get(self) -> T:
+        return self.value
+
+def main() -> None:
+    b: Box[int] = Box(5)
+    print(b.get())
+";
+        let m = crate::parser::parse(src).expect("parse");
+        let ctx = ctx_from_module(&m);
+        let errs = check_all(&m, &ctx);
+        assert!(errs.is_empty(), "correct-arity generic constructor must type-check, got: {:?}", errs);
+    }
+
+    #[test]
+    fn generic_class_conflicting_type_args_rejected() {
+        // Two constructor args binding the SAME class type var to inconsistent
+        // concrete types is an honest conflict error (reuses `unify_typevar`).
+        let src = "\
+class Same[T]:
+    a: T
+    b: T
+    def __init__(self, x: T, y: T) -> None:
+        self.a = x
+        self.b = y
+
+def main() -> None:
+    s: Same[int] = Same(1, \"two\")
+    print(s.a)
+";
+        let m = crate::parser::parse(src).expect("parse");
+        let ctx = ctx_from_module(&m);
+        let errs = check_all(&m, &ctx);
+        assert!(
+            errs.iter().any(|e| format!("{:?}", e).contains("conflicting types for type parameter")),
+            "inconsistent type-var bindings must be rejected, got: {:?}",
+            errs
+        );
     }
 
     #[test]

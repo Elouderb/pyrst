@@ -1,0 +1,45 @@
+# A generic class with DUNDER methods that lower to Rust trait impls. Each impl
+# must carry the class's `<T>` (and the inferred bounds): `impl<T: Clone + ..>
+# ::std::cmp::PartialEq for Box<T>`, and a `Box` operand/return spells `Box<T>`
+# — without the `<T>` rustc raises E0107 "missing generics for struct Box". The
+# bounds are inferred from the ops the dunder bodies perform on `T`: `==` needs
+# PartialEq, `<` needs PartialOrd, `+` needs Add<Output=T>, `str()` needs
+# Display — reusing the generic-FUNCTION bound machinery. Because EVERY dunder's
+# bound applies to EVERY instantiation, a class with `__add__` is usable only at
+# types that support `+` (int here); the comparison-only `Label` class below is
+# instantiated at BOTH int and str to show monomorphization across two types.
+class Box[T]:
+    value: T
+    def __init__(self, v: T) -> None:
+        self.value = v
+    def __eq__(self, other: Box) -> bool:
+        return self.value == other.value
+    def __lt__(self, other: Box) -> bool:
+        return self.value < other.value
+    def __add__(self, other: Box) -> Box:
+        return Box(self.value + other.value)
+    def __str__(self) -> str:
+        return "Box(" + str(self.value) + ")"
+    def get(self) -> T:
+        return self.value
+
+# A comparison/equality-only generic class: its bounds are Clone + PartialEq +
+# PartialOrd (no Add), so it monomorphizes at int AND str.
+class Label[T]:
+    key: T
+    def __init__(self, k: T) -> None:
+        self.key = k
+    def __eq__(self, other: Label) -> bool:
+        return self.key == other.key
+    def __lt__(self, other: Label) -> bool:
+        return self.key < other.key
+
+def main() -> None:
+    print(Box(5) == Box(5))         # True
+    print(Box(5) == Box(6))         # False
+    print(Box(2) < Box(9))          # True
+    r: Box[int] = Box(3) + Box(4)
+    print(r.get())                  # 7
+    print(Box(7))                   # Box(7)
+    print(Label(1) == Label(1))     # True   (T=int)
+    print(Label("a") < Label("b"))  # True   (SAME class, T=str — monomorphization)

@@ -1,0 +1,31 @@
+# Self-mutation inside a COLLECTION LITERAL. A method whose only mutation of
+# `self` happens through a call embedded in a list / tuple / dict literal (e.g.
+# `return [self.items.pop(), self.items.pop()]`) must still be inferred `&mut
+# self` — otherwise the `&mut self.items` borrow inside the popped element fails
+# to compile (E0596). The mutation walk recurses into literal elements (and dict
+# keys/values), so each of these methods is correctly `&mut self`.
+#   items = [1, 2, 3, 4, 5, 6]
+#   drain2()  -> [6, 5]      (list literal: two right-end pops)
+#   pair()    -> (4, 3)      (tuple literal)
+#   asdict()["top"] -> 2     (dict-value literal)
+class Stack:
+    items: list[int]
+
+    def __init__(self) -> None:
+        self.items = [1, 2, 3, 4, 5, 6]
+
+    def drain2(self) -> list[int]:
+        return [self.items.pop(), self.items.pop()]
+
+    def pair(self) -> tuple[int, int]:
+        return (self.items.pop(), self.items.pop())
+
+    def asdict(self) -> dict[str, int]:
+        return {"top": self.items.pop()}
+
+
+def main() -> None:
+    s: Stack = Stack()
+    print(s.drain2())             # [6, 5]
+    print(s.pair())               # (4, 3)
+    print(s.asdict()["top"])      # 2

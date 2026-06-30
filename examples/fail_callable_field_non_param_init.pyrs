@@ -1,0 +1,24 @@
+# NEGATIVE: a `Callable` field NOT initialized from a constructor parameter. A
+# `Callable` lowers to `Rc<dyn Fn>`, which has no `Default`, so the zero-then-
+# `__init__` constructor placeholder cannot synthesize one — the field MUST be
+# seeded from an `__init__` param (directly or via local rebinding). Assigning it
+# from a non-param expression (here a free function name) leaves no valid
+# placeholder; rather than silently fail at rustc (E0277 `dyn Fn: Default`), pyrst
+# rejects it honestly at `check`.
+def make_default() -> int:
+    return 0
+
+
+class Bad:
+    f: Callable[[], int]
+
+    def __init__(self) -> None:
+        self.f = make_default
+
+    def make(self) -> int:
+        return self.f()
+
+
+def main() -> None:
+    b: Bad = Bad()
+    print(b.make())

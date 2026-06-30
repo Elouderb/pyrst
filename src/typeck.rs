@@ -593,6 +593,57 @@ pub fn nearest_common_ancestor(a: &str, b: &str, ctx: &TyCtx) -> Option<String> 
     }
 }
 
+/// Map each `self.<field>` assigned (directly or via a chain of simple local
+/// rebindings) from an `__init__` PARAMETER to that parameter's name. Shared by
+/// codegen — to seed a generic / `Callable` field's struct-literal placeholder
+/// with `<param>.clone()` instead of the unavailable `Default::default()` — and
+/// by `check_class_prelude` — to reject a `Callable` field that is NOT seeded
+/// from a constructor param (which would otherwise silently build-fail, since
+/// `Rc<dyn Fn>` has no `Default`).
+///
+/// Resolution: a forward pass folds `tmp = g` / `tmp2 = tmp` ident aliases down
+/// to the underlying param, so an INDIRECT `self.f = tmp` still resolves to `g`.
+/// Only pure `local = <ident>` aliasing is tracked; any other RHS (a call, an
+/// expression) clears the local, so `self.f = make_default()` resolves to
+/// nothing and is reported as an honest error by the caller.
+pub fn init_field_param_map(init_fn: &Func) -> std::collections::HashMap<String, String> {
+    let param_names: std::collections::HashSet<&str> = init_fn.params.iter()
+        .filter(|p| p.name != "self")
+        .map(|p| p.name.as_str())
+        .collect();
+    let mut local_to_param: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut map = std::collections::HashMap::new();
+    for stmt in &init_fn.body {
+        match stmt {
+            Stmt::Assign { target, value, .. } => {
+                let resolved = match value {
+                    Expr::Ident(src, _) if param_names.contains(src.as_str()) => Some(src.clone()),
+                    Expr::Ident(src, _) => local_to_param.get(src).cloned(),
+                    _ => None,
+                };
+                match resolved {
+                    Some(p) => { local_to_param.insert(target.clone(), p); }
+                    None => { local_to_param.remove(target); }
+                }
+            }
+            Stmt::AttrAssign { obj, attr, value, .. } => {
+                let is_self = matches!(obj.as_ref(), Expr::Ident(n, _) if n == "self");
+                if is_self {
+                    if let Expr::Ident(p, _) = value {
+                        if param_names.contains(p.as_str()) {
+                            map.insert(attr.clone(), p.clone());
+                        } else if let Some(root) = local_to_param.get(p) {
+                            map.insert(attr.clone(), root.clone());
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    map
+}
+
 // Extract field assignments from __init__ method
 pub fn extract_init_fields(class_def: &mut ClassDef) {
     let mut discovered_fields: std::collections::HashMap<String, TypeExpr> = std::collections::HashMap::new();
@@ -1472,6 +1523,32 @@ fn check_class_prelude(c: &ClassDef, ctx: &TyCtx) -> Result<()> {
     // A non-generic class has empty `type_params`, identical to the legacy path.
     for field in &c.fields {
         Ty::from_type_expr_scoped(&field.ty, field.span, &c.type_params)?;
+    }
+
+    // A `Callable` field lowers to `Rc<dyn Fn(..) -> ..>`, which has no `Default`,
+    // so the zero-then-`__init__` constructor placeholder cannot synthesize one —
+    // the field MUST be seeded from an `__init__` parameter (directly, or through
+    // a chain of local rebindings; see `init_field_param_map`). A `Callable` field
+    // assigned from a non-param expression (`self.f = make_default()`) or with no
+    // `__init__` at all has no valid placeholder and would SILENTLY build-fail with
+    // rustc E0277 (`dyn Fn: Default`). Reject it honestly here so `pyrst check`
+    // catches it. (The direct/indirect param-seeded cases — the common shape —
+    // pass, so existing Callable-field classes are unaffected.)
+    let init_fn = c.methods.iter().find(|m| m.name == "__init__");
+    let seeded = init_fn.map(init_field_param_map).unwrap_or_default();
+    for field in &c.fields {
+        let ty = Ty::from_type_expr_scoped(&field.ty, field.span, &c.type_params)?;
+        if matches!(ty, Ty::Func(..)) && !seeded.contains_key(&field.name) {
+            return Err(Error::Type {
+                span: field.span,
+                msg: format!(
+                    "a Callable field (`{}`) must be initialized from a constructor \
+                     parameter (`self.{} = <__init__ param>`); a Callable value has no \
+                     default, so it cannot be synthesized any other way",
+                    field.name, field.name
+                ),
+            });
+        }
     }
     Ok(())
 }
@@ -10439,6 +10516,74 @@ def my_fn() -> float:
         // The container being a BARE type variable (unknown structure) stays an
         // honest rejection — only `dict`/`set`/`list` containers are relaxed.
         assert!(check_src("def f[T](x: int, t: T) -> bool:\n    return x in t\n").is_err());
+    }
+
+    #[test]
+    fn callable_field_direct_and_indirect_init_accepted() {
+        // A Callable field seeded from an __init__ param — directly, or via a
+        // chain of local rebindings — type-checks (it has a valid placeholder seed).
+        assert!(check_src(
+            "class M:\n    f: Callable[[], int]\n    def __init__(self, g: Callable[[], int]) -> None:\n        self.f = g\n    def make(self) -> int:\n        return self.f()\n"
+        ).is_ok());
+        assert!(check_src(
+            "class M:\n    f: Callable[[], int]\n    def __init__(self, g: Callable[[], int]) -> None:\n        tmp: Callable[[], int] = g\n        self.f = tmp\n    def make(self) -> int:\n        return self.f()\n"
+        ).is_ok());
+        assert!(check_src(
+            "class M:\n    f: Callable[[], int]\n    def __init__(self, g: Callable[[], int]) -> None:\n        a: Callable[[], int] = g\n        b: Callable[[], int] = a\n        self.f = b\n    def make(self) -> int:\n        return self.f()\n"
+        ).is_ok());
+    }
+
+    #[test]
+    fn callable_field_non_param_init_rejected() {
+        // A Callable field that is NOT seeded from a constructor param has no valid
+        // placeholder (Rc<dyn Fn> has no Default) — reject honestly at check, never
+        // a silent rustc E0277.
+        assert_type_err_unit(
+            check_src(
+                "def mk() -> int:\n    return 0\n\nclass B:\n    f: Callable[[], int]\n    def __init__(self) -> None:\n        self.f = mk\n    def make(self) -> int:\n        return self.f()\n"
+            ),
+            "must be initialized from a constructor parameter",
+        );
+    }
+
+    #[test]
+    fn init_field_param_map_follows_local_rebind_chain() {
+        // Unit-level check of the shared seed-resolution helper: a direct assign,
+        // a one-step rebind, and a two-step chain all resolve the field to the root
+        // param; a non-param RHS resolves to nothing.
+        use crate::ast::{Expr, Stmt, Func, Param, TypeExpr};
+        let sp = crate::diag::Span { start: 0, end: 0, line: 0, col: 0 };
+        let id = |n: &str| Expr::Ident(n.to_string(), sp);
+        let param = |n: &str| Param {
+            name: n.to_string(), ty: TypeExpr::Named("int".to_string()), default: None, span: sp, by_ref: false,
+        };
+        let self_attr = |attr: &str, val: Expr| Stmt::AttrAssign {
+            obj: Box::new(id("self")), attr: attr.to_string(), value: val, span: sp,
+        };
+        let local = |t: &str, v: Expr| Stmt::Assign {
+            target: t.to_string(), ty: None, value: v, span: sp,
+        };
+        let init = Func {
+            name: "__init__".to_string(),
+            params: vec![param("self"), param("g")],
+            ret: TypeExpr::None_,
+            body: vec![
+                local("a", id("g")),          // a = g
+                local("b", id("a")),          // b = a (chain)
+                self_attr("direct", id("g")), // self.direct = g
+                self_attr("chained", id("b")),// self.chained = b -> g
+                self_attr("nope", Expr::Int(1, sp)), // self.nope = 1 (not a param)
+            ],
+            span: sp,
+            is_method: true,
+            decorators: vec![],
+            crate_deps: vec![],
+            type_params: vec![],
+        };
+        let map = init_field_param_map(&init);
+        assert_eq!(map.get("direct").map(String::as_str), Some("g"));
+        assert_eq!(map.get("chained").map(String::as_str), Some("g"));
+        assert_eq!(map.get("nope"), None);
     }
 
     #[test]

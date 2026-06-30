@@ -1,0 +1,38 @@
+# A `Callable` field initialized INDIRECTLY — the constructor binds the param to
+# a local first, then assigns the local to the field (and a second class chains
+# two locals). A `Callable` field lowers to an `Rc<dyn Fn>`, which has no Default,
+# so the constructor placeholder must be seeded from the underlying `__init__`
+# parameter. The seed resolution follows a chain of simple local rebindings down
+# to the root param, so `self.f = tmp` (where `tmp = g`) still seeds from `g`.
+#   Holder(lambda: 10).make()        -> 10   (one-step rebind: tmp = g; self.f = tmp)
+#   Chain(lambda: 32).make()         -> 32   (two-step: a = g; b = a; self.f = b)
+
+
+class Holder:
+    f: Callable[[], int]
+
+    def __init__(self, g: Callable[[], int]) -> None:
+        tmp: Callable[[], int] = g
+        self.f = tmp
+
+    def make(self) -> int:
+        return self.f()
+
+
+class Chain:
+    f: Callable[[], int]
+
+    def __init__(self, g: Callable[[], int]) -> None:
+        a: Callable[[], int] = g
+        b: Callable[[], int] = a
+        self.f = b
+
+    def make(self) -> int:
+        return self.f()
+
+
+def main() -> None:
+    h: Holder = Holder(lambda: 10)
+    print(h.make())               # 10
+    c: Chain = Chain(lambda: 32)
+    print(c.make())               # 32

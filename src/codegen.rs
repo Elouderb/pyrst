@@ -761,7 +761,12 @@ impl<'a> Codegen<'a> {
             .get_all_fields(&class_def.name)
             .iter()
             .find(|f| f.name == field_name)
-            .and_then(|f| Ty::from_type_expr(&f.ty, f.span).ok())
+            // Scope the field annotation with the class's type params so a generic
+            // field (`Callable[[], V]`, `value: T`) lowers `V`/`T` to a
+            // `Ty::TypeVar`, not a `Ty::Class("V", [])`. The current call sites only
+            // match the OUTER `Ty::Func(..)` (unaffected), so this is hygiene that
+            // keeps the inner type honest for any future inspection.
+            .and_then(|f| Ty::from_type_expr_scoped(&f.ty, f.span, &class_def.type_params).ok())
     }
 
     /// (EPIC-5) Coerce an already-emitted expression `s` (for source expr `e`)
@@ -1066,6 +1071,17 @@ impl<'a> Codegen<'a> {
                     || Self::expr_mutates_self(body)
                     || Self::expr_mutates_self(orelse)
             }
+            // Collection LITERALS hold sub-expressions that may each be a
+            // self-mutating call: `return [self.items.pop(), self.items.pop()]`
+            // mutates self through the list elements. Without recursing here the
+            // method is emitted `&self` and the `&mut self.field` borrow inside the
+            // popped element trips E0596.
+            Expr::List(elems, _) | Expr::Tuple(elems, _) | Expr::Set(elems, _) => {
+                elems.iter().any(Self::expr_mutates_self)
+            }
+            Expr::Dict(pairs, _) => pairs
+                .iter()
+                .any(|(k, v)| Self::expr_mutates_self(k) || Self::expr_mutates_self(v)),
             _ => false,
         }
     }
@@ -2332,32 +2348,17 @@ impl<'a> Codegen<'a> {
         self.rust_ty(ty)
     }
 
-    /// Generics v2 (generic CLASSES): map each field directly assigned a bare
-    /// `__init__` PARAMETER (`self.value = v`) to that parameter NAME, so the
-    /// generic `new()` can seed a type-var field's struct-literal slot with the
-    /// argument it will receive (`value: v.clone()`) instead of an unavailable
-    /// `Default::default()`. Only the simple `self.<attr> = <Ident>` shape is
-    /// recorded; a field computed by any other expression is omitted (it then
-    /// falls back to `zeroed_default` — fine, because such a field is not of
-    /// type-var type for the Box/Pair shape this targets). Used ONLY on the generic
-    /// path, so the non-generic constructor is untouched.
+    /// Map each field assigned (directly OR via a chain of local rebindings) from
+    /// an `__init__` PARAMETER to that parameter NAME, so a generic / `Callable`
+    /// field's struct-literal placeholder is seeded with `<param>.clone()` instead
+    /// of the unavailable `Default::default()`. Thin wrapper over the shared
+    /// `typeck::init_field_param_map` (single source of truth — see its doc).
     fn init_field_param_map(init_fn: &Func) -> std::collections::HashMap<String, String> {
-        let param_names: std::collections::HashSet<&str> = init_fn.params.iter()
-            .filter(|p| p.name != "self")
-            .map(|p| p.name.as_str())
-            .collect();
-        let mut map = std::collections::HashMap::new();
-        for stmt in &init_fn.body {
-            if let Stmt::AttrAssign { obj, attr, value, .. } = stmt {
-                let is_self = matches!(obj.as_ref(), Expr::Ident(n, _) if n == "self");
-                if let (true, Expr::Ident(p, _)) = (is_self, value) {
-                    if param_names.contains(p.as_str()) {
-                        map.insert(attr.clone(), p.clone());
-                    }
-                }
-            }
-        }
-        map
+        // Single source of truth in typeck: the same field<-param resolution drives
+        // BOTH the constructor placeholder seed (here) and the honest-error check
+        // (`check_class_prelude`), so the two can never drift on which fields are
+        // considered param-seeded. Follows one-step+chained local rebinding.
+        crate::typeck::init_field_param_map(init_fn)
     }
 
     /// (EPIC-5 C2-2a) Emit the closed-set companion enum + method-dispatch impl +

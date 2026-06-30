@@ -1,0 +1,26 @@
+def emsg(n: int) -> str:
+    return "bad value: " + str(n)
+
+
+def sq(i: int) -> int:
+    return i * i
+
+
+def check(x: int) -> int:
+    if x < 0:
+        raise ValueError(emsg(x))
+    return x
+
+
+def squares(n: int) -> Iterator[int]:
+    for i in range(n):
+        yield sq(i)
+
+
+def main() -> None:
+    print(check(7))
+    try:
+        print(check(-1))
+    except ValueError:
+        print("caught")
+    print([v for v in squares(4)])

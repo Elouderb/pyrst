@@ -1858,6 +1858,11 @@ fn collect_calls_from_stmt(stmt: &Stmt, called: &mut std::collections::HashSet<S
             collect_calls_from_expr(idx, called);
             collect_calls_from_expr(value, called);
         }
+        // A function called ONLY inside a `raise`/`yield` expression must still be
+        // kept alive through dead-code elimination, or codegen emits a call to a
+        // pruned function -> rustc "cannot find function" (a check-passes/build-fails).
+        Stmt::Raise { exc: Some(e), .. } => collect_calls_from_expr(e, called),
+        Stmt::Yield(e, _) => collect_calls_from_expr(e, called),
         _ => {}
     }
 }

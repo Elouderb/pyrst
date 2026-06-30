@@ -1,0 +1,32 @@
+# Stdlib `collections.defaultdict` — a dict that fills a missing key from a
+# zero-arg factory (Tier-2 batch 2).
+#
+# `defaultdict[K, V]` is a generic CLASS backed by a `data: dict[K, V]` plus a
+# `default_factory: Callable[[], V]` field. `get` returns the existing value or
+# CREATES + inserts `default_factory()` for a missing key (CPython `d[key]`
+# semantics). `K` is hashable (`Hash + Eq`, inferred from the dict field and the
+# `key in self.data` membership test); the factory is a stored function value
+# (`Callable` field).
+#
+# Instantiation is annotation-driven inference (explicit `defaultdict[..]()` is
+# gated): `dd: defaultdict[str, int] = defaultdict(lambda: 0)` fixes `K = str`,
+# `V = int` (V from the factory's return).
+#
+# Deterministic: only individual key lookups / scalar queries are printed (dict
+# iteration order is unspecified, so the whole map is never printed).
+#   get("x")  -> 0     (missing -> factory() = 0, now stored)
+#   contains("x") -> True   (materialised by the previous get)
+#   set("y", 5); get("y") -> 5
+#   size()    -> 2     ("x" and "y")
+#   get("x")  -> 0     (still the stored 0, not re-created)
+from collections import defaultdict
+
+
+def main() -> None:
+    dd: defaultdict[str, int] = defaultdict(lambda: 0)
+    print(dd.get("x"))            # 0   (missing -> created)
+    print(dd.contains("x"))       # True
+    dd.set("y", 5)
+    print(dd.get("y"))            # 5
+    print(dd.size())              # 2
+    print(dd.get("x"))            # 0   (stored, not re-created)

@@ -2106,6 +2106,41 @@ fn substitute_typevars(ty: &Ty, subst: &HashMap<String, Ty>) -> Ty {
     }
 }
 
+/// Substitute class type-parameter NAMES with concrete types, matching a name in
+/// EITHER form it can take in a lowered type: a `Ty::TypeVar(name)` (scoped
+/// lowering) or a bare `Ty::Class(name, [])` (UNSCOPED lowering, which renders a
+/// type-param annotation as a class of that name). Used by codegen at a generic
+/// constructor call to turn a `Callable[[], V]` param type (`Rc<dyn Fn() -> V>`,
+/// where `V` is not in scope at the call site) into the concrete instance type
+/// (`Rc<dyn Fn() -> i64>`). Recurses through every container and `Ty::Class` args.
+pub fn substitute_class_typarams(ty: &Ty, subst: &HashMap<String, Ty>) -> Ty {
+    match ty {
+        Ty::TypeVar(name) => subst.get(name).cloned().unwrap_or_else(|| ty.clone()),
+        // A bare `Ty::Class(name, [])` whose name is a substituted type param IS
+        // that type param (unscoped lowering). A real class with args recurses.
+        Ty::Class(name, args) if args.is_empty() && subst.contains_key(name) => {
+            subst.get(name).cloned().unwrap()
+        }
+        Ty::Class(name, args) => Ty::Class(
+            name.clone(),
+            args.iter().map(|a| substitute_class_typarams(a, subst)).collect(),
+        ),
+        Ty::List(inner) => Ty::List(Box::new(substitute_class_typarams(inner, subst))),
+        Ty::Set(inner) => Ty::Set(Box::new(substitute_class_typarams(inner, subst))),
+        Ty::Dict(k, v) => Ty::Dict(
+            Box::new(substitute_class_typarams(k, subst)),
+            Box::new(substitute_class_typarams(v, subst)),
+        ),
+        Ty::Option(inner) => Ty::Option(Box::new(substitute_class_typarams(inner, subst))),
+        Ty::Tuple(parts) => Ty::Tuple(parts.iter().map(|p| substitute_class_typarams(p, subst)).collect()),
+        Ty::Func(args, ret) => Ty::Func(
+            args.iter().map(|a| substitute_class_typarams(a, subst)).collect(),
+            Box::new(substitute_class_typarams(ret, subst)),
+        ),
+        _ => ty.clone(),
+    }
+}
+
 /// True if `ty` mentions any `Ty::TypeVar` (used to decide whether a return type
 /// still has unsubstituted variables after unification). Recurses through every
 /// container AND a `Ty::Class`'s type args, so a `Box[T]`-typed field is detected
@@ -3226,6 +3261,24 @@ fn infer_bounds_expr(
                 if a == b {
                     if let Some(bound) = binop_typevar_bound(*op) {
                         add_bound(bounds, a, bound);
+                    }
+                }
+            }
+            // Membership of a type-var element/key into a known container:
+            // `k in dict`/`k in set` needs `K: Hash + Eq`; `x in list` needs
+            // `T: PartialEq`. Mirrors the typeck accept-site (`container_membership`)
+            // so the inferred trait clause matches the now-legal op exactly.
+            if matches!(op, BinOp::In | BinOp::NotIn) {
+                if let Ty::TypeVar(n) = &lt {
+                    match &rt {
+                        Ty::Dict(..) | Ty::Set(_) => {
+                            add_bound(bounds, n, TypeVarBound::Hash);
+                            add_bound(bounds, n, TypeVarBound::Eq);
+                        }
+                        Ty::List(_) => {
+                            add_bound(bounds, n, TypeVarBound::PartialEq);
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -6334,7 +6387,15 @@ fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
             // operand falls through to the v1 rejection.
             let same_typevar = matches!((&l, &r), (Ty::TypeVar(a), Ty::TypeVar(b)) if a == b);
             let supported_typevar_op = same_typevar && binop_typevar_bound(*op).is_some();
-            if !supported_typevar_op {
+            // Generics v2: membership where the CONTAINER (rhs) is a known
+            // `dict`/`set`/`list` and the ELEMENT/key (lhs) is a TypeVar is a
+            // VALID, bound-inferable op — `k in d` infers `K: Hash + Eq`
+            // (dict/set) or `K: PartialEq` (list), mirroring `infer_bounds_expr`.
+            // Only `x in t` where `t` itself is a BARE TypeVar (an unknown
+            // container) stays rejected by the bare-T sweep below.
+            let container_membership = matches!(op, BinOp::In | BinOp::NotIn)
+                && matches!(r, Ty::Dict(..) | Ty::Set(_) | Ty::List(_));
+            if !supported_typevar_op && !container_membership {
                 reject_typevar_op(&l, op_desc, *span)?;
                 reject_typevar_op(&r, op_desc, *span)?;
             }
@@ -10351,6 +10412,33 @@ def my_fn() -> float:
             check_src("def f[T](a: T, b: T) -> bool:\n    return a in b\n"),
             "this operation on a type parameter is not supported",
         );
+    }
+
+    #[test]
+    fn v2_accepts_membership_in_known_container() {
+        // `k in d` / `k in s` / `x in xs` where the CONTAINER is a known
+        // dict/set/list and the element/key is a type variable is a VALID,
+        // bound-inferable op (dict/set -> Hash+Eq on the key, list -> PartialEq).
+        assert!(check_src(
+            "def f[K, V](d: dict[K, V], k: K) -> bool:\n    return k in d\n"
+        ).is_ok());
+        assert!(check_src(
+            "def f[K](s: set[K], k: K) -> bool:\n    return k in s\n"
+        ).is_ok());
+        assert!(check_src(
+            "def f[T](xs: list[T], x: T) -> bool:\n    return x in xs\n"
+        ).is_ok());
+        // `not in` takes the same path.
+        assert!(check_src(
+            "def f[K, V](d: dict[K, V], k: K) -> bool:\n    return k not in d\n"
+        ).is_ok());
+    }
+
+    #[test]
+    fn v2_membership_still_rejects_bare_container_typevar() {
+        // The container being a BARE type variable (unknown structure) stays an
+        // honest rejection — only `dict`/`set`/`list` containers are relaxed.
+        assert!(check_src("def f[T](x: int, t: T) -> bool:\n    return x in t\n").is_err());
     }
 
     #[test]

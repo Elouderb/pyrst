@@ -1,0 +1,39 @@
+# Stdlib `collections.deque` — a generic double-ended queue (Tier-2 batch 2).
+#
+# `deque[T]` is a generic CLASS backed by a `list[T]`, with self-mutating
+# methods: `append`/`pop` at the right end, `appendleft`/`popleft` at the left
+# end (a list shift). Generic over the element type `T`, here `int`.
+#
+# Instantiation: explicit `deque[int]()` is gated, so the type arg is driven by
+# the binding's annotation — `d: deque[int] = deque()` infers `T = int`. The
+# qualified `import collections; collections.deque[int]()` form is NOT used: a
+# qualified module-CLASS constructor is not supported (only module FUNCTIONS
+# resolve qualified) and a qualified type annotation does not parse, so the
+# idiomatic flat `from collections import deque` + bare `deque[int]` annotation
+# is the working path.
+#
+# Deterministic: every line is a popped/peeked element or a scalar query (no
+# whole-collection print), so the output is order-stable.
+#   append 1, 2, 3            -> [1, 2, 3]
+#   popleft()                 -> 1     (FIFO front)
+#   pop()                     -> 3     (LIFO back)
+#   size()                    -> 1     ([2] remains)
+#   peekleft()                -> 2     (front, not removed)
+#   is_empty()                -> False
+#   appendleft(9)             -> [9, 2]
+#   popleft()                 -> 9
+from collections import deque
+
+
+def main() -> None:
+    d: deque[int] = deque()
+    d.append(1)
+    d.append(2)
+    d.append(3)
+    print(d.popleft())        # 1
+    print(d.pop())            # 3
+    print(d.size())           # 1
+    print(d.peekleft())       # 2
+    print(d.is_empty())       # False
+    d.appendleft(9)
+    print(d.popleft())        # 9

@@ -1,0 +1,50 @@
+# A class holding a `Callable` field — a stored function VALUE invoked through
+# the instance. This exercises the codegen path that lets a struct hold an
+# `Rc<dyn Fn(..) -> ..>`:
+#   - the struct omits the `Debug`/`PartialEq`/`Default` derives a trait object
+#     cannot satisfy,
+#   - the constructor seeds the field by cloning the `__init__` parameter (no
+#     `Default::default()` placeholder), and
+#   - `self.run(...)` on a Callable FIELD lowers to `(self.f)(...)`, not the
+#     non-existent method `self.f(...)`,
+#   - a lambda / function-name argument is wrapped (`Rc::new(..) as Rc<dyn Fn>`)
+#     at the constructor call site.
+#
+# `Strategy` stores a `Callable[[int], int]` and applies it; `Maker` stores a
+# zero-arg `Callable[[], int]` factory.
+#   Strategy(lambda x: x * x).run(6)      -> 36
+#   Strategy(double).run(21)              -> 42   (named-function value)
+#   Maker(lambda: 7).make()               -> 7
+
+
+def double(x: int) -> int:
+    return x * 2
+
+
+class Strategy:
+    op: Callable[[int], int]
+
+    def __init__(self, op: Callable[[int], int]) -> None:
+        self.op = op
+
+    def run(self, x: int) -> int:
+        return self.op(x)
+
+
+class Maker:
+    f: Callable[[], int]
+
+    def __init__(self, g: Callable[[], int]) -> None:
+        self.f = g
+
+    def make(self) -> int:
+        return self.f()
+
+
+def main() -> None:
+    square: Strategy = Strategy(lambda x: x * x)
+    print(square.run(6))          # 36
+    twice: Strategy = Strategy(double)
+    print(twice.run(21))          # 42
+    m: Maker = Maker(lambda: 7)
+    print(m.make())               # 7

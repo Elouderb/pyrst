@@ -1,0 +1,12 @@
+# NEGATIVE: membership against a BARE type variable (an UNKNOWN container) is
+# still rejected. The container-membership relaxation only accepts `x in t` when
+# `t` is a known `dict`/`set`/`list`; a bare `T` carries no container structure,
+# so `Hash + Eq` / `PartialEq` cannot be soundly inferred and the op stays an
+# honest generics-v2 rejection. Must be rejected at the typeck (`check`) level,
+# not deferred to rustc.
+def bad[T](x: int, t: T) -> bool:
+    return x in t
+
+
+def main() -> None:
+    print(bad(1, 2))

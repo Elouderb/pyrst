@@ -1,0 +1,29 @@
+# Generics v2: membership (`in`) where the CONTAINER is a known `dict`/`set`/
+# `list` and the ELEMENT/key is a type variable is a VALID, bound-inferable op.
+#   - `k in d` for `d: dict[K, V]` infers `K: Hash + Eq`.
+#   - `k in s` for `s: set[K]`     infers `K: Hash + Eq`.
+#   - `x in xs` for `xs: list[T]`  infers `T: PartialEq`.
+# (Membership against a BARE type variable — an unknown container — stays
+# rejected; see examples/fail_membership_bare_typevar.pyrs.)
+def has_key[K, V](d: dict[K, V], k: K) -> bool:
+    return k in d
+
+
+def in_set[K](s: set[K], k: K) -> bool:
+    return k in s
+
+
+def in_list[T](xs: list[T], x: T) -> bool:
+    return x in xs
+
+
+def main() -> None:
+    d: dict[str, int] = {"a": 1, "b": 2}
+    print(has_key(d, "a"))        # True
+    print(has_key(d, "z"))        # False
+    s: set[int] = {1, 2, 3}
+    print(in_set(s, 2))           # True
+    print(in_set(s, 9))           # False
+    xs: list[int] = [10, 20, 30]
+    print(in_list(xs, 20))        # True
+    print(in_list(xs, 99))        # False

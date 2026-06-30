@@ -595,6 +595,14 @@ impl<'a> Codegen<'a> {
     fn emit_arg_into_slot(&mut self, arg: &Expr, slot: Option<&Ty>) -> Result<String> {
         match slot {
             Some(t) if self.ty_has_poly_base(t) => self.emit_into_base_slot(arg, t),
+            // A `Callable` parameter slot (`Rc<dyn Fn(..) -> ..>`): a bare function
+            // name or lambda argument must be wrapped (`Rc::new(..) as Rc<dyn Fn>`)
+            // — a closure does not auto-coerce to `Rc<dyn Fn>` at a call boundary.
+            // This mirrors the free-function-call path (`emit_plain_func_call`) so
+            // a `Callable` field/param reached through a constructor or method call
+            // wraps identically. Values already of `Ty::Func` pass through as a
+            // cheap `Rc` clone inside `emit_into_func_slot`.
+            Some(t) if self.ty_has_func(t) => self.emit_into_func_slot(arg, t),
             _ => self.emit_consuming(arg),
         }
     }
@@ -990,8 +998,76 @@ impl<'a> Codegen<'a> {
             if self.stmt_passes_self_by_ref(stmt) {
                 return true;
             }
+            // A self-rooted in-place mutator (`self.items.pop()`, `self.x.insert(..)`,
+            // ...) used in ANY expression position — most importantly as a RETURN
+            // value (`return self.items.pop()`) or assignment RHS — also mutates
+            // self. The `Stmt::Expr` arm above only catches a BARE statement call;
+            // a mutator whose result is consumed (popleft/pop returning the removed
+            // element) lives inside `Stmt::Return`/`Stmt::Assign` and was missed,
+            // emitting `&self` and tripping E0596 on the `&mut self.field` borrow.
+            if self.stmt_mutates_self_in_expr(stmt) {
+                return true;
+            }
         }
         false
+    }
+
+    /// True when any statement-embedded expression contains a call
+    /// `<self-rooted>.<mutating_method>(..)`. Walks the same statement-nesting
+    /// surface `stmt_passes_self_by_ref` does (return values, RHS, conditions,
+    /// iterables, call args), then scans each expression recursively.
+    fn stmt_mutates_self_in_expr(&self, stmt: &Stmt) -> bool {
+        let mut found = false;
+        let mut check = |e: &Expr| { if Self::expr_mutates_self(e) { found = true; } };
+        match stmt {
+            Stmt::Expr(e) | Stmt::Return(Some(e), _) => check(e),
+            Stmt::Assign { value, .. } | Stmt::AugAssign { value, .. } => check(value),
+            Stmt::Unpack { value, .. } => check(value),
+            Stmt::AttrAssign { obj, value, .. } | Stmt::IndexAssign { obj, value, .. } => {
+                check(obj);
+                check(value);
+            }
+            Stmt::If { cond, .. } => check(cond),
+            Stmt::While { cond, .. } => check(cond),
+            Stmt::For { iter, .. } => check(iter),
+            Stmt::With { ctx_expr, .. } => check(ctx_expr),
+            _ => {}
+        }
+        found
+    }
+
+    /// Recursively scan `e` for a `<self-rooted>.<mutating_method>(..)` call.
+    /// `MUTATING_METHODS` is the shared in-place-mutator name set; the receiver
+    /// chain must root at `self` (`self.items`, `self.a.b[i]`, ...).
+    fn expr_mutates_self(e: &Expr) -> bool {
+        match e {
+            Expr::Call { callee, args, kwargs, .. } => {
+                if let Expr::Attr { obj, name, .. } = callee.as_ref() {
+                    if MUTATING_METHODS.contains(&name.as_str())
+                        && Self::expr_roots_at_self(obj)
+                    {
+                        return true;
+                    }
+                }
+                Self::expr_mutates_self(callee)
+                    || args.iter().any(Self::expr_mutates_self)
+                    || kwargs.iter().any(|(_, v)| Self::expr_mutates_self(v))
+            }
+            Expr::Attr { obj, .. } => Self::expr_mutates_self(obj),
+            Expr::Index { obj, idx, .. } => {
+                Self::expr_mutates_self(obj) || Self::expr_mutates_self(idx)
+            }
+            Expr::BinOp { lhs, rhs, .. } => {
+                Self::expr_mutates_self(lhs) || Self::expr_mutates_self(rhs)
+            }
+            Expr::UnOp { expr, .. } => Self::expr_mutates_self(expr),
+            Expr::IfExp { test, body, orelse, .. } => {
+                Self::expr_mutates_self(test)
+                    || Self::expr_mutates_self(body)
+                    || Self::expr_mutates_self(orelse)
+            }
+            _ => false,
+        }
     }
 
     /// True when any `Expr::Call` reachable from `stmt` (in any expression
@@ -1759,7 +1835,19 @@ impl<'a> Codegen<'a> {
             matches!(Ty::from_type_expr(&f.ty, f.span), Ok(Ty::Class(ref n, _))
                 if self.is_polymorphic_base(n) && !self.companion_enum_has_partial_eq(n))
         });
-        let pe = if has_eq || field_blocks_eq { "" } else { ", PartialEq" };
+        // A `Callable` field lowers to `Rc<dyn Fn(..) -> ..>`, which implements
+        // neither `Debug` nor `PartialEq` (and has no `Default`). A struct holding
+        // one therefore cannot derive `Debug`/`PartialEq` — Python's `repr()` and
+        // `==` on such an object are honestly unavailable, matching the trait
+        // object's own lack of those impls. (The field is scoped with the class
+        // type params so a `Callable[[], V]` field on a generic class is seen.)
+        let has_func_field = all_fields.iter().any(|f| {
+            Ty::from_type_expr_scoped(&f.ty, f.span, &c.type_params)
+                .map(|ty| self.ty_has_func(&ty))
+                .unwrap_or(false)
+        });
+        let pe = if has_eq || field_blocks_eq || has_func_field { "" } else { ", PartialEq" };
+        let dbg = if has_func_field { "" } else { ", Debug" };
         // Only derive Default when every field actually implements Default.
         // Copy classes (all-primitive fields) don't derive Default, so an outer
         // struct holding one must NOT include Default in its own derive list.
@@ -1769,11 +1857,11 @@ impl<'a> Codegen<'a> {
                 .unwrap_or(false)
         });
         let derives = if all_fields_copy {
-            format!("#[derive(Copy, Clone, Debug{})]", pe)
+            format!("#[derive(Copy, Clone{}{})]", dbg, pe)
         } else if all_fields_default {
-            format!("#[derive(Clone, Debug{}, Default)]", pe)
+            format!("#[derive(Clone{}{}, Default)]", dbg, pe)
         } else {
-            format!("#[derive(Clone, Debug{})]", pe)
+            format!("#[derive(Clone{}{})]", dbg, pe)
         };
         // Generics v2 (generic CLASSES): the type-parameter clauses threaded
         // through this class's struct + impl + method emission.
@@ -1874,16 +1962,25 @@ impl<'a> Codegen<'a> {
                     // param-assigned, so this is exact. The non-generic path is
                     // unaffected (`type_params` empty => the map is empty => the old
                     // `zeroed_default` branch is taken for every field, byte-for-byte).
-                    let init_field_params = if c.type_params.is_empty() {
+                    // The field<-param map is also needed for a `Callable` field: a
+                    // `Rc<dyn Fn>` field has no `Default`, so its zero-then-`__init__`
+                    // placeholder must clone the directly-assigned `__init__` param
+                    // (which is already the `Rc<dyn Fn>` value) rather than
+                    // `Default::default()`. Build the map when the class is generic OR
+                    // holds a func field; a class that is neither keeps the empty map
+                    // and the legacy `zeroed_default` path byte-for-byte.
+                    let init_field_params = if c.type_params.is_empty() && !has_func_field {
                         std::collections::HashMap::new()
                     } else {
                         Self::init_field_param_map(&init_fn)
                     };
                     let defaults: Vec<String> = all_fields.iter().map(|f| {
                         let ty = Ty::from_type_expr_scoped(&f.ty, f.span, &c.type_params).unwrap_or(Ty::Unknown);
-                        // A type-var-bearing field with a known init param: clone that
-                        // param as the placeholder. Otherwise the legacy zeroed default.
-                        let dv = if crate::typeck::ty_contains_typevar(&ty) {
+                        // A type-var-bearing OR func-typed field with a known init
+                        // param: clone that param as the placeholder (`T: Clone` is
+                        // always bounded; an `Rc<dyn Fn>` clones cheaply). Otherwise
+                        // the legacy zeroed default.
+                        let dv = if crate::typeck::ty_contains_typevar(&ty) || self.ty_has_func(&ty) {
                             if let Some(param) = init_field_params.get(&f.name) {
                                 format!("{}.clone()", escape_ident(param))
                             } else {
@@ -4269,6 +4366,27 @@ impl<'a> Codegen<'a> {
                         if self.ctx.get_method(&cls, name).is_some() {
                             return self.emit_user_method_call(&obj_s, &cls, name, args, &parts).map(Some);
                         }
+                        // Not a method — a `Callable` FIELD invoked as `obj.f(args)`.
+                        // The field holds an `Rc<dyn Fn(..) -> ..>`, so Rust needs the
+                        // field-access parenthesised before the call: `(obj.f)(args)`.
+                        // (`obj.f(args)` would be parsed as a method named `f`, which
+                        // does not exist — E0599.) Resolved via the same field-type
+                        // lookup used elsewhere so it walks the inheritance chain.
+                        if let Some(field_ty) = self
+                            .ctx
+                            .classes
+                            .get(cls.as_str())
+                            .and_then(|cd| self.class_field_type(cd, name))
+                        {
+                            if matches!(field_ty, Ty::Func(..)) {
+                                return Ok(Some(format!(
+                                    "({}.{})({})",
+                                    obj_s,
+                                    escape_ident(name),
+                                    parts.join(", ")
+                                )));
+                            }
+                        }
                     }
 
                     // Special handling for string methods that return &str and need to be converted to String
@@ -4700,13 +4818,47 @@ impl<'a> Codegen<'a> {
                             // sites) — otherwise the bare `Dog::new(..)` mismatches
                             // the `Animal__` param (E0308). Non-polymorphic params
                             // keep the clone-on-use emission.
-                            let init_params: Vec<(String, Ty)> = class_def.methods.iter()
+                            let mut init_params: Vec<(String, Ty)> = class_def.methods.iter()
                                 .find(|m| m.name == "__init__")
                                 .map(|m| m.params.iter()
                                     .filter(|p| p.name != "self")
                                     .filter_map(|p| Ty::from_type_expr(&p.ty, p.span).ok().map(|t| (p.name.clone(), t)))
                                     .collect())
                                 .unwrap_or_default();
+                            // Generics v2 (generic class with a `Callable[.., V]`
+                            // CONSTRUCTOR PARAM): the param type lowers with the bare
+                            // class type-param name (`Rc<dyn Fn() -> V>`), but `V` is
+                            // NOT in scope at this CALL site — a lambda arg would be
+                            // cast `as Rc<dyn Fn() -> V>` and rustc raises E0425. So
+                            // substitute the class's type params with the concrete
+                            // instance type args inferred for THIS constructor call
+                            // (`DD(lambda: 0)` infers `V = int` from the factory's
+                            // return), yielding a concrete cast (`Rc<dyn Fn() -> i64>`).
+                            // A non-generic class has empty `type_params`, so the map
+                            // is empty and every param type is unchanged.
+                            if !class_def.type_params.is_empty() {
+                                if let Ty::Class(_, inst_args) =
+                                    self.type_of_expr(&Expr::Call {
+                                        callee: callee.clone(),
+                                        args: args.to_vec(),
+                                        kwargs: kwargs.to_vec(),
+                                        span: callee.span(),
+                                    })
+                                {
+                                    let subst: std::collections::HashMap<String, Ty> = class_def
+                                        .type_params
+                                        .iter()
+                                        .cloned()
+                                        .zip(inst_args.into_iter())
+                                        .filter(|(_, t)| !matches!(t, Ty::Unknown))
+                                        .collect();
+                                    if !subst.is_empty() {
+                                        for (_, t) in init_params.iter_mut() {
+                                            *t = crate::typeck::substitute_class_typarams(t, &subst);
+                                        }
+                                    }
+                                }
+                            }
                             let mut call_parts = Vec::new();
                             for (i, a) in args.iter().enumerate() {
                                 call_parts.push(self.emit_arg_into_slot(a, init_params.get(i).map(|(_, t)| t))?);
@@ -5709,10 +5861,21 @@ impl<'a> Codegen<'a> {
                 }
                 let i = self.emit_expr(idx)?;
                 match &obj_ty {
-                    Ty::Dict(..) => {
+                    Ty::Dict(k, _) => {
                         // .expect() produces a Rust message without the NUL delimiter;
                         // unwrap_or_else lets us emit a matchable "KeyError\0..." payload.
-                        format!("({}.get(&{}).cloned().unwrap_or_else(|| panic!(\"KeyError\\0{{:?}}\", &{})))", o, i, i)
+                        // A GENERIC key type (a bare `Ty::TypeVar`, e.g. a class
+                        // indexing its own `dict[K, V]` field) has no `Debug` bound
+                        // — we never infer `K: Debug` — so the `{:?}` form would
+                        // force `K: Debug` and fail to build (E0277). For such a key
+                        // emit a key-less message; the `KeyError\0` payload prefix is
+                        // preserved so `try/except KeyError` still matches. A concrete
+                        // key keeps the value-bearing message byte-for-byte.
+                        if crate::typeck::ty_contains_typevar(k) {
+                            format!("({}.get(&{}).cloned().unwrap_or_else(|| panic!(\"KeyError\\0<key>\")))", o, i)
+                        } else {
+                            format!("({}.get(&{}).cloned().unwrap_or_else(|| panic!(\"KeyError\\0{{:?}}\", &{})))", o, i, i)
+                        }
                     }
                     Ty::Str => {
                         // String indexing with negative index support.
@@ -6560,7 +6723,7 @@ pub fn emit_program(modules: &[(Module, String)], ctx: &TyCtx) -> Result<String>
     // sentinel is legitimately unreachable. It is a structural artifact of the
     // generated wrapper, not a user mistake — the same reason `dead_code` /
     // `unused_variables` are already suppressed for generated code.
-    cg.line("#![allow(unused_parens, unused_variables, unused_mut, dead_code, unused_imports, non_upper_case_globals, unreachable_code)]");
+    cg.line("#![allow(unused_parens, unused_variables, unused_mut, dead_code, unused_imports, non_upper_case_globals, non_camel_case_types, unreachable_code)]");
     cg.line("use std::io::Write;");
     cg.line("");
     cg.line("fn __py_fmt_float(x: f64) -> String {");
@@ -7151,5 +7314,86 @@ def main() -> None:
         // The post-loop read resolves to the mangled const (loop var out of scope).
         assert!(out.contains("println!(\"{}\" , __pyrst_const_i)"),
             "post-loop reference is the mangled const; got:\n{}", out);
+    }
+
+    #[test]
+    fn callable_field_class_emits_buildable_rust() {
+        // A class holding a `Callable` field lowers to an `Rc<dyn Fn>` struct
+        // field, which implements neither Debug nor PartialEq and has no Default.
+        // Assert the four codegen pieces that make it BUILD + run:
+        //   1. the struct derives only Clone (no Debug / PartialEq),
+        //   2. the constructor seeds the field from the param (no Default::default),
+        //   3. a Callable-FIELD call lowers to `(self.f)(..)`, not `self.f(..)`,
+        //   4. a lambda arg at the constructor call is wrapped `Rc::new(..) as ..`.
+        let src = "\
+class Maker:
+    f: Callable[[], int]
+    def __init__(self, g: Callable[[], int]) -> None:
+        self.f = g
+    def make(self) -> int:
+        return self.f()
+
+def main() -> None:
+    m: Maker = Maker(lambda: 42)
+    print(m.make())
+";
+        let rust = crate::driver::compile_str(src).expect("compile_str must succeed");
+        // 1. The struct must derive only Clone (Rc<dyn Fn> lacks Debug/PartialEq).
+        assert!(
+            rust.contains("#[derive(Clone)]\nstruct Maker"),
+            "Maker struct must derive only Clone (no Debug/PartialEq), got:\n{}", rust
+        );
+        // 2. Constructor seeds `f` from the param clone, never Default::default().
+        assert!(
+            rust.contains("Maker { f: g.clone() }"),
+            "constructor must seed `f` from the param, got:\n{}", rust
+        );
+        // 3. The Callable-field call is parenthesised: `(self.f)()`.
+        assert!(
+            rust.contains("(self.f)()"),
+            "Callable-field call must lower to `(self.f)()`, got:\n{}", rust
+        );
+        // 4. The lambda argument is wrapped into the `Rc<dyn Fn>` slot.
+        assert!(
+            rust.contains("::std::rc::Rc::new(move ||")
+                && rust.contains("as ::std::rc::Rc<dyn Fn() -> i64>"),
+            "lambda arg must be wrapped `Rc::new(..) as Rc<dyn Fn() -> i64>`, got:\n{}", rust
+        );
+    }
+
+    #[test]
+    fn generic_class_callable_field_substitutes_ctor_type_arg() {
+        // A GENERIC class with a `Callable[[], V]` constructor param: the cast at
+        // the call site must use the CONCRETE instance type arg (`i64`), not the
+        // bare class type param `V` (which is not in scope at the call site — that
+        // would be E0425). `DD(lambda: 0)` infers `V = int` from the factory.
+        let src = "\
+class DD[K, V]:
+    data: dict[K, V]
+    default_factory: Callable[[], V]
+    def __init__(self, factory: Callable[[], V]) -> None:
+        self.data = {}
+        self.default_factory = factory
+    def get(self, key: K) -> V:
+        if key in self.data:
+            return self.data[key]
+        value: V = self.default_factory()
+        self.data[key] = value
+        return value
+
+def main() -> None:
+    dd: DD[str, int] = DD(lambda: 0)
+    print(dd.get(\"x\"))
+";
+        let rust = crate::driver::compile_str(src).expect("compile_str must succeed");
+        // The wrapped lambda cast must name the concrete return type, not `V`.
+        assert!(
+            rust.contains("as ::std::rc::Rc<dyn Fn() -> i64>"),
+            "ctor lambda cast must use the concrete `i64`, got:\n{}", rust
+        );
+        assert!(
+            !rust.contains("as ::std::rc::Rc<dyn Fn() -> V>"),
+            "ctor lambda cast must NOT name the bare type param `V`, got:\n{}", rust
+        );
     }
 }

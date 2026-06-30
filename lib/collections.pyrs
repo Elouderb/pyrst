@@ -25,8 +25,26 @@
 #     is fine for the small n typical of "top-N" queries and keeps the ordering
 #     deterministic and the bound requirements minimal (only `>` on the int
 #     counts, no ordering bound on the keys themselves).
-#   - `deque` / `defaultdict` / `namedtuple` / `OrderedDict` are DEFERRED: they
-#     are generic CLASSES, which are a later batch.
+#   - `deque` / `defaultdict` are generic CLASSES (Tier-2 batch 2), defined below.
+#     `namedtuple` / `OrderedDict` remain DEFERRED.
+#
+# Generic classes (batch 2):
+#   - `deque[T]`        → a double-ended queue backed by a `list[T]`. O(1) at the
+#     right end (`append`/`pop`); the left end (`appendleft`/`popleft`) is O(n)
+#     because it shifts the backing `list` — pyrst has no ring buffer, so this is
+#     a faithful API, not CPython's O(1)-both-ends complexity. Empty `pop`/
+#     `popleft`/`peek`/`peekleft` panic via the backing `list.pop` on empty (an
+#     `IndexError`-style panic), matching pyrst's `list.pop()` on empty.
+#   - `defaultdict[K, V]` → a dict that materialises a missing key's value from a
+#     zero-arg `default_factory: Callable[[], V]` on `get`. `K` is hashable
+#     (`Hash + Eq`, inferred from the `dict[K, V]` field + the `key in self.data`
+#     membership test). NOT a `dict` subclass (pyrst has no generic-class
+#     subclassing); the useful operations are exposed as methods over a `data`
+#     field.
+#
+# Instantiation note: explicit `Class[targs]()` is gated, so a typed binding
+# drives the type args via inference: `d: deque[int] = collections.deque()` and
+# `dd: defaultdict[str, int] = collections.defaultdict(lambda: 0)`.
 
 
 def Counter[T](items: list[T]) -> dict[T, int]:
@@ -53,3 +71,75 @@ def most_common[T](counts: dict[T, int], n: int) -> list[tuple[T, int]]:
         pairs.pop(best)
         taken = taken + 1
     return result
+
+
+class deque[T]:
+    # A double-ended queue over a `list[T]`. `append`/`pop` act on the right end
+    # (O(1)); `appendleft`/`popleft` act on the left end (O(n), a list shift).
+    items: list[T]
+
+    def __init__(self) -> None:
+        self.items = []
+
+    def append(self, x: T) -> None:
+        self.items.append(x)
+
+    def appendleft(self, x: T) -> None:
+        self.items.insert(0, x)
+
+    def pop(self) -> T:
+        # Remove + return the RIGHTMOST element. Empty -> list.pop() on empty
+        # panics (IndexError-style), matching pyrst's bare `list.pop()`.
+        return self.items.pop()
+
+    def popleft(self) -> T:
+        # Remove + return the LEFTMOST element.
+        return self.items.pop(0)
+
+    def peek(self) -> T:
+        # The rightmost element WITHOUT removing it.
+        return self.items[len(self.items) - 1]
+
+    def peekleft(self) -> T:
+        # The leftmost element WITHOUT removing it.
+        return self.items[0]
+
+    def size(self) -> int:
+        return len(self.items)
+
+    def is_empty(self) -> bool:
+        return len(self.items) == 0
+
+
+class defaultdict[K, V]:
+    # A dict that fills a missing key from a zero-arg factory on `get`. Backed by
+    # a `data: dict[K, V]` plus the `default_factory`. `K` is hashable (inferred
+    # `Hash + Eq` from the dict field + the `key in self.data` membership test).
+    data: dict[K, V]
+    default_factory: Callable[[], V]
+
+    def __init__(self, factory: Callable[[], V]) -> None:
+        self.data = {}
+        self.default_factory = factory
+
+    def get(self, key: K) -> V:
+        # Existing value, or create-insert-and-return `default_factory()` for a
+        # missing key (CPython `defaultdict.__getitem__` / `d[key]` semantics).
+        if key in self.data:
+            return self.data[key]
+        value: V = self.default_factory()
+        self.data[key] = value
+        return value
+
+    def set(self, key: K, value: V) -> None:
+        self.data[key] = value
+
+    def contains(self, key: K) -> bool:
+        return key in self.data
+
+    def size(self) -> int:
+        return len(self.data)
+
+    def to_dict(self) -> dict[K, V]:
+        # A shallow copy of the underlying mapping.
+        return self.data.copy()

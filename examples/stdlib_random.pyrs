@@ -1,0 +1,52 @@
+# Stdlib `random`: the embedded pure-pyrst SEEDABLE generator. Because pyrst has
+# no mutable module-level state, `random` is a `Random` CLASS holding a mutable
+# `seed: int`, advanced by a Numerical-Recipes LCG
+# (seed = (1664525*seed + 1013904223) mod 2^32) on every draw. `random` is
+# embedded (lib/random.pyrs -> include_str! -> src/stdlib.rs); it was never in
+# the resolver skip-list, so the import resolves; no local `random.pyrs` next to
+# this file.
+#
+# Exercises BOTH import forms:
+#   - FLAT `from random import Random` for construction — a qualified
+#     `random.Random(42)` constructor / `r: random.Random` annotation do NOT
+#     parse (only module FUNCTIONS resolve qualified, and a qualified type
+#     annotation is unsupported), exactly as `collections.deque` documents.
+#   - QUALIFIED `import random; random.choice(...)` / `random.shuffle(...)` for
+#     the free generic draws.
+# `choice[T]` / `shuffle[T]` are FREE generic functions taking `rng: Mut[Random]`
+# (generic METHODS inside a class are gated, and a class instance is passed by
+# value unless `Mut`), so they advance the SAME generator and stay reproducible.
+#
+# DETERMINISTIC by construction: a fixed seed (42) makes the entire draw sequence
+# reproducible — that is the whole point. The golden pins THIS LCG's actual
+# output, in call order:
+#   five r.randint(1, 6)        — a dice roll sequence
+#   choice(r, ["rock","paper","scissors"])
+#   r.randrange(100)            — an int in [0, 100)
+#   r.random()                  — a float in [0, 1)
+#   r.uniform(10.0, 20.0)       — a float in [10, 20]
+# Then a SEPARATE Random(7) drives `shuffle([1,2,3,4,5])` -> [1, 3, 5, 2, 4], a
+# visibly non-trivial Fisher–Yates permutation (a fresh seed is used so the
+# permutation is clearly not the identity).
+# Re-running yields the IDENTICAL lines every time (no wall-clock / OS entropy).
+import random
+from random import Random
+
+
+def main() -> None:
+    r: Random = Random(42)
+    print(r.randint(1, 6))
+    print(r.randint(1, 6))
+    print(r.randint(1, 6))
+    print(r.randint(1, 6))
+    print(r.randint(1, 6))
+    print(random.choice(r, ["rock", "paper", "scissors"]))
+    print(r.randrange(100))
+    print(r.random())
+    print(r.uniform(10.0, 20.0))
+    # A fresh generator for shuffle, seeded so the permutation is clearly
+    # non-identity (Random(42)'s state at this point happens to self-swap).
+    s: Random = Random(7)
+    deck: list[int] = [1, 2, 3, 4, 5]
+    random.shuffle(s, deck)
+    print(deck)

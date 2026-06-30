@@ -1,0 +1,32 @@
+# Stdlib `itertools`: the embedded pure-pyrst EAGER subset — `accumulate`
+# (int running fold), `chain` (binary concat), `repeat` (n copies), `product`
+# (cartesian pairs, two type params so the factors may differ in element type),
+# `combinations` and `permutations` (r-length index-ordered selections over a
+# generic `list[T]`). `itertools` is embedded (lib/itertools.pyrs -> include_str!
+# -> src/stdlib.rs) and was REMOVED from the resolver skip-list so the import
+# resolves; no local `itertools.pyrs` next to this file.
+#
+# Exercises BOTH import forms:
+#   - QUALIFIED `import itertools; itertools.f(...)` for most calls.
+#   - FLAT `from itertools import accumulate` for `accumulate`.
+# Both run the same generic call-site unification, so a generic `T` callee
+# instantiates correctly from its list argument.
+#
+# Deterministic — every result is a list (no dict/set ordering involved):
+#   accumulate([1,2,3,4], +)      -> [1, 3, 6, 10]   (running sum)
+#   chain([1,2],[3,4])            -> [1, 2, 3, 4]
+#   repeat("x", 3)                -> ['x', 'x', 'x']
+#   product(["a","b"],[1,2])      -> [('a',1), ('a',2), ('b',1), ('b',2)]
+#   combinations([1,2,3], 2)      -> [[1,2], [1,3], [2,3]]
+#   permutations([1,2,3], 2)      -> [[1,2],[1,3],[2,1],[2,3],[3,1],[3,2]]
+import itertools
+from itertools import accumulate
+
+
+def main() -> None:
+    print(accumulate([1, 2, 3, 4], lambda a, b: a + b))
+    print(itertools.chain([1, 2], [3, 4]))
+    print(itertools.repeat("x", 3))
+    print(itertools.product(["a", "b"], [1, 2]))
+    print(itertools.combinations([1, 2, 3], 2))
+    print(itertools.permutations([1, 2, 3], 2))

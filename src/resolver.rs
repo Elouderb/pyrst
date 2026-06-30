@@ -135,8 +135,11 @@ impl Resolver {
                 // for `Counter`/`most_common`; its generic-class members
                 // (`deque`/`defaultdict`/…) are a later batch. `json` stays
                 // skipped: its `JsonValue` type design is a separate, deferred
-                // card.
-                if matches!(mod_name.as_str(), "dataclasses" | "sys" | "json" | "itertools") {
+                // card. `itertools` is NO LONGER skipped: it is now a real
+                // embedded module (`lib/itertools.pyrs`, an eager subset), so it
+                // must reach the resolution path. (`textwrap`/`random` were never
+                // skipped and resolve as embedded modules too.)
+                if matches!(mod_name.as_str(), "dataclasses" | "sys" | "json") {
                     continue;
                 }
 

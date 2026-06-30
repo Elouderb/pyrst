@@ -44,6 +44,18 @@ pub const EMBEDDED_STDLIB: &[(&str, &str)] = &[
     ("bisect", include_str!("../lib/bisect.pyrs")),
     ("heapq", include_str!("../lib/heapq.pyrs")),
     ("collections", include_str!("../lib/collections.pyrs")),
+    // Tier-3 batch: pure-pyrst modules over generics + classes with mutable
+    // instance state. `itertools` is an EAGER combinatoric subset (`chain`/
+    // `repeat`/`product`/`combinations`/`permutations` over `list[T]`, plus an
+    // int-specialised `accumulate`); it was also removed from the resolver
+    // skip-list so the import resolves. `textwrap` is pure str-method text
+    // wrapping. `random` is a seedable LCG `Random` CLASS (mutable `seed`
+    // field) with free generic `choice`/`shuffle` helpers. None need an external
+    // crate (Rust std only), so importing them stays on the single-file build
+    // path.
+    ("itertools", include_str!("../lib/itertools.pyrs")),
+    ("textwrap", include_str!("../lib/textwrap.pyrs")),
+    ("random", include_str!("../lib/random.pyrs")),
 ];
 
 /// Look up an embedded stdlib module's source by NAME (e.g. `"os"`).

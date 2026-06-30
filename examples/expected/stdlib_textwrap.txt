@@ -1,0 +1,9 @@
+['the quick', 'brown fox']
+the quick
+brown fox
+[a b ...]
+> alpha
+> beta
+x
+y
+  z

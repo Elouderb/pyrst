@@ -1,0 +1,104 @@
+# pyrst standard library — random
+#
+# A SEEDABLE pseudo-random generator implemented as a pure-pyrst linear
+# congruential generator (LCG). Embedded via `include_str!` (see `src/stdlib.rs`);
+# `random` is not in the resolver skip-list, so the import resolves with no extra
+# change. Usable as either `from random import Random` or
+# `import random; r = random.Random(42)`.
+#
+# WHY A CLASS (not module functions): pyrst has NO mutable module-level state, so
+# the generator state (`seed`) must live in an instance. `Random` therefore holds
+# a mutable `seed: int` and advances it on every draw. The module-level
+# convenience API (`random.random()`, `random.randint(...)` backed by a hidden
+# global generator) is DEFERRED until pyrst grows mutable globals — construct a
+# `Random` explicitly.
+#
+# LCG: seed_{n+1} = (A * seed_n + C) mod M  with the Numerical Recipes constants
+#   A = 1664525, C = 1013904223, M = 4294967296 (= 2^32).
+# These fit pyrst's i64 int with no overflow once the state is in range: the
+# largest intermediate is A * (M-1) + C ≈ 7.15e15, far below i64::MAX (≈9.22e18).
+# After the FIRST `_advance()` the state is always in [0, M-1] (taken mod M), so
+# every subsequent step is overflow-safe. The seed should therefore be in
+# [0, 2^32): a seed far above M (e.g. 10**18) could overflow `A * seed` on the
+# very first step (Rust wraps in release builds). The example seeds (42, 7) are
+# well in range. M is written as the integer literal 4294967296 because `2 ** 32`
+# types as `float` in pyrst (Python `**` semantics), which would not fit an `int`
+# modulus.
+#
+# DETERMINISM: a given seed yields a fixed, reproducible draw sequence — that is
+# the entire point of a seedable PRNG and what the golden pins. Quality is "good
+# enough for examples/tests", NOT cryptographic.
+#
+# Generic draws (`choice`, `shuffle`) are FREE FUNCTIONS, not methods: pyrst gates
+# generic METHODS inside a class (only free functions may carry type parameters),
+# and a class instance is passed by VALUE unless declared `Mut[...]`. So `choice`
+# / `shuffle` take `rng: Mut[Random]` to (a) carry the generic element type `T`
+# on a free function and (b) advance the CALLER's generator state in place.
+#
+# Public API:
+#   class Random(seed):
+#     - random()          -> float in [0, 1)
+#     - randint(a, b)     -> int in [a, b] (inclusive both ends)
+#     - randrange(n)      -> int in [0, n)
+#     - uniform(a, b)     -> float in [a, b]
+#     - next_below(n)     -> int in [0, n)   (the shared index primitive; also the
+#                            building block `choice`/`shuffle` call)
+#   free functions:
+#     - choice(rng, xs)   -> T              (a uniformly-chosen element)
+#     - shuffle(rng, xs)  -> None           (in-place Fisher–Yates over Mut[list[T]])
+
+
+class Random:
+    seed: int
+
+    def __init__(self, seed: int) -> None:
+        self.seed = seed
+
+    def _advance(self) -> int:
+        # One LCG step; returns the new 32-bit state.
+        self.seed = (1664525 * self.seed + 1013904223) % 4294967296
+        return self.seed
+
+    def next_below(self, n: int) -> int:
+        # A draw in [0, n). Advances the state. (Slightly biased for n not a power
+        # of two — acceptable for the example/test domain.)
+        nxt: int = self._advance()
+        return nxt % n
+
+    def random(self) -> float:
+        # A float in [0, 1): the new 32-bit state divided by 2^32.
+        nxt: int = self._advance()
+        return float(nxt) / 4294967296.0
+
+    def randint(self, a: int, b: int) -> int:
+        # Inclusive on BOTH ends: an int in [a, b].
+        span: int = b - a + 1
+        return a + self.next_below(span)
+
+    def randrange(self, n: int) -> int:
+        # An int in [0, n).
+        return self.next_below(n)
+
+    def uniform(self, a: float, b: float) -> float:
+        # A float in [a, b] (CPython allows the order a > b; the formula handles it).
+        return a + (b - a) * self.random()
+
+
+def choice[T](rng: Mut[Random], xs: list[T]) -> T:
+    # A uniformly-chosen element of `xs`. Advances `rng`. Empty `xs` panics via
+    # the index (an IndexError-style panic), matching a bare out-of-range index.
+    idx: int = rng.next_below(len(xs))
+    return xs[idx]
+
+
+def shuffle[T](rng: Mut[Random], xs: Mut[list[T]]) -> None:
+    # In-place Fisher–Yates: walk from the last index down, swapping each element
+    # with a uniformly-chosen earlier-or-equal position. Advances `rng` once per
+    # step.
+    i: int = len(xs) - 1
+    while i > 0:
+        j: int = rng.next_below(i + 1)
+        tmp: T = xs[i]
+        xs[i] = xs[j]
+        xs[j] = tmp
+        i = i - 1

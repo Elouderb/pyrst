@@ -1,0 +1,130 @@
+# pyrst standard library — textwrap
+#
+# Pure-pyrst text wrapping / filling / indenting, built entirely from pyrst `str`
+# methods. Embedded via `include_str!` (see `src/stdlib.rs`); `textwrap` is not
+# in the resolver skip-list, so the import resolves with no extra change. Usable
+# as either `from textwrap import wrap` or `import textwrap; textwrap.wrap(t, w)`.
+#
+# Public API:
+#   - `wrap(text, width)`   — greedy word wrap: split on whitespace, then pack
+#                             words into lines no longer than `width` (a single
+#                             over-long word still gets its own line). Returns the
+#                             list of lines.
+#   - `fill(text, width)`   — `wrap` joined with newlines into one string.
+#   - `shorten(text, width)`— collapse runs of whitespace to single spaces; if the
+#                             result is <= `width`, return it; otherwise truncate
+#                             at a WORD boundary and append " ..." so the whole
+#                             result (including the placeholder) fits in `width`.
+#   - `indent(text, prefix)`— prefix every NON-EMPTY line with `prefix`.
+#   - `dedent(text)`        — remove the longest common run of leading spaces/tabs
+#                             shared by all non-blank lines.
+#
+# str methods used (all confirmed present in pyrst — see typeck `STR_METHODS`):
+#   `split()` (whitespace, drops empties), `splitlines`, `strip`, `len`, `join`,
+#   plus character iteration (`for ch in line`) and slicing (`line[k:]`).
+#
+# Notes / pyrst fit:
+#   - `width` is measured in CHARACTERS (pyrst `len(str)` is the char count).
+#   - CPython `textwrap` has many keyword options (`break_long_words`,
+#     `expand_tabs`, `initial_indent`, `drop_whitespace`, a `placeholder=` for
+#     `shorten`, a `predicate` for `indent`); pyrst has no keyword/default
+#     arguments yet, so this module ships the common positional behaviour. The
+#     `shorten` placeholder is fixed at " ..." (the 4-char value the requirements
+#     specify; CPython's OWN default is the 6-char " [...]"). `indent` here uses
+#     a "prefix lines that are not LITERALLY empty" predicate — note this differs
+#     from CPython's default `bool(line.strip())`, which also skips
+#     whitespace-only lines; a whitespace-only line IS prefixed here (it is not
+#     length-zero). The example corpus does not feed `indent` whitespace-only
+#     lines, so the two agree on the tested inputs.
+#   - `shorten` reserves 4 characters for the trailing " ..." so the placeholder
+#     fits within `width`.
+
+
+def wrap(text: str, width: int) -> list[str]:
+    words: list[str] = text.split()
+    lines: list[str] = []
+    current: str = ""
+    for w in words:
+        if len(current) == 0:
+            current = w
+        else:
+            candidate: str = current + " " + w
+            if len(candidate) <= width:
+                current = candidate
+            else:
+                lines.append(current)
+                current = w
+    if len(current) > 0:
+        lines.append(current)
+    return lines
+
+
+def fill(text: str, width: int) -> str:
+    return "\n".join(wrap(text, width))
+
+
+def shorten(text: str, width: int) -> str:
+    words: list[str] = text.split()
+    collapsed: str = " ".join(words)
+    if len(collapsed) <= width:
+        return collapsed
+    # Too long: pack whole words until the next word (plus the 4-char " ..."
+    # placeholder) would overflow `width`.
+    result: str = ""
+    for w in words:
+        if len(result) == 0:
+            candidate: str = w
+        else:
+            candidate = result + " " + w
+        if len(candidate) + 4 <= width:
+            result = candidate
+        else:
+            break
+    if len(result) == 0:
+        # Not even the first word fits alongside the placeholder.
+        return "..."
+    return result + " ..."
+
+
+def indent(text: str, prefix: str) -> str:
+    lines: list[str] = text.splitlines()
+    out: list[str] = []
+    for line in lines:
+        if len(line) == 0:
+            out.append(line)
+        else:
+            out.append(prefix + line)
+    return "\n".join(out)
+
+
+def dedent(text: str) -> str:
+    lines: list[str] = text.splitlines()
+    common: int = -1
+    for line in lines:
+        # Blank lines (whitespace-only) do not constrain the common indent.
+        if len(line.strip()) == 0:
+            continue
+        lead: int = _leading_ws(line)
+        if common < 0 or lead < common:
+            common = lead
+    if common <= 0:
+        return text
+    out: list[str] = []
+    for line in lines:
+        if len(line.strip()) == 0:
+            # Normalise blank lines to empty (CPython collapses their whitespace).
+            out.append("")
+        else:
+            out.append(line[common:])
+    return "\n".join(out)
+
+
+def _leading_ws(line: str) -> int:
+    # Count leading space/tab characters of `line`.
+    n: int = 0
+    for ch in line:
+        if ch == " " or ch == "\t":
+            n = n + 1
+        else:
+            break
+    return n

@@ -1,0 +1,29 @@
+# Stdlib `textwrap`: the embedded pure-pyrst text helpers — `wrap` (greedy word
+# wrap to a width), `fill` (`wrap` joined by newlines), `shorten` (collapse
+# whitespace + truncate at a word boundary with a " ..." placeholder), `indent`
+# (prefix non-empty lines) and `dedent` (strip the common leading whitespace).
+# All are built only from pyrst `str` methods (split / splitlines / strip / join
+# / len / slice / char-iteration). `textwrap` is embedded (lib/textwrap.pyrs ->
+# include_str! -> src/stdlib.rs); it was never in the resolver skip-list, so the
+# import resolves; no local `textwrap.pyrs` next to this file.
+#
+# Exercises BOTH import forms:
+#   - QUALIFIED `import textwrap; textwrap.f(...)`.
+#   - FLAT `from textwrap import shorten`.
+#
+# Deterministic — fixed strings and widths:
+#   wrap("the quick brown fox", 10) -> ['the quick', 'brown fox']
+#   fill(...)                       -> "the quick\nbrown fox"
+#   shorten("a b c d e", 7)         -> "a b ..."
+#   indent("alpha\nbeta", "> ")     -> "> alpha\n> beta"
+#   dedent("    x\n    y\n      z") -> "x\ny\n  z"
+import textwrap
+from textwrap import shorten
+
+
+def main() -> None:
+    print(textwrap.wrap("the quick brown fox", 10))
+    print(textwrap.fill("the quick brown fox", 10))
+    print("[" + shorten("a b c d e", 7) + "]")
+    print(textwrap.indent("alpha\nbeta", "> "))
+    print(textwrap.dedent("    x\n    y\n      z"))

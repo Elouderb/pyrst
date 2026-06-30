@@ -1,160 +1,130 @@
 # pyrst
 
-A statically typed Python-like language that compiles to efficient Rust. Combines Python's ergonomics with Rust's safety and performance.
+A statically typed, Python-like language that compiles to efficient Rust. Combines Python's ergonomics with Rust's safety and performance.
 
 **Think:** TypeScript-to-JavaScript, but the target is Rust instead of JS.
 
+```python
+def first[T](xs: list[T]) -> T:
+    return xs[0]
+
+class Box[T]:
+    value: T
+    def __init__(self, v: T) -> None:
+        self.value = v
+    def get(self) -> T:
+        return self.value
+
+def main() -> None:
+    print(first([10, 20, 30]))      # 10
+    print(first(["a", "b"]))        # a  (same function, monomorphized)
+    b: Box[int] = Box(42)
+    print(b.get())                  # 42
+```
+
 ## Key Features
 
-- **Python-like syntax:** Indentation-based blocks, familiar control flow, readable declarations
-- **Mandatory static typing:** All variables have compile-time types; strong guarantees
-- **Rust compilation:** Generates readable Rust code, compiled via `rustc` to native binaries
-- **Core functionality:** Functions, classes (single inheritance), collections, operators, pattern matching
+- **Python-like syntax:** indentation-based blocks, familiar control flow, readable declarations
+- **Mandatory static typing:** every binding has a compile-time type; honest errors over silent miscompiles
+- **Compiles to readable Rust**, then to a native binary via `rustc` (no runtime, no GC)
+- **Generics:** generic functions, **bounded** generics (trait bounds inferred from use), and **generic classes** (`class Box[T]`) — monomorphized
+- **First-class functions:** lambdas, nested-`def` closures, `Callable[[A], R]` values
+- **Generators** (`yield`), **pattern matching** (`match`/`case`, incl. capture patterns), **exceptions** (`try`/`except`/`finally`/`raise`)
+- **Rust interop (`@extern`):** wrap Rust `std` — and **external crates** (`@crate`) — behind typed pyrst signatures
+- **A standard library** written in pyrst + `@extern` (see below)
+- **Editor support:** a language server (`pyrst lsp`) with diagnostics, hover, go-to-definition, completion, and semantic tokens; plus a VS Code extension
 
 ## Status
 
-**Active development** — Full compiler pipeline (lexer → parser → resolver → type checker → Rust codegen → `rustc`). **All 194 single-file examples transpile and run successfully** (`./test_all.sh`: 194/194 positives, 64/64 rejection fixtures, 199 in-crate `#[test]` cases).
+**v0.1.0.** Full compiler pipeline (lexer → parser → resolver → type checker → Rust codegen → `rustc`), end-to-end.
 
-The core pipeline is working end-to-end, including multi-file imports, classes with single inheritance and dunder methods, comprehensions, and a broad set of string/list/dict methods. Lambdas are implemented (see `examples/lambda_demo.pyrs`, `examples/lambda_closure.pyrs`).
+`./test_all.sh`: **269/269 positive examples** build + run with matching output, **103/103 negative fixtures** correctly rejected (at both `check` and `build`), plus multi-file import demos. **513 in-crate `cargo test` cases**, 0 compiler warnings, CI green.
 
-**Known limitations (honest status):**
-- The static type checker is **best-effort, not yet fully sound**: some expressions still infer to an `Unknown` type that is permissively compatible with everything, so a few type/ownership errors are surfaced by the downstream `rustc` invocation against generated Rust rather than by pyrst itself. Recent work (type-inference soundness pass) has narrowed this escape hatch substantially; the remaining gaps are tracked as deferred items.
-- `try`/`except` matches on exception type and binds `except E as e` (the bound value is the exception message string). The builtin exception hierarchy is modeled — a base catches its builtin subclasses (e.g. `except LookupError:` catches `KeyError`/`IndexError`) — and caught exceptions print no stderr noise. Remaining limitation: user-defined exception classes match by exact type name (no user-defined subclass catching).
+pyrst is **not** a Python-compatible subset or a Python runtime — it's its own statically typed language with Python-flavored syntax.
 
-## Documentation Structure
-
-**Understand the language:**
-
-1. **[SPEC.md](SPEC.md)** — Formal language specification (what's supported, what's not)
-2. **[GRAMMAR.md](GRAMMAR.md)** — Formal grammar for the parser
-3. **[PYTHON_COMPATIBILITY.md](PYTHON_COMPATIBILITY.md)** — Compatibility matrix (honest comparison)
-
-**Design & implementation:**
-
-4. **[RUST_BACKEND.md](RUST_BACKEND.md)** — How pyrst constructs map to Rust
-5. **[docs/design/](docs/design/)** — Design documents (inference oracle, class subtyping, etc.)
-
-## Quick Example
-
-```python
-def fibonacci(n: int) -> int:
-    if n <= 1:
-        return n
-    return fibonacci(n - 1) + fibonacci(n - 2)
-
-def main() -> None:
-    for i in range(10):
-        print(fibonacci(i))
-```
-
-Compiles to Rust, then to native binary:
-
-```bash
-pyrst build examples/fib.pyrs
-./fib
-```
-
-## What's Implemented ✅
-
-- Functions with type annotations and default arguments
-- Classes and methods (single inheritance, `super()`/`__init__`, dunder methods)
-- Class subtyping via companion-enum polymorphism (closed-set dispatch)
-- Decorators: `@property`, `@staticmethod`
-- Value semantics: clone-on-use; `Mut[T]` parameter mode for by-reference mutation
-- `Optional[T]` / `T | None` with explicit narrowing (`is None` / `is not None`)
-- Variables with static types and type inference
-- Collections: `list[T]`, `dict[K, V]`, `tuple[T1, T2, ...]`, `set[T]`
-- Operators: arithmetic, comparison (including chaining `a < b < c`), logical, bitwise
-- Ternary expressions: `x if cond else y`
-- Lambdas: `lambda x: expr`
-- Control flow: if/elif/else, while, for, break, continue, `with`/context managers
-- Pattern matching: `match`/`case` with literal patterns and `_` wildcard
-- String operations and f-strings with interpolation; triple-quoted strings
-- List, dict, and set comprehensions with filters
-- `try`/`except` with type-matched exception handling and `except E as e` binding
-- Tuple unpacking in assignments and for loops
-- `enumerate()`, `zip()`, `range()` with optional step
-- `assert` statements and `raise` (maps to panic)
-- Rust-keyword escaping: pyrst identifiers that collide with Rust keywords are emitted as raw identifiers (`r#type`, `r#loop`, etc.)
-- Type checking with two-pass inference
-- Code generation to readable Rust
-- Multi-file programs with `import` and `from...import`
-- Circular import detection with clear error messages
-
-## What's NOT Implemented ❌
-
-See [PYTHON_COMPATIBILITY.md](PYTHON_COMPATIBILITY.md) for a complete matrix.
-
-Notable omissions (by design):
-- Generators and `yield`
-- Multiple inheritance
-- User-defined exception-subclass catching (the *builtin* hierarchy works; user-defined exceptions match by exact type name)
-- Metaclasses and dynamic attribute access
-- `eval`/`exec` and reflection
-- Python standard library compatibility
-- Package directories (`foo/__init__.pyrs`)
-- Module visibility / private modules
-- Shared-mutable aliasing (`Rc`/`RefCell`-style); mutation is explicit via `Mut[T]`
-
-## Building from Source
+## Quick start
 
 ```sh
 # Install Rust first: https://rustup.rs
-git clone https://github.com/yourusername/pyrst.git
-cd pyrst
 cargo build --release
-
-# Test it
-cargo run --release -- build examples/hello.pyrs
-./hello
+cargo run --release -- build examples/fib.pyrs
+./fib
 ```
 
-## CLI Usage
+### CLI
 
 ```bash
-pyrst check <file.pyrs>    # Parse and type-check
-pyrst emit <file.pyrs>     # Print generated Rust to stdout
-pyrst build <file.pyrs>    # Compile to native binary via rustc
+pyrst build <file.pyrs>    # compile to a native binary via rustc (a Cargo project if it uses @crate)
+pyrst emit  <file.pyrs>    # print the generated Rust to stdout
+pyrst check <file.pyrs>    # parse + type-check only
+pyrst fmt   <file.pyrs>    # format in place
+pyrst lint  <file.pyrs>    # style / common-issue checks
+pyrst repl                 # interactive shell
+pyrst lsp                  # language server (stdin/stdout, for editors)
 ```
 
-## Project Philosophy
+## What's implemented
 
-pyrst aims to preserve **Python's programming experience** (readable syntax, familiar semantics) while gaining **Rust's guarantees** (static types, memory safety, zero-cost abstractions).
+**Types & data**
+- Functions with type annotations and default arguments
+- Classes & methods: single inheritance, `super()`/`__init__`, dunder methods (`__eq__`/`__lt__`/`__add__`/`__str__`/…), `@property`/`@staticmethod`
+- Class subtyping via companion-enum polymorphism (closed-set dispatch)
+- **Generics:** `def f[T](..)`; **bounded** generics — `PartialOrd`/`PartialEq`/`Add`/`Display`/`Hash+Eq` inferred from the operations used on `T`, with transitive propagation across generic calls; **generic classes** `class Box[T]`; generic `Callable` parameters
+- Collections: `list[T]`, `dict[K, V]`, `tuple[..]`, `set[T]`
+- `Optional[T]` / `T | None` with explicit narrowing (`is None` / `is not None`)
+- Value semantics (clone-on-use); `Mut[T]` parameter mode for by-reference mutation
 
-This means:
-- ✅ Python-like syntax and control flow
-- ✅ Static types and compile-time safety
-- ✅ Readable, efficient generated code
-- ❌ NOT a Python-compatible subset
-- ❌ NOT a Python runtime emulator
+**Control & functions**
+- if/elif/else, while, for, break, continue, `with`/context managers
+- **Generators** (`yield`) consumable by `for`/comprehensions (eager evaluation — see limitations)
+- **First-class functions:** lambdas, nested-`def` closures (lexical capture), `Callable[[A], R]` values
+- **Pattern matching:** `match`/`case` with literal, `_` wildcard, and capture (`case y:`) patterns + guards
+- **Exceptions:** `try`/`except`/`else`/`finally`, `raise`, type-matched handlers with the builtin hierarchy (`except LookupError:` catches `KeyError`/`IndexError`), `except E as e`
+- Comprehensions (list/set/dict) with filters; f-strings; triple-quoted strings; tuple unpacking
+- `enumerate()`/`zip()`/`range()`, `assert`, operator chaining (`a < b < c`)
 
-See [SPEC.md](SPEC.md) and [RUST_BACKEND.md](RUST_BACKEND.md) for design details and key tradeoffs.
+**Interop & modules**
+- **`@extern`:** bind a Rust expression template behind a typed pyrst signature
+- **`@crate("name", "ver")`:** depend on an external crate (the build switches to a Cargo project); names/versions are validated to prevent `Cargo.toml` injection
+- Multi-file programs (`import` / `from … import`), an embedded standard library, circular-import detection
 
-## Status Summary
+## Standard library
 
-**Strengths:**
-- Full compiler pipeline working end-to-end (lexer → parser → resolver → type checker → codegen → `rustc`)
-- 194/194 single-file examples passing, covering core features and multi-file programs
-- Clear separation of lexer, parser, type checker, code generator
-- Readable generated Rust code
-- Error messages with source code context
+Written in pyrst (pure pyrst and/or `@extern`), embedded in the compiler binary and resolved on `import`:
 
-**Current Status:**
-The pipeline is functional end-to-end (lexer → type checker → Rust codegen →
-`rustc`) and matures with each epic — 194 passing example programs. Remaining work
-is incremental (diagnostics polish, parser edge cases, docs). See SPEC.md and
-PYTHON_COMPATIBILITY.md for the current feature surface and its honest limitations.
+| | Modules |
+|---|---|
+| **Core** | `math`, `os`, `time`, `operator`, `functools` (`reduce`), `statistics`, `string` |
+| **Data structures / algorithms** | `bisect`, `heapq`, `collections` (`Counter`, `deque`, `defaultdict`), `itertools`, `textwrap` |
+| **Parsing / external** | `re` (via the `regex` crate), `json` (a pure-pyrst recursive-descent parser + serializer over a dynamic `JsonValue`), `random` (a seedable `Random` class) |
 
-## Contributing
+Both `import math; math.sqrt(x)` and `from math import sqrt` forms work, including for generic stdlib functions (`import heapq; heapq.heappush(h, x)`).
 
-See [SPEC.md](SPEC.md) and [docs/design/](docs/design/) before proposing major features.
+## Known limitations (honest status)
 
-The project prioritizes **semantic clarity** and **compiler maturity** over raw feature count. New features should have explicit design decisions before implementation.
+By design (see [SPEC.md](SPEC.md) / [PYTHON_COMPATIBILITY.md](PYTHON_COMPATIBILITY.md)): not Python-compatible; multiple inheritance, metaclasses, dynamic attribute access, `eval`/`exec`, and shared-mutable aliasing (`Rc`/`RefCell`) are out.
+
+Current v0.1.0 gaps (tracked, with workarounds):
+- **Generators are eager** — a generator runs to completion collecting its yields; an *infinite* generator (`while True: yield …`) would not terminate. Lazy iteration is a follow-up.
+- **Generic classes** can't be instantiated via a *qualified* name (`collections.deque[int]()`); use a flat import (`from collections import deque; d: deque[int] = deque()`).
+- **Generic methods inside a class** (`def m[U](self)`) are not yet supported (top-level generic functions are).
+- **No module-level mutable state**, so `random`'s module-level convenience API and `sys.argv` are not available (use the `Random` class; pass args explicitly).
+- A generic `Callable[[T], R]` with **two distinct** type variables (where `R` comes from a lambda's return) is an honest error; same-type-var forms (`Callable[[T], T]`, `Callable[[T, T], T]`) work.
+- The type checker leans on `rustc` for a few residual ownership/edge cases; the honest-errors invariant (no silent miscompiles) is the priority and is enforced by an extensive negative-test suite.
+
+## Documentation
+
+- **[SPEC.md](SPEC.md)** — language specification
+- **[GRAMMAR.md](GRAMMAR.md)** — parser grammar
+- **[PYTHON_COMPATIBILITY.md](PYTHON_COMPATIBILITY.md)** — compatibility matrix
+- **[RUST_BACKEND.md](RUST_BACKEND.md)** — how pyrst maps to Rust
+- **[CHANGELOG.md](CHANGELOG.md)** — release history
+- **[docs/design/](docs/design/)** — design documents
+
+## Project philosophy
+
+pyrst preserves **Python's programming experience** (readable syntax, familiar semantics) while gaining **Rust's guarantees** (static types, memory safety, native performance). The guiding principle is **honest errors over silent miscompiles**: when something can't be compiled correctly, pyrst reports it rather than emitting wrong code.
 
 ## License
 
-MIT (or your preferred open-source license)
-
----
-
-**For detailed information on language design, Python compatibility, or implementation details, see the documentation files linked above.**
+MIT

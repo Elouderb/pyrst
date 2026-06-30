@@ -1,6 +1,6 @@
 [package]
 name = "pyrst"
-version = "0.0.24"
+version = "0.0.25"
 edition = "2021"
 description = "A Pythonic language that compiles to Rust"
 license = "MIT OR Apache-2.0"

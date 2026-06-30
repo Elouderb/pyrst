@@ -1,0 +1,37 @@
+# Generics: a generic function with a `Callable[[T], T]` / `Callable[[T, T], T]`
+# PARAMETER monomorphizes the type variable at the CALL SITE — the lambda/function
+# argument is coerced into a CONCRETE `Rc<dyn Fn(..) -> ..>` slot (the inferred T
+# substituted into the closure param types and the cast), so the SAME generic
+# function is reused at several concrete types via Rust monomorphization.
+#
+# `apply_twice[T](f: Callable[[T], T], x: T)` — one type var in/out:
+#   apply_twice(n -> n+1, 5)      -> f(f(5)) = 7    (T=int)
+#   apply_twice(s -> s+"!", "hi") -> f(f("hi")) = "hi!!"  (T=str — SAME fn)
+# `reduce2[T](f: Callable[[T, T], T], a: T, b: T)` — two args, same type var:
+#   reduce2(x,y -> x+y, 3, 4)     -> 7      (T=int)
+#   reduce2(x,y -> x*y, 5, 6)     -> 30     (T=int)
+#   reduce2(x,y -> x, "a", "b")   -> "a"    (T=str — value args drive the binding,
+#                                            not the lambda's body type)
+# A NAMED-function argument also coerces into the Callable slot:
+#   apply_twice(inc, 10)          -> inc(inc(10)) = 12
+
+
+def inc(n: int) -> int:
+    return n + 1
+
+
+def apply_twice[T](f: Callable[[T], T], x: T) -> T:
+    return f(f(x))
+
+
+def reduce2[T](f: Callable[[T, T], T], a: T, b: T) -> T:
+    return f(a, b)
+
+
+def main() -> None:
+    print(apply_twice(lambda n: n + 1, 5))        # 7
+    print(apply_twice(lambda s: s + "!", "hi"))   # hi!!
+    print(apply_twice(inc, 10))                   # 12
+    print(reduce2(lambda x, y: x + y, 3, 4))      # 7
+    print(reduce2(lambda x, y: x * y, 5, 6))      # 30
+    print(reduce2(lambda x, y: x, "a", "b"))      # a

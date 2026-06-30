@@ -131,11 +131,22 @@ pub struct Codegen<'a> {
     /// generic class's impl block (saved/restored around it), so non-generic
     /// classes and free functions are byte-for-byte unchanged.
     current_class_type_params: Vec<String>,
+    /// Generics: the type parameters in scope for the FREE FUNCTION (or method)
+    /// whose body is CURRENTLY being emitted — `["T"]` inside `apply_twice[T]`,
+    /// `["A", "B"]` inside `swap[A, B]`. A local annotation in the body (`acc: T`)
+    /// must lower with these names in scope so `T` becomes `Ty::TypeVar("T")`
+    /// (matching the param/return lowering and the call-result oracle), NOT a
+    /// `Ty::Class("T")`. Without this, the reassignment `acc = f(...)` sees a type
+    /// CHANGE (`Class("T")` vs the call result `TypeVar("T")`) and wrongly emits a
+    /// shadowing `let` instead of a mutation — silently breaking a running fold.
+    /// Saved/restored around each `emit_func` body (so a nested def / sibling fn
+    /// never inherits it); EMPTY for non-generic functions.
+    current_fn_type_params: Vec<String>,
 }
 
 impl<'a> Codegen<'a> {
     pub fn new(ctx: &'a TyCtx) -> Self {
-        Self { ctx, out: String::new(), indent: 0, locals: HashMap::new(), declared: Default::default(), current_class: None, current_ret_ty: Ty::Unit, dead_funcs: Default::default(), mut_self: HashMap::new(), by_ref_locals: Default::default(), poly_map: HashMap::new(), concrete_struct_params: Default::default(), const_names: Default::default(), const_strs: Default::default(), in_generator: false, try_return_escape: false, try_loopctl_escape: false, current_class_type_params: Vec::new() }
+        Self { ctx, out: String::new(), indent: 0, locals: HashMap::new(), declared: Default::default(), current_class: None, current_ret_ty: Ty::Unit, dead_funcs: Default::default(), mut_self: HashMap::new(), by_ref_locals: Default::default(), poly_map: HashMap::new(), concrete_struct_params: Default::default(), const_names: Default::default(), const_strs: Default::default(), in_generator: false, try_return_escape: false, try_loopctl_escape: false, current_class_type_params: Vec::new(), current_fn_type_params: Vec::new() }
     }
 
     pub fn with_dead_funcs(mut self, dead: std::collections::HashSet<String>) -> Self {
@@ -501,6 +512,22 @@ impl<'a> Codegen<'a> {
             Ty::List(e) | Ty::Set(e) | Ty::Option(e) => self.ty_has_func(e),
             Ty::Dict(k, v) => self.ty_has_func(k) || self.ty_has_func(v),
             Ty::Tuple(ts) => ts.iter().any(|t| self.ty_has_func(t)),
+            _ => false,
+        }
+    }
+
+    /// Whether `ty` mentions any `Ty::TypeVar` (a generic-call param-type slot
+    /// that needs monomorphization before emission). A cheap guard so the
+    /// call-site substitution only runs for an actually-generic callee.
+    fn ty_mentions_typevar(ty: &Ty) -> bool {
+        match ty {
+            Ty::TypeVar(_) => true,
+            Ty::List(e) | Ty::Set(e) | Ty::Option(e) => Self::ty_mentions_typevar(e),
+            Ty::Dict(k, v) => Self::ty_mentions_typevar(k) || Self::ty_mentions_typevar(v),
+            Ty::Tuple(ts) => ts.iter().any(Self::ty_mentions_typevar),
+            Ty::Func(args, ret) => {
+                args.iter().any(Self::ty_mentions_typevar) || Self::ty_mentions_typevar(ret)
+            }
             _ => false,
         }
     }
@@ -1608,6 +1635,12 @@ impl<'a> Codegen<'a> {
                 }
             }
         }
+        // Make the in-scope type vars visible to the BODY-emission paths
+        // (`prescan_types`, the annotated-assign declaration) so a local `acc: T`
+        // lowers to `Ty::TypeVar("T")` — matching the param/return lowering and
+        // the call-result oracle. Saved/restored so a nested/sibling fn never
+        // inherits this set.
+        let saved_fn_type_params = std::mem::replace(&mut self.current_fn_type_params, scope.clone());
 
         let mut sig = format!("fn {}{}(", name, generics);
         let mut first = true;
@@ -1815,6 +1848,7 @@ impl<'a> Codegen<'a> {
         self.in_generator = saved_in_generator;
         self.try_return_escape = saved_try_return_escape;
         self.try_loopctl_escape = saved_try_loopctl_escape;
+        self.current_fn_type_params = saved_fn_type_params;
         Ok(())
     }
 
@@ -2969,7 +3003,11 @@ impl<'a> Codegen<'a> {
         for s in stmts {
             match s {
                 Stmt::Assign { target, ty: Some(te), span, .. } => {
-                    if let Ok(t) = Ty::from_type_expr(te, *span) {
+                    // Scope with the enclosing generic function's type vars so a
+                    // local `acc: T` is `TypeVar("T")` (not `Class("T")`) — matching
+                    // the call-result oracle, so a later `acc = f(...)` mutates
+                    // rather than shadows.
+                    if let Ok(t) = Ty::from_type_expr_scoped(te, *span, &self.current_fn_type_params) {
                         self.locals.insert(target.clone(), t);
                     }
                 }
@@ -3258,7 +3296,11 @@ impl<'a> Codegen<'a> {
                     self.declared.insert(target.clone());
                     match ty {
                         Some(t) => {
-                            let ty_obj = Ty::from_type_expr(t, *span)?;
+                            // Scope with the enclosing generic function's type vars
+                            // so a `acc: T` declaration is `TypeVar("T")` and a later
+                            // `acc = f(...)` mutates (not shadows) — see the
+                            // `current_fn_type_params` field doc.
+                            let ty_obj = Ty::from_type_expr_scoped(t, *span, &self.current_fn_type_params)?;
                             // (EPIC-5 C2-2b-i) `a: Animal = Account(...)` — a raw
                             // struct into a polymorphic-base `Animal__` slot is
                             // WRAPPED in the right variant (replaces the C1 gate).
@@ -4220,13 +4262,50 @@ impl<'a> Codegen<'a> {
                 // bare value, `None` for the None literal, pass-through for an
                 // already-Optional value) — the same coercion as assignment and
                 // return. Methods / unknown callees keep the bare emission.
-                let param_tys: Vec<Ty> = if let Expr::Ident(n, _) = callee.as_ref() {
+                let mut param_tys: Vec<Ty> = if let Expr::Ident(n, _) = callee.as_ref() {
                     self.ctx.funcs.get(n.as_str())
                         .map(|sig| sig.params.iter().map(|(_, t)| t.clone()).collect())
                         .unwrap_or_default()
                 } else {
                     Vec::new()
                 };
+                // Generics: monomorphize the param-type slots for a GENERIC callee.
+                // A `Callable[[T], T]` param emits its `Rc<dyn Fn(T) -> T>` cast and
+                // (for a lambda arg) its closure param types from the slot type; if
+                // that slot still names the type variable `T`, the cast leaks an
+                // unbound `T` into the caller and rustc rejects it (E0425). So infer
+                // the call's `{T -> concrete}` substitution from the ARGUMENT types
+                // and apply it to every param-type slot, turning `Rc<dyn Fn(T)->T>`
+                // into `Rc<dyn Fn(i64)->i64>`. Value params (`x: T`) are inferred by
+                // Rust directly, but substituting them too is harmless. Non-generic
+                // callees are unaffected (`generic_call_param_subst` returns None).
+                if let Expr::Ident(n, _) = callee.as_ref() {
+                    if param_tys.iter().any(|t| Self::ty_mentions_typevar(t)) {
+                        // Build the binding-source arg types. A LAMBDA argument is
+                        // NOT an authoritative binding source: its parameter types
+                        // are unknown, so its inferred body type is unreliable
+                        // (`lambda x, y: x + y` defaults to int even when the call's
+                        // T is str). It is CHECKED against the expected slot, not the
+                        // other way round — so infer it as `Unknown` (non-binding)
+                        // and let the concrete value arguments (`a, b: T`) drive the
+                        // substitution. A named-function arg keeps its real
+                        // `Ty::Func` type (a reliable binding source).
+                        let arg_tys: Vec<Ty> = args.iter()
+                            .map(|a| if matches!(a, Expr::Lambda { .. }) {
+                                Ty::Unknown
+                            } else {
+                                self.type_of_expr(a)
+                            })
+                            .collect();
+                        if let Some(subst) =
+                            crate::typeck::generic_call_param_subst(n.as_str(), &arg_tys, self.ctx)
+                        {
+                            for pt in param_tys.iter_mut() {
+                                *pt = crate::typeck::apply_typevar_subst(pt, &subst);
+                            }
+                        }
+                    }
+                }
                 // (EPIC-4 V2-c) Per-arg by-reference (`Mut[T]`) flags for this
                 // free-function callee. Parallel to `args` (free functions have no
                 // `self`, so `param_by_ref[i]` lines up with `args[i]` directly).

@@ -13,7 +13,8 @@
 #
 # Public API:
 #   - `accumulate(xs, f)`        — running fold: result[i] = f(result[i-1], xs[i]),
-#                                  result[0] = xs[0]. (int-specialised, see note.)
+#                                  result[0] = xs[0]. Generic over the element
+#                                  type `T` (the fold `f` is `Callable[[T,T],T]`).
 #   - `chain(a, b)`              — `a` followed by `b` (binary concatenation).
 #   - `repeat(x, n)`             — a list of `n` copies of `x`.
 #   - `combinations(xs, r)`      — all r-length subsequences, in lexicographic
@@ -24,13 +25,12 @@
 #                                  `(x, y)` pairs (`a` is the outer loop).
 #
 # Implementation / language-fit notes:
-#   - `accumulate` is INT-SPECIALISED (`list[int]`, `Callable[[int,int],int]`),
-#     NOT generic. pyrst's codegen does not yet monomorphise a type parameter
-#     inside a generic function's `Callable[[T, …], …]` parameter — a generic
-#     `accumulate[T]` taking a `Callable[[T,T],T]` emits a closure cast that
-#     still mentions the unresolved `T`, which fails to compile. The non-generic
-#     int form below compiles and covers the common running-sum/running-max use.
-#     A generic form arrives when the generic-callable monomorphisation lands.
+#   - `accumulate[T]` is GENERIC over the element type. The codegen now
+#     monomorphises a type parameter inside a generic function's
+#     `Callable[[T, …], …]` parameter: at a call site the inferred concrete `T`
+#     is substituted into the closure cast (`Rc<dyn Fn(i64,i64)->i64>`), so the
+#     fold callable is well-typed. The element-type binding comes from the
+#     concrete `xs` argument (`list[T]`), not the lambda body.
 #   - `product[A, B]` uses TWO type parameters so the two inputs may differ in
 #     element type (e.g. `product(["a","b"], [1,2])`), matching CPython where the
 #     factors are independent. (A single-`T` form would force both lists to the
@@ -44,11 +44,11 @@
 #     `zip_longest`, and an n-ary `product` (variadics / *args needed).
 
 
-def accumulate(xs: list[int], f: Callable[[int, int], int]) -> list[int]:
-    result: list[int] = []
+def accumulate[T](xs: list[T], f: Callable[[T, T], T]) -> list[T]:
+    result: list[T] = []
     if len(xs) == 0:
         return result
-    acc: int = xs[0]
+    acc: T = xs[0]
     result.append(acc)
     i: int = 1
     while i < len(xs):

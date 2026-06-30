@@ -2331,6 +2331,46 @@ fn infer_generic_call_result(
     Ok(Some(res.ret))
 }
 
+/// CODEGEN: the type-argument substitution `{T -> concrete}` inferred for a
+/// generic function call to `name` from its actual argument types `arg_tys`.
+/// Returns `None` when `name` is not a generic function. Used by codegen at the
+/// call site to SUBSTITUTE the callee's declared param types before emitting an
+/// argument into a typed slot — most importantly a `Callable[[T], T]` param,
+/// whose `Rc<dyn Fn(T) -> T>` cast and lambda parameter types must be the
+/// MONOMORPHIZED concrete types (`Rc<dyn Fn(i64) -> i64>`, `move |n: i64|`), not
+/// the unsubstituted `T` (which would leak into the caller and fail rustc
+/// E0425). Value params (`x: T`) need no such substitution — Rust infers their
+/// monomorphization directly from the concrete argument — but substituting them
+/// too is harmless and keeps the slot types uniform.
+///
+/// Pure: a conflicting/uninferable binding (already rejected by the checking
+/// path) just yields a partial map; codegen never errors on it.
+pub fn generic_call_param_subst(
+    name: &str,
+    arg_tys: &[Ty],
+    ctx: &TyCtx,
+) -> Option<HashMap<String, Ty>> {
+    let type_params = match ctx.generic_funcs.get(name) {
+        Some(tps) if !tps.is_empty() => tps,
+        _ => return None,
+    };
+    let sig = ctx.funcs.get(name)?;
+    let mut subst: HashMap<String, Ty> = HashMap::new();
+    for ((_, decl), actual) in sig.params.iter().zip(arg_tys.iter()) {
+        // Ignore a conflict here — the checking path already rejected it; we
+        // only need a best-effort map to monomorphize the emitted slots.
+        let _ = unify_typevar(decl, actual, type_params, &mut subst);
+    }
+    Some(subst)
+}
+
+/// CODEGEN: apply a type-argument substitution to a declared type, exposing the
+/// internal `substitute_typevars` so codegen can monomorphize a generic call's
+/// param-type slots. (Thin `pub` wrapper — same semantics.)
+pub fn apply_typevar_subst(ty: &Ty, subst: &HashMap<String, Ty>) -> Ty {
+    substitute_typevars(ty, subst)
+}
+
 /// PURE codegen-oracle result type for a (possibly generic) call to `name` whose
 /// signature is `sig` and whose argument types are `arg_tys`. Mirrors the
 /// CHECKING path's substitution but never errors: on a non-generic callee, or a

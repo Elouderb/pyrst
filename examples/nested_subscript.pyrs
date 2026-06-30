@@ -1,0 +1,42 @@
+# Golden: indexing a list/string by an index expression that is ITSELF a
+# subscript. Regression cover for the nested-subscript codegen miscompile where
+# `xs[idx[0]]` passed `pyrst check` but failed `pyrst build` ("expected
+# expression, found `as`") because the inner subscript lowered to a block and
+# `{ block } as usize` does not parse. The index is now bound once (`__i_idx`)
+# in the value path and parenthesized in the place path.
+
+def main() -> None:
+    xs: list[int] = [10, 20, 30]
+    idx: list[int] = [2, 0]
+
+    # list indexed by a list-subscript value
+    print(xs[idx[0]])        # 30
+
+    # string indexed by a list-subscript value
+    s: str = "hello"
+    sidx: list[int] = [1]
+    print(s[sidx[0]])        # e
+
+    # deeper nesting: big[ys[idx[0]]]  (idx[0]=2 -> ys[2]=3 -> big[3]=400)
+    ys: list[int] = [0, 1, 3]
+    big: list[int] = [100, 200, 300, 400]
+    print(big[ys[idx[0]]])   # 400
+
+    # string indexed by a doubly-nested list subscript: s[xs2[idx2[0]]]
+    word: str = "world"
+    xs2: list[int] = [4, 0]
+    idx2: list[int] = [1]
+    print(word[xs2[idx2[0]]])  # w
+
+    # negative index reached through a list subscript
+    neg: list[int] = [-1]
+    print(xs[neg[0]])        # 30
+
+    # index-ASSIGN with a list-subscript index, then read it back
+    xs[idx[0]] = 99
+    print(xs[idx[0]])        # 99
+
+    # a dict indexed by a list value (dict base, list-subscript key)
+    m: dict[int, str] = {30: "thirty"}
+    keys: list[int] = [30]
+    print(m[keys[0]])        # thirty

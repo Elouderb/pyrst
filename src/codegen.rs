@@ -2809,8 +2809,13 @@ impl<'a> Codegen<'a> {
                     let k = self.emit_expr(idx)?;
                     Ok(format!("(*{}.get_mut(&{}).expect(\"key not found\"))", base, k))
                 } else {
+                    // Parenthesize the index before `as usize`: a nested list
+                    // subscript lowers `idx` to a *block* expression, and bare
+                    // `base[{ block } as usize]` is a Rust parse error ("expected
+                    // expression, found `as`"). The parens make it `base[(block)
+                    // as usize]`, valid for block / call / arith / ident alike.
                     let i = self.emit_expr(idx)?;
-                    Ok(format!("{}[{} as usize]", base, i))
+                    Ok(format!("{}[({}) as usize]", base, i))
                 }
             }
             // Any other base (a parenthesized/computed expr) — fall back to the
@@ -3715,8 +3720,11 @@ impl<'a> Codegen<'a> {
                     let k = self.emit_consuming(idx)?;
                     self.line(&format!("{}.insert({}, {});", place, k, v));
                 } else {
+                    // Parenthesize the index before `as usize` (see emit_place):
+                    // a nested list-subscript index lowers to a block, and bare
+                    // `place[{ block } as usize] = v` fails to parse.
                     let i = self.emit_expr(idx)?;
-                    self.line(&format!("{}[{} as usize] = {};", place, i, v));
+                    self.line(&format!("{}[({}) as usize] = {};", place, i, v));
                 }
             }
             Stmt::Match { subject, arms, .. } => {
@@ -5941,18 +5949,32 @@ impl<'a> Codegen<'a> {
                         // String indexing with negative index support.
                         // Explicit bounds check emits "IndexError\0..." so the
                         // try/except dispatcher can catch it as IndexError.
+                        //
+                        // The index expression is bound ONCE to `__i_idx: i64`
+                        // before use. This is required for correctness when the
+                        // index is itself a *block* expression (e.g. a nested list
+                        // subscript `s[xs[i]]`, which lowers to `{ ... }`): inlining
+                        // the raw block at each `{} < 0` / `+ {}` / `{} as usize`
+                        // site produces unparenthesized `{ block } as usize`, which
+                        // is a Rust parse error ("expected expression, found `as`").
+                        // Binding also evaluates a side-effecting index (e.g. a call
+                        // `s[f()]`) exactly once instead of three times.
                         format!(
-                            "{{ let __chars: Vec<char> = {}.chars().collect(); let __idx = if {} < 0 {{ ((__chars.len() as i64) + {}) as usize }} else {{ {} as usize }}; if __idx >= __chars.len() {{ panic!(\"IndexError\\0string index out of range\") }}; __chars[__idx].to_string() }}",
-                            o, i, i, i
+                            "{{ let __chars: Vec<char> = {}.chars().collect(); let __i_idx: i64 = {}; let __idx = if __i_idx < 0 {{ ((__chars.len() as i64) + __i_idx) as usize }} else {{ __i_idx as usize }}; if __idx >= __chars.len() {{ panic!(\"IndexError\\0string index out of range\") }}; __chars[__idx].to_string() }}",
+                            o, i
                         )
                     }
                     _ => {
                         // List indexing with negative index support.
                         // Explicit bounds check emits "IndexError\0..." so the
                         // try/except dispatcher can catch it as IndexError.
+                        //
+                        // The index is bound ONCE to `__i_idx: i64` first — see the
+                        // Str arm above for why (nested-subscript parse error +
+                        // single-evaluation of side-effecting indices).
                         format!(
-                            "{{ let __list = {}.clone(); let __idx = if {} < 0 {{ ((__list.len() as i64) + {}) as usize }} else {{ {} as usize }}; if __idx >= __list.len() {{ panic!(\"IndexError\\0list index out of range\") }}; __list[__idx].clone() }}",
-                            o, i, i, i
+                            "{{ let __list = {}.clone(); let __i_idx: i64 = {}; let __idx = if __i_idx < 0 {{ ((__list.len() as i64) + __i_idx) as usize }} else {{ __i_idx as usize }}; if __idx >= __list.len() {{ panic!(\"IndexError\\0list index out of range\") }}; __list[__idx].clone() }}",
+                            o, i
                         )
                     }
                 }

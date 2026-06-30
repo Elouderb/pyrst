@@ -133,13 +133,15 @@ impl Resolver {
                 // resolution path. `re` (Rust interop Phase 2) is backed by the
                 // external `regex` crate. `collections` is an embedded module
                 // for `Counter`/`most_common`; its generic-class members
-                // (`deque`/`defaultdict`/…) are a later batch. `json` stays
-                // skipped: its `JsonValue` type design is a separate, deferred
-                // card. `itertools` is NO LONGER skipped: it is now a real
-                // embedded module (`lib/itertools.pyrs`, an eager subset), so it
-                // must reach the resolution path. (`textwrap`/`random` were never
-                // skipped and resolve as embedded modules too.)
-                if matches!(mod_name.as_str(), "dataclasses" | "sys" | "json") {
+                // (`deque`/`defaultdict`/…) are a later batch. `json` is NO
+                // LONGER skipped: it is now a real PURE-PYRST embedded module
+                // (`lib/json.pyrs` — a recursive-descent `loads`/`dumps` over a
+                // recursive tagged `JsonValue` class), so it must reach the
+                // resolution path. `itertools` is NO LONGER skipped: it is now a
+                // real embedded module (`lib/itertools.pyrs`, an eager subset), so
+                // it must reach the resolution path. (`textwrap`/`random` were
+                // never skipped and resolve as embedded modules too.)
+                if matches!(mod_name.as_str(), "dataclasses" | "sys") {
                     continue;
                 }
 

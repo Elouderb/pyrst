@@ -1,0 +1,547 @@
+# pyrst standard library — json
+#
+# A PURE-PYRST JSON implementation: a recursive-descent parser (`loads`) and a
+# recursive serializer (`dumps`) over a dynamic, tagged `JsonValue`. No external
+# crate — the whole module is pyrst source, embedded via `include_str!` (see
+# `src/stdlib.rs`). Usable as either `from json import loads, dumps` or
+# `import json; json.loads(text)` (json's functions are non-generic, so the
+# qualified-call path works).
+#
+# WHY A TAGGED CLASS (not a sum type): pyrst has no first-class union/`Any`, so a
+# heterogeneous JSON document is modelled as ONE class, `JsonValue`, carrying a
+# `kind: int` discriminant plus a payload field per shape. Each instance uses its
+# `kind` tag and exactly ONE payload field; the others hold harmless defaults.
+# `JsonValue` is RECURSIVE: `arr: list[JsonValue]` and `obj: dict[str, JsonValue]`
+# hold nested documents (verified: pyrst builds+runs a class with `list[Self]`
+# and `dict[str, Self]` fields).
+#
+#   kind  meaning  payload field
+#   ----  -------  -------------
+#    0    null     (none)
+#    1    bool     b: bool
+#    2    int      i: int
+#    3    float    fl: float
+#    4    str      s: str
+#    5    array    arr: list[JsonValue]
+#    6    object   obj: dict[str, JsonValue]
+#
+# ACCESS API — get/at METHODS, not v["k"]/v[i] index syntax. pyrst's
+# `__getitem__` cannot overload BOTH a `str` key (object member) AND an `int`
+# index (array element) on one type, so navigation is exposed as methods:
+#   v.get("k")  — object member (raises if absent / not an object)
+#   v.at(i)     — array element (raises if out of range / not an array)
+# This is the one deliberate divergence from Python's `v["k"]` / `v[i]` feel.
+#
+# PARSER — a `_Parser` STATE CLASS (text + pos). pyrst has no mutable globals, so
+# the parse position is threaded as a mutable `pos: int` field on a small parser
+# object whose methods advance `self.pos` (self-mutation works). This reads more
+# cleanly than returning `(value, new_pos)` tuples through every level of the
+# recursive descent.
+#
+# WHAT THE PARSER HANDLES:
+#   - objects `{...}`, arrays `[...]` (recursive, arbitrary nesting)
+#   - strings with escapes  \"  \\  \/  \n  \t  \r  \b  \f  and  \uXXXX (BMP)
+#   - numbers: a leading `-`, an integer part, an optional `.frac` and optional
+#     `e`/`E` exponent. A `.` OR an exponent makes it a float (kind 3); otherwise
+#     it is an int (kind 2).
+#   - literals  true / false / null
+#   - leading/trailing/inter-token whitespace (space, tab, newline, CR)
+#
+# ERRORS — every malformed input RAISES a clear `ValueError` (unexpected char,
+# unterminated string, bad escape, bad number, trailing garbage). It NEVER panics
+# the program: in particular a `\uXXXX` escape in the surrogate range
+# (0xD800–0xDFFF) RAISES rather than calling `chr` (which would panic on a lone
+# surrogate). A pyrst exception is the honest failure mode here.
+#
+# DEFERRED: surrogate-PAIR decoding (`😀` → one astral codepoint) — a
+# lone or paired surrogate raises a clear error instead. JSON literal `inf`/`nan`
+# are not part of the spec and are not produced; serializing a non-finite float
+# is out of scope (matches CPython, which raises).
+
+
+# ── builders (public) ────────────────────────────────────────────────────────
+
+
+def json_null() -> JsonValue:
+    return JsonValue(0)
+
+
+def json_bool(x: bool) -> JsonValue:
+    v: JsonValue = JsonValue(1)
+    v.b = x
+    return v
+
+
+def json_int(n: int) -> JsonValue:
+    v: JsonValue = JsonValue(2)
+    v.i = n
+    return v
+
+
+def json_float(x: float) -> JsonValue:
+    v: JsonValue = JsonValue(3)
+    v.fl = x
+    return v
+
+
+def json_str(x: str) -> JsonValue:
+    v: JsonValue = JsonValue(4)
+    v.s = x
+    return v
+
+
+def json_array(items: list[JsonValue]) -> JsonValue:
+    v: JsonValue = JsonValue(5)
+    v.arr = items
+    return v
+
+
+def json_object(d: dict[str, JsonValue]) -> JsonValue:
+    v: JsonValue = JsonValue(6)
+    v.obj = d
+    return v
+
+
+class JsonValue:
+    # A dynamic, tagged JSON value. `kind` selects the active payload; the unused
+    # payload fields hold defaults. Build via the `json_*` functions above (or the
+    # parser); inspect via the predicates / accessors / navigation below.
+    kind: int
+    b: bool
+    i: int
+    fl: float
+    s: str
+    arr: list[JsonValue]
+    obj: dict[str, JsonValue]
+
+    def __init__(self, kind: int) -> None:
+        self.kind = kind
+        self.b = False
+        self.i = 0
+        self.fl = 0.0
+        self.s = ""
+        self.arr = []
+        self.obj = {}
+
+    # ── type predicates ──────────────────────────────────────────────────────
+
+    def is_null(self) -> bool:
+        return self.kind == 0
+
+    def is_bool(self) -> bool:
+        return self.kind == 1
+
+    def is_int(self) -> bool:
+        return self.kind == 2
+
+    def is_float(self) -> bool:
+        return self.kind == 3
+
+    def is_str(self) -> bool:
+        return self.kind == 4
+
+    def is_array(self) -> bool:
+        return self.kind == 5
+
+    def is_object(self) -> bool:
+        return self.kind == 6
+
+    # ── typed accessors (raise on a kind mismatch) ───────────────────────────
+
+    def as_bool(self) -> bool:
+        if self.kind != 1:
+            raise ValueError("JsonValue.as_bool: not a bool (kind " + str(self.kind) + ")")
+        return self.b
+
+    def as_int(self) -> int:
+        if self.kind != 2:
+            raise ValueError("JsonValue.as_int: not an int (kind " + str(self.kind) + ")")
+        return self.i
+
+    def as_float(self) -> float:
+        if self.kind != 3:
+            raise ValueError("JsonValue.as_float: not a float (kind " + str(self.kind) + ")")
+        return self.fl
+
+    def as_str(self) -> str:
+        if self.kind != 4:
+            raise ValueError("JsonValue.as_str: not a str (kind " + str(self.kind) + ")")
+        return self.s
+
+    def as_list(self) -> list[JsonValue]:
+        if self.kind != 5:
+            raise ValueError("JsonValue.as_list: not an array (kind " + str(self.kind) + ")")
+        return self.arr
+
+    def as_dict(self) -> dict[str, JsonValue]:
+        if self.kind != 6:
+            raise ValueError("JsonValue.as_dict: not an object (kind " + str(self.kind) + ")")
+        return self.obj
+
+    # ── navigation ───────────────────────────────────────────────────────────
+
+    def has(self, key: str) -> bool:
+        # Object membership. Raises if the value is not an object.
+        if self.kind != 6:
+            raise ValueError("JsonValue.has: not an object (kind " + str(self.kind) + ")")
+        return key in self.obj
+
+    def get(self, key: str) -> JsonValue:
+        # An object member. Raises if not an object or the key is absent.
+        if self.kind != 6:
+            raise ValueError("JsonValue.get: not an object (kind " + str(self.kind) + ")")
+        if key not in self.obj:
+            raise ValueError("JsonValue.get: no such key '" + key + "'")
+        return self.obj[key]
+
+    def at(self, idx: int) -> JsonValue:
+        # An array element. Raises if not an array or the index is out of range.
+        if self.kind != 5:
+            raise ValueError("JsonValue.at: not an array (kind " + str(self.kind) + ")")
+        if idx < 0 or idx >= len(self.arr):
+            raise ValueError("JsonValue.at: index " + str(idx) + " out of range")
+        return self.arr[idx]
+
+    def length(self) -> int:
+        # The element count of an array or the member count of an object. Raises
+        # for any scalar kind.
+        if self.kind == 5:
+            return len(self.arr)
+        if self.kind == 6:
+            return len(self.obj)
+        raise ValueError("JsonValue.length: not an array or object (kind " + str(self.kind) + ")")
+
+
+# ── character-class helpers ──────────────────────────────────────────────────
+
+
+def _is_digit(c: str) -> bool:
+    code: int = ord(c)
+    return code >= 48 and code <= 57
+
+
+def _is_ws(c: str) -> bool:
+    # JSON insignificant whitespace: space, tab, newline, carriage return.
+    return c == " " or c == "\t" or c == "\n" or c == "\r"
+
+
+def _hex_digit(c: str) -> int:
+    # A single hex digit's value, or raise. Used by the `\uXXXX` escape.
+    code: int = ord(c)
+    if code >= 48 and code <= 57:
+        return code - 48
+    if code >= 97 and code <= 102:
+        return code - 97 + 10
+    if code >= 65 and code <= 70:
+        return code - 65 + 10
+    raise ValueError("invalid \\u hex digit '" + c + "'")
+
+
+# ── parser state ─────────────────────────────────────────────────────────────
+
+
+class _Parser:
+    # The recursive-descent parser state: the source text plus a cursor `pos`
+    # advanced in place by the methods. Index threading lives here, not in
+    # return tuples, so the descent functions read top-down.
+    text: str
+    pos: int
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+        self.pos = 0
+
+    def at_end(self) -> bool:
+        return self.pos >= len(self.text)
+
+    def peek(self) -> str:
+        # The current char. Caller must have checked `not at_end()`; a bare guard
+        # is here so an internal slip raises rather than indexing out of range.
+        if self.pos >= len(self.text):
+            raise ValueError("unexpected end of JSON input")
+        return self.text[self.pos]
+
+    def advance(self) -> str:
+        c: str = self.peek()
+        self.pos = self.pos + 1
+        return c
+
+    def skip_ws(self) -> None:
+        while not self.at_end() and _is_ws(self.text[self.pos]):
+            self.pos = self.pos + 1
+
+    def expect(self, c: str) -> None:
+        # Consume `c` or raise. Used for the structural `:` , `]` `}` etc.
+        if self.at_end():
+            raise ValueError("expected '" + c + "' but reached end of input")
+        got: str = self.text[self.pos]
+        if got != c:
+            raise ValueError("expected '" + c + "' but found '" + got + "'")
+        self.pos = self.pos + 1
+
+    # ── value dispatch ────────────────────────────────────────────────────────
+
+    def parse_value(self) -> JsonValue:
+        self.skip_ws()
+        if self.at_end():
+            raise ValueError("unexpected end of JSON input")
+        c: str = self.text[self.pos]
+        if c == "{":
+            return self.parse_object()
+        if c == "[":
+            return self.parse_array()
+        if c == "\"":
+            return json_str(self.parse_string())
+        if c == "t" or c == "f":
+            return self.parse_bool()
+        if c == "n":
+            return self.parse_null()
+        if c == "-" or _is_digit(c):
+            return self.parse_number()
+        raise ValueError("unexpected character '" + c + "' at position " + str(self.pos))
+
+    def parse_keyword(self, word: str) -> None:
+        # Match the exact literal `word` (true / false / null) at the cursor.
+        wi: int = 0
+        while wi < len(word):
+            if self.at_end() or self.text[self.pos] != word[wi]:
+                raise ValueError("invalid literal, expected '" + word + "'")
+            self.pos = self.pos + 1
+            wi = wi + 1
+
+    def parse_bool(self) -> JsonValue:
+        if self.text[self.pos] == "t":
+            self.parse_keyword("true")
+            return json_bool(True)
+        self.parse_keyword("false")
+        return json_bool(False)
+
+    def parse_null(self) -> JsonValue:
+        self.parse_keyword("null")
+        return json_null()
+
+    def parse_string(self) -> str:
+        # Consumes a quoted string (cursor must be on the opening `"`), returning
+        # the decoded contents. Handles the JSON escape set incl. `\uXXXX` (BMP).
+        self.expect("\"")
+        out: str = ""
+        while True:
+            if self.at_end():
+                raise ValueError("unterminated string")
+            c: str = self.advance()
+            if c == "\"":
+                return out
+            if c == "\\":
+                out = out + self.parse_escape()
+            else:
+                out = out + c
+
+    def parse_escape(self) -> str:
+        # The cursor is just past the backslash. Returns the unescaped char(s).
+        if self.at_end():
+            raise ValueError("unterminated escape in string")
+        e: str = self.advance()
+        if e == "\"":
+            return "\""
+        if e == "\\":
+            return "\\"
+        if e == "/":
+            return "/"
+        if e == "n":
+            return "\n"
+        if e == "t":
+            return "\t"
+        if e == "r":
+            return "\r"
+        if e == "b":
+            # backspace U+0008. pyrst string literals have no `\b` escape, so the
+            # control char is produced via chr().
+            return chr(8)
+        if e == "f":
+            # form feed U+000C — produced via chr() for the same reason.
+            return chr(12)
+        if e == "u":
+            return self.parse_unicode_escape()
+        raise ValueError("invalid escape '\\" + e + "'")
+
+    def parse_unicode_escape(self) -> str:
+        # Four hex digits → one BMP codepoint. Cursor is just past `\u`. A
+        # surrogate-range value (0xD800–0xDFFF) RAISES (decoding a surrogate would
+        # panic `chr`); surrogate-pair joining is deferred.
+        code: int = 0
+        n: int = 0
+        while n < 4:
+            if self.at_end():
+                raise ValueError("incomplete \\u escape")
+            code = code * 16 + _hex_digit(self.advance())
+            n = n + 1
+        if code >= 55296 and code <= 57343:
+            raise ValueError("surrogate \\u" + str(code) + " is not supported")
+        return chr(code)
+
+    def parse_number(self) -> JsonValue:
+        # Grammar (JSON): -? int frac? exp?  with int = 0 | [1-9][0-9]* . We scan
+        # the run of number chars, track whether a `.` or exponent appeared, then
+        # convert the slice with int()/float(). A `.`/`e`/`E` ⇒ float (kind 3),
+        # else int (kind 2).
+        start: int = self.pos
+        is_float: bool = False
+        if not self.at_end() and self.text[self.pos] == "-":
+            self.pos = self.pos + 1
+        # integer part — at least one digit required
+        if self.at_end() or not _is_digit(self.text[self.pos]):
+            raise ValueError("invalid number at position " + str(start))
+        while not self.at_end() and _is_digit(self.text[self.pos]):
+            self.pos = self.pos + 1
+        # fraction
+        if not self.at_end() and self.text[self.pos] == ".":
+            is_float = True
+            self.pos = self.pos + 1
+            if self.at_end() or not _is_digit(self.text[self.pos]):
+                raise ValueError("invalid number: digit expected after '.'")
+            while not self.at_end() and _is_digit(self.text[self.pos]):
+                self.pos = self.pos + 1
+        # exponent
+        if not self.at_end() and (self.text[self.pos] == "e" or self.text[self.pos] == "E"):
+            is_float = True
+            self.pos = self.pos + 1
+            if not self.at_end() and (self.text[self.pos] == "+" or self.text[self.pos] == "-"):
+                self.pos = self.pos + 1
+            if self.at_end() or not _is_digit(self.text[self.pos]):
+                raise ValueError("invalid number: digit expected in exponent")
+            while not self.at_end() and _is_digit(self.text[self.pos]):
+                self.pos = self.pos + 1
+        token: str = self.text[start:self.pos]
+        if is_float:
+            return json_float(float(token))
+        return json_int(int(token))
+
+    def parse_array(self) -> JsonValue:
+        self.expect("[")
+        items: list[JsonValue] = []
+        self.skip_ws()
+        if not self.at_end() and self.text[self.pos] == "]":
+            self.pos = self.pos + 1
+            return json_array(items)
+        while True:
+            items.append(self.parse_value())
+            self.skip_ws()
+            if self.at_end():
+                raise ValueError("unterminated array")
+            sep: str = self.text[self.pos]
+            if sep == "]":
+                self.pos = self.pos + 1
+                return json_array(items)
+            if sep != ",":
+                raise ValueError("expected ',' or ']' in array but found '" + sep + "'")
+            self.pos = self.pos + 1
+
+    def parse_object(self) -> JsonValue:
+        self.expect("{")
+        members: dict[str, JsonValue] = {}
+        self.skip_ws()
+        if not self.at_end() and self.text[self.pos] == "}":
+            self.pos = self.pos + 1
+            return json_object(members)
+        while True:
+            self.skip_ws()
+            if self.at_end() or self.text[self.pos] != "\"":
+                raise ValueError("expected string key in object")
+            key: str = self.parse_string()
+            self.skip_ws()
+            self.expect(":")
+            members[key] = self.parse_value()
+            self.skip_ws()
+            if self.at_end():
+                raise ValueError("unterminated object")
+            sep: str = self.text[self.pos]
+            if sep == "}":
+                self.pos = self.pos + 1
+                return json_object(members)
+            if sep != ",":
+                raise ValueError("expected ',' or '}' in object but found '" + sep + "'")
+            self.pos = self.pos + 1
+
+
+# ── public entry points ──────────────────────────────────────────────────────
+
+
+def loads(text: str) -> JsonValue:
+    # Parse one complete JSON document. Leading/trailing whitespace is allowed;
+    # any non-whitespace AFTER the document is trailing garbage and raises.
+    p: _Parser = _Parser(text)
+    value: JsonValue = p.parse_value()
+    p.skip_ws()
+    if not p.at_end():
+        raise ValueError("trailing garbage at position " + str(p.pos))
+    return value
+
+
+def _escape_string(s: str) -> str:
+    # Escape a Python/JSON string body (without the surrounding quotes). Mirrors
+    # the parser's escape set: control chars get their short escapes; `"` and `\`
+    # are backslash-escaped; everything else passes through verbatim.
+    out: str = "\""
+    i: int = 0
+    while i < len(s):
+        c: str = s[i]
+        code: int = ord(c)
+        if c == "\"":
+            out = out + "\\\""
+        elif c == "\\":
+            out = out + "\\\\"
+        elif c == "\n":
+            out = out + "\\n"
+        elif c == "\t":
+            out = out + "\\t"
+        elif c == "\r":
+            out = out + "\\r"
+        elif code == 8:
+            # backspace U+0008 (no `\b` pyrst literal to compare against).
+            out = out + "\\b"
+        elif code == 12:
+            # form feed U+000C.
+            out = out + "\\f"
+        else:
+            out = out + c
+        i = i + 1
+    return out + "\""
+
+
+def dumps(v: JsonValue) -> str:
+    # Serialize a JsonValue to a VALID, compact JSON string. Spacing: a single
+    # space after each `,` and after each object `:` (the form the golden pins).
+    # Object key order follows dict iteration and is therefore unspecified — the
+    # goldens dump arrays / single-key objects / read specific keys to stay
+    # deterministic.
+    if v.kind == 0:
+        return "null"
+    if v.kind == 1:
+        if v.b:
+            return "true"
+        return "false"
+    if v.kind == 2:
+        return str(v.i)
+    if v.kind == 3:
+        return str(v.fl)
+    if v.kind == 4:
+        return _escape_string(v.s)
+    if v.kind == 5:
+        out: str = "["
+        i: int = 0
+        while i < len(v.arr):
+            if i > 0:
+                out = out + ", "
+            out = out + dumps(v.arr[i])
+            i = i + 1
+        return out + "]"
+    if v.kind == 6:
+        parts: str = "{"
+        first: bool = True
+        for key, member in v.obj.items():
+            if not first:
+                parts = parts + ", "
+            parts = parts + _escape_string(key) + ": " + dumps(member)
+            first = False
+        return parts + "}"
+    raise ValueError("dumps: unknown JsonValue kind " + str(v.kind))

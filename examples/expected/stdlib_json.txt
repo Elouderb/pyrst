@@ -1,0 +1,29 @@
+Ann
+30
+a
+2
+True
+True
+["a", "b"]
+True
+True
+False
+True
+5
+True
+[1, 2, [3, 4], {"x": [true, false, null]}]
+True
+3.14
+1500.0
+-17
+-17
+a"b
+"a\"b"
+"tab\there"
+café
+42
+err: unterminated string
+err: trailing garbage at position 7
+err: expected string key in object
+err: invalid literal, expected 'null'
+done

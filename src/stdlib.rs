@@ -56,6 +56,13 @@ pub const EMBEDDED_STDLIB: &[(&str, &str)] = &[
     ("itertools", include_str!("../lib/itertools.pyrs")),
     ("textwrap", include_str!("../lib/textwrap.pyrs")),
     ("random", include_str!("../lib/random.pyrs")),
+    // Tier-4: `json` is a PURE-PYRST module (no crate) — a recursive-descent
+    // parser (`loads`) and serializer (`dumps`) over a recursive, tagged
+    // `JsonValue` class (`kind` discriminant + per-shape payload fields,
+    // `arr: list[JsonValue]` / `obj: dict[str, JsonValue]`). It was removed from
+    // the resolver skip-list so the import resolves; it needs only Rust std, so
+    // importing it stays on the single-file build path.
+    ("json", include_str!("../lib/json.pyrs")),
 ];
 
 /// Look up an embedded stdlib module's source by NAME (e.g. `"os"`).
@@ -119,5 +126,19 @@ mod tests {
         assert!(src.contains("def sqrt"), "math must define sqrt");
         assert!(src.contains("@extern"), "math function bindings must be @extern");
         assert!(src.contains("pi: float"), "math must define the pi constant");
+    }
+
+    /// `json` is a PURE-PYRST embedded module (`lib/json.pyrs`): its source is
+    /// baked in, defines the `loads`/`dumps` entry points and the recursive
+    /// `JsonValue` class, and — being pure pyrst — declares NO `@crate`
+    /// dependency (it stays on the single-file build path).
+    #[test]
+    fn json_module_is_embedded() {
+        let src = lookup("json").expect("`json` must be an embedded stdlib module");
+        assert!(!src.trim().is_empty(), "embedded json source must be non-empty");
+        assert!(src.contains("def loads"), "json must define loads");
+        assert!(src.contains("def dumps"), "json must define dumps");
+        assert!(src.contains("class JsonValue"), "json must define JsonValue");
+        assert!(!src.contains("@crate"), "json is pure pyrst and needs no crate");
     }
 }

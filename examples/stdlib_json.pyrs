@@ -1,0 +1,91 @@
+# examples/stdlib_json.pyrs — the `json` stdlib module end to end.
+#
+# Exercises the pure-pyrst JSON module: `loads`/`dumps` over the recursive,
+# tagged `JsonValue`. Covers the acceptance golden (object access via get/at,
+# predicates, dumps), a round-trip stability check on a nested document, a float,
+# a negative int, an escaped string, a deeply nested array, and the malformed
+# inputs that must RAISE (caught here so the program exits 0 with deterministic
+# stdout — proving an honest error, not a panic).
+#
+# Determinism note: object key order from `dumps` is unspecified, so this example
+# only DUMPS arrays / single-key objects and otherwise READS specific keys — the
+# stdout is stable regardless of dict iteration order.
+
+from json import loads, dumps
+
+
+def main() -> None:
+    # ── acceptance golden ──────────────────────────────────────────────────────
+    v: JsonValue = loads('{"name": "Ann", "age": 30, "tags": ["a", "b"], "active": true, "extra": null}')
+    print(v.get("name").as_str())          # Ann
+    print(str(v.get("age").as_int()))      # 30
+    print(v.get("tags").at(0).as_str())    # a
+    print(str(v.get("tags").length()))     # 2
+    print(str(v.get("active").as_bool()))  # True
+    print(str(v.get("extra").is_null()))   # True
+    print(dumps(v.get("tags")))            # ["a", "b"]
+
+    # ── predicates / has ───────────────────────────────────────────────────────
+    print(str(v.is_object()))              # True
+    print(str(v.has("name")))              # True
+    print(str(v.has("missing")))           # False
+    print(str(v.get("age").is_int()))      # True
+    print(str(v.length()))                 # 5  (object member count)
+
+    # ── round-trip stability on a nested document ──────────────────────────────
+    doc: str = '[1, 2, [3, 4], {"x": [true, false, null]}]'
+    first: JsonValue = loads(doc)
+    once: str = dumps(first)
+    twice: str = dumps(loads(once))
+    print(str(once == twice))              # True  (loads∘dumps∘loads stable)
+    print(once)                            # [1, 2, [3, 4], {"x": [true, false, null]}]
+
+    # ── float ──────────────────────────────────────────────────────────────────
+    f: JsonValue = loads("3.14")
+    print(str(f.is_float()))               # True
+    print(dumps(f))                        # 3.14
+    print(dumps(loads("1.5e3")))           # 1500.0  (exponent ⇒ float)
+
+    # ── negative int ────────────────────────────────────────────────────────────
+    print(str(loads("-17").as_int()))      # -17
+    print(dumps(loads("-17")))             # -17
+
+    # ── escaped string (round-trips through parse and serialize) ───────────────
+    es: JsonValue = loads('"a\\"b"')
+    print(es.as_str())                     # a"b
+    print(dumps(es))                       # "a\"b"
+    print(dumps(loads('"tab\\there"')))    # "tab\there"
+
+    # ── unicode escape (BMP) ────────────────────────────────────────────────────
+    print(loads('"caf\\u00e9"').as_str())  # café
+
+    # ── deeply nested array ────────────────────────────────────────────────────
+    deep: JsonValue = loads('[[[[[42]]]]]')
+    print(str(deep.at(0).at(0).at(0).at(0).at(0).as_int()))  # 42
+
+    # ── malformed inputs MUST raise (caught → honest error, not a panic) ───────
+    try:
+        oops1: JsonValue = loads('{"a": "unterminated}')
+        print("WRONG: accepted unterminated string")
+    except ValueError as e1:
+        print("err: " + e1)                # err: unterminated string
+
+    try:
+        oops2: JsonValue = loads('[1, 2] trailing')
+        print("WRONG: accepted trailing garbage")
+    except ValueError as e2:
+        print("err: " + e2)                # err: trailing garbage at position 7
+
+    try:
+        oops3: JsonValue = loads('{,}')
+        print("WRONG: accepted bad object")
+    except ValueError as e3:
+        print("err: " + e3)                # err: expected string key in object
+
+    try:
+        oops4: JsonValue = loads('nul')
+        print("WRONG: accepted bad literal")
+    except ValueError as e4:
+        print("err: " + e4)                # err: invalid literal, expected 'null'
+
+    print("done")

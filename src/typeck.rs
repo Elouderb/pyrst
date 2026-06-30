@@ -4338,13 +4338,33 @@ fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
                 reject_typevar_op(&subject_ty, "match on a literal pattern against", *span)?;
             }
             for arm in arms {
-                // Check guard if present
+                // A `case <name>:` (capture) pattern BINDS `<name>` to the subject's
+                // value for the duration of this arm — its GUARD and its body (so
+                // both `case y if y > 10:` and `return y + 1` type-check). Insert the
+                // binding BEFORE checking the guard, scope it to the arm, then restore
+                // the prior binding (or remove it) so the capture name never leaks to
+                // a sibling arm or past the match. `_` (Wildcard) and literal patterns
+                // introduce no binding.
+                let saved_capture = match &arm.pattern {
+                    MatchPattern::Capture(name) => {
+                        let prev = env.locals.get(name).cloned();
+                        env.locals.insert(name.clone(), subject_ty.clone());
+                        Some((name.clone(), prev))
+                    }
+                    _ => None,
+                };
+                // Check guard if present (may reference the capture binding).
                 if let Some(guard) = &arm.guard {
                     check_expr(guard, env)?;
                 }
-                // Check body (with capture bindings noted but not applied in our simple impl)
                 for s in &arm.body {
                     check_stmt(s, env)?;
+                }
+                if let Some((name, prev)) = saved_capture {
+                    match prev {
+                        Some(ty) => { env.locals.insert(name, ty); }
+                        None => { env.locals.remove(name.as_str()); }
+                    }
                 }
             }
             Ok(())

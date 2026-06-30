@@ -368,6 +368,56 @@ impl<'a> Codegen<'a> {
         crate::typeck::infer_expr_ty(e, &self.locals, self.ctx)
     }
 
+    /// Bind a comprehension's loop target(s) into `self.locals` with the iterable's
+    /// ELEMENT type, so a method call on the loop variable inside the comprehension
+    /// body (`[it.get() for it in items]`) resolves its receiver type to the
+    /// element class and dispatches to the CLASS method — not a same-named dict/list
+    /// builtin (which would mis-emit, or `panic!` for a no-arg `.get()`). Mirrors the
+    /// `Stmt::For` element-type derivation (and typeck's `bind_comp_targets`): a
+    /// list/set yields its element, a dict yields its KEY (Python iterates keys), a
+    /// str yields a 1-char str, and a tuple element distributes across multiple
+    /// targets. Returns the prior bindings so the caller can `restore_comp_targets`
+    /// after emitting the body — the loop variable must NOT leak past the
+    /// comprehension or shadow an outer local of the same name.
+    fn bind_comp_targets(
+        &mut self,
+        targets: &[String],
+        iter: &Expr,
+    ) -> Vec<(String, Option<Ty>)> {
+        let elem = match self.type_of_expr(iter) {
+            Ty::List(inner) | Ty::Set(inner) => *inner,
+            Ty::Dict(key, _) => *key,
+            Ty::Str => Ty::Str,
+            _ => Ty::Unknown,
+        };
+        let mut saved = Vec::with_capacity(targets.len());
+        if targets.len() == 1 {
+            saved.push((targets[0].clone(), self.locals.get(&targets[0]).cloned()));
+            self.locals.insert(targets[0].clone(), elem);
+        } else {
+            let elem_tys = match &elem {
+                Ty::Tuple(tys) if tys.len() == targets.len() => tys.clone(),
+                _ => vec![Ty::Unknown; targets.len()],
+            };
+            for (i, t) in targets.iter().enumerate() {
+                saved.push((t.clone(), self.locals.get(t).cloned()));
+                self.locals.insert(t.clone(), elem_tys.get(i).cloned().unwrap_or(Ty::Unknown));
+            }
+        }
+        saved
+    }
+
+    /// Undo `bind_comp_targets`: restore each loop-target name to its prior binding
+    /// (or remove it when it was unbound before the comprehension).
+    fn restore_comp_targets(&mut self, saved: Vec<(String, Option<Ty>)>) {
+        for (name, prev) in saved {
+            match prev {
+                Some(ty) => { self.locals.insert(name, ty); }
+                None => { self.locals.remove(name.as_str()); }
+            }
+        }
+    }
+
     /// (EPIC-6) Emit a user-defined method call `obj_s.method_name(args)` on a
     /// known class receiver `cls`, threading per-param by-reference (`Mut[T]`)
     /// arguments exactly like the long-standing "Regular method call" tail of
@@ -2812,6 +2862,25 @@ impl<'a> Codegen<'a> {
         }
     }
 
+    /// Emit a comprehension element/key/value expression, casting an integer-valued
+    /// power to `f64` when its INFERRED type is `Float` (D5: `**` always types as
+    /// Float, but `int ** int` still EMITS i64 via `__py_ipow`). Without this, a
+    /// `[x ** 2 for x in [1, 2, 3]]` assigned to `list[float]` emits a `Vec<i64>`
+    /// and mismatches `Vec<f64>` (E0308). Mirrors the `Stmt::Assign` float-coercion
+    /// rule (`matches!(ty, Float) && emits_int_pow(value)`). A genuine float element
+    /// passes through unchanged. This matters now that the comprehension loop
+    /// variable carries its element type (so `type_of_expr` is accurate inside the
+    /// closure body) — previously the untyped loop var made `**` fall to the float
+    /// emission path by accident.
+    fn emit_comp_value(&mut self, e: &Expr) -> Result<String> {
+        let s = self.emit_expr(e)?;
+        if matches!(self.type_of_expr(e), Ty::Float) && self.emits_int_pow(e) {
+            Ok(format!("(({}) as f64)", s))
+        } else {
+            Ok(s)
+        }
+    }
+
     /// Combine two inferred types into the more specific / wider one.
     /// `Unknown` yields to anything concrete; `Int` widens to `Float`;
     /// matching collections unify element-wise. Otherwise the first wins.
@@ -3656,39 +3725,7 @@ impl<'a> Codegen<'a> {
                 let subj = self.emit_consuming(subject)?;
                 let temp_var = "__match_val".to_string();
                 self.line(&format!("let {} = {};", temp_var, subj));
-
-                // Emit as if/else chain
-                let mut first = true;
-                for (idx, arm) in arms.iter().enumerate() {
-                    let is_last = idx == arms.len() - 1;
-                    let is_catchall = matches!(&arm.pattern, crate::ast::MatchPattern::Wildcard | crate::ast::MatchPattern::Capture(_));
-
-                    let cond = self.emit_pattern_cond(&temp_var, &arm.pattern)?;
-                    let guard_str = if let Some(guard) = &arm.guard {
-                        let g = self.emit_expr(guard)?;
-                        format!(" && {}", g)
-                    } else {
-                        String::new()
-                    };
-
-                    if first {
-                        self.line(&format!("if {}{} {{", cond, guard_str));
-                        first = false;
-                    } else if is_last && is_catchall && guard_str.is_empty() {
-                        // Last arm is catchall without guard — emit as plain else
-                        self.line("} else {");
-                    } else {
-                        self.line(&format!("}} else if {}{} {{", cond, guard_str));
-                    }
-                    self.indent += 1;
-                    for s in &arm.body {
-                        self.emit_stmt(s)?;
-                    }
-                    self.indent -= 1;
-                }
-                if !first {
-                    self.line("}");
-                }
+                self.emit_match_arms(&temp_var, arms, true)?;
             }
             // (first-class functions, Increment 2) A NESTED `def` lowers to a
             // NAMED local closure `let <name> = Rc::new(move |..| { <block> }) as
@@ -4425,6 +4462,15 @@ impl<'a> Codegen<'a> {
                     //                         caller can narrow it with `is None`.
                     //   d.get(k, default)  -> V          (the supplied fallback).
                     if name == "get" {
+                        // A user-class receiver with a `get` method has already been
+                        // dispatched above; reaching here means a dict `.get()`. It
+                        // requires at least the key argument — a no-arg `.get()` is an
+                        // honest error (NEVER an index-out-of-bounds panic on parts[0]).
+                        if parts.is_empty() {
+                            return Err(crate::diag::Error::Codegen(
+                                "`.get()` requires a key argument (dict.get(k) or dict.get(k, default))".into(),
+                            ));
+                        }
                         if parts.len() > 1 {
                             return Ok(Some(format!(
                                 "{}.get(&{}).cloned().unwrap_or({})",
@@ -5673,20 +5719,27 @@ impl<'a> Codegen<'a> {
                 } else {
                     format!("{}.iter().cloned()", iter_s)
                 };
-                let elt_s = self.emit_expr(elt)?;
+                // Bind the loop target(s) to the iterable's element type for the
+                // closure body, so a method call on the loop variable inside it
+                // (`it.get()`) resolves to the element's CLASS method (BUG: an
+                // unbound loop var fell through to a dict builtin and panicked).
+                let saved = self.bind_comp_targets(targets, iter);
+                let elt_s = self.emit_comp_value(elt)?;
                 // (EPIC-6) Escape each comprehension target in the closure pattern;
                 // the elt/cond bodies reference it via emit_expr Ident (same escape).
                 // A single target is a bare name; multiple targets (tuple-unpacking,
                 // e.g. `[v for k, v in d.items()]`) form a tuple pattern `(k, v)`
                 // (mirrors the `Stmt::For` lowering).
                 let target = comp_target_pat(targets);
-                if let Some(cond_expr) = cond {
+                let result = if let Some(cond_expr) = cond {
                     let cond_s = self.emit_expr(cond_expr)?;
                     format!("{}.filter_map(|{}| if {} {{ Some({}) }} else {{ None }} ).collect::<Vec<_>>()",
                         chain, target, cond_s, elt_s)
                 } else {
                     format!("{}.map(|{}| {}).collect::<Vec<_>>()", chain, target, elt_s)
-                }
+                };
+                self.restore_comp_targets(saved);
+                result
             }
             Expr::SetComp { elt, targets, iter, cond, .. } => {
                 let iter_s = self.emit_expr(iter)?;
@@ -5698,16 +5751,19 @@ impl<'a> Codegen<'a> {
                 } else {
                     format!("{}.iter().cloned()", iter_s)
                 };
-                let elt_s = self.emit_expr(elt)?;
+                let saved = self.bind_comp_targets(targets, iter);
+                let elt_s = self.emit_comp_value(elt)?;
                 // (EPIC-6) Escape the comprehension target(s) (see ListComp above).
                 let target = comp_target_pat(targets);
-                if let Some(cond_expr) = cond {
+                let result = if let Some(cond_expr) = cond {
                     let cond_s = self.emit_expr(cond_expr)?;
                     format!("{}.filter_map(|{}| if {} {{ Some({}) }} else {{ None }} ).collect::<::std::collections::HashSet<_>>()",
                         chain, target, cond_s, elt_s)
                 } else {
                     format!("{}.map(|{}| {}).collect::<::std::collections::HashSet<_>>()", chain, target, elt_s)
-                }
+                };
+                self.restore_comp_targets(saved);
+                result
             }
             Expr::DictComp { key, val, targets, iter, cond, .. } => {
                 let iter_s = self.emit_expr(iter)?;
@@ -5719,17 +5775,20 @@ impl<'a> Codegen<'a> {
                 } else {
                     format!("{}.iter().cloned()", iter_s)
                 };
-                let key_s = self.emit_expr(key)?;
-                let val_s = self.emit_expr(val)?;
+                let saved = self.bind_comp_targets(targets, iter);
+                let key_s = self.emit_comp_value(key)?;
+                let val_s = self.emit_comp_value(val)?;
                 // (EPIC-6) Escape the comprehension target(s) (see ListComp above).
                 let target = comp_target_pat(targets);
-                if let Some(cond_expr) = cond {
+                let result = if let Some(cond_expr) = cond {
                     let cond_s = self.emit_expr(cond_expr)?;
                     format!("{}.filter_map(|{}| if {} {{ Some(({}, {})) }} else {{ None }} ).collect::<::std::collections::HashMap<_,_>>()",
                         chain, target, cond_s, key_s, val_s)
                 } else {
                     format!("{}.map(|{}| ({}, {})).collect::<::std::collections::HashMap<_,_>>()", chain, target, key_s, val_s)
-                }
+                };
+                self.restore_comp_targets(saved);
+                result
             }
             Expr::Set(elems, _) => {
                 if elems.is_empty() {
@@ -6223,6 +6282,140 @@ impl<'a> Codegen<'a> {
                 format!("(if {} {{ {} }} else {{ {} }})", t, b, o)
             }
         })
+    }
+
+    /// Lower a `match`'s arms to an `if`/`else if`/`else` chain over the owned
+    /// scrutinee temp `match_val` (`__match_val`). `is_first` is true at the head of
+    /// the chain (emit `if`) and false for a continuation (emit `else`/`else if`).
+    ///
+    /// Pattern semantics:
+    ///  * A `Wildcard` (`case _:`) or `Capture` (`case y:`) with NO guard ALWAYS
+    ///    matches and makes the match exhaustive — it is lowered as a real `else`
+    ///    (or an UNCONDITIONAL body when it heads the chain), never as `if true {}`
+    ///    with no else (which let a non-unit function fall off the end -> rustc
+    ///    E0317). Any arms after it are unreachable and are dropped.
+    ///  * A `Capture(name)` BINDS `name` to the subject for its guard AND body. A
+    ///    GUARDED capture (`case y if g:`) therefore needs `name` in scope before
+    ///    the guard is tested, so it lowers to a nested block
+    ///    `{ let name = mv.clone(); if g { body } else { <rest> } }` — the binding
+    ///    precedes the guard, and the remaining arms continue in the `else`.
+    ///  * A `Literal`/`Or` arm (optionally guarded) tests `emit_pattern_cond`
+    ///    (`&& guard`) and chains the rest into the following `else if`.
+    fn emit_match_arms(
+        &mut self,
+        match_val: &str,
+        arms: &[crate::ast::MatchArm],
+        is_first: bool,
+    ) -> Result<()> {
+        use crate::ast::MatchPattern;
+        let Some((arm, rest)) = arms.split_first() else {
+            return Ok(()); // no arms left to emit
+        };
+
+        let capture_name = match &arm.pattern {
+            MatchPattern::Capture(n) => Some(n.clone()),
+            _ => None,
+        };
+        let is_catchall = matches!(
+            &arm.pattern,
+            MatchPattern::Wildcard | MatchPattern::Capture(_)
+        );
+        let always_matches = arm.guard.is_none() && is_catchall;
+
+        // (1) Unguarded catchall — always matches, exhaustive. Drop unreachable rest.
+        if always_matches {
+            if is_first {
+                // No `if`/`else` wrapper: emit the body unconditionally.
+                self.emit_match_arm_body(match_val, capture_name.as_deref(), &arm.body)?;
+            } else {
+                self.line("} else {");
+                self.emit_match_arm_body(match_val, capture_name.as_deref(), &arm.body)?;
+                self.line("}");
+            }
+            return Ok(());
+        }
+
+        // (2) Guarded CAPTURE — bind the name before the guard, then test the guard,
+        // with the remaining arms continuing in the `else`. Lowered via a nested
+        // block so the binding scopes over the guard and body.
+        if let (Some(name), Some(guard)) = (&capture_name, &arm.guard) {
+            if is_first {
+                self.line("{");
+            } else {
+                self.line("} else {");
+            }
+            self.indent += 1;
+            let bind = escape_ident(name);
+            self.line(&format!("let {} = {}.clone();", bind, match_val));
+            self.declared.insert(name.clone());
+            let g = self.emit_expr(guard)?;
+            self.line(&format!("if {} {{", g));
+            self.indent += 1;
+            for s in &arm.body {
+                self.emit_stmt(s)?;
+            }
+            self.indent -= 1;
+            if rest.is_empty() {
+                self.line("}");
+            } else {
+                // Continue the remaining arms inside this guard's `else`.
+                self.emit_match_arms(match_val, rest, false)?;
+            }
+            self.indent -= 1;
+            self.line("}");
+            return Ok(());
+        }
+
+        // (3) Literal / Or / guarded-non-capture arm: a discriminating test.
+        let cond = self.emit_pattern_cond(match_val, &arm.pattern)?;
+        let guard_str = if let Some(guard) = &arm.guard {
+            let g = self.emit_expr(guard)?;
+            format!(" && {}", g)
+        } else {
+            String::new()
+        };
+        if is_first {
+            self.line(&format!("if {}{} {{", cond, guard_str));
+        } else {
+            self.line(&format!("}} else if {}{} {{", cond, guard_str));
+        }
+        self.indent += 1;
+        for s in &arm.body {
+            self.emit_stmt(s)?;
+        }
+        self.indent -= 1;
+        if rest.is_empty() {
+            self.line("}");
+        } else {
+            self.emit_match_arms(match_val, rest, false)?;
+        }
+        Ok(())
+    }
+
+    /// Emit a match arm body INDENTED one level, preceded by a capture binding
+    /// when the arm pattern is `case <name>:`. `match_val` is the owned scrutinee
+    /// temp (`__match_val`); a `Capture` binds `let <name> = __match_val.clone();`
+    /// so the body sees the subject value under `<name>` (a `.clone()` keeps the
+    /// scrutinee usable for sibling arms and matches pyrst's clone-on-use; it is a
+    /// no-op move for `Copy` subjects and a real clone otherwise).
+    fn emit_match_arm_body(
+        &mut self,
+        match_val: &str,
+        capture_name: Option<&str>,
+        body: &[crate::ast::Stmt],
+    ) -> Result<()> {
+        self.indent += 1;
+        if let Some(name) = capture_name {
+            let bind = escape_ident(name);
+            self.line(&format!("let {} = {}.clone();", bind, match_val));
+            // The binding is a `let`-declared local for the rest of this arm.
+            self.declared.insert(name.to_string());
+        }
+        for s in body {
+            self.emit_stmt(s)?;
+        }
+        self.indent -= 1;
+        Ok(())
     }
 
     fn emit_pattern_cond(&self, var: &str, pattern: &crate::ast::MatchPattern) -> Result<String> {

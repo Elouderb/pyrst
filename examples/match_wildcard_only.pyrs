@@ -1,0 +1,18 @@
+# A `match` whose SOLE arm is a wildcard must lower to its body UNCONDITIONALLY
+# (not `if true { .. }` with no else), so a non-unit function does not fall off
+# the end (rustc E0317). Covers both a returning wildcard-only arm and a
+# non-returning (unit) wildcard-only body.
+def f(x: int) -> int:
+    match x:
+        case _:
+            return 0
+
+def g(x: int) -> None:
+    match x:
+        case _:
+            print("wild")
+
+def main() -> None:
+    print(f(5))
+    print(f(-2))
+    g(7)

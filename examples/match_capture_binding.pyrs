@@ -1,0 +1,28 @@
+# A capture pattern `case <name>:` binds <name> to the subject value and always
+# matches (exhaustive). Covers: literal-then-capture, capture-only, a guard that
+# references the captured name, and a guarded capture followed by a plain capture.
+def f(x: int) -> int:
+    match x:
+        case 0:
+            return 10
+        case y:
+            return y + 1
+
+def double(x: int) -> int:
+    match x:
+        case y:
+            return y * 2
+
+def classify(x: int) -> int:
+    match x:
+        case y if y > 10:
+            return y * 2
+        case z:
+            return z + 1
+
+def main() -> None:
+    print(f(5))
+    print(f(0))
+    print(double(5))
+    print(classify(20))
+    print(classify(3))

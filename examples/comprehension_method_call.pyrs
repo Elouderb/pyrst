@@ -1,0 +1,34 @@
+# A class instance method whose name collides with a dict builtin (`get`/`pop`)
+# called inside a comprehension must resolve to the CLASS method (the loop var
+# carries its element type), never the dict builtin (which panicked codegen for a
+# no-arg `.get()`). Covers list/set/dict comprehensions AND a real dict `.get()`
+# in a comprehension still working.
+class Item:
+    v: int
+    def __init__(self, v: int) -> None:
+        self.v = v
+    def get(self) -> int:
+        return self.v
+    def pop(self) -> int:
+        return self.v * 10
+
+def main() -> None:
+    items: list[Item] = [Item(1), Item(2), Item(3)]
+    # list comp: collides with dict.get
+    vals: list[int] = [it.get() for it in items]
+    print(vals)
+    # list comp: collides with dict.pop
+    pops: list[int] = [it.pop() for it in items]
+    print(pops)
+    # set comp: collides with dict.get
+    s: set[int] = {it.get() for it in items}
+    print(len(s))
+    # dict comp: both key and value collide with dict builtins
+    m: dict[int, int] = {it.get(): it.pop() for it in items}
+    print(m[1])
+    print(m[3])
+    # a real dict .get(k, default) in a comprehension still works
+    d: dict[str, int] = {"a": 1, "b": 2}
+    keys: list[str] = ["a", "z"]
+    got: list[int] = [d.get(k, 0) for k in keys]
+    print(sorted(got))

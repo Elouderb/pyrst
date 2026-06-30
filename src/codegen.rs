@@ -1794,6 +1794,22 @@ impl<'a> Codegen<'a> {
                 // (own + enclosing generic class) so a `v: T` local is `TypeVar(T)`.
                 let ty = Ty::from_type_expr_scoped(&p.ty, p.span, &scope)?;
                 self.locals.insert(p.name.clone(), ty);
+                // (param-mutation fix) A value parameter is ALREADY a `let mut`
+                // binding (emitted `mut <name>: T` above) at function scope. Seed
+                // its name into `declared` so a later reassignment — at the body
+                // top level OR nested inside a while/for/if/try block — lowers to a
+                // MUTATION (`x = ...;`) of that binding, not a fresh shadowing
+                // `let mut x = ...;` scoped to the inner block. Without this, a loop
+                // whose condition reads the param never sees the update (the inner
+                // shadow dies at the block end) -> infinite loop / wrong result.
+                // BY-REFERENCE params (`Mut[T]` -> `&mut T`) are deliberately NOT
+                // seeded: their reassignment semantics are a separate concern and
+                // seeding them would turn the existing shadowing `let` into an
+                // ill-typed reference rebind. Value params are pyrst's common case
+                // and are function-scoped, so a reassignment anywhere is a mutation.
+                if !p.by_ref {
+                    self.declared.insert(p.name.clone());
+                }
             }
         }
 
@@ -3869,6 +3885,13 @@ impl<'a> Codegen<'a> {
         // captured enclosing name of the same identifier).
         for (p, pty) in f.params.iter().zip(param_tys.iter()) {
             self.locals.insert(p.name.clone(), pty.clone());
+            // (param-mutation fix) Seed the nested closure's params into the
+            // (freshly-emptied) `declared` set for the SAME reason as `emit_func`:
+            // the closure params are emitted `mut <name>: T`, so a reassignment of
+            // one — top level or nested in a loop/if — must lower to a mutation,
+            // not a block-scoped shadowing `let mut`. Nested defs take no `Mut[T]`
+            // params in this increment, so every param is a value binding here.
+            self.declared.insert(p.name.clone());
         }
 
         // Same body pipeline as `emit_func`: forward type inference, then hoist

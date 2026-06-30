@@ -1,0 +1,70 @@
+# Golden: a FUNCTION PARAMETER reassigned inside a NESTED scope (while / for /
+# if body) must lower to a MUTATION of the parameter binding, not a fresh
+# shadowing `let mut` scoped to the inner block.
+#
+# Before the fix, params were registered in codegen's `locals` (carrying type)
+# but NOT in the `declared` set that decides `let mut x = ...` (declare) vs
+# `x = ...` (mutate). A param reassigned inside a loop body therefore emitted a
+# block-scoped `let mut` that shadowed the param and died at the block end, so
+# the loop condition (which reads the outer param) never updated -> infinite
+# loop. `gcd` and `countdown` below both HUNG.
+#
+# Deterministic expected output:
+#   gcd(12, 8)              = 4
+#   gcd(48, 36)             = 12
+#   countdown(5)            = 0
+#   clamp(50) / clamp(3)    = 10 / 3   (if-body param reassign)
+#   sum_for(0,[1,2,3,4])    = 10       (for-body param accumulate)
+#   nested_countdown(7)     = 7        (param mutation in a NESTED def's loop)
+
+
+def gcd(a: int, b: int) -> int:
+    # Euclid: both params reassigned INSIDE the while body.
+    while b != 0:
+        t: int = b
+        b = a % b
+        a = t
+    return a
+
+
+def countdown(n: int) -> int:
+    # Param `n` decremented inside the while body until the condition fails.
+    while n > 0:
+        n = n - 1
+    return n
+
+
+def clamp(x: int) -> int:
+    # Param `x` reassigned inside an if body, then read.
+    if x > 10:
+        x = 10
+    return x
+
+
+def sum_for(start: int, items: list[int]) -> int:
+    # Param `start` accumulated inside a for body.
+    for it in items:
+        start = start + it
+    return start
+
+
+def nested_countdown(a: int) -> int:
+    # A NESTED def whose own param `b` is mutated inside its loop must also
+    # terminate; the outer param `a` is then mutated at the body top level.
+    def inner(b: int) -> int:
+        while b > 0:
+            b = b - 1
+        return b
+
+    a = a + inner(3)
+    return a
+
+
+def main() -> None:
+    print(gcd(12, 8))
+    print(gcd(48, 36))
+    print(countdown(5))
+    print(clamp(50))
+    print(clamp(3))
+    print(sum_for(0, [1, 2, 3, 4]))
+    print(nested_countdown(7))

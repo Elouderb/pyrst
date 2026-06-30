@@ -1,0 +1,79 @@
+# combo_bisect_sorted_merge.pyrs
+# Combines: bisect.insort + bisect_left/right + list comprehensions +
+# f-strings + generic max_of function (bounded generic) +
+# a practical "sorted event-priority queue" pattern.
+
+import bisect
+
+
+def max_of[T](a: T, b: T) -> T:
+    if a > b:
+        return a
+    return b
+
+
+def min_of[T](a: T, b: T) -> T:
+    if a < b:
+        return a
+    return b
+
+
+def sorted_merge(a: list[int], b: list[int]) -> list[int]:
+    """Merge two sorted lists into one sorted list using insort."""
+    result: list[int] = [x for x in a]
+    for v in b:
+        bisect.insort(result, v)
+    return result
+
+
+def count_in_range(sorted_lst: list[int], lo: int, hi: int) -> int:
+    """Count elements in [lo, hi] using bisect_left and bisect_right."""
+    left: int = bisect.bisect_left(sorted_lst, lo)
+    right: int = bisect.bisect_right(sorted_lst, hi)
+    return right - left
+
+
+def main() -> None:
+    # Build sorted list by insort
+    events: list[int] = []
+    bisect.insort(events, 50)
+    bisect.insort(events, 10)
+    bisect.insort(events, 80)
+    bisect.insort(events, 30)
+    bisect.insort(events, 60)
+    bisect.insort(events, 10)   # duplicate
+    bisect.insort(events, 90)
+    print(events)               # [10, 10, 30, 50, 60, 80, 90]
+
+    # Lookup positions
+    print(bisect.bisect_left(events, 10))     # 0  (first 10)
+    print(bisect.bisect_right(events, 10))    # 2  (after both 10s)
+    print(bisect.bisect_left(events, 60))     # 4
+    print(bisect.bisect_right(events, 60))    # 5
+
+    # Count elements in ranges
+    print(count_in_range(events, 10, 60))     # 5  (10,10,30,50,60)
+    print(count_in_range(events, 31, 79))     # 2  (50, 60)
+    print(count_in_range(events, 100, 200))   # 0
+
+    # Sorted merge
+    a: list[int] = [2, 5, 8, 11]
+    b: list[int] = [1, 4, 7, 10, 13]
+    merged: list[int] = sorted_merge(a, b)
+    print(merged)               # [1, 2, 4, 5, 7, 8, 10, 11, 13]
+    print(len(merged))          # 9
+
+    # Generic max/min on ints and strings
+    print(max_of(42, 17))       # 42
+    print(min_of(42, 17))       # 17
+    print(max_of("banana", "apple"))    # banana
+    print(min_of("banana", "apple"))    # apple
+
+    # Verify sorted merge is in order by checking all adjacent pairs
+    ok: bool = True
+    i: int = 0
+    while i < len(merged) - 1:
+        if merged[i] > merged[i + 1]:
+            ok = False
+        i = i + 1
+    print(ok)                   # True

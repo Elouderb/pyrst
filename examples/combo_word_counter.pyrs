@@ -1,0 +1,38 @@
+# combo_word_counter.pyrs
+# Combines: collections.Counter + most_common + string methods (split/lower/strip) +
+# list comprehension + f-strings + key lookups (deterministic)
+# Uses qualified `import collections; collections.Counter(...)` form.
+
+import collections
+
+
+def clean_words(text: str) -> list[str]:
+    raw: list[str] = text.lower().split(" ")
+    cleaned: list[str] = [w.strip() for w in raw if w.strip() != ""]
+    return cleaned
+
+
+def main() -> None:
+    text: str = "the cat sat on the mat the cat sat"
+    words: list[str] = clean_words(text)
+    print(len(words))                       # 9
+
+    counts: dict[str, int] = collections.Counter(words)
+
+    # Key lookups are deterministic (no whole-dict print)
+    print(counts["the"])                    # 3
+    print(counts["cat"])                    # 2
+    print(counts["sat"])                    # 2
+    print(counts["on"])                     # 1
+
+    # most_common(2): top 2 by count — the=3 is unambiguously first
+    top2: list[tuple[str, int]] = collections.most_common(counts, 2)
+    # top2[0] = ('the', 3), top2[1] could be cat or sat (tie=2) — avoid printing
+    first_word: str = top2[0][0]
+    first_count: int = top2[0][1]
+    print(f"{first_word}: {first_count}")   # the: 3
+
+    # Count words that appear exactly once
+    singles: list[str] = [w for w in words if counts[w] == 1]
+    # "on" and "mat" each appear once
+    print(len(singles))                     # 2

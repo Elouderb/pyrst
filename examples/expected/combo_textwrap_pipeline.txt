@@ -1,0 +1,18 @@
+['the quick brown fox', 'jumps over the lazy', 'dog']
+3
+the quick brown fox
+3
+the quick brown
+3
+the quick brown fox
+Introduction to Pyrst ...
+>>> def foo():
+>>>     return 42
+alpha
+  gamma
+8
+1
+1
+Report:
+  Pyrst compiles to Rust
+the quick brown ...

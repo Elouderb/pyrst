@@ -1,0 +1,16 @@
+# fail_callable_return_type.pyrs
+# A function with return type str returning an int should be caught at typeck.
+# Also, passing the wrong-typed result of a Callable to a typed variable.
+
+from statistics import mean
+
+
+def compute(data: list[float]) -> str:
+    # ERROR: mean() returns float, but we declared str as the return type
+    return mean(data)
+
+
+def main() -> None:
+    data: list[float] = [1.0, 2.0, 3.0]
+    result: str = compute(data)
+    print(result)

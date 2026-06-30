@@ -1,0 +1,129 @@
+# combo_match_class.pyrs
+# Combines: class hierarchy (Shape base + Circle/Rect/Triangle subclasses) +
+# __str__ / __repr__ methods + match on an int tag + f-strings +
+# list of base-class instances + method dispatch + arithmetic
+# A realistic "shape renderer / area calculator" ADT-style pattern.
+
+
+class Shape:
+    tag: int       # 1=circle, 2=rect, 3=triangle
+
+    def __init__(self, tag: int) -> None:
+        self.tag = tag
+
+    def area(self) -> float:
+        return 0.0
+
+    def describe(self) -> str:
+        return f"Shape(tag={self.tag})"
+
+
+class Circle(Shape):
+    radius: float
+
+    def __init__(self, radius: float) -> None:
+        super().__init__(1)
+        self.radius = radius
+
+    def area(self) -> float:
+        # Approximate pi as 3.14159
+        return 3.14159 * self.radius * self.radius
+
+    def describe(self) -> str:
+        return f"Circle(r={self.radius})"
+
+
+class Rect(Shape):
+    width: float
+    height: float
+
+    def __init__(self, width: float, height: float) -> None:
+        super().__init__(2)
+        self.width = width
+        self.height = height
+
+    def area(self) -> float:
+        return self.width * self.height
+
+    def describe(self) -> str:
+        return f"Rect({self.width}x{self.height})"
+
+
+class Triangle(Shape):
+    base: float
+    height: float
+
+    def __init__(self, base: float, height: float) -> None:
+        super().__init__(3)
+        self.base = base
+        self.height = height
+
+    def area(self) -> float:
+        return 0.5 * self.base * self.height
+
+    def describe(self) -> str:
+        return f"Triangle(b={self.base},h={self.height})"
+
+
+def shape_kind(tag: int) -> str:
+    match tag:
+        case 1:
+            return "circle"
+        case 2:
+            return "rectangle"
+        case 3:
+            return "triangle"
+        case _:
+            return "unknown"
+
+
+def classify_area(a: float) -> str:
+    match int(a):
+        case 0:
+            return "tiny"
+        case n if n < 10:
+            return "small"
+        case n if n < 100:
+            return "medium"
+        case _:
+            return "large"
+
+
+def main() -> None:
+    c: Circle = Circle(3.0)
+    r: Rect = Rect(4.0, 5.0)
+    t: Triangle = Triangle(6.0, 8.0)
+
+    # describe()
+    print(c.describe())             # Circle(r=3.0)
+    print(r.describe())             # Rect(4.0x5.0)
+    print(t.describe())             # Triangle(b=6.0,h=8.0)
+
+    # area()
+    ca: float = c.area()
+    ra: float = r.area()
+    ta: float = t.area()
+    print(int(ca * 100) / 100)      # approximate pi*9 ≈ 28.27 → int(2827) / 100 = 28
+    print(ra)                       # 20.0
+    print(ta)                       # 24.0
+
+    # tag-based match dispatch
+    print(shape_kind(c.tag))        # circle
+    print(shape_kind(r.tag))        # rectangle
+    print(shape_kind(t.tag))        # triangle
+    print(shape_kind(99))           # unknown
+
+    # classify area
+    print(classify_area(ra))        # medium (20)
+    print(classify_area(ta))        # medium (24)
+    print(classify_area(0.5))       # tiny (int(0.5)=0)
+
+    # Work with areas via list of floats
+    areas: list[float] = [ca, ra, ta]
+    total_area: float = areas[0] + areas[1] + areas[2]
+    print(int(total_area))          # approx 28+20+24=72 → int of real value
+
+    # f-string combining class and match
+    kinds: list[str] = [shape_kind(c.tag), shape_kind(r.tag), shape_kind(t.tag)]
+    for k in kinds:
+        print(f"kind: {k}")

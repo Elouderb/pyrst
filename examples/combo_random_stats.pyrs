@@ -1,0 +1,74 @@
+# combo_random_stats.pyrs
+# Combines: Random(seed) + randint/random/uniform + shuffle + statistics.mean/median +
+# list comprehensions + sorted() + f-strings. A realistic "simulate draws, compute
+# sample statistics" pattern. Fully deterministic via fixed seeds.
+
+import random
+import collections
+from random import Random
+from statistics import mean, median
+
+
+def simulate_dice_rolls(rng: Random, n: int) -> list[int]:
+    """Roll a 6-sided die n times and return results."""
+    rolls: list[int] = [rng.randint(1, 6) for _ in range(n)]
+    return rolls
+
+
+def count_face(rolls: list[int], face: int) -> int:
+    """Count how many times a specific face appeared."""
+    return len([r for r in rolls if r == face])
+
+
+def main() -> None:
+    # Seed-42 dice simulation
+    rng: Random = Random(42)
+    rolls: list[int] = simulate_dice_rolls(rng, 12)
+    print(rolls)                            # exact sequence from LCG seed 42
+
+    # Basic stats on rolls (all int but stats wants float-like)
+    floated: list[float] = [float(r) for r in rolls]
+    m: float = mean(floated)
+    med: float = median(floated)
+    print(m)                                # mean of 12 rolls
+    print(med)                              # median of 12 rolls
+
+    # Count occurrences of each face
+    counts: dict[int, int] = collections.Counter(rolls)
+    # Print counts for face 1 and face 6 (deterministic)
+    print(count_face(rolls, 1))
+    print(count_face(rolls, 6))
+
+    # Sorted rolls
+    sorted_rolls: list[int] = sorted(rolls)
+    print(sorted_rolls[0])                  # min
+    print(sorted_rolls[11])                 # max
+
+    # Shuffle with a different seed
+    rng2: Random = Random(99)
+    deck: list[int] = [10, 20, 30, 40, 50]
+    random.shuffle(rng2, deck)
+    print(deck)                             # shuffled deterministically
+
+    # Sample uniform floats and compute their mean
+    rng3: Random = Random(7)
+    uniforms: list[float] = [rng3.uniform(0.0, 10.0) for _ in range(6)]
+    um: float = mean(uniforms)
+    # Print rounded to 2 decimal places via int truncation trick
+    um_scaled: int = int(um * 100.0)
+    print(um_scaled)                        # deterministic
+
+    # Sorted uniforms extremes
+    sorted_u: list[float] = sorted(uniforms)
+    lo_scaled: int = int(sorted_u[0] * 10.0)
+    hi_scaled: int = int(sorted_u[5] * 10.0)
+    print(lo_scaled)
+    print(hi_scaled)
+
+    # Random booleans via randint(0, 1) — count true/false
+    rng4: Random = Random(13)
+    bools: list[int] = [rng4.randint(0, 1) for _ in range(10)]
+    true_count: int = len([b for b in bools if b == 1])
+    false_count: int = 10 - true_count
+    print(true_count)
+    print(false_count)

@@ -1,0 +1,17 @@
+Circle(r=3.0)
+Rect(4.0x5.0)
+Triangle(b=6.0,h=8.0)
+28.27
+20.0
+24.0
+circle
+rectangle
+triangle
+unknown
+medium
+medium
+tiny
+72
+kind: circle
+kind: rectangle
+kind: triangle

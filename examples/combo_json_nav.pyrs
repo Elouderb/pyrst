@@ -1,0 +1,55 @@
+# combo_json_nav.pyrs
+# Combines: json.loads + json.dumps + JsonValue navigation (get/at/as_str/as_int/
+# as_bool/is_null/length) + f-strings + try/except for malformed input +
+# list comprehension to build a result array
+# A realistic "parse a config, read values, emit a summary" pattern.
+
+from json import loads, dumps
+
+
+def get_config_str(cfg: JsonValue, key: str, default: str) -> str:
+    if cfg.has(key):
+        return cfg.get(key).as_str()
+    return default
+
+
+def main() -> None:
+    # Parse a "server config" JSON object
+    cfg_json: str = '{"host": "localhost", "port": 8080, "debug": true, "tags": ["web", "api"], "timeout": null}'
+    cfg: JsonValue = loads(cfg_json)
+
+    host: str = get_config_str(cfg, "host", "127.0.0.1")
+    port: int = cfg.get("port").as_int()
+    debug: bool = cfg.get("debug").as_bool()
+    timeout_null: bool = cfg.get("timeout").is_null()
+
+    print(f"host: {host}")             # host: localhost
+    print(f"port: {port}")             # port: 8080
+    print(f"debug: {debug}")           # debug: True
+    print(f"timeout_null: {timeout_null}")  # timeout_null: True
+
+    # Navigate array
+    tags: JsonValue = cfg.get("tags")
+    print(tags.length())               # 2
+    print(tags.at(0).as_str())         # web
+    print(tags.at(1).as_str())         # api
+
+    # Round-trip: dumps an array, reload and check
+    arr_json: str = dumps(tags)
+    print(arr_json)                    # ["web", "api"]
+    reloaded: JsonValue = loads(arr_json)
+    print(str(reloaded.at(0).as_str() == "web"))   # True
+
+    # Build a summary array and dump it (single-key objects — deterministic)
+    summary_str: str = '{"summary": "ok"}'
+    s: JsonValue = loads(summary_str)
+    print(s.get("summary").as_str())   # ok
+
+    # Error handling: malformed JSON
+    try:
+        bad: JsonValue = loads('{bad json}')
+        print("should not reach")
+    except ValueError as e:
+        print(f"parse error caught")   # parse error caught
+
+    print("done")                      # done

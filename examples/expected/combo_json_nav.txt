@@ -1,0 +1,12 @@
+host: localhost
+port: 8080
+debug: True
+timeout_null: True
+2
+web
+api
+["web", "api"]
+True
+ok
+parse error caught
+done

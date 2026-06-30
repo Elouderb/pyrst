@@ -1,0 +1,84 @@
+# combo_textwrap_pipeline.pyrs
+# Combines: textwrap.wrap + textwrap.fill + textwrap.shorten + textwrap.indent +
+# textwrap.dedent + string methods (split/strip/join/upper/lower/replace) +
+# list comprehensions + f-strings + counter (collections.Counter via dict[str,int])
+# A "document formatter" that wraps, indents, summarizes, and word-counts.
+
+import textwrap
+import collections
+from textwrap import shorten
+
+
+def word_count(text: str) -> int:
+    """Count non-empty words in text."""
+    return len([w for w in text.split(" ") if w.strip() != ""])
+
+
+def paragraph_summary(para: str, max_len: int) -> str:
+    """Return a shortened first-sentence summary."""
+    return shorten(para, max_len)
+
+
+def format_report(title: str, body: str, width: int) -> str:
+    """Wrap body text, indent it, and add a title header."""
+    wrapped: str = textwrap.fill(body, width)
+    indented: str = textwrap.indent(wrapped, "  ")
+    return title + "\n" + indented
+
+
+def main() -> None:
+    # Wrap a long sentence at different widths
+    sentence: str = "the quick brown fox jumps over the lazy dog"
+    lines_20: list[str] = textwrap.wrap(sentence, 20)
+    print(lines_20)                             # ['the quick brown fox', 'jumps over the', 'lazy dog']
+    print(len(lines_20))                        # 3
+    print(lines_20[0])                          # the quick brown fox
+
+    lines_15: list[str] = textwrap.wrap(sentence, 15)
+    print(len(lines_15))                        # 4
+    print(lines_15[0])                          # the quick brown
+
+    # Fill (wrap + join with newlines)
+    filled: str = textwrap.fill(sentence, 20)
+    parts: list[str] = filled.split("\n")
+    print(len(parts))                           # 3
+    print(parts[0])                             # the quick brown fox
+
+    # Shorten with ellipsis
+    long_title: str = "Introduction to Pyrst Language Features and Syntax"
+    short_title: str = shorten(long_title, 30)
+    print(short_title)                          # Introduction to Pyrst [...]
+
+    # Indent and dedent
+    code_block: str = "def foo():\n    return 42"
+    indented_code: str = textwrap.indent(code_block, ">>> ")
+    code_lines: list[str] = indented_code.split("\n")
+    print(code_lines[0])                        # >>> def foo():
+    print(code_lines[1])                        # >>>     return 42
+
+    dedented: str = textwrap.dedent("    alpha\n    beta\n      gamma")
+    ded_lines: list[str] = dedented.split("\n")
+    print(ded_lines[0])                         # alpha
+    print(ded_lines[2])                         # gamma (2 extra spaces)
+
+    # Word count pipeline
+    text: str = "pyrst is a pythonic language with rust codegen"
+    wc: int = word_count(text)
+    print(wc)                                   # 8
+
+    # Word frequency via Counter
+    words: list[str] = [w for w in text.split(" ") if w != ""]
+    freq: dict[str, int] = collections.Counter(words)
+    print(freq["pyrst"])                        # 1
+    print(freq["a"])                            # 1
+
+    # Format report
+    body: str = "Pyrst compiles to Rust via a transpiler pipeline"
+    report: str = format_report("Report:", body, 25)
+    report_lines: list[str] = report.split("\n")
+    print(report_lines[0])                      # Report:
+    print(report_lines[1])                      # (indented)
+
+    # Summary of the pipeline
+    summary: str = paragraph_summary(sentence, 20)
+    print(summary)                              # the quick brown [...]

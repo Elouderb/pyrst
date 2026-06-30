@@ -1,0 +1,13 @@
+# fail_counter_wrong_type.pyrs
+# collections.Counter on a list[int] returns dict[int, int], NOT dict[str, int].
+# Declaring the result as dict[str, int] is a type mismatch that pyrst must
+# catch at the typecheck level.
+
+import collections
+
+
+def main() -> None:
+    nums: list[int] = [1, 2, 2, 3, 3, 3]
+    # ERROR: Counter on list[int] produces dict[int, int], not dict[str, int]
+    counts: dict[str, int] = collections.Counter(nums)
+    print(counts)

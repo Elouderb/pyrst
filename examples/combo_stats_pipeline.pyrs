@@ -1,0 +1,47 @@
+# combo_stats_pipeline.pyrs
+# Combines: statistics.mean/median + generic filter/transform with lambdas +
+# list comprehension + f-strings + sorted() + first-class functions (Callable)
+# A realistic data-processing pipeline over a list of floats.
+
+from statistics import mean, median
+
+
+def filter_vals(data: list[float], pred: Callable[[float], bool]) -> list[float]:
+    return [x for x in data if pred(x)]
+
+
+def transform_vals(data: list[float], fn: Callable[[float], float]) -> list[float]:
+    return [fn(x) for x in data]
+
+
+def main() -> None:
+    data: list[float] = [3.0, 1.0, 4.0, 1.0, 5.0, 9.0, 2.0, 6.0, 5.0, 3.0]
+
+    print(mean(data))                              # 3.9
+    print(median(data))                            # 3.5
+
+    # Filter to above-mean values
+    m: float = mean(data)
+    above: list[float] = filter_vals(data, lambda x: x > m)
+    above_sorted: list[float] = sorted(above)
+    print(above_sorted)                            # [4.0, 5.0, 5.0, 6.0, 9.0]
+    print(mean(above_sorted))                      # 5.8
+
+    # Double all values and take median
+    doubled: list[float] = transform_vals(data, lambda x: x * 2.0)
+    print(median(doubled))                         # 7.0
+
+    # Pipeline: filter below median, then square, then sort
+    med: float = median(data)
+    below_med: list[float] = filter_vals(data, lambda x: x < med)
+    squared: list[float] = transform_vals(below_med, lambda x: x * x)
+    result: list[float] = sorted(squared)
+    print(result)                                  # [1.0, 1.0, 4.0, 9.0]
+    print(mean(result))                            # 3.75
+
+    # Normalize to [0, 1] range
+    lo: float = 1.0
+    hi: float = 9.0
+    normed: list[float] = transform_vals(data, lambda x: (x - lo) / (hi - lo))
+    print(len(normed))                             # 10
+    print(normed[0])                               # 0.25 (3-1)/(9-1)

@@ -1,0 +1,80 @@
+# combo_generic_stack_queue.pyrs
+# Combines: generic class Stack[T] with __init__/__str__/push/pop methods +
+# collections.deque[int] as a queue + bounded generics + f-strings
+# Tests that a user-defined generic class and a stdlib generic class coexist.
+
+from collections import deque
+
+
+class Stack[T]:
+    items: list[T]
+
+    def __init__(self) -> None:
+        self.items = []
+
+    def push(self, v: T) -> None:
+        self.items.append(v)
+
+    def pop(self) -> T:
+        return self.items.pop()
+
+    def peek(self) -> T:
+        return self.items[len(self.items) - 1]
+
+    def size(self) -> int:
+        return len(self.items)
+
+    def is_empty(self) -> bool:
+        return len(self.items) == 0
+
+
+def sum_stack(s: Stack[int]) -> int:
+    total: int = 0
+    sz: int = s.size()
+    i: int = 0
+    while i < sz:
+        total = total + s.items[i]
+        i = i + 1
+    return total
+
+
+def main() -> None:
+    # Generic Stack[int]
+    s: Stack[int] = Stack()
+    print(s.is_empty())          # True
+    s.push(10)
+    s.push(20)
+    s.push(30)
+    print(s.size())              # 3
+    print(s.peek())              # 30
+    print(s.pop())               # 30
+    print(s.size())              # 2
+    print(sum_stack(s))          # 30 (10+20)
+
+    # Generic Stack[str]
+    words: Stack[str] = Stack()
+    words.push("hello")
+    words.push("world")
+    print(words.pop())           # world
+    print(words.peek())          # hello
+
+    # deque[int] as a queue (FIFO)
+    q: deque[int] = deque()
+    q.append(1)
+    q.append(2)
+    q.append(3)
+    print(q.popleft())           # 1
+    print(q.popleft())           # 2
+    print(q.size())              # 1
+
+    # Interop: drain deque into stack
+    q.append(100)
+    q.append(200)
+    s2: Stack[int] = Stack()
+    while not q.is_empty():
+        s2.push(q.popleft())
+    print(s2.size())             # 3 (3 from before + 2 new — wait, we only added 100,200; q had 1 item (3) left)
+    # q had: [3] + append 100,200 = [3, 100, 200] -> popleft all -> s2 gets 3,100,200
+    print(s2.pop())              # 200
+    print(s2.pop())              # 100
+    print(s2.pop())              # 3

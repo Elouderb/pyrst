@@ -1,0 +1,14 @@
+# fail_reduce_type_mismatch.pyrs
+# functools.reduce expects (Callable[[int, int], int], list[int], int).
+# Passing a str as the initial accumulator is a type error that pyrst must
+# catch at the typecheck level.
+
+from functools import reduce
+from operator import add
+
+
+def main() -> None:
+    nums: list[int] = [1, 2, 3, 4]
+    # ERROR: init is str "0" but reduce expects int accumulator
+    total: int = reduce(add, nums, "0")
+    print(total)

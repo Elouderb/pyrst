@@ -1,0 +1,13 @@
+# fail_generator_yield_type.pyrs
+# A generator declared as Iterator[int] that yields str values should be
+# caught at the typecheck level — yield type does not match Iterator element type.
+
+def gen_strs() -> Iterator[int]:
+    # ERROR: yielding str from an Iterator[int] generator
+    yield "hello"
+    yield "world"
+
+
+def main() -> None:
+    for s in gen_strs():
+        print(s)

@@ -1,0 +1,77 @@
+# combo_reduce_operator.pyrs
+# Combines: functools.reduce + operator.add/mul/floordiv + lambda fold functions +
+# named helper functions (non-HOF) + list comprehensions + f-strings + sorted()
+# A realistic "numeric aggregation pipeline" using reduce for sum, product, max.
+#
+# NOTE: reduce(named_fn, ...) hangs due to a compiler codegen bug — only
+# lambdas and flat-imported operator names work as the reduce callable.
+# This is a known v0.1.0 finding. This example uses only lambda and operator forms.
+
+from functools import reduce
+from operator import add, mul
+
+
+def factorial(n: int) -> int:
+    """Compute n! using reduce * mul over range 1..n."""
+    nums: list[int] = [i for i in range(1, n + 1)]
+    if n == 0:
+        return 1
+    return reduce(mul, nums, 1)
+
+
+def sum_of_squares(nums: list[int]) -> int:
+    """Sum of squares using reduce over squares list."""
+    squares: list[int] = [x * x for x in nums]
+    return reduce(add, squares, 0)
+
+
+def main() -> None:
+    # Factorials via reduce+mul
+    print(factorial(0))         # 1
+    print(factorial(1))         # 1
+    print(factorial(5))         # 120
+    print(factorial(7))         # 5040
+
+    # Sum of integers via reduce+add
+    data: list[int] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    total: int = reduce(add, data, 0)
+    print(total)                # 55
+
+    # Product of first 5 via reduce+mul
+    first5: list[int] = [1, 2, 3, 4, 5]
+    prod: int = reduce(mul, first5, 1)
+    print(prod)                 # 120
+
+    # Sum of squares
+    sq_sum: int = sum_of_squares([1, 2, 3, 4])
+    print(sq_sum)               # 30  (1+4+9+16)
+
+    # Max via reduce with lambda
+    vals: list[int] = [3, 1, 4, 1, 5, 9, 2, 6]
+    max_val: int = reduce(lambda a, b: a if a > b else b, vals, vals[0])
+    print(max_val)              # 9
+
+    # Min via reduce with lambda
+    min_val: int = reduce(lambda a, b: a if a < b else b, vals, vals[0])
+    print(min_val)              # 1
+
+    # Clamp-sum: sum but capped at each step using lambda
+    capped: int = reduce(lambda acc, x: acc + x if acc + x < 30 else 30, data, 0)
+    print(capped)               # 30  (capped at 30 once we exceed it)
+
+    # Filter-then-reduce: sum of even numbers in data
+    evens: list[int] = [x for x in data if x % 2 == 0]
+    print(evens)                # [2, 4, 6, 8, 10]
+    even_sum: int = reduce(add, evens, 0)
+    print(even_sum)             # 30
+
+    # Odd product
+    odds: list[int] = [x for x in first5 if x % 2 != 0]
+    print(odds)                 # [1, 3, 5]
+    odd_prod: int = reduce(mul, odds, 1)
+    print(odd_prod)             # 15
+
+    # f-string report
+    print(f"5! = {factorial(5)}")           # 5! = 120
+    print(f"sum 1..10 = {total}")           # sum 1..10 = 55
+    print(f"max of vals = {max_val}")       # max of vals = 9

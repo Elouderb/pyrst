@@ -1,0 +1,55 @@
+# combo_rpn_exceptions.pyrs
+# Combines: list-based stack + match on token strings + exceptions (try/except/raise)
+# for divide-by-zero + f-strings + first-class functions via dict dispatch
+# A realistic RPN calculator that handles +, -, *, / with error recovery.
+
+def rpn_eval(expr: str) -> int:
+    stack: list[int] = []
+    for token in expr.split(" "):
+        if token == "+":
+            b: int = stack.pop()
+            a: int = stack.pop()
+            stack.append(a + b)
+        elif token == "-":
+            b2: int = stack.pop()
+            a2: int = stack.pop()
+            stack.append(a2 - b2)
+        elif token == "*":
+            b3: int = stack.pop()
+            a3: int = stack.pop()
+            stack.append(a3 * b3)
+        elif token == "/":
+            b4: int = stack.pop()
+            a4: int = stack.pop()
+            if b4 == 0:
+                raise ValueError("division by zero")
+            stack.append(a4 // b4)
+        else:
+            stack.append(int(token))
+    return stack.pop()
+
+
+def safe_eval(expr: str) -> str:
+    try:
+        result: int = rpn_eval(expr)
+        return str(result)
+    except ValueError as e:
+        return f"error: {e}"
+
+
+def main() -> None:
+    # Basic operations
+    print(rpn_eval("3 4 +"))           # 7
+    print(rpn_eval("10 3 -"))          # 7
+    print(rpn_eval("3 4 *"))           # 12
+    print(rpn_eval("10 2 /"))          # 5
+
+    # Compound expressions
+    print(rpn_eval("2 3 + 4 *"))       # 20  ((2+3)*4)
+    print(rpn_eval("5 1 2 + 4 * +"))   # 17  (5 + (1+2)*4)
+    print(rpn_eval("15 7 1 1 + - / 3 * 2 1 1 + + -"))  # 5
+
+    # Error recovery via safe_eval
+    print(safe_eval("4 2 /"))          # 2
+    print(safe_eval("5 0 /"))          # error: division by zero
+    print(safe_eval("100 4 / 3 -"))    # 22

@@ -1,0 +1,6 @@
+def main() -> None:
+    bs: str = "a\bc"
+    print(len(bs))
+    print(ord(bs[1]))
+    ff: str = "x\fy"
+    print(ord(ff[1]))

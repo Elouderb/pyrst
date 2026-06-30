@@ -327,6 +327,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
                         b'\'' => '\'',
                         b'"' => '"',
                         b'0' => '\0',
+                        b'b' => '\u{0008}',
+                        b'f' => '\u{000C}',
                         other => {
                             return Err(Error::Lex {
                                 span: Span::new(i, i + 2, line, col),
@@ -401,6 +403,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
                             b'\'' => '\'',
                             b'"' => '"',
                             b'0' => '\0',
+                            b'b' => '\u{0008}',
+                            b'f' => '\u{000C}',
                             b'\n' => {
                                 // Backslash-newline: line continuation inside triple string
                                 i += 2;
@@ -446,6 +450,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
                             b'\'' => '\'',
                             b'"' => '"',
                             b'0' => '\0',
+                            b'b' => '\u{0008}',
+                            b'f' => '\u{000C}',
                             other => {
                                 return Err(Error::Lex {
                                     span: Span::new(i, i + 2, line, col),

@@ -6346,7 +6346,7 @@ impl<'a> Codegen<'a> {
             }
             self.indent += 1;
             let bind = escape_ident(name);
-            self.line(&format!("let {} = {}.clone();", bind, match_val));
+            self.line(&format!("let mut {} = {}.clone();", bind, match_val));
             self.declared.insert(name.clone());
             let g = self.emit_expr(guard)?;
             self.line(&format!("if {} {{", g));
@@ -6407,7 +6407,7 @@ impl<'a> Codegen<'a> {
         self.indent += 1;
         if let Some(name) = capture_name {
             let bind = escape_ident(name);
-            self.line(&format!("let {} = {}.clone();", bind, match_val));
+            self.line(&format!("let mut {} = {}.clone();", bind, match_val));
             // The binding is a `let`-declared local for the rest of this arm.
             self.declared.insert(name.to_string());
         }

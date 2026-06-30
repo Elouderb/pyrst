@@ -49,9 +49,16 @@
 #
 # ERRORS — every malformed input RAISES a clear `ValueError` (unexpected char,
 # unterminated string, bad escape, bad number, trailing garbage). It NEVER panics
-# the program: in particular a `\uXXXX` escape in the surrogate range
-# (0xD800–0xDFFF) RAISES rather than calling `chr` (which would panic on a lone
-# surrogate). A pyrst exception is the honest failure mode here.
+# the program. In particular:
+#   - a `\uXXXX` escape in the surrogate range (0xD800–0xDFFF) RAISES rather than
+#     calling `chr` (which would panic on a lone surrogate); the message reports
+#     the codepoint in upper-case hex (e.g. `\uD800`).
+#   - per RFC 8259, a LEADING-ZERO integer (`01`, `-007`) is rejected, and a raw
+#     CONTROL character (U+0000–U+001F) inside a string must be escaped (an
+#     unescaped one is rejected).
+#   - an integer literal OUTSIDE the i64 range (e.g. `99999999999999999999`) is
+#     range-checked BEFORE conversion, so it raises a catchable ValueError instead
+#     of an i64-overflow panic. A pyrst exception is the honest failure mode.
 #
 # DEFERRED: surrogate-PAIR decoding (`😀` → one astral codepoint) — a
 # lone or paired surrogate raises a clear error instead. JSON literal `inf`/`nan`
@@ -237,6 +244,40 @@ def _hex_digit(c: str) -> int:
     raise ValueError("invalid \\u hex digit '" + c + "'")
 
 
+def _u4hex(code: int) -> str:
+    # `code` (0..65535) as an UPPER-CASE 4-digit hex string, e.g. 55296 -> "D800".
+    # Built from nibbles because pyrst's `hex()` yields a lower-case `0x…` form.
+    table: str = "0123456789ABCDEF"
+    d0: int = (code // 4096) % 16
+    d1: int = (code // 256) % 16
+    d2: int = (code // 16) % 16
+    d3: int = code % 16
+    return table[d0] + table[d1] + table[d2] + table[d3]
+
+
+def _i64_fits(digits: str, negative: bool) -> bool:
+    # Does the (sign-stripped) decimal digit string `digits` fit in pyrst's i64
+    # int? Used to range-check an integer token BEFORE int() converts it, so an
+    # out-of-range value becomes a catchable ValueError instead of an i64-overflow
+    # PANIC. `digits` has no sign and no leading zeros (the lone "0" aside), so its
+    # length equals its significant-digit count.
+    #
+    # i64 spans -9223372036854775808 .. 9223372036854775807 (both 19 digits). A
+    # PRECISE test that admits every in-range value and rejects every out-of-range
+    # one: by length, then a same-length lexicographic compare against the bound
+    # (equal-length decimal strings order the same as their numeric values).
+    n: int = len(digits)
+    if n < 19:
+        return True
+    if n > 19:
+        return False
+    bound: str = "9223372036854775807"
+    if negative:
+        bound = "9223372036854775808"
+    # Fits iff digits <= bound, i.e. NOT (digits > bound).
+    return not (digits > bound)
+
+
 # ── parser state ─────────────────────────────────────────────────────────────
 
 
@@ -334,6 +375,11 @@ class _Parser:
             if c == "\\":
                 out = out + self.parse_escape()
             else:
+                # RFC 8259: a raw control character (U+0000–U+001F) inside a string
+                # MUST be escaped. Reject an unescaped one. (Escaped forms reach
+                # `out` through the backslash branch above and are unaffected.)
+                if ord(c) < 32:
+                    raise ValueError("invalid unescaped control character in string")
                 out = out + c
 
     def parse_escape(self) -> str:
@@ -376,7 +422,15 @@ class _Parser:
             code = code * 16 + _hex_digit(self.advance())
             n = n + 1
         if code >= 55296 and code <= 57343:
-            raise ValueError("surrogate \\u" + str(code) + " is not supported")
+            # NOTE: the hex string is bound to a local FIRST, then raised. The
+            # call is deliberately NOT inlined into the `raise` expression: pyrst's
+            # dead-code pass (`analyze_called_functions`) does not traverse a
+            # `raise` statement's expression, so a helper reachable ONLY from a
+            # raise is wrongly pruned ("Dead function removed: _u4hex") and codegen
+            # then emits a call to a missing function. Binding here puts the call in
+            # an assignment (which the pass DOES traverse), keeping `_u4hex` alive.
+            hexcode: str = _u4hex(code)
+            raise ValueError("surrogate \\u" + hexcode + " is not supported")
         return chr(code)
 
     def parse_number(self) -> JsonValue:
@@ -384,15 +438,33 @@ class _Parser:
         # the run of number chars, track whether a `.` or exponent appeared, then
         # convert the slice with int()/float(). A `.`/`e`/`E` ⇒ float (kind 3),
         # else int (kind 2).
+        #
+        # Two safety checks are folded in here:
+        #   * leading-zero rejection — RFC 8259 forbids `01`/`-01` (a `0` may only
+        #     stand alone or be followed by `.`/`e`); silently keeping `1` would be
+        #     wrong, so a leading zero RAISES.
+        #   * integer-overflow rejection — int() over the token would PANIC (an
+        #     uncatchable i64 overflow) on a value outside i64; instead the digit
+        #     run is range-checked first so an out-of-range integer is a catchable
+        #     ValueError. (Floats can't panic: an over-large exponent yields `inf`.)
         start: int = self.pos
         is_float: bool = False
+        negative: bool = False
         if not self.at_end() and self.text[self.pos] == "-":
+            negative = True
             self.pos = self.pos + 1
         # integer part — at least one digit required
         if self.at_end() or not _is_digit(self.text[self.pos]):
             raise ValueError("invalid number at position " + str(start))
+        int_start: int = self.pos
+        first_digit: str = self.text[self.pos]
         while not self.at_end() and _is_digit(self.text[self.pos]):
             self.pos = self.pos + 1
+        int_len: int = self.pos - int_start
+        # Leading zero: a `0` immediately followed by another digit (e.g. `01`,
+        # `-007`) is forbidden. A lone `0`, or `0` before `.`/`e`, is fine.
+        if first_digit == "0" and int_len > 1:
+            raise ValueError("invalid number: leading zero")
         # fraction
         if not self.at_end() and self.text[self.pos] == ".":
             is_float = True
@@ -414,6 +486,14 @@ class _Parser:
         token: str = self.text[start:self.pos]
         if is_float:
             return json_float(float(token))
+        # Integer: range-check the bare digit run BEFORE int() so a too-large value
+        # raises instead of panicking. `int_end` is captured here (after the int
+        # scan, before fraction/exponent — which an int can't have) so the digit
+        # slice excludes any sign.
+        int_end: int = int_start + int_len
+        digits: str = self.text[int_start:int_end]
+        if not _i64_fits(digits, negative):
+            raise ValueError("integer out of range: " + token)
         return json_int(int(token))
 
     def parse_array(self) -> JsonValue:

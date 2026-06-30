@@ -88,4 +88,37 @@ def main() -> None:
     except ValueError as e4:
         print("err: " + e4)                # err: invalid literal, expected 'null'
 
+    # ── RFC validations that must RAISE (review blockers) ───────────────────────
+    # leading-zero integer (RFC 8259 forbids it) — and a bare 0 still parses
+    try:
+        oops5: JsonValue = loads('01')
+        print("WRONG: accepted leading zero")
+    except ValueError as e5:
+        print("err: " + e5)                # err: invalid number: leading zero
+    print(str(loads("0").as_int()))        # 0  (a lone zero is valid)
+
+    # a raw (unescaped) control character inside a string must be rejected;
+    # the ESCAPED form is unaffected (decodes to a real newline).
+    try:
+        oops6: JsonValue = loads('"a' + chr(10) + 'b"')
+        print("WRONG: accepted raw control char")
+    except ValueError as e6:
+        print("err: " + e6)                # err: invalid unescaped control character in string
+    print(str(len(loads('"a\\nb"').as_str())))  # 3  (escaped \n still works)
+
+    # an integer outside i64 must raise (NOT panic); the i64 max still parses.
+    try:
+        oops7: JsonValue = loads('99999999999999999999')
+        print("WRONG: accepted out-of-range int")
+    except ValueError as e7:
+        print("err: " + e7)                # err: integer out of range: 99999999999999999999
+    print(str(loads("9223372036854775807").as_int()))  # 9223372036854775807
+
+    # a surrogate \u escape must raise, with the codepoint shown in upper hex.
+    try:
+        oops8: JsonValue = loads('"\\ud800"')
+        print("WRONG: accepted surrogate")
+    except ValueError as e8:
+        print("err: " + e8)                # err: surrogate \uD800 is not supported
+
     print("done")

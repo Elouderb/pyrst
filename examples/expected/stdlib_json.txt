@@ -26,4 +26,11 @@ err: unterminated string
 err: trailing garbage at position 7
 err: expected string key in object
 err: invalid literal, expected 'null'
+err: invalid number: leading zero
+0
+err: invalid unescaped control character in string
+3
+err: integer out of range: 99999999999999999999
+9223372036854775807
+err: surrogate \uD800 is not supported
 done

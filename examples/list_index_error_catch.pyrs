@@ -1,0 +1,40 @@
+# Golden (perf card 082e3fc4): the borrow-based list index helper must still
+# raise a catchable IndexError (payload "IndexError\0list index out of range")
+# for an out-of-range index — via a self.field (borrow path) and via a
+# temporary (fallback path).
+
+class Box:
+    items: list[int]
+
+    def __init__(self) -> None:
+        self.items = [1, 2, 3]
+
+    def at(self, i: int) -> int:
+        return self.items[i]
+
+
+def main() -> None:
+    b: Box = Box()
+
+    # in-range read still works (borrow path)
+    print(b.at(1))                       # 2
+
+    # out-of-range via self.field (borrow path) -> catchable IndexError
+    try:
+        v: int = b.at(10)
+        print("WRONG " + str(v))
+    except IndexError as e:
+        print("caught: " + e)
+
+    # out-of-range via a temporary (fallback path) -> catchable IndexError
+    try:
+        w: int = make()[5]
+        print("WRONG " + str(w))
+    except IndexError as e:
+        print("caught: " + e)
+
+    print("done")
+
+
+def make() -> list[int]:
+    return [1, 2]

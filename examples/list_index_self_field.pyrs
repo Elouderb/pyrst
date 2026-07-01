@@ -1,0 +1,46 @@
+# Golden (perf card 082e3fc4): list index reads borrow the base and clone only
+# the element. A while-index loop over a `self.field` list lowers to
+# `__py_list_get(&self.items, i)` (no whole-container clone) and stays correct,
+# including negative indices (the element is still deep-cloned -> value
+# semantics preserved).
+
+class IntList:
+    items: list[int]
+
+    def __init__(self) -> None:
+        self.items = []
+
+    def add(self, v: int) -> None:
+        self.items.append(v)
+
+    def total(self) -> int:
+        acc: int = 0
+        i: int = 0
+        n: int = len(self.items)
+        while i < n:
+            acc = acc + self.items[i]
+            i = i + 1
+        return acc
+
+    def last(self) -> int:
+        return self.items[-1]
+
+
+def main() -> None:
+    xs: IntList = IntList()
+    k: int = 0
+    while k < 5:
+        xs.add(k * 10)
+        k = k + 1
+
+    print(xs.total())      # 0+10+20+30+40 = 100
+    print(xs.last())       # 40 (negative index -1 through self.field)
+    print(xs.items[-2])    # 30 (negative index through a local's field)
+    print(xs.items[0])     # 0
+
+    # element value semantics: mutating the read-out copy must not touch the list
+    row: list[int] = [1, 2, 3]
+    grid: list[list[int]] = [row, row]
+    first: list[int] = grid[0]
+    first.append(99)
+    print(len(grid[0]))    # 3 (the stored inner list is unchanged)

@@ -1,0 +1,4 @@
+2
+caught: list index out of range
+caught: list index out of range
+done

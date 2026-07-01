@@ -2775,6 +2775,65 @@ impl<'a> Codegen<'a> {
         }
     }
 
+    /// (PERF) True when `e` lowers to a Rust *place* we can borrow (`&e`) cheaply:
+    /// a bare variable, or an ordinary struct-field chain rooted at one. This is
+    /// the "borrow the base" precondition for list index/slice reads — when it
+    /// holds we clone only the element, not the whole container. The Attr rules
+    /// mirror the `emit_expr` Attr arm's plain-field branch so `emit_expr(obj)`
+    /// yields a real place: a `@property` is a getter call (owned temp), and a
+    /// polymorphic-base field read lowers to a `__field_x()` accessor call — both
+    /// are temporaries, not borrowable places. A module CONST may lower to a
+    /// `&'static` slice or a `.to_string()` temp, so it also stays on the clone
+    /// path. Anything else (a call result, slice, literal, nested subscript) is a
+    /// temporary rvalue and returns false.
+    fn is_borrowable_place(&self, e: &Expr) -> bool {
+        match e {
+            Expr::Ident(n, _) => !(self.const_names.contains(n) && !self.locals.contains_key(n)),
+            Expr::Attr { obj, name, .. } => {
+                if self.is_property_access(obj, name) {
+                    return false;
+                }
+                let poly_field = !matches!(obj.as_ref(),
+                        Expr::Ident(n, _) if n == "self" || self.concrete_struct_params.contains(n))
+                    && matches!(&self.type_of_expr(obj),
+                                Ty::Class(b, _) if self.is_polymorphic_base(b));
+                !poly_field && self.is_borrowable_place(obj)
+            }
+            _ => false,
+        }
+    }
+
+    /// (PERF) True when evaluating the index/slice sub-expression `e` cannot
+    /// mutate or move the base container we hold a shared borrow of — it performs
+    /// only reads, arithmetic, and the read-only `len()` builtin. This is the
+    /// second precondition (with `is_borrowable_place`) for the borrow fast path:
+    /// because every accepted form only SHARED-borrows the base, the emitted
+    /// `__py_list_get(&base, <idx>)` (base shared + idx shared) always compiles.
+    /// Any other call (a mutating method like `.pop()`, or an unknown user call)
+    /// forces the conservative clone fallback — honest correctness over a silent
+    /// miscompile.
+    fn is_borrow_safe_index(&self, e: &Expr) -> bool {
+        match e {
+            Expr::Int(..) | Expr::Float(..) | Expr::Bool(..) | Expr::Str(..)
+            | Expr::None_(..) | Expr::Ident(..) => true,
+            Expr::BinOp { lhs, rhs, .. } =>
+                self.is_borrow_safe_index(lhs) && self.is_borrow_safe_index(rhs),
+            Expr::UnOp { expr, .. } => self.is_borrow_safe_index(expr),
+            Expr::IfExp { test, body, orelse, .. } =>
+                self.is_borrow_safe_index(test)
+                    && self.is_borrow_safe_index(body)
+                    && self.is_borrow_safe_index(orelse),
+            Expr::Index { obj, idx, .. } =>
+                self.is_borrow_safe_index(obj) && self.is_borrow_safe_index(idx),
+            Expr::Attr { obj, name, .. } =>
+                !self.is_property_access(obj, name) && self.is_borrow_safe_index(obj),
+            Expr::Call { callee, args, .. } =>
+                matches!(callee.as_ref(), Expr::Ident(n, _) if n == "len")
+                    && args.iter().all(|a| self.is_borrow_safe_index(a)),
+            _ => false,
+        }
+    }
+
     /// The SINGLE ownership-decision point for value semantics (EPIC-4 V1).
     ///
     /// Emit `e` in a position that takes ownership of the value (constructor /
@@ -6071,13 +6130,25 @@ impl<'a> Codegen<'a> {
                         // Explicit bounds check emits "IndexError\0..." so the
                         // try/except dispatcher can catch it as IndexError.
                         //
-                        // The index is bound ONCE to `__i_idx: i64` first — see the
-                        // Str arm above for why (nested-subscript parse error +
-                        // single-evaluation of side-effecting indices).
-                        format!(
-                            "{{ let __list = {}.clone(); let __i_idx: i64 = {}; let __idx = if __i_idx < 0 {{ ((__list.len() as i64) + __i_idx) as usize }} else {{ __i_idx as usize }}; if __idx >= __list.len() {{ panic!(\"IndexError\\0list index out of range\") }}; __list[__idx].clone() }}",
-                            o, i
-                        )
+                        // FAST PATH: when the base is a borrowable place and the
+                        // index cannot mutate it, borrow the container and clone
+                        // only the element (O(1) vs cloning the whole Vec). The
+                        // `len(self.items) - 1` form (peek) qualifies: `len()` only
+                        // shared-borrows, compatible with the `&base` read borrow.
+                        if self.is_borrowable_place(obj) && self.is_borrow_safe_index(idx) {
+                            format!("__py_list_get(&{}, {})", o, i)
+                        } else {
+                            // FALLBACK: clone the base into `__list` FIRST (so a
+                            // mutating/moving index still compiles), then bounds-
+                            // check and clone the element. The index is bound ONCE
+                            // to `__i_idx: i64` — see the Str arm above for why
+                            // (nested-subscript parse error + single-evaluation of
+                            // side-effecting indices).
+                            format!(
+                                "{{ let __list = {}.clone(); let __i_idx: i64 = {}; let __idx = if __i_idx < 0 {{ ((__list.len() as i64) + __i_idx) as usize }} else {{ __i_idx as usize }}; if __idx >= __list.len() {{ panic!(\"IndexError\\0list index out of range\") }}; __list[__idx].clone() }}",
+                                o, i
+                            )
+                        }
                     }
                 }
             }
@@ -6132,10 +6203,19 @@ impl<'a> Codegen<'a> {
                                 // Simple: x[start:stop]
                                 let start_s = self.emit_expr(s)?;
                                 let stop_s = self.emit_expr(e)?;
-                                format!(
-                                    "{{ let __list = {}.clone(); let __len = __list.len() as i64; let __start = if {} < 0 {{ ((__len + {}) as usize).min(__list.len()) }} else {{ ({} as usize).min(__list.len()) }}; let __stop = if {} < 0 {{ ((__len + {}) as usize).min(__list.len()) }} else {{ ({} as usize).min(__list.len()) }}; __list[__start..(__start + (__stop - __start))].to_vec() }}",
-                                    o, start_s, start_s, start_s, stop_s, stop_s, stop_s
-                                )
+                                // Borrow the base when it is a place and neither
+                                // bound can mutate it; else snapshot-clone (below).
+                                if self.is_borrowable_place(obj)
+                                    && self.is_borrow_safe_index(s)
+                                    && self.is_borrow_safe_index(e)
+                                {
+                                    format!("__py_list_slice(&{}, {}, {})", o, start_s, stop_s)
+                                } else {
+                                    format!(
+                                        "{{ let __list = {}.clone(); let __len = __list.len() as i64; let __start = if {} < 0 {{ ((__len + {}) as usize).min(__list.len()) }} else {{ ({} as usize).min(__list.len()) }}; let __stop = if {} < 0 {{ ((__len + {}) as usize).min(__list.len()) }} else {{ ({} as usize).min(__list.len()) }}; __list[__start..(__start + (__stop - __start))].to_vec() }}",
+                                        o, start_s, start_s, start_s, stop_s, stop_s, stop_s
+                                    )
+                                }
                             }
                             _ => {
                                 // General with step and negative index handling
@@ -6147,10 +6227,21 @@ impl<'a> Codegen<'a> {
                                 let start_expr = format!("({})", start_val);
                                 let stop_expr = format!("({})", stop_val);
 
-                                format!(
-                                    "{{ let __list = {}.clone(); let mut __result = Vec::new(); let __len = __list.len() as i64; let __start = (if {} < 0 {{ (__len + {}) as usize }} else {{ {} as usize }}).min(__list.len()); let __stop = (if {} < 0 {{ (__len + {}) as usize }} else {{ {} as usize }}).min(__list.len()); let __step = {}; if __step > 0 {{ let mut __i = __start as i64; while __i < __stop as i64 {{ __result.push(__list[__i as usize].clone()); __i += __step; }} }} else if __step < 0 {{ let mut __i = (__stop as i64) - 1; while __i >= __start as i64 {{ __result.push(__list[__i as usize].clone()); __i += __step; }} }} __result }}",
-                                    o, start_expr, start_val, start_val, stop_expr, stop_val, stop_val, step_val
-                                )
+                                // Borrow the base when it is a place and no present
+                                // bound (start/stop/step) can mutate it. The helper
+                                // takes the already-defaulted i64 bounds and does the
+                                // negative/step handling internally.
+                                let subs_safe = start.as_ref().map_or(true, |e| self.is_borrow_safe_index(e))
+                                    && stop.as_ref().map_or(true, |e| self.is_borrow_safe_index(e))
+                                    && step.as_ref().map_or(true, |e| self.is_borrow_safe_index(e));
+                                if self.is_borrowable_place(obj) && subs_safe {
+                                    format!("__py_list_slice_step(&{}, {}, {}, {})", o, start_val, stop_val, step_val)
+                                } else {
+                                    format!(
+                                        "{{ let __list = {}.clone(); let mut __result = Vec::new(); let __len = __list.len() as i64; let __start = (if {} < 0 {{ (__len + {}) as usize }} else {{ {} as usize }}).min(__list.len()); let __stop = (if {} < 0 {{ (__len + {}) as usize }} else {{ {} as usize }}).min(__list.len()); let __step = {}; if __step > 0 {{ let mut __i = __start as i64; while __i < __stop as i64 {{ __result.push(__list[__i as usize].clone()); __i += __step; }} }} else if __step < 0 {{ let mut __i = (__stop as i64) - 1; while __i >= __start as i64 {{ __result.push(__list[__i as usize].clone()); __i += __step; }} }} __result }}",
+                                        o, start_expr, start_val, start_val, stop_expr, stop_val, stop_val, step_val
+                                    )
+                                }
                             }
                         }
                     }
@@ -7081,6 +7172,34 @@ pub fn emit_program(modules: &[(Module, String)], ctx: &TyCtx) -> Result<String>
     cg.line("fn __py_ipow(base: i64, exp: i64) -> i64 {");
     cg.line("    if exp < 0 { panic!(\"negative exponent for integer ** integer\"); }");
     cg.line("    base.pow(exp as u32)");
+    cg.line("}");
+    // List index/slice reads. The BASE is passed by shared reference (`&[T]`) so
+    // only the returned ELEMENT is cloned — an indexed loop is O(n) instead of
+    // the O(n^2) that cloning the whole container per access produced. Value
+    // semantics are unchanged (the element is still deep-`.clone()`d). Callers
+    // borrow the base (`__py_list_get(&xs, i)`) only when it is a genuine place
+    // and the index cannot mutate it; otherwise emit_expr falls back to an inline
+    // snapshot-clone form (see the Index/Slice arms). Bodies mirror that inline
+    // form character-for-character, incl. the byte-identical IndexError payload.
+    cg.line("fn __py_list_get<T: Clone>(__list: &[T], __i_idx: i64) -> T {");
+    cg.line("    let __idx = if __i_idx < 0 { ((__list.len() as i64) + __i_idx) as usize } else { __i_idx as usize };");
+    cg.line("    if __idx >= __list.len() { panic!(\"IndexError\\0list index out of range\") }");
+    cg.line("    __list[__idx].clone()");
+    cg.line("}");
+    cg.line("fn __py_list_slice<T: Clone>(__list: &[T], __start_in: i64, __stop_in: i64) -> Vec<T> {");
+    cg.line("    let __len = __list.len() as i64;");
+    cg.line("    let __start = if __start_in < 0 { ((__len + __start_in) as usize).min(__list.len()) } else { (__start_in as usize).min(__list.len()) };");
+    cg.line("    let __stop = if __stop_in < 0 { ((__len + __stop_in) as usize).min(__list.len()) } else { (__stop_in as usize).min(__list.len()) };");
+    cg.line("    __list[__start..(__start + (__stop - __start))].to_vec()");
+    cg.line("}");
+    cg.line("fn __py_list_slice_step<T: Clone>(__list: &[T], __start_in: i64, __stop_in: i64, __step: i64) -> Vec<T> {");
+    cg.line("    let mut __result: Vec<T> = Vec::new();");
+    cg.line("    let __len = __list.len() as i64;");
+    cg.line("    let __start = (if __start_in < 0 { (__len + __start_in) as usize } else { __start_in as usize }).min(__list.len());");
+    cg.line("    let __stop = (if __stop_in < 0 { (__len + __stop_in) as usize } else { __stop_in as usize }).min(__list.len());");
+    cg.line("    if __step > 0 { let mut __i = __start as i64; while __i < __stop as i64 { __result.push(__list[__i as usize].clone()); __i += __step; } }");
+    cg.line("    else if __step < 0 { let mut __i = (__stop as i64) - 1; while __i >= __start as i64 { __result.push(__list[__i as usize].clone()); __i += __step; } }");
+    cg.line("    __result");
     cg.line("}");
     // (try/except control flow) Signal a try BODY's escaping control flow out of
     // the catch_unwind closure: `Return(R)` carries the enclosing function's

@@ -1036,18 +1036,21 @@ fn is_bare_main_call(s: &Stmt) -> bool {
 /// first parameter of a method) is recognized and exempted below.
 const RUST_NON_RAW_KEYWORDS: &[&str] = &["crate", "self", "super", "Self"];
 
-/// Reserved codegen identifier prefix. The compiler lowers several internal
+/// Reserved codegen identifier prefixes. The compiler lowers several internal
 /// constructs to Rust identifiers under the `__pyrst_` namespace: module-level
 /// constants become `const __pyrst_const_<name>` (see codegen's `mangle_const`),
 /// and a generator's eager accumulator is `__pyrst_gen_acc` (see codegen's
-/// `emit_func`). A USER identifier sharing this prefix could collide with one of
-/// those generated names and silently miscompile (e.g. a generator local named
-/// `__pyrst_gen_acc`, or `__pyrst_const_x` aliasing the mangled const for `x`).
-/// The WHOLE `__pyrst_` prefix is therefore reserved for compiler-generated
-/// names and rejected honestly at typeck rather than risking a silent clash. (No
-/// real program uses this prefix; it exists only to make the lowering
-/// collision-proof and to keep future internals safe by construction.)
-const RESERVED_CODEGEN_PREFIX: &str = "__pyrst_";
+/// `emit_func`). The always-emitted runtime prelude additionally defines
+/// helpers under the `__py_` namespace (`__py_mod`, `__py_floordiv`,
+/// `__py_list_get`, …). A USER identifier sharing either prefix could collide
+/// with one of those generated names — a `__pyrst_` clash can silently
+/// miscompile (e.g. a generator local named `__pyrst_gen_acc`), and a `__py_`
+/// clash duplicates a prelude `fn` (rustc E0428). BOTH prefixes are therefore
+/// reserved for compiler-generated names and rejected honestly at typeck
+/// rather than risking a clash. (No real program uses these prefixes; they
+/// exist only to make the lowering collision-proof and to keep future
+/// internals safe by construction.)
+const RESERVED_CODEGEN_PREFIXES: &[&str] = &["__pyrst_", "__py_"];
 
 fn reject_if_reserved(name: &str, span: Span, role: &str) -> Result<()> {
     if RUST_NON_RAW_KEYWORDS.contains(&name) {
@@ -1062,16 +1065,19 @@ fn reject_if_reserved(name: &str, span: Span, role: &str) -> Result<()> {
             ),
         });
     }
-    if name.starts_with(RESERVED_CODEGEN_PREFIX) {
-        return Err(Error::Type {
-            span,
-            msg: format!(
-                "`{}` cannot be used as a {} name: the `{}` prefix is reserved for \
-                 compiler-generated identifiers (e.g. module-constant lowering and \
-                 generator accumulators). Rename it.",
-                name, role, RESERVED_CODEGEN_PREFIX
-            ),
-        });
+    for prefix in RESERVED_CODEGEN_PREFIXES {
+        if name.starts_with(prefix) {
+            return Err(Error::Type {
+                span,
+                msg: format!(
+                    "`{}` cannot be used as a {} name: the `{}` prefix is reserved for \
+                     compiler-generated identifiers (e.g. module-constant lowering, \
+                     generator accumulators, and runtime helpers like `__py_list_get`). \
+                     Rename it.",
+                    name, role, prefix
+                ),
+            });
+        }
     }
     Ok(())
 }

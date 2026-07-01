@@ -2817,8 +2817,11 @@ impl<'a> Codegen<'a> {
             Expr::Int(..) | Expr::Float(..) | Expr::Bool(..) | Expr::Str(..)
             | Expr::None_(..) | Expr::Ident(..) => true,
             Expr::BinOp { lhs, rhs, .. } =>
-                self.is_borrow_safe_index(lhs) && self.is_borrow_safe_index(rhs),
-            Expr::UnOp { expr, .. } => self.is_borrow_safe_index(expr),
+                self.is_borrow_safe_index(lhs) && self.is_borrow_safe_index(rhs)
+                    && !self.operand_moves_by_dunder(lhs)
+                    && !self.operand_moves_by_dunder(rhs),
+            Expr::UnOp { expr, .. } =>
+                self.is_borrow_safe_index(expr) && !self.operand_moves_by_dunder(expr),
             Expr::IfExp { test, body, orelse, .. } =>
                 self.is_borrow_safe_index(test)
                     && self.is_borrow_safe_index(body)
@@ -2832,6 +2835,21 @@ impl<'a> Codegen<'a> {
                     && args.iter().all(|a| self.is_borrow_safe_index(a)),
             _ => false,
         }
+    }
+
+    /// (PERF) True when using `e` as an arithmetic/unary OPERAND may MOVE it:
+    /// a class-typed operand invokes a dunder trait impl that takes its
+    /// operands BY VALUE (`std::ops` convention — `__add__` is
+    /// `Add::add(self, rhs)`), so `xs[h + h2]` would move `h` while the fast
+    /// path holds `&h.items` alive (E0505). A `TypeVar` operand may
+    /// monomorphize to such a class, and `Unknown` gets the same conservative
+    /// treatment: force the clone fallback rather than emit a borrow that a
+    /// by-value dunder call can invalidate.
+    fn operand_moves_by_dunder(&self, e: &Expr) -> bool {
+        matches!(
+            self.type_of_expr(e),
+            Ty::Class(..) | Ty::TypeVar(_) | Ty::Unknown
+        )
     }
 
     /// The SINGLE ownership-decision point for value semantics (EPIC-4 V1).

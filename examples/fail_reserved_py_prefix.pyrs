@@ -1,0 +1,12 @@
+# NEGATIVE: the `__py_` prefix is reserved for the compiler's runtime prelude
+# helpers (`__py_mod`, `__py_list_get`, ...). A user function with this prefix
+# would duplicate a prelude `fn` (rustc E0428), so typeck must reject it
+# honestly at check time — like the `__pyrst_` prefix already is.
+
+
+def __py_list_get(x: int) -> int:
+    return x
+
+
+def main() -> None:
+    print(__py_list_get(1))

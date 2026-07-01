@@ -1,0 +1,29 @@
+# Regression (review of card 082e3fc4): a class-typed operand inside an index
+# expression invokes a BY-VALUE dunder impl (std::ops convention), so the borrow
+# fast path (`__py_list_get(&h.items, h + h2)`) would move `h` while `&h.items`
+# is alive -> E0505. `is_borrow_safe_index` must force the clone FALLBACK here.
+# This program compiled before the borrow fast path existed and must keep
+# compiling after it. (Each holder is used only once past its dunder call:
+# BinOp dunder operands MOVE today — a separate, pre-existing consuming-site
+# gap tracked on the follow-ups card.)
+
+
+class Holder:
+    items: list[int]
+
+    def __init__(self, items: list[int]) -> None:
+        self.items = items
+
+    def __add__(self, other: Holder) -> int:
+        return len(self.items) - len(other.items)
+
+
+def main() -> None:
+    h: Holder = Holder([10, 20, 30])
+    h2: Holder = Holder([1, 2])
+    # h + h2 == 3 - 2 == 1 -> h.items[1] == 20
+    print(h.items[h + h2])
+    g: Holder = Holder([5, 6, 7])
+    g2: Holder = Holder([8])
+    # UnOp over a nested class-operand BinOp: -(g + g2) == -2 -> g.items[-2]
+    print(g.items[-(g + g2)])

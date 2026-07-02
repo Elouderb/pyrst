@@ -1,0 +1,44 @@
+# CARD 0c4bb6be: zip() with 3+ positional arguments previously typechecked
+# OK (check_expr/infer_expr_ty are already variadic) but failed to BUILD --
+# codegen's `emit_builtin_call` only had a mechanical lowering for the
+# 2-arg case (`a.zip(b)`), so 3+ args fell through to a generic call and
+# rustc raised a raw, unexplained E0425/E0599. CPython's zip yields a FLAT
+# N-tuple; Rust's chained `.zip()` NESTS (`a.zip(b).zip(c)` is `((a,b),c)`,
+# not `(a,b,c)`), so the fix folds the chain then flattens it with a
+# `.map()`. Covers both a plain for-loop and a list comprehension, and both
+# an all-list source and a mixed list+GENERATOR source. Every expected line
+# below is python3-verified.
+def nums(n: int) -> Iterator[int]:
+    i: int = 0
+    while i < n:
+        yield i
+        i = i + 1
+
+def main() -> None:
+    xs: list[int] = [1, 2, 3]
+    ys: list[int] = [10, 20, 30]
+    zs: list[int] = [100, 200, 300]
+
+    # 3-arg zip over three lists, in a for-loop
+    # python3: 666
+    total: int = 0
+    for a, b, c in zip(xs, ys, zs):
+        total = total + a + b + c
+    print(total)
+
+    # 3-arg zip over three lists, in a comprehension
+    # python3: [111, 222, 333]
+    print([a + b + c for a, b, c in zip(xs, ys, zs)])
+
+    # 3-arg zip with one GENERATOR argument, in a for-loop
+    # python3: 69
+    total2: int = 0
+    for a, b, c in zip(xs, ys, nums(3)):
+        total2 = total2 + a + b + c
+    print(total2)
+
+    # 3-arg zip with one GENERATOR argument, in a comprehension
+    # python3: [11, 23, 35]
+    print([a + b + c for a, b, c in zip(xs, ys, nums(3))])
+
+main()

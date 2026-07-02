@@ -1,0 +1,54 @@
+# CARD 55343eaa: `sorted(pairs, key=lambda t: t[0])` over a
+# `list[tuple[int, str]]` previously failed to BUILD. The key-lambda's body
+# emission bound the lambda's parameter to `Ty::Unknown` (not the sorted
+# source's actual element type), so `t[0]` -- via `type_of_expr` in
+# `emit_expr`'s Index arm -- couldn't see that `t` is a `Ty::Tuple(..)` and
+# fell through to the LIST-indexing lowering (`__py_list_get`, slice-based)
+# instead of tuple field access (`.0`) -- raw rustc E0599 (`Vec` has no
+# field `.0`) at build. `min`/`max` share the exact same key-lambda body
+# emission code path and had the identical bug; fixed identically. Uses
+# duplicate first-elements (two pairs both keyed `1`) to verify Python's
+# STABLE-SORT guarantee -- 'a' stays before 'b' both ascending AND under a
+# reversed comparator (`reverse=True` on equal keys must NOT flip their
+# relative order).
+#
+# `min`/`max` results are captured into an EXPLICITLY typed variable rather
+# than printed directly: `infer_expr_ty` (the pure oracle, distinct from
+# `check_expr`) has no arm for a bare `min`/`max` call at all, so
+# `type_of_expr` of the CALL ITSELF is `Unknown` regardless of this card's
+# fix — printing it directly falls to raw `{}` Display, which doesn't
+# compile against a tuple. An explicit annotation (`: tuple[int, str] =`)
+# sources the variable's type from the ANNOTATION, not that oracle gap
+# (see `Stmt::Assign`'s `Some(t)` arm), so it prints correctly via
+# `.py_repr()`. That oracle gap is separate/pre-existing/out of scope here
+# (it also affects plain `min`/`max` with no `key=` at all) — noted for a
+# follow-up card rather than fixed in this one, since patching it changes
+# float-formatting behavior for unrelated existing goldens. Each variable
+# gets its OWN fresh list literal (not shared with `pairs`) because
+# codegen's min/max `key=` lowering MOVES its source instead of cloning it
+# (unlike `sorted`'s, which clones) — a separate, pre-existing, also
+# out-of-scope gap. Every expected line below is python3-verified.
+def main() -> None:
+    pairs: list[tuple[int, str]] = [(3, "c"), (1, "a"), (1, "b"), (2, "z")]
+
+    # ascending by first tuple element -- (1,'a') stays before (1,'b')
+    # python3: [(1, 'a'), (1, 'b'), (2, 'z'), (3, 'c')]
+    print(sorted(pairs, key=lambda t: t[0]))
+
+    # reverse=True -- a stable REVERSED comparator, not sort-then-.reverse():
+    # (1,'a') still stays before (1,'b') (their relative order is unchanged)
+    # python3: [(3, 'c'), (2, 'z'), (1, 'a'), (1, 'b')]
+    print(sorted(pairs, key=lambda t: t[0], reverse=True))
+
+    # min/max with the same tuple-indexing key= lambda
+    pairs_min: list[tuple[int, str]] = [(3, "c"), (1, "a"), (1, "b"), (2, "z")]
+    lowest: tuple[int, str] = min(pairs_min, key=lambda t: t[0])
+    # python3: (1, 'a')
+    print(lowest)
+
+    pairs_max: list[tuple[int, str]] = [(3, "c"), (1, "a"), (1, "b"), (2, "z")]
+    highest: tuple[int, str] = max(pairs_max, key=lambda t: t[0])
+    # python3: (3, 'c')
+    print(highest)
+
+main()

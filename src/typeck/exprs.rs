@@ -1165,6 +1165,29 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                         for (_, v) in kwargs {
                             check_expr(v, env)?;
                         }
+                        // (CARD 0c4bb6be) Codegen's zip lowering has a
+                        // MECHANICAL N-ary form for 2-4 arguments only: a bare
+                        // `.zip()` for 2, and a chained
+                        // `.zip().zip()....map()` flatten for 3/4 (CPython
+                        // yields a flat N-tuple; Rust's chained `.zip()`
+                        // nests — `a.zip(b).zip(c)` is `((a,b),c)`, not
+                        // `(a,b,c)` — so the flatten is hand-written per
+                        // arity rather than open-ended). 5+ args previously
+                        // typechecked OK here (this arm never looked at
+                        // `args.len()`) and then failed at BUILD with a raw,
+                        // unexplained rustc E0425/E0599. Reject it HONESTLY
+                        // here instead — both `check` and `build` run this
+                        // same `check_bodies` pass, so both reject it with a
+                        // clear message rather than only one failing loudly.
+                        if args.len() > 4 {
+                            return Err(Error::Type {
+                                span: *span,
+                                msg: format!(
+                                    "zip with {} arguments is not supported; nest zip calls",
+                                    args.len()
+                                ),
+                            });
+                        }
                         if any_unknown || elem_tys.is_empty() {
                             Ty::Unknown
                         } else {

@@ -1,0 +1,22 @@
+# CARD 0c4bb6be: enumerate() over a `str` previously typechecked OK (the
+# oracle already special-cases Ty::Str -> Tuple(Int, Str)) but failed to
+# BUILD -- codegen's `emit_builtin_call` "enumerate" arm had no Ty::Str arm
+# at all, so it fell to the generic `.iter().cloned()` fallback, and
+# `String` has no `.iter()` (raw rustc E0599). Fixed by mirroring the
+# `.chars().map(|c| c.to_string())` arm the comprehension chain (and
+# `Stmt::For`) already use for a bare `for c in some_str`. Covers both a
+# plain for-loop and a list comprehension. Every expected line below is
+# python3-verified.
+def main() -> None:
+    s: str = "abc"
+
+    # for-loop over enumerate(str)
+    # python3: 0:a / 1:b / 2:c
+    for i, c in enumerate(s):
+        print(str(i) + ":" + c)
+
+    # comprehension over enumerate(str)
+    # python3: ['0-a', '1-b', '2-c']
+    print([f"{i}-{c}" for i, c in enumerate(s)])
+
+main()

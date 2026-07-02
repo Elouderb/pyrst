@@ -1,0 +1,17 @@
+# CARD 0c4bb6be: codegen's zip lowering only has a mechanical N-ary form for
+# 2-4 arguments (a bare `.zip()` for 2; a chained `.zip()...map()` flatten
+# for 3/4 -- CPython's zip yields a flat N-tuple, but Rust's chained
+# `.zip()` nests). 5+ args previously typechecked OK (the oracle never
+# looked at arg count) and then failed at BUILD with a raw, unexplained
+# rustc error. Rejected HONESTLY now at `pyrst check` AND `pyrst build`.
+# Expected substring: "zip with 5 arguments is not supported; nest zip calls"
+def main() -> None:
+    a: list[int] = [1, 2, 3]
+    b: list[int] = [4, 5, 6]
+    c: list[int] = [7, 8, 9]
+    d: list[int] = [10, 11, 12]
+    e: list[int] = [13, 14, 15]
+    for v1, v2, v3, v4, v5 in zip(a, b, c, d, e):
+        print(v1 + v2 + v3 + v4 + v5)
+
+main()

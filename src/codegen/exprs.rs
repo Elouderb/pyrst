@@ -788,6 +788,18 @@ impl<'a> Codegen<'a> {
                         let is_range = a.contains("..");
                         let iter_chain = if is_range {
                             format!("({}).into_iter()", a)
+                        } else if matches!(self.type_of_expr(&args[0]), Ty::Str) {
+                            // (CARD 0c4bb6be) Iterating a str yields
+                            // 1-character strings (Python semantics) — mirrors
+                            // the Str arm already used by the comprehension
+                            // chain (ListComp/SetComp/DictComp) and the
+                            // `Stmt::For` lowering. Previously missing here,
+                            // so `enumerate("hi")` typechecked (the oracle
+                            // already knew the element type) but failed at
+                            // BUILD: `String` has no `.iter()`, so the
+                            // fallback `.iter().cloned()` below was a raw
+                            // rustc E0599.
+                            format!("{}.chars().map(|__c| __c.to_string())", a)
                         } else if matches!(self.type_of_expr(&args[0]), Ty::Iterator(_)) {
                             // (LAZY-GEN V1-c) A generator source (`Gen<T>`) is
                             // itself an `Iterator` yielding owned `T` — consume
@@ -800,32 +812,52 @@ impl<'a> Codegen<'a> {
                     }
                 }
 
-                // Inline zip(a, b) — emits iterator chain without collecting
+                // Inline zip(a, b, ...) — emits iterator chain without collecting.
+                // (CARD 0c4bb6be) CPython's `zip` is variadic and yields FLAT
+                // N-tuples; Rust's `Iterator::zip` is binary and NESTS when
+                // chained (`a.zip(b).zip(c)` -> `((a,b),c)`, not `(a,b,c)`).
+                // The 2-arg case needs no flattening (Rust's pair already
+                // matches Python's 2-tuple) and stays the exact byte-identical
+                // fast path it always was. For 3-4 args, fold a nested
+                // `.zip()` chain then `.map()` it into a flat tuple — the
+                // typeck arm (typeck/exprs.rs `check_expr`'s "zip" case)
+                // rejects 5+ args honestly at check/build time, so codegen
+                // never needs to handle more than 4 here.
                 if let Expr::Ident(n, _) = callee.as_ref() {
-                    if n == "zip" && args.len() == 2 {
-                        let a = self.emit_expr(&args[0])?;
-                        let b = self.emit_expr(&args[1])?;
-                        let is_range_a = a.contains("..");
-                        let is_range_b = b.contains("..");
-                        // (LAZY-GEN V1-c) Either side may independently be a
-                        // generator (`Ty::Iterator`) — a mixed generator+list
-                        // `zip` is valid Python, so each side is classified on
-                        // its own type, not the other's shape.
-                        let iter_a = if is_range_a {
-                            format!("({}).into_iter()", a)
-                        } else if matches!(self.type_of_expr(&args[0]), Ty::Iterator(_)) {
-                            Self::iter_arg_source(&args[0], &a)
-                        } else {
-                            format!("{}.iter().cloned()", a)
-                        };
-                        let iter_b = if is_range_b {
-                            format!("({}).into_iter()", b)
-                        } else if matches!(self.type_of_expr(&args[1]), Ty::Iterator(_)) {
-                            Self::iter_arg_source(&args[1], &b)
-                        } else {
-                            format!("{}.iter().cloned()", b)
-                        };
-                        return Ok(Some(format!("{}.zip({})", iter_a, iter_b)));
+                    if n == "zip" && args.len() >= 2 && args.len() <= 4 {
+                        let mut iters: Vec<String> = Vec::with_capacity(args.len());
+                        for arg in args {
+                            let a = self.emit_expr(arg)?;
+                            let is_range = a.contains("..");
+                            // (LAZY-GEN V1-c) Each side is classified on its
+                            // OWN type — a mixed generator+list `zip` is valid
+                            // Python.
+                            let iter_s = if is_range {
+                                format!("({}).into_iter()", a)
+                            } else if matches!(self.type_of_expr(arg), Ty::Iterator(_)) {
+                                Self::iter_arg_source(arg, &a)
+                            } else {
+                                format!("{}.iter().cloned()", a)
+                            };
+                            iters.push(iter_s);
+                        }
+                        if args.len() == 2 {
+                            return Ok(Some(format!("{}.zip({})", iters[0], iters[1])));
+                        }
+                        // 3/4 args: fold the nested `.zip()` chain, then
+                        // flatten via `.map()`. E.g. for 3 args:
+                        // `a.zip(b).zip(c).map(|((x,y),z)| (x,y,z))`.
+                        let mut chain = iters[0].clone();
+                        for it in &iters[1..] {
+                            chain = format!("{}.zip({})", chain, it);
+                        }
+                        let vars: Vec<String> = (0..iters.len()).map(|i| format!("__z{}", i)).collect();
+                        let mut pat = vars[0].clone();
+                        for v in &vars[1..] {
+                            pat = format!("({}, {})", pat, v);
+                        }
+                        let flat = format!("({})", vars.join(", "));
+                        return Ok(Some(format!("{}.map(|{}| {})", chain, pat, flat)));
                     }
                 }
 
@@ -903,8 +935,20 @@ impl<'a> Codegen<'a> {
                                 let key_code = if let Expr::Lambda { params, body, .. } = key_expr {
                                     // Lambda: extract parameter name and body, rename param to __x
                                     let param_name = params.first().map(|(n, _)| n.clone()).unwrap_or_else(|| "__x".to_string());
+                                    // (CARD 55343eaa) See the `sorted` key= arm
+                                    // below for the full explanation: bind the
+                                    // param to the SOURCE's element type (not
+                                    // `Ty::Unknown`) so a tuple-indexing body
+                                    // (`t[0]`) lowers through tuple field access
+                                    // instead of list indexing.
+                                    let src_ty = self.type_of_expr(&args[0]);
+                                    let key_param_ty = match &src_ty {
+                                        Ty::List(inner) | Ty::Set(inner) | Ty::Iterator(inner) => (**inner).clone(),
+                                        Ty::Dict(k, _) => (**k).clone(),
+                                        _ => Ty::Unknown,
+                                    };
                                     let saved_local = self.locals.get(&param_name).cloned();
-                                    self.locals.insert(param_name.clone(), Ty::Unknown);
+                                    self.locals.insert(param_name.clone(), key_param_ty);
                                     let body_s = self.emit_expr(body)?;
                                     if let Some(ty) = saved_local {
                                         self.locals.insert(param_name.clone(), ty);
@@ -962,8 +1006,20 @@ impl<'a> Codegen<'a> {
                                 let key_code = if let Expr::Lambda { params, body, .. } = key_expr {
                                     // Lambda: extract parameter name and body, rename param to __x
                                     let param_name = params.first().map(|(n, _)| n.clone()).unwrap_or_else(|| "__x".to_string());
+                                    // (CARD 55343eaa) See the `sorted` key= arm
+                                    // below for the full explanation: bind the
+                                    // param to the SOURCE's element type (not
+                                    // `Ty::Unknown`) so a tuple-indexing body
+                                    // (`t[0]`) lowers through tuple field access
+                                    // instead of list indexing.
+                                    let src_ty = self.type_of_expr(&args[0]);
+                                    let key_param_ty = match &src_ty {
+                                        Ty::List(inner) | Ty::Set(inner) | Ty::Iterator(inner) => (**inner).clone(),
+                                        Ty::Dict(k, _) => (**k).clone(),
+                                        _ => Ty::Unknown,
+                                    };
                                     let saved_local = self.locals.get(&param_name).cloned();
-                                    self.locals.insert(param_name.clone(), Ty::Unknown);
+                                    self.locals.insert(param_name.clone(), key_param_ty);
                                     let body_s = self.emit_expr(body)?;
                                     if let Some(ty) = saved_local {
                                         self.locals.insert(param_name.clone(), ty);
@@ -1092,8 +1148,28 @@ impl<'a> Codegen<'a> {
                                 let key_code = if let Expr::Lambda { params, body, .. } = key_expr {
                                     // Lambda: extract parameter name and body, rename param to __x
                                     let param_name = params.first().map(|(n, _)| n.clone()).unwrap_or_else(|| "__x".to_string());
+                                    // (CARD 55343eaa) The param was previously bound
+                                    // to `Ty::Unknown` here, so a tuple-indexing body
+                                    // (`t[0]`) couldn't see — via `type_of_expr` in
+                                    // `emit_expr`'s Index arm — that `t` is a
+                                    // `Ty::Tuple(..)`, and fell through to the
+                                    // LIST-indexing lowering (`__py_list_get`,
+                                    // slice-based) instead of the tuple field-access
+                                    // lowering (`.0`/`.1`/...) the non-lambda
+                                    // tuple-index path already uses — raw rustc
+                                    // E0599 (`Vec` has no field `.0`) at BUILD.
+                                    // Bind the param to the SOURCE's actual element
+                                    // type (list/set/generator elem, or dict KEY —
+                                    // mirrors the `base` element-source dispatch in
+                                    // the no-key branch below) so the body sees the
+                                    // real shape.
+                                    let key_param_ty = match &list_ty {
+                                        Ty::List(inner) | Ty::Set(inner) | Ty::Iterator(inner) => (**inner).clone(),
+                                        Ty::Dict(k, _) => (**k).clone(),
+                                        _ => Ty::Unknown,
+                                    };
                                     let saved_local = self.locals.get(&param_name).cloned();
-                                    self.locals.insert(param_name.clone(), Ty::Unknown);
+                                    self.locals.insert(param_name.clone(), key_param_ty);
                                     let body_s = self.emit_expr(body)?;
                                     if let Some(ty) = saved_local {
                                         self.locals.insert(param_name.clone(), ty);

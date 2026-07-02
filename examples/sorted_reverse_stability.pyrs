@@ -1,0 +1,68 @@
+# CARD 0bab32ed: sorted(x, key=..., reverse=True) previously silently
+# dropped reverse= whenever key= was ALSO present (the codegen key= branch
+# never looked at the reverse kwarg at all) — every case below regressed to
+# plain ascending order before the fix.
+#
+# CPython's reverse=True is a REVERSED STABLE SORT: elements with equal keys
+# keep their ORIGINAL relative order. That is NOT the same as sorting
+# ascending and then reversing the whole result, which flips the order
+# within an equal-key run. Every expected line below is python3-verified.
+class Item:
+    label: str
+    value: int
+
+    def __init__(self, label: str, value: int) -> None:
+        self.label = label
+        self.value = value
+
+class Reading:
+    label: str
+    temp: float
+
+    def __init__(self, label: str, temp: float) -> None:
+        self.label = label
+        self.temp = temp
+
+def item_source() -> Iterator[Item]:
+    yield Item("bb", 2)
+    yield Item("a", 1)
+    yield Item("cc", 2)
+    yield Item("d", 1)
+    yield Item("ee", 2)
+
+def main() -> None:
+    items: list[Item] = [Item("bb", 2), Item("a", 1), Item("cc", 2), Item("d", 1), Item("ee", 2)]
+
+    # key= + reverse=True: stable reversed sort. All value=2 items keep their
+    # relative order (bb, cc, ee), then all value=1 items keep theirs (a, d).
+    # python3: ['bb', 'cc', 'ee', 'a', 'd']
+    for it in sorted(items, key=lambda i: i.value, reverse=True):
+        print(it.label)
+
+    # key= + reverse=False (explicit): plain ascending stable sort.
+    # python3: ['a', 'd', 'bb', 'cc', 'ee']
+    for it in sorted(items, key=lambda i: i.value, reverse=False):
+        print(it.label)
+
+    # key= with no reverse kwarg at all: ascending stable sort (regression guard).
+    # python3: ['a', 'd', 'bb', 'cc', 'ee']
+    for it in sorted(items, key=lambda i: i.value):
+        print(it.label)
+
+    # reverse=True WITHOUT key=: plain descending sort. Duplicates are the
+    # element itself here, so they're indistinguishable — no stability to check.
+    # python3: [3, 3, 2, 1, 1]
+    print(sorted([3, 1, 2, 1, 3], reverse=True))
+
+    # float key (partial_cmp path): reverse=True must still be a stable
+    # reversed sort, not sort-then-reverse.
+    # python3: ['b', 'a', 'c']
+    readings: list[Reading] = [Reading("a", 1.0), Reading("b", 2.0), Reading("c", 1.0)]
+    for r in sorted(readings, key=lambda x: x.temp, reverse=True):
+        print(r.label)
+
+    # sorted() over an Iterator (generator) source with BOTH key= and
+    # reverse= kwargs together — same stability guarantee as the list case.
+    # python3: ['bb', 'cc', 'ee', 'a', 'd']
+    for it in sorted(item_source(), key=lambda i: i.value, reverse=True):
+        print(it.label)

@@ -1,0 +1,24 @@
+bb
+cc
+ee
+a
+d
+a
+d
+bb
+cc
+ee
+a
+d
+bb
+cc
+ee
+[3, 3, 2, 1, 1]
+b
+a
+c
+bb
+cc
+ee
+a
+d

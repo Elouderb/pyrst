@@ -178,6 +178,51 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
                             _ => Ty::Unknown,
                         }
                     }
+                    // (CARD fd65dc99) `enumerate`/`zip` previously had no arm
+                    // here at all, so they fell through to the generic `n => {..}`
+                    // branch below, which resolves through `ctx.funcs.get(n)` —
+                    // the hardcoded builtin FuncSig registrations for
+                    // "enumerate"/"zip" (typeck/types.rs) both declare `ret:
+                    // Ty::Unknown` unconditionally. That made this ORACLE always
+                    // report `Unknown` for a zip/enumerate call — starving
+                    // `bind_comp_targets` (both here and in codegen's own
+                    // `type_of_expr`-backed copy) of the tuple element types
+                    // needed to destructure `for a, b in zip(..)` /
+                    // `for i, v in enumerate(..)` targets inside a comprehension,
+                    // and starving the comprehension `chain` codegen of the fact
+                    // that the source is a list at all. Mirror `check_expr`'s
+                    // already-correct zip/enumerate typing (used for `Stmt::For`)
+                    // here too, so the comprehension path sees the same element
+                    // types. Purely additive/widening — an unsupported source
+                    // still degrades to `Unknown`, never narrows an existing
+                    // `types_compatible` result.
+                    "enumerate" if !args.is_empty() => {
+                        match infer_expr_ty(&args[0], locals, ctx) {
+                            Ty::List(inner) | Ty::Set(inner) | Ty::Iterator(inner) => {
+                                Ty::List(Box::new(Ty::Tuple(vec![Ty::Int, *inner])))
+                            }
+                            Ty::Str => Ty::List(Box::new(Ty::Tuple(vec![Ty::Int, Ty::Str]))),
+                            _ => Ty::Unknown,
+                        }
+                    }
+                    "zip" => {
+                        let mut elem_tys: Vec<Ty> = Vec::with_capacity(args.len());
+                        let mut any_unknown = false;
+                        for a in args {
+                            match infer_expr_ty(a, locals, ctx) {
+                                Ty::List(inner) | Ty::Set(inner) | Ty::Iterator(inner) => {
+                                    elem_tys.push(*inner)
+                                }
+                                Ty::Str => elem_tys.push(Ty::Str),
+                                _ => any_unknown = true,
+                            }
+                        }
+                        if any_unknown || elem_tys.is_empty() {
+                            Ty::Unknown
+                        } else {
+                            Ty::List(Box::new(Ty::Tuple(elem_tys)))
+                        }
+                    }
                     "sorted" | "list" | "reversed" => {
                         // These return a list; preserve the element type.
                         // Over a dict they operate on its KEYS (Python semantics),

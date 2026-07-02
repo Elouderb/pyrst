@@ -1,0 +1,57 @@
+# CARD fd65dc99: a comprehension source built from zip(...)/enumerate(...)
+# previously failed to BUILD. Root cause was two-fold:
+#  1. codegen's own type oracle (`infer_expr_ty`, shared by `type_of_expr`)
+#     had no arm for "zip"/"enumerate" at all, so it fell through to the
+#     hardcoded builtin FuncSig for each (typeck/types.rs), which always
+#     declares `ret: Ty::Unknown` -- so the comprehension's `chain` codegen
+#     never recognized the source as a list at all.
+#  2. `emit_expr` inlines zip/enumerate as a REAL lazy Rust iterator chain
+#     (`.zip(..)`, `.enumerate().map(..)`) rather than a materialized Vec, so
+#     the comprehension codegen's `.iter().cloned()` fallback (for a plain
+#     list/set/dict source) doesn't compile against it (`Zip`/`Map` have no
+#     `.iter()`). For-loops already special-cased this by sniffing the
+#     emitted Rust text for `.zip(`/`.enumerate()`; comprehensions now do too.
+# Every expected line below is python3-verified.
+def nums(n: int) -> Iterator[int]:
+    i: int = 0
+    while i < n:
+        yield i
+        i = i + 1
+
+def letters() -> Iterator[str]:
+    yield "x"
+    yield "y"
+    yield "z"
+
+def main() -> None:
+    xs: list[int] = [1, 2, 3]
+    ys: list[int] = [10, 20, 30]
+    strs: list[str] = ["p", "q", "r"]
+
+    # list comprehension over zip(list, list)
+    # python3: [11, 22, 33]
+    print([a + b for a, b in zip(xs, ys)])
+
+    # list comprehension over enumerate(list), with an f-string element
+    # python3: ['0:p', '1:q', '2:r']
+    print([f"{i}:{v}" for i, v in enumerate(strs)])
+
+    # filtered variant: comprehension over zip(...) with an `if` clause
+    # python3: [22, 33]
+    print([a + b for a, b in zip(xs, ys) if a > 1])
+
+    # zip comprehension over two GENERATOR arguments
+    # python3: [0, 2, 4]
+    print([a + b for a, b in zip(nums(3), nums(5))])
+
+    # enumerate comprehension over a GENERATOR argument
+    # python3: ['0:x', '1:y', '2:z']
+    print([f"{i}:{v}" for i, v in enumerate(letters())])
+
+    # set comprehension over zip(...) (sorted for deterministic print)
+    # python3: [11, 22, 33]
+    print(sorted({a + b for a, b in zip(xs, ys)}))
+
+    # dict comprehension over enumerate(...)
+    # python3: {0: 'p', 1: 'q', 2: 'r'}
+    print({i: v for i, v in enumerate(strs)})

@@ -1113,6 +1113,41 @@ impl<'a> Codegen<'a> {
                                     self.emit_expr(key_expr)?
                                 };
 
+                                // (CARD 0bab32ed) `reverse=` was being silently
+                                // dropped whenever `key=` was also present. CPython's
+                                // `reverse=True` is a REVERSED STABLE SORT: elements
+                                // with equal keys keep their ORIGINAL relative order.
+                                // That is NOT the same as sorting ascending and then
+                                // `.reverse()`-ing the whole vec, which flips the
+                                // relative order within an equal-key run. Verified
+                                // against `python3`:
+                                //   sorted([(1,'a'),(2,'b'),(1,'c')], key=lambda t: t[0], reverse=True)
+                                //   -> [(2,'b'),(1,'a'),(1,'c')]   (a before c, unchanged)
+                                // A reversed COMPARATOR fed into Rust's stable
+                                // `sort_by` reproduces this exactly: when two keys
+                                // are equal, `.reverse()`'d Ordering::Equal is still
+                                // Equal, so the stable sort leaves their relative
+                                // input order untouched; only actually-unequal pairs
+                                // flip. Handle a runtime (non-literal) `reverse=`
+                                // expression too, not just `True`/`False` literals.
+                                if let Some((_, rev_expr)) = kwargs.iter().find(|(n, _)| n == "reverse") {
+                                    let rev_s = self.emit_expr(rev_expr)?;
+                                    return Ok(Some(match key_ret_ty {
+                                        Ty::Float => {
+                                            format!(
+                                                "{{ let mut __sorted = {}; let __rev = {}; __sorted.sort_by(|a, b| {{ let ka = {{ let __x = a.clone(); {} }}; let kb = {{ let __x = b.clone(); {} }}; let __ord = ka.partial_cmp(&kb).unwrap_or(::std::cmp::Ordering::Equal); if __rev {{ __ord.reverse() }} else {{ __ord }} }}); __sorted }}",
+                                                list_src, rev_s, key_code, key_code
+                                            )
+                                        }
+                                        _ => {
+                                            format!(
+                                                "{{ let mut __sorted = {}; let __rev = {}; __sorted.sort_by(|a, b| {{ let ka = {{ let __x = a.clone(); {} }}; let kb = {{ let __x = b.clone(); {} }}; let __ord = ka.cmp(&kb); if __rev {{ __ord.reverse() }} else {{ __ord }} }}); __sorted }}",
+                                                list_src, rev_s, key_code, key_code
+                                            )
+                                        }
+                                    }));
+                                }
+
                                 // Use appropriate sorting method based on key return type
                                 return Ok(Some(match key_ret_ty {
                                     Ty::Float => {
@@ -1558,8 +1593,23 @@ impl<'a> Codegen<'a> {
             }
             Expr::ListComp { elt, targets, iter, cond, .. } => {
                 let iter_s = self.emit_expr(iter)?;
+                // (CARD fd65dc99) `zip(...)`/`enumerate(...)` are inlined by
+                // `emit_expr` (above) straight into a REAL lazy Rust iterator
+                // adapter chain (`.zip(..)`, `.enumerate().map(..)`) — not a
+                // `.iter().cloned()`-able `Vec` — so the `.iter().cloned()`
+                // fallback below doesn't compile against it (`Zip`/`Map` have no
+                // `.iter()`). Detect that emitted shape the same way `Stmt::For`
+                // already does (string-sniffing the generated code, since
+                // codegen's own `type_of_expr` oracle types the call as a
+                // `Ty::List`, not `Ty::Iterator`) and consume it directly. Must
+                // be checked before `is_range`: a range nested inside
+                // (`zip(range(..), ys)`) would otherwise match `is_range` on the
+                // OUTER string and get double-wrapped in `.into_iter()`.
+                let is_lazy_adapter = iter_s.contains(".enumerate()") || iter_s.contains(".zip(");
                 let is_range = iter_s.contains("..");
-                let chain = if is_range {
+                let chain = if is_lazy_adapter {
+                    iter_s.clone()
+                } else if is_range {
                     format!("({}).into_iter()", iter_s)
                 } else if matches!(self.type_of_expr(iter), Ty::Str) {
                     // Iterating a str yields 1-character strings (Python semantics)
@@ -1605,8 +1655,14 @@ impl<'a> Codegen<'a> {
             }
             Expr::SetComp { elt, targets, iter, cond, .. } => {
                 let iter_s = self.emit_expr(iter)?;
+                // (CARD fd65dc99) See the ListComp arm above: a zip/enumerate
+                // source is already a real lazy Rust iterator chain, not a
+                // `.iter().cloned()`-able Vec.
+                let is_lazy_adapter = iter_s.contains(".enumerate()") || iter_s.contains(".zip(");
                 let is_range = iter_s.contains("..");
-                let chain = if is_range {
+                let chain = if is_lazy_adapter {
+                    iter_s.clone()
+                } else if is_range {
                     format!("({}).into_iter()", iter_s)
                 } else if matches!(self.type_of_expr(iter), Ty::Str) {
                     format!("{}.chars().map(|__c| __c.to_string())", iter_s)
@@ -1639,8 +1695,14 @@ impl<'a> Codegen<'a> {
             }
             Expr::DictComp { key, val, targets, iter, cond, .. } => {
                 let iter_s = self.emit_expr(iter)?;
+                // (CARD fd65dc99) See the ListComp arm above: a zip/enumerate
+                // source is already a real lazy Rust iterator chain, not a
+                // `.iter().cloned()`-able Vec.
+                let is_lazy_adapter = iter_s.contains(".enumerate()") || iter_s.contains(".zip(");
                 let is_range = iter_s.contains("..");
-                let chain = if is_range {
+                let chain = if is_lazy_adapter {
+                    iter_s.clone()
+                } else if is_range {
                     format!("({}).into_iter()", iter_s)
                 } else if matches!(self.type_of_expr(iter), Ty::Str) {
                     format!("{}.chars().map(|__c| __c.to_string())", iter_s)

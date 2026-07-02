@@ -1919,6 +1919,31 @@ pub(crate) fn check_nested_def(f: &Func, env: &mut FuncEnv) -> Result<()> {
         reject_captured_mutation(&f.body, env, &mut nested_locals)?;
     }
 
+    // CAPTURE-A-GENERATOR gate (card 56e46767). A generator (`Ty::Iterator`) is
+    // move-only AND NOT `Clone` (its Rust `Gen<T>` holds a coroutine future), and
+    // iterating it MUTATES it. Captured by a `move` closure it becomes `FnMut`, so
+    // the `Rc<dyn Fn>` cast codegen emits fails with a raw rustc E0525; a clone-on-
+    // capture (how other non-Copy captures get their value snapshot) is impossible
+    // here and would be semantically WRONG anyway — Python SHARES generator state,
+    // it does not snapshot it. Reject honestly at check: materialize first with
+    // `list(...)` and capture the list. Only ENCLOSING locals are policed (a nested
+    // param of the same name SHADOWS the capture and is bound, so it is excluded by
+    // `nested_def_captured_reads`); builtins / top-level fns are not `Iterator`
+    // locals here.
+    {
+        let mut captured: std::collections::HashSet<String> = std::collections::HashSet::new();
+        nested_def_captured_reads(f, &mut captured);
+        for name in &captured {
+            if matches!(env.locals.get(name), Some(Ty::Iterator(_))) {
+                return Err(iterator_materialize_error(
+                    &format!("cannot be captured by a nested function (`{}`)", name),
+                    &format!("bind `{name}_items = list({name})` before the nested function and capture that"),
+                    f.span,
+                ));
+            }
+        }
+    }
+
     // Register the nested def as a callable local in the ENCLOSING scope BEFORE
     // checking the body, so a LATER nested def (or a recursive-looking forward
     // reference, already rejected above) sees it, and so the enclosing body can

@@ -1030,14 +1030,72 @@ impl<'a> Codegen<'a> {
         let name_e = escape_ident(&f.name);
         let ret_s = self.rust_ty(&ret);
 
+        // (card 56e46767) Clone-on-capture for non-Copy CAPTURES. The closure is a
+        // `move` closure (below), so every captured enclosing binding is MOVED into
+        // it — and a captured non-`Copy` value the ENCLOSING scope still reads after
+        // the def would be a raw rustc E0382 (borrow of moved). pyrst nested defs
+        // document value-semantics capture (a SNAPSHOT taken at the def site), so we
+        // CLONE each such capture into a block-scoped binding the closure moves,
+        // leaving the enclosing original intact. This is python3-faithful for a READ
+        // of the original (it still sees the pre-def value); the snapshot does NOT
+        // observe a LATER mutation of the original — the same documented divergence
+        // from CPython that `gen_closure_capture` already carries for generators.
+        //
+        // Compute the def's captured free variables (the same free-var analysis
+        // typeck's liveness/capture gates use) and keep only those that must be
+        // cloned:
+        //   * an enclosing VALUE local of this name exists (in `self.locals`) — a
+        //     builtin / top-level fn / the def's own not-yet-registered name is not,
+        //     so those are skipped;
+        //   * its type is non-`Copy` — a Copy capture (Int/Float/Bool/…) is moved as
+        //     a bitwise copy and needs no clone, keeping the Copy-capture goldens
+        //     (nested_closures, …) byte-identical (empty set → no block wrapper);
+        //   * it is NOT a `Mut[T]` by-ref param (`by_ref_locals`) — cloning a `&mut`
+        //     would silently SNAPSHOT a by-REFERENCE param, dropping its aliasing;
+        //     keep the current move for those (works when not read after the def).
+        // Generator captures are rejected at check (`check_nested_def`): `Gen` is not
+        // `Clone` and sharing (not snapshotting) is the correct semantics, so every
+        // capture that reaches here is `Clone`. Each name resolves to its READ-name
+        // (the mangled shadow binding when an active divergent shadow hides the slot,
+        // exactly like the closure body's reads — b5ea0d5 keeps that shadow_map), so
+        // `let <rn> = <rn>.clone();` clones the same binding the body will read.
+        let mut captured: std::collections::HashSet<String> = std::collections::HashSet::new();
+        crate::typeck::nested_def_captured_reads(f, &mut captured);
+        let mut clone_caps: Vec<String> = captured.into_iter()
+            .filter(|n| {
+                self.locals.get(n).map(|ty| !self.is_copy_type(ty)).unwrap_or(false)
+                    && !self.by_ref_locals.contains(n)
+            })
+            .map(|n| self.shadow_read_name(&n).unwrap_or_else(|| escape_ident(&n)))
+            .collect();
+        clone_caps.sort();
+        clone_caps.dedup();
+        let wrap_block = !clone_caps.is_empty();
+
         // Open the binding + closure. The `-> Ret` is always written (uniform with
         // a `() -> ()` unit nested def); the block body follows on its own lines.
-        self.line(&format!(
-            "let {} = ::std::rc::Rc::new(move |{}| -> {} {{",
-            name_e,
-            param_strs.join(", "),
-            ret_s
-        ));
+        // When there are non-Copy captures, the `Rc::new(..)` becomes the TAIL
+        // expression of a wrapping block that first binds the `.clone()` snapshots
+        // the `move` closure captures.
+        if wrap_block {
+            self.line(&format!("let {} = {{", name_e));
+            self.indent += 1;
+            for rn in &clone_caps {
+                self.line(&format!("let {} = {}.clone();", rn, rn));
+            }
+            self.line(&format!(
+                "::std::rc::Rc::new(move |{}| -> {} {{",
+                param_strs.join(", "),
+                ret_s
+            ));
+        } else {
+            self.line(&format!(
+                "let {} = ::std::rc::Rc::new(move |{}| -> {} {{",
+                name_e,
+                param_strs.join(", "),
+                ret_s
+            ));
+        }
         self.indent += 1;
 
         // --- enter the nested scope ------------------------------------------------
@@ -1144,7 +1202,15 @@ impl<'a> Codegen<'a> {
         self.shadow_counter = saved_shadow_counter;
 
         self.indent -= 1;
-        self.line(&format!("}}) as {};", rc_ty));
+        if wrap_block {
+            // Close the closure as the wrapping block's TAIL expression (no `;`),
+            // then close the block that owns the `.clone()` snapshot bindings.
+            self.line(&format!("}}) as {}", rc_ty));
+            self.indent -= 1;
+            self.line("};");
+        } else {
+            self.line(&format!("}}) as {};", rc_ty));
+        }
 
         // Record the nested def as a func-valued local + declared name in the
         // ENCLOSING scope, so the rest of the parent body resolves `<name>` as an

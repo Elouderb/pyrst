@@ -1,0 +1,17 @@
+# card 56e46767: a generator (`Iterator[T]`) captured by a nested `def` is
+# rejected at check. A generator lowers to a move-only `Gen<T>` that is NOT Clone,
+# and iterating it MUTATES it — so a `move` closure over it is `FnMut`, which the
+# `Rc<dyn Fn>` cast codegen emits cannot satisfy (a raw rustc E0525 leak). A
+# clone-on-capture snapshot (how other non-Copy captures get their value) is
+# impossible here and semantically wrong anyway: Python SHARES generator state, it
+# does not snapshot it. Honest fix — materialize with list() first, then capture
+# the list: `items = list(g)` before the nested function, and `sum(items)` inside.
+def counter(n: int) -> Iterator[int]:
+    for i in range(n):
+        yield i
+
+def main() -> None:
+    g = counter(3)
+    def total() -> int:
+        return sum(g)
+    print(total())

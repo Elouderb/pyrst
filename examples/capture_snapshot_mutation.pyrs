@@ -1,0 +1,15 @@
+# card 56e46767 — DOCUMENTED DIVERGENCE FROM CPython (verified against python3):
+# a nested `def` captures enclosing non-Copy locals BY VALUE. Codegen takes a
+# CLONE snapshot at the def site (pyrst's value semantics), so a LATER mutation
+# of the caller's original is NOT visible inside the closure. CPython passes the
+# list by reference, so its twin prints 106 as the 2nd line (sum of [1,2,3,100]);
+# pyrst prints 6 — the frozen [1, 2, 3] snapshot captured at the def. This file's
+# expected output is the TRUE, verified pyrst behavior, mirroring the generator-
+# snapshot divergence already documented in gen_closure_capture.
+def main() -> None:
+    xs: list[int] = [1, 2, 3]
+    def total() -> int:
+        return sum(xs)   # snapshot of [1, 2, 3] captured at THIS def
+    xs.append(100)       # mutates the CALLER's xs only, AFTER the snapshot
+    print(xs)            # [1, 2, 3, 100] — caller's own list, mutated
+    print(total())       # 6 — the frozen snapshot sum, NOT CPython's 106

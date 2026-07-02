@@ -1,0 +1,17 @@
+# card 56e46767: a nested `def` captures enclosing locals BY VALUE — codegen
+# takes a CLONE snapshot of each non-Copy capture at the def site (pyrst value
+# semantics), so the ENCLOSING scope may still READ the originals after the def.
+# This is python3-faithful for a read (verified against a python3 twin: 11 /
+# [10, 20, 30] / pyrst / 3). A Copy capture (`scale`) is moved as a bitwise copy
+# and needs no clone. See capture_snapshot_mutation for the documented divergence
+# when the ORIGINAL is later MUTATED.
+def main() -> None:
+    xs: list[int] = [10, 20, 30]
+    name: str = "pyrst"
+    scale: int = 3
+    def summarize() -> int:
+        return len(xs) + len(name) + scale
+    print(summarize())   # 3 + 5 + 3 = 11
+    print(xs)            # [10, 20, 30] — the original list is still usable
+    print(name)          # pyrst    — the original string is still usable
+    print(scale)         # 3

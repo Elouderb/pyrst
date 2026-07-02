@@ -240,6 +240,24 @@ impl<'a> Codegen<'a> {
         result
     }
 
+    /// (LAZY-GEN V1-c) The source expression for a builtin (`sum`/`min`/`max`/
+    /// `any`/`all`/`enumerate`/`zip`/`sorted`/`list`) argument that types as a
+    /// `Ty::Iterator` (a generator). Mirrors the for-loop/comprehension
+    /// convention established in V1-b (review fix): a generator VARIABLE
+    /// (`Expr::Ident`) is consumed by `&mut` — std's blanket `impl<I: Iterator>
+    /// Iterator for &mut I` — so the binding stays live but advances in place
+    /// (`total = sum(g)` leaves `g` bound-but-exhausted, exactly like Python's
+    /// generator object, instead of moving it and making a later use an E0382).
+    /// A fresh call (`sum(gen(3))`) is a temporary with no caller-visible
+    /// binding to preserve, so it is consumed by value unchanged.
+    pub(crate) fn iter_arg_source(expr: &Expr, emitted: &str) -> String {
+        if matches!(expr, Expr::Ident(..)) {
+            format!("(&mut {})", emitted)
+        } else {
+            emitted.to_string()
+        }
+    }
+
     pub(crate) fn type_of_expr(&self, e: &Expr) -> Ty {
         crate::typeck::infer_expr_ty(e, &self.locals, self.ctx)
     }

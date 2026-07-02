@@ -131,6 +131,9 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
                             match infer_expr_ty(arg, locals, ctx) {
                                 Ty::List(inner) => *inner,
                                 Ty::Set(inner) => *inner,
+                                // (LAZY-GEN V1-c) A generator source sums to its
+                                // element type, same as a list/set.
+                                Ty::Iterator(inner) => *inner,
                                 _ => Ty::Int, // Default to int for other iterables.
                             }
                         } else {
@@ -164,9 +167,15 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
                         // These return a list; preserve the element type.
                         // Over a dict they operate on its KEYS (Python semantics),
                         // so the result element type is the dict's key type.
+                        // (LAZY-GEN V1-c) `sorted(gen)`/`list(gen)` materialize a
+                        // generator into `list[T]`, same element type as a
+                        // list/set source (`reversed(gen)` is a V1-d MATERIALIZE
+                        // error at the codegen/typeck-error layer; this arm is
+                        // the pure, non-erroring inference oracle and just
+                        // reports the type it WOULD be).
                         if let Some(arg) = args.first() {
                             match infer_expr_ty(arg, locals, ctx) {
-                                Ty::List(e) | Ty::Set(e) => Ty::List(e),
+                                Ty::List(e) | Ty::Set(e) | Ty::Iterator(e) => Ty::List(e),
                                 Ty::Dict(k, _) => Ty::List(k),
                                 Ty::Str => Ty::List(Box::new(Ty::Str)),
                                 _ => Ty::List(Box::new(Ty::Unknown)),
@@ -1034,7 +1043,9 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                             check_expr(v, env)?;
                         }
                         match arg_ty {
-                            Ty::List(elem) | Ty::Set(elem) => *elem,
+                            // (LAZY-GEN V1-c) A generator argument's min/max is
+                            // its element type, same as a list/set.
+                            Ty::List(elem) | Ty::Set(elem) | Ty::Iterator(elem) => *elem,
                             _ => Ty::Unknown,
                         }
                     } else if name == "enumerate" && !args.is_empty() {
@@ -1051,7 +1062,9 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                             check_expr(v, env)?;
                         }
                         let elem = match arg0_ty {
-                            Ty::List(inner) | Ty::Set(inner) => *inner,
+                            // (LAZY-GEN V1-c) A generator argument enumerates by
+                            // its element type, same as a list/set.
+                            Ty::List(inner) | Ty::Set(inner) | Ty::Iterator(inner) => *inner,
                             Ty::Str => Ty::Str,
                             _ => Ty::Unknown,
                         };
@@ -1071,7 +1084,10 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                             // variable has no IntoIterator bound.
                             reject_typevar_op(&ty, "consume the contents of", *span)?;
                             match ty {
-                                Ty::List(inner) | Ty::Set(inner) => elem_tys.push(*inner),
+                                // (LAZY-GEN V1-c) `zip` accepts a mix of sources
+                                // per argument — a generator arg contributes its
+                                // element type, same as a list/set.
+                                Ty::List(inner) | Ty::Set(inner) | Ty::Iterator(inner) => elem_tys.push(*inner),
                                 Ty::Str => elem_tys.push(Ty::Str),
                                 _ => any_unknown = true,
                             }

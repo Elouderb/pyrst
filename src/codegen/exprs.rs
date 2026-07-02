@@ -788,6 +788,11 @@ impl<'a> Codegen<'a> {
                         let is_range = a.contains("..");
                         let iter_chain = if is_range {
                             format!("({}).into_iter()", a)
+                        } else if matches!(self.type_of_expr(&args[0]), Ty::Iterator(_)) {
+                            // (LAZY-GEN V1-c) A generator source (`Gen<T>`) is
+                            // itself an `Iterator` yielding owned `T` — consume
+                            // it directly (no `.iter()`, `Gen` has none).
+                            Self::iter_arg_source(&args[0], &a)
                         } else {
                             format!("{}.iter().cloned()", a)
                         };
@@ -802,8 +807,24 @@ impl<'a> Codegen<'a> {
                         let b = self.emit_expr(&args[1])?;
                         let is_range_a = a.contains("..");
                         let is_range_b = b.contains("..");
-                        let iter_a = if is_range_a { format!("({}).into_iter()", a) } else { format!("{}.iter().cloned()", a) };
-                        let iter_b = if is_range_b { format!("({}).into_iter()", b) } else { format!("{}.iter().cloned()", b) };
+                        // (LAZY-GEN V1-c) Either side may independently be a
+                        // generator (`Ty::Iterator`) — a mixed generator+list
+                        // `zip` is valid Python, so each side is classified on
+                        // its own type, not the other's shape.
+                        let iter_a = if is_range_a {
+                            format!("({}).into_iter()", a)
+                        } else if matches!(self.type_of_expr(&args[0]), Ty::Iterator(_)) {
+                            Self::iter_arg_source(&args[0], &a)
+                        } else {
+                            format!("{}.iter().cloned()", a)
+                        };
+                        let iter_b = if is_range_b {
+                            format!("({}).into_iter()", b)
+                        } else if matches!(self.type_of_expr(&args[1]), Ty::Iterator(_)) {
+                            Self::iter_arg_source(&args[1], &b)
+                        } else {
+                            format!("{}.iter().cloned()", b)
+                        };
                         return Ok(Some(format!("{}.zip({})", iter_a, iter_b)));
                     }
                 }
@@ -908,10 +929,21 @@ impl<'a> Codegen<'a> {
                                 )));
                             } else if args.len() == 1 {
                                 let a = self.emit_expr(&args[0])?;
-                                let elem_ty = match self.type_of_expr(&args[0]) {
-                                    Ty::List(inner) => *inner,
+                                let arg_ty = self.type_of_expr(&args[0]);
+                                let elem_ty = match &arg_ty {
+                                    Ty::List(inner) | Ty::Iterator(inner) => (**inner).clone(),
                                     _ => Ty::Int,
                                 };
+                                // (LAZY-GEN V1-c) A generator source (`Gen<T>`)
+                                // yields OWNED elements directly — no `.iter()`
+                                // (`Gen` has none) and no `&`/deref on `__x`.
+                                if matches!(arg_ty, Ty::Iterator(_)) {
+                                    let src = Self::iter_arg_source(&args[0], &a);
+                                    return Ok(Some(match elem_ty {
+                                        Ty::Float => format!("{{ let mut __min = f64::INFINITY; for __x in {} {{ if __x < __min {{ __min = __x; }} }} __min }}", src),
+                                        _ => format!("{}.min().unwrap_or(0)", src),
+                                    }));
+                                }
                                 return Ok(Some(match elem_ty {
                                     Ty::Float => format!("{{ let mut __min = f64::INFINITY; for __x in {}.iter() {{ if __x < &__min {{ __min = *__x; }} }} __min }}", a),
                                     _ => format!("{}.iter().copied().min().unwrap_or(0)", a),
@@ -956,10 +988,21 @@ impl<'a> Codegen<'a> {
                                 )));
                             } else if args.len() == 1 {
                                 let a = self.emit_expr(&args[0])?;
-                                let elem_ty = match self.type_of_expr(&args[0]) {
-                                    Ty::List(inner) => *inner,
+                                let arg_ty = self.type_of_expr(&args[0]);
+                                let elem_ty = match &arg_ty {
+                                    Ty::List(inner) | Ty::Iterator(inner) => (**inner).clone(),
                                     _ => Ty::Int,
                                 };
+                                // (LAZY-GEN V1-c) See the `min` arm above: a
+                                // generator source yields OWNED elements — no
+                                // `.iter()`/deref.
+                                if matches!(arg_ty, Ty::Iterator(_)) {
+                                    let src = Self::iter_arg_source(&args[0], &a);
+                                    return Ok(Some(match elem_ty {
+                                        Ty::Float => format!("{{ let mut __max = f64::NEG_INFINITY; for __x in {} {{ if __x > __max {{ __max = __x; }} }} __max }}", src),
+                                        _ => format!("{}.max().unwrap_or(0)", src),
+                                    }));
+                                }
                                 return Ok(Some(match elem_ty {
                                     Ty::Float => format!("{{ let mut __max = f64::NEG_INFINITY; for __x in {}.iter() {{ if __x > &__max {{ __max = *__x; }} }} __max }}", a),
                                     _ => format!("{}.iter().copied().max().unwrap_or(0)", a),
@@ -973,6 +1016,20 @@ impl<'a> Codegen<'a> {
                         "sorted" => {
                             let a = self.emit_expr(&args[0])?;
                             let list_ty = self.type_of_expr(&args[0]);
+                            // (LAZY-GEN V1-c) A generator source can't be
+                            // `.clone()`d (`Gen<T>` isn't `Clone`) — materialize
+                            // it into an owned `Vec<T>` via `.collect()` first
+                            // (a VARIABLE source is consumed `&mut`, Python-exact
+                            // "exhausted but still bound"; a fresh call is
+                            // consumed by value — see `iter_arg_source`).
+                            // `sorted(...)` always returns a real `list[T]`,
+                            // matching Python (which also materializes a
+                            // generator when sorting it).
+                            let list_src = if matches!(list_ty, Ty::Iterator(_)) {
+                                format!("{}.collect::<Vec<_>>()", Self::iter_arg_source(&args[0], &a))
+                            } else {
+                                format!("{}.clone()", a)
+                            };
 
                             if let Some((_, key_expr)) = kwargs.iter().find(|(n, _)| n == "key") {
                                 // sorted with key parameter
@@ -984,7 +1041,9 @@ impl<'a> Codegen<'a> {
                                     // So we'll just check common patterns
                                     if let Expr::Attr { name, .. } = body.as_ref() {
                                         // Lambda body is field access - check the field type
-                                        if let Ty::List(ref elem_ty) = list_ty {
+                                        // (LAZY-GEN V1-c) A generator source's element
+                                        // class fields resolve the same way a list's do.
+                                        if let Ty::List(ref elem_ty) | Ty::Iterator(ref elem_ty) = list_ty {
                                             if let Ty::Class(cls, _) = elem_ty.as_ref() {
                                                 if let Some(c) = self.ctx.classes.get(cls.as_str()) {
                                                     if let Some(f) = c.fields.iter().find(|f| &f.name == name) {
@@ -1004,7 +1063,10 @@ impl<'a> Codegen<'a> {
                                     } else if let Expr::Call { callee, .. } = body.as_ref() {
                                         // Lambda body is a method call - check method return type
                                         if let Expr::Attr { name, .. } = callee.as_ref() {
-                                            if let Ty::List(ref elem_ty) = list_ty {
+                                            // (LAZY-GEN V1-c) Same as above: a
+                                            // generator source's element methods
+                                            // resolve the same way a list's do.
+                                            if let Ty::List(ref elem_ty) | Ty::Iterator(ref elem_ty) = list_ty {
                                                 if let Ty::Class(cls, _) = elem_ty.as_ref() {
                                                     if let Some(method_sig) = self.ctx.get_method(cls.as_str(), name) {
                                                         method_sig.ret.clone()
@@ -1055,20 +1117,23 @@ impl<'a> Codegen<'a> {
                                 return Ok(Some(match key_ret_ty {
                                     Ty::Float => {
                                         format!(
-                                            "{{ let mut __sorted = {}.clone(); __sorted.sort_by(|a, b| {{ let ka = {{ let __x = a.clone(); {} }}; let kb = {{ let __x = b.clone(); {} }}; ka.partial_cmp(&kb).unwrap_or(::std::cmp::Ordering::Equal) }}); __sorted }}",
-                                            a, key_code, key_code
+                                            "{{ let mut __sorted = {}; __sorted.sort_by(|a, b| {{ let ka = {{ let __x = a.clone(); {} }}; let kb = {{ let __x = b.clone(); {} }}; ka.partial_cmp(&kb).unwrap_or(::std::cmp::Ordering::Equal) }}); __sorted }}",
+                                            list_src, key_code, key_code
                                         )
                                     }
                                     _ => {
                                         format!(
-                                            "{{ let mut __sorted = {}.clone(); __sorted.sort_by_key(|__x| {}); __sorted }}",
-                                            a, key_code
+                                            "{{ let mut __sorted = {}; __sorted.sort_by_key(|__x| {}); __sorted }}",
+                                            list_src, key_code
                                         )
                                     }
                                 }));
                             } else {
                                 // Check if this is a float list to handle Ord constraint
-                                let is_float_list = matches!(&list_ty, Ty::List(inner) if inner.as_ref() == &Ty::Float);
+                                // (a float GENERATOR needs the same partial_cmp
+                                // treatment — f64 isn't Ord — once collected).
+                                let is_float_list = matches!(&list_ty,
+                                    Ty::List(inner) | Ty::Iterator(inner) if inner.as_ref() == &Ty::Float);
                                 let sort_code = if is_float_list {
                                     ".sort_by(|a, b| a.partial_cmp(b).unwrap_or(::std::cmp::Ordering::Equal))".to_string()
                                 } else {
@@ -1076,13 +1141,14 @@ impl<'a> Codegen<'a> {
                                 };
 
                                 // `sorted` operates on a Vec. A list arg is cloned
-                                // directly; a set is materialized from its elements
-                                // and a dict from its KEYS (Python semantics — both
-                                // HashMap/HashSet lack `.sort()`).
+                                // directly; a set is materialized from its elements;
+                                // a dict from its KEYS (Python semantics — both
+                                // HashMap/HashSet lack `.sort()`); a generator via
+                                // `list_src` (`.collect()`, computed above).
                                 let base = match &list_ty {
                                     Ty::Set(_) => format!("{}.iter().cloned().collect::<Vec<_>>()", a),
                                     Ty::Dict(_, _) => format!("{}.keys().cloned().collect::<Vec<_>>()", a),
-                                    _ => format!("{}.clone()", a),
+                                    _ => list_src.clone(),
                                 };
 
                                 if let Some((_, rev_expr)) = kwargs.iter().find(|(n, _)| n == "reverse") {
@@ -1100,14 +1166,22 @@ impl<'a> Codegen<'a> {
                         }
                         "sum" => {
                             let a = self.emit_expr(&args[0])?;
+                            let arg_ty = self.type_of_expr(&args[0]);
                             // Determine the sum type based on the iterable's element type
-                            let sum_type = match self.type_of_expr(&args[0]) {
-                                Ty::List(inner) | Ty::Set(inner) => match *inner {
+                            let sum_type = match &arg_ty {
+                                Ty::List(inner) | Ty::Set(inner) | Ty::Iterator(inner) => match inner.as_ref() {
                                     Ty::Float => "f64",
                                     _ => "i64",
                                 },
                                 _ => "i64",
                             };
+                            // (LAZY-GEN V1-c) A generator source (`Gen<T>`) is
+                            // itself an `Iterator` yielding owned `T` — consume
+                            // it directly (no `.iter()`, `Gen` has none).
+                            if matches!(arg_ty, Ty::Iterator(_)) {
+                                let src = Self::iter_arg_source(&args[0], &a);
+                                return Ok(Some(format!("{}.sum::<{}>()", src, sum_type)));
+                            }
                             return Ok(Some(format!("{}.iter().sum::<{}>()", a, sum_type)));
                         }
                         "input" => {
@@ -1120,10 +1194,22 @@ impl<'a> Codegen<'a> {
                         }
                         "any" => {
                             let a = self.emit_expr(&args[0])?;
+                            // (LAZY-GEN V1-c) A generator source yields owned
+                            // `bool` directly (no `.iter()`/deref); short-circuit
+                            // laziness is Rust `Iterator::any`'s native behavior,
+                            // matching Python.
+                            if matches!(self.type_of_expr(&args[0]), Ty::Iterator(_)) {
+                                let src = Self::iter_arg_source(&args[0], &a);
+                                return Ok(Some(format!("{}.any(|x| x)", src)));
+                            }
                             return Ok(Some(format!("{}.iter().any(|x| *x)", a)));
                         }
                         "all" => {
                             let a = self.emit_expr(&args[0])?;
+                            if matches!(self.type_of_expr(&args[0]), Ty::Iterator(_)) {
+                                let src = Self::iter_arg_source(&args[0], &a);
+                                return Ok(Some(format!("{}.all(|x| x)", src)));
+                            }
                             return Ok(Some(format!("{}.iter().all(|x| *x)", a)));
                         }
                         "round" => {
@@ -1273,6 +1359,20 @@ impl<'a> Codegen<'a> {
                                 // If the argument is already a list, just return it. Otherwise collect the iterator.
                                 match arg_type {
                                     Ty::List(_) => return Ok(Some(a)),
+                                    // (LAZY-GEN V1-c, review finding) A generator
+                                    // arg is TYPE-DRIVEN, not sniffed from the
+                                    // emitted call text — a generator function
+                                    // named e.g. `unsorted_gen` would otherwise
+                                    // mis-fire the "looks like a Vec already"
+                                    // heuristic below (its emitted call text
+                                    // contains the substring "sort") and skip the
+                                    // needed `.collect()`. This explicit arm runs
+                                    // FIRST, so the happy path is deliberate, not
+                                    // an accident of the fallback.
+                                    Ty::Iterator(_) => {
+                                        let src = Self::iter_arg_source(&args[0], &a);
+                                        return Ok(Some(format!("{}.collect::<Vec<_>>()", src)));
+                                    }
                                     // A set/dict is a concrete container, not an
                                     // iterator: take an owned Vec of its elements
                                     // (dict -> its KEYS, Python semantics).

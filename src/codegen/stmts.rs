@@ -808,6 +808,9 @@ impl<'a> Codegen<'a> {
         // statements. `prescan_types` / `collect_hoistable` do not descend into a
         // doubly-nested def, so they stay scoped to THIS closure's own body.
         self.prescan_types(&f.body);
+        // (LAZY-GEN V1-d BLOCKER insurance) Same divergent-join assertion as
+        // `emit_func`, on THIS closure's own body.
+        self.assert_no_branch_divergence(&f.body)?;
         let mut block_assigned = std::collections::HashSet::new();
         let mut unpack_targets = std::collections::HashSet::new();
         Self::collect_hoistable(&f.body, 0, &mut block_assigned, &mut unpack_targets);

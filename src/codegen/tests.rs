@@ -567,3 +567,37 @@ def main() -> None:
             "ctor lambda cast must NOT name the bare type param `V`, got:\n{}", rust
         );
     }
+
+    #[test]
+    fn codegen_asserts_branch_divergence_as_defence_in_depth() {
+        // The V1-d BLOCKER shape (a `list` vs a `set` across sibling `if`
+        // branches). typeck rejects it at `check`; this proves the codegen
+        // defence-in-depth assertion ALSO rejects it — driving `emit_program`
+        // DIRECTLY (bypassing `check_bodies`) so a divergent join can never
+        // silently reach the hoist and drop a branch's value. Without the
+        // assertion, `emit_program` would succeed and emit a wrong-output hoist.
+        let src = "\
+def main() -> None:
+    flag: bool = False
+    if flag:
+        xs = [1, 2, 3]
+    else:
+        xs = {9, 8, 7}
+    print(len(xs))
+";
+        let mut path = std::env::temp_dir();
+        path.push(format!("pyrst_branchdiv_{}.pyrs", std::process::id()));
+        std::fs::write(&path, src).expect("write temp source");
+        // `resolve` parses + builds the ctx but does NOT run typeck, so the
+        // divergent program reaches codegen unfiltered.
+        let prog = crate::resolver::resolve(&path).expect("resolve must succeed");
+        let result = crate::codegen::emit_program(&prog.modules, &prog.ctx);
+        let _ = std::fs::remove_file(&path);
+        let err = result.expect_err("codegen must reject the divergent branch join");
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("incompatible types across the branches"),
+            "expected a branch-divergence codegen error, got:\n{}",
+            msg
+        );
+    }

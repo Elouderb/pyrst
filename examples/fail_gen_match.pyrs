@@ -1,0 +1,18 @@
+# fail_gen_match.pyrs  (LAZY-GEN V1-d MAJOR)
+# `match g:` with a generator scrutinee check-passed but build-failed before V1-d:
+# match codegen clones the subject (`let __match_val = g.clone();`) and a lazy
+# `__PyrstGen<T>` has no `Clone` (raw rustc E0599). Now an honest CHECK error.
+# Expected substring: "a generator cannot be matched".
+
+def gen(n: int) -> Iterator[int]:
+    i: int = 0
+    while i < n:
+        yield i
+        i = i + 1
+
+
+def main() -> None:
+    g: Iterator[int] = gen(3)
+    match g:                      # ERROR: a generator cannot be matched
+        case _:
+            print("matched")

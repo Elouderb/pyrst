@@ -266,6 +266,134 @@ pub(crate) fn by_value_mutation_error(param: &str) -> String {
     )
 }
 
+// ── Branch-divergent bare-local detection (LAZY-GEN V1-d BLOCKER) ─────────────
+
+/// Whether two inferred types would DIVERGE if they had to share ONE Rust slot —
+/// the exact rule codegen uses to decide a hoisted local's single `let mut`
+/// declaration. This is the SINGLE SOURCE OF TRUTH for hoist-slot compatibility,
+/// consumed by BOTH modules: typeck (`detect_branch_divergence`, below) and
+/// codegen (`Codegen::types_conflict`, which delegates here) — same "one source of
+/// truth" discipline as [`is_copy`]/[`MUTATING_METHODS`], so the check-time
+/// rejection and the codegen shadow decision can never drift.
+///
+/// Two types are NON-divergent (can share a slot) when:
+///   - either side is `Unknown` (the permissive inference escape hatch), or
+///   - they are an `Int`/`Float` mix (codegen widens the slot to `f64`).
+/// Otherwise they diverge iff their `Ty` discriminants differ. Note this is a
+/// discriminant-level test: `List(Int)` and `List(Str)` do NOT diverge here (both
+/// are `Vec`, a genuine mismatch rustc would catch loudly), while `List(_)` vs
+/// `Iterator(_)`, `List(_)` vs `Set(_)`, and `List(_)` vs `Str` DO diverge — the
+/// exact silent-miscompile shapes of the V1-d BLOCKER.
+pub(crate) fn branch_divergent(a: &Ty, b: &Ty) -> bool {
+    if matches!(a, Ty::Unknown) || matches!(b, Ty::Unknown) {
+        return false;
+    }
+    if matches!((a, b), (Ty::Int, Ty::Float) | (Ty::Float, Ty::Int)) {
+        return false;
+    }
+    std::mem::discriminant(a) != std::mem::discriminant(b)
+}
+
+/// (LAZY-GEN V1-d BLOCKER) Detect a BARE (un-annotated) local assigned
+/// incompatible types across the sibling branches of one `if` — the silent
+/// miscompile the reviewer traced (comment 131): codegen hoists the name to ONE
+/// function-scope Rust slot, then the branch whose type diverges from the hoisted
+/// type emits a block-scoped shadow that is discarded at the block's end, so the
+/// value is silently dropped at the join. pyrst is statically typed with no union
+/// type to represent "one type on one path, another on the next", so this is an
+/// honest CHECK error.
+///
+/// SCOPE (over-rejection guards — card AC2):
+///   - Only DIRECT (top-level-of-branch) BARE assignments participate. Nested
+///     `if`s are covered by their own recursion; ANNOTATED re-declarations are
+///     exempt (the user chose the type — `block_scoping`'s `letter: str` in every
+///     branch is the canonical legal pattern, and codegen honours the annotation).
+///   - Cross-branch only — sequential same-scope retyping (`x = 5` then `x = "s"`)
+///     is a within-block sequence, never two sibling branches, so it is untouched
+///     (codegen's same-scope shadow stays legal).
+///   - `branch_divergent` treats Int/Float and Unknown as compatible, so numeric
+///     widening across branches and empty-collection branches are NOT rejected.
+///   - A name assigned in only ONE branch has no pair to compare, so the
+///     hoist-with-default idiom (assign-in-branch, use-after) stays legal.
+pub(crate) fn detect_branch_divergence(
+    then: &[Stmt],
+    elifs: &[(Expr, Vec<Stmt>)],
+    else_: &Option<Vec<Stmt>>,
+    env: &FuncEnv,
+) -> Result<()> {
+    // `seen`: name -> (first branch's inferred type, that branch's assign span).
+    let mut seen: std::collections::HashMap<String, (Ty, Span)> = std::collections::HashMap::new();
+    let mut branches: Vec<&[Stmt]> = vec![then];
+    for (_, b) in elifs { branches.push(b); }
+    if let Some(b) = else_ { branches.push(b); }
+    for branch in branches {
+        for (name, (ty, span)) in branch_direct_bare_assign_types(branch, env) {
+            match seen.get(&name) {
+                Some((prev_ty, _)) if branch_divergent(prev_ty, &ty) => {
+                    return Err(branch_divergence_error(&name, prev_ty, &ty, span));
+                }
+                Some(_) => {} // compatible so far — keep the first-seen type.
+                None => { seen.insert(name, (ty, span)); }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Type every DIRECT (branch-top-level) BARE assignment target in one `if` branch,
+/// threading earlier assignments into a throwaway CLONE of `base_env` so a later
+/// RHS sees an earlier local. Records the LAST bare assignment per name (its
+/// resulting value type + span). An ANNOTATED direct assignment removes the name
+/// from the map (it is exempt from divergence — the declared type governs its
+/// slot). Errors from `check_expr` are swallowed: the real `check_body` pass
+/// reports them properly; here an un-typeable RHS just yields `Unknown`, which is
+/// never divergent.
+fn branch_direct_bare_assign_types(
+    branch: &[Stmt],
+    base_env: &FuncEnv,
+) -> std::collections::HashMap<String, (Ty, Span)> {
+    let mut clone = base_env.clone();
+    let mut out: std::collections::HashMap<String, (Ty, Span)> = std::collections::HashMap::new();
+    for s in branch {
+        if let Stmt::Assign { target, ty, value, span } = s {
+            let vt = check_expr(value, &mut clone).unwrap_or(Ty::Unknown);
+            let tp = clone.type_param_list();
+            let declared = match ty {
+                Some(t) => Ty::from_type_expr_scoped(t, *span, &tp).unwrap_or_else(|_| vt.clone()),
+                None => vt.clone(),
+            };
+            if ty.is_none() {
+                out.insert(target.clone(), (vt, *span));
+            } else {
+                out.remove(target);
+            }
+            clone.locals.insert(target.clone(), declared);
+        }
+    }
+    out
+}
+
+/// The honest CHECK error for a bare local assigned divergent types across an
+/// `if`'s branches (see [`detect_branch_divergence`]). States what is wrong (no
+/// single static type for the name at the join) and the three fixes: distinct
+/// names, a matching annotation on both branches, or — the generator case —
+/// materializing with `list(...)` so both branches produce a `list`.
+pub(crate) fn branch_divergence_error(name: &str, a: &Ty, b: &Ty, span: Span) -> Error {
+    Error::Type {
+        span,
+        msg: format!(
+            "local `{}` is assigned incompatible types across the branches of this \
+             `if` ({} on one path, {} on another). pyrst is statically typed and has \
+             no union type to represent a value that is one type on one branch and a \
+             different type on the next. Use a distinct name per branch, give both \
+             branches the same explicit annotation, or — when mixing a generator \
+             with a list — materialize the generator with `list(...)` so both \
+             branches produce a `list`.",
+            name, a, b
+        ),
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Pre-scan a function body and collect the names of parameters that appear as
@@ -676,6 +804,23 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             }
             let val_ty = check_expr(value, env)?;
             reject_typevar_op(&val_ty, "apply an operator to", *span)?;
+            // (LAZY-GEN V1-d) A generator has no in-place augmented-assignment
+            // form. `xs: list[int] = [..]; xs += gen(3)` otherwise slips past
+            // `check` and leaks a raw rustc E0368 at `build` (Vec has no
+            // `AddAssign<__PyrstGen>`). Give it the same honest MATERIALIZE
+            // treatment as `Return`/annotated `Assign`: a generator RHS into a
+            // list target (the reviewer's repro), and — symmetrically — a
+            // generator TARGET (a generator cannot be the LHS of `+=`/`*=`/…).
+            if let Some(target_ty) = env.locals.get(target.as_str()).cloned() {
+                reject_iterator_into_list(&val_ty, &target_ty, *span)?;
+                if matches!(target_ty, Ty::Iterator(_)) {
+                    return Err(iterator_materialize_error(
+                        "cannot be the target of an augmented assignment (`+=`, `*=`, …)",
+                        "materialize it into a `list` local first",
+                        *span,
+                    ));
+                }
+            }
             Ok(())
         }
         Stmt::Unpack { targets, value, span } => {
@@ -702,6 +847,12 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             // v1). A narrowing guard (`if x is not None:`) is a `BinOp` typed
             // Bool, so it is never a bare `TypeVar` and is unaffected.
             reject_typevar_op(&cond_ty, "use as a condition", cond.span())?;
+            // (LAZY-GEN V1-d BLOCKER) Reject a bare local assigned incompatible
+            // types across the sibling branches of this `if` — a silent miscompile
+            // otherwise (codegen hoists one Rust slot and the divergent branch's
+            // value is dropped at the join). Runs on the PRE-branch env (the helper
+            // clones it), so it does not disturb the branch checks below.
+            detect_branch_divergence(then, elifs, else_, env)?;
             // (EPIC-5) None-guard narrowing. For `if x is not None:` the THEN
             // branch sees `x: T` (the non-None payload); for `if x is None:` the
             // ELSE branch sees `x: T`. `x` must be a local typed `Option(T)`.
@@ -835,6 +986,20 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
         }
         Stmt::Match { subject, arms, span } => {
             let subject_ty = check_expr(subject, env)?;
+            // (LAZY-GEN V1-d) A generator cannot be the scrutinee of a `match`:
+            // match codegen clones the subject (`let __match_val = g.clone();`),
+            // and `__PyrstGen<T>` has no `Clone` — so `match g:` check-passes but
+            // build-fails with a raw rustc E0599. Reject it honestly at `check`.
+            if matches!(subject_ty, Ty::Iterator(_)) {
+                return Err(Error::Type {
+                    span: *span,
+                    msg: "a generator cannot be matched (`match` clones and \
+                          re-inspects its subject, which a lazy generator cannot \
+                          do); materialize it with `list(...)` and match that, or \
+                          iterate it with a `for` loop"
+                        .to_string(),
+                });
+            }
             // Generics v1: matching a bare type variable against a LITERAL pattern
             // (`case 0:` / `case "x":`) lowers to a Rust literal match, which needs
             // `PartialEq` on the subject (E0369 otherwise). A match whose arms are

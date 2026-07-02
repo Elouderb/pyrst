@@ -1,0 +1,13 @@
+# fail_branch_list_set.pyrs  (LAZY-GEN V1-d BLOCKER — no generators involved)
+# The same branch-divergence silent miscompile reproduces with NO generators: a
+# bare local assigned a `list` on one branch and a `set` on the other cannot share
+# one hoisted Rust slot (`Vec` vs `HashSet`). Honest CHECK error. Expected
+# substring: "is assigned incompatible types across the branches".
+
+def main() -> None:
+    flag: bool = True
+    if flag:
+        xs = [1, 2, 3]
+    else:
+        xs = {10, 20, 30}         # ERROR: list on one path, set on the other
+    print(len(xs))

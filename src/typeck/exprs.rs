@@ -1,5 +1,20 @@
 use super::*;
 
+/// The source-level spelling of a binary operator, used to build honest error
+/// messages that echo the user's actual operator (e.g. the generator-materialize
+/// fix `list(g) * 2` for `g * 2`). Mirrors the formatter's operator table.
+pub(crate) fn binop_symbol(op: BinOp) -> &'static str {
+    match op {
+        BinOp::Add => "+", BinOp::Sub => "-", BinOp::Mul => "*", BinOp::Div => "/",
+        BinOp::FloorDiv => "//", BinOp::Mod => "%", BinOp::Pow => "**",
+        BinOp::Eq => "==", BinOp::Ne => "!=", BinOp::Lt => "<", BinOp::Le => "<=",
+        BinOp::Gt => ">", BinOp::Ge => ">=", BinOp::And => "and", BinOp::Or => "or",
+        BinOp::Is => "is", BinOp::IsNot => "is not", BinOp::In => "in", BinOp::NotIn => "not in",
+        BinOp::BitAnd => "&", BinOp::BitOr => "|", BinOp::BitXor => "^",
+        BinOp::LShift => "<<", BinOp::RShift => ">>",
+    }
+}
+
 /// Pure inference oracle — the single source of truth for expression types.
 ///
 /// A side-effect-free port of codegen's `type_of_expr` (codegen.rs:264-548) with
@@ -1729,9 +1744,11 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                         "has no membership test (`in` would drain it; lazy membership \
                          arrives in V2)",
                         "x in list(g)", *span),
+                    // Show the fix with the ACTUAL operator (`g * 2` -> `list(g) * 2`,
+                    // `g == g2` -> `list(g) == list(g2)`), not a hard-coded `+`.
                     _ => iterator_materialize_error(
                         "has no binary-operator form (an operator would consume it)",
-                        "list(g) + xs", *span),
+                        &format!("list(g) {} xs", binop_symbol(*op)), *span),
                 });
             }
             // Generics v2: a SUPPORTED binary operator on two values of the SAME

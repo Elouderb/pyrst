@@ -1,0 +1,13 @@
+# fail_branch_list_str.pyrs  (LAZY-GEN V1-d BLOCKER — no generators involved)
+# A bare local assigned a `list` on one branch and a `str` on the other: `Vec` vs
+# `String` cannot share one hoisted slot, so the divergent branch's value is
+# dropped at the join. Honest CHECK error. Expected substring:
+# "is assigned incompatible types across the branches".
+
+def main() -> None:
+    flag: bool = False
+    if flag:
+        xs = [1, 2, 3]
+    else:
+        xs = "hello"              # ERROR: list on one path, str on the other
+    print(xs)

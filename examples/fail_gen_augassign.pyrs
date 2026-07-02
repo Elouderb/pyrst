@@ -1,0 +1,17 @@
+# fail_gen_augassign.pyrs  (LAZY-GEN V1-d MAJOR)
+# `xs += gen(3)` (augmented assignment of a generator into a list) check-passed but
+# build-failed before V1-d, leaking a raw rustc E0368 that mentioned the internal
+# `__PyrstGen` type (Vec has no `AddAssign<__PyrstGen>`). Now an honest CHECK error
+# with the materialize fix. Expected substring: "materialize it first with `list(...)`".
+
+def gen(n: int) -> Iterator[int]:
+    i: int = 0
+    while i < n:
+        yield i
+        i = i + 1
+
+
+def main() -> None:
+    xs: list[int] = [1, 2, 3]
+    xs += gen(3)                  # ERROR: xs += list(gen(3))
+    print(sum(xs))

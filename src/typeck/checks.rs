@@ -1,6 +1,11 @@
 use super::*;
 
 // Local scope during function body type checking.
+// `Clone` is used by the branch-divergence detection (`detect_branch_divergence`)
+// to type each `if`-branch's assignments in a throwaway copy of the env without
+// mutating the real one. `ctx` is a shared reference (Copy); every other field is
+// `Clone`, so the derive is a cheap structural copy.
+#[derive(Clone)]
 pub(crate) struct FuncEnv<'a> {
     pub(crate) ctx: &'a TyCtx,
     pub(crate) locals: HashMap<String, Ty>,

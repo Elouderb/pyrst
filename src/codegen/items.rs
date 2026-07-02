@@ -298,6 +298,11 @@ impl<'a> Codegen<'a> {
         // refined by later uses (e.g. `d = {}` then `d[k] = some_str`, or an
         // `acc = 0` accumulator later assigned a float).
         self.prescan_types(&f.body);
+        // (LAZY-GEN V1-d BLOCKER insurance) Defence-in-depth: a bare local assigned
+        // divergent types across sibling `if` branches would let the hoist silently
+        // drop one branch's value at the join. typeck rejects this at `check`; assert
+        // it here too so any residual divergent join is a LOUD build error.
+        self.assert_no_branch_divergence(&f.body)?;
 
         // Python has function scope, but pyrst emits if/for/while/with/try bodies
         // as Rust `{}` blocks. Hoist locals first-assigned inside a block to
@@ -1591,15 +1596,13 @@ impl<'a> Codegen<'a> {
     /// Whether reassigning a `b`-typed value to an `a`-typed binding is a
     /// genuine type change (Python allows it; single-`let` Rust does not).
     /// `Unknown` and numeric int/float mixes are not conflicts.
+    ///
+    /// Delegates to `crate::typeck::branch_divergent` — the SINGLE SOURCE OF TRUTH
+    /// for hoist-slot compatibility, shared with typeck's branch-divergence check
+    /// (LAZY-GEN V1-d BLOCKER) so the check-time rejection and this codegen shadow
+    /// decision can never drift apart.
     pub(crate) fn types_conflict(a: &Ty, b: &Ty) -> bool {
-        use Ty::*;
-        if matches!(a, Unknown) || matches!(b, Unknown) {
-            return false;
-        }
-        if matches!((a, b), (Int, Float) | (Float, Int)) {
-            return false;
-        }
-        std::mem::discriminant(a) != std::mem::discriminant(b)
+        crate::typeck::branch_divergent(a, b)
     }
 
     /// Forward type-inference pre-pass over a statement list (recursing into

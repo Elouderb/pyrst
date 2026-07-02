@@ -1,0 +1,23 @@
+# fail_gen_branch_reassign.pyrs  (LAZY-GEN V1-d BLOCKER — the epic-gating fixture)
+# A bare local assigned a `list` on one branch and a generator on the other, then
+# used after the join, SILENTLY produced wrong output before V1-d: codegen hoisted
+# `xs` to a single `Vec` slot and dropped the generator branch's value at the join
+# (flag=False printed nothing; Python prints 0 1 2). Now an honest CHECK error:
+# pyrst is statically typed with no union type. Expected substring:
+# "is assigned incompatible types across the branches".
+
+def gen(n: int) -> Iterator[int]:
+    i: int = 0
+    while i < n:
+        yield i
+        i = i + 1
+
+
+def main() -> None:
+    flag: bool = False
+    if flag:
+        xs = [1, 2, 3]
+    else:
+        xs = gen(3)               # ERROR: list on one path, generator on the other
+    for x in xs:
+        print(x)

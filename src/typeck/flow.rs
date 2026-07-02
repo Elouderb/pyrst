@@ -328,17 +328,32 @@ pub(crate) fn detect_sibling_divergence(
     env: &FuncEnv,
     join_desc: &str,
 ) -> Result<()> {
-    // `seen`: name -> (first branch's inferred type, that branch's assign span).
-    let mut seen: std::collections::HashMap<String, (Ty, Span)> = std::collections::HashMap::new();
+    // `seen`: name -> the (type, span) CANDIDATES accumulated from PRIOR branches.
+    // A single branch may contribute MORE THAN ONE candidate for a name (a direct
+    // assign plus a divergent reassign nested one block deep — card eca0532e), so
+    // candidates are a Vec and we compare every CROSS-branch pair. Same-branch
+    // candidates are NOT paired against each other here (an intra-branch retype is
+    // the read-after-conflicting-reassign check's domain, not a sibling join).
+    let mut seen: std::collections::HashMap<String, Vec<(Ty, Span)>> =
+        std::collections::HashMap::new();
     for branch in branches {
-        for (name, (ty, span)) in branch_direct_bare_assign_types(branch, env) {
-            match seen.get(&name) {
-                Some((prev_ty, _)) if branch_divergent(prev_ty, &ty) => {
-                    return Err(branch_divergence_error(&name, prev_ty, &ty, span, join_desc));
+        let branch_map = branch_direct_bare_assign_types(branch, env);
+        // Compare THIS branch's candidates against every PRIOR branch's candidates.
+        for (name, cands) in &branch_map {
+            if let Some(prev) = seen.get(name) {
+                for (pty, _) in prev {
+                    for (ty, span) in cands {
+                        if branch_divergent(pty, ty) {
+                            return Err(branch_divergence_error(name, pty, ty, *span, join_desc));
+                        }
+                    }
                 }
-                Some(_) => {} // compatible so far — keep the first-seen type.
-                None => { seen.insert(name, (ty, span)); }
             }
+        }
+        // Fold this branch's candidates in AFTER comparing (so its own candidates are
+        // never paired against each other).
+        for (name, cands) in branch_map {
+            seen.entry(name).or_default().extend(cands);
         }
     }
     Ok(())
@@ -358,56 +373,114 @@ pub(crate) fn detect_branch_divergence(
     detect_sibling_divergence(&branches, env, "the branches of this `if`")
 }
 
-/// Type every DIRECT (branch-top-level) BARE binding in one branch — a bare
-/// `Stmt::Assign` (`xs = ...`) OR a `Stmt::Unpack` (`a, b = ...`, always bare) —
+/// Type every branch-level BARE binding a branch MAY exit with — a bare
+/// `Stmt::Assign` (`xs = ...`) or a `Stmt::Unpack` (`a, b = ...`, always bare) —
 /// threading earlier bindings into a throwaway CLONE of `base_env` so a later RHS
-/// sees an earlier local. Records the LAST binding per name (its resulting value
-/// type + span). An ANNOTATED direct assignment removes the name from the map (it
-/// is exempt from divergence — the declared type governs its slot). Errors from
-/// `check_expr` are swallowed: the real `check_body` pass reports them properly;
-/// here an un-typeable RHS just yields `Unknown`, which is never divergent.
+/// sees an earlier local. Descends into SINGLE-ALTERNATIVE nested blocks (an `if`
+/// with NO `else`, plus `while`/`for` bodies) so a divergent reassign nested one
+/// level deep inside a branch (card eca0532e: `else: if cond2: xs = gen(3)`) still
+/// participates in the cross-branch divergence comparison; a `with` body always
+/// runs, so it is INLINED (unconditional). A sibling-complete `if` (has `else`) is
+/// NOT descended into — it runs its own divergence check via the enclosing
+/// recursion. Each name maps to a Vec of candidate `(type, span)`:
+///   - a DIRECT (unconditional) bare assign REPLACES the name's candidates (a later
+///     unconditional store overrides everything before it — this keeps the
+///     documented `xs = gen(..); xs = list(xs)` materialize idiom legal), while
+///   - a CONDITIONAL nested assign (if-no-else / while / for) UNIONS its candidates
+///     in (the name may take the nested type OR keep its prior value at the join).
+/// An ANNOTATED direct assignment removes the name (the declared type governs its
+/// slot — exempt). Errors from `check_expr` are swallowed: the real `check_body`
+/// pass reports them; here an un-typeable RHS is `Unknown`, which is never
+/// divergent (so descent never over-rejects on inference gaps).
 fn branch_direct_bare_assign_types(
     branch: &[Stmt],
     base_env: &FuncEnv,
-) -> std::collections::HashMap<String, (Ty, Span)> {
+) -> std::collections::HashMap<String, Vec<(Ty, Span)>> {
     let mut clone = base_env.clone();
-    let mut out: std::collections::HashMap<String, (Ty, Span)> = std::collections::HashMap::new();
+    let mut out: std::collections::HashMap<String, Vec<(Ty, Span)>> =
+        std::collections::HashMap::new();
+    collect_branch_exit_types(branch, &mut clone, &mut out);
+    out
+}
+
+/// Walk one statement list computing, per name, the candidate `(type, span)` values
+/// it may hold at the list's exit (see [`branch_direct_bare_assign_types`]).
+/// `clone` threads forward types for RHS inference and is mutated in place.
+fn collect_branch_exit_types(
+    branch: &[Stmt],
+    clone: &mut FuncEnv,
+    out: &mut std::collections::HashMap<String, Vec<(Ty, Span)>>,
+) {
     for s in branch {
         match s {
             Stmt::Assign { target, ty, value, span } => {
-                let vt = check_expr(value, &mut clone).unwrap_or(Ty::Unknown);
+                let vt = check_expr(value, clone).unwrap_or(Ty::Unknown);
                 let tp = clone.type_param_list();
                 let declared = match ty {
                     Some(t) => Ty::from_type_expr_scoped(t, *span, &tp).unwrap_or_else(|_| vt.clone()),
                     None => vt.clone(),
                 };
                 if ty.is_none() {
-                    out.insert(target.clone(), (vt, *span));
+                    out.insert(target.clone(), vec![(vt, *span)]); // REPLACE (unconditional)
                 } else {
-                    out.remove(target);
+                    out.remove(target); // annotated → exempt
                 }
                 clone.locals.insert(target.clone(), declared);
             }
-            // Tuple unpack (`a, b = ...`) is always bare and hoists each name to
-            // its own slot, so a divergent component (`a, b = gen(3), 2` vs
-            // `a, b = [1,2,3], 1`) is the same join hazard as a bare `Assign`.
-            // Bind each target to its tuple-component type (mirrors the
+            // Tuple unpack (`a, b = ...`) is always bare and hoists each name to its
+            // own slot, so a divergent component is the same join hazard as a bare
+            // `Assign`. Bind each target to its tuple-component type (mirrors the
             // `Stmt::Unpack` arm of `check_stmt`).
             Stmt::Unpack { targets, value, span } => {
-                let vt = check_expr(value, &mut clone).unwrap_or(Ty::Unknown);
+                let vt = check_expr(value, clone).unwrap_or(Ty::Unknown);
                 let elem_tys = match &vt {
                     Ty::Tuple(tys) if tys.len() == targets.len() => tys.clone(),
                     _ => vec![Ty::Unknown; targets.len()],
                 };
                 for (t, ety) in targets.iter().zip(elem_tys.iter()) {
-                    out.insert(t.clone(), (ety.clone(), *span));
+                    out.insert(t.clone(), vec![(ety.clone(), *span)]); // REPLACE
                     clone.locals.insert(t.clone(), ety.clone());
                 }
+            }
+            // A `with` body always runs — INLINE it (unconditional; its direct
+            // assigns REPLACE like top-level ones). Threads the same `clone`.
+            Stmt::With { body, .. } => {
+                collect_branch_exit_types(body, clone, out);
+            }
+            // Single-alternative `if` (NO else): each then/elif body MAY run, so its
+            // assignments are CONDITIONAL candidates. A sibling-complete `if` (has
+            // `else`) is handled by the enclosing recursion's own check.
+            Stmt::If { then, elifs, else_: None, .. } => {
+                merge_conditional_exit_types(then, clone, out);
+                for (_, b) in elifs {
+                    merge_conditional_exit_types(b, clone, out);
+                }
+            }
+            // Loop bodies MAY run zero or more times — CONDITIONAL candidates.
+            Stmt::While { body, .. } | Stmt::For { body, .. } => {
+                merge_conditional_exit_types(body, clone, out);
             }
             _ => {}
         }
     }
-    out
+}
+
+/// Collect a CONDITIONAL nested body's exit types against an ISOLATED clone (it may
+/// not run, so it must not definitely rebind an outer local's inferred type) and
+/// UNION them into `out` — at the join the name may take the nested type OR keep
+/// its prior candidates.
+fn merge_conditional_exit_types(
+    body: &[Stmt],
+    clone: &FuncEnv,
+    out: &mut std::collections::HashMap<String, Vec<(Ty, Span)>>,
+) {
+    let mut sub_clone = clone.clone();
+    let mut sub: std::collections::HashMap<String, Vec<(Ty, Span)>> =
+        std::collections::HashMap::new();
+    collect_branch_exit_types(body, &mut sub_clone, &mut sub);
+    for (name, cands) in sub {
+        out.entry(name).or_default().extend(cands);
+    }
 }
 
 /// The honest CHECK error for a bare local assigned divergent types across a
@@ -1576,6 +1649,26 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             // type variable is opaque — reject it honestly (it would otherwise
             // emit context-manager glue against an opaque `T` and fail rustc).
             reject_typevar_op(&ctx_ty, "use as a context manager", ctx_expr.span())?;
+            // (card ff3b4fa8) The context-manager protocol is NOT wired for user
+            // classes: `with Guard(...) as g:` emits a plain `let mut g = Guard::new(...)`
+            // and silently skips BOTH __enter__ and __exit__ (the body runs, the hooks
+            // never fire) — a silent divergence from Python. Only a file handle from
+            // `open(...)` (`Ty::File`, closed via RAII Drop) is a real context manager
+            // in pyrst today. Full protocol support is blocked on real exception objects:
+            // pyrst `raise` panics with a string-encoded type and no exception
+            // value/traceback, so `__exit__(self, exc_type, exc_value, traceback)` cannot
+            // receive Python-correct arguments on the raise path, nor honor suppression.
+            // Reject honestly instead of miscompiling; see the (a) follow-up card.
+            if !matches!(ctx_ty, Ty::File) {
+                return Err(Error::Type {
+                    span: ctx_expr.span(),
+                    msg: "context-manager protocol (__enter__/__exit__) is not yet \
+                           supported; only `with open(...) as f:` is a context manager \
+                           in pyrst. Call the methods explicitly instead (e.g. \
+                           `g = Guard(...)`, run the body, then `g.__exit__(...)`)"
+                        .to_string(),
+                });
+            }
             // Bound name is block-scoped in codegen; save/restore so a stale type
             // does not leak past the block (mirrors the for-loop handling).
             let saved = as_name.as_ref().map(|n| (n.clone(), env.locals.get(n).cloned()));

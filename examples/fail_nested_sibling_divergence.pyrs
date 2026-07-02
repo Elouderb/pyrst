@@ -1,0 +1,24 @@
+# Negative (card eca0532e): a branch's divergent bare reassign nested ONE block
+# deep must be caught by the sibling-divergence check. `then` binds `xs` to a
+# list; the `else` binds `xs` to a generator inside a nested `if` (one level
+# deep). At the `for x in xs` join `xs` has no single static type — python3 prints
+# `0 1 2`, but pyrst's hoist would silently drop the generator branch. Honest
+# CHECK error (also rejected at build). See the direct-sibling shape in
+# fail_branch_divergence_generator*.pyrs; this is the nested-one-deep variant.
+def gen(n: int) -> Iterator[int]:
+    i: int = 0
+    while i < n:
+        yield i
+        i = i + 1
+
+
+def main() -> None:
+    flag: bool = False
+    cond2: bool = True
+    if flag:
+        xs = [1, 2, 3]
+    else:
+        if cond2:
+            xs = gen(3)
+    for x in xs:
+        print(x)

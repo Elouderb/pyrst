@@ -1,0 +1,25 @@
+# Negative (card ff3b4fa8): a `with` over a USER class that defines the
+# context-manager protocol must be an HONEST typeck error, not a silent
+# miscompile. pyrst emits `let mut g = Guard(...)` and never calls __enter__ or
+# __exit__ (the body runs, the hooks silently don't). Full protocol support is
+# blocked on real exception objects (raise = panic with a string-encoded type,
+# no exception value/traceback for __exit__). Only `with open(...)` is a real
+# context manager today. Rejected at `pyrst check` AND `pyrst build`.
+class Guard:
+    name: str
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    def __enter__(self) -> Guard:
+        print("enter")
+        return self
+
+    def __exit__(self, exc_type: str, exc_value: str, tb: str) -> bool:
+        print("exit")
+        return False
+
+
+def main() -> None:
+    with Guard("g") as g:
+        print(g.name)

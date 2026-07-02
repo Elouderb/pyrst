@@ -265,38 +265,57 @@ impl<'a> Codegen<'a> {
     /// name diverges (see [`Self::assert_no_branch_divergence`]). `join_desc` names
     /// the join for the message.
     fn assert_siblings_no_divergence(&self, branches: &[&[Stmt]], join_desc: &str) -> Result<()> {
-        let mut seen: HashMap<String, Ty> = HashMap::new();
+        // name -> candidate types from PRIOR branches; compare every CROSS-branch
+        // pair (a branch may contribute multiple candidates via nested descent).
+        let mut seen: HashMap<String, Vec<Ty>> = HashMap::new();
         for branch in branches {
-            for (name, vt) in self.branch_direct_types(branch) {
-                match seen.get(&name) {
-                    Some(prev) if crate::typeck::branch_divergent(prev, &vt) => {
-                        return Err(crate::diag::Error::Codegen(format!(
-                            "internal invariant violated: local `{}` is assigned incompatible \
-                             types across {} (`{}` vs `{}`); the codegen hoist would silently \
-                             drop one branch's value at the join. This should have been rejected \
-                             at `check`. Use a distinct name per branch, annotate both branches \
-                             with the same type, or — for a generator — materialize with `list(...)`.",
-                            name, join_desc, prev, vt
-                        )));
+            let bm = self.branch_direct_types(branch);
+            for (name, cands) in &bm {
+                if let Some(prev) = seen.get(name) {
+                    for pty in prev {
+                        for vt in cands {
+                            if crate::typeck::branch_divergent(pty, vt) {
+                                return Err(crate::diag::Error::Codegen(format!(
+                                    "internal invariant violated: local `{}` is assigned incompatible \
+                                     types across {} (`{}` vs `{}`); the codegen hoist would silently \
+                                     drop one branch's value at the join. This should have been rejected \
+                                     at `check`. Use a distinct name per branch, annotate both branches \
+                                     with the same type, or — for a generator — materialize with `list(...)`.",
+                                    name, join_desc, pty, vt
+                                )));
+                            }
+                        }
                     }
-                    Some(_) => {}
-                    None => { seen.insert(name, vt); }
                 }
+            }
+            for (name, cands) in bm {
+                seen.entry(name).or_default().extend(cands);
             }
         }
         Ok(())
     }
 
-    /// The DIRECT (branch-top-level) BARE bindings of one branch — a bare
-    /// `Stmt::Assign` or a `Stmt::Unpack` (always bare, each name → its
-    /// tuple-component type) — with their inferred types via `type_of_expr`.
-    /// Mirrors typeck's `branch_direct_bare_assign_types`.
-    fn branch_direct_types(&self, branch: &[Stmt]) -> HashMap<String, Ty> {
-        let mut out: HashMap<String, Ty> = HashMap::new();
+    /// The BARE bindings a branch MAY exit with — a bare `Stmt::Assign` or a
+    /// `Stmt::Unpack` (each name → its tuple-component type) via `type_of_expr`,
+    /// descending into SINGLE-ALTERNATIVE nested blocks (an `if` with NO `else`,
+    /// plus `while`/`for` bodies; a `with` body is inlined as it always runs) so a
+    /// divergent reassign nested one level deep participates in the comparison
+    /// (card eca0532e). Mirrors typeck's `branch_direct_bare_assign_types`: a DIRECT
+    /// (unconditional) assign REPLACES the name's candidates; a CONDITIONAL nested
+    /// assign UNIONS its candidates in.
+    fn branch_direct_types(&self, branch: &[Stmt]) -> HashMap<String, Vec<Ty>> {
+        let mut out: HashMap<String, Vec<Ty>> = HashMap::new();
+        self.collect_branch_exit_types(branch, &mut out);
+        out
+    }
+
+    /// Walk one statement list accumulating, per name, the candidate exit types (see
+    /// [`Self::branch_direct_types`]).
+    fn collect_branch_exit_types(&self, branch: &[Stmt], out: &mut HashMap<String, Vec<Ty>>) {
         for st in branch {
             match st {
                 Stmt::Assign { target, ty: None, value, .. } => {
-                    out.insert(target.clone(), self.type_of_expr(value));
+                    out.insert(target.clone(), vec![self.type_of_expr(value)]); // REPLACE
                 }
                 Stmt::Unpack { targets, value, .. } => {
                     let vt = self.type_of_expr(value);
@@ -305,13 +324,36 @@ impl<'a> Codegen<'a> {
                         _ => vec![Ty::Unknown; targets.len()],
                     };
                     for (t, ety) in targets.iter().zip(elem_tys.iter()) {
-                        out.insert(t.clone(), ety.clone());
+                        out.insert(t.clone(), vec![ety.clone()]); // REPLACE
                     }
+                }
+                // `with` body always runs — inline (unconditional).
+                Stmt::With { body, .. } => {
+                    self.collect_branch_exit_types(body, out);
+                }
+                // Single-alternative `if` (no else) — conditional candidates.
+                Stmt::If { then, elifs, else_: None, .. } => {
+                    self.merge_conditional_exit_types(then, out);
+                    for (_, b) in elifs {
+                        self.merge_conditional_exit_types(b, out);
+                    }
+                }
+                // Loop bodies may run zero or more times — conditional candidates.
+                Stmt::While { body, .. } | Stmt::For { body, .. } => {
+                    self.merge_conditional_exit_types(body, out);
                 }
                 _ => {}
             }
         }
-        out
+    }
+
+    /// Collect a CONDITIONAL nested body's exit types and UNION them into `out`.
+    fn merge_conditional_exit_types(&self, body: &[Stmt], out: &mut HashMap<String, Vec<Ty>>) {
+        let mut sub: HashMap<String, Vec<Ty>> = HashMap::new();
+        self.collect_branch_exit_types(body, &mut sub);
+        for (name, cands) in sub {
+            out.entry(name).or_default().extend(cands);
+        }
     }
 
     /// (fix-b defence-in-depth) The codegen MIRROR of typeck's

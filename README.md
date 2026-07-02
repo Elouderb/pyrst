@@ -75,7 +75,7 @@ pyrst lsp                  # language server (stdin/stdout, for editors)
 - Value semantics (clone-on-use); `Mut[T]` parameter mode for by-reference mutation
 
 **Control & functions**
-- if/elif/else, while, for, break, continue, `with`/context managers
+- if/elif/else, while, for, break, continue, `with open(...) as f:` (file context managers only — the general `__enter__`/`__exit__` protocol over user classes is a documented honest error, not silent)
 - **Generators** (`yield`), lazy (on-demand execution, O(1) memory) — consumable by `for`/comprehensions/`list`/`sum`/`min`/`max`/`any`/`all`/`enumerate`/`zip`/`sorted`; infinite generators are safe (`while True: yield ...` + `break`)
 - **First-class functions:** lambdas, nested-`def` closures (lexical capture), `Callable[[A], R]` values
 - **Pattern matching:** `match`/`case` with literal, `_` wildcard, and capture (`case y:`) patterns + guards

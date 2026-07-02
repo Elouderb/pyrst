@@ -344,7 +344,7 @@ to make it a genuine generator.
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| Context managers / `with` | ✅ Supported | `with X() as y:` |
+| Context managers / `with` | ⚠️ Files only | `with open(...) as f:` works (the handle is closed via RAII on scope exit). The general context-manager protocol over a **user class** is an **honest typeck error** — `with Guard(...) as g:` would silently skip `__enter__`/`__exit__`, so it is rejected (`context-manager protocol … not yet supported`). Call the methods explicitly. Full support is blocked on real exception objects (pyrst `raise` = panic with a string-encoded type; `__exit__` needs the exception value/traceback and suppression semantics). |
 | Operator overloading | ✅ Supported | Dunder methods (see Classes) |
 | Generators / `yield` | ✅ Supported (lazy) | `Iterator[T]`-returning functions; on-demand execution, infinite generators OK — see [Generators (`yield`)](#generators-yield) below |
 | Coroutines / `async` / `await` | ❌ Not Supported | Not in current roadmap |

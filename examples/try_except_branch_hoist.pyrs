@@ -1,0 +1,25 @@
+# The `try` body and the `except` handler may both assign a bare local with the
+# SAME type; it hoists to one slot and is visible after the try. V1-d's try/except
+# divergence check must NOT reject this same-type case.
+def risky(x: int) -> int:
+    if x < 0:
+        raise ValueError("neg")
+    return x
+
+
+def run(x: int) -> None:
+    try:
+        xs = [1, 2, 3]
+        r: int = risky(x)
+        print(r)
+    except ValueError:
+        xs = [7, 8, 9]
+    total: int = 0
+    for v in xs:
+        total = total + v
+    print(total)
+
+
+def main() -> None:
+    run(5)
+    run(-1)

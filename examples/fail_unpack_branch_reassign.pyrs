@@ -1,0 +1,23 @@
+# fail_unpack_branch_reassign.pyrs  (LAZY-GEN V1-d BLOCKER — tuple-unpack sibling join)
+# A tuple unpack (`a, b = ...`) hoists each name to its own slot, so a divergent
+# component across sibling branches is the same join hazard as a bare assign. `a`
+# is a `list` on one branch and a generator on the other — a check-OK/build-fail
+# hole (raw rustc E0425) before this fix. Now an honest CHECK error. Expected
+# substring: "is assigned incompatible types across".
+
+def gen(n: int) -> Iterator[int]:
+    i: int = 0
+    while i < n:
+        yield i
+        i = i + 1
+
+
+def main() -> None:
+    flag: bool = False
+    if flag:
+        a, b = [1, 2, 3], 1
+    else:
+        a, b = gen(3), 2          # ERROR: `a` is a list on one path, a generator on the other
+    print(b)
+    for x in a:
+        print(x)

@@ -1,0 +1,22 @@
+# fail_match_branch_reassign.pyrs  (LAZY-GEN V1-d BLOCKER — match-arm sibling join)
+# The arms of a `match` are sibling value-paths merged into ONE hoisted slot. A bare
+# local assigned a `list` in one arm and a generator in another, read after the
+# match, was a check-OK/build-fail hole (raw rustc E0425) before this fix. Now an
+# honest CHECK error. Expected substring: "is assigned incompatible types across".
+
+def gen(n: int) -> Iterator[int]:
+    i: int = 0
+    while i < n:
+        yield i
+        i = i + 1
+
+
+def main() -> None:
+    flag: int = 0
+    match flag:
+        case 0:
+            xs = [1, 2, 3]
+        case _:
+            xs = gen(3)           # ERROR: list in one arm, generator in another
+    for x in xs:
+        print(x)

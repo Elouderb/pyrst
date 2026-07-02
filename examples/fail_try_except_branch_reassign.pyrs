@@ -1,0 +1,23 @@
+# fail_try_except_branch_reassign.pyrs  (LAZY-GEN V1-d BLOCKER — try/except sibling join)
+# The `try` body and each `except` handler are sibling value-paths that codegen
+# merges into ONE hoisted Rust slot — structurally identical to the if/else BLOCKER.
+# A bare local assigned a `list` in the body and a generator in the handler, read
+# after the try, SILENTLY produced wrong output before this fix (check ok, build ok,
+# printed `1 2 3`; Python prints `0 1 2`). Now an honest CHECK error. Expected
+# substring: "is assigned incompatible types across".
+
+def gen(n: int) -> Iterator[int]:
+    i: int = 0
+    while i < n:
+        yield i
+        i = i + 1
+
+
+def main() -> None:
+    try:
+        xs = [1, 2, 3]
+        raise ValueError("boom")
+    except ValueError:
+        xs = gen(3)               # ERROR: list in the body, generator in the handler
+    for x in xs:
+        print(x)

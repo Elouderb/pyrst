@@ -601,3 +601,99 @@ def main() -> None:
             msg
         );
     }
+
+    /// Drive `emit_program` on `src` WITHOUT running typeck (`resolve` parses +
+    /// builds the ctx but does not typecheck), returning the codegen result. Used
+    /// to exercise the branch-divergence defence-in-depth assertion, which typeck
+    /// would otherwise reject at `check` before codegen runs.
+    fn emit_bypassing_typeck(src: &str, tag: &str) -> Result<String> {
+        let mut path = std::env::temp_dir();
+        path.push(format!("pyrst_{}_{}.pyrs", tag, std::process::id()));
+        std::fs::write(&path, src).expect("write temp source");
+        let prog = crate::resolver::resolve(&path).expect("resolve must succeed");
+        let result = crate::codegen::emit_program(&prog.modules, &prog.ctx);
+        let _ = std::fs::remove_file(&path);
+        result
+    }
+
+    #[test]
+    fn codegen_asserts_try_except_divergence() {
+        // The `try` body and its `except` handler are sibling value-paths; a
+        // divergent bare local across them is the same silent-drop hazard as
+        // if/else. typeck rejects it at `check`; prove the codegen insurance also
+        // rejects it (bypassing typeck) rather than emitting a wrong-output hoist.
+        let src = "\
+def gen(n: int) -> Iterator[int]:
+    i: int = 0
+    while i < n:
+        yield i
+        i = i + 1
+
+def main() -> None:
+    try:
+        xs = [1, 2, 3]
+        raise ValueError(\"boom\")
+    except ValueError:
+        xs = gen(3)
+    for x in xs:
+        print(x)
+";
+        let err = emit_bypassing_typeck(src, "trydiv").expect_err("codegen must reject");
+        assert!(
+            format!("{}", err).contains("incompatible types across"),
+            "expected try/except divergence rejection, got:\n{}", err
+        );
+    }
+
+    #[test]
+    fn codegen_asserts_match_arm_divergence() {
+        // The arms of a `match` are sibling value-paths; a divergent bare local
+        // across them must be caught by the codegen insurance too.
+        let src = "\
+def gen(n: int) -> Iterator[int]:
+    i: int = 0
+    while i < n:
+        yield i
+        i = i + 1
+
+def main() -> None:
+    flag: int = 0
+    match flag:
+        case 0:
+            xs = [1, 2, 3]
+        case _:
+            xs = gen(3)
+    for x in xs:
+        print(x)
+";
+        let err = emit_bypassing_typeck(src, "matchdiv").expect_err("codegen must reject");
+        assert!(
+            format!("{}", err).contains("incompatible types across"),
+            "expected match-arm divergence rejection, got:\n{}", err
+        );
+    }
+
+    #[test]
+    fn match_arm_same_type_local_hoists() {
+        // MAJOR 2a: a bare local assigned the SAME type in every match arm and read
+        // after the match must HOIST to function scope (prescan's Match arm) so it
+        // is visible after the `match` block — otherwise a raw rustc E0425 leaked
+        // while `check` passed. Assert the emitted Rust hoists `xs` at function
+        // scope (a `let mut xs: Vec<i64>` declaration BEFORE the `match`).
+        let src = "\
+def main() -> None:
+    flag: int = 0
+    match flag:
+        case 0:
+            xs = [1, 2, 3]
+        case _:
+            xs = [4, 5]
+    for x in xs:
+        print(x)
+";
+        let rust = crate::driver::compile_str(src).expect("compile_str must succeed");
+        assert!(
+            rust.contains("let mut xs: Vec<i64>"),
+            "match-arm local `xs` must be hoisted to a function-scope Vec, got:\n{}", rust
+        );
+    }

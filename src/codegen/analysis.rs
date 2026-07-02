@@ -186,69 +186,55 @@ impl<'a> Codegen<'a> {
     }
 
     /// (LAZY-GEN V1-d BLOCKER — codegen insurance) Assert that no BARE (un-annotated)
-    /// local is assigned DIVERGENT types across the sibling branches of any `if` in
-    /// `stmts`. Mirrors typeck's `detect_branch_divergence` — the SAME
-    /// `branch_divergent` predicate and the same "direct bare assignment per branch,
-    /// first-seen vs later" comparison — so it can never fire for a program that
-    /// passed `check` (a `build` runs `check` first; see driver.rs). It is
-    /// defence-in-depth for the reviewer-traced silent miscompile: the hoisting
-    /// machinery (`prescan_types`/`unify_ty` pick ONE Rust slot type, and the
-    /// shadow-on-conflict path block-scopes the divergent branch's value) must NEVER
-    /// silently drop a value at a branch join, so a divergent join that somehow
-    /// reaches codegen becomes a LOUD build error instead of a wrong-output binary.
+    /// local is assigned DIVERGENT types across the sibling value-paths of any join
+    /// in `stmts`. Mirrors typeck's `detect_sibling_divergence` — the SAME
+    /// `branch_divergent` predicate and the same "direct bare binding per branch,
+    /// first-seen vs later" comparison, over the SAME three join shapes: `if`
+    /// (then+elifs+else), `try`/`except` (body + each handler), and `match` (each
+    /// arm). So it can never fire for a program that passed `check` (a `build` runs
+    /// `check` first; see driver.rs). It is defence-in-depth for the reviewer-traced
+    /// silent miscompile: the hoisting machinery (`prescan_types`/`unify_ty` pick
+    /// ONE Rust slot type, and the shadow-on-conflict path block-scopes the
+    /// divergent branch's value) must NEVER silently drop a value at a join, so a
+    /// divergent join that somehow reaches codegen becomes a LOUD build error
+    /// instead of a wrong-output binary.
     ///
-    /// Deliberately narrow — this is exactly the sibling-branch shape, NOT the
-    /// legal Python idiom of reusing a name for a different type inside a single
-    /// block read only within it (e.g. `passing = [..]` then `passing = pred()`
-    /// inside a `for`), which never crosses a join. Runs AFTER `prescan_types` so
-    /// `type_of_expr` resolves un-annotated locals; does NOT descend into nested
-    /// `def`/`class` bodies (each runs this pre-pass on its own body).
+    /// Deliberately narrow — exactly the sibling-branch shape, NOT the legal Python
+    /// idiom of reusing a name for a different type inside a single block read only
+    /// within it (e.g. `passing = [..]` then `passing = pred()` inside a `for`),
+    /// which never crosses a join. Runs AFTER `prescan_types` so `type_of_expr`
+    /// resolves un-annotated locals; does NOT descend into nested `def`/`class`
+    /// bodies (each runs this pre-pass on its own body).
     pub(crate) fn assert_no_branch_divergence(&self, stmts: &[Stmt]) -> Result<()> {
         for s in stmts {
             match s {
                 Stmt::If { then, elifs, else_, .. } => {
-                    let mut seen: HashMap<String, Ty> = HashMap::new();
                     let mut branches: Vec<&[Stmt]> = vec![then.as_slice()];
                     for (_, b) in elifs { branches.push(b); }
                     if let Some(b) = else_ { branches.push(b); }
-                    for branch in &branches {
-                        for st in *branch {
-                            if let Stmt::Assign { target, ty: None, value, .. } = st {
-                                let vt = self.type_of_expr(value);
-                                match seen.get(target) {
-                                    Some(prev) if crate::typeck::branch_divergent(prev, &vt) => {
-                                        return Err(crate::diag::Error::Codegen(format!(
-                                            "internal invariant violated: local `{}` is assigned \
-                                             incompatible types across the branches of an `if` \
-                                             (`{}` vs `{}`); the codegen hoist would silently drop \
-                                             one branch's value at the join. This should have been \
-                                             rejected at `check`. Use a distinct name per branch, \
-                                             annotate both branches with the same type, or — for a \
-                                             generator — materialize with `list(...)`.",
-                                            target, prev, vt
-                                        )));
-                                    }
-                                    Some(_) => {}
-                                    None => { seen.insert(target.clone(), vt); }
-                                }
-                            }
-                        }
-                    }
+                    self.assert_siblings_no_divergence(&branches, "the branches of an `if`")?;
                     self.assert_no_branch_divergence(then)?;
                     for (_, b) in elifs { self.assert_no_branch_divergence(b)?; }
                     if let Some(b) = else_ { self.assert_no_branch_divergence(b)?; }
                 }
-                Stmt::While { body, .. } | Stmt::For { body, .. } | Stmt::With { body, .. } => {
-                    self.assert_no_branch_divergence(body)?;
-                }
                 Stmt::Try { body, handlers, else_, finally_, .. } => {
+                    // body + each handler are the sibling value-paths (else/finally
+                    // run sequentially after the body, not as alternatives).
+                    let mut branches: Vec<&[Stmt]> = vec![body.as_slice()];
+                    for h in handlers { branches.push(&h.body); }
+                    self.assert_siblings_no_divergence(&branches, "the branches of a `try`/`except`")?;
                     self.assert_no_branch_divergence(body)?;
                     for h in handlers { self.assert_no_branch_divergence(&h.body)?; }
                     if let Some(b) = else_ { self.assert_no_branch_divergence(b)?; }
                     if let Some(b) = finally_ { self.assert_no_branch_divergence(b)?; }
                 }
                 Stmt::Match { arms, .. } => {
+                    let branches: Vec<&[Stmt]> = arms.iter().map(|a| a.body.as_slice()).collect();
+                    self.assert_siblings_no_divergence(&branches, "the arms of a `match`")?;
                     for a in arms { self.assert_no_branch_divergence(&a.body)?; }
+                }
+                Stmt::While { body, .. } | Stmt::For { body, .. } | Stmt::With { body, .. } => {
+                    self.assert_no_branch_divergence(body)?;
                 }
                 // Nested defs/classes run this pre-pass on their own body.
                 Stmt::Func(_) | Stmt::Class(_) => {}
@@ -256,6 +242,59 @@ impl<'a> Codegen<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Compare the DIRECT bare bindings of a set of sibling branches; error if any
+    /// name diverges (see [`Self::assert_no_branch_divergence`]). `join_desc` names
+    /// the join for the message.
+    fn assert_siblings_no_divergence(&self, branches: &[&[Stmt]], join_desc: &str) -> Result<()> {
+        let mut seen: HashMap<String, Ty> = HashMap::new();
+        for branch in branches {
+            for (name, vt) in self.branch_direct_types(branch) {
+                match seen.get(&name) {
+                    Some(prev) if crate::typeck::branch_divergent(prev, &vt) => {
+                        return Err(crate::diag::Error::Codegen(format!(
+                            "internal invariant violated: local `{}` is assigned incompatible \
+                             types across {} (`{}` vs `{}`); the codegen hoist would silently \
+                             drop one branch's value at the join. This should have been rejected \
+                             at `check`. Use a distinct name per branch, annotate both branches \
+                             with the same type, or — for a generator — materialize with `list(...)`.",
+                            name, join_desc, prev, vt
+                        )));
+                    }
+                    Some(_) => {}
+                    None => { seen.insert(name, vt); }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The DIRECT (branch-top-level) BARE bindings of one branch — a bare
+    /// `Stmt::Assign` or a `Stmt::Unpack` (always bare, each name → its
+    /// tuple-component type) — with their inferred types via `type_of_expr`.
+    /// Mirrors typeck's `branch_direct_bare_assign_types`.
+    fn branch_direct_types(&self, branch: &[Stmt]) -> HashMap<String, Ty> {
+        let mut out: HashMap<String, Ty> = HashMap::new();
+        for st in branch {
+            match st {
+                Stmt::Assign { target, ty: None, value, .. } => {
+                    out.insert(target.clone(), self.type_of_expr(value));
+                }
+                Stmt::Unpack { targets, value, .. } => {
+                    let vt = self.type_of_expr(value);
+                    let elem_tys = match &vt {
+                        Ty::Tuple(tys) if tys.len() == targets.len() => tys.clone(),
+                        _ => vec![Ty::Unknown; targets.len()],
+                    };
+                    for (t, ety) in targets.iter().zip(elem_tys.iter()) {
+                        out.insert(t.clone(), ety.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
     }
 
     /// Replace identifier `old_name` with `new_name` in code, respecting word boundaries

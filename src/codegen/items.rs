@@ -1735,6 +1735,38 @@ impl<'a> Codegen<'a> {
                     if let Some(b) = else_ { self.prescan_types(b); }
                     if let Some(b) = finally_ { self.prescan_types(b); }
                 }
+                Stmt::Match { subject, arms, .. } => {
+                    // Recurse into each arm body so a bare local first-assigned in
+                    // match arms gets a type and therefore HOISTS (collect_hoistable
+                    // already collects match-arm assigns) — otherwise it stays
+                    // untyped, is not hoisted, and a read-after-the-match leaks a raw
+                    // rustc E0425 while `check` passed (review comment 134, MAJOR 2a).
+                    // A `case <name>:` CAPTURE is bound to the subject's type only for
+                    // the duration of its arm (scoped save/restore, like the `Try`
+                    // arm's `exc_name`): the binding does not persist, so a capture
+                    // reassigned inside its arm (`case y: y = y + 1`) is NOT recorded
+                    // function-wide and therefore NOT hoisted — preserving the
+                    // existing match-capture-reassign lowering. A genuinely FREE arm
+                    // local (`xs = [..]`) is recorded permanently by the `Assign` arm
+                    // above and does hoist.
+                    let subj_ty = self.type_of_expr(subject);
+                    for arm in arms {
+                        let saved = if let MatchPattern::Capture(name) = &arm.pattern {
+                            let prev = self.locals.get(name).cloned();
+                            self.locals.insert(name.clone(), subj_ty.clone());
+                            Some((name.clone(), prev))
+                        } else {
+                            None
+                        };
+                        self.prescan_types(&arm.body);
+                        if let Some((name, prev)) = saved {
+                            match prev {
+                                Some(ty) => { self.locals.insert(name, ty); }
+                                None => { self.locals.remove(name.as_str()); }
+                            }
+                        }
+                    }
+                }
                 _ => {}
             }
         }

@@ -295,42 +295,45 @@ pub(crate) fn branch_divergent(a: &Ty, b: &Ty) -> bool {
 }
 
 /// (LAZY-GEN V1-d BLOCKER) Detect a BARE (un-annotated) local assigned
-/// incompatible types across the sibling branches of one `if` — the silent
-/// miscompile the reviewer traced (comment 131): codegen hoists the name to ONE
-/// function-scope Rust slot, then the branch whose type diverges from the hoisted
-/// type emits a block-scoped shadow that is discarded at the block's end, so the
-/// value is silently dropped at the join. pyrst is statically typed with no union
-/// type to represent "one type on one path, another on the next", so this is an
-/// honest CHECK error.
+/// incompatible types across the SIBLING branches of a control-flow join — the
+/// silent miscompile the reviewer traced (comment 131): codegen hoists the name to
+/// ONE function-scope Rust slot, then the branch whose type diverges from the
+/// hoisted type emits a block-scoped shadow that is discarded at the block's end,
+/// so the value is silently dropped at the join. pyrst is statically typed with no
+/// union type to represent "one type on one path, another on the next", so this is
+/// an honest CHECK error.
+///
+/// `branches` are the sibling value-paths of ONE join and `join_desc` names it for
+/// the message. The three join shapes that reach codegen's shared hoist slot are:
+///   - `if` — `then` + each `elif` + `else`;
+///   - `try`/`except` — the `try` body + each `except` handler body (the `else`/
+///     `finally` blocks run SEQUENTIALLY after the body on the no-exception path,
+///     not as alternative values, so they are NOT siblings here);
+///   - `match` — each arm body.
 ///
 /// SCOPE (over-rejection guards — card AC2):
-///   - Only DIRECT (top-level-of-branch) BARE assignments participate. Nested
-///     `if`s are covered by their own recursion; ANNOTATED re-declarations are
-///     exempt (the user chose the type — `block_scoping`'s `letter: str` in every
-///     branch is the canonical legal pattern, and codegen honours the annotation).
+///   - Only DIRECT (top-level-of-branch) BARE assignments/unpacks participate.
+///     Nested joins are covered by their own recursion; ANNOTATED re-declarations
+///     are exempt (the user chose the type — `block_scoping`'s `letter: str` in
+///     every branch is the canonical legal pattern, and codegen honours it).
 ///   - Cross-branch only — sequential same-scope retyping (`x = 5` then `x = "s"`)
-///     is a within-block sequence, never two sibling branches, so it is untouched
-///     (codegen's same-scope shadow stays legal).
+///     is a within-block sequence, never two sibling branches, so it is untouched.
 ///   - `branch_divergent` treats Int/Float and Unknown as compatible, so numeric
 ///     widening across branches and empty-collection branches are NOT rejected.
 ///   - A name assigned in only ONE branch has no pair to compare, so the
 ///     hoist-with-default idiom (assign-in-branch, use-after) stays legal.
-pub(crate) fn detect_branch_divergence(
-    then: &[Stmt],
-    elifs: &[(Expr, Vec<Stmt>)],
-    else_: &Option<Vec<Stmt>>,
+pub(crate) fn detect_sibling_divergence(
+    branches: &[&[Stmt]],
     env: &FuncEnv,
+    join_desc: &str,
 ) -> Result<()> {
     // `seen`: name -> (first branch's inferred type, that branch's assign span).
     let mut seen: std::collections::HashMap<String, (Ty, Span)> = std::collections::HashMap::new();
-    let mut branches: Vec<&[Stmt]> = vec![then];
-    for (_, b) in elifs { branches.push(b); }
-    if let Some(b) = else_ { branches.push(b); }
     for branch in branches {
         for (name, (ty, span)) in branch_direct_bare_assign_types(branch, env) {
             match seen.get(&name) {
                 Some((prev_ty, _)) if branch_divergent(prev_ty, &ty) => {
-                    return Err(branch_divergence_error(&name, prev_ty, &ty, span));
+                    return Err(branch_divergence_error(&name, prev_ty, &ty, span, join_desc));
                 }
                 Some(_) => {} // compatible so far — keep the first-seen type.
                 None => { seen.insert(name, (ty, span)); }
@@ -340,14 +343,28 @@ pub(crate) fn detect_branch_divergence(
     Ok(())
 }
 
-/// Type every DIRECT (branch-top-level) BARE assignment target in one `if` branch,
-/// threading earlier assignments into a throwaway CLONE of `base_env` so a later
-/// RHS sees an earlier local. Records the LAST bare assignment per name (its
-/// resulting value type + span). An ANNOTATED direct assignment removes the name
-/// from the map (it is exempt from divergence — the declared type governs its
-/// slot). Errors from `check_expr` are swallowed: the real `check_body` pass
-/// reports them properly; here an un-typeable RHS just yields `Unknown`, which is
-/// never divergent.
+/// The `if`-shaped call (`then` + `elifs` + `else`), preserved for the `Stmt::If`
+/// arm's call site. Delegates to [`detect_sibling_divergence`].
+pub(crate) fn detect_branch_divergence(
+    then: &[Stmt],
+    elifs: &[(Expr, Vec<Stmt>)],
+    else_: &Option<Vec<Stmt>>,
+    env: &FuncEnv,
+) -> Result<()> {
+    let mut branches: Vec<&[Stmt]> = vec![then];
+    for (_, b) in elifs { branches.push(b); }
+    if let Some(b) = else_ { branches.push(b); }
+    detect_sibling_divergence(&branches, env, "the branches of this `if`")
+}
+
+/// Type every DIRECT (branch-top-level) BARE binding in one branch — a bare
+/// `Stmt::Assign` (`xs = ...`) OR a `Stmt::Unpack` (`a, b = ...`, always bare) —
+/// threading earlier bindings into a throwaway CLONE of `base_env` so a later RHS
+/// sees an earlier local. Records the LAST binding per name (its resulting value
+/// type + span). An ANNOTATED direct assignment removes the name from the map (it
+/// is exempt from divergence — the declared type governs its slot). Errors from
+/// `check_expr` are swallowed: the real `check_body` pass reports them properly;
+/// here an un-typeable RHS just yields `Unknown`, which is never divergent.
 fn branch_direct_bare_assign_types(
     branch: &[Stmt],
     base_env: &FuncEnv,
@@ -355,41 +372,61 @@ fn branch_direct_bare_assign_types(
     let mut clone = base_env.clone();
     let mut out: std::collections::HashMap<String, (Ty, Span)> = std::collections::HashMap::new();
     for s in branch {
-        if let Stmt::Assign { target, ty, value, span } = s {
-            let vt = check_expr(value, &mut clone).unwrap_or(Ty::Unknown);
-            let tp = clone.type_param_list();
-            let declared = match ty {
-                Some(t) => Ty::from_type_expr_scoped(t, *span, &tp).unwrap_or_else(|_| vt.clone()),
-                None => vt.clone(),
-            };
-            if ty.is_none() {
-                out.insert(target.clone(), (vt, *span));
-            } else {
-                out.remove(target);
+        match s {
+            Stmt::Assign { target, ty, value, span } => {
+                let vt = check_expr(value, &mut clone).unwrap_or(Ty::Unknown);
+                let tp = clone.type_param_list();
+                let declared = match ty {
+                    Some(t) => Ty::from_type_expr_scoped(t, *span, &tp).unwrap_or_else(|_| vt.clone()),
+                    None => vt.clone(),
+                };
+                if ty.is_none() {
+                    out.insert(target.clone(), (vt, *span));
+                } else {
+                    out.remove(target);
+                }
+                clone.locals.insert(target.clone(), declared);
             }
-            clone.locals.insert(target.clone(), declared);
+            // Tuple unpack (`a, b = ...`) is always bare and hoists each name to
+            // its own slot, so a divergent component (`a, b = gen(3), 2` vs
+            // `a, b = [1,2,3], 1`) is the same join hazard as a bare `Assign`.
+            // Bind each target to its tuple-component type (mirrors the
+            // `Stmt::Unpack` arm of `check_stmt`).
+            Stmt::Unpack { targets, value, span } => {
+                let vt = check_expr(value, &mut clone).unwrap_or(Ty::Unknown);
+                let elem_tys = match &vt {
+                    Ty::Tuple(tys) if tys.len() == targets.len() => tys.clone(),
+                    _ => vec![Ty::Unknown; targets.len()],
+                };
+                for (t, ety) in targets.iter().zip(elem_tys.iter()) {
+                    out.insert(t.clone(), (ety.clone(), *span));
+                    clone.locals.insert(t.clone(), ety.clone());
+                }
+            }
+            _ => {}
         }
     }
     out
 }
 
-/// The honest CHECK error for a bare local assigned divergent types across an
-/// `if`'s branches (see [`detect_branch_divergence`]). States what is wrong (no
-/// single static type for the name at the join) and the three fixes: distinct
-/// names, a matching annotation on both branches, or — the generator case —
-/// materializing with `list(...)` so both branches produce a `list`.
-pub(crate) fn branch_divergence_error(name: &str, a: &Ty, b: &Ty, span: Span) -> Error {
+/// The honest CHECK error for a bare local assigned divergent types across a
+/// control-flow join (see [`detect_sibling_divergence`]). `join_desc` names the
+/// join ("the branches of this `if`", "the branches of this `try`/`except`", "the
+/// arms of this `match`"). States what is wrong (no single static type for the
+/// name at the join) and the three fixes: distinct names, a matching annotation on
+/// both branches, or — the generator case — materializing with `list(...)`.
+pub(crate) fn branch_divergence_error(name: &str, a: &Ty, b: &Ty, span: Span, join_desc: &str) -> Error {
     Error::Type {
         span,
         msg: format!(
-            "local `{}` is assigned incompatible types across the branches of this \
-             `if` ({} on one path, {} on another). pyrst is statically typed and has \
-             no union type to represent a value that is one type on one branch and a \
-             different type on the next. Use a distinct name per branch, give both \
-             branches the same explicit annotation, or — when mixing a generator \
-             with a list — materialize the generator with `list(...)` so both \
-             branches produce a `list`.",
-            name, a, b
+            "local `{}` is assigned incompatible types across {} ({} on one path, {} \
+             on another). pyrst is statically typed and has no union type to \
+             represent a value that is one type on one branch and a different type \
+             on the next. Use a distinct name per branch, give both branches the \
+             same explicit annotation, or — when mixing a generator with a list — \
+             materialize the generator with `list(...)` so both branches produce a \
+             `list`.",
+            name, join_desc, a, b
         ),
     }
 }
@@ -946,6 +983,15 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
         }
         Stmt::Import { .. } => Ok(()), // Ignored in v0
         Stmt::Try { body, handlers, else_, finally_, .. } => {
+            // (LAZY-GEN V1-d BLOCKER) The `try` body and each `except` handler body
+            // are SIBLING value-paths that codegen merges into one hoisted slot —
+            // the same silent-drop hazard as `if`/`else`. A bare local assigned
+            // divergent types across body-vs-handler is an honest CHECK error.
+            // (`else`/`finally` run sequentially after the body, not as alternative
+            // values, so they are excluded here — see `detect_sibling_divergence`.)
+            let mut branches: Vec<&[Stmt]> = vec![body.as_slice()];
+            for h in handlers { branches.push(&h.body); }
+            detect_sibling_divergence(&branches, env, "the branches of this `try`/`except`")?;
             check_body(body, env)?;
             for h in handlers {
                 if let Some(name) = &h.exc_name {
@@ -1011,6 +1057,12 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             {
                 reject_typevar_op(&subject_ty, "match on a literal pattern against", *span)?;
             }
+            // (LAZY-GEN V1-d BLOCKER) The arm bodies are SIBLING value-paths merged
+            // into one hoisted slot — the same divergent-join hazard as `if`/`else`.
+            // A bare local assigned divergent types across arms is an honest CHECK
+            // error (a divergent case otherwise leaks a raw rustc E0425 at build).
+            let arm_branches: Vec<&[Stmt]> = arms.iter().map(|a| a.body.as_slice()).collect();
+            detect_sibling_divergence(&arm_branches, env, "the arms of this `match`")?;
             for arm in arms {
                 // A `case <name>:` (capture) pattern BINDS `<name>` to the subject's
                 // value for the duration of this arm — its GUARD and its body (so

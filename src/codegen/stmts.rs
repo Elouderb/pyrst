@@ -353,7 +353,28 @@ impl<'a> Codegen<'a> {
                     Ty::Tuple(tys) if tys.len() == targets.len() => tys.clone(),
                     _ => vec![Ty::Unknown; targets.len()],
                 };
-                let all_new = targets.iter().all(|t| !self.declared.contains(t));
+                // (card 8bedd8e4) Python allows a REPEATED unpack target
+                // (`a, a = 1, 2`, left-to-right, last wins -> a == 2). A single
+                // destructuring `let (mut a, mut a) = (1, 2);` — the `all_new` form
+                // below — is NOT valid Rust for a repeated name (E0416, "identifier
+                // bound more than once in the same pattern"); it was a raw rustc
+                // leak from `pyrst build` on an otherwise-typechecked program. A
+                // duplicate target forces `all_new` false so the MIXED/temp-split
+                // path (below) runs instead: it binds the whole RHS to temps first,
+                // then dispatches each target through `emit_unpack_target`
+                // SEQUENTIALLY — the second `a` sees the first's binding already
+                // `declared` and reassigns it (`a = temp1;`), giving the same
+                // left-to-right last-wins result Python does. This does not touch
+                // `all_declared`/`all_simple_reassign`: a duplicate target that is
+                // ALREADY declared before this statement takes that path unchanged,
+                // and Rust's destructuring ASSIGNMENT (unlike `let`) permits a
+                // repeated place (`(a, a) = (1, 2);` compiles — it is not a pattern
+                // binding), so that form was never broken.
+                let has_dup_targets = {
+                    let mut seen = std::collections::HashSet::with_capacity(targets.len());
+                    !targets.iter().all(|t| seen.insert(t.as_str()))
+                };
+                let all_new = targets.iter().all(|t| !self.declared.contains(t)) && !has_dup_targets;
                 let all_declared = targets.iter().all(|t| self.declared.contains(t));
                 let any_shadow = targets.iter().any(|t| self.shadow_map.contains_key(t));
                 // A pre-existing target whose slot is incompatible with its component
@@ -415,8 +436,19 @@ impl<'a> Codegen<'a> {
                 }
             }
             Stmt::AugAssign { target, op, value, .. } => {
-                let v = self.emit_expr(value)?;
                 let target_ty = self.locals.get(target.as_str()).cloned().unwrap_or(Ty::Unknown);
+                // (card 12052b4c) `xs += ys` (list target, Add) lowers to
+                // `xs.extend(<rhs>)` below, which needs the RHS built through the
+                // uniform clone-on-use helper (a bare-Ident RHS is `.clone()`d so
+                // `ys` stays usable afterward; an owned temp — literal/comprehension/
+                // call — stays bare), exactly like every other consuming site
+                // (`emit_consuming`, src/codegen/items.rs). Every other AugAssign
+                // shape keeps the plain `emit_expr` it always used (byte-identical).
+                let v = if matches!(target_ty, Ty::List(_)) && matches!(op, BinOp::Add) {
+                    self.emit_consuming(value)?
+                } else {
+                    self.emit_expr(value)?
+                };
                 // (EPIC-6) `target` names an existing local (emitted escaped by its
                 // `let`), so every occurrence here — store target AND read — uses
                 // the escaped form.
@@ -469,15 +501,50 @@ impl<'a> Codegen<'a> {
                     BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div
                     | BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor
                     | BinOp::LShift | BinOp::RShift => {
-                        // Direct Rust compound-assignment. Bitwise/shift ops are
-                        // int-only in pyrst, so `&=`/`|=`/`^=`/`<<=`/`>>=` map 1:1.
                         let op_s = match op {
                             BinOp::Add => "+=", BinOp::Sub => "-=", BinOp::Mul => "*=", BinOp::Div => "/=",
                             BinOp::BitAnd => "&=", BinOp::BitOr => "|=", BinOp::BitXor => "^=",
                             BinOp::LShift => "<<=", BinOp::RShift => ">>=",
                             _ => unreachable!(),
                         };
-                        self.line(&format!("{} {} {};", target, op_s, v));
+                        // (card 12052b4c) The bare `target op= value;` below is only
+                        // valid for `Copy` scalars (Int/Float): Rust's compound-
+                        // assignment traits don't cover the non-Copy heap types this
+                        // arm used to emit it for unconditionally, and that mismatch
+                        // doesn't fail as a clean pyrst diagnostic — it LEAKS a raw
+                        // rustc error at `build` (a `check`-time pass, not `check`
+                        // itself, since AugAssign never re-validates its own
+                        // op/target-type combination — see flow.rs). Concretely:
+                        // `String` implements `AddAssign<&str>`, NOT
+                        // `AddAssign<String>` (`s += "llo"` leaked E0308 — the
+                        // original bug report); `Vec`/`HashSet` implement NO
+                        // compound-assignment trait at all (`xs += ys` / `s1 |= s2`
+                        // leaked E0368). Special-case the two shapes Python actually
+                        // defines as an in-place mutation — str `+=` (append) and
+                        // list `+=` (`list.__iadd__`, i.e. extend; unlike list `+`,
+                        // which concatenates into a NEW list and stays an honest
+                        // reject in exprs.rs's BinOp::Add arm) — and give every
+                        // OTHER non-Copy combination (str `-=`/`*=`, list `-=`/`*=`,
+                        // set `|=`/`&=`/`-=`/`^=`, dict, class, …) an honest codegen
+                        // error instead of the raw rustc leak. None of those other
+                        // combinations is valid Python either (TypeError there), so
+                        // refusing is faithful, not merely defensive.
+                        if matches!(target_ty, Ty::Str) && matches!(op, BinOp::Add) {
+                            // `String` has no `AddAssign<String>` — borrow as `&str`.
+                            self.line(&format!("{} += &({});", target, v));
+                        } else if matches!(target_ty, Ty::List(_)) && matches!(op, BinOp::Add) {
+                            // `v` was already built via `emit_consuming` above.
+                            self.line(&format!("{}.extend({});", target, v));
+                        } else if !self.is_copy_type(&target_ty) {
+                            return Err(crate::diag::Error::Codegen(format!(
+                                "augmented assignment `{}` is not supported for type {} — \
+                                 rebind explicitly (`{target} = {target} <op> ...`) or use \
+                                 an equivalent method (e.g. `.extend()`, `.update()`)",
+                                op_s, target_ty
+                            )));
+                        } else {
+                            self.line(&format!("{} {} {};", target, op_s, v));
+                        }
                     }
                     // FloorDiv/Mod/Pow are handled by explicit arms above. No other
                     // BinOp can reach an AugAssign target: comparison, logical,

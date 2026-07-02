@@ -1,0 +1,19 @@
+# card 12052b4c: `s += "x"` (str target) and `xs += ys` (list target) both
+# previously leaked a raw rustc build error — `String` implements
+# `AddAssign<&str>`, NOT `AddAssign<String>` (the generic AugAssign arm
+# emitted `s += String::from("ab")`, an E0308 borrow mismatch), and `Vec`
+# implements no compound-assignment trait at all (`xs += ys` was an E0368).
+# str `+=` now borrows the RHS as `&str`; list `+=` mutates in place via
+# `.extend()`, mirroring Python's `list.__iadd__` — `ys` stays independently
+# usable afterward (clone-on-use), matching python3 ground truth.
+def main() -> None:
+    s: str = ""
+    for i in range(3):
+        s += "ab"
+    print(s)
+
+    xs: list[int] = [1, 2]
+    ys: list[int] = [3, 4]
+    xs += ys
+    print(xs)
+    print(ys)

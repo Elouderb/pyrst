@@ -1,0 +1,15 @@
+# card 8bedd8e4: a REPEATED tuple-unpack target (`a, a = 1, 2`) typechecked
+# but leaked a raw rustc E0416 ("identifier bound more than once in the same
+# pattern") at build — the fresh-binding path emitted a single destructuring
+# `let (mut a, mut a) = (1, 2);`, which Rust rejects for `let` patterns (though
+# it accepts the identical shape as a plain ASSIGNMENT, `(a, a) = (1, 2);`).
+# Python allows the repeat (left-to-right, last wins). A duplicate target now
+# routes through the existing temp-split unpack machinery, which assigns each
+# target sequentially and naturally reproduces last-wins.
+def main() -> None:
+    a, a = 1, 2
+    print(a)
+
+    x, y, x = 10, 20, 30
+    print(x)
+    print(y)

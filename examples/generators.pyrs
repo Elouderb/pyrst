@@ -1,12 +1,11 @@
-# Generators (`yield`) — EAGER v1.
+# Generators (`yield`) — LAZY.
 #
 # A function whose body uses `yield` is a GENERATOR and must be declared to
-# return `Iterator[T]` (the yielded element type). In this first version the
-# generator runs to completion, collecting every yielded value into a list, and
-# returns it; a `for` loop or comprehension then iterates that result. This is
-# faithful for FINITE generators (the common case). An INFINITE generator
-# (`while True: yield ...`) would collect forever and hang at runtime — true
-# lazy iteration is an explicit follow-up.
+# return `Iterator[T]` (the yielded element type). Generators are lazy: the
+# body runs on demand, one step per element, in O(1) memory — an infinite
+# generator (`while True: yield ...`) is safe when the consumer breaks (see
+# gen_infinite.pyrs). Consume with `for`, comprehensions, or the iterator-
+# aware builtins; materialize with `list(...)` for random access.
 def squares(n: int) -> Iterator[int]:
     i: int = 0
     while i < n:

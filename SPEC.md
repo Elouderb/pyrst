@@ -40,9 +40,11 @@ The full pipeline (lexer → parser → resolver → type checker → Rust codeg
 - Dynamic typing, runtime type changes, or an `Any`/`Dynamic` escape hatch.
 - Python standard-library compatibility.
 - The dynamic half of Python: metaclasses, descriptors, monkey-patching,
-  `eval`/`exec`, reflection, generators/`async`, and `*args`/`**kwargs`. These
-  are fundamentally incompatible with mandatory static typing and ahead-of-time
-  compilation to Rust, and are intentionally out of scope.
+  `eval`/`exec`, reflection, `async`, and `*args`/`**kwargs`. These are
+  fundamentally incompatible with mandatory static typing and ahead-of-time
+  compilation to Rust, and are intentionally out of scope. (Generators are a
+  scoped exception: `yield` is supported with lazy semantics — see
+  PYTHON_COMPATIBILITY.md's Generators section.)
 - Multiple inheritance.
 
 ### Intentional Restrictions
@@ -779,7 +781,7 @@ subtype polymorphism (§6.4), `Mut[T]` by-reference params (§13), Optional
 narrowing (§14), multi-file imports (§16).
 
 ### Not supported (by design)
-- Generators / `yield`; coroutines / `async` / `await`.
+- Coroutines / `async` / `await` (generators/`yield` ARE supported — lazy; see PYTHON_COMPATIBILITY.md).
 - `*args` / `**kwargs`.
 - `global` / `nonlocal` (no module-level mutable-state rebinding).
 - Metaclasses, descriptors, abstract base classes, multiple inheritance.

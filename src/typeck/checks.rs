@@ -23,7 +23,7 @@ pub(crate) struct FuncEnv<'a> {
     pub(crate) by_ref_params: std::collections::HashSet<String>,
     /// Generators: true when the function being checked has a `yield` in its
     /// body. A generator MUST be declared `Iterator[T]` (so `ret_ty` is the
-    /// `Ty::List(T)` that `Iterator[T]` lowers to). When set, a `yield x` checks
+    /// `Ty::Iterator(T)` that `Iterator[T]` lowers to — LAZY-GEN V1-a). When set, a `yield x` checks
     /// `x` against the element type `T`, a bare `return` is allowed even though
     /// `ret_ty` is not `Unit` (it ends collection early), and a `return <value>`
     /// is rejected (generators yield values, they do not return one).

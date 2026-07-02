@@ -22,7 +22,9 @@ impl<'a> Codegen<'a> {
     pub(crate) fn type_has_default(&self, ty: &Ty) -> bool {
         match ty {
             Ty::Int | Ty::Float | Ty::Bool | Ty::Str | Ty::Unit => true,
-            Ty::List(_) | Ty::Set(_) | Ty::Dict(_, _) | Ty::Option(_) => true,
+            // LAZY-GEN V1-a: a generator local is a `Vec<T>` (eager) — has `Default`
+            // exactly like a list, so hoisting stays byte-identical.
+            Ty::List(_) | Ty::Iterator(_) | Ty::Set(_) | Ty::Dict(_, _) | Ty::Option(_) => true,
             Ty::Class(n, _) => {
                 // (EPIC-5 C2-3) A polymorphic base lowers (via `rust_ty`) to its
                 // companion enum `n__`, a data-variant enum that CANNOT derive
@@ -107,7 +109,8 @@ impl<'a> Codegen<'a> {
     pub(crate) fn fully_concrete(ty: &Ty) -> bool {
         match ty {
             Ty::Unknown => false,
-            Ty::List(e) | Ty::Set(e) | Ty::Option(e) => Self::fully_concrete(e),
+            // LAZY-GEN V1-a: a generator is concrete iff its element type is (== list).
+            Ty::List(e) | Ty::Iterator(e) | Ty::Set(e) | Ty::Option(e) => Self::fully_concrete(e),
             Ty::Dict(k, v) => Self::fully_concrete(k) && Self::fully_concrete(v),
             Ty::Tuple(ts) => ts.iter().all(Self::fully_concrete),
             _ => true,
@@ -125,6 +128,8 @@ impl<'a> Codegen<'a> {
             Ty::Bool => "false".to_string(),
             Ty::Str => "String::new()".to_string(),
             Ty::List(_) => "Vec::new()".to_string(),
+            // LAZY-GEN V1-a: the eager generator local is a `Vec<T>` — same default.
+            Ty::Iterator(_) => "Vec::new()".to_string(),
             Ty::Set(_) => "::std::collections::HashSet::new()".to_string(),
             Ty::Dict(_, _) => "::std::collections::HashMap::new()".to_string(),
             Ty::Option(_) => "None".to_string(),
@@ -252,7 +257,9 @@ impl<'a> Codegen<'a> {
         iter: &Expr,
     ) -> Vec<(String, Option<Ty>)> {
         let elem = match self.type_of_expr(iter) {
-            Ty::List(inner) | Ty::Set(inner) => *inner,
+            // LAZY-GEN V1-a: a comprehension over a generator binds its target to
+            // the generator's element type, exactly like over a list.
+            Ty::List(inner) | Ty::Iterator(inner) | Ty::Set(inner) => *inner,
             Ty::Dict(key, _) => *key,
             Ty::Str => Ty::Str,
             _ => Ty::Unknown,
@@ -355,7 +362,7 @@ impl<'a> Codegen<'a> {
     pub(crate) fn ty_has_poly_base(&self, ty: &Ty) -> bool {
         match ty {
             Ty::Class(n, _) => self.is_polymorphic_base(n),
-            Ty::List(e) | Ty::Set(e) | Ty::Option(e) => self.ty_has_poly_base(e),
+            Ty::List(e) | Ty::Iterator(e) | Ty::Set(e) | Ty::Option(e) => self.ty_has_poly_base(e),
             Ty::Dict(k, v) => self.ty_has_poly_base(k) || self.ty_has_poly_base(v),
             Ty::Tuple(ts) => ts.iter().any(|t| self.ty_has_poly_base(t)),
             _ => false,
@@ -370,7 +377,7 @@ impl<'a> Codegen<'a> {
     pub(crate) fn ty_has_func(&self, ty: &Ty) -> bool {
         match ty {
             Ty::Func(..) => true,
-            Ty::List(e) | Ty::Set(e) | Ty::Option(e) => self.ty_has_func(e),
+            Ty::List(e) | Ty::Iterator(e) | Ty::Set(e) | Ty::Option(e) => self.ty_has_func(e),
             Ty::Dict(k, v) => self.ty_has_func(k) || self.ty_has_func(v),
             Ty::Tuple(ts) => ts.iter().any(|t| self.ty_has_func(t)),
             _ => false,
@@ -383,7 +390,7 @@ impl<'a> Codegen<'a> {
     pub(crate) fn ty_mentions_typevar(ty: &Ty) -> bool {
         match ty {
             Ty::TypeVar(_) => true,
-            Ty::List(e) | Ty::Set(e) | Ty::Option(e) => Self::ty_mentions_typevar(e),
+            Ty::List(e) | Ty::Iterator(e) | Ty::Set(e) | Ty::Option(e) => Self::ty_mentions_typevar(e),
             Ty::Dict(k, v) => Self::ty_mentions_typevar(k) || Self::ty_mentions_typevar(v),
             Ty::Tuple(ts) => ts.iter().any(Self::ty_mentions_typevar),
             Ty::Func(args, ret) => {

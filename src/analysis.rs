@@ -911,7 +911,8 @@ fn apply_stmt_to_locals(
         Stmt::For { targets, iter, body, .. } => {
             if targets.len() == 1 {
                 let elem = match crate::typeck::infer_expr_ty(iter, locals, ctx) {
-                    Ty::List(inner) | Ty::Set(inner) => *inner,
+                    // LAZY-GEN V1-a: a generator source yields elements like a list.
+                    Ty::List(inner) | Ty::Iterator(inner) | Ty::Set(inner) => *inner,
                     Ty::Dict(key, _) => *key,
                     Ty::Str => Ty::Str,
                     _ => Ty::Int,

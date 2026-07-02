@@ -303,7 +303,8 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
             // Infer element type from the iterable and element expression.
             let iter_ty = infer_expr_ty(iter, locals, ctx);
             let elem_iter_ty = match &iter_ty {
-                Ty::List(inner) | Ty::Set(inner) => Some(inner.as_ref().clone()),
+                // LAZY-GEN V1-a: a generator source == a list source, element-wise.
+                Ty::List(inner) | Ty::Iterator(inner) | Ty::Set(inner) => Some(inner.as_ref().clone()),
                 _ => None,
             };
             // The single-variable oracle only applies to single-target comps;
@@ -318,14 +319,16 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
             }
             // Fallback: use the iterable's element type.
             match iter_ty {
-                Ty::List(inner) => Ty::List(inner),
+                // LAZY-GEN V1-a: a comprehension over a generator yields a list of
+                // its element type, exactly like a comprehension over a list.
+                Ty::List(inner) | Ty::Iterator(inner) => Ty::List(inner),
                 Ty::Set(inner) => Ty::List(inner),
                 _ => Ty::List(Box::new(Ty::Unknown)),
             }
         }
         Expr::SetComp { elt, targets: _, iter, .. } => {
             let iter_ty = infer_expr_ty(iter, locals, ctx);
-            if let Ty::List(ref inner) | Ty::Set(ref inner) = iter_ty {
+            if let Ty::List(ref inner) | Ty::Iterator(ref inner) | Ty::Set(ref inner) = iter_ty {
                 match elt.as_ref() {
                     Expr::Attr { name, .. } => {
                         if let Ty::Class(cls, _) = inner.as_ref() {
@@ -732,7 +735,9 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
             // mirroring the `Stmt::For` gate.)
             reject_typevar_op(&iter_ty, "iterate over", iter.span())?;
             let elem_ty = match &iter_ty {
-                Ty::List(inner) => *inner.clone(),
+                // LAZY-GEN V1-a: a generator source (`Ty::Iterator`) yields the
+                // same element type as a `list[T]` — treated identically.
+                Ty::List(inner) | Ty::Iterator(inner) => *inner.clone(),
                 Ty::Set(inner) => *inner.clone(),
                 Ty::Str => Ty::Str, // iterating a string yields 1-char strings
                 _ => Ty::Int, // ranges and unknown iterables -> Int
@@ -771,7 +776,9 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
             // mirroring the `Stmt::For` gate.)
             reject_typevar_op(&iter_ty, "iterate over", iter.span())?;
             let elem_ty = match &iter_ty {
-                Ty::List(inner) => *inner.clone(),
+                // LAZY-GEN V1-a: a generator source (`Ty::Iterator`) yields the
+                // same element type as a `list[T]` — treated identically.
+                Ty::List(inner) | Ty::Iterator(inner) => *inner.clone(),
                 Ty::Set(inner) => *inner.clone(),
                 Ty::Str => Ty::Str, // iterating a string yields 1-char strings
                 _ => Ty::Int,
@@ -812,7 +819,9 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
             // mirroring the `Stmt::For` gate.)
             reject_typevar_op(&iter_ty, "iterate over", iter.span())?;
             let elem_ty = match &iter_ty {
-                Ty::List(inner) => *inner.clone(),
+                // LAZY-GEN V1-a: a generator source (`Ty::Iterator`) yields the
+                // same element type as a `list[T]` — treated identically.
+                Ty::List(inner) | Ty::Iterator(inner) => *inner.clone(),
                 Ty::Set(inner) => *inner.clone(),
                 Ty::Str => Ty::Str, // iterating a string yields 1-char strings
                 _ => Ty::Int,

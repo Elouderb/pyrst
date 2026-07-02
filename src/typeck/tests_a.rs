@@ -1836,3 +1836,99 @@ use super::test_support::*;
         let str_to_int = Ty::Func(vec![Ty::Str], Box::new(Ty::Int));
         assert!(!super::types_compatible(&str_to_int, &int_to_int, &ctx));
     }
+
+    // =========================================================================
+    // LAZY-GEN V1-a — the new `Ty::Iterator(T)` variant
+    // (docs/design/lazy-generators.md §A.1, §D, §G)
+    // =========================================================================
+
+    #[test]
+    fn iterator_display_renders_as_iterator_bracket() {
+        // Hover / diagnostics render an `Iterator[T]` distinctly from `list[T]`.
+        assert_eq!(Ty::Iterator(Box::new(Ty::Int)).to_string(), "Iterator[int]");
+        // Nested element types render recursively.
+        assert_eq!(
+            Ty::Iterator(Box::new(Ty::List(Box::new(Ty::Str)))).to_string(),
+            "Iterator[list[str]]"
+        );
+    }
+
+    #[test]
+    fn iterator_type_expr_lowers_to_iterator_variant() {
+        // `Iterator[int]` lowers to the DISTINCT `Ty::Iterator(Int)` variant —
+        // NOT `Ty::List(Int)` as it did before LAZY-GEN V1-a.
+        let te = TypeExpr::Generic(
+            "Iterator".to_string(),
+            vec![TypeExpr::Named("int".to_string())],
+        );
+        assert_eq!(
+            Ty::from_type_expr(&te, Span::DUMMY).unwrap(),
+            Ty::Iterator(Box::new(Ty::Int))
+        );
+        // It is explicitly a different value from the list of the same element.
+        assert_ne!(
+            Ty::from_type_expr(&te, Span::DUMMY).unwrap(),
+            Ty::List(Box::new(Ty::Int))
+        );
+    }
+
+    #[test]
+    fn unify_typevar_binds_through_iterator() {
+        // `def first(xs: Iterator[T]) -> T` must bind `T` from the argument, just
+        // like a `list[T]` param does. An `Iterator[int]` actual binds T=int.
+        let tps = vec!["T".to_string()];
+        let mut subst: HashMap<String, Ty> = HashMap::new();
+        super::unify_typevar(
+            &Ty::Iterator(Box::new(Ty::TypeVar("T".to_string()))),
+            &Ty::Iterator(Box::new(Ty::Int)),
+            &tps,
+            &mut subst,
+        )
+        .unwrap();
+        assert_eq!(subst.get("T"), Some(&Ty::Int));
+
+        // A `list[str]` actual also binds an `Iterator[T]` param (a list is
+        // covariantly assignable to an iterator slot — V1-a).
+        let mut subst2: HashMap<String, Ty> = HashMap::new();
+        super::unify_typevar(
+            &Ty::Iterator(Box::new(Ty::TypeVar("T".to_string()))),
+            &Ty::List(Box::new(Ty::Str)),
+            &tps,
+            &mut subst2,
+        )
+        .unwrap();
+        assert_eq!(subst2.get("T"), Some(&Ty::Str));
+    }
+
+    #[test]
+    fn v1a_iterator_and_list_are_interchangeable_in_types_compatible() {
+        // V1-a is behavior-INVISIBLE: an `Iterator[T]` and a `list[T]` must be
+        // mutually assignable in BOTH directions (the honest "iterator is not a
+        // list" error is a deliberate V1-d flip, not V1-a). This guards the
+        // iter_no_yield_return.pyrs corpus case (`list[int] = <Iterator[int] call>`).
+        let it_int = Ty::Iterator(Box::new(Ty::Int));
+        let li_int = Ty::List(Box::new(Ty::Int));
+        assert!(types_compatible(&it_int, &li_int)); // Iterator -> list slot
+        assert!(types_compatible(&li_int, &it_int)); // list -> Iterator slot
+        assert!(types_compatible(&it_int, &it_int)); // Iterator -> Iterator slot
+        // Unknown-element permissiveness carries through, like list.
+        assert!(types_compatible(
+            &Ty::List(Box::new(Ty::Unknown)),
+            &Ty::Iterator(Box::new(Ty::Int))
+        ));
+    }
+
+    #[test]
+    fn substitute_typevars_descends_through_iterator() {
+        // `Iterator[T]` with {T -> int} substitutes to `Iterator[int]`, mirroring
+        // how `list[T]` substitutes (V1-a: treat Iterator exactly like List).
+        let mut subst: HashMap<String, Ty> = HashMap::new();
+        subst.insert("T".to_string(), Ty::Int);
+        assert_eq!(
+            super::substitute_typevars(
+                &Ty::Iterator(Box::new(Ty::TypeVar("T".to_string()))),
+                &subst
+            ),
+            Ty::Iterator(Box::new(Ty::Int))
+        );
+    }

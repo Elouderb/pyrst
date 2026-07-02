@@ -13,6 +13,16 @@ pub enum Ty {
     Dict(Box<Ty>, Box<Ty>),
     Tuple(Vec<Ty>),
     Option(Box<Ty>),
+    /// The declared type of a GENERATOR (a function whose body uses `yield`),
+    /// spelled `Iterator[T]` in source. LAZY-GEN V1-a introduces this as a variant
+    /// DISTINCT from `List` (previously `Iterator[T]` lowered straight to
+    /// `List(T)`). In V1-a it is still treated EXACTLY like `List(T)` at every
+    /// destructure site — the eager Vec-collect pipeline and `rust_ty` -> `Vec<T>`
+    /// are unchanged, so the split is behavior-invisible. Later increments (V1-b/c/d)
+    /// flip the codegen to a lazy coroutine (`Gen<T>`) and turn the non-lazy
+    /// consumption shapes into honest `list(...)`-suggesting errors. See
+    /// docs/design/lazy-generators.md §A.1, §D, §G.
+    Iterator(Box<Ty>),
     /// A user class instance type. The `String` is the class NAME; the `Vec<Ty>`
     /// is its TYPE ARGUMENTS, which is EMPTY for a non-generic class (or a bare,
     /// not-yet-instantiated class name) and carries the inferred/declared args for
@@ -66,6 +76,7 @@ impl std::fmt::Display for Ty {
                 write!(f, "]")
             }
             Ty::Option(t) => write!(f, "{} | None", t),
+            Ty::Iterator(t) => write!(f, "Iterator[{}]", t),
             Ty::Class(n, args) => {
                 write!(f, "{}", n)?;
                 if !args.is_empty() {
@@ -157,15 +168,16 @@ impl Ty {
                 }
                 ("tuple", args) => Ty::Tuple(args.iter().map(|a| Ty::from_type_expr_scoped(a, span, type_params)).collect::<Result<Vec<_>>>()?),
                 // `Iterator[T]` is the declared return type of a GENERATOR (a
-                // function whose body contains `yield`). In pyrst's EAGER v1 a
-                // generator runs to completion collecting its yielded values into
-                // a `Vec<T>` and returns it, so `Iterator[T]` lowers to the same
-                // internal type as `list[T]` — every existing list machinery
-                // (for-loop / comprehension element typing, `Vec<T>` codegen)
-                // applies unchanged. Generator-ness is tracked separately (by the
-                // presence of `Stmt::Yield`) and drives the honest-error checks +
-                // the Vec-collect desugar; the element typing is just `list[T]`.
-                ("Iterator", [t]) => Ty::List(Box::new(Ty::from_type_expr_scoped(t, span, type_params)?)),
+                // function whose body contains `yield`). LAZY-GEN V1-a lowers it to
+                // its OWN variant `Ty::Iterator(T)`, distinct from `list[T]`, so the
+                // downstream machinery can eventually treat generators lazily. In
+                // V1-a the eager `Vec<T>`-collect pipeline is preserved: every list
+                // destructure site carries a mirror `Ty::Iterator` arm and `rust_ty`
+                // still emits `Vec<T>`, so introducing the variant is behavior-
+                // invisible. Generator-ness is tracked separately (by the presence
+                // of `Stmt::Yield`) and drives the honest-error checks + the Vec-
+                // collect desugar. See docs/design/lazy-generators.md §A.1, §G.
+                ("Iterator", [t]) => Ty::Iterator(Box::new(Ty::from_type_expr_scoped(t, span, type_params)?)),
                 ("Optional", [t]) => Ty::Option(Box::new(Ty::from_type_expr_scoped(t, span, type_params)?)),
                 ("Union", args) => {
                     let non_none: Vec<_> = args.iter()

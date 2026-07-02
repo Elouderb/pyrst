@@ -456,7 +456,11 @@ impl<'a> Codegen<'a> {
                 // `matches!` omitted.
                 let is_copy_elem = if let Expr::Ident(name, _) = iter {
                     self.locals.get(name.as_str()).or_else(|| self.ctx.vars.get(name.as_str()))
-                        .map(|ty| if let Ty::List(inner) = ty {
+                        // LAZY-GEN V1-a: a generator stored in a local (`Ty::Iterator`)
+                        // iterates like a list — the same `.copied()`-vs-`.cloned()`
+                        // element-copy decision applies (keeps `generator_gen_local`
+                        // byte-identical).
+                        .map(|ty| if let Ty::List(inner) | Ty::Iterator(inner) = ty {
                             self.is_copy_type(inner)
                         } else { false })
                         .unwrap_or(false)
@@ -522,7 +526,8 @@ impl<'a> Codegen<'a> {
                 // the body must reference the loop variable, not mangle the name to
                 // the const (`for i in range(3)` with a module const `i`).
                 let loop_elem_ty = match &for_iter_ty {
-                    Ty::List(inner) | Ty::Set(inner) => (**inner).clone(),
+                    // LAZY-GEN V1-a: a generator source yields elements like a list.
+                    Ty::List(inner) | Ty::Iterator(inner) | Ty::Set(inner) => (**inner).clone(),
                     Ty::Dict(key, _) => (**key).clone(),
                     Ty::Str => Ty::Str,
                     _ if is_range => Ty::Int,

@@ -2336,6 +2336,10 @@ impl<'a> Codegen<'a> {
             // upstream type error).
             Ty::NoneVal => "()".into(),
             Ty::List(inner) => format!("Vec<{}>", self.rust_ty(inner)),
+            // LAZY-GEN V1-a: the eager pipeline still returns/stores a generator as
+            // a `Vec<T>`, so `Iterator[T]` emits identically to `list[T]` for now.
+            // V1-b replaces this with the lazy `Gen<T>` coroutine type.
+            Ty::Iterator(inner) => format!("Vec<{}>", self.rust_ty(inner)),
             Ty::Set(inner) => format!("::std::collections::HashSet<{}>", self.rust_ty(inner)),
             Ty::Dict(k, v) => format!("::std::collections::HashMap<{}, {}>", self.rust_ty(k), self.rust_ty(v)),
             Ty::Tuple(parts) => {

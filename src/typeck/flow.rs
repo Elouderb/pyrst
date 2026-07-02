@@ -207,6 +207,9 @@ pub fn is_copy(ty: &Ty) -> bool {
         Ty::Option(inner) => is_copy(inner),
         Ty::Str
         | Ty::List(_)
+        // LAZY-GEN V1-a: a generator result is move-only (a `Vec<T>` in the eager
+        // pipeline, a `Gen<T>` later) — non-Copy, exactly like `List`.
+        | Ty::Iterator(_)
         | Ty::Set(_)
         | Ty::Dict(_, _)
         | Ty::Class(_, _)
@@ -598,8 +601,9 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
                 });
             }
             // The element type is the inner `T` of the `Iterator[T]` return,
-            // which lowered to `Ty::List(T)`. The yielded value must match `T`.
-            if let Ty::List(elem) = &env.ret_ty {
+            // which lowers to `Ty::Iterator(T)` (LAZY-GEN V1-a). The yielded value
+            // must match `T`.
+            if let Ty::Iterator(elem) = &env.ret_ty {
                 if !types_compatible(&yielded, elem, env.ctx) {
                     return Err(Error::Type {
                         span: *span,
@@ -753,7 +757,9 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             reject_typevar_op(&iter_ty, "iterate over", *span)?;
             // Determine element type from iterator type
             let elem_ty = match &iter_ty {
-                Ty::List(inner) => *inner.clone(),
+                // LAZY-GEN V1-a: a generator result (`Ty::Iterator`) yields the same
+                // element type as a `list[T]` — treated identically for now.
+                Ty::List(inner) | Ty::Iterator(inner) => *inner.clone(),
                 Ty::Set(inner) => *inner.clone(),
                 // Iterating a dict yields its KEYS (Python semantics).
                 Ty::Dict(key, _) => *key.clone(),

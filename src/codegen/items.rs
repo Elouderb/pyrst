@@ -171,12 +171,14 @@ impl<'a> Codegen<'a> {
         let saved_ret_ty = std::mem::replace(&mut self.current_ret_ty, ret.clone());
         // Generators (EAGER v1): a function whose body contains `yield` collects
         // its yielded values into a `Vec<T>` and returns it. typeck has already
-        // verified the signature is `Iterator[T]` (which lowered `ret` to
-        // `Ty::List(T)` -> a `Vec<T>` Rust return), so detecting the `yield` in
-        // the body is enough to switch on the desugar here. The flag is
-        // saved/restored so a nested function never inherits it.
+        // verified the signature is `Iterator[T]` (which LAZY-GEN V1-a lowers to
+        // `Ty::Iterator(T)`, still emitted as a `Vec<T>` Rust return by `rust_ty`),
+        // so detecting the `yield` in the body is enough to switch on the desugar
+        // here. The `Ty::List(_)` arm is retained defensively; a well-formed
+        // generator return is now `Ty::Iterator(_)`. The flag is saved/restored so
+        // a nested function never inherits it.
         let is_generator =
-            crate::typeck::body_contains_yield(&f.body) && matches!(ret, Ty::List(_));
+            crate::typeck::body_contains_yield(&f.body) && matches!(ret, Ty::List(_) | Ty::Iterator(_));
         let saved_in_generator = std::mem::replace(&mut self.in_generator, is_generator);
         // (try/except control flow) A nested `def` owns its own control flow:
         // a `return`/`break`/`continue` inside it is local to that function (or
@@ -1489,6 +1491,8 @@ impl<'a> Codegen<'a> {
                 Box::new(Self::unify_ty(*v1, *v2)),
             ),
             (Ty::List(e1), Ty::List(e2)) => Ty::List(Box::new(Self::unify_ty(*e1, *e2))),
+            // LAZY-GEN V1-a: unify two generator element types like two list ones.
+            (Ty::Iterator(e1), Ty::Iterator(e2)) => Ty::Iterator(Box::new(Self::unify_ty(*e1, *e2))),
             (Ty::Set(e1), Ty::Set(e2)) => Ty::Set(Box::new(Self::unify_ty(*e1, *e2))),
             (a, _) => a,
         }
@@ -1631,7 +1635,8 @@ impl<'a> Codegen<'a> {
                     // resolve to a (non-existent) local instead of the const.
                     if targets.len() == 1 {
                         let elem = match self.type_of_expr(iter) {
-                            Ty::List(inner) | Ty::Set(inner) => *inner,
+                            // LAZY-GEN V1-a: a generator source yields elements like a list.
+                            Ty::List(inner) | Ty::Iterator(inner) | Ty::Set(inner) => *inner,
                             // Iterating a dict yields its KEYS (Python semantics).
                             Ty::Dict(key, _) => *key,
                             Ty::Str => Ty::Str,

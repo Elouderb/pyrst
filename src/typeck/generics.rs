@@ -34,6 +34,21 @@ pub(crate) fn types_compatible(val_ty: &Ty, declared_ty: &Ty, ctx: &TyCtx) -> bo
         // Dict with Unknown key/value compatible with any Dict
         (Ty::Dict(k, v), Ty::Dict(_, _)) if **k == Ty::Unknown && **v == Ty::Unknown => true,
         (Ty::Dict(_, _), Ty::Dict(k, v)) if **k == Ty::Unknown && **v == Ty::Unknown => true,
+        // ── LAZY-GEN V1-a: Iterator ≡ List assignability (a DELIBERATE change to
+        //    a silent-fail site — the `_ => false` fallback below) ─────────────
+        // The variant split must be behavior-INVISIBLE in V1-a, so an `Iterator[T]`
+        // is interchangeable with a `list[T]` here in BOTH directions, exactly as
+        // when `Iterator[T]` *was* `Ty::List(T)`. This is what keeps the corpus's
+        // iter_no_yield_return.pyrs compiling byte-identically — it assigns an
+        // `Iterator[int]`-returning call into a `list[int]` slot (the Iterator→list
+        // direction). The honest "an iterator is not a list; wrap in list(...)"
+        // error (docs/design/lazy-generators.md §D.2) is a DELIBERATE V1-d behavior
+        // flip; introducing it here would violate the V1-a zero-behavior-change
+        // gate. Recursing on the element preserves the existing element rules
+        // (equal / Unknown via `types_compatible`).
+        (Ty::List(v), Ty::Iterator(d))
+        | (Ty::Iterator(v), Ty::List(d))
+        | (Ty::Iterator(v), Ty::Iterator(d)) => types_compatible(v, d, ctx),
         // ── Optional / None ──────────────────────────────────────────────────
         // (EPIC-5) `types_compatible(val_ty, declared_ty)` is directional: it asks
         // whether a value of `val_ty` may flow into a slot of `declared_ty`. The
@@ -161,6 +176,15 @@ pub(crate) fn unify_typevar(
             Ty::List(a) => unify_typevar(d, a, type_params, subst),
             _ => Ok(()),
         },
+        // LAZY-GEN V1-a: a DELIBERATE change to a silent-fail site (the outer
+        // `_ => Ok(())` binds nothing). An `Iterator[T]` declared param binds `T`
+        // from an `Iterator` actual OR a `list` actual (a list is covariantly
+        // assignable to an iterator slot — `types_compatible` above). Mirrors the
+        // `Ty::List` arm so `def first(xs: Iterator[T]) -> T` infers `T`.
+        Ty::Iterator(d) => match actual {
+            Ty::Iterator(a) | Ty::List(a) => unify_typevar(d, a, type_params, subst),
+            _ => Ok(()),
+        },
         Ty::Set(d) => match actual {
             Ty::Set(a) => unify_typevar(d, a, type_params, subst),
             _ => Ok(()),
@@ -208,6 +232,8 @@ pub(crate) fn substitute_typevars(ty: &Ty, subst: &HashMap<String, Ty>) -> Ty {
     match ty {
         Ty::TypeVar(name) => subst.get(name).cloned().unwrap_or_else(|| ty.clone()),
         Ty::List(inner) => Ty::List(Box::new(substitute_typevars(inner, subst))),
+        // LAZY-GEN V1-a: substitute through an `Iterator[T]` exactly like `List[T]`.
+        Ty::Iterator(inner) => Ty::Iterator(Box::new(substitute_typevars(inner, subst))),
         Ty::Set(inner) => Ty::Set(Box::new(substitute_typevars(inner, subst))),
         Ty::Dict(k, v) => Ty::Dict(
             Box::new(substitute_typevars(k, subst)),
@@ -243,6 +269,10 @@ pub fn substitute_class_typarams(ty: &Ty, subst: &HashMap<String, Ty>) -> Ty {
             args.iter().map(|a| substitute_class_typarams(a, subst)).collect(),
         ),
         Ty::List(inner) => Ty::List(Box::new(substitute_class_typarams(inner, subst))),
+        // LAZY-GEN V1-a: substitute class type-params through an `Iterator[T]`
+        // member exactly like a `list[T]` one (structural twin of the
+        // `substitute_typevars` arm; keeps generic-class substitution uniform).
+        Ty::Iterator(inner) => Ty::Iterator(Box::new(substitute_class_typarams(inner, subst))),
         Ty::Set(inner) => Ty::Set(Box::new(substitute_class_typarams(inner, subst))),
         Ty::Dict(k, v) => Ty::Dict(
             Box::new(substitute_class_typarams(k, subst)),
@@ -266,7 +296,7 @@ pub fn substitute_class_typarams(ty: &Ty, subst: &HashMap<String, Ty>) -> Ty {
 pub fn ty_contains_typevar(ty: &Ty) -> bool {
     match ty {
         Ty::TypeVar(_) => true,
-        Ty::List(inner) | Ty::Set(inner) | Ty::Option(inner) => ty_contains_typevar(inner),
+        Ty::List(inner) | Ty::Iterator(inner) | Ty::Set(inner) | Ty::Option(inner) => ty_contains_typevar(inner),
         Ty::Dict(k, v) => ty_contains_typevar(k) || ty_contains_typevar(v),
         Ty::Tuple(parts) => parts.iter().any(ty_contains_typevar),
         Ty::Func(args, ret) => args.iter().any(ty_contains_typevar) || ty_contains_typevar(ret),
@@ -1041,7 +1071,8 @@ pub(crate) fn collect_prop_edges_stmt(
         Stmt::For { targets, iter, body, .. } => {
             collect_prop_edges_expr(iter, locals, ctx, edges);
             let elem = match infer_expr_ty(iter, locals, ctx) {
-                Ty::List(inner) | Ty::Set(inner) => *inner,
+                // LAZY-GEN V1-a: a generator source yields elements like a list.
+                Ty::List(inner) | Ty::Iterator(inner) | Ty::Set(inner) => *inner,
                 Ty::Str => Ty::Str,
                 _ => Ty::Unknown,
             };
@@ -1155,7 +1186,9 @@ pub(crate) fn map_typevar_edges(
         (Ty::TypeVar(caller_tv), Ty::TypeVar(callee_tv)) if callee_tps.iter().any(|t| t == callee_tv) => {
             edges.push((caller_tv.clone(), callee.to_string(), callee_tv.clone()));
         }
-        (Ty::List(a), Ty::List(d)) | (Ty::Set(a), Ty::Set(d)) | (Ty::Option(a), Ty::Option(d)) => {
+        // LAZY-GEN V1-a: propagate type-var edges through an `Iterator[T]` param
+        // exactly like a `list[T]` one.
+        (Ty::List(a), Ty::List(d)) | (Ty::Iterator(a), Ty::Iterator(d)) | (Ty::Set(a), Ty::Set(d)) | (Ty::Option(a), Ty::Option(d)) => {
             map_typevar_edges(a, d, callee, callee_tps, edges);
         }
         (Ty::Dict(ak, av), Ty::Dict(dk, dv)) => {
@@ -1236,7 +1269,7 @@ pub(crate) fn record_hashable_typevars(
             record_hashable_typevars(k, bounds);
             record_hashable_typevars(v, bounds);
         }
-        Ty::List(inner) | Ty::Option(inner) => record_hashable_typevars(inner, bounds),
+        Ty::List(inner) | Ty::Iterator(inner) | Ty::Option(inner) => record_hashable_typevars(inner, bounds),
         Ty::Tuple(elems) => elems.iter().for_each(|e| record_hashable_typevars(e, bounds)),
         _ => {}
     }
@@ -1325,7 +1358,8 @@ pub(crate) fn infer_bounds_stmt(
             // type-var element infers Display. Iterating a bare `T` is rejected
             // by typeck, so the iterable is always a concrete container here.
             let elem = match infer_expr_ty(iter, locals, ctx) {
-                Ty::List(inner) | Ty::Set(inner) => *inner,
+                // LAZY-GEN V1-a: a generator source yields elements like a list.
+                Ty::List(inner) | Ty::Iterator(inner) | Ty::Set(inner) => *inner,
                 Ty::Str => Ty::Str,
                 _ => Ty::Unknown,
             };
@@ -1566,7 +1600,8 @@ pub(crate) fn bind_comp_targets_for_bounds(
     ctx: &TyCtx,
 ) {
     let elem = match infer_expr_ty(iter, locals, ctx) {
-        Ty::List(inner) | Ty::Set(inner) => *inner,
+        // LAZY-GEN V1-a: a generator source yields elements like a list.
+        Ty::List(inner) | Ty::Iterator(inner) | Ty::Set(inner) => *inner,
         Ty::Str => Ty::Str,
         _ => Ty::Unknown,
     };

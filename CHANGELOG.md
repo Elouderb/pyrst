@@ -2,6 +2,31 @@
 
 All notable changes to pyrst are documented here. This project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.1.2] — 2026-07-02
+
+Lazy generators and the silent-miscompile purge. Every change was independently code-reviewed with adversarial probing; runtime semantics were verified against CPython (python3) throughout. As of this release there are **no known cases where an accepted program produces wrong output**.
+
+### Lazy generators (the last major semantic gap)
+
+- **Generators are lazy.** A generator body compiles to an async-coroutine (Rust's compiler performs the state-machine transform; a ~60-line dependency-free prelude drives it as an `Iterator`). The body runs on demand — nothing executes until the first element is requested, side-effect ordering is byte-identical to CPython, and **infinite generators** (`while True: yield ...`) are safe to consume with `break` in O(1) memory. Previously a generator eagerly collected every value into a list, and an infinite generator hung forever.
+- `Iterator[T]` is a real, distinct type (no longer an alias of `list[T]`). Generator **variables** advance in place: a drained generator yields nothing forever (Python-exact reuse semantics), nested loops over two generator variables work, and `sum(g)` twice gives the total then 0.
+- Iterator-aware builtins: `list`/`sum`/`min`/`max`/`any`/`all`/`enumerate`/`zip`/`sorted` (+`set`) consume generators directly.
+- Everything non-lazy is an **honest `check`-time error** with a materialize-with-`list(...)` suggestion: `len`/subscript/slice/`reversed`/`str`/binops/membership on a generator, generator↔`list[T]` passing, `Iterator[T]` parameters, generator methods, `yield` inside `try` (all deferred features are clearly rejected, never miscompiled). Four of those rejections are `TypeError` in CPython too.
+- Documented divergence: a generator closing over locals captures a value-semantics **snapshot at construction** (CPython sees later mutations) — stated in the golden and the docs.
+
+### Correctness — the silent-miscompile purge
+
+- **Branch-divergent locals**: a bare local assigned incompatible types across sibling branches (`if`/`elif`/`else`, `try`/`except`, `match` arms, tuple unpacks — including assigns nested one block deep), or conditionally reassigned to a conflicting type and read after the block (liveness-checked), silently dropped one path's value. All shapes now reject at `check` with a what-plus-fix message. Same-type match-arm assignment read after the `match` now *works* (was a build error).
+- **Tuple-unpack reassignment in nested blocks**: `if flag: a, b = b, a` silently didn't swap, and a tuple-unpack Euclidean GCD (`while b != 0: a, b = b, a % b`) hung forever. Unpacking now distinguishes declare vs reassign (existing bindings get a real tuple assignment; mixed unpacks evaluate the right-hand side fully first — swap-safe).
+- **`sorted(key=..., reverse=True)`** silently ignored `reverse` — fixed with CPython's exact reversed-stable-sort semantics (equal-key elements keep their original order).
+- **Comprehensions over `zip(...)`/`enumerate(...)`** failed to build; they now work over lists and generators, with filters, in list/set/dict comprehensions.
+- **`with` over a user class** silently skipped `__enter__`/`__exit__` — now an honest error (`with open(...)` unchanged); the full context-manager protocol is tracked, gated on real exception objects.
+- Codegen scope hygiene: shadow decisions no longer leak across block boundaries (an abandoned intermediate retype can't poison later assignments), and the bare sequential retype idiom (`x = [1]` … `x = "s"`) is golden-covered.
+
+### Quality
+
+- `./test_all.sh`: 301/301 positive examples (+22), 136/136 negative fixtures (+32) at both gates; 524 `cargo test` cases; 0 compiler warnings; 5× full-corpus emit byte-stable.
+
 ## [0.1.1] — 2026-07-02
 
 Quality release: performance, correctness, and output-quality work on the compiler back end. Every change was independently code-reviewed; the slice work was verified against CPython on a 5,744-case oracle (0 mismatches).

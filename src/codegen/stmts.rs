@@ -642,11 +642,20 @@ impl<'a> Codegen<'a> {
                     let k = self.emit_consuming(idx)?;
                     self.line(&format!("{}.insert({}, {});", place, k, v));
                 } else {
-                    // Parenthesize the index before `as usize` (see emit_place):
-                    // a nested list-subscript index lowers to a block, and bare
-                    // `place[{ block } as usize] = v` fails to parse.
+                    // (card cc7ae370, item 1) Pre-evaluate the index into a
+                    // `let __idx` temp BEFORE the mutable store. An index that
+                    // READS the same base (`self.data[len(self.data) - 1] = v`)
+                    // would otherwise shared-borrow the base inside the index
+                    // while the store mutably borrows it — rustc E0502. emit_place
+                    // produces a bare place string that cannot contain a `let`, so
+                    // the temp is emitted as a preceding statement here. Binding
+                    // also parenthesizes any nested-subscript block index cleanly
+                    // (`[(__idx) as usize]` instead of `[{ block } as usize]`) and
+                    // evaluates a side-effecting index exactly once. A re-`let`
+                    // `__idx` harmlessly shadows across sibling assigns.
                     let i = self.emit_expr(idx)?;
-                    self.line(&format!("{}[({}) as usize] = {};", place, i, v));
+                    self.line(&format!("let __idx = {};", i));
+                    self.line(&format!("{}[(__idx) as usize] = {};", place, v));
                 }
             }
             Stmt::Match { subject, arms, .. } => {

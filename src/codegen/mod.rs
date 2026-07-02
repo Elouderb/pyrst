@@ -604,6 +604,24 @@ pub fn emit_program(modules: &[(Module, String)], ctx: &TyCtx) -> Result<String>
     cg.line("    else if __step < 0 { let mut __i = (__stop as i64) - 1; while __i >= __start as i64 { __result.push(__list[__i as usize].clone()); __i += __step; } }");
     cg.line("    __result");
     cg.line("}");
+    // (card cc7ae370, item 2) Stepped STRING slice over a SHARED-borrowed base
+    // (`&str`), so only the RESULT String is built — the source String is not
+    // cloned when the base is a borrowable place (callers borrow `&s`; an unsafe
+    // base still snapshot-clones inline, see the Slice/Str arm). Char-based (a
+    // `Vec<char>` — Python slices by code point, not UTF-8 byte). Mirrors
+    // __py_list_slice_step: leading zero-step ValueError check, `.min()`-clamped
+    // negative/positive bounds, step-directional fill.
+    cg.line("fn __py_str_slice_step(__s: &str, __start_in: i64, __stop_in: i64, __step: i64) -> String {");
+    cg.line("    if __step == 0 { panic!(\"ValueError\\0slice step cannot be zero\"); }");
+    cg.line("    let __chars: Vec<char> = __s.chars().collect();");
+    cg.line("    let mut __result = String::new();");
+    cg.line("    let __len = __chars.len() as i64;");
+    cg.line("    let __start = (if __start_in < 0 { (__len + __start_in) as usize } else { __start_in as usize }).min(__chars.len());");
+    cg.line("    let __stop = (if __stop_in < 0 { (__len + __stop_in) as usize } else { __stop_in as usize }).min(__chars.len());");
+    cg.line("    if __step > 0 { let mut __i = __start as i64; while __i < __stop as i64 { __result.push(__chars[__i as usize]); __i += __step; } }");
+    cg.line("    else if __step < 0 { let mut __i = (__stop as i64) - 1; while __i >= __start as i64 { __result.push(__chars[__i as usize]); __i += __step; } }");
+    cg.line("    __result");
+    cg.line("}");
     // (try/except control flow) Signal a try BODY's escaping control flow out of
     // the catch_unwind closure: `Return(R)` carries the enclosing function's
     // return value, `Break`/`Continue` re-target the loop enclosing the try, and

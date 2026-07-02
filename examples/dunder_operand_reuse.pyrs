@@ -1,0 +1,44 @@
+# (card cc7ae370, item 3) A class-typed arithmetic dunder takes its operands BY
+# VALUE (std::ops convention): `h + h2` invokes `Add::add(h, h2)`, moving both,
+# and `-p` invokes `Neg::neg(p)`, moving p. Reusing an operand afterward must
+# still work (Python value semantics) — codegen clones class-typed PLACE operands
+# at the operand site. Vec2 has a `str` field, so it is NON-Copy (an all-primitive
+# class would `#[derive(Copy)]` and not move at all); this is the shape that
+# actually reproduced the E0382 gap. (__neg__ returns the class itself: typeck
+# types `-p` as the operand type, so a class-returning __neg__ is the supported
+# shape.)
+
+
+class Vec2:
+    x: int
+    y: int
+    tag: str
+
+    def __init__(self, x: int, y: int, tag: str) -> None:
+        self.x = x
+        self.y = y
+        self.tag = tag
+
+    def __add__(self, other: Vec2) -> int:
+        return self.x + other.x + self.y + other.y
+
+    def __neg__(self) -> Vec2:
+        return Vec2(-self.x, -self.y, self.tag)
+
+
+def main() -> None:
+    h: Vec2 = Vec2(1, 2, "h")
+    h2: Vec2 = Vec2(3, 4, "h2")
+    s: int = h + h2          # moves h and h2 without the operand clone
+    print(s)                 # 10
+    print(h.x)               # 1   -- reuse h after h + h2
+    print(h2.y)              # 4   -- reuse h2 after h + h2
+    print(h.tag)             # h
+    print(h2.tag)            # h2
+
+    p: Vec2 = Vec2(5, 6, "p")
+    np: Vec2 = -p            # Neg::neg(p) moves p without the operand clone
+    print(np.x)              # -5
+    print(np.y)              # -6
+    print(p.x)               # 5   -- reuse p after -p
+    print(p.tag)             # p

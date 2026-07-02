@@ -1709,17 +1709,36 @@ impl<'a> Codegen<'a> {
                     Ty::Str => {
                         // String slicing with negative index support and optional step
                         let start_expr = start.as_ref().map(|e| self.emit_expr(e)).transpose()?;
-                        let start_val = start_expr.map(|s| {
+                        let start_val = start_expr.clone().map(|s| {
                             format!("(if {} < 0 {{ (({}.len() as i64) + {}) as usize }} else {{ {} as usize }})", s, o, s, s)
                         }).unwrap_or_else(|| "0usize".to_string());
 
                         let stop_expr = stop.as_ref().map(|e| self.emit_expr(e)).transpose()?;
-                        let stop_val = stop_expr.map(|s| {
+                        let stop_val = stop_expr.clone().map(|s| {
                             format!("(if {} < 0 {{ (({}.len() as i64) + {}) as usize }} else {{ {} as usize }})", s, o, s, s)
                         }).unwrap_or_else(|| format!("{}.len()", o));
 
                         if let Some(step_expr) = step {
                             let step_s = self.emit_expr(step_expr)?;
+                            // (card cc7ae370, item 2) Borrow the base when it is a
+                            // place and no present bound can mutate it — the helper
+                            // builds only the result String from a `&str`, no
+                            // whole-String clone. The raw i64 bounds are passed
+                            // through; the helper does negative/step handling over
+                            // `.chars()`. Absent stop -> `i64::MAX` (clamped to the
+                            // char count internally). Any unsafe base falls to the
+                            // verbatim snapshot-clone template below.
+                            let subs_safe = start.as_ref().map_or(true, |e| self.is_borrow_safe_index(e))
+                                && stop.as_ref().map_or(true, |e| self.is_borrow_safe_index(e))
+                                && self.is_borrow_safe_index(step_expr);
+                            if self.is_borrowable_place(obj) && subs_safe {
+                                let start_i = start_expr.unwrap_or_else(|| "0i64".to_string());
+                                let stop_i = stop_expr.unwrap_or_else(|| "i64::MAX".to_string());
+                                return Ok(format!(
+                                    "__py_str_slice_step(&{}, {}, {}, {})",
+                                    o, start_i, stop_i, step_s
+                                ));
+                            }
                             return Ok(format!(
                                 "{{ let __s = {}.clone(); let __chars: Vec<char> = __s.chars().collect(); \
                                 let __start = {}; let __stop = {}; let __step_val = {}; \
@@ -1905,6 +1924,32 @@ impl<'a> Codegen<'a> {
                         _ => unreachable!(),
                     });
                 }
+
+                // (card cc7ae370, item 3) A class-typed arithmetic dunder
+                // (`+`/`-`/`*`) lowers to a `std::ops::{Add,Sub,Mul}` impl whose
+                // method takes BOTH operands BY VALUE, moving them. A bare
+                // `h + h2` would therefore consume `h`/`h2`, so reusing either
+                // afterward is E0382 — breaking Python value semantics. Route each
+                // operand through emit_consuming (the single ownership-decision
+                // point): a non-Copy class PLACE (Ident / plain field chain) is
+                // `.clone()`d so the original stays usable, while a fresh owned
+                // rvalue (call/ctor result, literal, nested BinOp temp) is emitted
+                // bare — cloning it would double-clone. Comparisons (`==`/`<`, via
+                // PartialEq/PartialOrd) borrow their operands, so they are excluded
+                // and stay on the generic path unchanged.
+                if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul)
+                    && matches!(self.type_of_expr(lhs), Ty::Class(..))
+                {
+                    let l = self.emit_consuming(lhs)?;
+                    let r = self.emit_consuming(rhs)?;
+                    let op_s = match op {
+                        BinOp::Add => "+",
+                        BinOp::Sub => "-",
+                        BinOp::Mul => "*",
+                        _ => unreachable!(),
+                    };
+                    return Ok(format!("({} {} {})", l, op_s, r));
+                }
                 let l = self.emit_expr(lhs)?;
                 let r = self.emit_expr(rhs)?;
 
@@ -2015,7 +2060,17 @@ impl<'a> Codegen<'a> {
                     return self.emit_expr(&folded);
                 }
 
-                let e = self.emit_expr(expr)?;
+                // (card cc7ae370, item 3) `-x` on a class value invokes `__neg__`
+                // (`std::ops::Neg::neg(self)`), which takes the operand BY VALUE
+                // (move). Clone a non-Copy class PLACE via emit_consuming so the
+                // original stays usable (value semantics); a fresh owned rvalue
+                // (call/BinOp temp, e.g. `-(a + b)`) is emitted bare. `not`/`~`
+                // are not value-consuming dunders, so they stay on emit_expr.
+                let e = if matches!(op, UnOp::Neg) && matches!(self.type_of_expr(expr), Ty::Class(..)) {
+                    self.emit_consuming(expr)?
+                } else {
+                    self.emit_expr(expr)?
+                };
                 match op {
                     UnOp::Neg => format!("(-{})", e),
                     UnOp::Not => format!("(!{})", e),

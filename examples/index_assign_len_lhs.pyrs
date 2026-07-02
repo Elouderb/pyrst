@@ -1,0 +1,41 @@
+# (card cc7ae370, item 1) Index-assign whose LHS index expression READS the same
+# base — `self.data[len(self.data) - 1] = v` — must compile and mutate in place.
+# The index `len(self.data)` shared-borrows the base while the store mutably
+# borrows it; codegen pre-evaluates the index into a `let __idx` temp first
+# (rustc would otherwise reject the overlap with E0502). A bare-local base and a
+# nested `grid[r][c]` store exercise the Ident / Attr / nested-Index place forms.
+
+
+class Buf:
+    data: list[int]
+
+    def __init__(self, data: list[int]) -> None:
+        self.data = data
+
+    def set_last(self, v: int) -> None:
+        self.data[len(self.data) - 1] = v
+
+    def get(self, i: int) -> int:
+        return self.data[i]
+
+
+def main() -> None:
+    # Attr base: self.data[len(self.data) - 1] = v
+    b: Buf = Buf([1, 2, 3])
+    b.set_last(99)
+    print(b.get(0))
+    print(b.get(1))
+    print(b.get(2))
+
+    # Bare-local base: xs[len(xs) - 1] = v
+    xs: list[int] = [10, 20, 30, 40]
+    xs[len(xs) - 1] = 77
+    print(xs[0])
+    print(xs[3])
+
+    # Nested Index base: grid[r][c] = v (must still lower correctly)
+    grid: list[list[int]] = [[1, 2], [3, 4]]
+    grid[1][0] = 55
+    print(grid[0][0])
+    print(grid[1][0])
+    print(grid[1][1])

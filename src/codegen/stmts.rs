@@ -438,13 +438,23 @@ impl<'a> Codegen<'a> {
             Stmt::AugAssign { target, op, value, .. } => {
                 let target_ty = self.locals.get(target.as_str()).cloned().unwrap_or(Ty::Unknown);
                 // (card 12052b4c) `xs += ys` (list target, Add) lowers to
-                // `xs.extend(<rhs>)` below, which needs the RHS built through the
-                // uniform clone-on-use helper (a bare-Ident RHS is `.clone()`d so
-                // `ys` stays usable afterward; an owned temp — literal/comprehension/
-                // call — stays bare), exactly like every other consuming site
-                // (`emit_consuming`, src/codegen/items.rs). Every other AugAssign
-                // shape keeps the plain `emit_expr` it always used (byte-identical).
-                let v = if matches!(target_ty, Ty::List(_)) && matches!(op, BinOp::Add) {
+                // `xs.extend(<rhs>)` and `s += t` (str target, Add) lowers to
+                // `s += &(<rhs>)` below — both need the RHS built through the uniform
+                // clone-on-use helper (a bare-Ident RHS is `.clone()`d so `ys`/`t`
+                // stays usable afterward; an owned temp — literal/comprehension/call —
+                // stays bare), exactly like every other consuming site
+                // (`emit_consuming`, src/codegen/items.rs).
+                // (card 12052b4c review, comment 178) The Str+Add arm MUST also route
+                // through `emit_consuming`, not just List+Add: a SELF-aliasing append
+                // `s += s` otherwise emitted `s += &(s);` — `&mut s` (the `+=`) and
+                // `&s` (the borrowed RHS) alias the same binding, a raw rustc E0502
+                // leak that passed `check`. Cloning the bare-Ident RHS first
+                // (`s += &(s.clone());`) breaks the alias and yields the correct
+                // doubled string (`abab`), verified against python3. Every other
+                // AugAssign shape keeps the plain `emit_expr` it always used
+                // (byte-identical; a str/list literal RHS still emits bare because
+                // `emit_consuming` only clones a bare place, not an owned temp).
+                let v = if matches!(op, BinOp::Add) && matches!(target_ty, Ty::Str | Ty::List(_)) {
                     self.emit_consuming(value)?
                 } else {
                     self.emit_expr(value)?

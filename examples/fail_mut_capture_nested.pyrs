@@ -1,0 +1,17 @@
+# card 56e46767 (review comment 182): capturing a `Mut[T]` by-reference parameter
+# in a nested `def` is rejected at check. A `Mut[T]` param lowers to a Rust
+# `&mut T`; unlike an ordinary non-Copy capture (which codegen SNAPSHOTS by clone),
+# an `&mut` must NOT be cloned on capture — that would silently drop the aliasing
+# that is a by-reference param's whole purpose — so codegen moves the `&mut` into
+# the closure, leaving any later use of the param a raw rustc E0382. Rejected
+# honestly at check (check and build agree). Honest fix: snapshot the referent into
+# a value local first (`ds_local = ds`) and capture that.
+def modify(ds: Mut[list[int]]) -> int:
+    def show() -> int:
+        return len(ds)
+    ds.append(99)
+    return show() + len(ds)
+
+def main() -> None:
+    d: list[int] = [1, 2, 3]
+    print(modify(d))

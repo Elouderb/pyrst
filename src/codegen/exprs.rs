@@ -834,6 +834,18 @@ impl<'a> Codegen<'a> {
                             // Python.
                             let iter_s = if is_range {
                                 format!("({}).into_iter()", a)
+                            } else if matches!(self.type_of_expr(arg), Ty::Str) {
+                                // (CARD 0c4bb6be review, comment 180) A str arg
+                                // yields 1-character strings (Python semantics) —
+                                // mirror the Str arm the SAME wave added to the
+                                // `enumerate` lowering a few lines above. Without it
+                                // the fallback `.iter().cloned()` emitted `.iter()`
+                                // on a `String` (no such method) — a raw rustc E0599
+                                // that passed `check`. Applies to every arg position
+                                // independently (a mixed generator+list+str zip is
+                                // valid Python), and to both the 2-arg fast path and
+                                // the 3/4-arg fold below.
+                                format!("{}.chars().map(|__c| __c.to_string())", a)
                             } else if matches!(self.type_of_expr(arg), Ty::Iterator(_)) {
                                 Self::iter_arg_source(arg, &a)
                             } else {

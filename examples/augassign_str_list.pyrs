@@ -17,3 +17,15 @@ def main() -> None:
     xs += ys
     print(xs)
     print(ys)
+
+    # SELF-append (card 12052b4c review, comment 178): `s += s` / `xs += xs`
+    # must CLONE the RHS before the in-place op, else `&mut s` (the `+=`) and the
+    # borrowed `&s` RHS alias the same binding — a raw rustc E0502 that passed
+    # `check`. Both now double correctly, python3-verified (`abab` / doubled list).
+    ss: str = "ab"
+    ss += ss
+    print(ss)
+
+    zs: list[int] = [1, 2, 3]
+    zs += zs
+    print(zs)

@@ -41,4 +41,17 @@ def main() -> None:
     # python3: [11, 23, 35]
     print([a + b + c for a, b, c in zip(xs, ys, nums(3))])
 
+    # 3-arg zip MIXING a list, a GENERATOR, and a STR argument (card 0c4bb6be
+    # review, comment 180): a str arg iterates as 1-character strings (Python
+    # semantics), mirroring the enumerate Str arm. Previously the per-arg
+    # classification had no Ty::Str arm, so a str source emitted `.iter()` on a
+    # `String` — a raw rustc E0599 that passed `check`. for-loop + comprehension,
+    # every line python3-verified.
+    labels: str = "abc"
+    tag: str = ""
+    for a, g, ch in zip(xs, nums(3), labels):
+        tag = tag + str(a) + ch
+    print(tag)                                                    # 1a2b3c
+    print([f"{a}-{g}-{ch}" for a, g, ch in zip(xs, nums(3), labels)])  # ['1-0-a', '2-1-b', '3-2-c']
+
 main()

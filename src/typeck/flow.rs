@@ -1942,6 +1942,35 @@ pub(crate) fn check_nested_def(f: &Func, env: &mut FuncEnv) -> Result<()> {
                 ));
             }
         }
+
+        // CAPTURE-A-BY-REF-PARAM gate (card 56e46767, review comment 182). A
+        // `Mut[T]` by-reference parameter lowers to a Rust `&mut T`. Unlike an
+        // ordinary non-Copy capture (which codegen SNAPSHOTS by clone), an `&mut`
+        // must NOT be cloned on capture — that would silently snapshot a
+        // by-REFERENCE parameter, dropping the aliasing that is its entire purpose —
+        // so codegen deliberately excludes `by_ref_locals` from clone-on-capture and
+        // MOVES the `&mut` into the closure instead. That leaves any later use of the
+        // param in the enclosing scope (a further read, an in-place mutation, or
+        // passing it on) a raw rustc E0382 ("borrow of moved value"), and a captured
+        // `&mut` also cannot outlive the frame if the closure escapes — neither of
+        // which is a clean pyrst diagnostic. Reject the capture honestly at check
+        // (mirroring the generator gate above), so `check` and `build` agree. The
+        // fix is to snapshot the referent into a value LOCAL first and capture that
+        // (verified: `local = ds` clones the `&mut`'s target into an owned value the
+        // closure then clone-captures, leaving the `&mut` param usable afterward).
+        for name in &captured {
+            if env.by_ref_params.contains(name) {
+                return Err(Error::Type {
+                    span: f.span,
+                    msg: format!(
+                        "the `Mut[T]` by-reference parameter `{name}` cannot be \
+                         captured by a nested function (a by-reference binding cannot \
+                         be moved into a closure); copy it into a local first \
+                         (`{name}_local = {name}`) and capture that",
+                    ),
+                });
+            }
+        }
     }
 
     // Register the nested def as a callable local in the ENCLOSING scope BEFORE

@@ -1,13 +1,19 @@
-# POSITIVE: a function declared `Iterator[T]` is only a GENERATOR when its body
-# uses `yield`. With no `yield`, it is an ordinary function returning a `list[T]`
-# — and because it has an explicit `return <value>` on every path, it passes the
-# missing-return gate (it is NOT exempt as a generator, but it does return a
-# value, so the check is satisfied). Lowers to a normal `Vec<i64>` return.
-def empty() -> Iterator[int]:
+# POSITIVE: an ordinary function that builds and returns a `list[int]`. It has an
+# explicit `return <value>` on every path, so it passes the missing-return gate.
+#
+# (LAZY-GEN V1-b migration) These functions were previously annotated
+# `-> Iterator[int]` while containing NO `yield`, relying on the old conflation
+# `Iterator[T] ≡ list[T]`. V1-b lowers a generator to the lazy `Gen<T>` coroutine,
+# so `Iterator[T]` is now a DISTINCT type and a `yield`-less body that `return`s a
+# list no longer type-checks as `Iterator[int]`. Per docs/design/lazy-generators.md
+# §E the annotations are migrated to `list[int]` (the functions always returned
+# lists); output is byte-identical. Requiring `yield` for an `Iterator[T]` return
+# becomes an honest error in a later card.
+def empty() -> list[int]:
     return []
 
 
-def small(c: bool) -> Iterator[int]:
+def small(c: bool) -> list[int]:
     if c:
         return [1, 2, 3]
     else:

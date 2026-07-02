@@ -85,18 +85,18 @@ pub struct Codegen<'a> {
     /// `.to_string()` to recover pyrst's `str == Rust String` value type.
     /// int/float/bool consts are `Copy` and need no such fix-up.
     const_strs: std::collections::HashSet<String>,
-    /// Generators (EAGER v1): true while emitting a function whose body contains
-    /// `yield`. Such a function is lowered to one that declares
-    /// `let mut __pyrst_gen_acc: Vec<T> = Vec::new();` at the top, lowers each
-    /// `yield x` to `__pyrst_gen_acc.push(x);`, and returns `__pyrst_gen_acc`
-    /// (both at end-of-body fall-off and at any bare `return`, which means "stop
-    /// collecting"). The accumulator lives under the reserved `__pyrst_` prefix
-    /// (typeck's `reject_if_reserved` blocks user identifiers with that prefix) so
-    /// it can never be shadowed by a user local. Saved/restored per function like
-    /// `current_ret_ty`. EAGER LIMITATION: an INFINITE generator
-    /// (`while True: yield ...`) collects forever and hangs / OOMs at runtime —
-    /// true lazy iteration (a state-machine / `impl Iterator` transform) is an
-    /// explicit follow-up; v1 is faithful for FINITE generators (the common case).
+    /// Generators (LAZY-GEN V1-b): true while emitting a function whose body
+    /// contains `yield`. Such a function lowers to the lazy `Gen<T>` coroutine
+    /// (docs/design/lazy-generators.md §C): its body is wrapped in a
+    /// `Box::pin(async move { .. })` future driven by the GEN_PRELUDE, `yield x`
+    /// becomes `__pyrst_gen_co.yield_(x).await`, and a bare `return` completes the
+    /// future (end of iteration). The coroutine locals live under the reserved
+    /// `__pyrst_` prefix (typeck's `reject_if_reserved` blocks user identifiers
+    /// there) so they can never be shadowed by a user local. Saved/restored per
+    /// function like `current_ret_ty` so a nested `def` never inherits it. Unlike
+    /// the retired eager desugar (which collected into a `Vec<T>` and hung on an
+    /// infinite generator), nothing runs until the first `next()` and an infinite
+    /// `while True: yield ...` consumed with `break` is O(1) and terminates.
     in_generator: bool,
     /// (try/except control flow) True while emitting the BODY of a `try:` —
     /// the statements that run inside the `catch_unwind` closure. Because that
@@ -495,6 +495,56 @@ fn __py_open(path: &str, mode: &str) -> PyFile {
 }
 "#;
 
+/// (LAZY-GEN V1-b) The lazy-generator runtime. A pyrst generator — a `def` whose
+/// body `yield`s, declared `-> Iterator[T]` — lowers to a `Gen<T>`: its body
+/// becomes an `async move { .. }` coroutine, `yield x` becomes
+/// `__pyrst_gen_co.yield_(x).await`, and `Gen`'s `Iterator` impl drives that
+/// coroutine one yield at a time with a no-op waker. Nothing runs until the first
+/// `next()` (Python-exact laziness), an infinite generator is O(1) and terminates
+/// when its consumer stops, and `T` need not be `Send` (single-threaded `Rc`,
+/// matching pyrst's `Rc`-holding values). `Gen<T>` is a concrete, nameable struct
+/// (a boxed `dyn Future` inside) — NOT `impl Iterator` — so a generator can be
+/// stored, passed, and returned like any other value (`rust_ty` emits `Gen<T>`
+/// uniformly). Emitted once per program, like REPR_PRELUDE/FILE_PRELUDE, and
+/// covered by the crate-level `#![allow(dead_code, ...)]` when a program defines
+/// no generator. Prototype-validated: docs/design/lazy-generators.md §C.1. Every
+/// `std::` path (incl. `Box`, `Option`, `Some`, `None`, and the `Iterator` impl)
+/// is spelled out in full rather than `use`-imported, matching the other preludes'
+/// namespace-safe convention: a pyrst `class Box`/`Option`/`Iterator` emits a
+/// same-named `struct`/type that would otherwise shadow the std name here (the
+/// corpus has `class Box`). The logic is byte-identical to the validated
+/// prototype. `Waker::noop()` is stable since rustc 1.85.
+const GEN_PRELUDE: &str = r#"struct YieldNow { done: bool }
+impl std::future::Future for YieldNow {
+    type Output = ();
+    fn poll(mut self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        if self.done { std::task::Poll::Ready(()) } else { self.done = true; std::task::Poll::Pending }
+    }
+}
+struct Co<T> { slot: std::rc::Rc<std::cell::RefCell<std::option::Option<T>>> }
+impl<T> Co<T> {
+    fn yield_(&self, v: T) -> YieldNow {
+        *self.slot.borrow_mut() = std::option::Option::Some(v);
+        YieldNow { done: false }
+    }
+}
+struct Gen<T> {
+    fut: std::pin::Pin<std::boxed::Box<dyn std::future::Future<Output = ()>>>,
+    slot: std::rc::Rc<std::cell::RefCell<std::option::Option<T>>>,
+}
+impl<T> std::iter::Iterator for Gen<T> {
+    type Item = T;
+    fn next(&mut self) -> std::option::Option<T> {
+        let __waker = std::task::Waker::noop();
+        let mut __cx = std::task::Context::from_waker(__waker);
+        match self.fut.as_mut().poll(&mut __cx) {
+            std::task::Poll::Ready(()) => std::option::Option::None,
+            std::task::Poll::Pending => self.slot.borrow_mut().take(),
+        }
+    }
+}
+"#;
+
 /// Emit Rust code from multiple modules in dependency order.
 /// Used for multi-file compilation.
 pub fn emit_program(modules: &[(Module, String)], ctx: &TyCtx) -> Result<String> {
@@ -652,6 +702,10 @@ pub fn emit_program(modules: &[(Module, String)], ctx: &TyCtx) -> Result<String>
     cg.line("enum __PyrstTryFlow<R> { Normal, Return(R), Break, Continue }");
     cg.line(REPR_PRELUDE);
     cg.line(FILE_PRELUDE);
+    // (LAZY-GEN V1-b) The lazy-generator runtime (Gen<T>/Co<T>/YieldNow).
+    // Emitted unconditionally like the preludes above; dead when a program has
+    // no generator (covered by the crate-level `#![allow(dead_code)]`).
+    cg.line(GEN_PRELUDE);
     cg.line("");
     cg.line("// ----- user code -----");
 

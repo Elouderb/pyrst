@@ -31,6 +31,16 @@ impl<'a> Codegen<'a> {
         // body performs. A non-generic function has an empty `type_params` and
         // emits no clause. Methods are never generic in v1 (parser-rejected), so
         // this only matters for free functions, but the code is uniform.
+        // (LAZY-GEN V1-b) A generator's body is wrapped in a `Box::pin(async move
+        // { .. })` future stored behind a `dyn Future` — a `'static` trait object
+        // — so any element/param type var it captures must be `'static`. All pyrst
+        // value types are owned/`'static`, so the bound is always satisfiable; it
+        // is added ONLY for a generator function (doc §C.2 #3, the validated
+        // `repeat<T: Clone + 'static>`). `body_contains_yield` is the generator
+        // signal here: typeck guarantees a yielding body has an `Iterator[T]`
+        // return, so it never fires for a non-generator. Reused below to build the
+        // full `is_generator` (which additionally confirms the lowered return type).
+        let is_generator_fn = crate::typeck::body_contains_yield(&f.body);
         let generics = if f.type_params.is_empty() {
             String::new()
         } else {
@@ -42,10 +52,17 @@ impl<'a> Codegen<'a> {
                     // (Clone first) via the BTreeSet iteration.
                     let mut set = inferred.get(t).cloned().unwrap_or_default();
                     set.insert(crate::typeck::TypeVarBound::Clone);
-                    let parts = set.iter()
+                    let mut parts = set.iter()
                         .map(|b| b.rust_bound(t))
-                        .collect::<Vec<_>>()
-                        .join(" + ");
+                        .collect::<Vec<_>>();
+                    // A generic generator boxes its body as `dyn Future` (`'static`);
+                    // append `'static` LAST so the clause reads `T: Clone + .. +
+                    // 'static` (matches the prototype). No-op for a non-generic
+                    // generator (empty `type_params`) or a non-generator function.
+                    if is_generator_fn {
+                        parts.push("'static".to_string());
+                    }
+                    let parts = parts.join(" + ");
                     format!("{}: {}", t, parts)
                 })
                 .collect::<Vec<_>>()
@@ -178,7 +195,7 @@ impl<'a> Codegen<'a> {
         // generator return is now `Ty::Iterator(_)`. The flag is saved/restored so
         // a nested function never inherits it.
         let is_generator =
-            crate::typeck::body_contains_yield(&f.body) && matches!(ret, Ty::List(_) | Ty::Iterator(_));
+            is_generator_fn && matches!(ret, Ty::List(_) | Ty::Iterator(_));
         let saved_in_generator = std::mem::replace(&mut self.in_generator, is_generator);
         // (try/except control flow) A nested `def` owns its own control flow:
         // a `return`/`break`/`continue` inside it is local to that function (or
@@ -190,13 +207,38 @@ impl<'a> Codegen<'a> {
         let saved_try_return_escape = std::mem::replace(&mut self.try_return_escape, false);
         let saved_try_loopctl_escape = std::mem::replace(&mut self.try_loopctl_escape, false);
         if is_generator {
-            // The accumulator the lowered `yield`s push into and the function
-            // returns. Typed to the Rust return type (`Vec<T>`) so an empty
-            // generator and element inference both resolve without annotation
-            // churn. The `__pyrst_` prefix is reserved (typeck rejects user
-            // identifiers under it), so this name can never collide with a user
-            // local. See the `Stmt::Yield` arm in `emit_stmt`.
-            self.line(&format!("let mut __pyrst_gen_acc: {} = Vec::new();", ret_s));
+            // (LAZY-GEN V1-b) A generator lowers to the lazy `Gen<T>` coroutine
+            // (docs/design/lazy-generators.md §C.2): a shared yield slot, a `Co`
+            // yielder cloned into the body, and the body wrapped in a
+            // `Box::pin(async move { .. })` future. `yield x` becomes
+            // `__pyrst_gen_co.yield_(x).await` (see `Stmt::Yield`), and a bare
+            // `return` completes the future — end of iteration. The three locals
+            // use the reserved `__pyrst_` prefix (typeck rejects user identifiers
+            // under it) so they can never collide with a user local, and the
+            // struct/field names (`Gen`/`Co`/`slot`/`fut`) match the GEN_PRELUDE.
+            // The captured params/locals are OWNED (pyrst value semantics), so
+            // `async move` moves them in cleanly; the function never touches a
+            // param after this point. The element type annotates the slot so an
+            // empty/inference-only generator still resolves.
+            let elem_ty = match &ret {
+                Ty::Iterator(e) | Ty::List(e) => (**e).clone(),
+                _ => Ty::Unknown, // unreachable: is_generator ⇒ Iterator|List
+            };
+            let elem_rust = self.rust_ty(&elem_ty);
+            // Every `std::` path is spelled in full (not `use`-imported) so bare
+            // names can never resolve to a user class: a pyrst `class Box`/`Option`
+            // emits a same-named `struct`, which would otherwise shadow
+            // `std::boxed::Box` / `std::option::Option` here (corpus has `class
+            // Box`). Same namespace-safe convention as the GEN_PRELUDE.
+            self.line(&format!(
+                "let __pyrst_gen_slot: std::rc::Rc<std::cell::RefCell<std::option::Option<{}>>> = std::rc::Rc::new(std::cell::RefCell::new(std::option::Option::None));",
+                elem_rust
+            ));
+            self.line("let __pyrst_gen_co = Co { slot: __pyrst_gen_slot.clone() };");
+            self.line("let __pyrst_gen_fut: std::pin::Pin<std::boxed::Box<dyn std::future::Future<Output = ()>>> = std::boxed::Box::pin(async move {");
+            // The body (hoisted-local preamble + statements) is emitted INSIDE the
+            // `async move` block, one indent level deeper.
+            self.indent += 1;
         }
         // (EPIC-4 V2-c) Track this function's by-reference (`&mut T`) param
         // bindings so a forwarded-by-reference arg that names one emits an
@@ -281,12 +323,15 @@ impl<'a> Codegen<'a> {
         for s in &f.body {
             self.emit_stmt(s)?;
         }
-        // Generators: fall-off-the-end returns the collected Vec. (A bare
-        // `return` inside the body also lowers to `return __pyrst_gen_acc;` via
-        // emit_stmt, so collection stops there; this final return covers the
-        // normal path where control reaches the end of the body.)
+        // (LAZY-GEN V1-b) Close the generator's `async move` coroutine and hand
+        // back the `Gen<T>`. Fall-off-the-end completes the future naturally (the
+        // `Gen` driver reports `None` on `Poll::Ready`); a bare `return` inside the
+        // body does the same (see `Stmt::Return`). The old eager
+        // `return __pyrst_gen_acc;` is gone.
         if is_generator {
-            self.line("return __pyrst_gen_acc;");
+            self.indent -= 1;
+            self.line("});");
+            self.line("Gen { fut: __pyrst_gen_fut, slot: __pyrst_gen_slot }");
         }
         self.indent -= 1;
         self.line("}");

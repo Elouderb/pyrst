@@ -66,21 +66,20 @@ impl<'a> Codegen<'a> {
                 }
             }
             Stmt::Return(None, _) => {
-                // In a generator a bare `return` stops collection and hands back
-                // the values gathered so far. Elsewhere it is a plain `return;`.
-                // (try/except control flow) Inside a try body the value must
-                // escape the catch_unwind closure: wrap it in
-                // `__PyrstTryFlow::Return(..)` (the function's Rust return type R
-                // is `()` for a Unit function, `Vec<T>` for a generator), which
-                // the try lowering re-issues as a real `return` after `finally`.
-                // The generator accumulator is CLONED (not moved) so the Normal
-                // fall-through path still owns it for its trailing return.
+                // (LAZY-GEN V1-b) In a generator — now the lazy `async move`
+                // coroutine, whose `Output` is `()` — a bare `return` COMPLETES the
+                // future: the `Gen` driver sees `Poll::Ready` and reports `None`,
+                // ending iteration (Python StopIteration). The old eager
+                // `return __pyrst_gen_acc;` is gone. yield-in-`try` is a V1
+                // honest-error and no corpus generator carries an escaping `return`
+                // inside a `catch_unwind` try body, so the plain `return;` is the
+                // correct lowering for the async block. This stays DISTINCT from the
+                // non-generator path (which threads a `return` out of a try body as
+                // `__PyrstTryFlow::Return(())`); reading `self.in_generator` here
+                // also keeps the flag's save/restore discipline (nested defs reset
+                // it — see `emit_func`) load-bearing.
                 if self.in_generator {
-                    if self.try_return_escape {
-                        self.line("return __PyrstTryFlow::Return(__pyrst_gen_acc.clone());");
-                    } else {
-                        self.line("return __pyrst_gen_acc;");
-                    }
+                    self.line("return;");
                 } else if self.try_return_escape {
                     self.line("return __PyrstTryFlow::Return(());");
                 } else {
@@ -88,15 +87,17 @@ impl<'a> Codegen<'a> {
                 }
             }
             Stmt::Yield(e, _) => {
-                // EAGER generator desugar: `yield x` -> push x onto the collected
-                // Vec. `emit_consuming` deep-clones a non-Copy place so the pushed
-                // value is independent of the binding (pyrst value semantics), and
-                // a Copy element (int/bool/float) is pushed by value. The
-                // accumulator `__pyrst_gen_acc` and the trailing
-                // `return __pyrst_gen_acc;` are emitted by `emit_func` for any
-                // function whose body contains a `yield`.
+                // (LAZY-GEN V1-b) `yield x` suspends the coroutine: store the value
+                // in the shared slot and `.await` the one-shot `YieldNow` future so
+                // the `Gen` driver's `next()` observes `Poll::Pending` and takes it
+                // out. `emit_consuming` deep-clones a non-Copy place (pyrst value
+                // semantics) / passes a Copy element by value — a SINGLE clone; the
+                // driver's `slot.take()` hands that owned value straight to the
+                // consumer, so there is no second clone. The `.await` is valid
+                // because the body is emitted inside the `async move` block (see
+                // `emit_func`); a `yield` only ever appears in a generator body.
                 let s = self.emit_consuming(e)?;
-                self.line(&format!("__pyrst_gen_acc.push({});", s));
+                self.line(&format!("__pyrst_gen_co.yield_({}).await;", s));
             }
             Stmt::Return(Some(e), _) => {
                 // (EPIC-5) In an Option-returning function, wrap the value:
@@ -478,7 +479,15 @@ impl<'a> Codegen<'a> {
                                  i.contains(".collect::<Vec<_>>()");
                 // For ranges, use into_iter(); for collections, use iter().cloned() or iter().copied().
                 // If it's already an iterator (enumerate/zip), use directly.
-                let iter_expr = if is_iterator {
+                let iter_expr = if matches!(for_iter_ty, Ty::Iterator(_)) {
+                    // (LAZY-GEN V1-b) A generator value is itself an `Iterator`
+                    // (`Gen<T>`); iterate it DIRECTLY — `Gen` has no `.iter()`, and
+                    // it already yields OWNED `T`, so no `.cloned()` and no double
+                    // clone. This is the type-driven path that retires the emitted-
+                    // string `is_iterator` sniff FOR GENERATORS; the sniff below
+                    // still handles the `enumerate`/`zip`/`cloned` adapter shapes.
+                    i
+                } else if is_iterator {
                     i
                 } else if is_range {
                     format!("({}).into_iter()", i)

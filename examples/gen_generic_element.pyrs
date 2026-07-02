@@ -1,0 +1,19 @@
+# Generic-element generator: `repeat[T]` is element-agnostic — the coroutine
+# driver doesn't care what T is. Codegen adds a `T: 'static` bound (needed
+# because the coroutine body is boxed as `dyn Future` and captured by
+# async-move) on top of the usual `T: Clone` bound, on generator type params
+# only.
+def repeat[T](x: T, times: int) -> Iterator[T]:
+    k: int = 0
+    while k < times:
+        yield x
+        k = k + 1
+
+def main() -> None:
+    for s in repeat("hi", 3):
+        print(s)                                 # hi / hi / hi
+
+    nums: list[int] = [v for v in repeat(7, 4)]
+    print(nums)                                  # [7, 7, 7, 7]
+
+    print(sum(repeat(2, 5)))                      # 10

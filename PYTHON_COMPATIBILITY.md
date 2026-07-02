@@ -268,8 +268,59 @@ See `RUST_BACKEND.md` for the `catch_unwind` lowering.
 | List comprehensions | ✅ Supported | `[x*2 for x in items if x > 0]` |
 | Set comprehensions | ✅ Supported | `{x for x in items}` |
 | Dict comprehensions | ✅ Supported | `{k: v for k, v in pairs}` |
-| Generator expressions | ❌ Not Supported | Use comprehensions |
+| Generator expressions `(x for x in ...)` | ❌ Not Supported | Use a comprehension, or a generator **function** — see [Generators (`yield`)](#generators-yield) below |
 | `for`/`else` | ❌ Not Supported | `else` block not supported |
+
+---
+
+## Generators (`yield`)
+
+A function whose body contains `yield` is a **generator** and must declare
+`-> Iterator[T]` (the yielded element type). `Iterator[T]` is its own distinct
+type — **not** an alias for `list[T]` — and generators are **lazy**: nothing in
+the body runs until the generator is consumed, and the body advances exactly
+one step per value produced. This matches CPython's on-demand timing exactly,
+including the interleaving of `print`s in the generator body vs. its consumer.
+Because nothing runs ahead of demand, an **infinite** generator
+(`while True: yield ...`) is safe to construct and consume with a `break` — O(1)
+memory, no eager collection into a list, no hang.
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| `yield` inside `while`/`for`/`if`/`with` | ✅ Supported | Lazy; on-demand timing matches Python exactly |
+| Infinite generators (`while True: yield`) | ✅ Supported | O(1) memory; safe with `for ... : ... break` |
+| `for x in gen(...)` / comprehension source | ✅ Supported | The canonical lazy consumption form |
+| `list(gen)` | ✅ Supported | Materializes; the universal escape hatch for every "honest error" shape below |
+| `sum`/`min`/`max`/`any`/`all`/`enumerate`/`zip`/`sorted` over a generator | ✅ Supported | Consume the generator directly (fresh call or a variable) |
+| `set(gen)` | ✅ Supported (bonus) | Not an explicit design target, but works |
+| Generic-element generators (`def g[T](...) -> Iterator[T]`) | ✅ Supported | The coroutine driver is element-agnostic |
+| A generator variable, reused/consumed twice | ✅ Matches Python | A drained generator behaves like Python's exhausted generator object across the supported consumption forms above — a second pass yields nothing / `0` / `[]` / `False` rather than re-running the body (no error, same as CPython) |
+| A generator closing over a mutable argument | ⚠️ Diverges from Python | pyrst's value semantics **clone** the argument into the generator at construction time; a caller mutation performed *after* construction is **not** visible inside the generator body. Python passes objects by reference, so a Python generator *would* see that mutation. See `examples/gen_closure_capture.pyrs`. |
+| `len(gen)` | ❌ Honest error | `TypeError` in CPython too (no `__len__`) — materialize with `list(gen)` first |
+| `gen[i]` / `gen[a:b]` | ❌ Honest error | `TypeError` in CPython too (not subscriptable / not sliceable) — materialize with `list(gen)` first |
+| `reversed(gen)` | ❌ Honest error | `TypeError` in CPython too — materialize with `list(gen)` first |
+| `str(gen)` / `print(gen)` / f-string interpolation | ❌ Honest error | A generator has no printable form (CPython prints an opaque `<generator object ...>`, not its contents) — materialize with `list(gen)` to show contents |
+| `gen + gen` / `gen * n` / other binary operators | ❌ Honest error | No lazy analog — materialize first |
+| `x in gen` | ❌ Honest error | Would silently drain the generator to test membership — deferred to V2 |
+| Passing a generator where `list[T]` is required | ❌ Honest error | An iterator is not a list — materialize with `list(gen)` |
+| `Iterator[T]` as a parameter type | ❌ Not yet supported (deferred) | Declare the parameter `list[T]` instead |
+| Generator **methods** (`yield` inside a class method) | ❌ Not yet supported (deferred) | Define a free-function generator instead |
+| `yield` inside `try`/`except`/`finally` | ❌ Not yet supported (deferred) | Move the `yield` out of the `try` block |
+| Nested generator `def`s | ❌ Not yet supported (deferred) | `yield` inside a nested `def` is rejected regardless of return type |
+| Generator expressions `(x for x in ...)` | ❌ Not Supported | Use a comprehension or a generator function |
+| Explicit `next(g)` | ❌ Not yet supported (deferred) | Consume via `for` / a comprehension / a builtin instead |
+
+Every shape marked "Honest error" above is rejected at `pyrst check` (not
+deferred to a confusing `rustc` failure) with a message that names the problem
+and suggests the `list(...)` fix. Four of them — `len`, `gen[i]`, `gen[a:b]`,
+`reversed(gen)` — are `TypeError` in CPython too, so pyrst is *more* Pythonic
+here than a hypothetical eager implementation that silently allowed them.
+
+**A function declared `-> Iterator[T]` must contain a `yield`.** Because
+`Iterator[T]` is its own type rather than `list[T]` in disguise, a `yield`-less
+function claiming to return `Iterator[T]` is an honest error at `pyrst check` —
+declare `-> list[T]` and `return` a materialized list instead, or add a `yield`
+to make it a genuine generator.
 
 ---
 
@@ -295,7 +346,7 @@ See `RUST_BACKEND.md` for the `catch_unwind` lowering.
 |---------|--------|-------|
 | Context managers / `with` | ✅ Supported | `with X() as y:` |
 | Operator overloading | ✅ Supported | Dunder methods (see Classes) |
-| Generators / `yield` | ❌ Not Supported | Use lists instead |
+| Generators / `yield` | ✅ Supported (lazy) | `Iterator[T]`-returning functions; on-demand execution, infinite generators OK — see [Generators (`yield`)](#generators-yield) below |
 | Coroutines / `async` / `await` | ❌ Not Supported | Not in current roadmap |
 | `global` / `nonlocal` | ❌ Not Supported | No module-level mutable state rebinding |
 | Decorators (general) | ⚠️ Partial | Only `@dataclass`/`@staticmethod`/`@property` |
@@ -483,7 +534,7 @@ The compatibility strategy:
 3. ❌ Do not attempt to emulate Python's dynamic behavior
 4. ❌ Do not support features that conflict with static typing or Rust idioms
 
-The dynamic half of Python — metaclasses, monkey-patching, `eval`/`exec`, generators/`async`, `*args`/`**kwargs`, reflection, and the full stdlib — is intentionally out of scope; it is fundamentally incompatible with mandatory static typing and ahead-of-time compilation to Rust.
+The dynamic half of Python — metaclasses, monkey-patching, `eval`/`exec`, coroutines/`async`/`await`, `*args`/`**kwargs`, reflection, and the full stdlib — is intentionally out of scope; it is fundamentally incompatible with mandatory static typing and ahead-of-time compilation to Rust. Generators (`yield`) are a deliberate, scoped exception to this stance: they compile to a lazy async-coroutine object under the hood, but the *pyrst-level* surface is a plain `Iterator[T]`-returning function with no exposed `async`/`await` — see [Generators (`yield`)](#generators-yield).
 
 ---
 

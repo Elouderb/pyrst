@@ -76,7 +76,7 @@ pyrst lsp                  # language server (stdin/stdout, for editors)
 
 **Control & functions**
 - if/elif/else, while, for, break, continue, `with`/context managers
-- **Generators** (`yield`) consumable by `for`/comprehensions (eager evaluation — see limitations)
+- **Generators** (`yield`), lazy (on-demand execution, O(1) memory) — consumable by `for`/comprehensions/`list`/`sum`/`min`/`max`/`any`/`all`/`enumerate`/`zip`/`sorted`; infinite generators are safe (`while True: yield ...` + `break`)
 - **First-class functions:** lambdas, nested-`def` closures (lexical capture), `Callable[[A], R]` values
 - **Pattern matching:** `match`/`case` with literal, `_` wildcard, and capture (`case y:`) patterns + guards
 - **Exceptions:** `try`/`except`/`else`/`finally`, `raise`, type-matched handlers with the builtin hierarchy (`except LookupError:` catches `KeyError`/`IndexError`), `except E as e`
@@ -105,7 +105,7 @@ Both `import math; math.sqrt(x)` and `from math import sqrt` forms work, includi
 By design (see [SPEC.md](SPEC.md) / [PYTHON_COMPATIBILITY.md](PYTHON_COMPATIBILITY.md)): not Python-compatible; multiple inheritance, metaclasses, dynamic attribute access, `eval`/`exec`, and shared-mutable aliasing (`Rc`/`RefCell`) are out.
 
 Current v0.1.1 gaps (tracked, with workarounds):
-- **Generators are eager** — a generator runs to completion collecting its yields; an *infinite* generator (`while True: yield …`) would not terminate. Lazy iteration is a follow-up.
+- **Generators (`yield`) are lazy**, but a few shapes are deferred: `Iterator[T]` as a *parameter* type, generator **methods** (`yield` in a class method), `yield` inside `try`/`except`/`finally`, nested generator `def`s, generator expressions (`(x for x in ...)`), and explicit `next(g)`. Every non-lazy consumption (`len`/`gen[i]`/slicing/`reversed`/`str`/binops/`x in gen`/passing a generator where `list[T]` is required) is an honest `pyrst check` error suggesting `list(gen)` to materialize — see [PYTHON_COMPATIBILITY.md](PYTHON_COMPATIBILITY.md#generators-yield).
 - **Generic classes** can't be instantiated via a *qualified* name (`collections.deque[int]()`); use a flat import (`from collections import deque; d: deque[int] = deque()`).
 - **Generic methods inside a class** (`def m[U](self)`) are not yet supported (top-level generic functions are).
 - **No module-level mutable state**, so `random`'s module-level convenience API and `sys.argv` are not available (use the `Random` class; pass args explicitly).

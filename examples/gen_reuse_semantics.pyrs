@@ -1,0 +1,30 @@
+# Generator reuse semantics: a generator VARIABLE iterates by &mut (not moved
+# fresh each loop entry), matching Python's single-pass generator-object
+# semantics. Nested loops over two separately-assigned generator variables: the
+# inner generator `b` is only non-empty on the FIRST outer pass — once
+# exhausted it stays exhausted for subsequent outer iterations. After the
+# nested loop, both `a` and `b` are fully drained: a second pass over either
+# silently yields nothing (Python semantics — StopIteration immediately, no
+# error, no re-run of the body).
+def counter(n: int) -> Iterator[int]:
+    i: int = 0
+    while i < n:
+        yield i
+        i = i + 1
+
+def main() -> None:
+    a = counter(3)
+    b = counter(2)
+    for x in a:
+        for y in b:
+            print(x, y)                 # b is only non-empty on the FIRST outer pass
+
+    # both a and b are now fully exhausted (single-pass, Python semantics):
+    total: int = 0
+    for x in a:
+        total = total + x
+    print(total)                        # 0 — second pass over a yields nothing
+
+    for y in b:
+        print(y)                         # nothing printed — b stays exhausted
+    print("done")

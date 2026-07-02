@@ -1,0 +1,22 @@
+# Laziness-ordering golden: interleaved prints in the generator body and its
+# consumer prove ON-DEMAND execution, not eager collection. If this were still
+# eager, ALL "body: producing" lines would print back-to-back immediately after
+# "main: creating generator" (at construction), before any "main: got" line.
+# Under lazy codegen, "main: created" precedes every "body:" line, and each
+# "body: producing N" is immediately followed by its own "main: got N" — the
+# body only advances one step per `.next()` poll.
+def count_up(n: int) -> Iterator[int]:
+    i: int = 0
+    while i < n:
+        print("body: producing", i)
+        yield i
+        i = i + 1
+    print("body: exhausted")
+
+def main() -> None:
+    print("main: creating generator")
+    g = count_up(3)
+    print("main: created, about to iterate")
+    for v in g:
+        print("main: got", v)
+    print("main: done")

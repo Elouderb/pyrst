@@ -1,0 +1,22 @@
+# NOTE ON SEMANTICS (VERIFIED, not assumed — see the epic's V1-e test log):
+# pyrst has value semantics — a generator's argument is CLONED into the
+# coroutine at the moment the generator OBJECT is constructed (the value-
+# semantics capture into the codegen's `async move` block). A later mutation
+# of the caller's original object is therefore NOT visible inside the
+# generator body. This DIVERGES from CPython: Python passes objects by
+# reference, so a Python generator that closes over a mutable list DOES see a
+# mutation performed on that same list object after the generator was created
+# but before it is consumed (confirmed against a python3 twin: CPython prints
+# 990 as a 5th line; pyrst does not — this file's expected output is the TRUE,
+# verified pyrst behavior, not a false Python-parity claim).
+def scaled(data: list[int]) -> Iterator[int]:
+    for v in data:
+        yield v * 10
+
+def main() -> None:
+    xs: list[int] = [1, 2, 3]
+    g = scaled(xs)           # snapshot of xs = [1, 2, 3] captured here
+    xs.append(99)            # mutates the CALLER's xs only, after capture
+    print(xs)                 # [1, 2, 3, 99] — caller's own list, mutated
+    for v in g:
+        print(v)               # 10 / 20 / 30 — the frozen snapshot, NOT 990

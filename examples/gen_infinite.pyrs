@@ -1,0 +1,18 @@
+# THE FLAGSHIP of the lazy-generators epic. `naturals()` never returns — an
+# eager (pre-epic) generator collects every yielded value into a Vec before
+# returning, so calling this function would hang forever. Under lazy codegen
+# (an async-coroutine `__PyrstGen<T>` driven one `.next()` at a time) nothing
+# runs until the consumer asks for a value, so a `for` loop that `break`s early
+# only drives the coroutine as far as it needs to — O(1) memory, terminates.
+def naturals() -> Iterator[int]:
+    n: int = 0
+    while True:
+        yield n
+        n = n + 1
+
+def main() -> None:
+    for x in naturals():
+        if x >= 5:
+            break
+        print(x)                                  # 0 / 1 / 2 / 3 / 4
+    print("done")

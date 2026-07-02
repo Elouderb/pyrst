@@ -133,10 +133,13 @@ pub enum Stmt {
     Return(Option<Expr>, Span),
     /// `yield <expr>` as a STATEMENT. A function whose body contains any
     /// `Stmt::Yield` is a GENERATOR: typeck requires it to be declared
-    /// `Iterator[T]` and codegen lowers it EAGERLY — each `yield x` becomes a
-    /// `__pyrst_gen_acc.push(x)` into a `Vec<T>` that the function collects and
-    /// returns (see `Codegen::emit_func`). `yield` as an expression, `yield from`,
-    /// and `send` are intentionally out of scope.
+    /// `Iterator[T]` and codegen lowers it LAZILY to an async-coroutine object
+    /// (`__PyrstGen<T>`) — each `yield x` becomes `__pyrst_gen_co.yield_(x).await`
+    /// inside an `async move` body that runs on demand, one value per `.next()`
+    /// poll, not at construction (see `Codegen::emit_func` and the `GEN_PRELUDE`
+    /// in `codegen/mod.rs`). This makes an infinite generator (`while True: yield`)
+    /// safe to construct — O(1) memory, nothing runs until consumed. `yield` as an
+    /// expression, `yield from`, and `send` are intentionally out of scope.
     Yield(Expr, Span),
     If { cond: Expr, then: Vec<Stmt>, elifs: Vec<(Expr, Vec<Stmt>)>, else_: Option<Vec<Stmt>>, span: Span },
     While { cond: Expr, body: Vec<Stmt>, span: Span },

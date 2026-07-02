@@ -1,0 +1,10 @@
+main: creating generator
+main: created, about to iterate
+body: producing 0
+main: got 0
+body: producing 1
+main: got 1
+body: producing 2
+main: got 2
+body: exhausted
+main: done

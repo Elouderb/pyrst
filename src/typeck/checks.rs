@@ -664,9 +664,12 @@ pub(crate) fn check_one_func(f: &Func, ctx: &TyCtx) -> Result<()> {
 ///
 /// Exemptions:
 /// - `-> None`/Unit functions implicitly return `()`; nothing to enforce.
-/// - Generators (`Iterator[T]` + a `yield` in the body) implicitly return their
-///   eagerly-collected `Vec<T>` (codegen appends `return __pyrst_gen_acc;`), so
-///   falling off the end is correct for them.
+/// - Generators (`Iterator[T]` + a `yield` in the body) are lowered to a lazy
+///   async coroutine (`__PyrstGen<T>`, see `codegen/mod.rs`'s `GEN_PRELUDE`):
+///   falling off the end of the body completes the underlying future, which the
+///   driver observes as `Poll::Ready(())` and reports as iterator exhaustion
+///   (`None` — Python's `StopIteration`). So falling off the end is correct for
+///   them and needs no explicit `return`.
 pub(crate) fn check_all_paths_return(body: &[Stmt], env: &FuncEnv, name: &str, span: Span) -> Result<()> {
     if env.is_generator || env.ret_ty == Ty::Unit {
         return Ok(());
@@ -686,9 +689,10 @@ pub(crate) fn check_all_paths_return(body: &[Stmt], env: &FuncEnv, name: &str, s
 /// Whether the function/method whose body is `body` and declared return type is
 /// `ret` is a GENERATOR, validating its signature in the process. A body
 /// containing `yield` MUST be declared `Iterator[T]` (honest error otherwise — a
-/// generator that is not typed as an iterator). A body WITHOUT `yield` is never a
-/// generator, even if declared `Iterator[T]` (such a function just returns a
-/// `list[T]`, which is fine — no `yield`, no special handling). Returns
+/// generator that is not typed as an iterator). Since `Iterator[T]` is now a
+/// distinct lazy type (`Ty::Iterator`, not `≡ list[T]`), a body WITHOUT `yield`
+/// declared `-> Iterator[T]` is ALSO an honest error — it promises a generator but
+/// produces none; the fix is to add a `yield` or declare `-> list[T]` instead. Returns
 /// `Ok(true)` iff the function is a (well-formed) generator.
 pub(crate) fn check_generator_signature(body: &[Stmt], ret: &TypeExpr, span: Span) -> Result<bool> {
     if !body_contains_yield(body) {

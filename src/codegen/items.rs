@@ -1346,43 +1346,73 @@ impl<'a> Codegen<'a> {
     /// `a.b.c=v`) lower to in-place mutation. Struct fields are bare
     /// HashMap/Vec/struct values (no Rc/RefCell), so `place.field`,
     /// `place[i as usize]`, and `*place.get_mut(&k)` are valid places.
-    pub(crate) fn emit_place(&mut self, e: &Expr) -> Result<String> {
+    /// (card cc7ae370, item 1) Emit an lvalue *place* expression for an
+    /// assignment-target / mutable-borrow base — as opposed to `emit_expr`, which
+    /// produces a clone-based *rvalue* for `Index`/`Attr`. Used by AttrAssign /
+    /// IndexAssign / mutating-method receivers / by-reference arguments so chained
+    /// targets (`self.dict[k] = v`, `rooms[i].field = v`, `a.b.c = v`) lower to
+    /// in-place mutation. Struct fields are bare HashMap/Vec/struct values (no
+    /// Rc/RefCell), so `place.field`, `place[i as usize]`, and `*place.get_mut(&k)`
+    /// are valid places.
+    ///
+    /// It HOISTS *every* subscript index in the place chain into a
+    /// `let __idxN = <expr>;` line pushed to `prelude`, returning a place string
+    /// that references those temps. The caller must arrange for `prelude` (in
+    /// order) to run BEFORE the place's mutable use — a statement-level caller
+    /// emits the lines ahead of the store; an expression-level caller wraps the
+    /// whole operation in a block via [`Self::hoist_wrap`].
+    ///
+    /// This eliminates rustc E0502 wherever a subscript index READS the same base
+    /// the place mutably borrows — `grid[len(grid) - 1][0] = v`,
+    /// `row[len(row) - 1].field = v`, `grid[len(grid) - 1].append(x)`,
+    /// `f(grid[len(grid) - 1])` — because each index temp fully evaluates (and
+    /// drops its shared borrow) before the enclosing `&mut` place is formed. A
+    /// place string cannot itself contain a `let`, which is why the temps are
+    /// hoisted out to the statement/block level. `Index`/`Attr` place shapes are
+    /// the ordinary ones — only the index text differs (a temp name instead of the
+    /// inline expression). `__idxN` uses `prelude.len()` for a name unique within
+    /// the chain; a re-`let` in a sibling statement/block shadows harmlessly.
+    pub(crate) fn emit_place_hoisted(
+        &mut self,
+        e: &Expr,
+        prelude: &mut Vec<String>,
+    ) -> Result<String> {
         match e {
-            // A bare name (`self`, a local, a `mut` param) is already a place.
-            // (EPIC-6) Escape a keyword-named place so it matches its `let`/param
-            // definition (which is also escaped).
             Expr::Ident(n, _) => Ok(escape_ident(n)),
-            // Field access: the base recursively as a place, then `.field`.
-            // (No @property handling: a property getter is not an lvalue.)
             Expr::Attr { obj, name, .. } => {
-                let base = self.emit_place(obj)?;
+                let base = self.emit_place_hoisted(obj, prelude)?;
                 Ok(format!("{}.{}", base, escape_ident(name)))
             }
-            // Subscript in a *base* position (we are descending further into the
-            // target, e.g. `grid[r][c]` or `self.dict[k].field`): produce a place
-            // that mutably borrows the element. Dict -> deref of get_mut; list ->
-            // direct index. Negative indices in nested lvalue position are not
-            // supported yet (a place cannot contain a `let`); the common
-            // non-negative cases lower directly.
             Expr::Index { obj, idx, .. } => {
-                let base = self.emit_place(obj)?;
+                let base = self.emit_place_hoisted(obj, prelude)?;
+                let tmp = format!("__idx{}", prelude.len());
                 if matches!(self.type_of_expr(obj), Ty::Dict(..)) {
                     let k = self.emit_expr(idx)?;
-                    Ok(format!("(*{}.get_mut(&{}).unwrap_or_else(|| panic!(\"KeyError\\0<key>\")))", base, k))
+                    prelude.push(format!("let {} = {};", tmp, k));
+                    Ok(format!("(*{}.get_mut(&{}).unwrap_or_else(|| panic!(\"KeyError\\0<key>\")))", base, tmp))
                 } else {
-                    // Parenthesize the index before `as usize`: a nested list
-                    // subscript lowers `idx` to a *block* expression, and bare
-                    // `base[{ block } as usize]` is a Rust parse error ("expected
-                    // expression, found `as`"). The parens make it `base[(block)
-                    // as usize]`, valid for block / call / arith / ident alike.
                     let i = self.emit_expr(idx)?;
-                    Ok(format!("{}[({}) as usize]", base, i))
+                    prelude.push(format!("let {} = {};", tmp, i));
+                    Ok(format!("{}[({}) as usize]", base, tmp))
                 }
             }
-            // Any other base (a parenthesized/computed expr) — fall back to the
-            // normal emission; in practice the parser only yields Ident/Attr/Index
-            // chains as assignment-target bases.
             _ => self.emit_expr(e),
+        }
+    }
+
+    /// (card cc7ae370, item 1) Wrap an EXPRESSION-context place operation so its
+    /// hoisted index temps run first. If `prelude` is empty (no subscript in the
+    /// chain) the `expr` is returned unchanged — byte-identical to the pre-change
+    /// emit. Otherwise it becomes a block `{ let __idx0 = ..; .. <expr> }` whose
+    /// tail is `expr`. Because the *bare* place lives INSIDE the block (not a
+    /// pre-taken `&mut`), a two-phase borrow of that place for a method argument
+    /// (`grid[i].append(grid[j])`) still compiles — the block wraps the WHOLE
+    /// operation, not just the receiver, so no reference is activated early.
+    pub(crate) fn hoist_wrap(prelude: &[String], expr: String) -> String {
+        if prelude.is_empty() {
+            expr
+        } else {
+            format!("{{ {} {} }}", prelude.join(" "), expr)
         }
     }
 

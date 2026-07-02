@@ -1,0 +1,45 @@
+# (card cc7ae370, item 1 — review follow-up) A subscript index in a BASE (outer)
+# position that reads the SAME base — grid[len(grid) - 1][0] = v — must hoist the
+# OUTER index into a temp too, not only the leaf/final index. Covers: a bare-local
+# list-of-list store, the aug-assign variant (which desugars to IndexAssign), the
+# same shape through a self field (method body), and a mutating-method receiver on
+# a self-referential subscript. Each self-referential index would otherwise
+# shared-borrow the base inside the subscript while the store/receiver mutably
+# borrows it (rustc E0502).
+
+
+class Grid:
+    cells: list[list[int]]
+
+    def __init__(self, cells: list[list[int]]) -> None:
+        self.cells = cells
+
+    def set_corner(self, v: int) -> None:
+        self.cells[len(self.cells) - 1][0] = v
+
+    def bump_corner(self) -> None:
+        self.cells[len(self.cells) - 1][1] += 100
+
+
+def main() -> None:
+    # bare-local list-of-list: OUTER subscript index reads the base
+    grid: list[list[int]] = [[1, 2], [3, 4]]
+    grid[len(grid) - 1][0] = 100
+    print(grid[1][0])       # 100
+    print(grid[0][0])       # 1   (untouched)
+
+    # aug-assign variant on a bare local (desugars to IndexAssign)
+    grid[len(grid) - 1][1] += 5
+    print(grid[1][1])       # 4 + 5 = 9
+
+    # same shape through a self field (assign + aug-assign in method bodies)
+    g: Grid = Grid([[10, 20], [30, 40]])
+    g.set_corner(77)
+    print(g.cells[1][0])    # 77
+    g.bump_corner()
+    print(g.cells[1][1])    # 40 + 100 = 140
+
+    # mutating-method receiver on a self-referential subscript
+    rows: list[list[int]] = [[1], [2]]
+    rows[len(rows) - 1].append(9)
+    print(rows[1][1])       # 9

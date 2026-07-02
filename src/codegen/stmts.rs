@@ -624,14 +624,33 @@ impl<'a> Codegen<'a> {
                 let v = self.emit_consuming(value)?;
                 // The base must be emitted as a *place* (lvalue), not the
                 // clone-based rvalue emit_expr produces for Attr/Index.
-                let place = self.emit_place(obj)?;
+                // (card cc7ae370, item 1) Hoist every subscript index in the base
+                // chain into preceding `let __idxN` temps so a self-referential
+                // index (`row[len(row) - 1].field = v`) does not shared-borrow the
+                // base inside the place while the field store mutably borrows it
+                // (E0502).
+                let mut prelude = Vec::new();
+                let place = self.emit_place_hoisted(obj, &mut prelude)?;
+                for l in &prelude { self.line(l); }
                 // (EPIC-6) Escape a keyword field name in the field-WRITE target so
                 // it matches the (escaped) struct field def.
                 self.line(&format!("{}.{} = {};", place, escape_ident(attr), v));
             }
             Stmt::IndexAssign { obj, idx, value, .. } => {
                 let v = self.emit_consuming(value)?;
-                let place = self.emit_place(obj)?;
+                // (card cc7ae370, item 1) Hoist EVERY subscript index — the
+                // base-chain ones (`emit_place_hoisted`) AND the leaf index below —
+                // into preceding `let __idxN` temps BEFORE the mutable store. An
+                // index that READS the same base (`self.data[len(self.data) - 1] =
+                // v`, or a nested `grid[len(grid) - 1][0] = v`) would otherwise
+                // shared-borrow the base inside the subscript while the store
+                // mutably borrows it — rustc E0502. A place string cannot contain a
+                // `let`, so the temps are emitted as preceding statements here. The
+                // leaf temp is numbered AFTER the base chain (`prelude.len()`) so it
+                // never collides. Binding also parenthesizes any nested-subscript
+                // block index cleanly and evaluates a side-effecting index once.
+                let mut prelude = Vec::new();
+                let place = self.emit_place_hoisted(obj, &mut prelude)?;
                 // Dispatch on the base's collection kind (dict -> HashMap::insert,
                 // list -> indexed store). type_of_expr resolves chained bases
                 // (self.dict, grid[r], ...), not just bare locals.
@@ -640,22 +659,14 @@ impl<'a> Codegen<'a> {
                     // HashMap::insert takes ownership of the key, so emit it owned
                     // (a String key var becomes `k.clone()`; Copy keys are unchanged).
                     let k = self.emit_consuming(idx)?;
+                    for l in &prelude { self.line(l); }
                     self.line(&format!("{}.insert({}, {});", place, k, v));
                 } else {
-                    // (card cc7ae370, item 1) Pre-evaluate the index into a
-                    // `let __idx` temp BEFORE the mutable store. An index that
-                    // READS the same base (`self.data[len(self.data) - 1] = v`)
-                    // would otherwise shared-borrow the base inside the index
-                    // while the store mutably borrows it — rustc E0502. emit_place
-                    // produces a bare place string that cannot contain a `let`, so
-                    // the temp is emitted as a preceding statement here. Binding
-                    // also parenthesizes any nested-subscript block index cleanly
-                    // (`[(__idx) as usize]` instead of `[{ block } as usize]`) and
-                    // evaluates a side-effecting index exactly once. A re-`let`
-                    // `__idx` harmlessly shadows across sibling assigns.
                     let i = self.emit_expr(idx)?;
-                    self.line(&format!("let __idx = {};", i));
-                    self.line(&format!("{}[(__idx) as usize] = {};", place, v));
+                    let leaf = format!("__idx{}", prelude.len());
+                    for l in &prelude { self.line(l); }
+                    self.line(&format!("let {} = {};", leaf, i));
+                    self.line(&format!("{}[({}) as usize] = {};", place, leaf, v));
                 }
             }
             Stmt::Match { subject, arms, .. } => {
@@ -1224,8 +1235,14 @@ impl<'a> Codegen<'a> {
                         // when `a` names one of this function's own `&mut T`
                         // params (forwarded-by-reference, e.g. a recursive call),
                         // avoiding the E0596 double-`&mut`.
-                        let place = self.emit_place(a)?;
-                        parts.push(self.byref_borrow(a, &place));
+                        // (card cc7ae370, item 1) Hoist any subscript index in the
+                        // arg place (`f(grid[len(grid) - 1])`) and wrap `&mut place`
+                        // in a `{ let __idxN = ..; &mut .. }` block so the index
+                        // temp evaluates before the borrow is taken (E0502).
+                        let mut aprelude = Vec::new();
+                        let place = self.emit_place_hoisted(a, &mut aprelude)?;
+                        let borrow = self.byref_borrow(a, &place);
+                        parts.push(Self::hoist_wrap(&aprelude, borrow));
                         continue;
                     }
                     // (EPIC-5 C2-2b-i) A raw-struct argument into a polymorphic-base

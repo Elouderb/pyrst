@@ -1,11 +1,31 @@
 use super::*;
 
 impl<'a> Codegen<'a> {
+    /// (card cc7ae370, item 1) Thin wrapper: collects any subscript-index temps
+    /// hoisted for a MUTATING-method receiver (`grid[len(grid) - 1].append(x)`)
+    /// and wraps the whole emitted call in a `{ let __idxN = ..; <call> }` block so
+    /// the index temp runs before the receiver's `&mut` borrow (E0502). Wrapping
+    /// the ENTIRE call — with the bare receiver place still INSIDE — rather than
+    /// just the receiver keeps two-phase borrows valid for the method's own
+    /// arguments (`grid[i].append(grid[j])`). With no subscript receiver the
+    /// prelude is empty and the call is returned unchanged (byte-identical).
     #[allow(clippy::borrowed_box)]
     pub(crate) fn emit_method_call_on_attr(
         &mut self,
         callee: &Box<Expr>,
         args: &[Expr],
+    ) -> Result<Option<String>> {
+        let mut recv_prelude = Vec::new();
+        let result = self.emit_method_call_on_attr_inner(callee, args, &mut recv_prelude)?;
+        Ok(result.map(|s| Self::hoist_wrap(&recv_prelude, s)))
+    }
+
+    #[allow(clippy::borrowed_box)]
+    pub(crate) fn emit_method_call_on_attr_inner(
+        &mut self,
+        callee: &Box<Expr>,
+        args: &[Expr],
+        recv_prelude: &mut Vec<String>,
     ) -> Result<Option<String>> {
                 // Method call with attribute callee — handle method name remapping
                 if let Expr::Attr { obj, name, .. } = callee.as_ref() {
@@ -58,10 +78,15 @@ impl<'a> Codegen<'a> {
                     // the real element. Bare-name and `self.field` receivers are
                     // already place expressions under emit_expr.
                     // MUTATING_METHODS is the module-level const above.
+                    // (card cc7ae370, item 1) Hoist the subscript receiver's index
+                    // temps into `recv_prelude`; the wrapper blocks the whole call
+                    // so the temp runs before the `&mut` receiver borrow (E0502).
+                    // The receiver stays a bare place here, preserving two-phase
+                    // borrows for the method's arguments.
                     let obj_s = if matches!(obj.as_ref(), Expr::Index { .. })
                         && MUTATING_METHODS.contains(&name.as_str())
                     {
-                        self.emit_place(obj)?
+                        self.emit_place_hoisted(obj, recv_prelude)?
                     } else {
                         self.emit_expr(obj)?
                     };
@@ -507,8 +532,13 @@ impl<'a> Codegen<'a> {
                         let mut mparts = Vec::with_capacity(args.len());
                         for (i, a) in args.iter().enumerate() {
                             if method_by_ref.get(i).copied().unwrap_or(false) {
-                                let place = self.emit_place(a)?;
-                                mparts.push(self.byref_borrow(a, &place));
+                                // (card cc7ae370, item 1) Hoist + block-wrap a
+                                // subscripted by-ref arg place (see the free-func
+                                // by-ref path) so its index temp runs before `&mut`.
+                                let mut aprelude = Vec::new();
+                                let place = self.emit_place_hoisted(a, &mut aprelude)?;
+                                let borrow = self.byref_borrow(a, &place);
+                                mparts.push(Self::hoist_wrap(&aprelude, borrow));
                             } else {
                                 mparts.push(self.emit_consuming(a)?);
                             }

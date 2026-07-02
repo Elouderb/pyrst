@@ -318,8 +318,13 @@ impl<'a> Codegen<'a> {
             let mut mparts = Vec::with_capacity(args.len());
             for (i, a) in args.iter().enumerate() {
                 if method_by_ref.get(i).copied().unwrap_or(false) {
-                    let place = self.emit_place(a)?;
-                    mparts.push(self.byref_borrow(a, &place));
+                    // (card cc7ae370, item 1) Hoist any subscript index in the arg
+                    // place and wrap `&mut place` in a block so the index temp runs
+                    // before the borrow (E0502) — see the free-function by-ref path.
+                    let mut aprelude = Vec::new();
+                    let place = self.emit_place_hoisted(a, &mut aprelude)?;
+                    let borrow = self.byref_borrow(a, &place);
+                    mparts.push(Self::hoist_wrap(&aprelude, borrow));
                 } else {
                     mparts.push(self.emit_consuming(a)?);
                 }

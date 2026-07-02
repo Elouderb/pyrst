@@ -36,9 +36,9 @@ def main() -> None:
 
 ## Status
 
-**v0.1.0.** Full compiler pipeline (lexer → parser → resolver → type checker → Rust codegen → `rustc`), end-to-end.
+**v0.1.1.** Full compiler pipeline (lexer → parser → resolver → type checker → Rust codegen → `rustc`), end-to-end.
 
-`./test_all.sh`: **269/269 positive examples** build + run with matching output, **103/103 negative fixtures** correctly rejected (at both `check` and `build`), plus multi-file import demos. **513 in-crate `cargo test` cases**, 0 compiler warnings, CI green.
+`./test_all.sh`: **279/279 positive examples** build + run with matching output, **104/104 negative fixtures** correctly rejected (at both `check` and `build`), plus multi-file import demos. **513 in-crate `cargo test` cases**, 0 compiler warnings, CI green. Slice semantics are CPython-exact (verified against python3 on a 5,700+-case oracle); builtin runtime errors are catchable by their Python exception type; emitted Rust is rustfmt-formatted and deterministic.
 
 pyrst is **not** a Python-compatible subset or a Python runtime — it's its own statically typed language with Python-flavored syntax.
 
@@ -104,7 +104,7 @@ Both `import math; math.sqrt(x)` and `from math import sqrt` forms work, includi
 
 By design (see [SPEC.md](SPEC.md) / [PYTHON_COMPATIBILITY.md](PYTHON_COMPATIBILITY.md)): not Python-compatible; multiple inheritance, metaclasses, dynamic attribute access, `eval`/`exec`, and shared-mutable aliasing (`Rc`/`RefCell`) are out.
 
-Current v0.1.0 gaps (tracked, with workarounds):
+Current v0.1.1 gaps (tracked, with workarounds):
 - **Generators are eager** — a generator runs to completion collecting its yields; an *infinite* generator (`while True: yield …`) would not terminate. Lazy iteration is a follow-up.
 - **Generic classes** can't be instantiated via a *qualified* name (`collections.deque[int]()`); use a flat import (`from collections import deque; d: deque[int] = deque()`).
 - **Generic methods inside a class** (`def m[U](self)`) are not yet supported (top-level generic functions are).

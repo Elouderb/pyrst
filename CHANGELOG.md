@@ -2,6 +2,36 @@
 
 All notable changes to pyrst are documented here. This project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.1.1] — 2026-07-02
+
+Quality release: performance, correctness, and output-quality work on the compiler back end. Every change was independently code-reviewed; the slice work was verified against CPython on a 5,744-case oracle (0 mismatches).
+
+### Performance
+
+- **List index/slice reads no longer clone the container.** Every read went through a deep clone of the whole list (indexed loops were O(n²)); reads now borrow the base through generic prelude helpers and clone only the element, with a conservative clone fallback whenever borrowing isn't provably safe. A 50k-element index-sum dropped from 1.52 s to under 10 ms. Stepped string slices got the same treatment.
+
+### Correctness
+
+- **Builtin runtime errors are now catchable by their Python exception type.** `list.pop()` on empty → `IndexError`; missing dict key (including mutable/nested access) → `KeyError`; `list.remove`/`.index`, `str.index`/`.rindex`, negative integer `**=` exponent, zero slice step → `ValueError`; file I/O failures → `OSError`. Previously these panicked with unstructured messages that `except` could not match. The builtin hierarchy applies (`except LookupError:` catches `IndexError`/`KeyError`).
+- **Slice semantics are CPython-exact** (`PySlice_AdjustIndices` for both step signs). Previously `xs[4:0:-1]` silently returned `[]`, `xs[-100:2]` panicked, and a list slice with step 0 silently returned `[]` — now `[4, 3, 2, 1]`, `[0, 1]` (clamped), and a catchable `ValueError` respectively. String slicing is char-based (multibyte-correct).
+- **Same-base index-assign compiles.** `self.data[len(self.data) - 1] = v` (and every place-chain variant: nested `grid[len(grid)-1][0]`, aug-assign, attribute assign, mutating-method receivers, `Mut[T]` arguments) no longer hits rustc E0502 — all place-chain indices pre-evaluate into temps.
+- **Class dunder operands are no longer consumed.** Reusing `h` after `h + h2` (by-value `std::ops` impls) was a compile error; operands now follow value semantics (places clone, temporaries don't).
+- Deterministic output: struct fields emit in source declaration order (was HashMap iteration order — same input could produce differently-ordered Rust run to run).
+
+### Emitted-code quality
+
+- `pyrst emit` output is formatted with rustfmt when available (silent fallback), literals emit without redundant parens, and the declaration-hoisting double-init artifact folds away in the common case.
+
+### Internal
+
+- `typeck.rs` (10.7k lines) and `codegen.rs` (7.7k) split into focused submodules (move-only; emit output byte-identical).
+- New design doc: `docs/design/exception-lowering.md` — the v0.2+ migration path from panic/`catch_unwind` to `Result`-based exceptions.
+- `PYTHON_COMPATIBILITY.md`'s exception-catchability section corrected (it was wrong in both directions).
+
+### Quality
+
+- `./test_all.sh`: 279/279 positive examples (+10), 104/104 negative fixtures (+1) at both gates; 513 `cargo test` cases; 0 compiler warnings.
+
 ## [0.1.0] — 2026-06-30
 
 First tagged release. pyrst is a statically typed, Python-like language that compiles to readable Rust and then to a native binary via `rustc`. Guiding principle: **honest errors over silent miscompiles**.

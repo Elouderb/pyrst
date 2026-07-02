@@ -641,6 +641,13 @@ pub fn init_field_param_map(init_fn: &Func) -> std::collections::HashMap<String,
 
 // Extract field assignments from __init__ method
 pub fn extract_init_fields(class_def: &mut ClassDef) {
+    // DETERMINISM (card b2608b03): discovered fields must land on the struct in
+    // SOURCE DECLARATION order — the order the user first wrote `self.<attr> = ..`
+    // in __init__. `order` records that first-assignment position; the map holds
+    // the inferred type (last-write-wins, matching the previous behaviour when an
+    // attr is assigned more than once). Iterating a HashMap here previously
+    // randomized struct-field emission run-to-run.
+    let mut order: Vec<String> = Vec::new();
     let mut discovered_fields: std::collections::HashMap<String, TypeExpr> = std::collections::HashMap::new();
 
     // Find the __init__ method
@@ -659,6 +666,9 @@ pub fn extract_init_fields(class_def: &mut ClassDef) {
                         let is_self = matches!(obj.as_ref(), Expr::Ident(n, _) if n == "self");
                         if is_self && !class_def.fields.iter().any(|f| &f.name == attr) {
                             let inferred_ty = guess_field_type(value, &param_types);
+                            if !discovered_fields.contains_key(attr) {
+                                order.push(attr.clone());
+                            }
                             discovered_fields.insert(attr.clone(), inferred_ty);
                         }
                     }
@@ -669,9 +679,12 @@ pub fn extract_init_fields(class_def: &mut ClassDef) {
         }
     }
 
-    // For fields with generic/collection types, try to infer element types from method usage
-    let mut updated_fields = std::collections::HashMap::new();
-    for (field_name, field_type) in &discovered_fields {
+    // Add discovered fields to the class IN SOURCE ORDER, refining any
+    // collection element type from later method usage as we go.
+    // (`infer_list_element_type` reads only class_def.methods, never
+    // class_def.fields, so pushing incrementally here is safe.)
+    for field_name in &order {
+        let field_type = &discovered_fields[field_name];
         let updated_type = if let TypeExpr::Generic(coll_type, generic_args) = field_type {
             if coll_type == "list" && generic_args.len() > 0 && generic_args[0] == TypeExpr::Named("int".to_string()) {
                 // This was a default inference for an empty list
@@ -687,14 +700,9 @@ pub fn extract_init_fields(class_def: &mut ClassDef) {
         } else {
             field_type.clone()
         };
-        updated_fields.insert(field_name.clone(), updated_type);
-    }
-
-    // Add all discovered fields to the class
-    for (attr_name, attr_type) in updated_fields {
         class_def.fields.push(Param {
-            name: attr_name,
-            ty: attr_type,
+            name: field_name.clone(),
+            ty: updated_type,
             default: None,
             span: Span::DUMMY,
             by_ref: false,

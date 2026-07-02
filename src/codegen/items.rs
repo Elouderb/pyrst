@@ -303,6 +303,12 @@ impl<'a> Codegen<'a> {
         // drop one branch's value at the join. typeck rejects this at `check`; assert
         // it here too so any residual divergent join is a LOUD build error.
         self.assert_no_branch_divergence(&f.body)?;
+        // (fix-b insurance) The non-sibling counterpart: a bare outer local
+        // reassigned to a divergent type inside a single block and read after it
+        // would let the block-scoped shadow silently drop the value at the read.
+        // typeck rejects it at `check`; assert it here too so any residual is LOUD.
+        let param_names: std::collections::HashSet<String> = f.params.iter().map(|p| p.name.clone()).collect();
+        self.assert_no_read_after_divergent_reassign(&f.body, &param_names)?;
 
         // Python has function scope, but pyrst emits if/for/while/with/try bodies
         // as Rust `{}` blocks. Hoist locals first-assigned inside a block to

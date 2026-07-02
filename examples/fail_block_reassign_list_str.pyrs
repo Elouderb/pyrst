@@ -1,0 +1,13 @@
+# fail_block_reassign_list_str.pyrs  (fix-b — no generators; list -> str)
+# The residual silent value-drop is NOT generator-specific: any conflicting-type
+# reassignment of an outer local inside a single block, read after it, drops the
+# value. Here `xs` is a list at the outer scope, reassigned to a `str` inside the
+# `if`, then read after (list on the skip path, the STALE list on the taken path —
+# pyrst prints the list; python3 prints the string). Honest CHECK error.
+
+def main() -> None:
+    flag: bool = True
+    xs = [1, 2, 3]
+    if flag:
+        xs = "hello"              # ERROR: list -> str inside the block, read after
+    print(xs)

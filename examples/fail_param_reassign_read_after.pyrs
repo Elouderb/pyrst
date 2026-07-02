@@ -1,0 +1,25 @@
+# fail_param_reassign_read_after.pyrs  (fix-b — the outer local is a PARAM)
+# A by-value parameter is a function-scoped local: reassigning it to a conflicting
+# type inside a block and reading it after is the same silent value-drop as a
+# reassigned local. Here `xs` (a `list[int]` param) is reassigned to a generator
+# inside the `if`, then read after — codegen shadows the reassignment block-locally
+# and the `for` reads the STALE parameter list (pyrst prints `1 2 3`; python3 prints
+# `0 1 2`). Honest CHECK error.
+
+def gen(n: int) -> Iterator[int]:
+    i: int = 0
+    while i < n:
+        yield i
+        i = i + 1
+
+
+def f(xs: list[int]) -> None:
+    flag: bool = True
+    if flag:
+        xs = gen(3)               # ERROR: param list -> generator inside the block, read after
+    for x in xs:
+        print(x)
+
+
+def main() -> None:
+    f([1, 2, 3])

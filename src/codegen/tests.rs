@@ -697,3 +697,52 @@ def main() -> None:
             "match-arm local `xs` must be hoisted to a function-scope Vec, got:\n{}", rust
         );
     }
+
+    #[test]
+    fn codegen_asserts_read_after_conflicting_reassign() {
+        // (fix-b) An outer local (`xs`, a list) reassigned to a generator inside a
+        // single `if` branch and READ after the block is the residual non-sibling
+        // silent value-drop. typeck rejects it at `check`; prove the codegen
+        // insurance also rejects it (bypassing typeck) rather than emitting a
+        // wrong-output hoist that discards the block-scoped shadow at the join.
+        let src = "\
+def gen(n: int) -> Iterator[int]:
+    i: int = 0
+    while i < n:
+        yield i
+        i = i + 1
+
+def main() -> None:
+    flag: bool = True
+    xs = [1, 2, 3]
+    if flag:
+        xs = gen(3)
+    for x in xs:
+        print(x)
+";
+        let err = emit_bypassing_typeck(src, "readafterdiv").expect_err("codegen must reject");
+        assert!(
+            format!("{}", err).contains("read after the block"),
+            "expected a read-after-conflicting-reassign codegen error, got:\n{}", err
+        );
+    }
+
+    #[test]
+    fn codegen_accepts_conflicting_reassign_read_only_in_block() {
+        // The over-rejection guard (the corpus canary shape): an outer local
+        // reassigned to a conflicting type inside a block but read ONLY WITHIN that
+        // block never crosses a join, so the block-scoped shadow is correct. The
+        // codegen insurance must NOT reject it — it is type-free liveness that keeps
+        // `xs` out of the block's exit-liveness, exactly as at `check`.
+        let src = "\
+def main() -> None:
+    xs = [1, 2, 3]
+    flag: bool = True
+    if flag:
+        xs = \"hello\"
+        print(xs)
+    print(\"done\")
+";
+        emit_bypassing_typeck(src, "readonlyblock")
+            .expect("codegen must NOT reject a conflicting reassign read only within its block");
+    }

@@ -1,0 +1,22 @@
+# fail_while_reassign_read_after.pyrs  (fix-b — while-body variant)
+# Same residual silent value-drop, but the conflicting reassignment is in a
+# `while` body (not an `if`): `xs` (a list) is reassigned to a generator inside
+# the loop body and read after the loop. The block-scoped shadow dies at the end
+# of each iteration, so the hoisted list slot is what `for x in xs` reads. Honest
+# CHECK error.
+
+def gen(n: int) -> Iterator[int]:
+    i: int = 0
+    while i < n:
+        yield i
+        i = i + 1
+
+
+def main() -> None:
+    xs = [1, 2, 3]
+    flag: bool = True
+    while flag:
+        xs = gen(3)               # ERROR: list -> generator inside the loop body, read after
+        flag = False
+    for x in xs:
+        print(x)

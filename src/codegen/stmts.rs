@@ -811,6 +811,9 @@ impl<'a> Codegen<'a> {
         // (LAZY-GEN V1-d BLOCKER insurance) Same divergent-join assertion as
         // `emit_func`, on THIS closure's own body.
         self.assert_no_branch_divergence(&f.body)?;
+        // (fix-b insurance) Same read-after-conflicting-reassign assertion.
+        let param_names: std::collections::HashSet<String> = f.params.iter().map(|p| p.name.clone()).collect();
+        self.assert_no_read_after_divergent_reassign(&f.body, &param_names)?;
         let mut block_assigned = std::collections::HashSet::new();
         let mut unpack_targets = std::collections::HashSet::new();
         Self::collect_hoistable(&f.body, 0, &mut block_assigned, &mut unpack_targets);

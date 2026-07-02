@@ -1,4 +1,21 @@
 use super::*;
+use std::collections::HashSet;
+
+/// The LOUD codegen error for a residual read-after-conflicting-reassign (it
+/// should have been rejected at `check`; see
+/// [`Codegen::assert_no_read_after_divergent_reassign`]).
+fn read_after_reassign_codegen_error(name: &str, outer: &Ty, inner: &Ty) -> crate::diag::Error {
+    crate::diag::Error::Codegen(format!(
+        "internal invariant violated: local `{}` is reassigned to an incompatible \
+         type inside a block ({} before the block, {} inside) and is read after the \
+         block; the block-scoped shadow codegen emits for the reassignment is \
+         discarded at the block's end, so the read would silently see the stale \
+         outer value. This should have been rejected at `check`. Use a distinct name \
+         for the block-local value, annotate both with the same type, or — for a \
+         generator — materialize with `list(...)`.",
+        name, outer, inner
+    ))
+}
 
 impl<'a> Codegen<'a> {
     pub fn new(ctx: &'a TyCtx) -> Self {
@@ -295,6 +312,157 @@ impl<'a> Codegen<'a> {
             }
         }
         out
+    }
+
+    /// (fix-b defence-in-depth) The codegen MIRROR of typeck's
+    /// `detect_read_after_conflicting_reassign`. typeck rejects this shape at
+    /// `check` (which `build` runs first), so this is pure insurance: an outer-scope
+    /// bare local reassigned to a divergent type inside a single nested block and
+    /// READ after that block would let codegen's block-scoped shadow (stmts.rs,
+    /// `types_conflict` → shadow) silently drop the value at the read. If any such
+    /// residual reaches codegen it becomes a LOUD build error, never a wrong-output
+    /// binary. Shares the type-free liveness engine (`live_in_stmt`,
+    /// `loop_body_live_out`) and the `branch_divergent` predicate with typeck, so it
+    /// is corpus-safe by construction (a name read only WITHIN its block is not in
+    /// `body_live_out`, exactly as at `check`). Runs after `prescan_types` so
+    /// `type_of_expr` resolves un-annotated locals; does NOT descend into nested
+    /// `def`/`class` bodies (each runs this pre-pass on its own body).
+    pub(crate) fn assert_no_read_after_divergent_reassign(&self, body: &[Stmt], params: &HashSet<String>) -> Result<()> {
+        // Params are function-scoped: reassigning one inside a block shadows, so
+        // they must seed the top-level bound set (they become `outer` on descent).
+        self.walk_read_after_cg(body, &HashSet::new(), &HashMap::new(), &HashSet::new(), params)
+    }
+
+    fn walk_read_after_cg(
+        &self,
+        body: &[Stmt],
+        outer: &HashSet<String>,
+        types_in: &HashMap<String, Ty>,
+        body_live_out: &HashSet<String>,
+        seed_bound: &HashSet<String>,
+    ) -> Result<()> {
+        use crate::typeck::{branch_divergent, collect_bound_names_stmt, live_in_stmt, loop_body_live_out};
+        let n = body.len();
+        let mut live_at: Vec<HashSet<String>> = vec![HashSet::new(); n + 1];
+        live_at[n] = body_live_out.clone();
+        for i in (0..n).rev() {
+            live_at[i] = live_in_stmt(&body[i], &live_at[i + 1]);
+        }
+        let mut types = types_in.clone();
+        let mut bound_here = seed_bound.clone();
+
+        for i in 0..n {
+            let after = &live_at[i + 1];
+            let s = &body[i];
+
+            // 1) FLAG a direct bare reassign of an OUTER name to a divergent type
+            //    read AFTER this block. Outer type = the forward-threaded slot type
+            //    (falling back to the prescan type); reassign type via type_of_expr.
+            match s {
+                Stmt::Assign { target, ty: None, value, .. } => {
+                    if outer.contains(target) && body_live_out.contains(target) {
+                        if let Some(ot) = types.get(target).cloned().or_else(|| self.locals.get(target).cloned()) {
+                            let vt = self.type_of_expr(value);
+                            if branch_divergent(&ot, &vt) {
+                                return Err(read_after_reassign_codegen_error(target, &ot, &vt));
+                            }
+                        }
+                    }
+                }
+                Stmt::Unpack { targets, value, .. } => {
+                    let vt = self.type_of_expr(value);
+                    let elem_tys = match &vt {
+                        Ty::Tuple(tys) if tys.len() == targets.len() => tys.clone(),
+                        _ => vec![Ty::Unknown; targets.len()],
+                    };
+                    for (t, ety) in targets.iter().zip(elem_tys.iter()) {
+                        if outer.contains(t) && body_live_out.contains(t) {
+                            if let Some(ot) = types.get(t).cloned().or_else(|| self.locals.get(t).cloned()) {
+                                if branch_divergent(&ot, ety) {
+                                    return Err(read_after_reassign_codegen_error(t, &ot, ety));
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+
+            // 2) RECURSE into nested blocks (their direct reassigns flagged at their level).
+            let new_outer: HashSet<String> = outer.union(&bound_here).cloned().collect();
+            let empty = HashSet::new();
+            match s {
+                Stmt::If { then, elifs, else_, .. } => {
+                    self.walk_read_after_cg(then, &new_outer, &types, after, &empty)?;
+                    for (_, b) in elifs { self.walk_read_after_cg(b, &new_outer, &types, after, &empty)?; }
+                    if let Some(b) = else_ { self.walk_read_after_cg(b, &new_outer, &types, after, &empty)?; }
+                }
+                Stmt::While { cond, body: wb, .. } => {
+                    let loop_out = loop_body_live_out(wb, after, None, Some(cond));
+                    self.walk_read_after_cg(wb, &new_outer, &types, &loop_out, &empty)?;
+                }
+                Stmt::For { targets, body: fb, .. } => {
+                    let loop_out = loop_body_live_out(fb, after, Some(targets), None);
+                    let tset: HashSet<String> = targets.iter().cloned().collect();
+                    let mut btypes = types.clone();
+                    for t in targets { btypes.entry(t.clone()).or_insert(Ty::Unknown); }
+                    self.walk_read_after_cg(fb, &new_outer, &btypes, &loop_out, &tset)?;
+                }
+                Stmt::Try { body: tb, handlers, else_, finally_, .. } => {
+                    self.walk_read_after_cg(tb, &new_outer, &types, after, &empty)?;
+                    for h in handlers {
+                        let mut htypes = types.clone();
+                        let mut hseed = HashSet::new();
+                        if let Some(nm) = &h.exc_name {
+                            htypes.insert(nm.clone(), Ty::Str);
+                            hseed.insert(nm.clone());
+                        }
+                        self.walk_read_after_cg(&h.body, &new_outer, &htypes, after, &hseed)?;
+                    }
+                    if let Some(b) = else_ { self.walk_read_after_cg(b, &new_outer, &types, after, &empty)?; }
+                    if let Some(b) = finally_ { self.walk_read_after_cg(b, &new_outer, &types, after, &empty)?; }
+                }
+                Stmt::With { as_name, body: wb, .. } => {
+                    let mut wtypes = types.clone();
+                    let mut wseed = HashSet::new();
+                    if let Some(nm) = as_name {
+                        wtypes.entry(nm.clone()).or_insert(Ty::Unknown);
+                        wseed.insert(nm.clone());
+                    }
+                    self.walk_read_after_cg(wb, &new_outer, &wtypes, after, &wseed)?;
+                }
+                Stmt::Match { subject, arms, .. } => {
+                    let subj_ty = self.type_of_expr(subject);
+                    for arm in arms {
+                        let mut atypes = types.clone();
+                        let mut aseed = HashSet::new();
+                        if let MatchPattern::Capture(nm) = &arm.pattern {
+                            atypes.insert(nm.clone(), subj_ty.clone());
+                            aseed.insert(nm.clone());
+                        }
+                        self.walk_read_after_cg(&arm.body, &new_outer, &atypes, after, &aseed)?;
+                    }
+                }
+                _ => {}
+            }
+
+            // 3) Advance the forward slot types + the set of names bound at this level.
+            match s {
+                Stmt::Assign { target, value, .. } => { types.insert(target.clone(), self.type_of_expr(value)); }
+                Stmt::Unpack { targets, value, .. } => {
+                    let vt = self.type_of_expr(value);
+                    let elem_tys = match &vt {
+                        Ty::Tuple(tys) if tys.len() == targets.len() => tys.clone(),
+                        _ => vec![Ty::Unknown; targets.len()],
+                    };
+                    for (t, ety) in targets.iter().zip(elem_tys.iter()) { types.insert(t.clone(), ety.clone()); }
+                }
+                Stmt::For { targets, .. } => { for t in targets { types.entry(t.clone()).or_insert(Ty::Unknown); } }
+                _ => {}
+            }
+            collect_bound_names_stmt(s, &mut bound_here);
+        }
+        Ok(())
     }
 
     /// Replace identifier `old_name` with `new_name` in code, respecting word boundaries

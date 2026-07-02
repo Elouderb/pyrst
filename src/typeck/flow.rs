@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::HashSet;
 
 /// Generics v1: whether a `match` arm pattern DISCRIMINATES — i.e. it compares the
 /// subject against a value and therefore needs `PartialEq` on the subject's type.
@@ -429,6 +430,570 @@ pub(crate) fn branch_divergence_error(name: &str, a: &Ty, b: &Ty, span: Span, jo
             name, join_desc, a, b
         ),
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// (fix-b) READ-AFTER-CONFLICTING-REASSIGN — the residual NON-SIBLING silent
+// value-drop that the 439ea0ae sibling-divergence fix left open.
+//
+// THE SHAPE: an outer-scope bare local is reassigned to a type that DIVERGES from
+// its outer/slot type inside a SINGLE nested block (an `if` branch, a `while`/`for`
+// body, a `try` body/handler/`else`, a `with`, or a `match` arm), then READ after
+// that block. codegen emits the block's reassignment as a block-scoped shadow
+// `let` (stmts.rs, `types_conflict` → shadow) that is discarded at the block's
+// `}`; the hoisted outer slot keeps its stale value, so the read after the block
+// silently observes the wrong value. The sibling-divergence check does not see it
+// (it is one branch, or every branch diverges from the OUTER type but agrees with
+// its siblings).
+//
+// WHY LIVENESS: the naive "reject any deeper-scope conflicting reassign" guard
+// over-rejects the legal Python idiom of reusing a name for a different type
+// inside a block that reads it ONLY within the block (the corpus canary
+// `student_management.pyrs` reuses `passing` as `list` then `bool` in a `for`
+// body, read only there). The sound discriminator is exactly whether the
+// reassigned name is READ AFTER the block exits — classic MAY-liveness at the
+// block's exit, INCLUDING the loop back-edge (a reassign in a loop body read on
+// the next iteration, before it is rebound, is also stale because each iteration
+// is a fresh Rust scope).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Collect the names an expression READS (identifiers used as values), for the
+/// liveness analysis below. Comprehension loop targets and lambda parameters are
+/// LOCAL to the expression, so reads of them are subtracted (a use of a
+/// comprehension/lambda-bound name is not a read of an enclosing local of the same
+/// name). Everything else — call arguments, f-string interpolations,
+/// comprehension/`for` sources, subscripts, slices, ternary arms — is a read.
+pub(crate) fn expr_reads(e: &Expr, out: &mut HashSet<String>) {
+    match e {
+        Expr::Int(..) | Expr::Float(..) | Expr::Str(..) | Expr::Bool(..) | Expr::None_(..) => {}
+        Expr::Ident(n, _) => { out.insert(n.clone()); }
+        Expr::FStr(parts, _) => {
+            for p in parts {
+                if let FStrPart::Interp(e, _) = p { expr_reads(e, out); }
+            }
+        }
+        Expr::List(xs, _) | Expr::Tuple(xs, _) | Expr::Set(xs, _) => {
+            for x in xs { expr_reads(x, out); }
+        }
+        Expr::Dict(pairs, _) => {
+            for (k, v) in pairs { expr_reads(k, out); expr_reads(v, out); }
+        }
+        Expr::ListComp { elt, targets, iter, cond, .. }
+        | Expr::SetComp { elt, targets, iter, cond, .. } => {
+            expr_reads(iter, out);
+            let mut inner = HashSet::new();
+            expr_reads(elt, &mut inner);
+            if let Some(c) = cond { expr_reads(c, &mut inner); }
+            for t in targets { inner.remove(t); }
+            out.extend(inner);
+        }
+        Expr::DictComp { key, val, targets, iter, cond, .. } => {
+            expr_reads(iter, out);
+            let mut inner = HashSet::new();
+            expr_reads(key, &mut inner);
+            expr_reads(val, &mut inner);
+            if let Some(c) = cond { expr_reads(c, &mut inner); }
+            for t in targets { inner.remove(t); }
+            out.extend(inner);
+        }
+        Expr::Call { callee, args, kwargs, .. } => {
+            expr_reads(callee, out);
+            for a in args { expr_reads(a, out); }
+            for (_, v) in kwargs { expr_reads(v, out); }
+        }
+        Expr::Attr { obj, .. } => expr_reads(obj, out),
+        Expr::Index { obj, idx, .. } => { expr_reads(obj, out); expr_reads(idx, out); }
+        Expr::Slice { obj, start, stop, step, .. } => {
+            expr_reads(obj, out);
+            if let Some(e) = start { expr_reads(e, out); }
+            if let Some(e) = stop { expr_reads(e, out); }
+            if let Some(e) = step { expr_reads(e, out); }
+        }
+        Expr::BinOp { lhs, rhs, .. } => { expr_reads(lhs, out); expr_reads(rhs, out); }
+        Expr::UnOp { expr, .. } => expr_reads(expr, out),
+        Expr::Lambda { params, body, .. } => {
+            let mut inner = HashSet::new();
+            expr_reads(body, &mut inner);
+            for (p, _) in params { inner.remove(p); }
+            out.extend(inner);
+        }
+        Expr::IfExp { test, body, orelse, .. } => {
+            expr_reads(test, out); expr_reads(body, out); expr_reads(orelse, out);
+        }
+    }
+}
+
+/// Names BOUND (assigned, unpacked, loop target, `with … as`, `except … as`, or a
+/// nested `def`/`class` NAME) anywhere in a body, recursing into control-flow
+/// blocks but NOT into nested `def`/`class` bodies (their internal bindings are a
+/// separate scope; only the def/class NAME is bound at this level).
+pub(crate) fn collect_bound_names(stmts: &[Stmt], out: &mut HashSet<String>) {
+    for s in stmts { collect_bound_names_stmt(s, out); }
+}
+
+pub(crate) fn collect_bound_names_stmt(s: &Stmt, out: &mut HashSet<String>) {
+    match s {
+        Stmt::Assign { target, .. } => { out.insert(target.clone()); }
+        Stmt::Unpack { targets, .. } => { for t in targets { out.insert(t.clone()); } }
+        Stmt::For { targets, body, .. } => {
+            for t in targets { out.insert(t.clone()); }
+            collect_bound_names(body, out);
+        }
+        Stmt::While { body, .. } => collect_bound_names(body, out),
+        Stmt::If { then, elifs, else_, .. } => {
+            collect_bound_names(then, out);
+            for (_, b) in elifs { collect_bound_names(b, out); }
+            if let Some(b) = else_ { collect_bound_names(b, out); }
+        }
+        Stmt::Try { body, handlers, else_, finally_, .. } => {
+            collect_bound_names(body, out);
+            for h in handlers {
+                if let Some(nm) = &h.exc_name { out.insert(nm.clone()); }
+                collect_bound_names(&h.body, out);
+            }
+            if let Some(b) = else_ { collect_bound_names(b, out); }
+            if let Some(b) = finally_ { collect_bound_names(b, out); }
+        }
+        Stmt::With { as_name, body, .. } => {
+            if let Some(nm) = as_name { out.insert(nm.clone()); }
+            collect_bound_names(body, out);
+        }
+        Stmt::Match { arms, .. } => {
+            for arm in arms {
+                if let MatchPattern::Capture(nm) = &arm.pattern { out.insert(nm.clone()); }
+                collect_bound_names(&arm.body, out);
+            }
+        }
+        Stmt::Func(f) => { out.insert(f.name.clone()); }
+        Stmt::Class(c) => { out.insert(c.name.clone()); }
+        _ => {}
+    }
+}
+
+/// All names READ anywhere in a body (recursing into control-flow blocks). A
+/// nested `def`'s reads contribute its CAPTURES (free vars) — a captured name is a
+/// read at this level too.
+fn collect_body_reads(stmts: &[Stmt], out: &mut HashSet<String>) {
+    for s in stmts { collect_stmt_reads(s, out); }
+}
+
+fn collect_stmt_reads(s: &Stmt, out: &mut HashSet<String>) {
+    match s {
+        Stmt::Expr(e) | Stmt::Yield(e, _) => expr_reads(e, out),
+        Stmt::Assign { value, .. } => expr_reads(value, out),
+        Stmt::AugAssign { target, value, .. } => { out.insert(target.clone()); expr_reads(value, out); }
+        Stmt::Unpack { value, .. } => expr_reads(value, out),
+        Stmt::Return(Some(e), _) => expr_reads(e, out),
+        Stmt::Raise { exc: Some(e), .. } => expr_reads(e, out),
+        Stmt::Assert { cond, msg, .. } => { expr_reads(cond, out); if let Some(m) = msg { expr_reads(m, out); } }
+        Stmt::Del { target, .. } => expr_reads(target, out),
+        Stmt::AttrAssign { obj, value, .. } => { expr_reads(obj, out); expr_reads(value, out); }
+        Stmt::IndexAssign { obj, idx, value, .. } => { expr_reads(obj, out); expr_reads(idx, out); expr_reads(value, out); }
+        Stmt::If { cond, then, elifs, else_, .. } => {
+            expr_reads(cond, out);
+            collect_body_reads(then, out);
+            for (c, b) in elifs { expr_reads(c, out); collect_body_reads(b, out); }
+            if let Some(b) = else_ { collect_body_reads(b, out); }
+        }
+        Stmt::While { cond, body, .. } => { expr_reads(cond, out); collect_body_reads(body, out); }
+        Stmt::For { iter, body, .. } => { expr_reads(iter, out); collect_body_reads(body, out); }
+        Stmt::Try { body, handlers, else_, finally_, .. } => {
+            collect_body_reads(body, out);
+            for h in handlers { collect_body_reads(&h.body, out); }
+            if let Some(b) = else_ { collect_body_reads(b, out); }
+            if let Some(b) = finally_ { collect_body_reads(b, out); }
+        }
+        Stmt::With { ctx_expr, body, .. } => { expr_reads(ctx_expr, out); collect_body_reads(body, out); }
+        Stmt::Match { subject, arms, .. } => {
+            expr_reads(subject, out);
+            for arm in arms {
+                if let Some(g) = &arm.guard { expr_reads(g, out); }
+                collect_body_reads(&arm.body, out);
+            }
+        }
+        Stmt::Func(f) => nested_def_captured_reads(f, out),
+        _ => {}
+    }
+}
+
+/// The names a nested `def` CAPTURES from its enclosing scope — its free
+/// variables: every name it reads that it does not itself bind (its params, plus
+/// any name assigned anywhere in its body). A captured name is a READ of the
+/// enclosing local for liveness: codegen moves/borrows the captured value at the
+/// def site, so a divergent reassign whose name is later captured is not safe.
+pub(crate) fn nested_def_captured_reads(f: &Func, out: &mut HashSet<String>) {
+    let mut reads = HashSet::new();
+    collect_body_reads(&f.body, &mut reads);
+    let mut bound: HashSet<String> = f.params.iter().map(|p| p.name.clone()).collect();
+    collect_bound_names(&f.body, &mut bound);
+    for n in reads {
+        if !bound.contains(&n) { out.insert(n); }
+    }
+}
+
+/// Backward MAY-liveness at the ENTRY of a statement list, given `live_out` = the
+/// names possibly read (before redefinition) after the list executes.
+pub(crate) fn live_in_stmts(stmts: &[Stmt], live_out: &HashSet<String>) -> HashSet<String> {
+    let mut live = live_out.clone();
+    for s in stmts.iter().rev() {
+        live = live_in_stmt(s, &live);
+    }
+    live
+}
+
+/// Liveness at the EXIT of a loop body (what a reassign directly in the body is
+/// checked against, and the `live_out` passed when recursing into the body): the
+/// least fixed point of `exit_live ∪ reads(cond) ∪ live_in(body)`, so the loop
+/// BACK-EDGE is included — a name read at the top of the body on a later iteration,
+/// before it is rebound, is live at the body's exit. `for` targets are rebound at
+/// the top of each iteration, so they are killed on the back-edge.
+pub(crate) fn loop_body_live_out(
+    body: &[Stmt],
+    exit_live: &HashSet<String>,
+    for_targets: Option<&[String]>,
+    while_cond: Option<&Expr>,
+) -> HashSet<String> {
+    let mut bo = exit_live.clone();
+    if let Some(c) = while_cond { expr_reads(c, &mut bo); }
+    loop {
+        let mut inner = live_in_stmts(body, &bo);
+        if let Some(ts) = for_targets { for t in ts { inner.remove(t); } }
+        let mut next = exit_live.clone();
+        if let Some(c) = while_cond { expr_reads(c, &mut next); }
+        next.extend(inner);
+        if next.is_subset(&bo) { break; }
+        for x in next { bo.insert(x); }
+    }
+    bo
+}
+
+/// Liveness at the ENTRY of a single statement, given `live_out` after it. A bare
+/// `Assign`/`Unpack` KILLS its target(s) (a redefinition); `AugAssign`, `return`,
+/// `for`-source, call arguments, comprehension sources, and a nested `def`'s
+/// captures are READS. Loops fold their back-edge via `loop_body_live_out`.
+pub(crate) fn live_in_stmt(s: &Stmt, live_out: &HashSet<String>) -> HashSet<String> {
+    match s {
+        Stmt::Assign { target, value, .. } => {
+            let mut live = live_out.clone();
+            live.remove(target);
+            expr_reads(value, &mut live);
+            live
+        }
+        Stmt::AugAssign { target, value, .. } => {
+            let mut live = live_out.clone();
+            expr_reads(value, &mut live);
+            live.insert(target.clone());
+            live
+        }
+        Stmt::Unpack { targets, value, .. } => {
+            let mut live = live_out.clone();
+            for t in targets { live.remove(t); }
+            expr_reads(value, &mut live);
+            live
+        }
+        Stmt::Expr(e) | Stmt::Yield(e, _) => {
+            let mut live = live_out.clone();
+            expr_reads(e, &mut live);
+            live
+        }
+        // A `return <e>` diverts control: statements after it in this list are not
+        // reached on this path, so nothing in `live_out` survives — only the
+        // return expression's own reads are live.
+        Stmt::Return(Some(e), _) => {
+            let mut live = HashSet::new();
+            expr_reads(e, &mut live);
+            live
+        }
+        Stmt::Return(None, _) => HashSet::new(),
+        Stmt::Raise { exc, .. } => {
+            let mut live = HashSet::new();
+            if let Some(e) = exc { expr_reads(e, &mut live); }
+            live
+        }
+        Stmt::Assert { cond, msg, .. } => {
+            let mut live = live_out.clone();
+            expr_reads(cond, &mut live);
+            if let Some(m) = msg { expr_reads(m, &mut live); }
+            live
+        }
+        Stmt::Del { target, .. } => {
+            let mut live = live_out.clone();
+            expr_reads(target, &mut live);
+            live
+        }
+        Stmt::AttrAssign { obj, value, .. } => {
+            let mut live = live_out.clone();
+            expr_reads(obj, &mut live);
+            expr_reads(value, &mut live);
+            live
+        }
+        Stmt::IndexAssign { obj, idx, value, .. } => {
+            let mut live = live_out.clone();
+            expr_reads(obj, &mut live);
+            expr_reads(idx, &mut live);
+            expr_reads(value, &mut live);
+            live
+        }
+        Stmt::Pass(_) | Stmt::Break(_) | Stmt::Continue(_) | Stmt::Import { .. } => live_out.clone(),
+        Stmt::If { cond, then, elifs, else_, .. } => {
+            let mut live = HashSet::new();
+            live.extend(live_in_stmts(then, live_out));
+            for (_, b) in elifs { live.extend(live_in_stmts(b, live_out)); }
+            match else_ {
+                Some(b) => live.extend(live_in_stmts(b, live_out)),
+                // No `else`: the "no branch taken" path falls through, so `live_out`
+                // survives unchanged.
+                None => live.extend(live_out.iter().cloned()),
+            }
+            expr_reads(cond, &mut live);
+            for (c, _) in elifs { expr_reads(c, &mut live); }
+            live
+        }
+        Stmt::While { cond, body, .. } => loop_body_live_out(body, live_out, None, Some(cond)),
+        Stmt::For { targets, iter, body, .. } => {
+            let mut live = loop_body_live_out(body, live_out, Some(targets), None);
+            expr_reads(iter, &mut live);
+            live
+        }
+        Stmt::Try { body, handlers, else_, finally_, .. } => {
+            let after_finally = match finally_ {
+                Some(f) => live_in_stmts(f, live_out),
+                None => live_out.clone(),
+            };
+            // No-exception path: body then `else` then finally.
+            let else_live = match else_ {
+                Some(e) => live_in_stmts(e, &after_finally),
+                None => after_finally.clone(),
+            };
+            let mut live = live_in_stmts(body, &else_live);
+            // Exception paths: each handler then finally.
+            for h in handlers {
+                let mut hlive = live_in_stmts(&h.body, &after_finally);
+                if let Some(nm) = &h.exc_name { hlive.remove(nm); }
+                live.extend(hlive);
+            }
+            live
+        }
+        Stmt::With { ctx_expr, as_name, body, .. } => {
+            let mut live = live_in_stmts(body, live_out);
+            if let Some(nm) = as_name { live.remove(nm); }
+            expr_reads(ctx_expr, &mut live);
+            live
+        }
+        Stmt::Match { subject, arms, .. } => {
+            let mut live = HashSet::new();
+            for arm in arms {
+                let mut al = live_in_stmts(&arm.body, live_out);
+                if let Some(g) = &arm.guard { expr_reads(g, &mut al); }
+                if let MatchPattern::Capture(nm) = &arm.pattern { al.remove(nm); }
+                live.extend(al);
+            }
+            // A non-exhaustive `match` can fall through, so `live_out` survives.
+            live.extend(live_out.iter().cloned());
+            expr_reads(subject, &mut live);
+            live
+        }
+        // A nested `def` binds its NAME (kills it) and READS its captures.
+        Stmt::Func(f) => {
+            let mut live = live_out.clone();
+            live.remove(&f.name);
+            nested_def_captured_reads(f, &mut live);
+            live
+        }
+        Stmt::Class(c) => {
+            let mut live = live_out.clone();
+            live.remove(&c.name);
+            live
+        }
+    }
+}
+
+/// The honest CHECK error for the read-after-conflicting-reassign shape. Mirrors
+/// the sibling-divergence house style: what is wrong (a block-scoped shadow is
+/// dropped at the block's end so the read sees the stale outer value) + the fixes
+/// (distinct name / same annotation / materialize a generator with `list(...)`).
+pub(crate) fn read_after_reassign_error(name: &str, outer: &Ty, inner: &Ty, span: Span) -> Error {
+    Error::Type {
+        span,
+        msg: format!(
+            "local `{}` is reassigned to an incompatible type inside this block ({} \
+             before the block, {} inside) and is read after the block. pyrst emits \
+             the reassignment as a block-scoped shadow that is discarded when the \
+             block ends, so the read after the block would see the stale outer value \
+             (a silent wrong result). Use a distinct name for the block-local value, \
+             give the reassignment the same explicit annotation as the outer \
+             binding, or — when mixing a generator with a list — materialize the \
+             generator with `list(...)` so the block does not change the type.",
+            name, outer, inner
+        ),
+    }
+}
+
+/// The type of a reassignment's RHS for the divergence decision, correcting a
+/// known `check_expr` blind spot: it blanket-types the bitwise operators
+/// (`|`, `&`, `^`, `<<`, `>>`) as `Int`, but Python overloads `|`/`&`/`^`/`-` for
+/// SET ALGEBRA (union / intersection / symmetric-difference / difference), which
+/// codegen emits as `HashSet` operations that PRESERVE the set type. Without this,
+/// a set accumulator `s = s | t` (which reads `s` on the loop back-edge, so it is
+/// live) would look like a `set → int` type change and be falsely rejected. The
+/// correction fires ONLY when `check_expr` returned `Int` AND an operand is a
+/// `Set`, so it never hides a real divergence (a `Set` value into a non-`Set`
+/// outer slot stays divergent).
+fn reassign_value_ty(value: &Expr, env: &FuncEnv) -> Ty {
+    let t = check_expr(value, &mut env.clone()).unwrap_or(Ty::Unknown);
+    if matches!(t, Ty::Int) {
+        if let Expr::BinOp { op: BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Sub, lhs, rhs, .. } = value {
+            let lt = check_expr(lhs, &mut env.clone()).unwrap_or(Ty::Unknown);
+            if matches!(lt, Ty::Set(_)) { return lt; }
+            let rt = check_expr(rhs, &mut env.clone()).unwrap_or(Ty::Unknown);
+            if matches!(rt, Ty::Set(_)) { return rt; }
+        }
+    }
+    t
+}
+
+/// (fix-b) Entry point: reject a bare outer-scope local reassigned to a divergent
+/// type inside a single nested block and READ after that block. `env` is the
+/// function-scope environment (params typed); runs AFTER `check_body` so the body
+/// already type-checks (RHS typing errors are swallowed here).
+pub(crate) fn detect_read_after_conflicting_reassign(body: &[Stmt], env: &FuncEnv) -> Result<()> {
+    let params: HashSet<String> = env.params.iter().cloned().collect();
+    walk_read_after(body, &HashSet::new(), env, &HashSet::new(), &params)
+}
+
+/// Recursive worker. `outer` = names bound in strictly-enclosing scopes
+/// (reassigning one HERE emits a block-scoped shadow); `env` = forward types at
+/// this body's entry; `body_live_out` = MAY-liveness at this body's exit (the loop
+/// fixed point for a loop body); `seed_bound` = names pre-bound at this body's
+/// level (params at the top, loop targets / `except`-as / `with`-as / capture in a
+/// nested body). A DIRECT bare reassign `n = e` is FLAGGED iff `n ∈ outer`,
+/// `n ∈ body_live_out`, and `branch_divergent(outer_slot_ty, ty(e))`. Deeper
+/// reassigns are caught by recursion; checking against `body_live_out` (not the
+/// per-statement liveness) is what keeps a same-block read AFTER the reassign safe
+/// (the block-scoped shadow reaches the rest of the block).
+fn walk_read_after(
+    body: &[Stmt],
+    outer: &HashSet<String>,
+    env: &FuncEnv,
+    body_live_out: &HashSet<String>,
+    seed_bound: &HashSet<String>,
+) -> Result<()> {
+    let n = body.len();
+    // Suffix liveness: live_at[i] = names live just before body[i]; live_at[i+1] is
+    // the exit-liveness a non-loop child block at position i is checked against.
+    let mut live_at: Vec<HashSet<String>> = vec![HashSet::new(); n + 1];
+    live_at[n] = body_live_out.clone();
+    for i in (0..n).rev() {
+        live_at[i] = live_in_stmt(&body[i], &live_at[i + 1]);
+    }
+
+    let mut env = env.clone();
+    let mut bound_here: HashSet<String> = seed_bound.clone();
+
+    for i in 0..n {
+        let after = &live_at[i + 1];
+        let s = &body[i];
+
+        // 1) FLAG a direct bare reassign of an OUTER name to a divergent type that
+        //    is read AFTER this block.
+        match s {
+            Stmt::Assign { target, ty: None, value, span } => {
+                if outer.contains(target) && body_live_out.contains(target) {
+                    if let Some(outer_ty) = env.locals.get(target).cloned() {
+                        let vt = reassign_value_ty(value, &env);
+                        if branch_divergent(&outer_ty, &vt) {
+                            return Err(read_after_reassign_error(target, &outer_ty, &vt, *span));
+                        }
+                    }
+                }
+            }
+            Stmt::Unpack { targets, value, span } => {
+                let vt = check_expr(value, &mut env.clone()).unwrap_or(Ty::Unknown);
+                let elem_tys = match &vt {
+                    Ty::Tuple(tys) if tys.len() == targets.len() => tys.clone(),
+                    _ => vec![Ty::Unknown; targets.len()],
+                };
+                for (t, ety) in targets.iter().zip(elem_tys.iter()) {
+                    if outer.contains(t) && body_live_out.contains(t) {
+                        if let Some(outer_ty) = env.locals.get(t).cloned() {
+                            if branch_divergent(&outer_ty, ety) {
+                                return Err(read_after_reassign_error(t, &outer_ty, ety, *span));
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        // 2) RECURSE into nested blocks. Their DIRECT reassigns are flagged at their
+        //    own level; `new_outer` adds everything bound before this block, and each
+        //    block body carries the exit-liveness it is checked against.
+        let new_outer: HashSet<String> = outer.union(&bound_here).cloned().collect();
+        let empty = HashSet::new();
+        match s {
+            Stmt::If { then, elifs, else_, .. } => {
+                walk_read_after(then, &new_outer, &env, after, &empty)?;
+                for (_, b) in elifs { walk_read_after(b, &new_outer, &env, after, &empty)?; }
+                if let Some(b) = else_ { walk_read_after(b, &new_outer, &env, after, &empty)?; }
+            }
+            Stmt::While { cond, body: wb, .. } => {
+                let loop_out = loop_body_live_out(wb, after, None, Some(cond));
+                walk_read_after(wb, &new_outer, &env, &loop_out, &empty)?;
+            }
+            Stmt::For { targets, body: fb, .. } => {
+                let loop_out = loop_body_live_out(fb, after, Some(targets), None);
+                let tset: HashSet<String> = targets.iter().cloned().collect();
+                let mut benv = env.clone();
+                for t in targets { benv.locals.entry(t.clone()).or_insert(Ty::Unknown); }
+                walk_read_after(fb, &new_outer, &benv, &loop_out, &tset)?;
+            }
+            Stmt::Try { body: tb, handlers, else_, finally_, .. } => {
+                walk_read_after(tb, &new_outer, &env, after, &empty)?;
+                for h in handlers {
+                    let mut henv = env.clone();
+                    let mut hseed = HashSet::new();
+                    if let Some(nm) = &h.exc_name {
+                        henv.locals.insert(nm.clone(), Ty::Str);
+                        hseed.insert(nm.clone());
+                    }
+                    walk_read_after(&h.body, &new_outer, &henv, after, &hseed)?;
+                }
+                if let Some(b) = else_ { walk_read_after(b, &new_outer, &env, after, &empty)?; }
+                if let Some(b) = finally_ { walk_read_after(b, &new_outer, &env, after, &empty)?; }
+            }
+            Stmt::With { as_name, body: wb, .. } => {
+                let mut wenv = env.clone();
+                let mut wseed = HashSet::new();
+                if let Some(nm) = as_name {
+                    wenv.locals.entry(nm.clone()).or_insert(Ty::Unknown);
+                    wseed.insert(nm.clone());
+                }
+                walk_read_after(wb, &new_outer, &wenv, after, &wseed)?;
+            }
+            Stmt::Match { subject, arms, .. } => {
+                let subj_ty = check_expr(subject, &mut env.clone()).unwrap_or(Ty::Unknown);
+                for arm in arms {
+                    let mut aenv = env.clone();
+                    let mut aseed = HashSet::new();
+                    if let MatchPattern::Capture(nm) = &arm.pattern {
+                        aenv.locals.insert(nm.clone(), subj_ty.clone());
+                        aseed.insert(nm.clone());
+                    }
+                    walk_read_after(&arm.body, &new_outer, &aenv, after, &aseed)?;
+                }
+            }
+            _ => {}
+        }
+
+        // 3) Advance the forward type env EXACTLY as the checker (so block-locals
+        //    hoist and sequential retypes flow into later blocks' baselines), and
+        //    grow the set of names bound at this level. Errors are swallowed: the
+        //    real `check_body` pass already reported them.
+        let _ = check_stmt(s, &mut env);
+        collect_bound_names_stmt(s, &mut bound_here);
+    }
+    Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1289,8 +1854,11 @@ pub(crate) fn check_nested_def(f: &Func, env: &mut FuncEnv) -> Result<()> {
     // type-var value is still rejected by the same gate inside the nested body.
     nested_env.type_params = env.type_params.clone();
     collect_returned_param_idents(&f.body, &nested_env.params, &mut nested_env.returned_params);
+    // (fix-b) Snapshot before check_body mutates locals (see check_one_func).
+    let entry_env = nested_env.clone();
     check_body(&f.body, &mut nested_env)?;
     check_all_paths_return(&f.body, &nested_env, &f.name, f.span)?;
+    detect_read_after_conflicting_reassign(&f.body, &entry_env)?;
     Ok(())
 }
 

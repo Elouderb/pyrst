@@ -1,0 +1,23 @@
+# fail_block_reassign_read_after.pyrs  (fix-b — the card's residual repro)
+# An outer-scope bare local (`xs`, a list) is reassigned to a CONFLICTING type
+# (a generator) inside a SINGLE `if` branch, then READ after the block. codegen
+# hoists `xs` to one `Vec` slot and emits the `if`-branch reassignment as a
+# block-scoped shadow that is discarded at the block's end, so `for x in xs` reads
+# the STALE list (silent wrong output: pyrst prints `1 2 3`; python3 prints
+# `0 1 2`). The sibling-divergence check misses it (one branch). Now an honest
+# CHECK error (read-after-conflicting-reassign, liveness-aware).
+
+def gen(n: int) -> Iterator[int]:
+    i: int = 0
+    while i < n:
+        yield i
+        i = i + 1
+
+
+def main() -> None:
+    flag: bool = True
+    xs = [1, 2, 3]
+    if flag:
+        xs = gen(3)               # ERROR: list -> generator inside the block, read after
+    for x in xs:
+        print(x)

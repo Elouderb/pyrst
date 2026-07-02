@@ -1,0 +1,31 @@
+# fail_try_else_reassign_read_after.pyrs  (fix-b — try body-vs-else variant)
+# The `try`/`except` SIBLING check treats the body + each handler as the sibling
+# value-paths and deliberately EXCLUDES `else`/`finally` (they run sequentially,
+# not as alternatives). So a conflicting reassignment in the `else` block — which
+# runs after the body on the no-exception path — slipped through: `xs` (a list)
+# reassigned to a generator in the `else`, read after the `try`, silently drops the
+# generator (the block-scoped shadow dies at the `else` block's end). Honest CHECK
+# error via the liveness-aware read-after-conflicting-reassign check.
+
+def gen(n: int) -> Iterator[int]:
+    i: int = 0
+    while i < n:
+        yield i
+        i = i + 1
+
+
+def compute() -> int:
+    return 7
+
+
+def main() -> None:
+    xs = [1, 2, 3]
+    try:
+        r: int = compute()
+        print(r)
+    except ValueError:
+        print("err")
+    else:
+        xs = gen(3)               # ERROR: list -> generator in the else, read after the try
+    for x in xs:
+        print(x)

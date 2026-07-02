@@ -650,8 +650,19 @@ pub(crate) fn check_one_func(f: &Func, ctx: &TyCtx) -> Result<()> {
     // (LAZY-GEN V1-d) `yield` inside `try` cannot be lowered (E0728, §C.4) — reject.
     reject_yield_in_try(&f.body)?;
     collect_returned_param_idents(&f.body, &env.params, &mut env.returned_params);
+    // (fix-b) Snapshot the env with params at their DECLARED types BEFORE
+    // `check_body` threads (and mutates) `locals` through the body. The read-after
+    // pass re-derives per-position types forward and must start from the clean
+    // param types, not the end-of-body state — otherwise a reassigned PARAM's outer
+    // type is read as its final (post-reassignment) type and the divergence is
+    // missed (a param `xs: list[int]` reassigned to a generator in a block).
+    let entry_env = env.clone();
     check_body(&f.body, &mut env)?;
     check_all_paths_return(&f.body, &env, &f.name, f.span)?;
+    // (fix-b) Reject the residual non-sibling silent value-drop: a bare outer-scope
+    // local reassigned to a divergent type inside a single nested block and read
+    // after it (the block-scoped shadow is dropped at the join).
+    detect_read_after_conflicting_reassign(&f.body, &entry_env)?;
     Ok(())
 }
 
@@ -1032,8 +1043,10 @@ pub(crate) fn check_one_method(c: &ClassDef, method: &Func, ctx: &TyCtx) -> Resu
     // (LAZY-GEN V1-d) `yield` inside `try` cannot be lowered (E0728, §C.4) — reject.
     reject_yield_in_try(&method.body)?;
     collect_returned_param_idents(&method.body, &env.params, &mut env.returned_params);
+    let entry_env = env.clone();
     check_body(&method.body, &mut env)?;
     check_all_paths_return(&method.body, &env, &method.name, method.span)?;
+    detect_read_after_conflicting_reassign(&method.body, &entry_env)?;
     Ok(())
 }
 

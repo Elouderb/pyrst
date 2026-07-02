@@ -1,0 +1,61 @@
+# Builtin runtime errors are catchable by their Python exception type
+# (card 2c4f63cc — V1 of docs/design/exception-lowering.md). Every builtin
+# panic site emits the "<Type>\0<msg>" payload the try dispatcher parses:
+# previously list.pop / dict mutable get / remove / index / str.index /
+# zero slice step / negative int exponent panicked with PLAIN strings and
+# were silently uncatchable (and list zero-step returned [] silently).
+
+
+def main() -> None:
+    xs: list[int] = []
+    try:
+        v: int = xs.pop()
+        print(v)
+    except IndexError:
+        print("pop caught")
+    ys: list[int] = [1, 2, 3]
+    try:
+        ys.remove(99)
+    except ValueError:
+        print("remove caught")
+    try:
+        i: int = ys.index(99)
+        print(i)
+    except ValueError:
+        print("index caught")
+    s: str = "hello"
+    try:
+        j: int = s.index("zz")
+        print(j)
+    except ValueError:
+        print("str index caught")
+    st: int = 0
+    try:
+        zs: list[int] = ys[0:2:st]
+        print(len(zs))
+    except ValueError:
+        print("zero step caught")
+    e: int = -2
+    x: int = 2
+    try:
+        x **= e
+        print(x)
+    except ValueError:
+        print("neg exp caught")
+    d: dict[str, int] = {"a": 1}
+    try:
+        d.pop("zz")
+    except KeyError:
+        print("dict pop caught")
+    try:
+        d["zz"] += 1
+    except KeyError:
+        print("aug assign caught")
+    # hierarchy: except LookupError catches its IndexError descendant
+    ws: list[int] = []
+    try:
+        w: int = ws.pop()
+        print(w)
+    except LookupError:
+        print("lookup caught")
+    print("done")

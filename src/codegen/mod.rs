@@ -464,14 +464,16 @@ impl<A: PyRepr, B: PyRepr, C: PyRepr, D: PyRepr, E: PyRepr, F: PyRepr> PyRepr fo
 /// Prelude implementing the minimal file-object model: `open()` -> PyFile, with
 /// read/readlines/write/close. The PyFile owns a std::fs::File, so a `with
 /// open(...) as f:` block closes it via RAII when the Rust scope ends. I/O
-/// errors panic (matching pyrst's raise->panic model). readlines() strips line
-/// endings (a documented deviation from CPython, which keeps them).
+/// errors panic with the `OSError\0<msg>` payload convention, so `except
+/// OSError:` catches them (exact-name match; OSError is not in the builtin
+/// descendant hierarchy). readlines() strips line endings (a documented
+/// deviation from CPython, which keeps them).
 const FILE_PRELUDE: &str = r#"struct PyFile { inner: std::fs::File }
 impl PyFile {
     fn read(&mut self) -> String {
         use std::io::Read;
         let mut s = String::new();
-        self.inner.read_to_string(&mut s).expect("read failed");
+        self.inner.read_to_string(&mut s).unwrap_or_else(|e| panic!("OSError\0read failed: {}", e));
         s
     }
     fn readlines(&mut self) -> Vec<String> {
@@ -479,15 +481,15 @@ impl PyFile {
     }
     fn write(&mut self, s: &str) {
         use std::io::Write;
-        self.inner.write_all(s.as_bytes()).expect("write failed");
+        self.inner.write_all(s.as_bytes()).unwrap_or_else(|e| panic!("OSError\0write failed: {}", e));
     }
     fn close(&mut self) {}
 }
 fn __py_open(path: &str, mode: &str) -> PyFile {
     let f = match mode {
-        "w" => std::fs::File::create(path).expect("open failed"),
-        "a" => std::fs::OpenOptions::new().create(true).append(true).open(path).expect("open failed"),
-        _ => std::fs::File::open(path).expect("open failed"),
+        "w" => std::fs::File::create(path).unwrap_or_else(|e| panic!("OSError\0open failed: {}: {}", path, e)),
+        "a" => std::fs::OpenOptions::new().create(true).append(true).open(path).unwrap_or_else(|e| panic!("OSError\0open failed: {}: {}", path, e)),
+        _ => std::fs::File::open(path).unwrap_or_else(|e| panic!("OSError\0open failed: {}: {}", path, e)),
     };
     PyFile { inner: f }
 }
@@ -570,7 +572,7 @@ pub fn emit_program(modules: &[(Module, String)], ctx: &TyCtx) -> Result<String>
     // Python, which cannot be represented in an i64 result, so panic with a
     // clear message rather than silently wrapping the `as u32` cast.
     cg.line("fn __py_ipow(base: i64, exp: i64) -> i64 {");
-    cg.line("    if exp < 0 { panic!(\"negative exponent for integer ** integer\"); }");
+    cg.line("    if exp < 0 { panic!(\"ValueError\\0negative exponent for integer ** integer\"); }");
     cg.line("    base.pow(exp as u32)");
     cg.line("}");
     // List index/slice reads. The BASE is passed by shared reference (`&[T]`) so
@@ -593,6 +595,7 @@ pub fn emit_program(modules: &[(Module, String)], ctx: &TyCtx) -> Result<String>
     cg.line("    __list[__start..(__start + (__stop - __start))].to_vec()");
     cg.line("}");
     cg.line("fn __py_list_slice_step<T: Clone>(__list: &[T], __start_in: i64, __stop_in: i64, __step: i64) -> Vec<T> {");
+    cg.line("    if __step == 0 { panic!(\"ValueError\\0slice step cannot be zero\"); }");
     cg.line("    let mut __result: Vec<T> = Vec::new();");
     cg.line("    let __len = __list.len() as i64;");
     cg.line("    let __start = (if __start_in < 0 { (__len + __start_in) as usize } else { __start_in as usize }).min(__list.len());");

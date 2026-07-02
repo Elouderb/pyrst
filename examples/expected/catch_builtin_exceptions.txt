@@ -1,0 +1,10 @@
+pop caught
+remove caught
+index caught
+str index caught
+zero step caught
+neg exp caught
+dict pop caught
+aug assign caught
+lookup caught
+done

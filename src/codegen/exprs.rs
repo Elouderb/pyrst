@@ -248,7 +248,7 @@ impl<'a> Codegen<'a> {
                     }
                     if name == "rindex" && !parts.is_empty() {
                         return Ok(Some(format!(
-                            "{{ let __idx = {}.rfind({}.as_str()); match __idx {{ Some(i) => i as i64, None => panic!(\"substring not found\") }} }}",
+                            "{{ let __idx = {}.rfind({}.as_str()); match __idx {{ Some(i) => i as i64, None => panic!(\"ValueError\\0substring not found\") }} }}",
                             obj_s, parts[0]
                         )));
                     }
@@ -357,7 +357,7 @@ impl<'a> Codegen<'a> {
                         match obj_ty {
                             Ty::Str => {
                                 return Ok(Some(format!(
-                                    "{}.find({}.as_str()).map(|i| i as i64).expect(\"substring not found\")",
+                                    "{}.find({}.as_str()).map(|i| i as i64).unwrap_or_else(|| panic!(\"ValueError\\0substring not found\"))",
                                     obj_s, parts[0]
                                 )));
                             }
@@ -433,7 +433,7 @@ impl<'a> Codegen<'a> {
                         // list.pop(): remove and return the last element (or pop(i) -> remove index).
                         if let Ty::List(_) = self.type_of_expr(obj) {
                             return Ok(Some(if parts.is_empty() {
-                                format!("{}.pop().expect(\"pop from empty list\")", obj_s)
+                                format!("{}.pop().unwrap_or_else(|| panic!(\"IndexError\\0pop from empty list\"))", obj_s)
                             } else {
                                 // Honor Python negative indices: pop(-1) is the last element.
                                 format!(
@@ -448,7 +448,7 @@ impl<'a> Codegen<'a> {
                             return Err(crate::diag::Error::Codegen("pop requires at least one argument".into()));
                         } else if parts.len() == 1 {
                             // pop(key) — remove from the receiver and return the value (panic if absent)
-                            return Ok(Some(format!("{}.remove(&{}).expect(\"KeyError: key not found\")", obj_s, parts[0])));
+                            return Ok(Some(format!("{}.remove(&{}).unwrap_or_else(|| panic!(\"KeyError\\0<key>\"))", obj_s, parts[0])));
                         } else {
                             // pop(key, default) — remove from the receiver; default if absent
                             return Ok(Some(format!("{}.remove(&{}).unwrap_or({})", obj_s, parts[0], parts[1])));
@@ -462,10 +462,10 @@ impl<'a> Codegen<'a> {
                         return Ok(Some(format!("{}.insert({} as usize, {})", obj_s, parts[0], parts[1])));
                     }
                     if name == "remove" && !parts.is_empty() {
-                        return Ok(Some(format!("{{ let __idx = {}.iter().position(|__x| *__x == {}).expect(\"value not found\"); {}.remove(__idx); }}", obj_s, parts[0], obj_s)));
+                        return Ok(Some(format!("{{ let __idx = {}.iter().position(|__x| *__x == {}).unwrap_or_else(|| panic!(\"ValueError\\0value not found\")); {}.remove(__idx); }}", obj_s, parts[0], obj_s)));
                     }
                     if name == "index" && !parts.is_empty() {
-                        return Ok(Some(format!("{}.iter().position(|__x| *__x == {}).expect(\"value not found\") as i64", obj_s, parts[0])));
+                        return Ok(Some(format!("{}.iter().position(|__x| *__x == {}).unwrap_or_else(|| panic!(\"ValueError\\0value not found\")) as i64", obj_s, parts[0])));
                     }
                     if name == "count" && !parts.is_empty() {
                         return Ok(Some(format!("{}.iter().filter(|__x| **__x == {}).count() as i64", obj_s, parts[0])));
@@ -1723,7 +1723,7 @@ impl<'a> Codegen<'a> {
                             return Ok(format!(
                                 "{{ let __s = {}.clone(); let __chars: Vec<char> = __s.chars().collect(); \
                                 let __start = {}; let __stop = {}; let __step_val = {}; \
-                                if __step_val == 0 {{ panic!(\"slice step cannot be zero\") }} \
+                                if __step_val == 0 {{ panic!(\"ValueError\\0slice step cannot be zero\") }} \
                                 else if __step_val > 0 {{ \
                                 let __step = __step_val as usize; \
                                 __chars.iter().enumerate().filter_map(|(i, c)| \
@@ -1787,7 +1787,7 @@ impl<'a> Codegen<'a> {
                                     format!("__py_list_slice_step(&{}, {}, {}, {})", o, start_val, stop_val, step_val)
                                 } else {
                                     format!(
-                                        "{{ let __list = {}.clone(); let mut __result = Vec::new(); let __len = __list.len() as i64; let __start = (if {} < 0 {{ (__len + {}) as usize }} else {{ {} as usize }}).min(__list.len()); let __stop = (if {} < 0 {{ (__len + {}) as usize }} else {{ {} as usize }}).min(__list.len()); let __step = {}; if __step > 0 {{ let mut __i = __start as i64; while __i < __stop as i64 {{ __result.push(__list[__i as usize].clone()); __i += __step; }} }} else if __step < 0 {{ let mut __i = (__stop as i64) - 1; while __i >= __start as i64 {{ __result.push(__list[__i as usize].clone()); __i += __step; }} }} __result }}",
+                                        "{{ let __list = {}.clone(); let mut __result = Vec::new(); let __len = __list.len() as i64; let __start = (if {} < 0 {{ (__len + {}) as usize }} else {{ {} as usize }}).min(__list.len()); let __stop = (if {} < 0 {{ (__len + {}) as usize }} else {{ {} as usize }}).min(__list.len()); let __step = {}; if __step == 0 {{ panic!(\"ValueError\\0slice step cannot be zero\") }} else if __step > 0 {{ let mut __i = __start as i64; while __i < __stop as i64 {{ __result.push(__list[__i as usize].clone()); __i += __step; }} }} else {{ let mut __i = (__stop as i64) - 1; while __i >= __start as i64 {{ __result.push(__list[__i as usize].clone()); __i += __step; }} }} __result }}",
                                         o, start_expr, start_val, start_val, stop_expr, stop_val, stop_val, step_val
                                     )
                                 }

@@ -1368,7 +1368,7 @@ impl<'a> Codegen<'a> {
                 let base = self.emit_place(obj)?;
                 if matches!(self.type_of_expr(obj), Ty::Dict(..)) {
                     let k = self.emit_expr(idx)?;
-                    Ok(format!("(*{}.get_mut(&{}).expect(\"key not found\"))", base, k))
+                    Ok(format!("(*{}.get_mut(&{}).unwrap_or_else(|| panic!(\"KeyError\\0<key>\")))", base, k))
                 } else {
                     // Parenthesize the index before `as usize`: a nested list
                     // subscript lowers `idx` to a *block* expression, and bare

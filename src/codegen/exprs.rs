@@ -1336,10 +1336,13 @@ impl<'a> Codegen<'a> {
         Ok(match e {
             // A numeric literal is a primary expression, so bare `0i64` / `1.5f64`
             // is precedence-safe in every position (receiver, exponent, as-cast,
-            // operand). The lexer only produces non-negative literals — a leading
-            // `-` is a separate `UnOp::Neg` node that adds its own parens — so the
-            // guard below is defensive: parenthesize only if a `-` ever appears,
-            // otherwise emit the literal bare (was unconditionally `(..)`).
+            // operand). The lexer only produces non-negative literals (a leading
+            // `-` is a separate `UnOp::Neg` node that adds its own parens), BUT
+            // `try_fold_const` can fold e.g. `2 - 5` into `Expr::Int(-3)`, so the
+            // guard below is load-bearing: a negative literal must parenthesize
+            // (`(-3i64)`) or it would bind as `-(3i64.method())` in receiver
+            // position. Non-negative literals emit bare (was unconditionally
+            // `(..)`).
             Expr::Int(n, _) => {
                 let lit = format!("{}i64", n);
                 if lit.starts_with('-') { format!("({})", lit) } else { lit }

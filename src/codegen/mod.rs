@@ -534,7 +534,13 @@ pub fn emit_program(modules: &[(Module, String)], ctx: &TyCtx) -> Result<String>
     // sentinel is legitimately unreachable. It is a structural artifact of the
     // generated wrapper, not a user mistake — the same reason `dead_code` /
     // `unused_variables` are already suppressed for generated code.
-    cg.line("#![allow(unused_parens, unused_variables, unused_mut, dead_code, unused_imports, non_upper_case_globals, non_camel_case_types, unreachable_code)]");
+    // `unused_assignments` (card adc0d1c4): when 2+ locals are hoisted, the sorted
+    // decl preamble separates all but the last-sorted var's default decl from its
+    // first reassignment, so `try_fold_hoisted_init`'s adjacency fold cannot fire
+    // and those keep `let mut x: T = <default>; x = <init>;`. The dead default is a
+    // generated-code artifact (never a user bug), suppressed here uniformly for all
+    // hoist orderings — see the note on `try_fold_hoisted_init`.
+    cg.line("#![allow(unused_parens, unused_variables, unused_mut, dead_code, unused_imports, non_upper_case_globals, non_camel_case_types, unreachable_code, unused_assignments)]");
     cg.line("use std::io::Write;");
     cg.line("");
     cg.line("fn __py_fmt_float(x: f64) -> String {");
@@ -588,38 +594,55 @@ pub fn emit_program(modules: &[(Module, String)], ctx: &TyCtx) -> Result<String>
     cg.line("    if __idx >= __list.len() { panic!(\"IndexError\\0list index out of range\") }");
     cg.line("    __list[__idx].clone()");
     cg.line("}");
+    // Simple (step-1) list slice. Resolves a negative bound by +len then clamps
+    // to [0, len] (CPython semantics for step>0), and yields the empty slice when
+    // the clamped stop is not past the clamped start — so out-of-range bounds
+    // (`xs[-100:2]`, `xs[10:2]`) clamp instead of panicking on a usize underflow.
     cg.line("fn __py_list_slice<T: Clone>(__list: &[T], __start_in: i64, __stop_in: i64) -> Vec<T> {");
     cg.line("    let __len = __list.len() as i64;");
-    cg.line("    let __start = if __start_in < 0 { ((__len + __start_in) as usize).min(__list.len()) } else { (__start_in as usize).min(__list.len()) };");
-    cg.line("    let __stop = if __stop_in < 0 { ((__len + __stop_in) as usize).min(__list.len()) } else { (__stop_in as usize).min(__list.len()) };");
-    cg.line("    __list[__start..(__start + (__stop - __start))].to_vec()");
+    cg.line("    let mut __start = if __start_in < 0 { __start_in + __len } else { __start_in };");
+    cg.line("    if __start < 0 { __start = 0; } else if __start > __len { __start = __len; }");
+    cg.line("    let mut __stop = if __stop_in < 0 { __stop_in + __len } else { __stop_in };");
+    cg.line("    if __stop < 0 { __stop = 0; } else if __stop > __len { __stop = __len; }");
+    cg.line("    if __stop > __start { __list[(__start as usize)..(__stop as usize)].to_vec() } else { Vec::new() }");
     cg.line("}");
-    cg.line("fn __py_list_slice_step<T: Clone>(__list: &[T], __start_in: i64, __stop_in: i64, __step: i64) -> Vec<T> {");
+    // Stepped list slice, faithful to CPython PySlice_AdjustIndices for BOTH step
+    // signs. Absent bounds arrive as `None` so the step-sign-dependent default is
+    // applied at RUNTIME (step may be a runtime expr): start None -> len-1 (step<0)
+    // / 0 (step>0); stop None -> -1 (step<0) / len (step>0). A present bound is
+    // resolved by +len then clamped to [lower,upper] = [-1,len-1] for step<0 /
+    // [0,len] for step>0. Iteration is direction-aware: i=start while i<stop
+    // (step>0) or i>stop (step<0). The fallback (rvalue-base) call sites clone the
+    // base into a local and call this same fn, so borrow and fallback agree.
+    cg.line("fn __py_list_slice_step<T: Clone>(__list: &[T], __start_in: Option<i64>, __stop_in: Option<i64>, __step: i64) -> Vec<T> {");
     cg.line("    if __step == 0 { panic!(\"ValueError\\0slice step cannot be zero\"); }");
-    cg.line("    let mut __result: Vec<T> = Vec::new();");
     cg.line("    let __len = __list.len() as i64;");
-    cg.line("    let __start = (if __start_in < 0 { (__len + __start_in) as usize } else { __start_in as usize }).min(__list.len());");
-    cg.line("    let __stop = (if __stop_in < 0 { (__len + __stop_in) as usize } else { __stop_in as usize }).min(__list.len());");
-    cg.line("    if __step > 0 { let mut __i = __start as i64; while __i < __stop as i64 { __result.push(__list[__i as usize].clone()); __i += __step; } }");
-    cg.line("    else if __step < 0 { let mut __i = (__stop as i64) - 1; while __i >= __start as i64 { __result.push(__list[__i as usize].clone()); __i += __step; } }");
+    cg.line("    let __lower = if __step < 0 { -1i64 } else { 0i64 };");
+    cg.line("    let __upper = if __step < 0 { __len - 1 } else { __len };");
+    cg.line("    let __start = match __start_in { None => if __step < 0 { __len - 1 } else { 0 }, Some(__v) => { let __v = if __v < 0 { __v + __len } else { __v }; if __v < __lower { __lower } else if __v > __upper { __upper } else { __v } } };");
+    cg.line("    let __stop = match __stop_in { None => if __step < 0 { -1 } else { __len }, Some(__v) => { let __v = if __v < 0 { __v + __len } else { __v }; if __v < __lower { __lower } else if __v > __upper { __upper } else { __v } } };");
+    cg.line("    let mut __result: Vec<T> = Vec::new();");
+    cg.line("    let mut __i = __start;");
+    cg.line("    if __step > 0 { while __i < __stop { __result.push(__list[__i as usize].clone()); __i += __step; } }");
+    cg.line("    else { while __i > __stop { __result.push(__list[__i as usize].clone()); __i += __step; } }");
     cg.line("    __result");
     cg.line("}");
-    // (card cc7ae370, item 2) Stepped STRING slice over a SHARED-borrowed base
-    // (`&str`), so only the RESULT String is built — the source String is not
-    // cloned when the base is a borrowable place (callers borrow `&s`; an unsafe
-    // base still snapshot-clones inline, see the Slice/Str arm). Char-based (a
-    // `Vec<char>` — Python slices by code point, not UTF-8 byte). Mirrors
-    // __py_list_slice_step: leading zero-step ValueError check, `.min()`-clamped
-    // negative/positive bounds, step-directional fill.
-    cg.line("fn __py_str_slice_step(__s: &str, __start_in: i64, __stop_in: i64, __step: i64) -> String {");
+    // Stepped STRING slice — the char-based twin of __py_list_slice_step (Python
+    // slices strings by code point, not UTF-8 byte). Same PySlice_AdjustIndices
+    // logic and Option-encoded absent bounds. Also serves the simple (step-1)
+    // string slice, so every string slice is char-correct and out-of-range-safe.
+    cg.line("fn __py_str_slice_step(__s: &str, __start_in: Option<i64>, __stop_in: Option<i64>, __step: i64) -> String {");
     cg.line("    if __step == 0 { panic!(\"ValueError\\0slice step cannot be zero\"); }");
     cg.line("    let __chars: Vec<char> = __s.chars().collect();");
-    cg.line("    let mut __result = String::new();");
     cg.line("    let __len = __chars.len() as i64;");
-    cg.line("    let __start = (if __start_in < 0 { (__len + __start_in) as usize } else { __start_in as usize }).min(__chars.len());");
-    cg.line("    let __stop = (if __stop_in < 0 { (__len + __stop_in) as usize } else { __stop_in as usize }).min(__chars.len());");
-    cg.line("    if __step > 0 { let mut __i = __start as i64; while __i < __stop as i64 { __result.push(__chars[__i as usize]); __i += __step; } }");
-    cg.line("    else if __step < 0 { let mut __i = (__stop as i64) - 1; while __i >= __start as i64 { __result.push(__chars[__i as usize]); __i += __step; } }");
+    cg.line("    let __lower = if __step < 0 { -1i64 } else { 0i64 };");
+    cg.line("    let __upper = if __step < 0 { __len - 1 } else { __len };");
+    cg.line("    let __start = match __start_in { None => if __step < 0 { __len - 1 } else { 0 }, Some(__v) => { let __v = if __v < 0 { __v + __len } else { __v }; if __v < __lower { __lower } else if __v > __upper { __upper } else { __v } } };");
+    cg.line("    let __stop = match __stop_in { None => if __step < 0 { -1 } else { __len }, Some(__v) => { let __v = if __v < 0 { __v + __len } else { __v }; if __v < __lower { __lower } else if __v > __upper { __upper } else { __v } } };");
+    cg.line("    let mut __result = String::new();");
+    cg.line("    let mut __i = __start;");
+    cg.line("    if __step > 0 { while __i < __stop { __result.push(__chars[__i as usize]); __i += __step; } }");
+    cg.line("    else { while __i > __stop { __result.push(__chars[__i as usize]); __i += __step; } }");
     cg.line("    __result");
     cg.line("}");
     // (try/except control flow) Signal a try BODY's escaping control flow out of

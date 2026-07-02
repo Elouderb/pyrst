@@ -1737,72 +1737,42 @@ impl<'a> Codegen<'a> {
 
                 match obj_ty {
                     Ty::Str => {
-                        // String slicing with negative index support and optional step
-                        let start_expr = start.as_ref().map(|e| self.emit_expr(e)).transpose()?;
-                        let start_val = start_expr.clone().map(|s| {
-                            format!("(if {} < 0 {{ (({}.len() as i64) + {}) as usize }} else {{ {} as usize }})", s, o, s, s)
-                        }).unwrap_or_else(|| "0usize".to_string());
-
-                        let stop_expr = stop.as_ref().map(|e| self.emit_expr(e)).transpose()?;
-                        let stop_val = stop_expr.clone().map(|s| {
-                            format!("(if {} < 0 {{ (({}.len() as i64) + {}) as usize }} else {{ {} as usize }})", s, o, s, s)
-                        }).unwrap_or_else(|| format!("{}.len()", o));
-
-                        if let Some(step_expr) = step {
-                            let step_s = self.emit_expr(step_expr)?;
-                            // (card cc7ae370, item 2) Borrow the base when it is a
-                            // place and no present bound can mutate it — the helper
-                            // builds only the result String from a `&str`, no
-                            // whole-String clone. The raw i64 bounds are passed
-                            // through; the helper does negative/step handling over
-                            // `.chars()`. Absent stop -> `i64::MAX` (clamped to the
-                            // char count internally). Any unsafe base falls to the
-                            // verbatim snapshot-clone template below.
-                            let subs_safe = start.as_ref().map_or(true, |e| self.is_borrow_safe_index(e))
-                                && stop.as_ref().map_or(true, |e| self.is_borrow_safe_index(e))
-                                && self.is_borrow_safe_index(step_expr);
-                            if self.is_borrowable_place(obj) && subs_safe {
-                                let start_i = start_expr.unwrap_or_else(|| "0i64".to_string());
-                                let stop_i = stop_expr.unwrap_or_else(|| "i64::MAX".to_string());
-                                return Ok(format!(
-                                    "__py_str_slice_step(&{}, {}, {}, {})",
-                                    o, start_i, stop_i, step_s
-                                ));
-                            }
-                            return Ok(format!(
-                                "{{ let __s = {}.clone(); let __chars: Vec<char> = __s.chars().collect(); \
-                                let __start = {}; let __stop = {}; let __step_val = {}; \
-                                if __step_val == 0 {{ panic!(\"ValueError\\0slice step cannot be zero\") }} \
-                                else if __step_val > 0 {{ \
-                                let __step = __step_val as usize; \
-                                __chars.iter().enumerate().filter_map(|(i, c)| \
-                                if i >= __start && i < __stop && (i as i64 - __start as i64) % __step_val == 0 {{ Some(*c) }} else {{ None }} \
-                                ).collect::<String>() }} \
-                                else {{ \
-                                let mut __result = String::new(); \
-                                let mut __i = __stop as i64 - 1; \
-                                while __i >= __start as i64 {{ \
-                                if __i >= 0 && (__i as usize) < __chars.len() {{ \
-                                __result.push(__chars[__i as usize]); \
-                                }} \
-                                __i += __step_val; \
-                                }} \
-                                __result }} }}",
-                                o, start_val, stop_val, step_s
-                            ));
-                        } else {
-                            return Ok(format!("((&{}[{}..{}]).to_string())", o, start_val, stop_val));
+                        // Every string slice (with or without an explicit step)
+                        // routes through __py_str_slice_step, which does all the
+                        // negative-index resolution, CPython PySlice_AdjustIndices
+                        // clamping, and step-directional (char-based) fill. Absent
+                        // start/stop pass as `None` so the helper can apply the
+                        // step-sign-dependent default at runtime; an absent step is
+                        // the literal 1. Borrow the base when it is a place and no
+                        // present bound can mutate it (the helper needs only `&str`);
+                        // otherwise snapshot-clone the base into a local and call the
+                        // SAME helper, so borrow and fallback agree exactly.
+                        let start_arg = start.as_ref().map(|e| self.emit_expr(e)).transpose()?
+                            .map(|s| format!("Some({})", s)).unwrap_or_else(|| "None".to_string());
+                        let stop_arg = stop.as_ref().map(|e| self.emit_expr(e)).transpose()?
+                            .map(|s| format!("Some({})", s)).unwrap_or_else(|| "None".to_string());
+                        let step_arg = step.as_ref().map(|e| self.emit_expr(e)).transpose()?
+                            .unwrap_or_else(|| "1i64".to_string());
+                        let subs_safe = start.as_ref().map_or(true, |e| self.is_borrow_safe_index(e))
+                            && stop.as_ref().map_or(true, |e| self.is_borrow_safe_index(e))
+                            && step.as_ref().map_or(true, |e| self.is_borrow_safe_index(e));
+                        if self.is_borrowable_place(obj) && subs_safe {
+                            return Ok(format!("__py_str_slice_step(&{}, {}, {}, {})", o, start_arg, stop_arg, step_arg));
                         }
+                        return Ok(format!("{{ let __s = {}.clone(); __py_str_slice_step(&__s, {}, {}, {}) }}", o, start_arg, stop_arg, step_arg));
                     }
                     Ty::List(_) => {
                         // List slicing with step support and negative index handling
                         match (start, stop, step) {
                             (Some(s), Some(e), None) => {
-                                // Simple: x[start:stop]
+                                // Simple: x[start:stop]. __py_list_slice resolves the
+                                // negative bounds, clamps to [0,len], and empties when
+                                // stop <= start (no usize underflow on out-of-range).
                                 let start_s = self.emit_expr(s)?;
                                 let stop_s = self.emit_expr(e)?;
                                 // Borrow the base when it is a place and neither
-                                // bound can mutate it; else snapshot-clone (below).
+                                // bound can mutate it; else snapshot-clone and call
+                                // the SAME helper so both paths agree exactly.
                                 if self.is_borrowable_place(obj)
                                     && self.is_borrow_safe_index(s)
                                     && self.is_borrow_safe_index(e)
@@ -1810,34 +1780,36 @@ impl<'a> Codegen<'a> {
                                     format!("__py_list_slice(&{}, {}, {})", o, start_s, stop_s)
                                 } else {
                                     format!(
-                                        "{{ let __list = {}.clone(); let __len = __list.len() as i64; let __start = if {} < 0 {{ ((__len + {}) as usize).min(__list.len()) }} else {{ ({} as usize).min(__list.len()) }}; let __stop = if {} < 0 {{ ((__len + {}) as usize).min(__list.len()) }} else {{ ({} as usize).min(__list.len()) }}; __list[__start..(__start + (__stop - __start))].to_vec() }}",
-                                        o, start_s, start_s, start_s, stop_s, stop_s, stop_s
+                                        "{{ let __list = {}.clone(); __py_list_slice(&__list, {}, {}) }}",
+                                        o, start_s, stop_s
                                     )
                                 }
                             }
                             _ => {
-                                // General with step and negative index handling
-                                let start_val = start.as_ref().map(|e| self.emit_expr(e)).transpose()?.unwrap_or_else(|| "0i64".to_string());
-                                let stop_val = stop.as_ref().map(|e| self.emit_expr(e)).transpose()?.unwrap_or_else(|| format!("{}.len() as i64", o));
-                                let step_val = step.as_ref().map(|e| self.emit_expr(e)).transpose()?.unwrap_or_else(|| "1i64".to_string());
-
-                                // Wrap values in parens for safety in comparisons
-                                let start_expr = format!("({})", start_val);
-                                let stop_expr = format!("({})", stop_val);
+                                // General (stepped / one-sided) slice. All bound
+                                // handling lives in __py_list_slice_step; absent
+                                // start/stop pass as `None` so the helper applies the
+                                // step-sign-dependent default at runtime, and an
+                                // absent step is the literal 1.
+                                let start_arg = start.as_ref().map(|e| self.emit_expr(e)).transpose()?
+                                    .map(|s| format!("Some({})", s)).unwrap_or_else(|| "None".to_string());
+                                let stop_arg = stop.as_ref().map(|e| self.emit_expr(e)).transpose()?
+                                    .map(|s| format!("Some({})", s)).unwrap_or_else(|| "None".to_string());
+                                let step_val = step.as_ref().map(|e| self.emit_expr(e)).transpose()?
+                                    .unwrap_or_else(|| "1i64".to_string());
 
                                 // Borrow the base when it is a place and no present
-                                // bound (start/stop/step) can mutate it. The helper
-                                // takes the already-defaulted i64 bounds and does the
-                                // negative/step handling internally.
+                                // bound (start/stop/step) can mutate it; else
+                                // snapshot-clone and call the SAME helper.
                                 let subs_safe = start.as_ref().map_or(true, |e| self.is_borrow_safe_index(e))
                                     && stop.as_ref().map_or(true, |e| self.is_borrow_safe_index(e))
                                     && step.as_ref().map_or(true, |e| self.is_borrow_safe_index(e));
                                 if self.is_borrowable_place(obj) && subs_safe {
-                                    format!("__py_list_slice_step(&{}, {}, {}, {})", o, start_val, stop_val, step_val)
+                                    format!("__py_list_slice_step(&{}, {}, {}, {})", o, start_arg, stop_arg, step_val)
                                 } else {
                                     format!(
-                                        "{{ let __list = {}.clone(); let mut __result = Vec::new(); let __len = __list.len() as i64; let __start = (if {} < 0 {{ (__len + {}) as usize }} else {{ {} as usize }}).min(__list.len()); let __stop = (if {} < 0 {{ (__len + {}) as usize }} else {{ {} as usize }}).min(__list.len()); let __step = {}; if __step == 0 {{ panic!(\"ValueError\\0slice step cannot be zero\") }} else if __step > 0 {{ let mut __i = __start as i64; while __i < __stop as i64 {{ __result.push(__list[__i as usize].clone()); __i += __step; }} }} else {{ let mut __i = (__stop as i64) - 1; while __i >= __start as i64 {{ __result.push(__list[__i as usize].clone()); __i += __step; }} }} __result }}",
-                                        o, start_expr, start_val, start_val, stop_expr, stop_val, stop_val, step_val
+                                        "{{ let __list = {}.clone(); __py_list_slice_step(&__list, {}, {}, {}) }}",
+                                        o, start_arg, stop_arg, step_val
                                     )
                                 }
                             }
@@ -2314,6 +2286,15 @@ impl<'a> Codegen<'a> {
     /// `default_val` (no side effect dropped) and only on true emitted adjacency,
     /// so it is exactly the card's "immediately-next statement in the same block"
     /// rule and cannot reorder or drop any effect. Returns true iff it folded.
+    ///
+    /// NOTE: this handles the SINGLE-hoist / adjacent case. When 2+ locals are
+    /// hoisted, the sorted decl preamble separates all but the last-sorted var's
+    /// decl from the buffer tail, so those do not fold and keep the double-init.
+    /// The residual `unused_assignments` on that dead default is suppressed by the
+    /// emitted `#![allow(..)]` header (see `emit_program`) — the order-independent
+    /// completeness fix for card adc0d1c4; a name-based multi-hoist splice was
+    /// prototyped but is order-sensitive (a later-sorting var folded first blocks
+    /// the earlier ones), so it was not adopted.
     pub(crate) fn try_fold_hoisted_init(&mut self, target_e: &str, ty: &Ty, new_rhs: &str) -> bool {
         let def = match self.default_val(ty) {
             Some(d) => d,

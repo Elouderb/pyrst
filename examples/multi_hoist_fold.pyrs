@@ -1,0 +1,24 @@
+def running(nums: list[int]) -> None:
+    a = 100
+    b = 0
+    for n in nums:
+        a = a - n
+        b = b + n
+    print(a)
+    print(b)
+
+def three(nums: list[int]) -> None:
+    total = 1
+    count = 0
+    prod = 1
+    for n in nums:
+        total = total + n
+        count = count + 1
+        prod = prod * n
+    print(total)
+    print(count)
+    print(prod)
+
+def main() -> None:
+    running([10, 20, 30])
+    three([2, 3, 4])

@@ -531,14 +531,33 @@ impl<T> Co<T> {
 struct Gen<T> {
     fut: std::pin::Pin<std::boxed::Box<dyn std::future::Future<Output = ()>>>,
     slot: std::rc::Rc<std::cell::RefCell<std::option::Option<T>>>,
+    done: bool,
+}
+impl<T> Gen<T> {
+    fn empty() -> Gen<T> {
+        Gen {
+            fut: std::boxed::Box::pin(async {}),
+            slot: std::rc::Rc::new(std::cell::RefCell::new(std::option::Option::None)),
+            done: false,
+        }
+    }
 }
 impl<T> std::iter::Iterator for Gen<T> {
     type Item = T;
     fn next(&mut self) -> std::option::Option<T> {
+        // FUSED: polling a completed future is a contract violation ("resumed
+        // after completion" panic). Python iterates an exhausted generator as
+        // empty forever, so next() on a done Gen returns None forever.
+        if self.done {
+            return std::option::Option::None;
+        }
         let __waker = std::task::Waker::noop();
         let mut __cx = std::task::Context::from_waker(__waker);
         match self.fut.as_mut().poll(&mut __cx) {
-            std::task::Poll::Ready(()) => std::option::Option::None,
+            std::task::Poll::Ready(()) => {
+                self.done = true;
+                std::option::Option::None
+            }
             std::task::Poll::Pending => self.slot.borrow_mut().take(),
         }
     }

@@ -486,7 +486,18 @@ impl<'a> Codegen<'a> {
                     // clone. This is the type-driven path that retires the emitted-
                     // string `is_iterator` sniff FOR GENERATORS; the sniff below
                     // still handles the `enumerate`/`zip`/`cloned` adapter shapes.
-                    i
+                    //
+                    // (review fix) A generator VARIABLE iterates by `&mut` (std's
+                    // blanket `Iterator for &mut I`) instead of MOVING: the binding
+                    // stays live and ADVANCES in place, so a nested loop over two
+                    // generator locals compiles and a second `for x in g` yields
+                    // nothing — Python's generator semantics exactly (was E0382).
+                    // A fresh rvalue (`for x in gen()`) is consumed by value.
+                    if matches!(iter, Expr::Ident(..)) {
+                        format!("(&mut {})", i)
+                    } else {
+                        i
+                    }
                 } else if is_iterator {
                     i
                 } else if is_range {

@@ -331,7 +331,7 @@ impl<'a> Codegen<'a> {
         if is_generator {
             self.indent -= 1;
             self.line("});");
-            self.line("Gen { fut: __pyrst_gen_fut, slot: __pyrst_gen_slot }");
+            self.line("Gen { fut: __pyrst_gen_fut, slot: __pyrst_gen_slot, done: false }");
         }
         self.indent -= 1;
         self.line("}");

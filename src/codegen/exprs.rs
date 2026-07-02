@@ -1469,7 +1469,15 @@ impl<'a> Codegen<'a> {
                     // `Iterator` yielding owned `T`; consume it DIRECTLY — no
                     // `.iter().cloned()` (`Gen` has no `.iter()`), no double clone.
                     // The map/filter_map adapters compose straight onto the `Gen`.
-                    iter_s.clone()
+                    // (review fix) A generator VARIABLE is borrowed `&mut`, not
+                    // moved — the binding stays live and advances in place
+                    // (Python: a comprehension drains the generator; reuse then
+                    // yields nothing instead of E0382).
+                    if matches!(iter.as_ref(), Expr::Ident(..)) {
+                        format!("(&mut {})", iter_s)
+                    } else {
+                        iter_s.clone()
+                    }
                 } else {
                     format!("{}.iter().cloned()", iter_s)
                 };
@@ -1506,7 +1514,12 @@ impl<'a> Codegen<'a> {
                     // (LAZY-GEN V1-b) A generator source is itself an `Iterator`
                     // (`Gen<T>`) yielding owned `T`; consume it DIRECTLY — no
                     // `.iter().cloned()` (`Gen` has no `.iter()`), no double clone.
-                    iter_s.clone()
+                    // (review fix) A VARIABLE source borrows `&mut` (see ListComp).
+                    if matches!(iter.as_ref(), Expr::Ident(..)) {
+                        format!("(&mut {})", iter_s)
+                    } else {
+                        iter_s.clone()
+                    }
                 } else {
                     format!("{}.iter().cloned()", iter_s)
                 };
@@ -1535,7 +1548,12 @@ impl<'a> Codegen<'a> {
                     // (LAZY-GEN V1-b) A generator source is itself an `Iterator`
                     // (`Gen<T>`) yielding owned `T`; consume it DIRECTLY — no
                     // `.iter().cloned()` (`Gen` has no `.iter()`), no double clone.
-                    iter_s.clone()
+                    // (review fix) A VARIABLE source borrows `&mut` (see ListComp).
+                    if matches!(iter.as_ref(), Expr::Ident(..)) {
+                        format!("(&mut {})", iter_s)
+                    } else {
+                        iter_s.clone()
+                    }
                 } else {
                     format!("{}.iter().cloned()", iter_s)
                 };

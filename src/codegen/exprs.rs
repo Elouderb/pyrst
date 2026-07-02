@@ -1778,7 +1778,16 @@ impl<'a> Codegen<'a> {
                 // name resolution), so the mangling only applies when `n` is NOT a
                 // local. A str const additionally recovers a `String` from its
                 // `&str` const.
-                if self.const_names.contains(n) && !self.locals.contains_key(n) {
+                if let Some(m) = self.shadow_read_name(n) {
+                    // (card 575bcf3a, poison2) A read of a HOISTED local that is
+                    // currently divergently shadowed inside a block resolves to the
+                    // mangled shadow binding (`__pyrst_shadow_..`) that holds the
+                    // block-local value, not the hidden function-scope slot. Empty
+                    // shadow_map (the common case) never reaches here, so shadow-free
+                    // code is byte-for-byte unchanged. A shadowed name is always a
+                    // local, so this correctly precedes the module-const path.
+                    m
+                } else if self.const_names.contains(n) && !self.locals.contains_key(n) {
                     if self.const_strs.contains(n) {
                         format!("{}.to_string()", mangle_const(n))
                     } else {
@@ -2368,9 +2377,11 @@ impl<'a> Codegen<'a> {
             let g = self.emit_expr(guard)?;
             self.line(&format!("if {} {{", g));
             self.indent += 1;
+            let __arm_scope = self.scope_enter();
             for s in &arm.body {
                 self.emit_stmt(s)?;
             }
+            self.scope_exit(__arm_scope);
             self.indent -= 1;
             if rest.is_empty() {
                 self.line("}");
@@ -2397,9 +2408,11 @@ impl<'a> Codegen<'a> {
             self.line(&format!("}} else if {}{} {{", cond, guard_str));
         }
         self.indent += 1;
+        let __arm_scope = self.scope_enter();
         for s in &arm.body {
             self.emit_stmt(s)?;
         }
+        self.scope_exit(__arm_scope);
         self.indent -= 1;
         if rest.is_empty() {
             self.line("}");
@@ -2422,6 +2435,9 @@ impl<'a> Codegen<'a> {
         body: &[crate::ast::Stmt],
     ) -> Result<()> {
         self.indent += 1;
+        // (card 575bcf3a) Isolate the arm body's block-scope emission state; the
+        // capture binding below is captured inside this window.
+        let __arm_scope = self.scope_enter();
         if let Some(name) = capture_name {
             let bind = escape_ident(name);
             self.line(&format!("let mut {} = {}.clone();", bind, match_val));
@@ -2431,6 +2447,7 @@ impl<'a> Codegen<'a> {
         for s in body {
             self.emit_stmt(s)?;
         }
+        self.scope_exit(__arm_scope);
         self.indent -= 1;
         Ok(())
     }

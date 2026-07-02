@@ -1,0 +1,9 @@
+# card 602b1675: an all-new unpack `a,b=0,1` records the names as declared, so the
+# LATER `a,b=b,a+b` inside the loop REASSIGNS them (Fibonacci) instead of shadowing.
+def main() -> None:
+    a, b = 0, 1
+    i: int = 0
+    while i < 10:
+        a, b = b, a + b
+        i = i + 1
+    print(a)

@@ -1,0 +1,20 @@
+# card 575bcf3a (shape 1): a DEAD nested divergent assign (`if c: xs = gen(3)`) must
+# not poison the sibling unconditional override (`xs = [7,8,9]`) into being shadowed.
+def gen(n: int) -> Iterator[int]:
+    i: int = 0
+    while i < n:
+        yield i
+        i = i + 1
+
+
+def main() -> None:
+    c: bool = True
+    flag: bool = False
+    if flag:
+        xs = [4, 5, 6]
+    else:
+        if c:
+            xs = gen(3)
+        xs = [7, 8, 9]
+    for x in xs:
+        print(x)

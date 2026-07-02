@@ -1,0 +1,10 @@
+# card 602b1675: tuple-unpack reassignment in a `for` body accumulates into the
+# pre-initialized outer bindings.
+def main() -> None:
+    total: int = 0
+    count: int = 0
+    nums: list[int] = [3, 1, 4, 1, 5, 9]
+    for n in nums:
+        total, count = total + n, count + 1
+    print(total)
+    print(count)

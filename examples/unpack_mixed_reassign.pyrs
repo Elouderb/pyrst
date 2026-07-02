@@ -1,0 +1,7 @@
+# card 602b1675: a MIXED unpack (one pre-existing target + one fresh target) is
+# supported via temp-split — the existing `a` is reassigned, the new `c` declared.
+def main() -> None:
+    a: int = 1
+    a, c = 10, 20
+    print(a)
+    print(c)

@@ -1,0 +1,20 @@
+# card 575bcf3a (elif-chain variant): a materialize in the THEN branch must not leak
+# its Iterator type into the sibling ELIF branch (per-branch scope isolation).
+def gen(n: int) -> Iterator[int]:
+    i: int = 0
+    while i < n:
+        yield i
+        i = i + 1
+
+
+def main() -> None:
+    k: int = 1
+    if k == 0:
+        xs = gen(3)
+        xs = [1, 1]
+    elif k == 1:
+        xs = [2, 2, 2]
+    else:
+        xs = [9, 9]
+    for x in xs:
+        print(x)

@@ -142,6 +142,32 @@ pub struct Codegen<'a> {
     /// Saved/restored around each `emit_func` body (so a nested def / sibling fn
     /// never inherits it); EMPTY for non-generic functions.
     current_fn_type_params: Vec<String>,
+    /// (card 602b1675 / 575bcf3a) Names given a FUNCTION-SCOPE hoist slot
+    /// (`let mut x: T = <default>` in the body preamble). Populated by the hoist
+    /// loop in `emit_func` / `emit_nested_def`. A divergent shadow of a HOISTED
+    /// local inside a nested block must be emitted under a MANGLED name (so it
+    /// does not hide the function-scope slot by name and a later reconverging
+    /// assign can still reach the slot — see `shadow_map`). A non-hoisted local's
+    /// block shadow keeps its own name (a function-scope `let` shadow works). Empty
+    /// until the hoist loop runs; saved/restored around a nested `def`.
+    hoisted: std::collections::HashSet<String>,
+    /// (card 575bcf3a, poison2) ACTIVE divergent shadows of hoisted locals in the
+    /// CURRENT scope: pyrst name -> (mangled Rust binding, the hoisted SLOT type).
+    /// When a hoisted local is reassigned to a type that conflicts with its slot
+    /// inside a block, the shadow is emitted as `let mut <mangled> = ..` and this
+    /// records the redirect; `emit_expr`'s Ident arm resolves reads of the name to
+    /// `<mangled>` while the shadow is live. A later reassign whose value type
+    /// RECONVERGES to the slot type writes the ORIGINAL name (the slot) and clears
+    /// the entry — so `xs = gen(3); xs = list(xs)` inside a branch materializes into
+    /// the hoisted slot instead of a discarded block-local shadow. Saved/restored
+    /// (with locals + declared) around every child block so a shadow never leaks
+    /// past its block; empty in the overwhelmingly common shadow-free case.
+    shadow_map: std::collections::HashMap<String, (String, Ty)>,
+    /// (card 575bcf3a) Monotonic counter making each mangled shadow name unique
+    /// and DETERMINISTIC (`__pyrst_shadow_<name>_<n>`). Reset to 0 at the start of
+    /// each `emit_func` / `emit_nested_def` body and saved/restored around a nested
+    /// def, so emission is byte-stable across runs.
+    shadow_counter: usize,
 }
 
 

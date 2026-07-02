@@ -19,7 +19,7 @@ fn read_after_reassign_codegen_error(name: &str, outer: &Ty, inner: &Ty) -> crat
 
 impl<'a> Codegen<'a> {
     pub fn new(ctx: &'a TyCtx) -> Self {
-        Self { ctx, out: String::new(), indent: 0, locals: HashMap::new(), declared: Default::default(), current_class: None, current_ret_ty: Ty::Unit, dead_funcs: Default::default(), mut_self: HashMap::new(), by_ref_locals: Default::default(), poly_map: HashMap::new(), concrete_struct_params: Default::default(), const_names: Default::default(), const_strs: Default::default(), in_generator: false, try_return_escape: false, try_loopctl_escape: false, current_class_type_params: Vec::new(), current_fn_type_params: Vec::new() }
+        Self { ctx, out: String::new(), indent: 0, locals: HashMap::new(), declared: Default::default(), current_class: None, current_ret_ty: Ty::Unit, dead_funcs: Default::default(), mut_self: HashMap::new(), by_ref_locals: Default::default(), poly_map: HashMap::new(), concrete_struct_params: Default::default(), const_names: Default::default(), const_strs: Default::default(), in_generator: false, try_return_escape: false, try_loopctl_escape: false, current_class_type_params: Vec::new(), current_fn_type_params: Vec::new(), hoisted: Default::default(), shadow_map: Default::default(), shadow_counter: 0 }
     }
 
     pub fn with_dead_funcs(mut self, dead: std::collections::HashSet<String>) -> Self {
@@ -167,35 +167,43 @@ impl<'a> Codegen<'a> {
         })
     }
 
-    /// Collect names first-assigned inside a nested block (depth > 0) and all
-    /// unpack targets (never hoistable). Recurses through every block but not
+    /// Collect names first-assigned inside a nested block (depth > 0), so they can
+    /// be hoisted to a function-scope slot. Recurses through every block but not
     /// into nested function/class definitions (those have their own scope).
+    ///
+    /// (card 602b1675) An unpack target is now treated EXACTLY like an assign target
+    /// (a depth>0 unpack REASSIGNS the hoisted slot rather than declaring a
+    /// block-scoped `let (..)` shadow that gets discarded). The former blanket
+    /// unpack-EXCLUSION was there because the old codegen always emitted `let (..)`
+    /// for an unpack — that no longer holds (`Stmt::Unpack` distinguishes declare vs
+    /// reassign via `self.declared`, like `Stmt::Assign`), and the exclusion also
+    /// wrongly blocked hoisting a name that is BOTH a nested assign target AND an
+    /// unpack target somewhere.
     pub(crate) fn collect_hoistable(
         stmts: &[Stmt],
         depth: usize,
         block_assigned: &mut std::collections::HashSet<String>,
-        unpack: &mut std::collections::HashSet<String>,
     ) {
         for s in stmts {
             match s {
                 Stmt::Assign { target, .. } => { if depth > 0 { block_assigned.insert(target.clone()); } }
-                Stmt::Unpack { targets, .. } => { for t in targets { unpack.insert(t.clone()); } }
+                Stmt::Unpack { targets, .. } => { if depth > 0 { for t in targets { block_assigned.insert(t.clone()); } } }
                 Stmt::If { then, elifs, else_, .. } => {
-                    Self::collect_hoistable(then, depth + 1, block_assigned, unpack);
-                    for (_, b) in elifs { Self::collect_hoistable(b, depth + 1, block_assigned, unpack); }
-                    if let Some(b) = else_ { Self::collect_hoistable(b, depth + 1, block_assigned, unpack); }
+                    Self::collect_hoistable(then, depth + 1, block_assigned);
+                    for (_, b) in elifs { Self::collect_hoistable(b, depth + 1, block_assigned); }
+                    if let Some(b) = else_ { Self::collect_hoistable(b, depth + 1, block_assigned); }
                 }
                 Stmt::While { body, .. } | Stmt::For { body, .. } | Stmt::With { body, .. } => {
-                    Self::collect_hoistable(body, depth + 1, block_assigned, unpack);
+                    Self::collect_hoistable(body, depth + 1, block_assigned);
                 }
                 Stmt::Try { body, handlers, else_, finally_, .. } => {
-                    Self::collect_hoistable(body, depth + 1, block_assigned, unpack);
-                    for h in handlers { Self::collect_hoistable(&h.body, depth + 1, block_assigned, unpack); }
-                    if let Some(b) = else_ { Self::collect_hoistable(b, depth + 1, block_assigned, unpack); }
-                    if let Some(b) = finally_ { Self::collect_hoistable(b, depth + 1, block_assigned, unpack); }
+                    Self::collect_hoistable(body, depth + 1, block_assigned);
+                    for h in handlers { Self::collect_hoistable(&h.body, depth + 1, block_assigned); }
+                    if let Some(b) = else_ { Self::collect_hoistable(b, depth + 1, block_assigned); }
+                    if let Some(b) = finally_ { Self::collect_hoistable(b, depth + 1, block_assigned); }
                 }
                 Stmt::Match { arms, .. } => {
-                    for a in arms { Self::collect_hoistable(&a.body, depth + 1, block_assigned, unpack); }
+                    for a in arms { Self::collect_hoistable(&a.body, depth + 1, block_assigned); }
                 }
                 _ => {}
             }
@@ -583,6 +591,64 @@ impl<'a> Codegen<'a> {
 
     pub(crate) fn type_of_expr(&self, e: &Expr) -> Ty {
         crate::typeck::infer_expr_ty(e, &self.locals, self.ctx)
+    }
+
+    /// (card 575bcf3a) Snapshot the per-scope emission state that a Rust `{}` block
+    /// must NOT leak past its end: the forward type view (`locals`), the set of
+    /// in-scope `let` bindings (`declared`), and the active hoisted-local shadows
+    /// (`shadow_map`). Paired with [`Self::scope_exit`] around EACH child-block body
+    /// (per-branch, so a `then`-branch shadow never poisons an `elif`/sibling).
+    /// Models Rust block scoping exactly: a `let`/shadow inside the block, and any
+    /// type-view change it caused, reverts at the block's close — so a divergent
+    /// reassign nested one level deep can no longer make the enclosing block's next
+    /// statement wrongly shadow (the reviewer-traced miscompile). `hoisted` and
+    /// `shadow_counter` are FUNCTION-scoped (not restored here).
+    pub(crate) fn scope_enter(
+        &self,
+    ) -> (
+        HashMap<String, Ty>,
+        HashSet<String>,
+        HashMap<String, (String, Ty)>,
+    ) {
+        (
+            self.locals.clone(),
+            self.declared.clone(),
+            self.shadow_map.clone(),
+        )
+    }
+
+    /// Restore the state captured by [`Self::scope_enter`] at a child block's end.
+    pub(crate) fn scope_exit(
+        &mut self,
+        snap: (
+            HashMap<String, Ty>,
+            HashSet<String>,
+            HashMap<String, (String, Ty)>,
+        ),
+    ) {
+        self.locals = snap.0;
+        self.declared = snap.1;
+        self.shadow_map = snap.2;
+    }
+
+    /// (card 575bcf3a, poison2) A fresh, deterministic mangled Rust binding name for
+    /// a divergent shadow of hoisted local `name`. The `__pyrst_shadow_` prefix is
+    /// reserved (typeck's `reject_if_reserved` blocks user identifiers under
+    /// `__pyrst`), so it can never collide with a user binding; the counter makes
+    /// repeated shadows of the same name distinct and keeps emission byte-stable.
+    pub(crate) fn fresh_shadow_name(&mut self, name: &str) -> String {
+        let n = self.shadow_counter;
+        self.shadow_counter += 1;
+        format!("__pyrst_shadow_{}_{}", name, n)
+    }
+
+    /// The Rust identifier a READ of local `name` must resolve to: the mangled
+    /// shadow binding when an active divergent shadow hides the function-scope slot,
+    /// otherwise `None` (the caller uses the ordinary `escape_ident` name). Consulted
+    /// by `emit_expr`'s Ident arm. Empty `shadow_map` (the common case) → always
+    /// `None`, so shadow-free code is byte-for-byte unchanged.
+    pub(crate) fn shadow_read_name(&self, name: &str) -> Option<String> {
+        self.shadow_map.get(name).map(|(m, _)| m.clone())
     }
 
     /// Bind a comprehension's loop target(s) into `self.locals` with the iterable's

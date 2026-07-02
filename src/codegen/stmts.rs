@@ -259,9 +259,46 @@ impl<'a> Codegen<'a> {
                     let value_ty = self.type_of_expr(value);
                     // (EPIC-6) Escape the emitted name (raw `target` stays map key).
                     let target_e = escape_ident(target);
-                    if Self::types_conflict(&cur, &value_ty) {
-                        self.locals.insert(target.clone(), value_ty);
-                        self.line(&format!("let mut {} = {};", target_e, v));
+                    if let Some((_, slot_ty)) = self.shadow_map.get(target).cloned() {
+                        // (card 575bcf3a, poison2) A divergent shadow of this HOISTED
+                        // local is live (a prior block statement retyped it away from
+                        // its function-scope slot). `v` above already read the shadow
+                        // through its mangled name.
+                        if !Self::types_conflict(&slot_ty, &value_ty) {
+                            // RECONVERGE: the value fits the slot again -> write the
+                            // ORIGINAL (slot) binding and drop the shadow, so the
+                            // materialized value reaches the hoisted slot and later
+                            // reads resolve to it (`xs = gen(3); xs = list(xs)`).
+                            self.shadow_map.remove(target);
+                            self.locals.insert(target.clone(), slot_ty);
+                            self.line(&format!("{} = {};", target_e, v));
+                        } else {
+                            // Still divergent from the slot -> a fresh mangled shadow.
+                            let m = self.fresh_shadow_name(target);
+                            self.shadow_map.insert(target.clone(), (m.clone(), slot_ty));
+                            self.locals.insert(target.clone(), value_ty);
+                            self.line(&format!("let mut {} = {};", m, v));
+                        }
+                    } else if Self::types_conflict(&cur, &value_ty) {
+                        if self.hoisted.contains(target) {
+                            // (card 575bcf3a, poison2) First divergence of a HOISTED
+                            // local inside this block: emit the shadow under a MANGLED
+                            // name (not `target`) so it does not hide the
+                            // function-scope slot by name — a later assign whose value
+                            // reconverges to the slot type can then still reach the
+                            // slot (above). `cur` is the slot type here. Reads of the
+                            // name in the interim resolve to the mangled shadow.
+                            let m = self.fresh_shadow_name(target);
+                            self.shadow_map.insert(target.clone(), (m.clone(), cur.clone()));
+                            self.locals.insert(target.clone(), value_ty);
+                            self.line(&format!("let mut {} = {};", m, v));
+                        } else {
+                            // Non-hoisted (function-scope / param) binding: a
+                            // same-named `let` shadow is correct — there is no
+                            // separate slot to keep reachable (unchanged behavior).
+                            self.locals.insert(target.clone(), value_ty);
+                            self.line(&format!("let mut {} = {};", target_e, v));
+                        }
                     } else if matches!(cur, Ty::Float)
                         && (matches!(value_ty, Ty::Int) || self.emits_int_pow(value))
                     {
@@ -280,11 +317,80 @@ impl<'a> Codegen<'a> {
                 }
             }
             Stmt::Unpack { targets, value, .. } => {
-                let v = self.emit_expr(value)?;
-                // (EPIC-6) Escape each unpack target name; body uses resolve to the
-                // same escaped form via emit_expr's Ident arm.
-                let targets_e: Vec<String> = targets.iter().map(|t| escape_ident(t)).collect();
-                self.line(&format!("let ({}) = {};", targets_e.join(", "), v));
+                // (card 602b1675) Give tuple-unpack the same declare-vs-reassign
+                // distinction `Stmt::Assign` has, so an unpack REASSIGNMENT of
+                // pre-existing bindings inside a nested block writes those bindings
+                // instead of emitting a discarded block-scoped `let (..)` shadow (the
+                // swap idiom `a,b=b,a` and tuple-unpack GCD in a `while` loop).
+                //
+                // Per-target component types of the RHS (Unknown when the RHS is not
+                // a statically-known tuple of matching arity), mirroring the
+                // liveness/divergence analyses so the decisions agree.
+                let vt = self.type_of_expr(value);
+                let comp_tys: Vec<Ty> = match &vt {
+                    Ty::Tuple(tys) if tys.len() == targets.len() => tys.clone(),
+                    _ => vec![Ty::Unknown; targets.len()],
+                };
+                let all_new = targets.iter().all(|t| !self.declared.contains(t));
+                let all_declared = targets.iter().all(|t| self.declared.contains(t));
+                let any_shadow = targets.iter().any(|t| self.shadow_map.contains_key(t));
+                // A pre-existing target whose slot is incompatible with its component
+                // (a real divergence, or an int component into a float slot needing an
+                // `as f64` cast) cannot ride the plain destructuring-assignment form.
+                let all_simple_reassign = all_declared && !any_shadow
+                    && targets.iter().zip(comp_tys.iter()).all(|(t, ct)| {
+                        let cur = self.locals.get(t).cloned().unwrap_or(Ty::Unknown);
+                        !Self::types_conflict(&cur, ct)
+                            && !(matches!(cur, Ty::Float) && matches!(ct, Ty::Int))
+                    });
+
+                if all_new {
+                    // Every target is a FRESH binding: one destructuring `let` (the
+                    // long-standing form — bare_unpack's `x,y=1,2` / `a,b=get_pair()`
+                    // stay byte-identical). Record each as declared + typed so a LATER
+                    // reassignment of the same name reassigns the binding rather than
+                    // shadowing (`a,b=0,1; while ...: a,b=b,a+b`).
+                    let v = self.emit_expr(value)?;
+                    // Each fresh binding is `mut` (uniform with scalar `let mut x`)
+                    // so a LATER reassignment of the same name compiles; unused-mut is
+                    // allowed crate-wide. `let (mut a, mut b) = ..` is the Rust form
+                    // (a bare `let (a, b) mut` does not exist).
+                    let targets_e: Vec<String> = targets.iter().map(|t| format!("mut {}", escape_ident(t))).collect();
+                    self.line(&format!("let ({}) = {};", targets_e.join(", "), v));
+                    for (t, ct) in targets.iter().zip(comp_tys.iter()) {
+                        self.declared.insert(t.clone());
+                        self.locals.insert(t.clone(), ct.clone());
+                    }
+                } else if all_simple_reassign {
+                    // Every target is an existing, shadow-free binding whose component
+                    // type fits it: a Rust destructuring ASSIGNMENT to the existing
+                    // places (valid Rust since 1.59). The RHS tuple is evaluated IN
+                    // FULL before any target is written, so `a,b=b,a` swaps correctly
+                    // and the tuple-unpack GCD `a,b=b,a%b` updates the outer bindings
+                    // (terminates). No locals/declared change (a non-conflict reassign
+                    // keeps the richer existing type, exactly like scalar Assign).
+                    let v = self.emit_expr(value)?;
+                    let targets_e: Vec<String> = targets.iter().map(|t| escape_ident(t)).collect();
+                    self.line(&format!("({}) = {};", targets_e.join(", "), v));
+                } else {
+                    // MIXED (some new + some existing), a per-component conflict, an
+                    // int->float widen, or an active shadow. Bind the whole RHS to
+                    // fresh temps FIRST — so it is fully evaluated before any target is
+                    // written (swap-safe) and the temps never re-read a target (no
+                    // LHS/RHS name collision) — then emit each target independently
+                    // (declare / reassign / shadow / reconverge) via the shared
+                    // per-target helper. This SUPPORTS the mixed shape cleanly.
+                    let v = self.emit_expr(value)?;
+                    let base = self.shadow_counter;
+                    self.shadow_counter += 1;
+                    let temps: Vec<String> = (0..targets.len())
+                        .map(|i| format!("__pyrst_unpack_{}_{}", base, i))
+                        .collect();
+                    self.line(&format!("let ({}) = {};", temps.join(", "), v));
+                    for ((t, temp), ct) in targets.iter().zip(temps.iter()).zip(comp_tys.iter()) {
+                        self.emit_unpack_target(t, temp, ct);
+                    }
+                }
             }
             Stmt::AugAssign { target, op, value, .. } => {
                 let v = self.emit_expr(value)?;
@@ -374,6 +480,12 @@ impl<'a> Codegen<'a> {
                 let c = self.emit_expr(cond)?;
                 self.line(&format!("if {} {{", c));
                 self.indent += 1;
+                // (card 575bcf3a) Isolate this branch's block-scope emission state
+                // (locals / declared / shadow_map) so a divergent shadow inside it
+                // cannot poison the sibling branches or the statement following the
+                // whole `if`. Per-branch (not per-`if`) so a `then` shadow also does
+                // not leak into an `elif`/`else`.
+                let __then_scope = self.scope_enter();
                 // THEN branch is the non-None case for `x is not None`. Emit the
                 // unwrap and retype the local so type-dispatched emission inside
                 // the block (e.g. `str(x)`) sees the inner type; restore after.
@@ -390,17 +502,21 @@ impl<'a> Codegen<'a> {
                 if let Some((var, prev)) = then_saved {
                     match prev { Some(t) => { self.locals.insert(var, t); } None => { self.locals.remove(var.as_str()); } }
                 }
+                self.scope_exit(__then_scope);
                 self.indent -= 1;
                 for (c, b) in elifs {
                     let cs = self.emit_expr(c)?;
                     self.line(&format!("}} else if {} {{", cs));
                     self.indent += 1;
+                    let __elif_scope = self.scope_enter();
                     for s in b { self.emit_stmt(s)?; }
+                    self.scope_exit(__elif_scope);
                     self.indent -= 1;
                 }
                 if let Some(b) = else_ {
                     self.line("} else {");
                     self.indent += 1;
+                    let __else_scope = self.scope_enter();
                     // ELSE is the non-None case only for `x is None` with no elifs.
                     let else_narrow = narrowed.as_ref()
                         .filter(|(_, is_not_none, _)| !*is_not_none && elifs.is_empty());
@@ -415,6 +531,7 @@ impl<'a> Codegen<'a> {
                     if let Some((var, prev)) = else_saved {
                         match prev { Some(t) => { self.locals.insert(var, t); } None => { self.locals.remove(var.as_str()); } }
                     }
+                    self.scope_exit(__else_scope);
                     self.indent -= 1;
                 }
                 self.line("}");
@@ -443,7 +560,11 @@ impl<'a> Codegen<'a> {
                 // `return` inside a loop that sits in a try body must still
                 // escape the catch_unwind closure.
                 let saved_loopctl = std::mem::replace(&mut self.try_loopctl_escape, false);
+                // (card 575bcf3a) The loop body is a Rust `{}` scope; isolate its
+                // block-scope emission state so a shadow inside it never leaks out.
+                let __while_scope = self.scope_enter();
                 for s in body { self.emit_stmt(s)?; }
+                self.scope_exit(__while_scope);
                 self.try_loopctl_escape = saved_loopctl;
                 self.indent -= 1;
                 self.line("}");
@@ -553,6 +674,10 @@ impl<'a> Codegen<'a> {
                     _ if is_range => Ty::Int,
                     _ => Ty::Unknown,
                 };
+                // (card 575bcf3a) Isolate the loop body's block-scope emission state
+                // (locals / declared / shadow_map) — the loop-variable registration
+                // below is captured INSIDE this window and reverts with it.
+                let __for_scope = self.scope_enter();
                 if targets.len() == 1 {
                     let saved = self.locals.get(&targets[0]).cloned();
                     self.locals.insert(targets[0].clone(), loop_elem_ty);
@@ -578,6 +703,7 @@ impl<'a> Codegen<'a> {
                         }
                     }
                 }
+                self.scope_exit(__for_scope);
                 self.try_loopctl_escape = saved_loopctl_for;
 
                 self.indent -= 1;
@@ -593,6 +719,9 @@ impl<'a> Codegen<'a> {
                 let ctx_s = self.emit_expr(ctx_expr)?;
                 self.line("{");
                 self.indent += 1;
+                // (card 575bcf3a) Isolate the `with` body's block-scope emission
+                // state (the bound name below is captured inside this window).
+                let __with_scope = self.scope_enter();
                 // The bound name is block-scoped in the generated Rust, so save and
                 // restore the outer locals entry around the body (mirrors for-loop).
                 let saved = if let Some(name) = as_name {
@@ -615,6 +744,7 @@ impl<'a> Codegen<'a> {
                         None => { self.locals.remove(name.as_str()); }
                     }
                 }
+                self.scope_exit(__with_scope);
                 self.indent -= 1;
                 self.line("}");
             }
@@ -719,6 +849,56 @@ impl<'a> Codegen<'a> {
         Ok(())
     }
 
+    /// (card 602b1675) Emit ONE target of a temp-split tuple unpack: `target` gets
+    /// the already-evaluated component value held in `rhs` (a fresh `__pyrst_unpack_`
+    /// temp), typed `comp_ty`. `rhs` never re-reads `target`, so — unlike scalar
+    /// `Stmt::Assign` whose RHS reads the place — there is no LHS/RHS name collision
+    /// and each component is handled independently. The declare / reassign / shadow /
+    /// reconverge decisions mirror the scalar reassign path (incl. the hoisted-local
+    /// shadow-mangling and int->float slot widening) so a mixed or divergent unpack
+    /// component behaves exactly like the equivalent single assignment.
+    pub(crate) fn emit_unpack_target(&mut self, target: &str, rhs: &str, comp_ty: &Ty) {
+        let target_e = escape_ident(target);
+        if !self.declared.contains(target) {
+            // Fresh binding.
+            self.declared.insert(target.to_string());
+            self.locals.insert(target.to_string(), comp_ty.clone());
+            self.line(&format!("let mut {} = {};", target_e, rhs));
+            return;
+        }
+        if let Some((_, slot_ty)) = self.shadow_map.get(target).cloned() {
+            // A divergent shadow of this hoisted local is live (card 575bcf3a).
+            if !Self::types_conflict(&slot_ty, comp_ty) {
+                self.shadow_map.remove(target);
+                self.locals.insert(target.to_string(), slot_ty);
+                self.line(&format!("{} = {};", target_e, rhs));
+            } else {
+                let m = self.fresh_shadow_name(target);
+                self.shadow_map.insert(target.to_string(), (m.clone(), slot_ty));
+                self.locals.insert(target.to_string(), comp_ty.clone());
+                self.line(&format!("let mut {} = {};", m, rhs));
+            }
+            return;
+        }
+        let cur = self.locals.get(target).cloned().unwrap_or(Ty::Unknown);
+        if Self::types_conflict(&cur, comp_ty) {
+            if self.hoisted.contains(target) {
+                let m = self.fresh_shadow_name(target);
+                self.shadow_map.insert(target.to_string(), (m.clone(), cur));
+                self.locals.insert(target.to_string(), comp_ty.clone());
+                self.line(&format!("let mut {} = {};", m, rhs));
+            } else {
+                self.locals.insert(target.to_string(), comp_ty.clone());
+                self.line(&format!("let mut {} = {};", target_e, rhs));
+            }
+        } else if matches!(cur, Ty::Float) && matches!(comp_ty, Ty::Int) {
+            // Int component into a float slot — cast to keep the slot's type.
+            self.line(&format!("{} = {} as f64;", target_e, rhs));
+        } else {
+            self.line(&format!("{} = {};", target_e, rhs));
+        }
+    }
+
     /// (first-class functions, Increment 2) Emit a NESTED `def` as a named local
     /// closure bound with `let`. The closure is `move` (it captures every
     /// referenced enclosing variable BY VALUE — Rust moves a captured binding into
@@ -789,6 +969,12 @@ impl<'a> Codegen<'a> {
         // The closure's by-reference locals start empty (nested defs take no
         // `Mut[T]` params in this increment); save+restore mirrors `emit_func`.
         let saved_by_ref = std::mem::take(&mut self.by_ref_locals);
+        // (card 575bcf3a) The hoist-slot set, active shadows, and the shadow
+        // counter are per-function: the nested closure gets its OWN (empty / 0) and
+        // the enclosing function's are restored on exit, mirroring locals/declared.
+        let saved_hoisted = std::mem::take(&mut self.hoisted);
+        let saved_shadow_map = std::mem::take(&mut self.shadow_map);
+        let saved_shadow_counter = std::mem::replace(&mut self.shadow_counter, 0);
 
         // Overlay the nested params onto the captured locals (a param SHADOWS a
         // captured enclosing name of the same identifier).
@@ -815,17 +1001,18 @@ impl<'a> Codegen<'a> {
         let param_names: std::collections::HashSet<String> = f.params.iter().map(|p| p.name.clone()).collect();
         self.assert_no_read_after_divergent_reassign(&f.body, &param_names)?;
         let mut block_assigned = std::collections::HashSet::new();
-        let mut unpack_targets = std::collections::HashSet::new();
-        Self::collect_hoistable(&f.body, 0, &mut block_assigned, &mut unpack_targets);
+        Self::collect_hoistable(&f.body, 0, &mut block_assigned);
         let params: std::collections::HashSet<&str> = f.params.iter().map(|p| p.name.as_str()).collect();
         let mut hoist: Vec<String> = block_assigned.into_iter()
-            .filter(|n| !unpack_targets.contains(n) && !params.contains(n.as_str()) && !self.declared.contains(n))
+            .filter(|n| !params.contains(n.as_str()) && !self.declared.contains(n))
             .collect();
         hoist.sort();
         for hname in hoist {
             let ty = self.locals.get(&hname).cloned().unwrap_or(Ty::Unknown);
             if let Some(def) = self.default_val(&ty) {
                 self.line(&format!("let mut {}: {} = {};", escape_ident(&hname), self.rust_ty(&ty), def));
+                // (card 575bcf3a) Record the closure's function-scope slot.
+                self.hoisted.insert(hname.clone());
                 self.declared.insert(hname);
             }
         }
@@ -841,6 +1028,9 @@ impl<'a> Codegen<'a> {
         self.try_loopctl_escape = saved_try_loopctl;
         self.in_generator = saved_in_generator;
         self.by_ref_locals = saved_by_ref;
+        self.hoisted = saved_hoisted;
+        self.shadow_map = saved_shadow_map;
+        self.shadow_counter = saved_shadow_counter;
 
         self.indent -= 1;
         self.line(&format!("}}) as {};", rc_ty));
@@ -902,7 +1092,11 @@ impl<'a> Codegen<'a> {
                 self.indent += 1;
                 let saved_ret_escape = std::mem::replace(&mut self.try_return_escape, true);
                 let saved_loopctl_escape = std::mem::replace(&mut self.try_loopctl_escape, true);
+                // (card 575bcf3a) The try body runs in its own closure/scope; isolate
+                // its block-scope emission state (locals / declared / shadow_map).
+                let __try_scope = self.scope_enter();
                 for s in body { self.emit_stmt(s)?; }
+                self.scope_exit(__try_scope);
                 self.try_return_escape = saved_ret_escape;
                 self.try_loopctl_escape = saved_loopctl_escape;
                 self.line("__PyrstTryFlow::Normal");
@@ -987,7 +1181,9 @@ impl<'a> Codegen<'a> {
                 if let Some(else_body) = else_ {
                     self.line("if let __PyrstTryFlow::Normal = &__flow {");
                     self.indent += 1;
+                    let __else_scope = self.scope_enter();
                     for s in else_body { self.emit_stmt(s)?; }
+                    self.scope_exit(__else_scope);
                     self.indent -= 1;
                     self.line("}");
                 }
@@ -1068,6 +1264,9 @@ impl<'a> Codegen<'a> {
                         // const `e`) would mangle to the const, and conversely a
                         // const read outside the handler must still resolve to the
                         // const. Save/restore around the body.
+                        // (card 575bcf3a) Isolate the handler body's block-scope
+                        // state; the exc binding below is captured inside the window.
+                        let __handler_scope = self.scope_enter();
                         let exc_saved = if let Some(name) = &h.exc_name {
                             let name_e = escape_ident(name);
                             self.line(&format!("let {} = __exc_msg.clone();", name_e));
@@ -1085,6 +1284,7 @@ impl<'a> Codegen<'a> {
                                 None => { self.locals.remove(name.as_str()); }
                             }
                         }
+                        self.scope_exit(__handler_scope);
                         self.line("::std::option::Option::None");
                         self.indent -= 1;
                     }
@@ -1103,7 +1303,9 @@ impl<'a> Codegen<'a> {
 
                 // finally: runs on every path, before any re-raise.
                 if let Some(fin) = finally_ {
+                    let __finally_scope = self.scope_enter();
                     for s in fin { self.emit_stmt(s)?; }
+                    self.scope_exit(__finally_scope);
                 }
 
                 // Re-raise an unmatched exception (after finally).

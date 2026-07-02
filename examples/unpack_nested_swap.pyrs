@@ -1,0 +1,16 @@
+# card 602b1675: tuple-unpack REASSIGNMENT inside a nested block must write the
+# outer bindings (swap idiom), not a discarded block-scoped `let (..)` shadow.
+def main() -> None:
+    a: int = 1
+    b: int = 2
+    flag: bool = True
+    if flag:
+        a, b = b, a
+    print(a)
+    print(b)
+    c: int = 10
+    d: int = 20
+    if a > b:
+        c, d = d, c
+    print(c)
+    print(d)

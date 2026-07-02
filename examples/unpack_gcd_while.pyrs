@@ -1,0 +1,12 @@
+# card 602b1675: tuple-unpack GCD in a `while` loop must TERMINATE — the unpack
+# reassigns the outer `a`/`b` each iteration instead of a block-scoped shadow.
+def gcd(a: int, b: int) -> int:
+    while b != 0:
+        a, b = b, a % b
+    return a
+
+
+def main() -> None:
+    print(gcd(48, 36))
+    print(gcd(1071, 462))
+    print(gcd(17, 5))

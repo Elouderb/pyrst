@@ -1,0 +1,18 @@
+# card 575bcf3a (shape 2): the two-step materialize `xs = gen(3); xs = list(xs)`
+# inside a diverging-sibling branch must reach the hoisted slot (reconverge).
+def gen(n: int) -> Iterator[int]:
+    i: int = 0
+    while i < n:
+        yield i
+        i = i + 1
+
+
+def main() -> None:
+    flag: bool = False
+    if flag:
+        xs = [4, 5, 6]
+    else:
+        xs = gen(3)
+        xs = list(xs)
+    for x in xs:
+        print(x)

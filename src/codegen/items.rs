@@ -316,11 +316,10 @@ impl<'a> Codegen<'a> {
         // block. Params, unpack targets, and names whose type has no usable
         // default keep their in-place `let` (and the prior block-scope limit).
         let mut block_assigned = std::collections::HashSet::new();
-        let mut unpack_targets = std::collections::HashSet::new();
-        Self::collect_hoistable(&f.body, 0, &mut block_assigned, &mut unpack_targets);
+        Self::collect_hoistable(&f.body, 0, &mut block_assigned);
         let params: std::collections::HashSet<&str> = f.params.iter().map(|p| p.name.as_str()).collect();
         let mut hoist: Vec<String> = block_assigned.into_iter()
-            .filter(|n| !unpack_targets.contains(n) && !params.contains(n.as_str()) && !self.declared.contains(n))
+            .filter(|n| !params.contains(n.as_str()) && !self.declared.contains(n))
             .collect();
         hoist.sort();
         for name in hoist {
@@ -329,6 +328,9 @@ impl<'a> Codegen<'a> {
                 // (EPIC-6) Escape the hoisted local's emitted name; the raw name
                 // stays the `declared`/`locals` key.
                 self.line(&format!("let mut {}: {} = {};", escape_ident(&name), self.rust_ty(&ty), def));
+                // (card 575bcf3a) Record the function-scope slot so a divergent
+                // shadow of this name inside a block mangles instead of hiding it.
+                self.hoisted.insert(name.clone());
                 self.declared.insert(name);
             }
         }
@@ -353,6 +355,12 @@ impl<'a> Codegen<'a> {
         // Clear locals and declared for next function
         self.locals.clear();
         self.declared.clear();
+        // (card 575bcf3a) The hoist-slot set and any active shadow are
+        // function-scoped; reset them (and the deterministic shadow counter) so the
+        // next function starts clean and never inherits a stale slot/shadow.
+        self.hoisted.clear();
+        self.shadow_map.clear();
+        self.shadow_counter = 0;
         self.current_ret_ty = saved_ret_ty;
         self.by_ref_locals = saved_by_ref;
         self.in_generator = saved_in_generator;
@@ -1540,6 +1548,26 @@ impl<'a> Codegen<'a> {
     /// Combine two inferred types into the more specific / wider one.
     /// `Unknown` yields to anything concrete; `Int` widens to `Float`;
     /// matching collections unify element-wise. Otherwise the first wins.
+    /// (card 575bcf3a) Merge a newly-assigned type into the forward `prescan_types`
+    /// slot for a name. A GENUINELY DIVERGENT direct reassignment (different `Ty`
+    /// discriminant, non-numeric — `branch_divergent`) REPLACES the running slot
+    /// type rather than `unify_ty`-ing it: a program that assigns `xs = gen(3)` and
+    /// then unconditionally `xs = list(xs)` / `xs = [..]` reconverges to the LATER
+    /// (join) type, so the hoisted slot must be that later type — not the dead
+    /// intermediate one that `unify_ty`'s first-wins rule would keep (which made the
+    /// hoisted slot the wrong type and the reconverging assign a discarded shadow).
+    /// A COMPATIBLE reassignment (Int/Float widening, empty-collection refinement)
+    /// still `unify_ty`-widens, so numeric-widening and empty-collection idioms are
+    /// unchanged. Mirrors `collect_branch_exit_types`'s replace-on-direct-assign
+    /// rule, so the hoist-slot type and the divergence check agree.
+    pub(crate) fn prescan_merge_ty(existing: Option<&Ty>, vt: Ty) -> Ty {
+        match existing {
+            Some(prev) if crate::typeck::branch_divergent(prev, &vt) => vt,
+            Some(prev) => Self::unify_ty(prev.clone(), vt),
+            None => vt,
+        }
+    }
+
     pub(crate) fn unify_ty(a: Ty, b: Ty) -> Ty {
         match (a, b) {
             (Ty::Unknown, x) | (x, Ty::Unknown) => x,
@@ -1630,11 +1658,24 @@ impl<'a> Codegen<'a> {
                 }
                 Stmt::Assign { target, ty: None, value, .. } => {
                     let vt = self.type_of_expr(value);
-                    let merged = match self.locals.get(target) {
-                        Some(existing) => Self::unify_ty(existing.clone(), vt),
-                        None => vt,
-                    };
+                    let merged = Self::prescan_merge_ty(self.locals.get(target), vt);
                     self.locals.insert(target.clone(), merged);
+                }
+                Stmt::Unpack { targets, value, .. } => {
+                    // (card 602b1675) Type each unpack target from its tuple
+                    // component (merging with any prior inference, mirroring the
+                    // Assign arm) so a nested unpack target gets a CONCRETE slot type
+                    // and can HOIST — a prerequisite for an unpack reassignment inside
+                    // a block to write a function-scope slot.
+                    let vt = self.type_of_expr(value);
+                    let elem_tys = match &vt {
+                        Ty::Tuple(tys) if tys.len() == targets.len() => tys.clone(),
+                        _ => vec![Ty::Unknown; targets.len()],
+                    };
+                    for (t, ety) in targets.iter().zip(elem_tys) {
+                        let merged = Self::prescan_merge_ty(self.locals.get(t), ety);
+                        self.locals.insert(t.clone(), merged);
+                    }
                 }
                 Stmt::IndexAssign { obj, value, .. } => {
                     // Refine an empty-collection element type from `name[k] = v`

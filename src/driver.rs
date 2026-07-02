@@ -27,8 +27,45 @@ pub fn check(path: &Path) -> Result<()> {
 
 pub fn emit(path: &Path) -> Result<()> {
     let rust = compile_to_rust(path)?;
+    // Readability pass: run the generated source through rustfmt when available.
+    // Best-effort — a missing or failing rustfmt returns the source unchanged so
+    // `emit` never fails on a cosmetic step (card e6a57b9c item 1).
+    let rust = maybe_rustfmt(rust);
     print!("{}", rust);
     Ok(())
+}
+
+/// Format generated Rust with `rustfmt`, best-effort. Writes the source to a
+/// temp file and formats it in place (a temp file rather than a stdin/stdout
+/// pipe so a large program cannot deadlock on the pipe buffers), then reads it
+/// back. If rustfmt is missing, errors, or exits non-zero — or any file I/O
+/// fails — the ORIGINAL source is returned unchanged (silent fallback). Given a
+/// fixed rustfmt, the result is deterministic, so it does not reintroduce the
+/// emit-stability problem fixed in card b2608b03.
+fn maybe_rustfmt(src: String) -> String {
+    use std::process::{Command, Stdio};
+    // PID keeps concurrent `pyrst` invocations from sharing a scratch file; the
+    // name never appears in the output, so it does not affect determinism.
+    let tmp = std::env::temp_dir().join(format!("pyrst-fmt-{}.rs", std::process::id()));
+    if std::fs::write(&tmp, &src).is_err() {
+        return src;
+    }
+    let ok = Command::new("rustfmt")
+        .arg("--edition")
+        .arg("2021")
+        .arg(&tmp)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    let out = if ok {
+        std::fs::read_to_string(&tmp).unwrap_or(src)
+    } else {
+        src
+    };
+    let _ = std::fs::remove_file(&tmp);
+    out
 }
 
 pub fn build(path: &Path) -> Result<()> {

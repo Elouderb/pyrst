@@ -1334,8 +1334,20 @@ impl<'a> Codegen<'a> {
     }
     pub(crate) fn emit_expr(&mut self, e: &Expr) -> Result<String> {
         Ok(match e {
-            Expr::Int(n, _) => format!("({}i64)", n),
-            Expr::Float(f, _) => format!("({}f64)", f),
+            // A numeric literal is a primary expression, so bare `0i64` / `1.5f64`
+            // is precedence-safe in every position (receiver, exponent, as-cast,
+            // operand). The lexer only produces non-negative literals — a leading
+            // `-` is a separate `UnOp::Neg` node that adds its own parens — so the
+            // guard below is defensive: parenthesize only if a `-` ever appears,
+            // otherwise emit the literal bare (was unconditionally `(..)`).
+            Expr::Int(n, _) => {
+                let lit = format!("{}i64", n);
+                if lit.starts_with('-') { format!("({})", lit) } else { lit }
+            }
+            Expr::Float(f, _) => {
+                let lit = format!("{}f64", f);
+                if lit.starts_with('-') { format!("({})", lit) } else { lit }
+            }
             Expr::Bool(b, _) => b.to_string(),
             Expr::None_(_) => "None".to_string(),
             Expr::Str(s, _) => format!("String::from({:?})", s),
@@ -2201,6 +2213,35 @@ impl<'a> Codegen<'a> {
         for _ in 0..self.indent { self.out.push_str("    "); }
         self.out.push_str(s);
         self.out.push('\n');
+    }
+
+    /// Fold the declaration-hoisting DOUBLE-INIT artifact: a hoisted local is
+    /// emitted at the top of the function as `let mut x: T = <default>;`, and its
+    /// first (unconditional, top-level) assignment then re-emits as `x = <init>;`
+    /// — two writes where one suffices. When the immediately-preceding emitted
+    /// line is EXACTLY this variable's hoisted default declaration (same name,
+    /// same type, same indent = same block, adjacent = nothing between), splice
+    /// the real initializer straight into that `let` and skip the separate
+    /// assignment. Fires only when the discarded initializer is the pure
+    /// `default_val` (no side effect dropped) and only on true emitted adjacency,
+    /// so it is exactly the card's "immediately-next statement in the same block"
+    /// rule and cannot reorder or drop any effect. Returns true iff it folded.
+    pub(crate) fn try_fold_hoisted_init(&mut self, target_e: &str, ty: &Ty, new_rhs: &str) -> bool {
+        let def = match self.default_val(ty) {
+            Some(d) => d,
+            None => return false,
+        };
+        let rust_ty = self.rust_ty(ty);
+        let indent = "    ".repeat(self.indent);
+        let expected = format!("{}let mut {}: {} = {};\n", indent, target_e, rust_ty, def);
+        if self.out.ends_with(&expected) {
+            let keep = self.out.len() - expected.len();
+            self.out.truncate(keep);
+            self.line(&format!("let mut {}: {} = {};", target_e, rust_ty, new_rhs));
+            true
+        } else {
+            false
+        }
     }
 
     /// Maps a pyrst `Ty` to its emitted Rust type text.

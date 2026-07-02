@@ -265,9 +265,16 @@ impl<'a> Codegen<'a> {
                         && (matches!(value_ty, Ty::Int) || self.emits_int_pow(value))
                     {
                         // Reassigning an int into a float-typed (e.g. hoisted) var.
-                        self.line(&format!("{} = {} as f64;", target_e, v));
+                        let rhs = format!("{} as f64", v);
+                        if !self.try_fold_hoisted_init(&target_e, &cur, &rhs) {
+                            self.line(&format!("{} = {};", target_e, rhs));
+                        }
                     } else {
-                        self.line(&format!("{} = {};", target_e, v));
+                        // Fold a hoisting double-init when this is the assignment
+                        // immediately following the hoisted default declaration.
+                        if !self.try_fold_hoisted_init(&target_e, &cur, &v) {
+                            self.line(&format!("{} = {};", target_e, v));
+                        }
                     }
                 }
             }

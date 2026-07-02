@@ -1,0 +1,19 @@
+# fail_gen_to_list_param.pyrs
+# Passing a lazy generator where a `list[int]` parameter is required is an honest
+# MATERIALIZE error at typeck — a generator is not a list. (V1-d flips the V1-a
+# Iterator<->list interchangeability in types_compatible.) Expected substring:
+# "materialize it first with `list(...)`".
+
+def gen(n: int) -> Iterator[int]:
+    i: int = 0
+    while i < n:
+        yield i
+        i = i + 1
+
+
+def take_list(xs: list[int]) -> int:
+    return sum(xs)
+
+
+def main() -> None:
+    print(take_list(gen(3)))      # ERROR: take_list(list(gen(3)))

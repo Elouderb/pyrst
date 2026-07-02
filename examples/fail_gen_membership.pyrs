@@ -1,0 +1,16 @@
+# fail_gen_membership.pyrs
+# Membership `x in g` on a lazy generator is an honest error at typeck. It works
+# in Python but DRAINS the generator; pyrst has no lazy membership until V2, so
+# it is a MATERIALIZE error. Expected substring: "membership test".
+
+def gen(n: int) -> Iterator[int]:
+    i: int = 0
+    while i < n:
+        yield i
+        i = i + 1
+
+
+def main() -> None:
+    g: Iterator[int] = gen(3)
+    if 2 in g:                    # ERROR: 2 in list(g)
+        print("found")

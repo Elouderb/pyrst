@@ -1,0 +1,17 @@
+# fail_yield_in_try.pyrs
+# `yield` inside a `try:` is not yet supported. A generator body runs inside a
+# synchronous `catch_unwind` closure where `await` (the lowering of `yield`) is
+# illegal — rustc E0728 (docs/design/lazy-generators.md §C.4). Honest typeck
+# error. Expected substring: "yield inside `try` is not yet supported".
+
+def gen() -> Iterator[int]:
+    try:
+        yield 1                   # ERROR: move the yield out of the try block
+        yield 2
+    except ValueError as e:
+        print(e)
+
+
+def main() -> None:
+    for x in gen():
+        print(x)

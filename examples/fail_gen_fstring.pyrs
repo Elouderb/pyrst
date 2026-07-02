@@ -1,0 +1,15 @@
+# fail_gen_fstring.pyrs
+# Formatting a bare generator in an f-string is an honest MATERIALIZE error at
+# typeck — it would interpolate an opaque handle, not the contents (like str(g)).
+# Expected substring: "string form".
+
+def gen(n: int) -> Iterator[int]:
+    i: int = 0
+    while i < n:
+        yield i
+        i = i + 1
+
+
+def main() -> None:
+    g: Iterator[int] = gen(3)
+    print(f"values: {g}")         # ERROR: f"{list(g)}"

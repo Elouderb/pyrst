@@ -1,0 +1,13 @@
+# fail_iter_return_no_yield.pyrs
+# A function declared `-> Iterator[T]` that contains NO `yield` is an honest error
+# (V1-d). Since `Iterator[T]` is now a DISTINCT type (not `≡ list[T]`), a
+# yield-less body claiming to return an iterator is the last vestige of the old
+# conflation: declare `-> list[T]`, or add a `yield`. Expected substring:
+# "must contain a `yield`".
+
+def numbers() -> Iterator[int]:   # ERROR: declare -> list[int], or add a yield
+    return [1, 2, 3]
+
+
+def main() -> None:
+    print(0)

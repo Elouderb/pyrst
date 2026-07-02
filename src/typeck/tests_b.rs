@@ -1447,10 +1447,13 @@ def my_fn() -> float:
     }
 
     #[test]
-    fn gate_accepts_iterator_return_without_yield() {
-        // A non-generator Iterator[int] (no yield) that returns a value passes.
+    fn gate_rejects_iterator_return_without_yield() {
+        // (LAZY-GEN V1-d) A function declared `-> Iterator[T]` with NO `yield` is
+        // now an honest error: since `Iterator[T]` is a DISTINCT type (no longer
+        // `≡ list[T]`), a yield-less body claiming to return an iterator is the last
+        // vestige of the old conflation. Fix: declare `-> list[T]`, or add a `yield`.
         let r = check_src("def empty() -> Iterator[int]:\n    return []\n");
-        assert!(r.is_ok(), "non-generator Iterator[T] with return must pass: {:?}", r);
+        assert_type_err_unit(r, "must contain a `yield`");
     }
 
     #[test]

@@ -207,15 +207,17 @@ impl<'a> Codegen<'a> {
         let saved_try_return_escape = std::mem::replace(&mut self.try_return_escape, false);
         let saved_try_loopctl_escape = std::mem::replace(&mut self.try_loopctl_escape, false);
         if is_generator {
-            // (LAZY-GEN V1-b) A generator lowers to the lazy `Gen<T>` coroutine
-            // (docs/design/lazy-generators.md §C.2): a shared yield slot, a `Co`
-            // yielder cloned into the body, and the body wrapped in a
+            // (LAZY-GEN V1-b) A generator lowers to the lazy `__PyrstGen<T>`
+            // coroutine (docs/design/lazy-generators.md §C.2): a shared yield slot,
+            // a `__PyrstCo` yielder cloned into the body, and the body wrapped in a
             // `Box::pin(async move { .. })` future. `yield x` becomes
             // `__pyrst_gen_co.yield_(x).await` (see `Stmt::Yield`), and a bare
             // `return` completes the future — end of iteration. The three locals
             // use the reserved `__pyrst_` prefix (typeck rejects user identifiers
             // under it) so they can never collide with a user local, and the
-            // struct/field names (`Gen`/`Co`/`slot`/`fut`) match the GEN_PRELUDE.
+            // struct/field names (`__PyrstGen`/`__PyrstCo`/`slot`/`fut`) match the
+            // GEN_PRELUDE (V1-d renamed them under the reserved `__Pyrst` prefix so
+            // a user `class Gen`/`Co`/`YieldNow` can no longer collide).
             // The captured params/locals are OWNED (pyrst value semantics), so
             // `async move` moves them in cleanly; the function never touches a
             // param after this point. The element type annotates the slot so an
@@ -234,7 +236,7 @@ impl<'a> Codegen<'a> {
                 "let __pyrst_gen_slot: std::rc::Rc<std::cell::RefCell<std::option::Option<{}>>> = std::rc::Rc::new(std::cell::RefCell::new(std::option::Option::None));",
                 elem_rust
             ));
-            self.line("let __pyrst_gen_co = Co { slot: __pyrst_gen_slot.clone() };");
+            self.line("let __pyrst_gen_co = __PyrstCo { slot: __pyrst_gen_slot.clone() };");
             self.line("let __pyrst_gen_fut: std::pin::Pin<std::boxed::Box<dyn std::future::Future<Output = ()>>> = std::boxed::Box::pin(async move {");
             // The body (hoisted-local preamble + statements) is emitted INSIDE the
             // `async move` block, one indent level deeper.
@@ -324,14 +326,14 @@ impl<'a> Codegen<'a> {
             self.emit_stmt(s)?;
         }
         // (LAZY-GEN V1-b) Close the generator's `async move` coroutine and hand
-        // back the `Gen<T>`. Fall-off-the-end completes the future naturally (the
-        // `Gen` driver reports `None` on `Poll::Ready`); a bare `return` inside the
+        // back the `__PyrstGen<T>`. Fall-off-the-end completes the future naturally
+        // (the driver reports `None` on `Poll::Ready`); a bare `return` inside the
         // body does the same (see `Stmt::Return`). The old eager
         // `return __pyrst_gen_acc;` is gone.
         if is_generator {
             self.indent -= 1;
             self.line("});");
-            self.line("Gen { fut: __pyrst_gen_fut, slot: __pyrst_gen_slot, done: false }");
+            self.line("__PyrstGen { fut: __pyrst_gen_fut, slot: __pyrst_gen_slot, done: false }");
         }
         self.indent -= 1;
         self.line("}");

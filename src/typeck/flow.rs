@@ -576,6 +576,9 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
                 });
             }
             let ty = check_expr(e, env)?;
+            // (LAZY-GEN V1-d) Returning a generator where a `list[T]` is declared:
+            // honest MATERIALIZE error (`list(g)`) before the bare mismatch.
+            reject_iterator_into_list(&ty, &env.ret_ty, *span)?;
             if !types_compatible(&ty, &env.ret_ty, env.ctx) {
                 return Err(Error::Type {
                     span: *span,
@@ -634,6 +637,9 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             };
             if let Some(t) = ty {
                 let explicit = Ty::from_type_expr_scoped(t, *span, &tp)?;
+                // (LAZY-GEN V1-d) A generator assigned into a `list[T]` slot:
+                // honest MATERIALIZE error (`list(g)`) before the bare mismatch.
+                reject_iterator_into_list(&val_ty, &explicit, *span)?;
                 if !types_compatible(&val_ty, &explicit, env.ctx) {
                     return Err(Error::Type {
                         span: *span,

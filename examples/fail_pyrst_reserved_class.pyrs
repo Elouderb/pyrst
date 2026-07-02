@@ -1,0 +1,13 @@
+# fail_pyrst_reserved_class.pyrs
+# A user class named with the reserved `__Pyrst` prefix collides with the
+# lazy-generator runtime types (`__PyrstGen`/`__PyrstCo`/`__PyrstYieldNow`), which
+# would be an rustc E0428 "defined multiple times". V1-d reserves the `__Pyrst`
+# case-variant prefix and policies class names, so this is an honest typeck error.
+# Expected substring: "prefix is reserved for compiler-generated identifiers".
+
+class __PyrstGen:                 # ERROR: reserved `__Pyrst` prefix
+    value: int
+
+
+def main() -> None:
+    print(0)

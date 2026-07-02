@@ -247,18 +247,23 @@ pub(crate) const RUST_NON_RAW_KEYWORDS: &[&str] = &["crate", "self", "super", "S
 /// Reserved codegen identifier prefixes. The compiler lowers several internal
 /// constructs to Rust identifiers under the `__pyrst_` namespace: module-level
 /// constants become `const __pyrst_const_<name>` (see codegen's `mangle_const`),
-/// and a generator's eager accumulator is `__pyrst_gen_acc` (see codegen's
-/// `emit_func`). The always-emitted runtime prelude additionally defines
-/// helpers under the `__py_` namespace (`__py_mod`, `__py_floordiv`,
-/// `__py_list_get`, …). A USER identifier sharing either prefix could collide
-/// with one of those generated names — a `__pyrst_` clash can silently
-/// miscompile (e.g. a generator local named `__pyrst_gen_acc`), and a `__py_`
-/// clash duplicates a prelude `fn` (rustc E0428). BOTH prefixes are therefore
-/// reserved for compiler-generated names and rejected honestly at typeck
-/// rather than risking a clash. (No real program uses these prefixes; they
-/// exist only to make the lowering collision-proof and to keep future
-/// internals safe by construction.)
-pub(crate) const RESERVED_CODEGEN_PREFIXES: &[&str] = &["__pyrst_", "__py_"];
+/// and a generator's coroutine locals are `__pyrst_gen_slot`/`_co`/`_fut` (see
+/// codegen's `emit_func`). The always-emitted runtime prelude additionally
+/// defines helpers under the `__py_` namespace (`__py_mod`, `__py_floordiv`,
+/// `__py_list_get`, …) and the lazy-generator runtime TYPES under the `__Pyrst`
+/// namespace (`__PyrstGen`/`__PyrstCo`/`__PyrstYieldNow`, see the GEN_PRELUDE).
+/// A USER identifier sharing any of these prefixes could collide with a
+/// generated name — a `__pyrst_` clash can silently miscompile (e.g. a
+/// generator local named `__pyrst_gen_slot`), a `__py_` clash duplicates a
+/// prelude `fn`, and a `__Pyrst` clash (e.g. a user `class __PyrstGen`)
+/// duplicates a prelude `struct` (all rustc E0428). The `__Pyrst` case-variant
+/// is listed SEPARATELY because pyrst class/type names are conventionally
+/// capitalized, so a colliding user type would not match the lowercase
+/// `__pyrst_` prefix. All three prefixes are reserved for compiler-generated
+/// names and rejected honestly at typeck rather than risking a clash. (No real
+/// program uses these prefixes; they exist only to make the lowering
+/// collision-proof and to keep future internals safe by construction.)
+pub(crate) const RESERVED_CODEGEN_PREFIXES: &[&str] = &["__pyrst_", "__py_", "__Pyrst"];
 
 pub(crate) fn reject_if_reserved(name: &str, span: Span, role: &str) -> Result<()> {
     if RUST_NON_RAW_KEYWORDS.contains(&name) {
@@ -280,8 +285,9 @@ pub(crate) fn reject_if_reserved(name: &str, span: Span, role: &str) -> Result<(
                 msg: format!(
                     "`{}` cannot be used as a {} name: the `{}` prefix is reserved for \
                      compiler-generated identifiers (e.g. module-constant lowering, \
-                     generator accumulators, and runtime helpers like `__py_list_get`). \
-                     Rename it.",
+                     generator coroutine locals, runtime helpers like `__py_list_get`, \
+                     and the lazy-generator runtime types `__PyrstGen`/`__PyrstCo`/\
+                     `__PyrstYieldNow`). Rename it.",
                     name, role, prefix
                 ),
             });
@@ -452,6 +458,10 @@ pub(crate) fn reject_reserved_idents(m: &Module) -> Result<()> {
                 reject_reserved_in_body(&f.body)?;
             }
             Stmt::Class(c) => {
+                // The class NAME lowers to a Rust `struct`/`enum` of the same name,
+                // so it must not collide with a reserved compiler-generated type
+                // (notably the `__Pyrst`-prefixed lazy-generator runtime structs).
+                reject_if_reserved(&c.name, c.span, "class")?;
                 for field in &c.fields {
                     reject_if_reserved(&field.name, field.span, "field")?;
                 }
@@ -625,10 +635,15 @@ pub(crate) fn check_one_func(f: &Func, ctx: &TyCtx) -> Result<()> {
         .filter(|p| p.name != "self" && p.by_ref)
         .map(|p| p.name.clone())
         .collect();
+    // (LAZY-GEN V1-d) An `Iterator[T]` parameter is a V2 feature — reject at the
+    // def site (honest error, not an accidental codegen success for fresh-call args).
+    reject_iterator_params(&f.params)?;
     let ret = Ty::from_type_expr_scoped(&f.ret, f.span, &f.type_params)?;
     let mut env = FuncEnv::with_by_ref(ctx, &params, &by_ref_names, ret);
     env.type_params = f.type_params.iter().cloned().collect();
     env.is_generator = check_generator_signature(&f.body, &f.ret, f.span)?;
+    // (LAZY-GEN V1-d) `yield` inside `try` cannot be lowered (E0728, §C.4) — reject.
+    reject_yield_in_try(&f.body)?;
     collect_returned_param_idents(&f.body, &env.params, &mut env.returned_params);
     check_body(&f.body, &mut env)?;
     check_all_paths_return(&f.body, &env, &f.name, f.span)?;
@@ -672,6 +687,22 @@ pub(crate) fn check_all_paths_return(body: &[Stmt], env: &FuncEnv, name: &str, s
 /// `Ok(true)` iff the function is a (well-formed) generator.
 pub(crate) fn check_generator_signature(body: &[Stmt], ret: &TypeExpr, span: Span) -> Result<bool> {
     if !body_contains_yield(body) {
+        // (LAZY-GEN V1-d) Require `yield` for an `Iterator[T]` return. Since V1-a
+        // made `Iterator[T]` a DISTINCT type (no longer `≡ list[T]`), a `yield`-less
+        // function declaring `-> Iterator[T]` is the last vestige of the old
+        // list/iterator conflation — it promises a lazy generator but produces none.
+        // Honest error (docs/design/lazy-generators.md §F): return `list[T]`, or add
+        // a `yield`.
+        if is_iterator_type_expr(ret) {
+            return Err(Error::Type {
+                span,
+                msg: "a function declared to return `Iterator[T]` must contain a \
+                      `yield` (it is a generator). To return a materialized sequence \
+                      instead, declare `-> list[T]`; or add a `yield` to make it a \
+                      generator."
+                    .to_string(),
+            });
+        }
         return Ok(false);
     }
     if !is_iterator_type_expr(ret) {
@@ -683,6 +714,121 @@ pub(crate) fn check_generator_signature(body: &[Stmt], ret: &TypeExpr, span: Spa
         });
     }
     Ok(true)
+}
+
+/// (LAZY-GEN V1-d) The honest error for a lazy generator (`Ty::Iterator`) used in
+/// a position that cannot be lazy — one needing a length, random access, a second
+/// pass, a string form, or any binary-operator result. Every such site suggests
+/// the same fix: materialize with `list(...)`. `problem` completes "a generator is
+/// lazy and …"; `fix` shows the materialized form (e.g. `len(list(g))`). Codegen
+/// would otherwise leak a raw rustc failure on the internal `__PyrstGen<T>` type;
+/// this keeps the diagnostic honest and at `check` time.
+pub(crate) fn iterator_materialize_error(problem: &str, fix: &str, span: Span) -> Error {
+    Error::Type {
+        span,
+        msg: format!(
+            "a generator is lazy and {}; materialize it first with `list(...)`: {}",
+            problem, fix
+        ),
+    }
+}
+
+/// (LAZY-GEN V1-d) Reject a generator (`Ty::Iterator`) value flowing into a
+/// concrete `list[T]` slot — a function argument, a `return`, or an annotated
+/// assignment. `types_compatible` already returns `false` for this pair (the V1-a
+/// interchangeability was flipped in V1-d); calling this FIRST replaces the
+/// generic "expected list[..], found Iterator[..]" with the honest materialize
+/// suggestion. The reverse direction (a `list` into an `Iterator[T]` slot) is a
+/// V2 adapter feature and stays the generic type-mismatch error.
+pub(crate) fn reject_iterator_into_list(val_ty: &Ty, slot_ty: &Ty, span: Span) -> Result<()> {
+    if matches!(val_ty, Ty::Iterator(_)) && matches!(slot_ty, Ty::List(_)) {
+        return Err(Error::Type {
+            span,
+            msg: format!(
+                "a generator is lazy and cannot be used where `{}` is required; \
+                 materialize it first with `list(...)`",
+                slot_ty
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// (LAZY-GEN V1-d) Reject `yield` inside a `try:` (or its `except`/`else`/
+/// `finally` blocks). A `yield` lowers to `.await` on the coroutine, but the `try`
+/// body runs inside a synchronous `catch_unwind` closure where `await` is illegal
+/// (rustc E0728 — disproof in docs/design/lazy-generators.md §C.4). This is a V1
+/// honest error and a V3 feature (needs a non-`catch_unwind` try lowering for
+/// generator bodies). Walks the whole body; does NOT descend into nested
+/// `def`/`class` bodies (they own their own yields).
+pub(crate) fn reject_yield_in_try(body: &[Stmt]) -> Result<()> {
+    for s in body {
+        match s {
+            Stmt::Try { body, handlers, else_, finally_, span } => {
+                let has_yield = body_contains_yield(body)
+                    || handlers.iter().any(|h| body_contains_yield(&h.body))
+                    || else_.as_ref().is_some_and(|b| body_contains_yield(b))
+                    || finally_.as_ref().is_some_and(|b| body_contains_yield(b));
+                if has_yield {
+                    return Err(Error::Type {
+                        span: *span,
+                        msg: "yield inside `try` is not yet supported; move the \
+                              `yield` out of the `try` block (a generator's `try` \
+                              body runs in a synchronous `catch_unwind` where `await` \
+                              — the lowering of `yield` — is illegal)"
+                            .to_string(),
+                    });
+                }
+                // A `yield` may also sit in a `try` NESTED inside these blocks.
+                reject_yield_in_try(body)?;
+                for h in handlers { reject_yield_in_try(&h.body)?; }
+                if let Some(b) = else_ { reject_yield_in_try(b)?; }
+                if let Some(b) = finally_ { reject_yield_in_try(b)?; }
+            }
+            Stmt::If { then, elifs, else_, .. } => {
+                reject_yield_in_try(then)?;
+                for (_, b) in elifs { reject_yield_in_try(b)?; }
+                if let Some(b) = else_ { reject_yield_in_try(b)?; }
+            }
+            Stmt::While { body, .. } | Stmt::For { body, .. } | Stmt::With { body, .. } => {
+                reject_yield_in_try(body)?;
+            }
+            Stmt::Match { arms, .. } => {
+                for arm in arms { reject_yield_in_try(&arm.body)?; }
+            }
+            // Nested defs/classes own their own yields.
+            Stmt::Func(_) | Stmt::Class(_) => {}
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// (LAZY-GEN V1-d) Reject a parameter annotated `Iterator[T]`. An `Iterator[T]`
+/// PARAMETER is a V2 feature — it needs a call-site `list → __PyrstGen` adapter
+/// (a `Vec<T>` argument does not fit a `__PyrstGen<T>` slot). Until then a
+/// generator parameter silently type-checks and only works by accident for a
+/// fresh-call argument (review c5/c6), so reject it honestly at the def site
+/// (docs/design/lazy-generators.md §F). Applies to free functions and methods;
+/// the receiver `self` carries no annotation and is skipped by the caller.
+pub(crate) fn reject_iterator_params(params: &[Param]) -> Result<()> {
+    for p in params {
+        if p.name == "self" {
+            continue;
+        }
+        if is_iterator_type_expr(&p.ty) {
+            return Err(Error::Type {
+                span: p.span,
+                msg: format!(
+                    "`Iterator[T]` parameters arrive in V2: parameter `{}` cannot be \
+                     a generator yet. Take a `list[T]` and pass `list(g)` at the call \
+                     site.",
+                    p.name
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Whether a declared return annotation is `Iterator[T]` (the generator return
@@ -851,10 +997,31 @@ pub(crate) fn check_one_method(c: &ClassDef, method: &Func, ctx: &TyCtx) -> Resu
         .filter(|p| p.name != "self" && p.by_ref)
         .map(|p| p.name.clone())
         .collect();
+    // (LAZY-GEN V1-d) An `Iterator[T]` parameter is a V2 feature — reject it on a
+    // method too (`self` carries no annotation and is skipped).
+    reject_iterator_params(&method.params)?;
     let ret = Ty::from_type_expr_scoped(&method.ret, method.span, &c.type_params)?;
     let mut env = FuncEnv::with_by_ref(ctx, &params, &by_ref_names, ret);
     env.type_params = c.type_params.iter().cloned().collect();
     env.is_generator = check_generator_signature(&method.body, &method.ret, method.span)?;
+    // (LAZY-GEN V1-d) Generator METHODS are a V2 feature (V2-b): the returned
+    // `__PyrstGen<T>` outlives the `&self` borrow, so the body must capture the
+    // needed `self` fields by clone into `async move` — not wired yet. A generator
+    // method currently type-checks and mis-lowers; reject it honestly at the def
+    // site (docs/design/lazy-generators.md §F).
+    if env.is_generator {
+        return Err(Error::Type {
+            span: method.span,
+            msg: format!(
+                "generator methods arrive in V2: method `{}` uses `yield`, which is \
+                 not yet supported inside a class. Move the generator to a free \
+                 function (`def {}(...) -> Iterator[T]:`) and call it from the method.",
+                method.name, method.name
+            ),
+        });
+    }
+    // (LAZY-GEN V1-d) `yield` inside `try` cannot be lowered (E0728, §C.4) — reject.
+    reject_yield_in_try(&method.body)?;
     collect_returned_param_idents(&method.body, &env.params, &mut env.returned_params);
     check_body(&method.body, &mut env)?;
     check_all_paths_return(&method.body, &env, &method.name, method.span)?;

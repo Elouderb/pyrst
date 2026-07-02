@@ -1,0 +1,21 @@
+# fail_gen_method.pyrs
+# A generator METHOD (a `def` with `yield` inside a class) is a V2 feature (V2-b):
+# the returned generator outlives the `&self` borrow, so the body must capture the
+# needed `self` fields by clone into `async move` — not wired yet. Honest typeck
+# error at the def site. Expected substring: "generator methods arrive in V2".
+
+class Counter:
+    limit: int
+
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+
+    def upto(self) -> Iterator[int]:   # ERROR: yield inside a class method
+        i: int = 0
+        while i < self.limit:
+            yield i
+            i = i + 1
+
+
+def main() -> None:
+    print(0)

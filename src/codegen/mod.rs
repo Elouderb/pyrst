@@ -514,40 +514,40 @@ fn __py_open(path: &str, mode: &str) -> PyFile {
 /// same-named `struct`/type that would otherwise shadow the std name here (the
 /// corpus has `class Box`). The logic is byte-identical to the validated
 /// prototype. `Waker::noop()` is stable since rustc 1.85.
-const GEN_PRELUDE: &str = r#"struct YieldNow { done: bool }
-impl std::future::Future for YieldNow {
+const GEN_PRELUDE: &str = r#"struct __PyrstYieldNow { done: bool }
+impl std::future::Future for __PyrstYieldNow {
     type Output = ();
     fn poll(mut self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
         if self.done { std::task::Poll::Ready(()) } else { self.done = true; std::task::Poll::Pending }
     }
 }
-struct Co<T> { slot: std::rc::Rc<std::cell::RefCell<std::option::Option<T>>> }
-impl<T> Co<T> {
-    fn yield_(&self, v: T) -> YieldNow {
+struct __PyrstCo<T> { slot: std::rc::Rc<std::cell::RefCell<std::option::Option<T>>> }
+impl<T> __PyrstCo<T> {
+    fn yield_(&self, v: T) -> __PyrstYieldNow {
         *self.slot.borrow_mut() = std::option::Option::Some(v);
-        YieldNow { done: false }
+        __PyrstYieldNow { done: false }
     }
 }
-struct Gen<T> {
+struct __PyrstGen<T> {
     fut: std::pin::Pin<std::boxed::Box<dyn std::future::Future<Output = ()>>>,
     slot: std::rc::Rc<std::cell::RefCell<std::option::Option<T>>>,
     done: bool,
 }
-impl<T> Gen<T> {
-    fn empty() -> Gen<T> {
-        Gen {
+impl<T> __PyrstGen<T> {
+    fn empty() -> __PyrstGen<T> {
+        __PyrstGen {
             fut: std::boxed::Box::pin(async {}),
             slot: std::rc::Rc::new(std::cell::RefCell::new(std::option::Option::None)),
             done: false,
         }
     }
 }
-impl<T> std::iter::Iterator for Gen<T> {
+impl<T> std::iter::Iterator for __PyrstGen<T> {
     type Item = T;
     fn next(&mut self) -> std::option::Option<T> {
         // FUSED: polling a completed future is a contract violation ("resumed
         // after completion" panic). Python iterates an exhausted generator as
-        // empty forever, so next() on a done Gen returns None forever.
+        // empty forever, so next() on a done __PyrstGen returns None forever.
         if self.done {
             return std::option::Option::None;
         }

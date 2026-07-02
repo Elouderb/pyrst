@@ -128,12 +128,13 @@ impl<'a> Codegen<'a> {
             Ty::Bool => "false".to_string(),
             Ty::Str => "String::new()".to_string(),
             Ty::List(_) => "Vec::new()".to_string(),
-            // LAZY-GEN V1-b (review fix): a hoisted generator local is a `Gen<T>`
-            // since rust_ty flipped — `Vec::new()` was the eager-era default and
-            // is E0308 now. `Gen::empty()` (prelude) yields nothing, matching the
-            // documented hoisting semantics (read-before-assign gives a default,
-            // not UnboundLocalError).
-            Ty::Iterator(_) => "Gen::empty()".to_string(),
+            // LAZY-GEN V1-b (review fix): a hoisted generator local is a
+            // `__PyrstGen<T>` since rust_ty flipped — `Vec::new()` was the
+            // eager-era default and is E0308 now. `__PyrstGen::empty()` (prelude)
+            // yields nothing, matching the documented hoisting semantics
+            // (read-before-assign gives a default, not UnboundLocalError). V1-d
+            // renamed the prelude type under the reserved `__Pyrst` prefix.
+            Ty::Iterator(_) => "__PyrstGen::empty()".to_string(),
             Ty::Set(_) => "::std::collections::HashSet::new()".to_string(),
             Ty::Dict(_, _) => "::std::collections::HashMap::new()".to_string(),
             Ty::Option(_) => "None".to_string(),

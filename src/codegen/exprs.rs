@@ -2470,12 +2470,13 @@ impl<'a> Codegen<'a> {
             // upstream type error).
             Ty::NoneVal => "()".into(),
             Ty::List(inner) => format!("Vec<{}>", self.rust_ty(inner)),
-            // LAZY-GEN V1-b: a generator lowers to the lazy `Gen<T>` coroutine
-            // (docs/design/lazy-generators.md §C.1). `Gen<T>` is a concrete,
-            // nameable struct that `impl`s `Iterator<Item = T>`, so this emission
-            // is uniform across return / param / field / local positions (the
-            // reason it is a named struct rather than `impl Iterator`).
-            Ty::Iterator(inner) => format!("Gen<{}>", self.rust_ty(inner)),
+            // LAZY-GEN V1-b: a generator lowers to the lazy `__PyrstGen<T>`
+            // coroutine (docs/design/lazy-generators.md §C.1). `__PyrstGen<T>` is a
+            // concrete, nameable struct that `impl`s `Iterator<Item = T>`, so this
+            // emission is uniform across return / param / field / local positions
+            // (the reason it is a named struct rather than `impl Iterator`). V1-d
+            // renamed it under the reserved `__Pyrst` prefix (collision-proof).
+            Ty::Iterator(inner) => format!("__PyrstGen<{}>", self.rust_ty(inner)),
             Ty::Set(inner) => format!("::std::collections::HashSet<{}>", self.rust_ty(inner)),
             Ty::Dict(k, v) => format!("::std::collections::HashMap<{}, {}>", self.rust_ty(k), self.rust_ty(v)),
             Ty::Tuple(parts) => {

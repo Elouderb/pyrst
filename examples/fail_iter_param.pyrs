@@ -1,0 +1,15 @@
+# fail_iter_param.pyrs
+# An `Iterator[T]` PARAMETER is a V2 feature (it needs a call-site list->generator
+# adapter). Until then it silently type-checks and only works by accident for a
+# fresh-call argument, so pyrst rejects it honestly at the def site. Expected
+# substring: "`Iterator[T]` parameters arrive in V2".
+
+def consume(xs: Iterator[int]) -> int:   # ERROR: take a list[int] and pass list(g)
+    total: int = 0
+    for x in xs:
+        total = total + x
+    return total
+
+
+def main() -> None:
+    print(0)

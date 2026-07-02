@@ -1,0 +1,17 @@
+# fail_gen_add.pyrs
+# A list binary-op on a lazy generator (g + g) is an honest MATERIALIZE error at
+# typeck — a generator has no `+` form; it would have to be materialized first.
+# Expected substring: "binary-operator form".
+
+def gen(n: int) -> Iterator[int]:
+    i: int = 0
+    while i < n:
+        yield i
+        i = i + 1
+
+
+def main() -> None:
+    g: Iterator[int] = gen(3)
+    both: Iterator[int] = g + g   # ERROR: list(g) + xs
+    for x in both:
+        print(x)

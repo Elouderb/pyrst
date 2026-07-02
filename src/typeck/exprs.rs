@@ -702,7 +702,7 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
         Expr::Int(_, _) => Ty::Int,
         Expr::Float(_, _) => Ty::Float,
         Expr::Str(_, _) => Ty::Str,
-        Expr::FStr(parts, _span) => {
+        Expr::FStr(parts, fstr_span) => {
             // Visit each interpolation: an f-string FORMATS each `{expr}` via the
             // value's `Display`. Generics v2: a bare type variable (`f"{x}"` where
             // `x: T`) is now LEGAL — it infers a `Display` bound on `T` (collected
@@ -711,7 +711,17 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
             // sub-exprs still surfaces any of THEIR own errors.
             for part in parts {
                 if let FStrPart::Interp(expr, _) = part {
-                    check_expr(expr, env)?;
+                    let ity = check_expr(expr, env)?;
+                    // (LAZY-GEN V1-d) Formatting a generator would print an opaque
+                    // handle, not its contents (like `str(g)`/`print(g)`). Reject
+                    // with the materialize fix (docs/design/lazy-generators.md §D.2).
+                    if matches!(ity, Ty::Iterator(_)) {
+                        // Interpolation exprs may carry a DUMMY span (the parser
+                        // does not always thread one), so caret the whole f-string.
+                        return Err(iterator_materialize_error(
+                            "has no string form (it would show an opaque generator handle)",
+                            "f\"{list(g)}\"", *fstr_span));
+                    }
                 }
             }
             Ty::Str
@@ -1222,6 +1232,29 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                             {
                                 reject_typevar_op(&arg_ty, "consume the contents of", *span)?;
                             }
+                            // (LAZY-GEN V1-d) These builtins cannot consume a lazy
+                            // generator: `len` needs a length, `reversed` a backward
+                            // pass, and the format family (`str`/`repr`/`ascii`/
+                            // `print`) would show an opaque handle. Reject with the
+                            // materialize fix. The V1-c WORKS builtins (list/sum/
+                            // sorted/any/all here, and the earlier-branch min/max/
+                            // enumerate/zip) deliberately consume a generator lazily
+                            // and are NOT in this set (docs §D.1/§D.2).
+                            if matches!(arg_ty, Ty::Iterator(_)) {
+                                match name.as_str() {
+                                    "len" => return Err(iterator_materialize_error(
+                                        "has no len()", "len(list(g))", *span)),
+                                    "reversed" => return Err(iterator_materialize_error(
+                                        "cannot be reversed", "reversed(list(g))", *span)),
+                                    "str" | "repr" | "ascii" => return Err(iterator_materialize_error(
+                                        "has no string form (it would show an opaque generator handle)",
+                                        &format!("{}(list(g))", name), *span)),
+                                    "print" => return Err(iterator_materialize_error(
+                                        "has no printable form (it would show an opaque generator handle)",
+                                        "print(list(g))", *span)),
+                                    _ => {}
+                                }
+                            }
                             // Concrete-only positional arg-type check (skip variadic builtins).
                             // Only fires when BOTH param and arg types are concrete and
                             // incompatible. Int->Float is explicitly allowed (Python coercion).
@@ -1229,6 +1262,11 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                             // here — unification validates it structurally afterwards.
                             if !variadic {
                                 if let Some((_, param_ty)) = sig_params.get(i) {
+                                    // (LAZY-GEN V1-d) A generator passed where a
+                                    // concrete `list[T]` is required: honest
+                                    // MATERIALIZE error (`list(g)`) instead of the
+                                    // bare "expected list, found Iterator" mismatch.
+                                    reject_iterator_into_list(&arg_ty, param_ty, *span)?;
                                     let int_to_float =
                                         matches!(arg_ty, Ty::Int) && matches!(param_ty, Ty::Float);
                                     if !int_to_float
@@ -1631,6 +1669,14 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
             // (Indexing a `list[T]`/`dict[K, V]` whose ELEMENT is a type var is
             // fine — that yields the element type below.)
             reject_typevar_op(&obj_ty, "index", *span)?;
+            // (LAZY-GEN V1-d) A generator is single-pass with no random access —
+            // `g[i]` is a `TypeError` in CPython too. Honest MATERIALIZE error
+            // (closes the Index-vs-Slice asymmetry from review comment 123: Index
+            // fell to `Ty::Unknown` with no pyrst error while Slice already errored).
+            if matches!(obj_ty, Ty::Iterator(_)) {
+                return Err(iterator_materialize_error(
+                    "is not subscriptable (no random access)", "list(g)[i]", *span));
+            }
             match obj_ty {
                 Ty::List(inner) => *inner,
                 Ty::Dict(_, v) => *v,
@@ -1643,6 +1689,13 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
             // Generics v1: a bare type variable is OPAQUE — slicing it (`t[a:b]`)
             // needs a slice/Index bound and is rejected (mirrors the Index arm).
             reject_typevar_op(&obj_ty, "slice", *span)?;
+            // (LAZY-GEN V1-d) Slicing a generator is a `TypeError` in CPython too.
+            // Honest MATERIALIZE error at `check` time (previously only a codegen
+            // error fired, so `pyrst check` leaked it — review comment 123).
+            if matches!(obj_ty, Ty::Iterator(_)) {
+                return Err(iterator_materialize_error(
+                    "cannot be sliced (no random access)", "list(g)[a:b]", *span));
+            }
             // Validate slice indices are integers
             for e in &[start.as_ref(), stop.as_ref(), step.as_ref()] {
                 if let Some(e) = e {
@@ -1665,6 +1718,22 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
         Expr::BinOp { op, lhs, rhs, span } => {
             let l = check_expr(lhs, env)?;
             let r = check_expr(rhs, env)?;
+            // (LAZY-GEN V1-d) A lazy generator has no binary-operator form in V1 —
+            // `g + g` / `g * n` would need a materialized list, and membership
+            // `x in g` (valid in Python but DRAINS the generator) has no lazy analog
+            // until V2. Reject any binop/membership with a generator operand, with
+            // the op-appropriate materialize fix (docs/design/lazy-generators.md §D.2).
+            if matches!(l, Ty::Iterator(_)) || matches!(r, Ty::Iterator(_)) {
+                return Err(match op {
+                    BinOp::In | BinOp::NotIn => iterator_materialize_error(
+                        "has no membership test (`in` would drain it; lazy membership \
+                         arrives in V2)",
+                        "x in list(g)", *span),
+                    _ => iterator_materialize_error(
+                        "has no binary-operator form (an operator would consume it)",
+                        "list(g) + xs", *span),
+                });
+            }
             // Generics v2: a SUPPORTED binary operator on two values of the SAME
             // type variable (`T op T`) is now LEGAL — codegen emits the inferred
             // trait bound (`PartialOrd` / `PartialEq` / `Add<Output=T>` / ...) in

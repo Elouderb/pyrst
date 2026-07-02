@@ -1901,19 +1901,25 @@ use super::test_support::*;
     }
 
     #[test]
-    fn v1a_iterator_and_list_are_interchangeable_in_types_compatible() {
-        // V1-a is behavior-INVISIBLE: an `Iterator[T]` and a `list[T]` must be
-        // mutually assignable in BOTH directions (the honest "iterator is not a
-        // list" error is a deliberate V1-d flip, not V1-a). This guards the
-        // iter_no_yield_return.pyrs corpus case (`list[int] = <Iterator[int] call>`).
+    fn v1d_iterator_and_list_are_not_interchangeable_in_types_compatible() {
+        // V1-d FLIPS the V1-a behavior-invisible bridge: a generator is not a list.
+        // Only `Iterator[T]` fills an `Iterator[T]` slot; both CROSS directions are
+        // now rejected (the honest MATERIALIZE error / the deferred V2 list→Gen
+        // adapter). `reject_iterator_into_list` supplies the helpful message at the
+        // arg/return/assignment sites; here we assert the raw compatibility matrix.
         let it_int = Ty::Iterator(Box::new(Ty::Int));
         let li_int = Ty::List(Box::new(Ty::Int));
-        assert!(types_compatible(&it_int, &li_int)); // Iterator -> list slot
-        assert!(types_compatible(&li_int, &it_int)); // list -> Iterator slot
-        assert!(types_compatible(&it_int, &it_int)); // Iterator -> Iterator slot
-        // Unknown-element permissiveness carries through, like list.
-        assert!(types_compatible(
+        assert!(!types_compatible(&it_int, &li_int)); // Iterator -> list slot: NO (materialize)
+        assert!(!types_compatible(&li_int, &it_int)); // list -> Iterator slot: NO (V2 adapter)
+        assert!(types_compatible(&it_int, &it_int)); // Iterator -> Iterator slot: yes
+        // The cross directions stay false even with an Unknown element (no List↔Iterator bridge).
+        assert!(!types_compatible(
             &Ty::List(Box::new(Ty::Unknown)),
+            &Ty::Iterator(Box::new(Ty::Int))
+        ));
+        // Iterator -> Iterator with an Unknown element remains permissive (like list).
+        assert!(types_compatible(
+            &Ty::Iterator(Box::new(Ty::Unknown)),
             &Ty::Iterator(Box::new(Ty::Int))
         ));
     }

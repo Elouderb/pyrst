@@ -1,0 +1,15 @@
+# fail_gen_len.pyrs
+# len(g) on a lazy generator is an honest MATERIALIZE error at typeck (check).
+# A generator has no length without consuming it; len(gen) is a TypeError in
+# CPython too. Expected message substring: "a generator is lazy and has no len()".
+
+def gen(n: int) -> Iterator[int]:
+    i: int = 0
+    while i < n:
+        yield i
+        i = i + 1
+
+
+def main() -> None:
+    g: Iterator[int] = gen(3)
+    print(len(g))                 # ERROR: len(list(g))

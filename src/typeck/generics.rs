@@ -34,21 +34,19 @@ pub(crate) fn types_compatible(val_ty: &Ty, declared_ty: &Ty, ctx: &TyCtx) -> bo
         // Dict with Unknown key/value compatible with any Dict
         (Ty::Dict(k, v), Ty::Dict(_, _)) if **k == Ty::Unknown && **v == Ty::Unknown => true,
         (Ty::Dict(_, _), Ty::Dict(k, v)) if **k == Ty::Unknown && **v == Ty::Unknown => true,
-        // ── LAZY-GEN V1-a: Iterator ≡ List assignability (a DELIBERATE change to
-        //    a silent-fail site — the `_ => false` fallback below) ─────────────
-        // The variant split must be behavior-INVISIBLE in V1-a, so an `Iterator[T]`
-        // is interchangeable with a `list[T]` here in BOTH directions, exactly as
-        // when `Iterator[T]` *was* `Ty::List(T)`. This is what keeps the corpus's
-        // iter_no_yield_return.pyrs compiling byte-identically — it assigns an
-        // `Iterator[int]`-returning call into a `list[int]` slot (the Iterator→list
-        // direction). The honest "an iterator is not a list; wrap in list(...)"
-        // error (docs/design/lazy-generators.md §D.2) is a DELIBERATE V1-d behavior
-        // flip; introducing it here would violate the V1-a zero-behavior-change
-        // gate. Recursing on the element preserves the existing element rules
-        // (equal / Unknown via `types_compatible`).
-        (Ty::List(v), Ty::Iterator(d))
-        | (Ty::Iterator(v), Ty::List(d))
-        | (Ty::Iterator(v), Ty::Iterator(d)) => types_compatible(v, d, ctx),
+        // ── LAZY-GEN V1-d: an Iterator is NOT interchangeable with a List ─────
+        // V1-a made `Iterator[T]` and `list[T]` mutually assignable here (a
+        // behavior-invisible bridge while the variant split landed). V1-d FLIPS
+        // that: a generator is not a list. Only an `Iterator[T]` fills an
+        // `Iterator[T]` slot (recursing on the element preserves equal/Unknown
+        // rules); both CROSS directions now fall through to `_ => false`:
+        //   • Iterator → list slot: honest MATERIALIZE error (`list(g)`), produced
+        //     with a helpful message by `reject_iterator_into_list` at the arg /
+        //     return / assignment sites before this check reports the bare mismatch.
+        //   • list → Iterator slot: the `list → __PyrstGen` adapter is a V2 feature;
+        //     it stays a plain type-mismatch error until then.
+        // (docs/design/lazy-generators.md §D.2/§F.)
+        (Ty::Iterator(v), Ty::Iterator(d)) => types_compatible(v, d, ctx),
         // ── Optional / None ──────────────────────────────────────────────────
         // (EPIC-5) `types_compatible(val_ty, declared_ty)` is directional: it asks
         // whether a value of `val_ty` may flow into a slot of `declared_ty`. The

@@ -1,0 +1,16 @@
+# fail_gen_slice.pyrs
+# g[a:b] on a lazy generator is an honest MATERIALIZE error at typeck (check).
+# Slicing a generator is a TypeError in CPython too. Previously only a codegen
+# error fired, so `pyrst check` leaked it (V1-b review). Expected substring:
+# "cannot be sliced".
+
+def gen(n: int) -> Iterator[int]:
+    i: int = 0
+    while i < n:
+        yield i
+        i = i + 1
+
+
+def main() -> None:
+    g: Iterator[int] = gen(3)
+    print(g[0:2])                 # ERROR: list(g)[a:b]

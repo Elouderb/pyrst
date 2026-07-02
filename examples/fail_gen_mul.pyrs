@@ -1,0 +1,17 @@
+# fail_gen_mul.pyrs
+# A list binary-op on a lazy generator (g * n) is an honest MATERIALIZE error at
+# typeck — a generator has no `*` (repeat) form. Expected substring:
+# "binary-operator form".
+
+def gen(n: int) -> Iterator[int]:
+    i: int = 0
+    while i < n:
+        yield i
+        i = i + 1
+
+
+def main() -> None:
+    g: Iterator[int] = gen(3)
+    repeated: Iterator[int] = g * 2   # ERROR: list(g) * n
+    for x in repeated:
+        print(x)

@@ -1,0 +1,16 @@
+# fail_gen_index.pyrs
+# g[i] on a lazy generator is an honest MATERIALIZE error at typeck (check).
+# A generator has no random access; gen[i] is a TypeError in CPython too. This
+# closes the Index-vs-Slice asymmetry from the V1-b review (Index fell to
+# Ty::Unknown with no pyrst error). Expected substring: "is not subscriptable".
+
+def gen(n: int) -> Iterator[int]:
+    i: int = 0
+    while i < n:
+        yield i
+        i = i + 1
+
+
+def main() -> None:
+    g: Iterator[int] = gen(3)
+    print(g[0])                   # ERROR: list(g)[i]

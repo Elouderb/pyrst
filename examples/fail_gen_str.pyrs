@@ -1,0 +1,15 @@
+# fail_gen_str.pyrs
+# str(g) on a lazy generator is an honest MATERIALIZE error at typeck.
+# CPython prints an opaque `<generator object ...>`, not the contents, so pyrst
+# rejects it (materialize to show contents). Expected substring: "string form".
+
+def gen(n: int) -> Iterator[int]:
+    i: int = 0
+    while i < n:
+        yield i
+        i = i + 1
+
+
+def main() -> None:
+    g: Iterator[int] = gen(3)
+    print(str(g))                 # ERROR: str(list(g))

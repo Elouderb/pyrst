@@ -1,0 +1,8 @@
+# card 575bcf3a (BLOCKER fix): a bare, unannotated sequential divergent retype at
+# function top level must SHADOW (build + print the reconverged value), not
+# plain-reassign into the first slot. `prescan_merge_ty`'s replaced slot type must
+# not corrupt the first declare's tracked type.
+def main() -> None:
+    x = [1]
+    x = "s"
+    print(x)

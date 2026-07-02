@@ -1,0 +1,15 @@
+# card 575bcf3a (MAJOR fix): a nested def capturing a name that is actively
+# divergently-shadowed at its definition point must resolve the capture to the
+# mangled shadow binding (the real current value), not the stale outer slot.
+def main() -> None:
+    flag: bool = False
+    if flag:
+        xs = [1, 2, 3]
+    else:
+        xs = "hello"
+        def size() -> int:
+            return len(xs)
+        print(size())
+        xs = [7, 8, 9]
+    for x in xs:
+        print(x)

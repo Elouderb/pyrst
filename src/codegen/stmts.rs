@@ -168,6 +168,12 @@ impl<'a> Codegen<'a> {
                 let is_declared = self.declared.contains(target);
                 if !is_declared {
                     self.declared.insert(target.clone());
+                    // (card 575bcf3a) Declaring a fresh binding of this name means it
+                    // has no active shadow in the new scope. A no-op in the enclosing
+                    // function (a shadowed name is always already-declared → the else
+                    // branch); it matters only inside a nested `def` that declares its
+                    // OWN local of a name captured-and-shadowed at the definition site.
+                    self.shadow_map.remove(target);
                     match ty {
                         Some(t) => {
                             // Scope with the enclosing generic function's type vars
@@ -220,8 +226,24 @@ impl<'a> Codegen<'a> {
                             // (e.g. an `acc = 0` later assigned floats).
                             let value_ty = self.type_of_expr(value);
                             let decl_ty = match self.locals.get(target) {
-                                Some(pre) => Self::unify_ty(pre.clone(), value_ty.clone()),
-                                None => value_ty.clone(),
+                                // (card 575bcf3a fix) `pre` is the forward pre-pass
+                                // type. It legitimately WIDENS this declaration (an
+                                // `acc = 0` later assigned floats → declare as f64) —
+                                // but only when it is COMPATIBLE with the value being
+                                // declared. When `pre` is a genuinely DIVERGENT type
+                                // (a later `x = "s"` after `x = [1]`, which
+                                // `prescan_merge_ty`'s replace-on-divergence baked into
+                                // the slot), adopting it would leave `self.locals[x]`
+                                // lying about the just-emitted binding's Rust type
+                                // (`Vec` emitted, `Str` tracked) and make the NEXT
+                                // divergent reassign wrongly plain-reassign into a
+                                // Vec slot (rustc E0308). Keep the declared value's OWN
+                                // type in that case; the later reassign then correctly
+                                // shadows.
+                                Some(pre) if !crate::typeck::branch_divergent(pre, &value_ty) => {
+                                    Self::unify_ty(pre.clone(), value_ty.clone())
+                                }
+                                _ => value_ty.clone(),
                             };
                             self.locals.insert(target.clone(), decl_ty.clone());
                             // If the variable is later widened from int to float,
@@ -398,7 +420,14 @@ impl<'a> Codegen<'a> {
                 // (EPIC-6) `target` names an existing local (emitted escaped by its
                 // `let`), so every occurrence here — store target AND read — uses
                 // the escaped form.
-                let target = escape_ident(target);
+                // (card 575bcf3a fix) When the target is a HOISTED local under an
+                // active divergent shadow, `x += v` reads AND writes the mangled
+                // shadow binding (which holds the current value), not the outer slot.
+                // Resolve through shadow_map exactly like Assign / emit_expr reads;
+                // `target_ty` is already the shadow's tracked type (locals holds it
+                // while shadowed). `shadow_map` is empty for all shadow-free code, so
+                // this is a no-op there.
+                let target = self.shadow_read_name(target).unwrap_or_else(|| escape_ident(target));
                 let target = target.as_str();
                 match op {
                     BinOp::FloorDiv => {
@@ -973,7 +1002,15 @@ impl<'a> Codegen<'a> {
         // counter are per-function: the nested closure gets its OWN (empty / 0) and
         // the enclosing function's are restored on exit, mirroring locals/declared.
         let saved_hoisted = std::mem::take(&mut self.hoisted);
-        let saved_shadow_map = std::mem::take(&mut self.shadow_map);
+        // (card 575bcf3a fix) KEEP the definition-site shadow_map (only a CLONE is
+        // saved for restore) so a READ of a captured enclosing name that is actively
+        // shadowed at this point resolves to the mangled binding the `move` closure
+        // captures — not the stale, unreconverged outer slot (was rustc E0599, or a
+        // silent stale read for overlapping-API type pairs). The closure's OWN new
+        // shadows are layered on top and cleaned by the restore on exit. Names the
+        // closure RE-BINDS (params, and its own hoisted locals below) drop their
+        // captured-shadow entry so they resolve to the closure's binding.
+        let saved_shadow_map = self.shadow_map.clone();
         let saved_shadow_counter = std::mem::replace(&mut self.shadow_counter, 0);
 
         // Overlay the nested params onto the captured locals (a param SHADOWS a
@@ -987,6 +1024,10 @@ impl<'a> Codegen<'a> {
             // not a block-scoped shadowing `let mut`. Nested defs take no `Mut[T]`
             // params in this increment, so every param is a value binding here.
             self.declared.insert(p.name.clone());
+            // A param NAME shadows any captured enclosing shadow of the same
+            // identifier — reads inside the closure must resolve to the param, not
+            // the captured mangled binding.
+            self.shadow_map.remove(&p.name);
         }
 
         // Same body pipeline as `emit_func`: forward type inference, then hoist
@@ -1011,7 +1052,10 @@ impl<'a> Codegen<'a> {
             let ty = self.locals.get(&hname).cloned().unwrap_or(Ty::Unknown);
             if let Some(def) = self.default_val(&ty) {
                 self.line(&format!("let mut {}: {} = {};", escape_ident(&hname), self.rust_ty(&ty), def));
-                // (card 575bcf3a) Record the closure's function-scope slot.
+                // (card 575bcf3a) Record the closure's function-scope slot. A closure
+                // local of this name is its OWN binding, so drop any captured
+                // definition-site shadow of the same identifier.
+                self.shadow_map.remove(&hname);
                 self.hoisted.insert(hname.clone());
                 self.declared.insert(hname);
             }

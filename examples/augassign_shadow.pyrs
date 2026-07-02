@@ -1,0 +1,12 @@
+# card 575bcf3a (MAJOR fix): an AugAssign on a HOISTED local under an active
+# divergent shadow must read/write the mangled shadow binding, not the outer slot.
+def main() -> None:
+    flag: bool = False
+    if flag:
+        xs = [1, 2, 3]
+    else:
+        xs = 100
+        xs += 5
+        xs = [xs, xs]
+    for x in xs:
+        print(x)

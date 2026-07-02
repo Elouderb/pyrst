@@ -1,0 +1,6 @@
+# card 575bcf3a (BLOCKER fix): a 3-step divergent retype chain (list -> str -> int).
+def main() -> None:
+    x = [1]
+    x = "s"
+    x = 99
+    print(x)

@@ -1,12 +1,17 @@
 # Negative fixture (honest-errors): an UNKNOWN ATTRIBUTE on a KNOWN embedded
 # module must be REJECTED by `pyrst check` (not deferred to a rustc E0425 at
-# `build`). `math.inf` is not a pyrst constant (inf/nan have no literal form and
-# were not migrated), so referencing it as a non-call attribute on the known
-# `math` module is an honest "module `math` has no attribute `inf`" error —
+# `build`). `math.golden_ratio` does not exist in pyrst's math module (nor in
+# CPython's), so referencing it as a non-call attribute on the known `math`
+# module is an honest "module `math` has no attribute `golden_ratio`" error —
 # mirroring the unknown-qualified-FUNCTION rejection on the call path.
+#
+# (This fixture previously used `math.inf`; the stdlib-fidelity wave added
+# `inf`/`nan` to lib/math.pyrs as niladic @extern FUNCTIONS — `math.inf()` —
+# so `inf` is now a KNOWN module member and no longer serves as the
+# unknown-attribute probe.)
 
 import math
 
 
 def main() -> None:
-    print(math.inf > 1.0)
+    print(math.golden_ratio > 1.0)

@@ -11,7 +11,7 @@ from itertools import accumulate
 def dot_product(xs: list[int], ys: list[int]) -> int:
     """Compute dot product of two equal-length lists."""
     prods: list[int] = [xs[i] * ys[i] for i in range(len(xs))]
-    acc: list[int] = accumulate(prods, lambda p, q: p + q)
+    acc: list[int] = list(accumulate(prods, lambda p, q: p + q))
     return acc[len(acc) - 1]
 
 
@@ -19,12 +19,12 @@ def main() -> None:
     # chain: merge sensor readings from two lists
     batch1: list[int] = [10, 20, 30]
     batch2: list[int] = [40, 50]
-    combined: list[int] = itertools.chain(batch1, batch2)
+    combined: list[int] = list(itertools.chain(batch1, batch2))
     print(combined)                         # [10, 20, 30, 40, 50]
     print(len(combined))                    # 5
 
     # accumulate: running totals of combined
-    running: list[int] = accumulate(combined, lambda a, b: a + b)
+    running: list[int] = list(accumulate(combined, lambda a, b: a + b))
     print(running)                          # [10, 30, 60, 100, 150]
     print(running[4])                       # 150
 
@@ -63,6 +63,6 @@ def main() -> None:
     # chain + accumulate final sum
     s1: list[int] = [1, 2, 3]
     s2: list[int] = [4, 5, 6]
-    s12: list[int] = itertools.chain(s1, s2)
-    total: list[int] = accumulate(s12, lambda x, y: x + y)
+    s12: list[int] = list(itertools.chain(s1, s2))
+    total: list[int] = list(accumulate(s12, lambda x, y: x + y))
     print(total[5])                         # 21  (1+2+3+4+5+6)

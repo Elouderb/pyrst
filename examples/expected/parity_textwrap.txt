@@ -1,0 +1,35 @@
+['the quick brown fox', 'jumps over the lazy', 'dog']
+['the quick brown', 'fox jumps over', 'the lazy dog']
+the quick brown fox
+jumps over the lazy
+dog
+a b [...]
+one two three
+[...]
+> alpha
+> beta
+> gamma
+x
+y
+  z
+one
+
+two
+three
+[]
+[]
+['word']
+['wor', 'd']
+
+['supercalif', 'ragilistic', 'expialidoc', 'ious']
+
+
+a b c d e f g h
+['café', 'naïve', 'froma', 'ge']
+
+x
+y
+
+> a
+
+> b

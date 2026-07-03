@@ -5,7 +5,7 @@ the quick brown fox
 the quick brown
 3
 the quick brown fox
-Introduction to Pyrst ...
+Introduction to Pyrst [...]
 >>> def foo():
 >>>     return 42
 alpha
@@ -15,4 +15,4 @@ alpha
 1
 Report:
   Pyrst compiles to Rust
-the quick brown ...
+the quick [...]

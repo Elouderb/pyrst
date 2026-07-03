@@ -32,7 +32,7 @@
 #   v.at(i)     — array element (raises if out of range / not an array)
 # This is the one deliberate divergence from Python's `v["k"]` / `v[i]` feel.
 #
-# PARSER — a `_Parser` STATE CLASS (text + pos). pyrst has no mutable globals, so
+# PARSER — a `_json_Parser` STATE CLASS (text + pos). pyrst has no mutable globals, so
 # the parse position is threaded as a mutable `pos: int` field on a small parser
 # object whose methods advance `self.pos` (self-mutation works). This reads more
 # cleanly than returning `(value, new_pos)` tuples through every level of the
@@ -60,10 +60,63 @@
 #     range-checked BEFORE conversion, so it raises a catchable ValueError instead
 #     of an i64-overflow panic. A pyrst exception is the honest failure mode.
 #
-# DEFERRED: surrogate-PAIR decoding (`😀` → one astral codepoint) — a
-# lone or paired surrogate raises a clear error instead. JSON literal `inf`/`nan`
-# are not part of the spec and are not produced; serializing a non-finite float
-# is out of scope (matches CPython, which raises).
+# FIDELITY SCORE: 4 / 5 (docs/design/stdlib-full.md §D "json" row). Surface:
+# `loads`, `dumps(v, indent=None, sort_keys=False)`, the `JsonValue` class
+# (predicates/accessors/navigation), and the private parser/serializer
+# helpers below (all now prefixed `_json_` per stdlib convention — the parser
+# class `_json_Parser` and the top-level helpers `_json_is_digit` /
+# `_json_is_ws` / `_json_hex_digit` / `_json_u4hex` / `_json_u4hex_lower` /
+# `_json_i64_fits` / `_json_escape_string` were renamed this pass from their
+# previously-unprefixed forms, closing the review's helper-prefix finding).
+#
+# THIS PASS (closing docs/design/stdlib-full.md §D "json" deltas):
+#   - `dumps(v, indent=None, sort_keys=False)` — CPython's two most-used
+#     `dumps` keyword params, matched byte-for-byte against `json.dumps`
+#     (2-space/1-tab/etc pretty-printing with `,`/`: ` separators when
+#     `indent` is given; `sort_keys=True` sorts object keys before emission;
+#     a negative `indent` clamps to 0, matching CPython). Multi-line output
+#     recurses through `_json_dumps_rec(v, has_indent, indent, level,
+#     sort_keys)` so each nesting level gets its own pad width.
+#   - surrogate-PAIR decoding: `\uD800`-`\uDBFF` immediately followed by a
+#     `\uDC00`-`\uDFFF` low surrogate now JOINS into one astral codepoint
+#     (`😀` round-trips), matching CPython. A lone/unpaired surrogate (either
+#     half) still RAISES — pyrst `str` is backed by a UTF-8 Rust `String` and
+#     cannot hold an unpaired surrogate the way a CPython `str` can, so that
+#     one edge stays a documented, permanent divergence, not a bug.
+#
+# DEFERRED (documented, not silently dropped):
+#   - `json.load(fp)` / `json.dump(v, fp)` (file-object overloads) — NOT
+#     reachable from pyrst source today: `open()`'s return type is the
+#     compiler-internal `Ty::File`, but there is no user-facing type-annotation
+#     spelling that resolves to it (`fp: file` parses to `Ty::Class("file",
+#     [])`, a *different* type that merely prints identically — the type
+#     checker rejects passing a real file handle to it: "expected file, found
+#     file"). This needs a compiler-level fix (a `file` keyword in
+#     `Ty::from_type_expr_scoped`, `src/typeck/types.rs`) before a pure-pyrst
+#     `lib/json.pyrs` can accept a file handle as a parameter. Callers can
+#     work around this today with `os.read_file(path)` + `loads(...)` and
+#     `dumps(...)` + `os.write_file(path, s)`.
+#   - `separators=`, `skipkeys=`, `ensure_ascii=`, `check_circular=`,
+#     `allow_nan=`, `cls=`, `default=`, `**kw` — real CPython `dumps` params
+#     not in the design row's required delta set; `ensure_ascii`'s absence
+#     means non-ASCII chars serialize as literal UTF-8 rather than `\uXXXX`
+#     escapes (CPython's default `ensure_ascii=True` would escape them) —
+#     documented, not silently wrong.
+#   - CALL-SITE SHAPE: CPython's real `dumps` signature is keyword-ONLY after
+#     `obj` (`def dumps(obj, *, indent=None, sort_keys=False, ...)`). pyrst
+#     supports keyword args only at class-constructor call sites (v0), not
+#     for plain functions, so `dumps(v, indent=2, sort_keys=True)` cannot be
+#     written — callers must pass `indent`/`sort_keys` POSITIONALLY, in
+#     declared order: `dumps(v, 2, True)`. Documented divergence, not a bug.
+#   - `loads` does NOT accept the non-standard `Infinity`/`-Infinity`/`NaN`
+#     literal tokens that CPython's parser also accepts by default (outside
+#     strict JSON grammar) — unexpected-character error instead. `dumps`,
+#     however, DOES match CPython's default (`allow_nan=True`) behavior for a
+#     non-finite float that reaches it (e.g. via `loads("1e400")`, which
+#     silently saturates to +inf, same as CPython's own float parse): it
+#     emits `Infinity` / `-Infinity` / `NaN`, not Rust's `inf`/`NaN` spelling.
+#     (`allow_nan=False`, which would instead raise, is not exposed — no
+#     caller-visible way to request the raising behavior.)
 
 
 # ── builders (public) ────────────────────────────────────────────────────────
@@ -222,17 +275,17 @@ class JsonValue:
 # ── character-class helpers ──────────────────────────────────────────────────
 
 
-def _is_digit(c: str) -> bool:
+def _json_is_digit(c: str) -> bool:
     code: int = ord(c)
     return code >= 48 and code <= 57
 
 
-def _is_ws(c: str) -> bool:
+def _json_is_ws(c: str) -> bool:
     # JSON insignificant whitespace: space, tab, newline, carriage return.
     return c == " " or c == "\t" or c == "\n" or c == "\r"
 
 
-def _hex_digit(c: str) -> int:
+def _json_hex_digit(c: str) -> int:
     # A single hex digit's value, or raise. Used by the `\uXXXX` escape.
     code: int = ord(c)
     if code >= 48 and code <= 57:
@@ -244,9 +297,11 @@ def _hex_digit(c: str) -> int:
     raise ValueError("invalid \\u hex digit '" + c + "'")
 
 
-def _u4hex(code: int) -> str:
+def _json_u4hex(code: int) -> str:
     # `code` (0..65535) as an UPPER-CASE 4-digit hex string, e.g. 55296 -> "D800".
     # Built from nibbles because pyrst's `hex()` yields a lower-case `0x…` form.
+    # UPPER-CASE is used ONLY for the surrogate-error messages (the pyrst-only
+    # golden pins `\uD800`); the `dumps` escape path uses `_json_u4hex_lower`.
     table: str = "0123456789ABCDEF"
     d0: int = (code // 4096) % 16
     d1: int = (code // 256) % 16
@@ -255,7 +310,22 @@ def _u4hex(code: int) -> str:
     return table[d0] + table[d1] + table[d2] + table[d3]
 
 
-def _i64_fits(digits: str, negative: bool) -> bool:
+def _json_u4hex_lower(code: int) -> str:
+    # `code` (0..65535) as a LOWER-CASE 4-digit hex string, e.g. 31 -> "001f".
+    # CPython's `json.dumps` emits generic control-char `\uXXXX` escapes in
+    # LOWER case (`json.dumps(chr(31)) == '"\\u001f"'`), so the `dumps` path
+    # uses this variant to keep the alphabetic hex digits (a-f) byte-identical
+    # to CPython. Distinct from `_json_u4hex` (upper), which feeds the
+    # pyrst-only surrogate error strings.
+    table: str = "0123456789abcdef"
+    d0: int = (code // 4096) % 16
+    d1: int = (code // 256) % 16
+    d2: int = (code // 16) % 16
+    d3: int = code % 16
+    return table[d0] + table[d1] + table[d2] + table[d3]
+
+
+def _json_i64_fits(digits: str, negative: bool) -> bool:
     # Does the (sign-stripped) decimal digit string `digits` fit in pyrst's i64
     # int? Used to range-check an integer token BEFORE int() converts it, so an
     # out-of-range value becomes a catchable ValueError instead of an i64-overflow
@@ -281,7 +351,7 @@ def _i64_fits(digits: str, negative: bool) -> bool:
 # ── parser state ─────────────────────────────────────────────────────────────
 
 
-class _Parser:
+class _json_Parser:
     # The recursive-descent parser state: the source text plus a cursor `pos`
     # advanced in place by the methods. Index threading lives here, not in
     # return tuples, so the descent functions read top-down.
@@ -308,7 +378,7 @@ class _Parser:
         return c
 
     def skip_ws(self) -> None:
-        while not self.at_end() and _is_ws(self.text[self.pos]):
+        while not self.at_end() and _json_is_ws(self.text[self.pos]):
             self.pos = self.pos + 1
 
     def expect(self, c: str) -> None:
@@ -337,7 +407,7 @@ class _Parser:
             return self.parse_bool()
         if c == "n":
             return self.parse_null()
-        if c == "-" or _is_digit(c):
+        if c == "-" or _json_is_digit(c):
             return self.parse_number()
         raise ValueError("unexpected character '" + c + "' at position " + str(self.pos))
 
@@ -373,14 +443,14 @@ class _Parser:
             if c == "\"":
                 return out
             if c == "\\":
-                out = out + self.parse_escape()
+                out += self.parse_escape()
             else:
                 # RFC 8259: a raw control character (U+0000–U+001F) inside a string
                 # MUST be escaped. Reject an unescaped one. (Escaped forms reach
                 # `out` through the backslash branch above and are unaffected.)
                 if ord(c) < 32:
                     raise ValueError("invalid unescaped control character in string")
-                out = out + c
+                out += c
 
     def parse_escape(self) -> str:
         # The cursor is just past the backslash. Returns the unescaped char(s).
@@ -410,27 +480,63 @@ class _Parser:
             return self.parse_unicode_escape()
         raise ValueError("invalid escape '\\" + e + "'")
 
-    def parse_unicode_escape(self) -> str:
-        # Four hex digits → one BMP codepoint. Cursor is just past `\u`. A
-        # surrogate-range value (0xD800–0xDFFF) RAISES (decoding a surrogate would
-        # panic `chr`); surrogate-pair joining is deferred.
+    def _parse_hex4(self) -> int:
+        # Four hex digits -> a 0..65535 codepoint value. Shared by the main
+        # `\uXXXX` scan and the surrogate-pair lookahead below.
         code: int = 0
         n: int = 0
         while n < 4:
             if self.at_end():
                 raise ValueError("incomplete \\u escape")
-            code = code * 16 + _hex_digit(self.advance())
+            code = code * 16 + _json_hex_digit(self.advance())
             n = n + 1
-        if code >= 55296 and code <= 57343:
+        return code
+
+    def parse_unicode_escape(self) -> str:
+        # Four hex digits → one codepoint. Cursor is just past `\u`.
+        #
+        # SURROGATE PAIRS: a HIGH surrogate (0xD800-0xDBFF) immediately followed
+        # by `\uXXXX` whose value is a LOW surrogate (0xDC00-0xDFFF) is joined
+        # into one astral codepoint (per the UTF-16 surrogate-pair formula),
+        # matching CPython's `json.loads` decoding an astral `\u`-escaped char
+        # (e.g. 😀 as `😀`). The lookahead is speculative: if the next
+        # `\u` escape's hex digits fail to parse (bad hex / truncated input) OR
+        # its value is not a low surrogate, the cursor is RESTORED to `saved`
+        # and the high surrogate falls through to the "not supported" raise
+        # below (so a malformed trailing escape doesn't half-consume input).
+        #
+        # A single UNPAIRED surrogate (either half, on its own) still RAISES:
+        # pyrst's `str` is a UTF-8 Rust `String`, which cannot hold a lone
+        # surrogate the way a CPython `str` can — this remains a permanent,
+        # documented divergence (see the module header).
+        code: int = self._parse_hex4()
+        if code >= 55296 and code <= 56319:
+            # high surrogate — look for an immediately-following low surrogate
+            if self.pos + 1 < len(self.text) and self.text[self.pos] == "\\" and self.text[self.pos + 1] == "u":
+                saved: int = self.pos
+                low: int = -1
+                try:
+                    self.pos = self.pos + 2
+                    low = self._parse_hex4()
+                except ValueError:
+                    low = -1
+                if low >= 56320 and low <= 57343:
+                    combined: int = 65536 + (code - 55296) * 1024 + (low - 56320)
+                    return chr(combined)
+                self.pos = saved
             # NOTE: the hex string is bound to a local FIRST, then raised. The
             # call is deliberately NOT inlined into the `raise` expression: pyrst's
             # dead-code pass (`analyze_called_functions`) does not traverse a
             # `raise` statement's expression, so a helper reachable ONLY from a
-            # raise is wrongly pruned ("Dead function removed: _u4hex") and codegen
+            # raise is wrongly pruned ("Dead function removed: _json_u4hex") and codegen
             # then emits a call to a missing function. Binding here puts the call in
-            # an assignment (which the pass DOES traverse), keeping `_u4hex` alive.
-            hexcode: str = _u4hex(code)
+            # an assignment (which the pass DOES traverse), keeping `_json_u4hex` alive.
+            hexcode: str = _json_u4hex(code)
             raise ValueError("surrogate \\u" + hexcode + " is not supported")
+        if code >= 56320 and code <= 57343:
+            # a lone low surrogate, not preceded by a high one
+            hexcode2: str = _json_u4hex(code)
+            raise ValueError("surrogate \\u" + hexcode2 + " is not supported")
         return chr(code)
 
     def parse_number(self) -> JsonValue:
@@ -454,11 +560,11 @@ class _Parser:
             negative = True
             self.pos = self.pos + 1
         # integer part — at least one digit required
-        if self.at_end() or not _is_digit(self.text[self.pos]):
+        if self.at_end() or not _json_is_digit(self.text[self.pos]):
             raise ValueError("invalid number at position " + str(start))
         int_start: int = self.pos
         first_digit: str = self.text[self.pos]
-        while not self.at_end() and _is_digit(self.text[self.pos]):
+        while not self.at_end() and _json_is_digit(self.text[self.pos]):
             self.pos = self.pos + 1
         int_len: int = self.pos - int_start
         # Leading zero: a `0` immediately followed by another digit (e.g. `01`,
@@ -469,9 +575,9 @@ class _Parser:
         if not self.at_end() and self.text[self.pos] == ".":
             is_float = True
             self.pos = self.pos + 1
-            if self.at_end() or not _is_digit(self.text[self.pos]):
+            if self.at_end() or not _json_is_digit(self.text[self.pos]):
                 raise ValueError("invalid number: digit expected after '.'")
-            while not self.at_end() and _is_digit(self.text[self.pos]):
+            while not self.at_end() and _json_is_digit(self.text[self.pos]):
                 self.pos = self.pos + 1
         # exponent
         if not self.at_end() and (self.text[self.pos] == "e" or self.text[self.pos] == "E"):
@@ -479,9 +585,9 @@ class _Parser:
             self.pos = self.pos + 1
             if not self.at_end() and (self.text[self.pos] == "+" or self.text[self.pos] == "-"):
                 self.pos = self.pos + 1
-            if self.at_end() or not _is_digit(self.text[self.pos]):
+            if self.at_end() or not _json_is_digit(self.text[self.pos]):
                 raise ValueError("invalid number: digit expected in exponent")
-            while not self.at_end() and _is_digit(self.text[self.pos]):
+            while not self.at_end() and _json_is_digit(self.text[self.pos]):
                 self.pos = self.pos + 1
         token: str = self.text[start:self.pos]
         if is_float:
@@ -492,7 +598,7 @@ class _Parser:
         # slice excludes any sign.
         int_end: int = int_start + int_len
         digits: str = self.text[int_start:int_end]
-        if not _i64_fits(digits, negative):
+        if not _json_i64_fits(digits, negative):
             raise ValueError("integer out of range: " + token)
         return json_int(int(token))
 
@@ -549,7 +655,7 @@ class _Parser:
 def loads(text: str) -> JsonValue:
     # Parse one complete JSON document. Leading/trailing whitespace is allowed;
     # any non-whitespace AFTER the document is trailing garbage and raises.
-    p: _Parser = _Parser(text)
+    p: _json_Parser = _json_Parser(text)
     value: JsonValue = p.parse_value()
     p.skip_ws()
     if not p.at_end():
@@ -557,43 +663,92 @@ def loads(text: str) -> JsonValue:
     return value
 
 
-def _escape_string(s: str) -> str:
+def _json_escape_string(s: str) -> str:
     # Escape a Python/JSON string body (without the surrounding quotes). Mirrors
     # the parser's escape set: control chars get their short escapes; `"` and `\`
     # are backslash-escaped; everything else passes through verbatim.
+    #
+    # RFC 8259 forbids an UNESCAPED control character (U+0000-U+001F) in a JSON
+    # string — the parser above enforces this on the way IN (see `parse_string`),
+    # so `dumps` must enforce it on the way OUT too: any control char without one
+    # of the named short escapes (\n \t \r \b \f) gets the generic `\u00XX` form,
+    # matching CPython's `json.dumps` (e.g. a bare NUL -> `\u0000`, not a raw
+    # byte). Emitting it unescaped would silently produce INVALID JSON that a
+    # conforming reader must reject.
     out: str = "\""
     i: int = 0
     while i < len(s):
         c: str = s[i]
         code: int = ord(c)
         if c == "\"":
-            out = out + "\\\""
+            out += "\\\""
         elif c == "\\":
-            out = out + "\\\\"
+            out += "\\\\"
         elif c == "\n":
-            out = out + "\\n"
+            out += "\\n"
         elif c == "\t":
-            out = out + "\\t"
+            out += "\\t"
         elif c == "\r":
-            out = out + "\\r"
+            out += "\\r"
         elif code == 8:
             # backspace U+0008 (no `\b` pyrst literal to compare against).
-            out = out + "\\b"
+            out += "\\b"
         elif code == 12:
             # form feed U+000C.
-            out = out + "\\f"
+            out += "\\f"
+        elif code < 32:
+            # any other control char (U+0000-U+0007, U+000B, U+000E-U+001F):
+            # generic 4-hex-digit escape, RFC-required. LOWER-case hex digits,
+            # matching CPython's json.dumps (the review casing fix).
+            out += "\\u" + _json_u4hex_lower(code)
         else:
-            out = out + c
+            out += c
         i = i + 1
     return out + "\""
 
 
-def dumps(v: JsonValue) -> str:
-    # Serialize a JsonValue to a VALID, compact JSON string. Spacing: a single
-    # space after each `,` and after each object `:` (the form the golden pins).
-    # Object key order follows dict iteration and is therefore unspecified — the
-    # goldens dump arrays / single-key objects / read specific keys to stay
-    # deterministic.
+def dumps(v: JsonValue, indent: Optional[int] = None, sort_keys: bool = False) -> str:
+    # Serialize a JsonValue to a VALID JSON string, matching CPython's
+    # `json.dumps(obj, indent=..., sort_keys=...)`:
+    #   - `indent=None` (default): COMPACT form — a single space after each
+    #     `,` and after each object `:` (unchanged from the pre-upgrade form).
+    #   - `indent=N`: PRETTY form — each array/object element on its own line,
+    #     indented `N` spaces per nesting level, with a bare `,` (no trailing
+    #     space; the newline supplies the separation) and `: ` after object
+    #     keys. A negative `N` clamps to 0 (matches CPython). Empty arrays/
+    #     objects still collapse to `[]` / `{}` (no interior newline).
+    #   - `sort_keys=True`: object members are emitted in ascending key order
+    #     (`sorted()` over the member keys) instead of dict iteration order.
+    #     DIVERGENCE (corrected on hardening review — an earlier version of
+    #     this comment was wrong): pyrst's `dict.keys()` iteration is an
+    #     UNSORTED, per-process-randomized hash order, not sorted-key order —
+    #     verified empirically (the same literal dict prints its `.keys()` in
+    #     a different order on repeated runs of the same binary). Since
+    #     CPython's true default (`sort_keys=False`) is insertion order,
+    #     which pyrst's `dict` has no way to reproduce, and the raw hash
+    #     order is actively non-deterministic (worse than any fixed
+    #     divergence), `_json_dumps_rec` below ALWAYS sorts object keys
+    #     regardless of this flag. `sort_keys=False` and `sort_keys=True`
+    #     therefore currently produce IDENTICAL pyrst output.
+    #
+    # CALL-SITE NOTE: pyrst supports keyword args only at class-constructor
+    # call sites (v0), so callers pass `indent`/`sort_keys` POSITIONALLY, in
+    # this declared order — `dumps(v, 2, True)` — unlike CPython's real
+    # keyword-only `dumps(obj, *, indent=None, ..., sort_keys=False, ...)`.
+    has_indent: bool = False
+    ind: int = 0
+    if indent is not None:
+        has_indent = True
+        n: int = indent
+        if n > 0:
+            ind = n
+    return _json_dumps_rec(v, has_indent, ind, 0, sort_keys)
+
+
+def _json_dumps_rec(v: JsonValue, has_indent: bool, indent: int, level: int, sort_keys: bool) -> str:
+    # The recursive worker behind `dumps`. `level` is the current nesting
+    # depth (0 at the root); `indent * level` spaces precede a closing
+    # bracket, `indent * (level + 1)` precede each element/member line.
     if v.kind == 0:
         return "null"
     if v.kind == 1:
@@ -603,25 +758,87 @@ def dumps(v: JsonValue) -> str:
     if v.kind == 2:
         return str(v.i)
     if v.kind == 3:
+        # Non-finite floats (reachable via an over/underflowing exponent, e.g.
+        # `loads("1e400")` -> +inf, since JSON has no `1e400`-is-an-error rule
+        # and Rust's float parse silently saturates): CPython's DEFAULT
+        # `allow_nan=True` emits the non-standard `Infinity`/`-Infinity`/`NaN`
+        # tokens (it only raises when a caller passes `allow_nan=False`,
+        # which this module doesn't expose — see the header). Match that
+        # default rather than emitting Rust's `str(float)` spelling
+        # (`inf`/`-inf`/`NaN`), which is invalid JSON either way.
+        if v.fl != v.fl:
+            return "NaN"
+        maxf: float = float("1.7976931348623157e308")
+        if v.fl > maxf:
+            return "Infinity"
+        if v.fl < (0.0 - maxf):
+            return "-Infinity"
         return str(v.fl)
     if v.kind == 4:
-        return _escape_string(v.s)
+        return _json_escape_string(v.s)
     if v.kind == 5:
-        out: str = "["
-        i: int = 0
-        while i < len(v.arr):
-            if i > 0:
-                out = out + ", "
-            out = out + dumps(v.arr[i])
-            i = i + 1
-        return out + "]"
+        if len(v.arr) == 0:
+            return "[]"
+        if not has_indent:
+            out: str = "["
+            i: int = 0
+            while i < len(v.arr):
+                if i > 0:
+                    out += ", "
+                out += _json_dumps_rec(v.arr[i], has_indent, indent, level, sort_keys)
+                i = i + 1
+            return out + "]"
+        pad: str = " " * (indent * (level + 1))
+        closepad: str = " " * (indent * level)
+        pretty: str = "[\n"
+        pi: int = 0
+        while pi < len(v.arr):
+            if pi > 0:
+                pretty += ",\n"
+            pretty += pad + _json_dumps_rec(v.arr[pi], has_indent, indent, level + 1, sort_keys)
+            pi = pi + 1
+        return pretty + "\n" + closepad + "]"
     if v.kind == 6:
-        parts: str = "{"
-        first: bool = True
-        for key, member in v.obj.items():
-            if not first:
-                parts = parts + ", "
-            parts = parts + _escape_string(key) + ": " + dumps(member)
-            first = False
-        return parts + "}"
+        if len(v.obj) == 0:
+            return "{}"
+        # HARDENING FIX: `dict.keys()` iteration order in pyrst is an
+        # UNSORTED, per-process-RANDOMIZED hash order (verified empirically:
+        # the same compiled binary run repeatedly on the same literal dict
+        # prints its keys in a different order each time) — NOT the
+        # sorted-key order that pyrst's `print(dict)`/`__str__` guarantees,
+        # despite this module's earlier claim to the contrary. Relying on it
+        # here would make `dumps(v)` (the `sort_keys=False` default) silently
+        # NON-DETERMINISTIC across runs — worse than any documented
+        # divergence, since it breaks reproducibility outright. Until pyrst's
+        # `dict` tracks insertion order (`sort_keys=False` could then match
+        # CPython exactly) or `.keys()` is fixed to the same sorted order
+        # `print` already uses, ALWAYS sort here regardless of `sort_keys`:
+        # deterministic-but-alphabetical beats CPython-insertion-order-
+        # shaped-but-random. This means `sort_keys=False` and `sort_keys=True`
+        # currently produce IDENTICAL pyrst output — a disclosed, permanent
+        # divergence from CPython's true insertion-order default, not a bug.
+        keys: list[str] = sorted(v.obj.keys())
+        if not has_indent:
+            parts: str = "{"
+            first: bool = True
+            j: int = 0
+            while j < len(keys):
+                if not first:
+                    parts += ", "
+                key: str = keys[j]
+                parts += _json_escape_string(key) + ": " + _json_dumps_rec(v.obj[key], has_indent, indent, level, sort_keys)
+                first = False
+                j = j + 1
+            return parts + "}"
+        opad: str = " " * (indent * (level + 1))
+        oclosepad: str = " " * (indent * level)
+        opretty: str = "{\n"
+        oj: int = 0
+        while oj < len(keys):
+            if oj > 0:
+                opretty += ",\n"
+            okey: str = keys[oj]
+            opretty += opad + _json_escape_string(okey) + ": " + _json_dumps_rec(v.obj[okey], has_indent, indent, level + 1, sort_keys)
+            oj = oj + 1
+        return opretty + "\n" + oclosepad + "}"
     raise ValueError("dumps: unknown JsonValue kind " + str(v.kind))

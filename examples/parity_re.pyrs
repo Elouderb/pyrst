@@ -1,0 +1,63 @@
+# parity: pyrst-only
+#
+# Reason: `re` is @crate("regex")-backed (see lib/re.pyrs header) and, per the
+# W1 fidelity audit (docs/design/stdlib-full.md §D "re" row), a real
+# `Match`/`Pattern` object is G1-deferred — every wrapper here returns a plain
+# bool/str/list[str]/tuple[str,int] instead. Three names in the surface below
+# (`is_match`, `find_all`, `match_`) have NO equivalent attribute on CPython's
+# real `re` module (`is_match`/`find_all` predate this upgrade and are kept for
+# backward compatibility; `match_` is `re.match` renamed because `match` is a
+# pyrst statement keyword) — under the harness's `import re`, Python resolves
+# to its OWN stdlib `re`, which does not define those names, so a literal
+# whole-file dual run is not executable. Every function's BEHAVIOR was instead
+# verified individually against `python3 -c "import re; ..."` as the semantic
+# oracle (see card 275bfe47 comment); `search`, `fullmatch`, `sub`, `subn`,
+# `split`, `escape`, `findall` share CPython's exact names, positional shapes,
+# and default-count/maxsplit semantics.
+import re
+
+
+def main() -> None:
+    # --- legacy pyrst-only helpers (kept for backward compatibility) ---
+    print(re.is_match("[0-9]+", "abc123"))
+    print(re.is_match("^x", "abc"))
+    print(re.find_all("[0-9]+", "a1b22c333"))
+    print(re.replace_all("[0-9]", "#", "a1b2c3"))
+
+    # --- match_ / search / fullmatch (anchoring deltas) ---
+    print(re.match_("ab", "abc"))
+    print(re.match_("bc", "abc"))
+    print(re.search("bc", "abc"))
+    print(re.search("zz", "abc"))
+    print(re.fullmatch("a.c", "abc"))
+    print(re.fullmatch("a.c", "abcd"))
+
+    # --- findall (CPython-named alias of find_all) ---
+    print(re.findall("[0-9]+", "a1b22c333"))
+
+    # --- sub / subn with count= ---
+    print(re.sub("a", "X", "aaa"))
+    print(re.sub("a", "X", "aaa", 2))
+    print(re.subn("a", "X", "aaa"))
+    print(re.subn("a", "X", "aaa", 1))
+
+    # --- split with maxsplit= ---
+    print(re.split(",", "a,b,c,d"))
+    print(re.split(",", "a,b,c,d", 2))
+
+    # --- escape ---
+    print(re.escape("a.b+c*d?"))
+    print(re.escape("hello world!"))
+    print(re.escape("1_2-3"))
+    print(re.escape(""))
+
+    # --- edge cases (W1-hardening: negative count/maxsplit, empty pattern,
+    # literal "$" in repl) ---
+    print(re.sub("a", "X", "aaa", -1))       # CPython: no-op -> "aaa"
+    print(re.subn("a", "X", "aaa", -1))      # CPython: no-op -> ("aaa", 0)
+    print(re.split(",", "a,b,c,d", -1))      # CPython: no split -> ["a,b,c,d"]
+    print(re.sub("a", "$5", "a"))            # CPython: "$5" literal (no backref expansion)
+    print(re.subn("a", "$5", "a"))           # CPython: ("$5", 1)
+    print(re.findall("", "abc"))             # CPython: ['', '', '', '']
+    print(re.split("", "abc"))               # CPython: ['', 'a', 'b', 'c', '']
+    print(re.fullmatch("a*", ""))            # CPython: truthy (bool True)

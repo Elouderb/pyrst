@@ -8,13 +8,49 @@
 # linked. This file is EMBEDDED into the compiler binary via `include_str!`
 # (see `src/stdlib.rs`), so it ships with the binary and needs no install.
 #
-# Scope (Phase 2): thin `@extern` wrappers that return SIMPLE types (bool, str,
-# list[str]) — there is NO `Match` object. Each wrapper compiles a fresh
-# `regex::Regex` from the pattern and applies one operation. As elsewhere in the
-# stdlib, pyrst `str` is an owned `String`, so each `&str`/pattern argument needs
-# the `&{x}` borrow glue, and string outputs are `.to_string()`/`.into_owned()`'d
-# back to owned `String`s. A malformed pattern unwraps to a panic (a pyrst
-# exception) — mirroring the `os` module's `.unwrap()` error contract.
+# --- W1 fidelity upgrade (card 275bfe47) ---------------------------------
+# Fidelity score: 2 -> 3 (design doc §D "re" row). Closed every NON-GATED
+# delta from the audit:
+#   - `escape(pattern)`               — CPython's exact special-char set.
+#   - `fullmatch(pattern, text)`      — anchored both ends (`^(?:...)$`).
+#   - `match_(pattern, text)`         — anchored at the START only (`^(?:...)`).
+#     Named `match_` (trailing underscore) because `match` is a pyrst keyword
+#     (the `match`/`case` statement) — CPython's `re.match` cannot be spelled
+#     `match` here. Documented pyrst-only divergence.
+#   - `search(pattern, text)`         — CPython-named alias of the pre-existing
+#     `is_match` (unanchored search-test). Both are kept: `is_match` for
+#     backward compatibility with existing programs, `search` for parity.
+#   - `findall(pattern, text)`        — CPython-named alias of `find_all`
+#     (kept for backward compatibility).
+#   - `sub(pattern, repl, string, count=0)` — CPython-named upgrade of
+#     `replace_all` (kept) with the `count` limit; `count=0` means "replace
+#     all", matching CPython's `re.sub` default exactly (and matching Rust
+#     regex's `Regex::replacen` `limit=0` semantics one-for-one).
+#   - `subn(pattern, repl, string, count=0)` — returns `(new_string, n)`,
+#     the number of substitutions actually made, exactly like CPython's
+#     `re.subn`.
+#   - `split(pattern, string, maxsplit=0)` — the pre-existing `split` gained a
+#     `maxsplit` default arg (`0` = no limit, matching CPython).
+#
+# STILL GATED — G1 (opaque handles): a real `Match`/`Pattern` object (with
+# `.group()`, `.start()`, `.end()`, capture groups, `finditer`) needs a
+# stateful handle wrapping a compiled `regex::Regex` / `regex::Captures`
+# across calls; pyrst has no opaque-handle story yet, so every wrapper here
+# still recompiles a fresh `regex::Regex` per call and returns only bool /
+# str / list[str] / tuple[str, int] — never a `Match` object. `finditer` and
+# capturing-group access remain deferred behind G1.
+#
+# Divergences (all documented, none silent):
+#   - `match_`/`fullmatch`/`search`/`is_match` return `bool`, not a `Match`
+#     object or `None` — callers get "did it match", not "what/where matched".
+#   - `escape()` covers every CPython-escaped character EXCEPT the vertical
+#     tab (`\v`, `\x0b`): pyrst's lexer supports `\n \t \r \\ \' \" \0 \b \f`
+#     but has no `\x`/hex escape (src/lexer.rs), so `\x0b` cannot be spelled
+#     as a pyrst string literal. All 21 other CPython-escaped characters
+#     (`()[]{}?*+-|^$\.&~#` plus space/`\t`/`\n`/`\r`/`\f`) are covered and
+#     verified against `python3 -c "import re; re.escape(...)"` byte-for-byte.
+#   - A malformed pattern still unwraps to a panic (a pyrst exception) —
+#     mirroring the `os` module's `.unwrap()` error contract.
 #
 # Only the `from re import f; f(...)` flat form is exercised by the golden.
 
@@ -25,19 +61,101 @@ def is_match(pattern: str, text: str) -> bool:
     "regex::Regex::new(&{pattern}).unwrap().is_match(&{text})"
 
 
+# CPython-named alias of `is_match` (unanchored search-test).
+@crate("regex", "1")
+@extern
+def search(pattern: str, text: str) -> bool:
+    "regex::Regex::new(&{pattern}).unwrap().is_match(&{text})"
+
+
+# CPython's `re.match` anchors at the START of the string only (not the end).
+# Named `match_` because `match` is a pyrst statement keyword.
+@crate("regex", "1")
+@extern
+def match_(pattern: str, text: str) -> bool:
+    "regex::Regex::new(&format!(\"^(?:{})\", {pattern})).unwrap().is_match(&{text})"
+
+
+# CPython's `re.fullmatch` anchors at BOTH the start and the end.
+@crate("regex", "1")
+@extern
+def fullmatch(pattern: str, text: str) -> bool:
+    "regex::Regex::new(&format!(\"^(?:{})$\", {pattern})).unwrap().is_match(&{text})"
+
+
 @crate("regex", "1")
 @extern
 def find_all(pattern: str, text: str) -> list[str]:
     "regex::Regex::new(&{pattern}).unwrap().find_iter(&{text}).map(|m| m.as_str().to_string()).collect::<Vec<String>>()"
 
 
+# CPython-named alias of `find_all`.
+@crate("regex", "1")
+@extern
+def findall(pattern: str, text: str) -> list[str]:
+    "regex::Regex::new(&{pattern}).unwrap().find_iter(&{text}).map(|m| m.as_str().to_string()).collect::<Vec<String>>()"
+
+
+# NOTE: passes `repl` through a closure (not a `&str`/`Replacer` template)
+# so the Rust `regex` crate's `$1`/`${name}` backreference-expansion syntax
+# is NEVER triggered — `repl` is always inserted as a fully literal string,
+# matching CPython's `re.sub`, whose replacement string has no `$`-expansion
+# syntax of its own (verified: `re.sub('a','$5','a')` -> `'$5'` literal;
+# without this closure indirection the Rust template form would silently
+# expand `$5` to an EMPTY string, a correctness landmine given pyrst has no
+# group-capture API to intentionally use backreferences with anyway).
 @crate("regex", "1")
 @extern
 def replace_all(pattern: str, repl: str, text: str) -> str:
-    "regex::Regex::new(&{pattern}).unwrap().replace_all(&{text}, {repl}.as_str()).into_owned()"
+    "regex::Regex::new(&{pattern}).unwrap().replace_all(&{text}, |_c: &regex::Captures| { {repl}.to_string() }).into_owned()"
 
 
+# CPython-named upgrade of `replace_all`: `count=0` means "replace all"
+# (matching CPython's `re.sub` default exactly, and Rust regex's own
+# `replacen(text, limit=0, ..)` "0 = unlimited" convention). A NEGATIVE
+# `count` mirrors CPython's `re.sub` exactly: zero substitutions are made
+# and the original string is returned unchanged (verified against
+# `python3 -c "import re; re.sub('a','X','aaa',count=-1)"` -> `'aaa'`).
+# Like `replace_all` above, `repl` is passed through a closure so `$`-style
+# backreference-expansion is never triggered (`repl` is always literal).
 @crate("regex", "1")
 @extern
-def split(pattern: str, text: str) -> list[str]:
-    "regex::Regex::new(&{pattern}).unwrap().split(&{text}).map(|s| s.to_string()).collect::<Vec<String>>()"
+def sub(pattern: str, repl: str, string: str, count: int = 0) -> str:
+    "{ if {count} < 0 { {string}.clone() } else { let re = regex::Regex::new(&{pattern}).unwrap(); if {count} == 0 { re.replace_all(&{string}, |_c: &regex::Captures| { {repl}.to_string() }).into_owned() } else { re.replacen(&{string}, {count} as usize, |_c: &regex::Captures| { {repl}.to_string() }).into_owned() } } }"
+
+
+# CPython's `re.subn`: same as `sub` but also returns the number of
+# substitutions actually made, as `(new_string, count)`. A negative `count`
+# mirrors CPython: no substitutions, `(string, 0)` is returned unchanged.
+# Already closure-based (counter closure), so `repl` was always literal —
+# no `$`-expansion landmine here (see the `sub`/`replace_all` note above).
+@crate("regex", "1")
+@extern
+def subn(pattern: str, repl: str, string: str, count: int = 0) -> tuple[str, int]:
+    "{ if {count} < 0 { ({string}.clone(), 0i64) } else { let re = regex::Regex::new(&{pattern}).unwrap(); let n = std::cell::Cell::new(0i64); let result = if {count} == 0 { re.replace_all(&{string}, |_c: &regex::Captures| { n.set(n.get() + 1); {repl}.to_string() }) } else { re.replacen(&{string}, {count} as usize, |_c: &regex::Captures| { n.set(n.get() + 1); {repl}.to_string() }) }; (result.into_owned(), n.get()) } }"
+
+
+# `maxsplit=0` means "no limit" (matching CPython's `re.split` default). A
+# NEGATIVE `maxsplit` mirrors CPython exactly: no split is performed at all
+# and the original string is returned as the sole list element (verified
+# against `python3 -c "import re; re.split(',', 'a,b,c,d', maxsplit=-1)"`
+# -> `['a,b,c,d']`).
+@crate("regex", "1")
+@extern
+def split(pattern: str, text: str, maxsplit: int = 0) -> list[str]:
+    "{ if {maxsplit} < 0 { vec![{text}.clone()] } else { let re = regex::Regex::new(&{pattern}).unwrap(); if {maxsplit} == 0 { re.split(&{text}).map(|s| s.to_string()).collect::<Vec<String>>() } else { re.splitn(&{text}, ({maxsplit} as usize) + 1).map(|s| s.to_string()).collect::<Vec<String>>() } } }"
+
+
+# Pure pyrst: escape every regex-metacharacter in `pattern` exactly as
+# CPython's `re.escape` does (Python 3.7+ semantics — only the characters in
+# `()[]{}?*+-|^$\.&~#` plus whitespace are escaped; e.g. `!`, `_`, letters,
+# and digits are left alone). See the module-header divergence note re `\v`.
+def escape(pattern: str) -> str:
+    specials: str = "()[]{}?*+-|^$\\.&~# \t\n\r\f"
+    out: str = ""
+    for ch in pattern:
+        if ch in specials:
+            out += "\\" + ch
+        else:
+            out += ch
+    return out

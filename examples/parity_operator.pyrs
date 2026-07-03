@@ -1,0 +1,125 @@
+# parity_operator.pyrs — dual-run parity golden for the upgraded `operator`
+# module (card 90eb1f2d). Exercises the full surface: the original 11
+# int-specialized fns (all 6 comparisons — lt/le/gt/ge/eq/ne — are now
+# GENERIC, verified across int, float, str, and list[int] calls to the SAME
+# imported name in one program; add/sub/mul/floordiv/mod_ stay int-specialized,
+# see lib/operator.pyrs header for why), plus the W1 additions (itemgetter,
+# truth, not_, contains_, concat). CPython's `contains` is spelled
+# `contains_` here (see lib/operator.pyrs header for the forced-rename
+# reason, same class of issue as the pre-existing `mod_`).
+#
+# parity: pyrst-only
+#
+# NOT dual-run despite being deterministic pure arithmetic/comparisons/
+# sequence ops: this file imports `mod_` and `contains_`, two names FORCED
+# to diverge from CPython's real `operator.mod`/`operator.contains` (see
+# lib/operator.pyrs header) — real CPython's `operator` module has no
+# `mod_`/`contains_`, so `from operator import mod_, contains_` raises
+# ImportError under python3 and a same-source dual-run cannot pass. Every
+# OTHER name imported below (add/sub/mul/floordiv/lt/le/gt/ge/eq/ne/truth/
+# not_/concat/itemgetter) is an exact CPython name; manually verified
+# (w1drop/operator/notes.md) that the subset excluding mod_/contains_
+# dual-runs byte-identical against python3.
+from operator import add, sub, mul, floordiv, mod_
+from operator import lt, le, gt, ge, eq, ne
+from operator import truth, not_, contains_, concat, itemgetter
+
+
+def main() -> None:
+    # --- int-specialized add/sub/mul (kept non-generic: see header) ---
+    print(add(2, 3))          # 5
+    print(sub(10, 4))         # 6
+    print(mul(4, 5))          # 20
+    # edge: negative operands, zero
+    print(add(-5, -7))        # -12
+    print(sub(0, 0))          # 0
+    print(mul(-3, 4))         # -12
+    print(mul(0, 999))        # 0
+
+    # --- int-only floordiv/mod_ ---
+    print(floordiv(7, 2))     # 3
+    print(mod_(7, 2))         # 1
+    # edge: negative dividend/divisor (Python floor semantics, not C truncation)
+    print(floordiv(-7, 2))    # -4
+    print(floordiv(7, -2))    # -4
+    print(mod_(-7, 2))        # 1
+    print(mod_(7, -2))        # -1
+
+    # --- generic comparisons: int ---
+    print(lt(2, 3))           # True
+    print(le(3, 3))           # True
+    print(gt(3, 2))           # True
+    print(ge(3, 3))           # True
+    print(eq(3, 3))           # True
+    print(ne(3, 4))           # True
+    # edge: ties and negative numbers
+    print(lt(-5, -3))         # True
+    print(eq(-0, 0))          # True
+    print(ge(-1, -1))         # True
+
+    # --- generic comparisons: float ---
+    print(lt(1.5, 2.5))       # True
+    print(eq(1.5, 1.5))       # True
+    print(eq(-0.0, 0.0))      # True (IEEE 754: -0.0 == 0.0)
+
+    # --- generic comparisons: str ---
+    print(lt("abc", "abd"))   # True
+    print(eq("x", "x"))       # True
+    print(ne("x", "y"))       # True
+    # edge: empty string, unicode
+    print(eq("", ""))         # True
+    print(lt("", "a"))        # True
+    print(eq("héllo", "héllo"))  # True
+    print(lt("café", "cafz"))    # True
+
+    # --- generic comparisons: list ---
+    print(eq([1, 2, 3], [1, 2, 3]))   # True
+    print(ne([1, 2], [1, 2, 3]))      # True
+    # edge: empty lists, prefix ordering
+    empty_a: list[int] = []
+    empty_b: list[int] = []
+    print(eq(empty_a, empty_b))       # True
+    print(lt([1, 2], [1, 2, 3]))      # True (shorter prefix < longer)
+    print(lt([1, 3], [1, 2, 3]))      # False (first differing elem wins)
+
+    # --- truth / not_ (int-specialized) ---
+    print(truth(1))           # True
+    print(truth(0))           # False
+    print(not_(1))            # False
+    print(not_(0))            # True
+    # edge: negative numbers are truthy (nonzero)
+    print(truth(-5))          # True
+    print(not_(-5))           # False
+
+    # --- contains_ (generic over list[T]) ---
+    print(contains_([1, 2, 3], 2))          # True
+    print(contains_([1, 2, 3], 9))          # False
+    print(contains_(["a", "b", "c"], "b"))  # True
+    # edge: empty list, duplicates
+    print(contains_(empty_a, 1))            # False
+    dup: list[int] = [1, 1, 2, 2, 3]
+    print(contains_(dup, 1))                # True
+    print(contains_(dup, 4))                # False
+
+    # --- concat (generic over list[T]) ---
+    print(concat([1, 2], [3, 4]))          # [1, 2, 3, 4]
+    print(concat(["a"], ["b", "c"]))       # ['a', 'b', 'c']
+    # edge: empty-list operands (both sides)
+    print(concat(empty_a, [42]))           # [42]
+    print(concat([42], empty_b))           # [42]
+    print(concat(empty_a, empty_b))        # []
+
+    # --- itemgetter (int-specialized: list[int] -> int) ---
+    second: int = itemgetter(1)([10, 20, 30])
+    print(second)              # 20
+    first: int = itemgetter(0)([100, 200])
+    print(first)               # 100
+    # edge: negative index (last element), single-element list
+    last: int = itemgetter(-1)([10, 20, 30])
+    print(last)                # 30
+    only: int = itemgetter(0)([7])
+    print(only)                # 7
+    # edge: same getter reused across two different lists (closure snapshot of i)
+    first_getter = itemgetter(0)
+    print(first_getter([10, 20, 30]))   # 10
+    print(first_getter([100, 200]))     # 100

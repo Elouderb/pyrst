@@ -1,0 +1,107 @@
+# parity: pyrst-only (wall-clock @extern surface; see notes below)
+#
+# `time` mixes pure calendar math (dual-run-eligible: gmtime/ctime/strftime given
+# an explicit epoch) with @extern wall-clock/monotonic-clock bindings that are
+# inherently nondeterministic and have no CPython-callable twin inside a pyrst
+# harness (per docs/design/stdlib-full.md: "@extern/@crate modules ... use a
+# python3-reference golden ... or a tiny shim"). This example is therefore
+# marked pyrst-only; the deterministic calendar-math portions were additionally
+# hand-verified against CPython's real `time` module (see notes.md for the
+# `python3 -c` transcript) so the fixed-epoch outputs below are true CPython
+# parity, not just self-consistency.
+from time import ctime, gmtime, monotonic, perf_counter, process_time, sleep, strftime, struct_time, time, time_ns
+
+
+def main() -> None:
+    # --- deterministic calendar math: fixed epoch seconds ---
+    epoch: struct_time = gmtime(0.0)
+    print(epoch)
+    print(strftime("%Y-%m-%d %H:%M:%S", epoch))
+    print(strftime("%A %B %d, %Y", epoch))
+    print(ctime(0.0))
+
+    mid: struct_time = gmtime(1700000000.0)
+    print(mid)
+    print(strftime("%Y-%m-%d %H:%M:%S %j %a %b %p", mid))
+    print(ctime(1700000000.0))
+
+    leap: struct_time = gmtime(951868800.0)
+    print(leap)
+    print(strftime("%Y-%m-%d", leap))
+
+    print(strftime("100%%", epoch))
+
+    # trailing lone "%" with no following directive char: CPython emits the
+    # literal "%" rather than raising (verified via python3), so pyrst matches.
+    print(strftime("abc%", epoch))
+
+    # century boundary: 2000 is a leap year (div by 400), 2100 is not (div by
+    # 100 but not 400) -- exercises the century branch of _time_is_leap.
+    y2100: struct_time = gmtime(4102444800.0)
+    print(y2100)
+
+    # %p boundary: midnight -> AM, exact noon -> PM.
+    noon: struct_time = gmtime(43200.0)
+    print(strftime("%p", epoch))
+    print(strftime("%p", noon))
+
+    # unsupported locale/tz directive: documented divergence, must raise
+    # ValueError rather than silently emit literal "%Z".
+    try:
+        strftime("%Z", epoch)
+        print("NO_RAISE")
+    except ValueError:
+        print("raised ValueError for %Z")
+
+    # negative (pre-epoch, including sub-second-magnitude fractional) seconds
+    # must raise -- this also guards against a truncate-toward-zero bug where
+    # int(-0.5) == 0 could silently slip past a post-truncation "t < 0" check.
+    try:
+        gmtime(-0.5)
+        print("NO_RAISE")
+    except ValueError:
+        print("raised ValueError for gmtime(-0.5)")
+
+    try:
+        gmtime(-1.0)
+        print("NO_RAISE")
+    except ValueError:
+        print("raised ValueError for gmtime(-1.0)")
+
+    # struct_time fields are directly readable
+    print(mid.tm_year)
+    print(mid.tm_mon)
+    print(mid.tm_wday)
+
+    # --- nondeterministic wall-clock / monotonic surface: assert derived
+    # facts only, never absolute values ---
+    t0: float = time()
+    ns0: int = time_ns()
+    print(t0 > 0.0)
+    print(ns0 > 0)
+
+    m0: float = monotonic()
+    p0: float = perf_counter()
+    c0: float = process_time()
+    sleep(0.01)
+    m1: float = monotonic()
+    p1: float = perf_counter()
+    c1: float = process_time()
+
+    print(m1 >= m0)
+    print(p1 >= p0)
+    print(c1 >= c0)
+    print((m1 - m0) >= 0.0)
+
+    # gmtime()/ctime()/strftime() with no argument use the current wall clock;
+    # only check they type-check and return sane, self-consistent structure.
+    now: struct_time = gmtime()
+    print(now.tm_year >= 2024)
+    print(now.tm_mon >= 1 and now.tm_mon <= 12)
+    print(now.tm_mday >= 1 and now.tm_mday <= 31)
+    print(now.tm_wday >= 0 and now.tm_wday <= 6)
+    print(len(ctime()) > 0)
+    print(len(strftime("%Y-%m-%d", now)) == 10)
+
+
+main()

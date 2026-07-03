@@ -1,18 +1,41 @@
 # pyrst standard library — heapq
 #
-# Pure-pyrst binary MIN-heap over a `list[T]` whose elements are ordered (the
-# `<` operator on `T` infers `T: PartialOrd` — generics v2). The list itself IS
-# the heap (as in CPython): index 0 is the smallest element, children of `i` are
-# at `2*i+1` and `2*i+2`. Embedded via `include_str!` (see `src/stdlib.rs`).
-# Usable as either `from heapq import heappush` or
-# `import heapq; heapq.heappush(h, x)`.
+# Fidelity score: 4 (near drop-in). Pure-pyrst binary MIN-heap over a
+# `list[T]` whose elements are ordered (the `<` operator on `T` infers
+# `T: PartialOrd` — generics v2). The list itself IS the heap (as in CPython):
+# index 0 is the smallest element, children of `i` are at `2*i+1` and `2*i+2`.
+# Embedded via `include_str!` (see `src/stdlib.rs`). Usable as either
+# `from heapq import heappush` or `import heapq; heapq.heappush(h, x)`.
 #
-# Public API:
-#   - `heappush(heap, item)` — push `item`, restoring the heap invariant.
-#   - `heappop(heap)`        — remove and return the smallest element.
-#   - `heapify(x)`           — rearrange `x` into a heap in place, O(n).
-# All three take the heap as a `Mut[list[T]]` by-reference param and mutate it
-# in place (CPython mutates the list argument too).
+# Public API (7 functions — CPython names, exact positional shape):
+#   - `heappush(heap, item)`      — push `item`, restoring the heap invariant.
+#   - `heappop(heap)`             — remove and return the smallest element.
+#   - `heapify(x)`                — rearrange `x` into a heap in place, O(n).
+#   - `heappushpop(heap, item)`   — push `item` then pop+return the smallest;
+#     equivalent to (but faster than) `heappush` followed by `heappop`.
+#   - `heapreplace(heap, item)`   — pop+return the smallest, then push `item`;
+#     faster than `heappop` followed by `heappush`, but (like CPython) the
+#     returned value may be larger than `item` — assumes a non-empty heap.
+#   - `nlargest(n, iterable)`     — the `n` largest elements, largest first;
+#     equivalent to `sorted(iterable, reverse=True)[:n]`.
+#   - `nsmallest(n, iterable)`    — the `n` smallest elements, smallest first;
+#     equivalent to `sorted(iterable)[:n]`.
+# `heappush`/`heappop`/`heapify`/`heappushpop`/`heapreplace` take the heap as
+# a `Mut[list[T]]` by-reference param and mutate it in place (CPython mutates
+# the list argument too). `nlargest`/`nsmallest` take the source as a plain
+# `list[T]` (read-only) and return a new list, matching CPython.
+#
+# Divergences (documented, not silent):
+#   - `nlargest`/`nsmallest` drop the optional `key=` callable parameter.
+#     CPython's `key` is `Callable[[T], Any]` with an *unconstrained* return
+#     type (`Any`), which pyrst's closed type system cannot express as a
+#     bare positional/keyword default here without a second generic type
+#     parameter forcing every call site to disambiguate; deferred rather than
+#     shipped half-faithful. Divergence class: dynamic-return (B.1).
+#   - `merge(*iterables, key=None, reverse=False)` is DEFERRED. It needs
+#     variadic `*args` (G4) for the iterable list, and its natural pyrst
+#     shape (`list[Iterator[T]]` consumed lazily) still runs headlong into
+#     "Iterator[T] as a PARAMETER type" being unsupported. Not attempted.
 #
 # Implementation notes:
 #   - Standard sift-up (push) / sift-down (pop, heapify) on the array.
@@ -21,28 +44,53 @@
 #     hoisted into a local FIRST — passing `len(heap)` inline alongside the
 #     `&mut heap` reference triggers a Rust borrow conflict (E0502). Hence the
 #     `last_index` / `n` locals below.
-#   - `nlargest` / `nsmallest` / `heappushpop` / `heapreplace` are DEFERRED to a
-#     later batch.
+#   - `heappushpop`/`heapreplace` mirror CPython's `Lib/heapq.py` reference
+#     implementation exactly (see `_heapq_sift_up`/`_heapq_sift_down_from`
+#     helpers below), including the "no-op fast path" in `heappushpop` when
+#     the heap is empty or `item` is already `<=` the current minimum.
+#   - `nlargest`/`nsmallest` are implemented via `_heapq_sorted_asc` (a private
+#     helper: heapify a copy, then repeatedly `heappop` into a result list —
+#     this stays generic over `T: PartialOrd`, unlike Rust's `.sort()`, which
+#     demands `Ord` and cannot be inferred from a bare `<`-using generic
+#     function). `nsmallest` slices the ascending result; `nlargest` reverses
+#     it first, then slices. CPython's own docstrings state the equivalence
+#     (`sorted(iterable, reverse=True)[:n]` / `sorted(iterable)[:n]`); output
+#     was verified value-for-value against CPython on ties and edge `n`
+#     (0, 1, `n == len`, `n > len`).
+#   - `nlargest`/`nsmallest` explicitly return `[]` for `n <= 0` before doing
+#     any work. CPython does this too (its heap-building loops consume from
+#     `range(n)`/`range(0, -n, -1)`, both empty for `n <= 0`) but pyrst's
+#     naive `descending[:n]` / `asc[:n]` slice would NOT: pyrst list slicing
+#     follows ordinary negative-index slice semantics, so `xs[:-1]` drops the
+#     last element instead of returning `[]` like CPython's `nlargest`/
+#     `nsmallest` do for negative `n`. Caught during hardening review
+#     (w1-hardener) and fixed with an explicit early-return guard.
+#   - Private helpers (`_heapq_swap`, `_heapq_sift_up`, `_heapq_sift_down`,
+#     `_heapq_sorted_asc`) are all prefixed `_heapq_` — the stdlib namespace
+#     is flat across modules (`include_str!`-concatenated), so unprefixed
+#     generic names like a bare `_swap`/`_sift_up` risk an E0428 duplicate-
+#     definition collision with another module's private helper of the same
+#     name. Renamed during hardening review (was previously unprefixed).
 
 
-def _swap[T](heap: Mut[list[T]], i: int, j: int) -> None:
+def _heapq_swap[T](heap: Mut[list[T]], i: int, j: int) -> None:
     tmp: T = heap[i]
     heap[i] = heap[j]
     heap[j] = tmp
 
 
-def _sift_up[T](heap: Mut[list[T]], pos: int) -> None:
+def _heapq_sift_up[T](heap: Mut[list[T]], pos: int) -> None:
     child: int = pos
     while child > 0:
         parent: int = (child - 1) // 2
         if heap[child] < heap[parent]:
-            _swap(heap, child, parent)
+            _heapq_swap(heap, child, parent)
             child = parent
         else:
             return
 
 
-def _sift_down[T](heap: Mut[list[T]], pos: int) -> None:
+def _heapq_sift_down[T](heap: Mut[list[T]], pos: int) -> None:
     n: int = len(heap)
     root: int = pos
     while True:
@@ -55,14 +103,14 @@ def _sift_down[T](heap: Mut[list[T]], pos: int) -> None:
             smallest = right
         if smallest == root:
             return
-        _swap(heap, root, smallest)
+        _heapq_swap(heap, root, smallest)
         root = smallest
 
 
 def heappush[T](heap: Mut[list[T]], item: T) -> None:
     heap.append(item)
     last_index: int = len(heap) - 1
-    _sift_up(heap, last_index)
+    _heapq_sift_up(heap, last_index)
 
 
 def heappop[T](heap: Mut[list[T]]) -> T:
@@ -73,7 +121,7 @@ def heappop[T](heap: Mut[list[T]]) -> T:
         return last
     result: T = heap[0]
     heap[0] = last
-    _sift_down(heap, 0)
+    _heapq_sift_down(heap, 0)
     return result
 
 
@@ -81,5 +129,52 @@ def heapify[T](x: Mut[list[T]]) -> None:
     n: int = len(x)
     i: int = n // 2 - 1
     while i >= 0:
-        _sift_down(x, i)
+        _heapq_sift_down(x, i)
         i = i - 1
+
+
+def heapreplace[T](heap: Mut[list[T]], item: T) -> T:
+    result: T = heap[0]
+    heap[0] = item
+    _heapq_sift_down(heap, 0)
+    return result
+
+
+def heappushpop[T](heap: Mut[list[T]], item: T) -> T:
+    n: int = len(heap)
+    if n > 0 and heap[0] < item:
+        result: T = heap[0]
+        heap[0] = item
+        _heapq_sift_down(heap, 0)
+        return result
+    return item
+
+
+def _heapq_sorted_asc[T](xs: list[T]) -> list[T]:
+    working: list[T] = xs
+    heapify(working)
+    result: list[T] = []
+    while len(working) > 0:
+        result.append(heappop(working))
+    return result
+
+
+def nlargest[T](n: int, iterable: list[T]) -> list[T]:
+    if n <= 0:
+        empty_result: list[T] = []
+        return empty_result
+    asc: list[T] = _heapq_sorted_asc(iterable)
+    descending: list[T] = []
+    i: int = len(asc) - 1
+    while i >= 0:
+        descending.append(asc[i])
+        i = i - 1
+    return descending[:n]
+
+
+def nsmallest[T](n: int, iterable: list[T]) -> list[T]:
+    if n <= 0:
+        empty_result: list[T] = []
+        return empty_result
+    asc: list[T] = _heapq_sorted_asc(iterable)
+    return asc[:n]

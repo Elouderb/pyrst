@@ -1,0 +1,215 @@
+# parity: pyrst-only
+#
+# Card 30f62dbc — fidelity upgrade for `lib/json.pyrs` (docs/design/
+# stdlib-full.md §D "json" row: add `indent=`/`sort_keys=` to `dumps`,
+# surrogate-pair decoding in `loads`; `load`/`dump` deferred — see the
+# module header in `lib/json.pyrs` for why).
+#
+# WHY PYRST-ONLY (not dual-run under python3 like most stdlib parity goldens):
+# `json.loads` in real CPython returns NATIVE dynamic types (`dict`/`list`/
+# `str`/`int`/`float`/`bool`/`None`) navigated with `v["k"]`/`v[i]`. pyrst has
+# no `Any`/union return type and no dual `__getitem__` overload, so
+# `lib/json.pyrs` returns a single tagged `JsonValue` class navigated via
+# `.get(k)`/`.at(i)`/`.as_str()`/etc — a deliberate, permanent API divergence
+# (see `lib/json.pyrs`'s header). The SAME source calling `v.get("k")` cannot
+# run under python3's real `json` module (`JsonValue`/`.get`/`.as_str` don't
+# exist there) — so a byte-identical dual run is not achievable for this
+# module's *API shape*, only for underlying SERIALIZED-STRING behavior, which
+# is validated separately (see notes.md) by round-tripping equivalent
+# documents through both `lib/json.pyrs`'s `dumps`/`loads` and CPython's
+# `json.dumps`/`json.loads` with matching `indent=`/`sort_keys=` args and
+# byte-diffing the two serialized strings directly (not the API surface).
+#
+# This file is the pyrst-only golden: deterministic pyrst output covering the
+# FULL upgraded surface (old builders/predicates/accessors/navigation/errors,
+# plus the new `dumps(v, indent=, sort_keys=)` pretty-printing and the new
+# surrogate-pair decode in `loads`).
+
+from json import loads, dumps, json_str
+
+
+def main() -> None:
+    # ── builders + predicates + accessors (pre-existing surface) ──────────────
+    v: JsonValue = loads('{"name": "Ann", "age": 30, "tags": ["a", "b"], "active": true, "extra": null}')
+    print(v.get("name").as_str())          # Ann
+    print(str(v.get("age").as_int()))      # 30
+    print(v.get("tags").at(0).as_str())    # a
+    print(str(v.get("tags").length()))     # 2
+    print(str(v.get("active").as_bool()))  # True
+    print(str(v.get("extra").is_null()))   # True
+    print(dumps(v.get("tags")))            # ["a", "b"]
+    print(str(v.is_object()))              # True
+    print(str(v.has("name")))              # True
+    print(str(v.has("missing")))           # False
+    print(str(v.length()))                 # 5
+
+    # ── round-trip stability (compact form, default args) ──────────────────────
+    doc: str = '[1, 2, [3, 4], {"x": [true, false, null]}]'
+    first: JsonValue = loads(doc)
+    once: str = dumps(first)
+    twice: str = dumps(loads(once))
+    print(str(once == twice))              # True
+    print(once)                            # [1, 2, [3, 4], {"x": [true, false, null]}]
+
+    # ── float / negative int / escapes (pre-existing) ──────────────────────────
+    print(dumps(loads("3.14")))            # 3.14
+    print(dumps(loads("1.5e3")))           # 1500.0
+    print(dumps(loads("-17")))             # -17
+    print(dumps(loads('"a\\"b"')))         # "a\"b"
+    print(loads('"caf\\u00e9"').as_str())  # café  (BMP \u escape)
+
+    # ── NEW: surrogate-PAIR decode (astral codepoint) ──────────────────────────
+    grin: JsonValue = loads('"\\ud83d\\ude00"')
+    print(str(len(grin.as_str())))                 # 1  (one astral char, not two code units)
+    print(str(grin.as_str() == chr(128512)))        # True (matches U+1F600 GRINNING FACE)
+    print(dumps(grin))                              # "😀"  (re-serializes as raw UTF-8, ensure_ascii not implemented)
+
+    # a lone (unpaired) high surrogate still raises — permanent divergence
+    try:
+        bad1: JsonValue = loads('"\\ud800"')
+        print("WRONG: accepted lone high surrogate")
+    except ValueError as eb1:
+        print("err: " + eb1)               # err: surrogate \uD800 is not supported
+
+    # a lone (unpaired) low surrogate still raises
+    try:
+        bad2: JsonValue = loads('"\\udc00"')
+        print("WRONG: accepted lone low surrogate")
+    except ValueError as eb2:
+        print("err: " + eb2)               # err: surrogate \uDC00 is not supported
+
+    # a high surrogate followed by a NON-surrogate \u escape: no pair, raises
+    # on the ORIGINAL high surrogate (the lookahead backs off cleanly)
+    try:
+        bad3: JsonValue = loads('"\\ud800\\u0041"')
+        print("WRONG: accepted mismatched surrogate lookahead")
+    except ValueError as eb3:
+        print("err: " + eb3)               # err: surrogate \uD800 is not supported
+
+    # ── NEW: dumps(indent=) pretty-printing ─────────────────────────────────────
+    arr: JsonValue = loads("[1, 2, 3]")
+    print(dumps(arr, 2))
+    # [
+    #   1,
+    #   2,
+    #   3
+    # ]
+
+    nested: JsonValue = loads('{"a": 1, "b": [1, 2, {"c": 3}], "d": {}}')
+    print(dumps(nested, 2, True))
+    # {
+    #   "a": 1,
+    #   "b": [
+    #     1,
+    #     2,
+    #     {
+    #       "c": 3
+    #     }
+    #   ],
+    #   "d": {}
+    # }
+
+    print(dumps(loads("[]"), 2))           # []  (empty array never gets interior newlines)
+    print(dumps(loads("{}"), 2))           # {}
+
+    # indent=0: newlines with zero-width padding (matches CPython's indent=0)
+    print(dumps(arr, 0))
+    # [
+    # 1,
+    # 2,
+    # 3
+    # ]
+
+    # a NEGATIVE indent clamps to 0 (matches CPython's indent=-5 behavior)
+    print(str(dumps(arr, 0) == dumps(arr, -5)))    # True
+
+    # indent=None (the default) is unchanged from the compact pre-upgrade form
+    print(str(dumps(arr) == dumps(arr, None)))     # True
+
+    # ── NEW: sort_keys=True on a multi-key object (deterministic vs raw dict
+    # iteration order, which is UNSPECIFIED in pyrst — see lib/json.pyrs header) ─
+    multi: JsonValue = loads('{"c": 3, "a": 1, "b": 2}')
+    print(dumps(multi, None, True))        # {"a": 1, "b": 2, "c": 3}
+
+    # ── pre-existing malformed-input error paths (unchanged) ───────────────────
+    try:
+        oops1: JsonValue = loads('{"a": "unterminated}')
+        print("WRONG: accepted unterminated string")
+    except ValueError as e1:
+        print("err: " + e1)                # err: unterminated string
+
+    try:
+        oops5: JsonValue = loads('01')
+        print("WRONG: accepted leading zero")
+    except ValueError as e5:
+        print("err: " + e5)                # err: invalid number: leading zero
+
+    try:
+        oops7: JsonValue = loads('99999999999999999999')
+        print("WRONG: accepted out-of-range int")
+    except ValueError as e7:
+        print("err: " + e7)                # err: integer out of range: 99999999999999999999
+
+    try:
+        oops8: JsonValue = loads('   ')
+        print("WRONG: accepted whitespace-only input")
+    except ValueError as e8:
+        print("err: " + e8)                # err: unexpected end of JSON input
+
+    try:
+        oops9: JsonValue = loads('1 2')
+        print("WRONG: accepted trailing garbage")
+    except ValueError as e9:
+        print("err: " + e9)                # err: trailing garbage at position 2
+
+    # ── HARDENING: edge cases added on independent re-review ───────────────────
+
+    # empty containers, nested-empty, single-element array
+    print(dumps(loads("[[], {}, [[]]]")))          # [[], {}, [[]]]
+    print(dumps(loads("[1]")))                     # [1]
+
+    # duplicate object keys: last value wins (both pyrst dict and CPython dict)
+    print(dumps(loads('{"a": 1, "a": 2}')))         # {"a": 2}
+
+    # negative zero (int and float forms) round-trip
+    print(dumps(loads("-0")))                       # 0
+    print(dumps(loads("-0.0")))                     # -0.0
+
+    # large exponent -> float overflow saturates to +-inf (same as CPython's own
+    # float parse); dumps must emit CPython's default (allow_nan=True) spelling
+    # `Infinity`/`-Infinity`, not Rust's `inf`/`-inf`
+    print(dumps(loads("1e400")))                    # Infinity
+    print(dumps(loads("-1e400")))                   # -Infinity
+
+    # a raw control character (U+0000) round-trips through loads/dumps as a
+    # RFC-8259-legal \u00XX escape, not an unescaped literal byte
+    nul: JsonValue = loads('"\\u0000"')
+    print(str(len(nul.as_str())))                   # 1
+    print(dumps(nul))                                # "\u0000" (escaped NUL)
+
+    # control chars whose hex has ALPHABETIC digits (a-f) exercise the review's
+    # casing fix: CPython json.dumps emits LOWER-case unicode escapes
+    # (json.dumps(chr(31)) yields the lowercase form ending in 'f'). The U+0000
+    # case above is all-numeric hex, so it never surfaced the upper-vs-lower bug.
+    # Built via json_str(chr(...)) to avoid a literal control byte in this file.
+    ctrls: JsonValue = json_str(chr(1) + chr(31) + chr(27))
+    print(str(len(ctrls.as_str())))                 # 3
+    print(dumps(ctrls))                             # lowercase escapes for 01/1f/1b
+    print(dumps(json_str(chr(27))))                 # U+001B ESC -> lowercase alpha hex 'b'
+
+    # empty-string document, bare scalar documents (no container)
+    print(dumps(loads('""')))                       # ""
+    print(dumps(loads("42")))                        # 42
+    print(dumps(loads("true")))                      # true
+
+    # indent applied to a bare (non-container) root value: no pretty-printing
+    # to do, output unchanged
+    print(dumps(loads("42"), 2))                     # 42
+    print(dumps(loads('"hi"'), 2))                   # "hi"
+    print(dumps(loads("null"), 4))                   # null
+
+    # sort_keys recurses into nested objects, not just the top level
+    print(dumps(loads('{"b": {"z": 1, "a": 2}, "a": 1}'), None, True))
+    # {"a": 1, "b": {"a": 2, "z": 1}}
+
+    print("done")

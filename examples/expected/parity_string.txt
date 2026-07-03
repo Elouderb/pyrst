@@ -1,0 +1,27 @@
+abcdefghijklmnopqrstuvwxyz
+ABCDEFGHIJKLMNOPQRSTUVWXYZ
+abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ
+0123456789
+0123456789abcdefABCDEF
+01234567
+!"#$%&'()*+,-./:;<=>?@[\]^_`{|}~
+[32, 9, 10, 13, 11, 12]
+6
+100
+0123456789
+abcdefghijklmnopqrstuvwxyz
+ABCDEFGHIJKLMNOPQRSTUVWXYZ
+!"#$%&'()*+,-./:;<=>?@[\]^_`{|}~
+Hello World
+The Quick Brown Fox
+
+Hello,World
+A,,B
+One-Two-Three
+
+Hello World
+Single
+A  B
+,A,B,
+A B C
+caught: empty separator

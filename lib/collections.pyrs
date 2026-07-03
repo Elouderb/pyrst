@@ -1,50 +1,94 @@
 # pyrst standard library — collections
 #
-# Pure-pyrst counting helpers over a `list[T]` whose elements are hashable (used
-# as dict keys, so the `T: Hash + Eq` bound is inferred — generics v2). Embedded
-# via `include_str!` (see `src/stdlib.rs`). Usable as either
-# `from collections import Counter` or `import collections;
-# collections.Counter(items)`.
+# Fidelity score: 4 (near drop-in). Pure-pyrst counting/queueing helpers over
+# generic `T`/`K`/`V` type params (dict keys use the inferred `Hash + Eq`
+# bound). Embedded via `include_str!` (see `src/stdlib.rs`). Usable as either
+# `from collections import Counter` or `import collections; collections.Counter(...)`.
 #
 # Public API:
-#   - `Counter(items)`        → a `dict[T, int]` mapping each distinct element to
-#     its number of occurrences. (CPython's `Counter` is a dict SUBCLASS; pyrst
-#     has no generic-class subclassing yet, so this batch models the counts as a
-#     plain `dict[T, int]`, which is what the useful operations need.)
-#   - `most_common(counts, n)` → the `n` highest-count `(element, count)` pairs as
-#     a `list[tuple[T, int]]`, ordered by count DESCENDING. This gives a
-#     DETERMINISTIC ordering even though dict iteration order is unspecified.
+#   Counter (function, unchanged since v0.1):
+#     - `Counter(items)`                    → `dict[T, int]` of element -> count.
+#     - `most_common(counts, n=-1)`         → top-`n` `(elem, count)` pairs, DESC
+#       by count; `n < 0` (the default) returns ALL entries (CPython's
+#       `most_common()` with no arg); `n == 0` returns `[]` (matches CPython).
+#       DETERMINISM (hardened, w1-hardener pass): ties are broken by ASCENDING
+#       key, not "first seen" — pyrst dict iteration walks a HashMap whose
+#       order is randomized PER PROCESS, so a naive first-seen tie-break would
+#       make output vary run-to-run for the identical binary on tied counts.
+#       Split into two private helpers (`_collections_pairs` /
+#       `_collections_top_n`) specifically because the generic-bound inference
+#       pass is annotation-blind for a freshly-declared `x: list[tuple[T,int]]
+#       = []` local — the same comparison written inline against that local
+#       fails to compile (rustc E0369, `T` missing `PartialOrd`) even though
+#       the identical comparison against a function PARAMETER of the same
+#       declared type compiles cleanly and infers the bound correctly. This is
+#       a confirmed compiler inference gap (not a design limitation), worked
+#       around here without touching the compiler. CPython instead preserves
+#       first-insertion order for ties; this is a documented shape divergence.
+#   Counter arithmetic / update (NEW — free functions, not operators/methods:
+#   `dict[T, int]` has no operator-overload or method-attachment point in
+#   pyrst, so this is a documented SHAPE divergence — method-not-operator,
+#   same class of divergence as `json`'s `v.get`/`v.at`):
+#     - `counter_update(counts, items)`      → in-place `+= 1` per item (`Mut`).
+#     - `counter_subtract(counts, items)`    → in-place `-= 1` per item (`Mut`,
+#       counts may go negative, matching CPython `Counter.subtract`).
+#     - `counter_add(a, b)`                  → sum of counts, POSITIVE entries only
+#       (matches CPython `Counter.__add__`).
+#     - `counter_sub(a, b)`                  → `a - b`, POSITIVE entries only
+#       (matches CPython `Counter.__sub__`).
+#     - `counter_and(a, b)`                  → min(a[k], b[k]), POSITIVE only
+#       (matches CPython `Counter.__and__`, set-intersection-of-multiplicities).
+#     - `counter_or(a, b)`                   → max(a[k], b[k]), POSITIVE only
+#       (matches CPython `Counter.__or__`).
+#     - `counter_total(counts)`              → sum of all counts (CPython
+#       `Counter.total()`, Python 3.10+).
+#     - `counter_elements(counts)`           → each key repeated `count` times.
+#       ORDER DIVERGENCE: CPython yields in first-insertion order; pyrst dict
+#       iteration order is unspecified (HashMap, randomized per process), so
+#       this yields in most-common-first (descending count, ties broken by
+#       ascending key — see `most_common`) order instead. This tie-break is
+#       REQUIRED for determinism, not cosmetic: pyrst dict `.items()` iteration
+#       order varies per process, so breaking ties by "whatever came first in
+#       iteration" would make output vary run-to-run for the SAME binary on
+#       tied counts. Documented, not silent; deterministic across runs.
 #
-# Implementation notes:
-#   - `Counter` increments via `counts.get(it, 0) + 1` rather than an `if it in
-#     counts` membership test: generics v2 infers bounds for comparison,
-#     equality, arithmetic, Display and Hash, but NOT for the `in` (contains)
-#     operator on a bare type parameter, so the `.get`-with-default form is the
-#     one that type-checks for a generic key.
-#   - `most_common` does a repeated max-selection (O(n*k) for k=n results), which
-#     is fine for the small n typical of "top-N" queries and keeps the ordering
-#     deterministic and the bound requirements minimal (only `>` on the int
-#     counts, no ordering bound on the keys themselves).
-#   - `deque` / `defaultdict` are generic CLASSES (Tier-2 batch 2), defined below.
-#     `namedtuple` / `OrderedDict` remain DEFERRED.
+# Generic classes (Tier-2 batch 2, rounded out this pass):
+#   - `deque[T]` → double-ended queue backed by a `list[T]`. O(1) at the right
+#     end (`append`/`pop`); O(n) at the left end (`appendleft`/`popleft`, a
+#     list shift) — a faithful API, not CPython's O(1)-both-ends complexity.
+#     NEW this pass: `set_maxlen`, `rotate`, `extend`, `extendleft`, `count`,
+#     `remove`, `clear`.
+#     - `set_maxlen(n)`: CPython's `maxlen` is a CONSTRUCTOR keyword
+#       (`deque(iterable, maxlen=n)`); pyrst's zero-arg `deque()` + default-arg
+#       lowering in a generic `__init__` does not thread a default through the
+#       zero-arg call site (compiler gap, not a language-design limit) — so
+#       `maxlen` is set post-construction: `d: deque[int] = deque();
+#       d.set_maxlen(3)`. Calling it immediately after construction (before any
+#       append) is semantically equivalent to CPython's constructor kwarg.
+#       Setting it trims existing overflow from the LEFT, matching CPython.
+#     - `rotate(n)`: n>0 rotates right (last `n` to the front), n<0 rotates
+#       left; matches CPython `deque.rotate`.
+#     - `remove(x)` raises `ValueError` if `x` is not present (matches CPython).
+#   - `defaultdict[K, V]` → dict that materialises a missing key's value from a
+#     zero-arg `default_factory: Callable[[], V]` on `get`. NOT a `dict`
+#     subclass (no generic-class subclassing); the useful operations are
+#     methods over a `data: dict[K, V]` field. NEW this pass (rounding out the
+#     dict-method surface): `pop`, `setdefault`, `update`, `keys`, `values`,
+#     `items`, `clear`. `pop` raises `KeyError` on a missing key (CPython
+#     `dict.pop` semantics — it does NOT consult `default_factory`, matching
+#     CPython: only `__getitem__`/`get`-style access triggers the factory).
 #
-# Generic classes (batch 2):
-#   - `deque[T]`        → a double-ended queue backed by a `list[T]`. O(1) at the
-#     right end (`append`/`pop`); the left end (`appendleft`/`popleft`) is O(n)
-#     because it shifts the backing `list` — pyrst has no ring buffer, so this is
-#     a faithful API, not CPython's O(1)-both-ends complexity. Empty `pop`/
-#     `popleft`/`peek`/`peekleft` panic via the backing `list.pop` on empty (an
-#     `IndexError`-style panic), matching pyrst's `list.pop()` on empty.
-#   - `defaultdict[K, V]` → a dict that materialises a missing key's value from a
-#     zero-arg `default_factory: Callable[[], V]` on `get`. `K` is hashable
-#     (`Hash + Eq`, inferred from the `dict[K, V]` field + the `key in self.data`
-#     membership test). NOT a `dict` subclass (pyrst has no generic-class
-#     subclassing); the useful operations are exposed as methods over a `data`
-#     field.
+# Deferred (not in this pass): `namedtuple` (needs G4 `**kwargs`/G8 codegen for
+# a lightweight record type), `OrderedDict` (plain `dict` + the already-stated
+# order divergence make a distinct class low-value until G3/G8 land),
+# `ChainMap` (straightforward but out of the scoped delta for this pass — see
+# card 04252875 notes: Counter arithmetic/update, deque maxlen/rotate/extend,
+# defaultdict surface).
 #
-# Instantiation note: explicit `Class[targs]()` is gated, so a typed binding
-# drives the type args via inference: `d: deque[int] = collections.deque()` and
-# `dd: defaultdict[str, int] = collections.defaultdict(lambda: 0)`.
+# Instantiation note (unchanged): explicit `Class[targs]()` is gated, so a
+# typed binding drives the type args via inference: `d: deque[int] =
+# collections.deque()` and `dd: defaultdict[str, int] =
+# collections.defaultdict(lambda: 0)`.
 
 
 def Counter[T](items: list[T]) -> dict[T, int]:
@@ -54,38 +98,181 @@ def Counter[T](items: list[T]) -> dict[T, int]:
     return counts
 
 
-def most_common[T](counts: dict[T, int], n: int) -> list[tuple[T, int]]:
+def _collections_pairs[T](counts: dict[T, int]) -> list[tuple[T, int]]:
     pairs: list[tuple[T, int]] = []
     for k, v in counts.items():
         pairs.append((k, v))
+    return pairs
+
+
+def _collections_top_n[T](pairs: list[tuple[T, int]], limit: int) -> list[tuple[T, int]]:
+    # NOTE (determinism, documented in module header): `counts.items()` walks a
+    # HashMap whose iteration order is randomized PER PROCESS, so ties must be
+    # broken on something other than "first seen in iteration order" or the tie
+    # order would vary from run to run of the SAME binary. We break ties by
+    # ascending `T` (requires `T: PartialOrd` — this helper takes `pairs` as a
+    # PARAMETER rather than an in-function `[]` literal specifically so the
+    # compiler's generic-bound inference, which is annotation-blind for a
+    # freshly-declared empty-literal local, sees the `T` comparison and adds
+    # the bound; see `most_common` below). CPython instead preserves
+    # first-insertion order for ties; this is a documented shape divergence,
+    # not a bug — deterministic across runs, not identical to CPython's order.
+    total: int = len(pairs)
+    used: list[bool] = []
+    i: int = 0
+    while i < total:
+        used.append(False)
+        i = i + 1
     result: list[tuple[T, int]] = []
     taken: int = 0
-    while taken < n and len(pairs) > 0:
-        best: int = 0
-        scan: int = 1
-        while scan < len(pairs):
-            if pairs[scan][1] > pairs[best][1]:
-                best = scan
+    while taken < limit and taken < total:
+        best: int = -1
+        scan: int = 0
+        while scan < total:
+            if not used[scan]:
+                if best < 0:
+                    best = scan
+                elif pairs[scan][1] > pairs[best][1]:
+                    best = scan
+                elif pairs[scan][1] == pairs[best][1] and pairs[scan][0] < pairs[best][0]:
+                    best = scan
             scan = scan + 1
+        used[best] = True
         result.append(pairs[best])
-        pairs.pop(best)
         taken = taken + 1
     return result
+
+
+def most_common[T](counts: dict[T, int], n: int = -1) -> list[tuple[T, int]]:
+    pairs: list[tuple[T, int]] = _collections_pairs(counts)
+    limit: int = n
+    if limit < 0:
+        limit = len(pairs)
+    return _collections_top_n(pairs, limit)
+
+
+def counter_update[T](counts: Mut[dict[T, int]], items: list[T]) -> None:
+    for it in items:
+        counts[it] = counts.get(it, 0) + 1
+
+
+def counter_subtract[T](counts: Mut[dict[T, int]], items: list[T]) -> None:
+    for it in items:
+        counts[it] = counts.get(it, 0) - 1
+
+
+def _collections_positive[T](counts: dict[T, int]) -> dict[T, int]:
+    result: dict[T, int] = {}
+    for k, v in counts.items():
+        if v > 0:
+            result[k] = v
+    return result
+
+
+def _collections_clone[T](counts: dict[T, int]) -> dict[T, int]:
+    # A shallow copy of `counts` (the identical 3-line seed loop shared by
+    # counter_add/counter_sub/counter_or), factored out mirroring
+    # `_collections_positive`.
+    result: dict[T, int] = {}
+    for k, v in counts.items():
+        result[k] = v
+    return result
+
+
+def counter_add[T](a: dict[T, int], b: dict[T, int]) -> dict[T, int]:
+    merged: dict[T, int] = _collections_clone(a)
+    for k, v in b.items():
+        merged[k] = merged.get(k, 0) + v
+    return _collections_positive(merged)
+
+
+def counter_sub[T](a: dict[T, int], b: dict[T, int]) -> dict[T, int]:
+    merged: dict[T, int] = _collections_clone(a)
+    for k, v in b.items():
+        merged[k] = merged.get(k, 0) - v
+    return _collections_positive(merged)
+
+
+def counter_and[T](a: dict[T, int], b: dict[T, int]) -> dict[T, int]:
+    merged: dict[T, int] = {}
+    for k, v in a.items():
+        if k in b:
+            merged[k] = min(v, b.get(k, 0))
+    return _collections_positive(merged)
+
+
+def counter_or[T](a: dict[T, int], b: dict[T, int]) -> dict[T, int]:
+    merged: dict[T, int] = _collections_clone(a)
+    for k, v in b.items():
+        cur: int = merged.get(k, 0)
+        if v > cur:
+            merged[k] = v
+    return _collections_positive(merged)
+
+
+def counter_total[T](counts: dict[T, int]) -> int:
+    total: int = 0
+    for v in counts.values():
+        total = total + v
+    return total
+
+
+def counter_elements[T](counts: dict[T, int]) -> list[T]:
+    # Descending-by-count order (see module header ORDER DIVERGENCE note).
+    ordered: list[tuple[T, int]] = most_common(counts, len(counts))
+    out: list[T] = []
+    for pair in ordered:
+        k: T = pair[0]
+        n: int = pair[1]
+        i: int = 0
+        while i < n:
+            out.append(k)
+            i = i + 1
+    return out
 
 
 class deque[T]:
     # A double-ended queue over a `list[T]`. `append`/`pop` act on the right end
     # (O(1)); `appendleft`/`popleft` act on the left end (O(n), a list shift).
     items: list[T]
+    maxlen: int
 
     def __init__(self) -> None:
         self.items = []
+        self.maxlen = -1
+
+    def set_maxlen(self, n: int) -> None:
+        # See module header: maxlen is applied post-construction (compiler
+        # gap around default-arg lowering in a generic zero-arg __init__).
+        self.maxlen = n
+        while self.maxlen >= 0 and len(self.items) > self.maxlen:
+            self.items.pop(0)
+
+    def _enforce_maxlen_right(self) -> None:
+        if self.maxlen >= 0 and len(self.items) > self.maxlen:
+            self.items.pop(0)
+
+    def _enforce_maxlen_left(self) -> None:
+        if self.maxlen >= 0 and len(self.items) > self.maxlen:
+            self.items.pop()
 
     def append(self, x: T) -> None:
         self.items.append(x)
+        self._enforce_maxlen_right()
 
     def appendleft(self, x: T) -> None:
         self.items.insert(0, x)
+        self._enforce_maxlen_left()
+
+    def extend(self, xs: list[T]) -> None:
+        for x in xs:
+            self.append(x)
+
+    def extendleft(self, xs: list[T]) -> None:
+        # CPython appendlefts one at a time, so the result is the REVERSE of
+        # the input order.
+        for x in xs:
+            self.appendleft(x)
 
     def pop(self) -> T:
         # Remove + return the RIGHTMOST element. Empty -> list.pop() on empty
@@ -104,6 +291,40 @@ class deque[T]:
         # The leftmost element WITHOUT removing it.
         return self.items[0]
 
+    def rotate(self, n: int) -> None:
+        # n > 0 rotates right (last n elements move to the front); n < 0
+        # rotates left. Matches CPython `deque.rotate`.
+        ln: int = len(self.items)
+        if ln == 0:
+            return
+        steps: int = n % ln
+        i: int = 0
+        while i < steps:
+            x: T = self.items.pop()
+            self.items.insert(0, x)
+            i = i + 1
+
+    def count(self, x: T) -> int:
+        # Delegate to the backing list's own `count` (identical semantics).
+        return self.items.count(x)
+
+    def remove(self, x: T) -> None:
+        # DELIBERATE non-delegation (not `self.items.remove(x)`): the list
+        # builtin's not-found message is NOT CPython-faithful for a deque,
+        # whereas CPython's `deque.remove` raises the exact
+        # ValueError("deque.remove(x): x not in deque") below. The hand-rolled
+        # scan preserves that message for fidelity.
+        i: int = 0
+        while i < len(self.items):
+            if self.items[i] == x:
+                self.items.pop(i)
+                return
+            i = i + 1
+        raise ValueError("deque.remove(x): x not in deque")
+
+    def clear(self) -> None:
+        self.items = []
+
     def size(self) -> int:
         return len(self.items)
 
@@ -112,9 +333,10 @@ class deque[T]:
 
 
 class defaultdict[K, V]:
-    # A dict that fills a missing key from a zero-arg factory on `get`. Backed by
-    # a `data: dict[K, V]` plus the `default_factory`. `K` is hashable (inferred
-    # `Hash + Eq` from the dict field + the `key in self.data` membership test).
+    # A dict that fills a missing key from a zero-arg factory on `get`. Backed
+    # by a `data: dict[K, V]` plus the `default_factory`. `K` is hashable
+    # (inferred `Hash + Eq` from the dict field + the `key in self.data`
+    # membership test).
     data: dict[K, V]
     default_factory: Callable[[], V]
 
@@ -133,6 +355,34 @@ class defaultdict[K, V]:
 
     def set(self, key: K, value: V) -> None:
         self.data[key] = value
+
+    def setdefault(self, key: K, default: V) -> V:
+        # Unlike `get`, does NOT consult `default_factory` — matches CPython
+        # `dict.setdefault` (factory is only for missing-key `__getitem__`).
+        if key in self.data:
+            return self.data[key]
+        self.data[key] = default
+        return default
+
+    def pop(self, key: K) -> V:
+        # Raises KeyError on a missing key; does NOT consult `default_factory`
+        # (matches CPython `dict.pop`).
+        return self.data.pop(key)
+
+    def update(self, other: dict[K, V]) -> None:
+        self.data.update(other)
+
+    def keys(self) -> list[K]:
+        return self.data.keys()
+
+    def values(self) -> list[V]:
+        return self.data.values()
+
+    def items(self) -> list[tuple[K, V]]:
+        return self.data.items()
+
+    def clear(self) -> None:
+        self.data.clear()
 
     def contains(self, key: K) -> bool:
         return key in self.data

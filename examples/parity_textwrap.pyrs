@@ -1,0 +1,64 @@
+# parity_textwrap.pyrs — dual-run CPython parity golden for stdlib `textwrap`.
+#
+# This file is executed BOTH by the pyrst binary and, unmodified (harness
+# prepends `from __future__ import annotations`), by real python3 — under
+# python3, `import textwrap` / `from textwrap import shorten` resolve to the
+# REAL CPython textwrap module, so this is a genuine oracle comparison, not
+# a self-check.
+#
+# Scope: the part of the upgraded surface that is positionally compatible
+# with CPython's actual signatures (`wrap(text, width=70, **kwargs)`,
+# `fill(text, width=70, **kwargs)`, `shorten(text, width, **kwargs)`,
+# `indent(text, prefix, predicate=None)`, `dedent(text)`). CPython's `wrap`/
+# `fill`/`shorten` only accept `text`/`width` positionally — every other
+# option (`initial_indent`, `subsequent_indent`, `break_long_words`,
+# `placeholder`, ...) is keyword-only in real CPython. This build's codegen
+# only threads named keyword-call bindings correctly into class
+# constructors (a plain/cross-module keyword call either hard-errors or
+# silently substitutes the parameter's default — see lib/textwrap.pyrs
+# header), so a single shared source cannot pass those options identically
+# to both engines. Those options are therefore verified pyrst-side only,
+# in examples/stdlib_textwrap.pyrs (checked by hand against python3
+# one-off snippets during development — see notes), not in this dual-run
+# file.
+#
+# This file DOES verify, byte-for-byte against real CPython, the biggest
+# behavioral upgrade: `shorten`'s default placeholder is now `" [...]"`
+# (CPython's actual default), replacing the v1 module's fixed `" ..."`.
+import textwrap
+from textwrap import shorten
+
+
+def main() -> None:
+    # wrap / fill: plain positional (text, width) — unchanged core algorithm.
+    sentence: str = "the quick brown fox jumps over the lazy dog"
+    print(textwrap.wrap(sentence, 20))
+    print(textwrap.wrap(sentence, 15))
+    print(textwrap.fill(sentence, 20))
+
+    # shorten: default placeholder now matches CPython's " [...]" exactly.
+    print(shorten("a b c d e f g h", 10))
+    print(shorten("one two three", 100))
+    print(textwrap.shorten("supercalifragilisticexpialidocious", 10))
+
+    # indent / dedent: unchanged, still parity-verified.
+    print(textwrap.indent("alpha\nbeta\ngamma", "> "))
+    print(textwrap.dedent("    x\n    y\n      z"))
+    print(textwrap.dedent("  one\n\n  two\n  three"))
+
+    # --- Hardening: edge cases (empty/whitespace input, exact-width ties,
+    # long-word splitting, unicode, empty prefix/dedent) ---
+    print(textwrap.wrap("", 10))
+    print(textwrap.wrap("   ", 10))
+    print(textwrap.wrap("word", 4))
+    print(textwrap.wrap("word", 3))
+    print(textwrap.fill("", 10))
+    print(textwrap.wrap("supercalifragilisticexpialidocious", 10))
+    print(shorten("", 10))
+    print(shorten("   ", 10))
+    print(shorten("a b c d e f g h", 100))
+    print(textwrap.wrap("café naïve fromage", 5))
+    print(textwrap.dedent(""))
+    print(textwrap.dedent("\t\tx\n\t\ty"))
+    print(textwrap.indent("", "> "))
+    print(textwrap.indent("a\n\nb", "> "))

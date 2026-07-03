@@ -1,19 +1,70 @@
 # pyrst standard library — os
 #
-# Starter `os` module: a handful of deterministic, Phase-1 `@extern` bindings
-# over Rust std (`std::env`, `std::path`, `std::fs`). This file is EMBEDDED into
+# Fidelity-upgrade pass (card 97260dad, docs/design/stdlib-full.md §D row
+# "os"): fidelity score 3/5. A handful of deterministic `@extern` bindings
+# over Rust std (`std::env`, `std::path`, `std::fs`, `std::process`) plus one
+# `@crate("getrandom", ...)` binding for `urandom`. This file is EMBEDDED into
 # the pyrst compiler binary via `include_str!` (see `src/stdlib.rs`), so it
 # travels with the binary and needs no filesystem install.
 #
-# Phase-1 limits (see docs/design/stdlib-outline.md):
-#   - Only `from os import f; f()` is supported. Qualified `os.f()` is a separate
-#     deferred card and is NOT available yet.
+# Surface (this pass adds `walk`, `stat`/`stat_result`, `getpid`, `rename`,
+# `rmdir`, `makedirs`, the `sep`/`linesep` consts, and `urandom` on top of the
+# original 12 `@extern` bindings):
+#   getenv, getcwd, basename, path_exists, read_file, write_file, join,
+#   dirname, isfile, isdir, listdir, mkdir, remove, walk, stat, stat_result,
+#   getpid, rename, rmdir, makedirs, urandom, sep, linesep.
+#
+# Limits (see docs/design/stdlib-outline.md and stdlib-full.md §D):
+#   - Only `from os import f; f()` is supported. Qualified `os.f()` / a
+#     faithful `os.path` submodule needs dotted-submodule support and is
+#     DEFERRED to **G3** (docs/design/stdlib-full.md row 174/209). Until then
+#     the path-shaped API stays flattened under `os` (e.g. `os.join` instead
+#     of `os.path.join`), exactly as it was before this pass.
+#   - `os.environ` (mutable-mapping) is DEFERRED to **G2** (no module-level
+#     mutable state yet). `getenv` (read-only, already shipped) is unaffected.
 #   - `str` is an owned `String` in pyrst, so std functions that take `&str` /
 #     `&Path` need the `&{p}` borrow glue in the template (the binding author
 #     writes the boundary glue; rustc validates the template at build time).
 #   - Errors: a Rust `Result` is unwrapped in the template here, so a failed
-#     `read_file` / `write_file` surfaces as a panic (a pyrst exception). A
+#     `read_file` / `write_file` / `stat` / `rename` / `rmdir` / `mkdir` /
+#     `remove` surfaces as a panic (a pyrst exception), matching CPython's
+#     `OSError`-family behavior in spirit but not in exact exception type. A
 #     future nicety maps `Result` to `Optional[T]` / typed exceptions.
+#   - `sep` / `linesep` are hardcoded to POSIX values ("/", "\n"). pyrst only
+#     targets POSIX today, so no `os.name`/Windows branch is provided; this is
+#     a documented, permanent divergence should a Windows target ever exist.
+#   - `stat_result` exposes only `st_size` (bytes, int) and `st_mtime`
+#     (seconds since epoch, float) — the two fields nearly every real program
+#     actually reads. CPython's full `st_mode`/`st_ino`/`st_dev`/... bitfield
+#     surface is NOT modeled (no bit-level `stat.S_IS*` module either); this
+#     is a documented partial-fidelity divergence, not a bug.
+#   - `urandom(n)` returns `list[int]` (each 0..=255), NOT a `bytes` object —
+#     pyrst has no `bytes` type. The VALUES are inherently non-deterministic
+#     (real CSPRNG output via the `getrandom` crate), so `urandom` is
+#     necessarily a **pyrst-only** parity case: the golden test asserts
+#     `len(...)` and the 0..=255 range only, never exact bytes.
+#   - `walk` implements `os.walk(top)` with CPython's default `topdown=True`
+#     order (yields `(dirpath, dirnames, filenames)` for `top` itself first,
+#     then recurses into each subdirectory in the order `listdir` returns
+#     them). `topdown=False`, `onerror=`, and `followlinks=` are NOT
+#     implemented (default-args-only surface, matching the row's target).
+#     `listdir` order is OS/filesystem-dependent (exactly like CPython's), so
+#     the golden test sorts collected `walk` results before printing.
+#   - `urandom(n)` with a negative `n` raises an explicit "ValueError: negative
+#     argument not allowed" panic (guarded in the template) instead of letting
+#     the negative-to-usize cast blow up as a raw `Vec` "capacity overflow"
+#     panic; matches CPython's `ValueError` in spirit (still a generic pyrst
+#     panic, not a typed exception class — see the unwrap-panic note above).
+#   - PRE-EXISTING divergence, not touched by this pass (documented here for
+#     hardening-pass honesty, hardener review of card 97260dad): `basename`/
+#     `dirname` wrap Rust's `std::path::Path` component logic, which differs
+#     from CPython's pure string-splitting `os.path.basename`/`dirname` on a
+#     few edge inputs — e.g. `basename("/tmp/foo/")` is `"foo"` in pyrst vs
+#     `""` in CPython (Rust drops a trailing separator before taking the final
+#     component), and `basename(".")`/`basename("..")` are `""` in pyrst (Rust
+#     does not treat `.`/`..` as a file-name component) vs `"."`/`".."` in
+#     CPython. Out of this card's scope (the row targets only the 9 new
+#     bindings; `basename`/`dirname` are unchanged), flagged for a future pass.
 
 
 @extern
@@ -85,3 +136,75 @@ def mkdir(p: str) -> None:
 @extern
 def remove(p: str) -> None:
     "std::fs::remove_file(&{p}).unwrap()"
+
+
+# --- Fidelity-upgrade additions (card 97260dad) ------------------------------
+# Closes every non-gated delta from docs/design/stdlib-full.md §D row "os":
+# `walk`, `stat`/`stat_result`, `getpid`, `rename`, `rmdir`, `makedirs`,
+# `sep`/`linesep` consts, `urandom`. `os.path` (G3) and `os.environ` mutation
+# (G2) remain deferred — see the module header.
+
+
+sep: str = "/"
+linesep: str = "\n"
+
+
+@extern
+def getpid() -> int:
+    "std::process::id() as i64"
+
+
+@extern
+def rename(src: str, dst: str) -> None:
+    "std::fs::rename(&{src}, &{dst}).unwrap()"
+
+
+@extern
+def rmdir(p: str) -> None:
+    "std::fs::remove_dir(&{p}).unwrap()"
+
+
+@extern
+def makedirs(name: str, exist_ok: bool = False) -> None:
+    "{ if !{exist_ok} && std::path::Path::new(&{name}).is_dir() { panic!(\"FileExistsError: {}\", {name}); } std::fs::create_dir_all(&{name}).unwrap(); }"
+
+
+@crate("getrandom", "0.2")
+@extern
+def urandom(n: int) -> list[int]:
+    "{ if {n} < 0 { panic!(\"ValueError: negative argument not allowed\"); } let mut buf = vec![0u8; {n} as usize]; getrandom::getrandom(&mut buf).unwrap(); buf.into_iter().map(|b| b as i64).collect::<Vec<i64>>() }"
+
+
+class stat_result:
+    st_size: int
+    st_mtime: float
+
+    def __init__(self, st_size: int, st_mtime: float) -> None:
+        self.st_size = st_size
+        self.st_mtime = st_mtime
+
+
+@extern
+def _os_stat_raw(p: str) -> tuple[int, float]:
+    "{ let m = std::fs::metadata(&{p}).unwrap(); let sz = m.len() as i64; let mt = m.modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64(); (sz, mt) }"
+
+
+def stat(p: str) -> stat_result:
+    sz, mt = _os_stat_raw(p)
+    return stat_result(sz, mt)
+
+
+def walk(top: str) -> Iterator[tuple[str, list[str], list[str]]]:
+    entries: list[str] = listdir(top)
+    dirs: list[str] = []
+    files: list[str] = []
+    for e in entries:
+        full: str = join(top, e)
+        if isdir(full):
+            dirs.append(e)
+        else:
+            files.append(e)
+    yield (top, dirs, files)
+    for d in dirs:
+        for item in walk(join(top, d)):
+            yield item

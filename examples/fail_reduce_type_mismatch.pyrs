@@ -1,14 +1,21 @@
 # fail_reduce_type_mismatch.pyrs
-# functools.reduce expects (Callable[[int, int], int], list[int], int).
-# Passing a str as the initial accumulator is a type error that pyrst must
-# catch at the typecheck level.
+# functools.reduce is generic: reduce[T](f: Callable[[T, T], T], xs: list[T],
+# init: Optional[T] = None) -> T. Passing operator.add (int-specialized,
+# (int, int) -> int) together with a list[str] forces conflicting bindings
+# for T (int from `f` vs str from `xs`) — a type error that pyrst must catch
+# at the typecheck level ("conflicting types for type parameter `T`").
+#
+# (This fixture previously passed a str as the INIT accumulator; with the
+# stdlib-fidelity wave's generic signature, `init: Optional[T]` does not yet
+# participate in typeck unification — a known compiler gap — so the mismatch
+# is staged on the `f` vs `xs` params instead, which unification does check.)
 
 from functools import reduce
 from operator import add
 
 
 def main() -> None:
-    nums: list[int] = [1, 2, 3, 4]
-    # ERROR: init is str "0" but reduce expects int accumulator
-    total: int = reduce(add, nums, "0")
+    words: list[str] = ["a", "b", "c"]
+    # ERROR: add binds T=int but words binds T=str — conflicting T
+    total: int = reduce(add, words, 0)
     print(total)

@@ -1,0 +1,75 @@
+Ann
+30
+a
+2
+True
+True
+["a", "b"]
+True
+True
+False
+5
+True
+[1, 2, [3, 4], {"x": [true, false, null]}]
+3.14
+1500.0
+-17
+"a\"b"
+café
+1
+True
+"😀"
+err: surrogate \uD800 is not supported
+err: surrogate \uDC00 is not supported
+err: surrogate \uD800 is not supported
+[
+  1,
+  2,
+  3
+]
+{
+  "a": 1,
+  "b": [
+    1,
+    2,
+    {
+      "c": 3
+    }
+  ],
+  "d": {}
+}
+[]
+{}
+[
+1,
+2,
+3
+]
+True
+True
+{"a": 1, "b": 2, "c": 3}
+err: unterminated string
+err: invalid number: leading zero
+err: integer out of range: 99999999999999999999
+err: unexpected end of JSON input
+err: trailing garbage at position 2
+[[], {}, [[]]]
+[1]
+{"a": 2}
+0
+-0.0
+Infinity
+-Infinity
+1
+"\u0000"
+3
+"\u0001\u001f\u001b"
+"\u001b"
+""
+42
+true
+42
+"hi"
+null
+{"a": 1, "b": {"a": 2, "z": 1}}
+done

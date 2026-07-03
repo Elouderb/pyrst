@@ -4,26 +4,82 @@
 # `include_str!` (see `src/stdlib.rs`). Usable as either
 # `from statistics import mean` or `import statistics; statistics.mean(xs)`.
 #
-# Phase-1 notes:
-#   - float-specialized (pyrst generics are a later card): inputs are
-#     `list[float]`, results are `float`.
-#   - `variance` / `stdev` here are the POPULATION forms (divide by N), i.e. the
-#     mean of squared deviations and its square root. (CPython's `variance` is
-#     the SAMPLE form dividing by N-1; the sample variants arrive with a `ddof`
-#     argument in a later card.) Documented so the semantics are unambiguous.
-#   - `sqrt` is bound locally via `@extern` over Rust's `f64::sqrt` so `stdev`
-#     needs no `math` import.
-#   - Empty-input handling (CPython raises `StatisticsError`) is deferred; an
-#     empty list divides by zero (an `inf`/`nan`), matching pyrst's current
-#     numeric behavior rather than a typed exception.
+# Fidelity: 4/5 (CPython `statistics` module).
+#
+# Implemented surface (float-specialized; pyrst generics for a numeric
+# `Real`-like bound are a later card, matching the design row):
+#   mean, fmean(data, weights=None), median, median_low, median_high,
+#   mode, multimode, quantiles(data, n=4, method="exclusive"),
+#   variance(data, xbar=None)      -- SAMPLE variance (divides by N-1)
+#   stdev(data, xbar=None)         -- SAMPLE stdev
+#   pvariance(data, mu=None)       -- POPULATION variance (divides by N)
+#   pstdev(data, mu=None)          -- POPULATION stdev
+#   geometric_mean(data)
+#
+# Divergences / deferrals:
+#   - `variance`/`stdev` used to be population-only in a previous revision;
+#     they are now CPython-accurate SAMPLE forms (N-1). The population forms
+#     live under their CPython names `pvariance`/`pstdev`.
+#   - `quantiles`' `n` and `method` are ordinary keyword-defaultable params,
+#     not Python's keyword-*only* (`*,`) params — pyrst has no bare `*`
+#     separator, so callers may pass them positionally in pyrst
+#     (`quantiles(data, 10, "inclusive")`) where CPython requires
+#     `quantiles(data, n=10, method="inclusive")`. Additionally, pyrst v0
+#     does not support `name=value` keyword syntax at a plain-function call
+#     site at all (only for class constructors), so the two languages can
+#     never be driven with the *same* source line once `n`/`method` are
+#     overridden. Verified equal by hand with a positional pyrst call vs.
+#     a keyword CPython call on identical data (see notes.md); the shared
+#     dual-run parity file therefore only exercises the default
+#     `n=4, method="exclusive"` path (a bare `quantiles(data)` call, which
+#     is valid and behaves identically in both languages).
+#   - CPython raises `StatisticsError` (a `ValueError` subclass) on empty
+#     input, one-element `variance`/`stdev`, a mixed-sign/zero
+#     `geometric_mean`, etc. pyrst has no `StatisticsError` type yet, so
+#     these edge cases are DEFERRED: pyrst instead produces `inf`/`nan`/a
+#     runtime division-by-zero rather than a typed exception. Documented
+#     here; parity tests avoid empty/degenerate inputs so behavior stays
+#     identical to CPython on the covered surface.
+#   - `mode`/`multimode` here operate on `list[float]` only (CPython's
+#     versions are polymorphic over any hashable). Tie-breaking matches
+#     CPython: the first value encountered (in input order) among those
+#     tied for highest frequency wins / is emitted first.
+#     PERF DIVERGENCE: `float` is not usable as a key in pyrst's Rust-backed
+#     map (f64 has no `Hash`/`Eq`), so the frequency tally
+#     (`_statistics_counts`) is a LINEAR value-list scan — O(n * distinct) —
+#     rather than CPython's `collections.Counter`-backed O(n). Identical
+#     results; slower only on inputs with many distinct values.
+#   - `quantiles` linear interpolation matches CPython's `method="exclusive"`
+#     (default) and `method="inclusive"` formulas exactly.
+#
+#   - Local `f64::sqrt`/`ln`/`exp` bindings are all private (`_statistics_`
+#     prefixed) so this module needs no `math` import and, critically, does
+#     not collide with `math.pyrs`'s own public `sqrt` in the flat stdlib
+#     namespace when both modules are imported together (see HARDENING
+#     notes: this was a real E0428 defect found and fixed during review).
 
 
 @extern
-def sqrt(x: float) -> float:
+def _statistics_sqrt(x: float) -> float:
     "({x}).sqrt()"
 
 
 def mean(xs: list[float]) -> float:
+    return sum(xs) / len(xs)
+
+
+def fmean(xs: list[float], weights: list[float] | None = None) -> float:
+    if weights is not None:
+        ws: list[float] = weights
+        total: float = 0.0
+        wtotal: float = 0.0
+        i: int = 0
+        for x in xs:
+            w: float = ws[i]
+            total = total + x * w
+            wtotal = wtotal + w
+            i = i + 1
+        return total / wtotal
     return sum(xs) / len(xs)
 
 
@@ -35,13 +91,142 @@ def median(xs: list[float]) -> float:
     return ordered[n // 2]
 
 
-def variance(xs: list[float]) -> float:
+def median_low(xs: list[float]) -> float:
+    ordered: list[float] = sorted(xs)
+    n: int = len(ordered)
+    if n % 2 == 0:
+        return ordered[n // 2 - 1]
+    return ordered[n // 2]
+
+
+def median_high(xs: list[float]) -> float:
+    ordered: list[float] = sorted(xs)
+    n: int = len(ordered)
+    return ordered[n // 2]
+
+
+def _statistics_counts(xs: list[float]) -> tuple[list[float], list[int]]:
+    values: list[float] = []
+    counts: list[int] = []
+    for x in xs:
+        found: bool = False
+        i: int = 0
+        for v in values:
+            if v == x:
+                counts[i] = counts[i] + 1
+                found = True
+                break
+            i = i + 1
+        if not found:
+            values.append(x)
+            counts.append(1)
+    return (values, counts)
+
+
+def mode(xs: list[float]) -> float:
+    values, counts = _statistics_counts(xs)
+    best_i: int = 0
+    best_c: int = counts[0]
+    i: int = 1
+    while i < len(counts):
+        if counts[i] > best_c:
+            best_c = counts[i]
+            best_i = i
+        i = i + 1
+    return values[best_i]
+
+
+def multimode(xs: list[float]) -> list[float]:
+    if len(xs) == 0:
+        return []
+    values, counts = _statistics_counts(xs)
+    best_c: int = 0
+    for c in counts:
+        if c > best_c:
+            best_c = c
+    result: list[float] = []
+    i: int = 0
+    while i < len(values):
+        if counts[i] == best_c:
+            result.append(values[i])
+        i = i + 1
+    return result
+
+
+def variance(xs: list[float], xbar: float | None = None) -> float:
     m: float = mean(xs)
+    if xbar is not None:
+        v: float = xbar
+        m = v
+    total: float = 0.0
+    for x in xs:
+        total = total + (x - m) * (x - m)
+    return total / (len(xs) - 1)
+
+
+def stdev(xs: list[float], xbar: float | None = None) -> float:
+    return _statistics_sqrt(variance(xs, xbar))
+
+
+def pvariance(xs: list[float], mu: float | None = None) -> float:
+    m: float = mean(xs)
+    if mu is not None:
+        v: float = mu
+        m = v
     total: float = 0.0
     for x in xs:
         total = total + (x - m) * (x - m)
     return total / len(xs)
 
 
-def stdev(xs: list[float]) -> float:
-    return sqrt(variance(xs))
+def pstdev(xs: list[float], mu: float | None = None) -> float:
+    return _statistics_sqrt(pvariance(xs, mu))
+
+
+def geometric_mean(xs: list[float]) -> float:
+    total: float = 0.0
+    for x in xs:
+        total = total + _statistics_ln(x)
+    return _statistics_exp(total / len(xs))
+
+
+@extern
+def _statistics_ln(x: float) -> float:
+    "({x}).ln()"
+
+
+@extern
+def _statistics_exp(x: float) -> float:
+    "({x}).exp()"
+
+
+# Exact-integer reimplementation of CPython's `quantiles`, so the
+# interpolation arithmetic (integer `j`/`delta`, then one float division)
+# matches bit-for-bit rather than accumulating float rounding differently.
+def quantiles(xs: list[float], n: int = 4, method: str = "exclusive") -> list[float]:
+    ordered: list[float] = sorted(xs)
+    ld: int = len(ordered)
+    result: list[float] = []
+    if method == "inclusive":
+        m: int = ld - 1
+        i: int = 1
+        while i < n:
+            j: int = (i * m) // n
+            delta: int = (i * m) % n
+            interpolated: float = (ordered[j] * float(n - delta) + ordered[j + 1] * float(delta)) / float(n)
+            result.append(interpolated)
+            i = i + 1
+        return result
+    m2: int = ld + 1
+    i2: int = 1
+    while i2 < n:
+        j2: int = (i2 * m2) // n
+        if j2 < 1:
+            j2 = 1
+        elif j2 > ld - 1:
+            j2 = ld - 1
+        delta2: int = i2 * m2 - j2 * n
+        interpolated2: float = (ordered[j2 - 1] * float(n - delta2) + ordered[j2] * float(delta2)) / float(n)
+        result.append(interpolated2)
+        i2 = i2 + 1
+    return result

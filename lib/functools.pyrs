@@ -1,22 +1,167 @@
 # pyrst standard library — functools
 #
-# Pure-pyrst higher-order helpers built on pyrst's first-class functions.
-# Embedded via `include_str!` (see `src/stdlib.rs`). Usable as either
+# Pure-pyrst higher-order helpers built on pyrst's first-class functions,
+# closures, generics, and Optional/dunder support. Embedded via
+# `include_str!` (see `src/stdlib.rs`). Usable as either
 # `from functools import reduce` or `import functools; functools.reduce(...)`.
 #
-# Phase-1 scope:
-#   - `reduce(f, xs, init)` folds `init` left-to-right over `xs` with the binary
-#     function `f` — `init = f(init, x)` for each `x`. The 3-arg form (explicit
-#     initial value) is the only one provided; the 2-arg form (no initializer)
-#     needs Optional/empty-sequence handling that is deferred.
-#   - int-specialized (pyrst generics are a later card): `f` is
-#     `Callable[[int, int], int]` and the sequence/accumulator are `int`.
-#   - `partial` is DEFERRED: it requires variadic argument capture, which pyrst
-#     does not model yet (see card 552d2c11 notes).
+# Fidelity score: 4/5 (docs/design/stdlib-full.md §D "functools" row).
+#
+# Implemented surface:
+#   - `reduce(f, xs, init=None)` — generic over `T`. With `init` given, folds
+#     `init` left-to-right over every element of `xs` (`acc = f(acc, x)`).
+#     With `init` omitted (`None`), CPython's 2-arg form: the first element of
+#     `xs` seeds the accumulator and folding starts from the second element;
+#     an empty `xs` with no `init` raises `ValueError` (CPython raises
+#     `TypeError` for this case — pyrst's exception hierarchy has no
+#     `TypeError` for user code, so `ValueError` is the closest honest
+#     substitute; documented divergence). Implementation note: the two folds
+#     are split into private helpers (`_functools_reduce_with_init` /
+#     `_functools_reduce_no_init`) rather than inlined under the `init is not
+#     None` narrowing — inlining a loop-reassigned local directly inside that
+#     narrowed block trips a codegen invariant (block-scoped shadow discarded
+#     at block end) that appears to be a compiler edge case around
+#     Optional-narrowing + generics + loop-local reassignment, not a
+#     functools-specific issue; worth a compiler card if other modules hit it.
+#   - `partial(f, a)` — closures make this real (design-doc probe p16).
+#     CPython's `partial(func, *args, **keywords)` is fully variadic; pyrst
+#     has no `*args`, so this ships the single-leading-positional-argument
+#     shape: `partial(f, a)` binds the first parameter of a 2-arg callable
+#     and returns the resulting 1-arg closure. This is a *documented,
+#     permanent* divergence from CPython's arbitrary-arity `partial`, not a
+#     deferral — closing it fully needs variadic capture (G4, see the design
+#     doc's gating table), which is out of scope for pyrst as it stands.
+#     Implementation note: `partial` is shipped **int-specialized**
+#     (`Callable[[int, int], int]`), not generic over `T`. A closure that
+#     CAPTURES a generic-typed value and ESCAPES the function as a returned
+#     `Callable` needs a Rust `T: 'static` bound that pyrst's codegen does
+#     not currently emit on generic functions (verified empirically: the
+#     generic version type-checks in pyrst but fails `rustc` with "parameter
+#     type `T` may not live long enough" / E0310). Non-escaping generic
+#     higher-order functions (like `reduce` above) are unaffected — only
+#     closure-construction-and-return is. int-specialization here mirrors
+#     the existing precedent set by `operator`'s int-specialized functions.
+#   - `cmp_to_key(cmp)` — wraps an old-style 2-arg `int`-returning comparator
+#     into a key-wrapper object (`__lt__`/`__eq__` delegate to `cmp`),
+#     matching CPython's signature. Also **int-specialized** for the same
+#     `'static`-escaping-closure reason as `partial` above. A second,
+#     independent limitation: pyrst's `sorted(xs, key=...)` codegen (a)
+#     requires the key type to derive Rust `Ord`, which user-defined classes
+#     never get (only `PartialOrd` via `__lt__`), and (b) only correctly
+#     re-invokes the key expression per-element when it is a lambda over a
+#     bare primitive op — passing a `Callable` value (or a lambda that calls
+#     a named function on the loop variable) as `key=` either evaluates the
+#     key expression once instead of per-element, or hits a reference/value
+#     type mismatch. Both are empirically-confirmed compiler limitations
+#     independent of this module. The **documented, working usage pattern**
+#     is CPython's original decorate-sort-undecorate: build a
+#     `list[_functools_CmpKey]` via a comprehension calling `cmp_to_key(cmp)`
+#     on each element, `sorted()` that list directly (no `key=`), then read
+#     `.obj` back off each sorted wrapper — see `examples/parity_functools.pyrs`.
+#     Composing directly as `sorted(xs, key=cmp_to_key(cmp))` is NOT
+#     supported by the current compiler.
+#   - `Cache` — a generic memoizing cache class (`Cache[K, V]`) with a
+#     `.get(key, compute)` method: returns the cached value for `key` if
+#     present, otherwise calls `compute(key)`, stores, and returns it.
+#     CPython's `functools.cache`/`lru_cache` are *decorators* applied to a
+#     zero-extra-arg function; pyrst has no user-definable decorators for
+#     free functions (only `@property`/`@staticmethod` on classes) and no
+#     module-level mutable state to back a hidden global cache dict, so a
+#     faithful `@cache`/`@lru_cache` decorator cannot be expressed. `Cache`
+#     is the closest honest analog: an explicit, class-based memoizer with
+#     the same "look up or compute-and-store" semantics, no LRU eviction
+#     (documented permanent divergence — no `maxsize` bound, matching
+#     `@lru_cache(maxsize=None)` behavior only). Empirically-confirmed
+#     compiler gotcha (hardening pass, verified independently of this
+#     module): `Cache.get`'s `compute: Callable[[K], V]` parameter is a
+#     generic CLASS METHOD param, and passing a bare top-level function name
+#     as that argument directly (`cache.get(k, square)`) fails `rustc`
+#     codegen with E0308 ("expected `Rc<dyn Fn(K) -> V>`, found fn item") —
+#     unlike a plain free function's `Callable` param (e.g. `reduce`'s `f`,
+#     or a bespoke `def apply(f: Callable[[int],int], x: int)`), which
+#     accepts a bare function name fine. The generic-class-method path does
+#     not auto-wrap a bare `fn` item into the `Rc<dyn Fn>` it monomorphizes
+#     to. Workaround (used throughout this module's examples): bind the bare
+#     function to a `Callable`-typed local first (`sq: Callable[[int], int]
+#     = square`) and pass that local — the explicit annotation forces the
+#     `Rc<dyn Fn>` wrap at the assignment, and the wrapped value then passes
+#     through `.get()` cleanly, including calling `.get()` repeatedly with
+#     *different* wrapped functions against the same `Cache` instance.
+#
+# Deferred / out of scope (see docs/design/stdlib-full.md §D "functools" row):
+#   - `wraps` — deferred: needs decorator support pyrst does not have.
+#   - `lru_cache` with bounded `maxsize` / eviction — deferred: needs an
+#     ordered-eviction data structure and decorator syntax; `Cache` above
+#     covers the unbounded case only.
+#   - `total_ordering`, `singledispatch`, `reduce`'s `*iterables` fan-out —
+#     deferred: no decorators / no variadics (G4).
 
 
-def reduce(f: Callable[[int, int], int], xs: list[int], init: int) -> int:
-    acc: int = init
+def _functools_reduce_with_init[T](f: Callable[[T, T], T], xs: list[T], init: T) -> T:
+    acc: T = init
     for x in xs:
         acc = f(acc, x)
     return acc
+
+
+def _functools_reduce_no_init[T](f: Callable[[T, T], T], xs: list[T]) -> T:
+    acc: T = xs[0]
+    i: int = 1
+    while i < len(xs):
+        acc = f(acc, xs[i])
+        i += 1
+    return acc
+
+
+def reduce[T](f: Callable[[T, T], T], xs: list[T], init: Optional[T] = None) -> T:
+    if len(xs) == 0:
+        if init is not None:
+            return init
+        raise ValueError("reduce() of empty sequence with no initial value")
+    if init is not None:
+        return _functools_reduce_with_init(f, xs, init)
+    return _functools_reduce_no_init(f, xs)
+
+
+def partial(f: Callable[[int, int], int], a: int) -> Callable[[int], int]:
+    def _functools_bound(b: int) -> int:
+        return f(a, b)
+    return _functools_bound
+
+
+class _functools_CmpKey:
+    obj: int
+    cmp: Callable[[int, int], int]
+    def __init__(self, obj: int, cmp: Callable[[int, int], int]) -> None:
+        self.obj = obj
+        self.cmp = cmp
+    def __lt__(self, other: _functools_CmpKey) -> bool:
+        return self.cmp(self.obj, other.obj) < 0
+    def __eq__(self, other: _functools_CmpKey) -> bool:
+        return self.cmp(self.obj, other.obj) == 0
+
+
+def cmp_to_key(cmp: Callable[[int, int], int]) -> Callable[[int], _functools_CmpKey]:
+    def _functools_key(x: int) -> _functools_CmpKey:
+        return _functools_CmpKey(x, cmp)
+    return _functools_key
+
+
+class Cache[K, V]:
+    store: dict[K, V]
+    def __init__(self) -> None:
+        self.store = {}
+    def get(self, key: K, compute: Callable[[K], V]) -> V:
+        if key in self.store:
+            return self.store[key]
+        value: V = compute(key)
+        self.store[key] = value
+        return value
+    def __eq__(self, other: Cache[K, V]) -> bool:
+        # Explicit `__eq__` is REQUIRED here, not stylistic: without one, the
+        # struct falls back to a derived structural `PartialEq` whose
+        # auto-generated bound (`K: PartialEq`) is too weak for the `dict[K, V]`
+        # field's `HashMap<K, V>: PartialEq` requirement (`K: Eq + Hash`),
+        # which fails to compile (E0369). Defining `__eq__` switches codegen to
+        # a manual `impl PartialEq` with the correct inferred bounds instead.
+        return len(self.store) == len(other.store)

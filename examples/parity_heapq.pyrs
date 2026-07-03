@@ -1,0 +1,157 @@
+# Parity test for heapq (card 1add42d8, docs/design/stdlib-full.md §D).
+# Dual-run under BOTH the pyrst binary and python3 (test_all.sh Section 4c
+# style: 'from __future__ import annotations' + exec of this source, calling
+# main()). Covers the full upgraded surface: heappush, heappop, heapify,
+# heappushpop, heapreplace, nlargest, nsmallest. Hardened (w1-hardener) with
+# negative numbers, floats, unicode strings, single/empty-boundary heaps,
+# heappushpop tie fast-path, and nlargest/nsmallest with negative n (CPython
+# returns [] for n <= 0 — this differs from plain Python list[:n] negative-
+# index slicing semantics and was a real defect caught during review).
+from heapq import heappush
+from heapq import heappop
+from heapq import heapify
+from heapq import heappushpop
+from heapq import heapreplace
+from heapq import nlargest
+from heapq import nsmallest
+
+
+def main() -> None:
+    # heappush / heappop basic behavior.
+    h: list[int] = []
+    heappush(h, 5)
+    heappush(h, 1)
+    heappush(h, 4)
+    heappush(h, 1)
+    heappush(h, 9)
+    heappush(h, 2)
+    heappush(h, 6)
+    print(h)
+
+    popped: list[int] = []
+    while len(h) > 0:
+        popped.append(heappop(h))
+    print(popped)
+
+    # heapify on an arbitrary list.
+    x: list[int] = [9, 5, 3, 1, 8, 2, 7, 4, 6, 0]
+    heapify(x)
+    print(x)
+    ordered: list[int] = []
+    while len(x) > 0:
+        ordered.append(heappop(x))
+    print(ordered)
+
+    # heappushpop: heap-untouched fast path (item <= current min).
+    hp: list[int] = [2, 4, 6, 8]
+    heapify(hp)
+    r1: int = heappushpop(hp, 1)
+    print(r1)
+    print(hp)
+
+    # heappushpop: normal path (item enters the heap).
+    r2: int = heappushpop(hp, 5)
+    print(r2)
+    print(hp)
+
+    # heappushpop on an empty heap.
+    empty: list[int] = []
+    r3: int = heappushpop(empty, 42)
+    print(r3)
+    print(empty)
+
+    # heapreplace: pop-then-push, may return something larger than item.
+    hr: list[int] = [1, 3, 5, 7, 9]
+    heapify(hr)
+    r4: int = heapreplace(hr, 4)
+    print(r4)
+    print(hr)
+    r5: int = heapreplace(hr, 100)
+    print(r5)
+    print(hr)
+
+    # nlargest / nsmallest across n < size, n == size, n > size, n == 0, n == 1.
+    data: list[int] = [5, 1, 4, 1, 5, 9, 2, 6]
+    print(nlargest(3, data))
+    print(nsmallest(3, data))
+    print(nlargest(0, data))
+    print(nsmallest(0, data))
+    print(nlargest(1, data))
+    print(nsmallest(1, data))
+    print(nlargest(len(data), data))
+    print(nsmallest(len(data), data))
+    print(nlargest(100, data))
+    print(nsmallest(100, data))
+
+    # nlargest/nsmallest with n <= 0 (CPython: always []).
+    print(nlargest(-1, data))
+    print(nsmallest(-1, data))
+    print(nlargest(-100, data))
+    print(nsmallest(-100, data))
+
+    # negative numbers, incl. duplicates and a boundary at 0.
+    neg: list[int] = [-5, -1, -100, 0, 3, -2, -5]
+    heapify(neg)
+    negout: list[int] = []
+    while len(neg) > 0:
+        negout.append(heappop(neg))
+    print(negout)
+    print(nlargest(3, [-5, -1, -100, 0, 3, -2, -5]))
+    print(nsmallest(3, [-5, -1, -100, 0, 3, -2, -5]))
+
+    # floats, incl. negative and large-magnitude values.
+    fl: list[float] = [3.5, -2.1, 0.0, 10000000000.0, -10000000000.0, 2.25]
+    heapify(fl)
+    fout: list[float] = []
+    while len(fl) > 0:
+        fout.append(heappop(fl))
+    print(fout)
+
+    # single-element heap: push then pop back to empty.
+    single: list[int] = []
+    heappush(single, 42)
+    print(heappop(single))
+    print(single)
+
+    # heapify of an already-empty list is a no-op.
+    emp: list[int] = []
+    heapify(emp)
+    print(emp)
+
+    # unicode strings (case and accents affect codepoint ordering).
+    strs: list[str] = ["banana", "apple", "cherry", "Apple", "élan", "amazing"]
+    heapify(strs)
+    sout: list[str] = []
+    while len(strs) > 0:
+        sout.append(heappop(strs))
+    print(sout)
+    print(nlargest(3, ["banana", "apple", "cherry", "Apple", "élan", "amazing"]))
+    print(nsmallest(3, ["banana", "apple", "cherry", "Apple", "élan", "amazing"]))
+
+    # nlargest/nsmallest boundaries on a single-element iterable.
+    one: list[int] = [7]
+    print(nlargest(1, one))
+    print(nsmallest(1, one))
+    print(nlargest(5, one))
+    print(nsmallest(5, one))
+
+    # nlargest/nsmallest on an empty iterable.
+    none_: list[int] = []
+    print(nlargest(3, none_))
+    print(nsmallest(3, none_))
+    print(nlargest(0, none_))
+
+    # heappushpop tie fast-path: item == current min leaves heap untouched.
+    tie: list[int] = [3, 3, 3]
+    rt: int = heappushpop(tie, 3)
+    print(rt)
+    print(tie)
+
+    # heappushpop/heapreplace with negative numbers.
+    hpn: list[int] = [-10, -5, 0, 5]
+    r6: int = heappushpop(hpn, -20)
+    print(r6)
+    print(hpn)
+    r7: int = heapreplace(hpn, 100)
+    print(r7)
+    print(hpn)

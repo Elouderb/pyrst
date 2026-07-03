@@ -1,0 +1,52 @@
+0.2523451747838408
+89
+7
+-2.77445734012872
+5
+0
+1727
+2185201375941640521
+0.9482036455174819
+7.525780453932963
+3.0
+-1.2479980299473759
+-1.5477849500773486
+4.283013484574813
+0.10573552333418472
+101.73925447035978
+0.7522449995527566
+0.6111930280234695
+3.796231475487172
+0.2537407683674511
+0.4174943263035371
+10
+[50, 20, 30, 60, 10, 40]
+[10, 60, 30, 50]
+[]
+[10]
+[40, 10, 20, 50, 20]
+[40, 40, 40, 60, 40, 30]
+sample error: Sample larger than population or is negative
+choices error: The number of weights does not match the population
+-2
+7
+5.0
+-1.2603616188280284
+café
+['naïve', 'a', 'café', '😀', '日本語']
+['café', '日本語', 'naïve', '😀', 'a']
+[50, 30, 40, 10, 60, 20]
+[]
+randint error: empty range in randrange(5, 4)
+randrange error: empty range for randrange()
+randrange negative error: empty range for randrange()
+choice empty error: Cannot choose from an empty sequence
+choices empty error: list index out of range
+choices zero-weight error: Total of weights must be greater than zero
+getrandbits(0) error: number of bits must be in [1, 62]
+getrandbits(63) error: number of bits must be in [1, 62]
+gammavariate error: gammavariate: alpha and beta must be > 0.0
+betavariate error: gammavariate: alpha and beta must be > 0.0
+0.2523451747838408
+[6986301772858220, 944519265150, 3026468176620992352, 272542971794, 3717002178837926036, 978305354470, 1534642310897533704, 856380803450, 2931292028264530620, 1011160434510, 1774178926400553904, 339959519330, 1432633249412282852, 1046930526390, 421738150956144984, 926920803402, 1843000436722669068, 1082074695454, 793411876024034304, 410125135154]
+True

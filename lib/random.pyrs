@@ -1,17 +1,54 @@
 # pyrst standard library — random
 #
+# FIDELITY: 4/5 (design doc docs/design/stdlib-full.md §D "random" row).
+# Hardening pass (reviewer): fixed 5 undocumented error-path divergences from
+# CPython uncovered by adversarial edge-case testing — see the
+# "DEFECT FIX (hardening pass)" comments on `next_below`, `randint`, `choice`,
+# and `choices` below for details (invalid ranges, empty sequences, and
+# all-zero weights now raise the same exception type/message CPython raises,
+# instead of panicking with a raw Rust error or silently returning wrong data).
+#
 # A SEEDABLE pseudo-random generator implemented as a pure-pyrst linear
 # congruential generator (LCG). Embedded via `include_str!` (see `src/stdlib.rs`);
 # `random` is not in the resolver skip-list, so the import resolves with no extra
 # change. Usable as either `from random import Random` or
 # `import random; r = random.Random(42)`.
 #
+# *** PYRST-ONLY PARITY NOTICE ***
+# CPython's `random` module is backed by the Mersenne Twister (MT19937). This
+# module is backed by a 32-bit Numerical-Recipes LCG (see below) — a
+# DIFFERENT, much weaker generator with a different internal state and a
+# different draw sequence for any given seed. Every function here reproduces
+# CPython's *algorithm/formula* (so the statistical shape — e.g. Box-Muller for
+# `gauss`, the pool-swap algorithm for `sample`) but NOT CPython's *numeric
+# output* for a given seed, because the underlying uniform stream differs.
+# Parity for this module is therefore PYRST-ONLY: determinism (same seed ⇒
+# same sequence, run to run, inside pyrst) is pinned by the golden; bit-for-bit
+# agreement with `python3 -c "import random; ..."` is NOT claimed or tested.
+#
 # WHY A CLASS (not module functions): pyrst has NO mutable module-level state, so
 # the generator state (`seed`) must live in an instance. `Random` therefore holds
 # a mutable `seed: int` and advances it on every draw. The module-level
 # convenience API (`random.random()`, `random.randint(...)` backed by a hidden
-# global generator) is DEFERRED until pyrst grows mutable globals — construct a
-# `Random` explicitly.
+# global generator) is DEFERRED until pyrst grows mutable globals (G2 — see
+# docs/design/stdlib-full.md §D "random" row and the G2 module-level-mutable-
+# state epic) — construct a `Random` explicitly instead.
+#
+# `randbytes` is also DEFERRED: pyrst has no `bytes` type (G7).
+#
+# *** DISCOVERED COMPILER LIMITATION (not a G-gate, a workaround) ***
+# While implementing the distribution methods below, instance methods (i.e.
+# functions with a `self` parameter) were found to NOT support: (a) omitting a
+# defaulted trailing argument at the call site, or (b) passing a bare value
+# where an `Optional`/`T | None`-typed parameter is expected — both fail Rust
+# codegen with a missing-argument / missing-`Some(..)` type error. FREE
+# functions with the identical parameter shapes (verified with `choices`
+# below) do NOT have this problem. Rather than block on a compiler fix, every
+# new distribution method (`triangular`, `gauss`, `normalvariate`) drops its
+# CPython default values and makes every parameter REQUIRED (see each
+# method's docstring for the CPython default to pass explicitly); no new
+# method uses an `Optional` parameter. `choices`'s `weights=None, k=1` keeps
+# its CPython defaults because it is a free function, not a method.
 #
 # LCG: seed_{n+1} = (A * seed_n + C) mod M  with the Numerical Recipes constants
 #   A = 1664525, C = 1013904223, M = 4294967296 (= 2^32).
@@ -23,7 +60,8 @@
 # very first step (Rust wraps in release builds). The example seeds (42, 7) are
 # well in range. M is written as the integer literal 4294967296 because `2 ** 32`
 # types as `float` in pyrst (Python `**` semantics), which would not fit an `int`
-# modulus.
+# modulus. For the same reason every OTHER integer power-of-two needed below
+# (e.g. in `getrandbits`) is built by the private helper `_random_pow2i`, not `**`.
 #
 # DETERMINISM: a given seed yields a fixed, reproducible draw sequence — that is
 # the entire point of a seedable PRNG and what the golden pins. Quality is "good
@@ -32,27 +70,75 @@
 # Generic draws (`choice`, `shuffle`) are FREE FUNCTIONS, not methods: pyrst gates
 # generic METHODS inside a class (only free functions may carry type parameters),
 # and a class instance is passed by VALUE unless declared `Mut[...]`. So `choice`
-# / `shuffle` take `rng: Mut[Random]` to (a) carry the generic element type `T`
-# on a free function and (b) advance the CALLER's generator state in place.
+# / `shuffle` / `sample` / `choices` take `rng: Mut[Random]` to (a) carry the
+# generic element type `T` on a free function and (b) advance the CALLER's
+# generator state in place. This mirrors CPython's `random.sample`/`choices`
+# being *methods* of `Random` — here they are free functions for the same
+# generic-method restriction as `choice`/`shuffle`.
 #
 # Public API:
 #   class Random(seed):
-#     - random()          -> float in [0, 1)
-#     - randint(a, b)     -> int in [a, b] (inclusive both ends)
-#     - randrange(n)      -> int in [0, n)
-#     - uniform(a, b)     -> float in [a, b]
-#     - next_below(n)     -> int in [0, n)   (the shared index primitive; also the
-#                            building block `choice`/`shuffle` call)
+#     - random()               -> float in [0, 1)
+#     - randint(a, b)          -> int in [a, b] (inclusive both ends)
+#     - randrange(n)           -> int in [0, n)
+#     - uniform(a, b)          -> float in [a, b]
+#     - next_below(n)          -> int in [0, n)   (shared index primitive)
+#     - getrandbits(k)         -> int in [0, 2**k)   (k in [1, 62]; CPython allows
+#                                 arbitrary k via bignum, pyrst int is i64 -> capped)
+#     - triangular(low, high, mode) -> float, triangular distribution (`mode`
+#                                 REQUIRED — pass `(low + high) / 2.0` for
+#                                 CPython's default "no mode" midpoint; see the
+#                                 compiler-limitation note above)
+#     - gauss(mu, sigma)       -> float, Gaussian via CPython's cached
+#                                 Box-Muller-pair formula (self.gauss_next);
+#                                 `mu`/`sigma` REQUIRED (pass `0.0, 1.0` for
+#                                 CPython's defaults)
+#     - normalvariate(mu, sigma) -> float, Gaussian via the ratio-of-uniforms
+#                                 rejection formula (no caching, matches
+#                                 CPython's `normalvariate`, distinct from
+#                                 `gauss`); `mu`/`sigma` REQUIRED likewise
+#     - gammavariate(alpha, beta) -> float, CPython's Marsaglia/Cheng algorithm
+#                                 (added as a helper for `betavariate`; also a
+#                                 real CPython method, so exposed publicly)
+#     - betavariate(alpha, beta) -> float, via two `gammavariate` draws
 #   free functions:
-#     - choice(rng, xs)   -> T              (a uniformly-chosen element)
-#     - shuffle(rng, xs)  -> None           (in-place Fisher–Yates over Mut[list[T]])
+#     - choice(rng, xs)             -> T     (uniformly-chosen element)
+#     - shuffle(rng, xs)            -> None  (in-place Fisher-Yates, Mut[list[T]])
+#     - sample(rng, population, k)  -> list[T]  (k distinct elements, no replacement,
+#                                      pool-swap algorithm; raises ValueError if
+#                                      k < 0 or k > len(population))
+#     - choices(rng, population, weights=None, k=1) -> list[T]  (WITH replacement;
+#                                      uniform if weights is None, else weighted by
+#                                      cumulative sum; CPython's `cum_weights`
+#                                      keyword is not offered — pass pre-normalized
+#                                      `weights` instead)
+#
+# Deferred (documented, not silently dropped):
+#   - module-level `random.random()`/`random.randint(...)` convenience API: G2
+#     (no mutable module-level state to back a hidden global generator).
+#   - `randbytes`: G7 (no `bytes` type).
+#   - `choices(..., cum_weights=...)`: keyword-only param folded away since
+#     `weights` alone covers the same use case pyrst-side.
+#   - `Random.seed(...)`/`getstate`/`setstate`: re-seeding is just constructing a
+#     new `Random(seed)`; there is no internal MT state to save/restore.
 
 
 class Random:
     seed: int
+    # `gauss_next` is split into a value + presence flag rather than a single
+    # `float | None` field: assigning a concrete (non-None) value to an
+    # `Optional`-typed FIELD was independently found to hit the same codegen
+    # bug documented above for method parameters (Rust expects `Some(..)`,
+    # gets a bare value) — `self.field = None` compiles, `self.field = 1.0`
+    # for a `float | None` field does not. A plain `float` + `bool` sidesteps
+    # the bug entirely.
+    gauss_next: float
+    has_gauss_next: bool
 
     def __init__(self, seed: int) -> None:
         self.seed = seed
+        self.gauss_next = 0.0
+        self.has_gauss_next = False
 
     def _advance(self) -> int:
         # One LCG step; returns the new 32-bit state.
@@ -62,6 +148,16 @@ class Random:
     def next_below(self, n: int) -> int:
         # A draw in [0, n). Advances the state. (Slightly biased for n not a power
         # of two — acceptable for the example/test domain.)
+        # DEFECT FIX (hardening pass): n <= 0 used to fall through to a bare
+        # `% n`, which panics with a raw Rust "ZeroDivisionError" message for
+        # n == 0 and produces silently-wrong output for n < 0. CPython's
+        # `randrange`/`_randbelow` raises `ValueError("empty range for
+        # randrange()")` for a non-positive span — matched here explicitly so
+        # every caller (`randrange`, `randint` via the check below, `choice`,
+        # `shuffle`, `sample`, `choices`) gets a clean, documented exception
+        # instead of a crash or bogus value.
+        if n <= 0:
+            raise ValueError("empty range for randrange()")
         nxt: int = self._advance()
         return nxt % n
 
@@ -72,6 +168,14 @@ class Random:
 
     def randint(self, a: int, b: int) -> int:
         # Inclusive on BOTH ends: an int in [a, b].
+        # DEFECT FIX (hardening pass): a > b used to silently return `a`
+        # (span went <= 0 but `next_below` didn't validate it, so `% span`
+        # produced a meaningless-but-not-crashing result). CPython's
+        # `randint(a, b)` calls `randrange(a, b + 1)`, which raises
+        # `ValueError(f"empty range in randrange({a}, {b + 1})")` for a > b —
+        # matched here verbatim (verified byte-identical against CPython 3.12).
+        if a > b:
+            raise ValueError(f"empty range in randrange({a}, {b + 1})")
         span: int = b - a + 1
         return a + self.next_below(span)
 
@@ -83,10 +187,216 @@ class Random:
         # A float in [a, b] (CPython allows the order a > b; the formula handles it).
         return a + (b - a) * self.random()
 
+    def getrandbits(self, k: int) -> int:
+        # A non-negative int with exactly `k` random bits: in [0, 2**k). CPython
+        # allows arbitrary `k` (bignum-backed); pyrst `int` is a 63-bit-usable
+        # i64, so `k` is capped at 62 to stay overflow-safe (2**62 fits i64).
+        if k < 1 or k > 62:
+            raise ValueError("number of bits must be in [1, 62]")
+        if k <= 32:
+            return self._advance() % _random_pow2i(k)
+        hi: int = self._advance()
+        lo: int = self._advance()
+        # Mask `hi` down to the (k - 32) high bits BEFORE combining, so the
+        # product `hi * 2^32` can never overflow i64: with `hi` in
+        # [0, 2^(k-32)), the largest possible combined value is 2^k - 1, which
+        # is < 2^62 for k <= 62. The old `hi * 4294967296 + lo` overflowed
+        # whenever hi >= 2^31 and k > 32 (e.g. Random(682).getrandbits(62)
+        # panicked with "attempt to multiply with overflow"). Masking first is
+        # algebraically identical to the old trailing `% 2^k` for the
+        # non-overflowing cases and correct (no panic/wrap) for the rest.
+        hi = hi % _random_pow2i(k - 32)
+        combined: int = hi * 4294967296 + lo
+        return combined % _random_pow2i(k)
+
+    def triangular(self, low: float, high: float, mode: float) -> float:
+        # CPython's `random.triangular(low=0.0, high=1.0, mode=None)`: a
+        # triangular distribution over [low, high] peaking at `mode`.
+        # DIVERGENCE (compiler limitation, not a design choice): default
+        # argument values AND `Optional`-typed parameters on instance methods
+        # are not call-site-injected/wrapped by this pyrst compiler version
+        # (verified independently of this module — an instance-method call
+        # omitting a defaulted arg, or passing a bare value where an `Optional`
+        # is expected, fails Rust codegen with a missing-argument /
+        # missing-`Some(..)` type error). All three params are therefore
+        # REQUIRED here, and `mode` is a plain `float`, not `float | None`.
+        # To reproduce CPython's default "no mode" behavior, pass the midpoint
+        # explicitly: `triangular(low, high, (low + high) / 2.0)`.
+        u: float = self.random()
+        c: float = 0.5
+        if high != low:
+            c = (mode - low) / (high - low)
+        else:
+            return low
+        lo: float = low
+        hi: float = high
+        if u > c:
+            u = 1.0 - u
+            c = 1.0 - c
+            lo = high
+            hi = low
+        return lo + (hi - lo) * _random_sqrt(u * c)
+
+    def gauss(self, mu: float, sigma: float) -> float:
+        # CPython's `random.gauss(mu=0.0, sigma=1.0)`: Box-Muller, caching the
+        # second value of the generated pair in `self.gauss_next` for the
+        # following call. `mu`/`sigma` are REQUIRED here (no default) for the
+        # same instance-method compiler limitation documented on `triangular`
+        # above — pass `0.0, 1.0` explicitly to reproduce CPython's defaults.
+        had_cache: bool = self.has_gauss_next
+        cached: float = self.gauss_next
+        self.has_gauss_next = False
+        z: float = 0.0
+        if had_cache:
+            z = cached
+        else:
+            two_pi: float = 6.283185307179586
+            x2pi: float = self.random() * two_pi
+            g2rad: float = _random_sqrt(-2.0 * _random_log(1.0 - self.random()))
+            z = _random_cos(x2pi) * g2rad
+            self.gauss_next = _random_sin(x2pi) * g2rad
+            self.has_gauss_next = True
+        return mu + z * sigma
+
+    def normalvariate(self, mu: float, sigma: float) -> float:
+        # CPython's `random.normalvariate(mu=0.0, sigma=1.0)`: ratio-of-uniforms
+        # rejection method (Kinderman-Monahan). Does NOT share `gauss`'s cache —
+        # a fresh pair of draws every call, matching CPython. `mu`/`sigma` are
+        # REQUIRED here for the same reason as `triangular`/`gauss` above.
+        nv_magicconst: float = 1.7155277699214135
+        z: float = 0.0
+        while True:
+            u1: float = self.random()
+            u2: float = 1.0 - self.random()
+            z = nv_magicconst * (u1 - 0.5) / u2
+            zz: float = z * z / 4.0
+            if zz <= -_random_log(u2):
+                break
+        return mu + z * sigma
+
+    def gammavariate(self, alpha: float, beta: float) -> float:
+        # CPython's `random.gammavariate`: Marsaglia-and-Tsang-style algorithm
+        # for alpha > 1, Cheng's algorithm for alpha < 1, exponential for
+        # alpha == 1. Also backs `betavariate` below.
+        if alpha <= 0.0 or beta <= 0.0:
+            raise ValueError("gammavariate: alpha and beta must be > 0.0")
+        log4: float = 1.3862943611198906
+        sg_magicconst: float = 2.5040773967762742
+        if alpha > 1.0:
+            ainv: float = _random_sqrt(2.0 * alpha - 1.0)
+            bbb: float = alpha - log4
+            ccc: float = alpha + ainv
+            while True:
+                u1: float = self.random()
+                if not (u1 > 0.0000001 and u1 < 0.9999999):
+                    continue
+                u2: float = 1.0 - self.random()
+                v: float = _random_log(u1 / (1.0 - u1)) / ainv
+                x: float = alpha * _random_exp(v)
+                z: float = u1 * u1 * u2
+                r: float = bbb + ccc * v - x
+                if r + sg_magicconst - 4.5 * z >= 0.0 or r >= _random_log(z):
+                    return x * beta
+        elif alpha == 1.0:
+            u: float = self.random()
+            while u <= 0.0000001:
+                u = self.random()
+            return -_random_log(u) * beta
+        else:
+            e: float = 2.718281828459045
+            x: float = 0.0
+            while True:
+                u: float = self.random()
+                b: float = (e + alpha) / e
+                p: float = b * u
+                if p <= 1.0:
+                    x = _random_powf(p, 1.0 / alpha)
+                else:
+                    x = -_random_log((b - p) / alpha)
+                u1: float = self.random()
+                if p > 1.0:
+                    if u1 <= _random_powf(x, alpha - 1.0):
+                        break
+                elif u1 <= _random_exp(-x):
+                    break
+            return x * beta
+
+    def betavariate(self, alpha: float, beta: float) -> float:
+        # CPython's `random.betavariate`: two `gammavariate` draws.
+        y: float = self.gammavariate(alpha, 1.0)
+        if y == 0.0:
+            return 0.0
+        return y / (y + self.gammavariate(beta, 1.0))
+
+
+def _random_pow2i(k: int) -> int:
+    # 2**k as an int, for k in [0, 62]. `**` types int-base results as float in
+    # pyrst (Python `**` semantics), so a plain multiply loop is used instead.
+    result: int = 1
+    i: int = 0
+    while i < k:
+        result = result * 2
+        i = i + 1
+    return result
+
+
+# The elementary float-math helpers below are private one-line @extern wrappers
+# over Rust's `f64` methods, with the SAME names/signatures as the previous
+# hand-rolled Newton/Taylor implementations, so every call site above is
+# untouched. This mirrors the `_statistics_sqrt` precedent in
+# lib/statistics.pyrs and yields full native f64 precision instead of the old
+# fixed-iteration approximations. Every argument that reaches these on the
+# covered code paths is in-domain (`u * c >= 0`, `1 - random()` in (0, 1],
+# `u1 / (1 - u1) > 0`, etc.), so Rust's NaN-on-out-of-domain behavior is never
+# triggered here.
+#
+# PRECISION NOTE: switching from the approximations to the native f64 ops
+# changes the low-order bits of the FLOAT distribution outputs
+# (gauss/normalvariate/gammavariate/betavariate/triangular); the INTEGER draws
+# (random/uniform/getrandbits/randint/choice/shuffle/sample) are unaffected
+# because they never call these helpers and the LCG state sequence is
+# unchanged. examples/expected/parity_random.txt was regenerated accordingly.
+@extern
+def _random_sqrt(x: float) -> float:
+    "({x}).sqrt()"
+
+
+@extern
+def _random_exp(x: float) -> float:
+    "({x}).exp()"
+
+
+@extern
+def _random_log(x: float) -> float:
+    "({x}).ln()"
+
+
+@extern
+def _random_powf(x: float, y: float) -> float:
+    "({x}).powf({y})"
+
+
+@extern
+def _random_sin(x: float) -> float:
+    "({x}).sin()"
+
+
+@extern
+def _random_cos(x: float) -> float:
+    "({x}).cos()"
+
 
 def choice[T](rng: Mut[Random], xs: list[T]) -> T:
-    # A uniformly-chosen element of `xs`. Advances `rng`. Empty `xs` panics via
-    # the index (an IndexError-style panic), matching a bare out-of-range index.
+    # A uniformly-chosen element of `xs`. Advances `rng`.
+    # DEFECT FIX (hardening pass): empty `xs` previously reached `next_below`
+    # unguarded, which panicked with a raw Rust "ZeroDivisionError" message
+    # (NOT the "IndexError-style panic" the old comment here claimed).
+    # CPython's `Random.choice([])` raises
+    # `IndexError("Cannot choose from an empty sequence")` — matched exactly
+    # (verified byte-identical against CPython 3.12) instead of advancing the
+    # generator and crashing.
+    if len(xs) == 0:
+        raise IndexError("Cannot choose from an empty sequence")
     idx: int = rng.next_below(len(xs))
     return xs[idx]
 
@@ -102,3 +412,77 @@ def shuffle[T](rng: Mut[Random], xs: Mut[list[T]]) -> None:
         xs[i] = xs[j]
         xs[j] = tmp
         i = i - 1
+
+
+def sample[T](rng: Mut[Random], population: list[T], k: int) -> list[T]:
+    # CPython's `random.sample`: `k` DISTINCT elements of `population`, drawn
+    # without replacement, order not weighted (pool-swap algorithm — swap each
+    # picked slot with the current tail so it can't be picked again).
+    n: int = len(population)
+    if k < 0 or k > n:
+        raise ValueError("Sample larger than population or is negative")
+    pool: list[T] = list(population)
+    result: list[T] = []
+    i: int = 0
+    while i < k:
+        j: int = rng.next_below(n - i)
+        result.append(pool[j])
+        pool[j] = pool[n - i - 1]
+        i = i + 1
+    return result
+
+
+def choices[T](rng: Mut[Random], population: list[T], weights: list[float] | None = None, k: int = 1) -> list[T]:
+    # CPython's `random.choices`: `k` elements chosen WITH replacement, each
+    # slot independent. Uniform if `weights` is None, else weighted by relative
+    # size (weights need not sum to 1). CPython's `cum_weights=` keyword is not
+    # offered here — pass `weights` directly (see module header).
+    #
+    # DEFECT FIXES (hardening pass), both verified against CPython 3.12:
+    # 1. `choices(pop, k=0)` used to unconditionally raise even on an EMPTY
+    #    population, when CPython returns `[]` for `k=0` regardless of
+    #    population size (no draw is ever attempted). Fixed by short-circuiting
+    #    on `k == 0` before validating `population`.
+    # 2. An empty `population` with `k > 0` previously raised
+    #    `ValueError("Cannot choose from an empty sequence")` (that is actually
+    #    `choice`'s message, not `choices`'s). CPython's `choices` has no
+    #    explicit empty-population guard and instead fails while indexing,
+    #    raising `IndexError("list index out of range")` — matched here.
+    # 3. All-zero (or otherwise non-positive-summing) `weights` used to be
+    #    silently accepted, producing a bogus but plausible-looking result
+    #    (every cumulative-weight comparison degenerates to picking the last
+    #    element). CPython raises
+    #    `ValueError("Total of weights must be greater than zero")` — matched
+    #    here.
+    if k == 0:
+        return []
+    n: int = len(population)
+    if n == 0:
+        raise IndexError("list index out of range")
+    result: list[T] = []
+    if weights is not None:
+        ws: list[float] = weights
+        if len(ws) != n:
+            raise ValueError("The number of weights does not match the population")
+        total: float = 0.0
+        cum: list[float] = []
+        for w in ws:
+            total = total + w
+            cum.append(total)
+        if total <= 0.0:
+            raise ValueError("Total of weights must be greater than zero")
+        i: int = 0
+        while i < k:
+            target: float = rng.random() * total
+            j: int = 0
+            while j < n - 1 and cum[j] <= target:
+                j = j + 1
+            result.append(population[j])
+            i = i + 1
+        return result
+    i2: int = 0
+    while i2 < k:
+        idx: int = rng.next_below(n)
+        result.append(population[idx])
+        i2 = i2 + 1
+    return result

@@ -1,0 +1,215 @@
+# parity: pyrst-only
+# Random surface fidelity golden (card 7d79d4d1, docs/design/stdlib-full.md §D
+# "random" row). NOT dual-run: this module's `Random` is a pure-pyrst 32-bit
+# LCG (Numerical Recipes constants), while CPython's `random` module is
+# backed by the Mersenne Twister — a different generator with a different
+# state and a different draw sequence for any given seed. Every distribution
+# method here reproduces CPython's *formula*, not its *numeric output* for a
+# shared seed (see lib/random.pyrs's "PYRST-ONLY PARITY NOTICE"). Determinism
+# is what is pinned: the same seed must reproduce the exact same sequence of
+# values every run, in pyrst, forever — that is what expected/parity_random.txt
+# checks.
+#
+# Covers old surface (random/randint/randrange/uniform/next_below/choice/
+# shuffle) plus the new §D-4 additions (getrandbits, triangular, gauss,
+# normalvariate, gammavariate, betavariate, sample, choices).
+#
+# NOTE on `triangular`/`gauss`/`normalvariate`: CPython defaults these
+# (mode=None, mu=0.0, sigma=1.0) but this pyrst version requires every
+# argument explicitly — see lib/random.pyrs's "DISCOVERED COMPILER
+# LIMITATION" note (instance methods do not call-site-inject defaulted or
+# `Optional` args). Passing `0.0, 1.0` / the midpoint reproduces CPython's
+# default behavior.
+#
+# W1 FIX ROUND (this pass) — two changes affect this golden:
+#   - PRECISION (regenerated): the float distribution methods
+#     (gauss/normalvariate/gammavariate/betavariate/triangular) now use native
+#     f64 math (`.sqrt()`/`.exp()`/`.ln()`/`.sin()`/`.cos()`/`.powf()`) via
+#     private @extern wrappers, replacing the old hand-rolled Newton/Taylor
+#     approximations (see lib/random.pyrs). This changes the LOW-ORDER BITS of
+#     those FLOAT outputs, so expected/parity_random.txt was REGENERATED. The
+#     integer draws (random/uniform/getrandbits/randint/randrange/choice/
+#     shuffle/sample/choices) are UNCHANGED — they never call those helpers and
+#     the LCG state sequence is identical, so those lines are byte-for-byte the
+#     same as before.
+#   - getrandbits(k>32) OVERFLOW FIX: `getrandbits` used to overflow i64 in
+#     `hi * 2^32` whenever hi >= 2^31 (e.g. Random(682).getrandbits(62)
+#     panicked). `hi` is now masked to the needed high bits first. A seeded
+#     stress loop of getrandbits(62)/getrandbits(40) draws (previously ~50%
+#     panic odds per draw) is exercised at the end of main() and is
+#     deterministic run-to-run.
+from random import Random, choice, shuffle, sample, choices
+
+
+def main() -> None:
+    r: Random = Random(42)
+
+    # Original surface.
+    print(r.random())
+    print(r.randint(1, 100))
+    print(r.randrange(10))
+    print(r.uniform(-5.0, 5.0))
+    print(r.next_below(7))
+
+    # New §D-4 surface: getrandbits.
+    print(r.getrandbits(1))
+    print(r.getrandbits(16))
+    print(r.getrandbits(62))
+
+    # New §D-4 surface: triangular (mode required; pass the midpoint for
+    # CPython's implicit "no mode" default).
+    print(r.triangular(0.0, 1.0, 0.5))
+    print(r.triangular(-10.0, 10.0, 8.0))
+    print(r.triangular(3.0, 3.0, 3.0))
+
+    # New §D-4 surface: gauss (cached Box-Muller pair) and normalvariate
+    # (independent ratio-of-uniforms draw). mu/sigma required.
+    print(r.gauss(0.0, 1.0))
+    print(r.gauss(0.0, 1.0))
+    print(r.gauss(5.0, 2.0))
+    print(r.normalvariate(0.0, 1.0))
+    print(r.normalvariate(100.0, 15.0))
+
+    # New §D-4 surface: gammavariate / betavariate.
+    print(r.gammavariate(2.0, 1.0))
+    print(r.gammavariate(0.5, 2.0))
+    print(r.gammavariate(1.0, 1.0))
+    print(r.betavariate(2.0, 3.0))
+    print(r.betavariate(0.5, 0.5))
+
+    # Free functions: choice / shuffle (existing surface) and the new
+    # sample / choices (§D-4).
+    xs: list[int] = [10, 20, 30, 40, 50, 60]
+    print(choice(r, xs))
+    shuffle(r, xs)
+    print(xs)
+    print(sample(r, xs, 4))
+    print(sample(r, xs, 0))
+    print(choices(r, xs))
+    print(choices(r, xs, None, 5))
+    print(choices(r, xs, [1.0, 1.0, 1.0, 1.0, 1.0, 20.0], 6))
+
+    # Error paths: sample() with k > len(population) and choices() with a
+    # mismatched weights length both raise ValueError.
+    try:
+        sample(r, xs, 99)
+    except ValueError as e:
+        print(f"sample error: {e}")
+
+    try:
+        choices(r, xs, [1.0, 2.0], 3)
+    except ValueError as e:
+        print(f"choices error: {e}")
+
+    # --- Hardening pass: edge cases discovered during adversarial review ---
+    # (see lib/random.pyrs's "DEFECT FIX (hardening pass)" comments on
+    # `next_below`, `randint`, `choice`, `choices`).
+
+    # negative numbers / single-element / boundary ranges.
+    print(r.randint(-10, -1))
+    print(r.randint(7, 7))
+    print(r.uniform(5.0, 5.0))
+    print(r.uniform(3.0, -3.0))
+
+    # unicode elements through choice/shuffle/sample (list of str, not
+    # char-indexing — codepoint width doesn't matter for element ops).
+    words: list[str] = ["café", "naïve", "日本語", "a", "😀"]
+    print(choice(r, words))
+    shuffle(r, words)
+    print(words)
+    print(sample(r, words, len(words)))
+
+    # sample(k == n): a full-population permutation, no error.
+    print(sample(r, xs, len(xs)))
+
+    # choices(k=0): CPython returns [] regardless of population size — must
+    # NOT raise even though the population-emptiness check exists below.
+    print(choices(r, xs, None, 0))
+
+    # DEFECT (fixed): randint(a, b) with a > b used to silently return `a`.
+    try:
+        r.randint(5, 3)
+    except ValueError as e:
+        print(f"randint error: {e}")
+
+    # DEFECT (fixed): randrange(n) with n <= 0 used to panic with a raw
+    # Rust "ZeroDivisionError" instead of a documented ValueError.
+    try:
+        r.randrange(0)
+    except ValueError as e:
+        print(f"randrange error: {e}")
+    try:
+        r.randrange(-5)
+    except ValueError as e:
+        print(f"randrange negative error: {e}")
+
+    # DEFECT (fixed): choice([]) used to panic with a raw Rust
+    # "ZeroDivisionError" instead of CPython's IndexError.
+    empty_ints: list[int] = []
+    try:
+        choice(r, empty_ints)
+    except IndexError as e:
+        print(f"choice empty error: {e}")
+
+    # DEFECT (fixed): choices(population=[], k>0) used to raise the wrong
+    # message (`choice`'s, not `choices`'s); now matches CPython's actual
+    # IndexError("list index out of range").
+    try:
+        choices(r, empty_ints, None, 1)
+    except IndexError as e:
+        print(f"choices empty error: {e}")
+
+    # DEFECT (fixed): all-zero weights used to be silently accepted and
+    # produce a bogus-but-plausible result; now raises ValueError like
+    # CPython.
+    try:
+        choices(r, xs, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 2)
+    except ValueError as e:
+        print(f"choices zero-weight error: {e}")
+
+    # getrandbits boundary: k out of [1, 62] still raises (unchanged
+    # behavior, re-asserted here alongside the new edge cases).
+    try:
+        r.getrandbits(0)
+    except ValueError as e:
+        print(f"getrandbits(0) error: {e}")
+    try:
+        r.getrandbits(63)
+    except ValueError as e:
+        print(f"getrandbits(63) error: {e}")
+
+    # gammavariate/betavariate domain errors (alpha/beta <= 0).
+    try:
+        r.gammavariate(0.0, 1.0)
+    except ValueError as e:
+        print(f"gammavariate error: {e}")
+    try:
+        r.betavariate(-1.0, 1.0)
+    except ValueError as e:
+        print(f"betavariate error: {e}")
+
+    # A second, independently-seeded generator proves determinism: the same
+    # seed reproduces the exact same first draw, every run.
+    r2: Random = Random(42)
+    print(r2.random())
+
+    # getrandbits overflow fix (review finding): getrandbits(k) for k > 32 used
+    # to compute `hi * 2^32 + lo` and overflow i64 whenever hi >= 2^31 — e.g.
+    # Random(682).getrandbits(62) panicked with "attempt to multiply with
+    # overflow". A seeded loop of large-k draws (each getrandbits(62) had ~50%
+    # panic odds) now runs clean and deterministically; every value stays in
+    # [0, 2**62), proving no overflow or negative wrap.
+    r3: Random = Random(682)
+    grb: list[int] = []
+    i3: int = 0
+    while i3 < 10:
+        grb.append(r3.getrandbits(62))
+        grb.append(r3.getrandbits(40))
+        i3 = i3 + 1
+    print(grb)
+    cap62: int = 4611686018427387904
+    all_in_range: bool = True
+    for g in grb:
+        if g < 0 or g >= cap62:
+            all_in_range = False
+    print(all_in_range)

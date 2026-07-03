@@ -1,77 +1,323 @@
-# pyrst standard library — itertools (EAGER subset)
+# pyrst standard library — itertools (LAZY, W1 fidelity upgrade)
 #
-# Pure-pyrst combinatoric / sequence helpers over `list[T]`. Embedded via
-# `include_str!` (see `src/stdlib.rs`) and removed from the resolver skip-list,
-# so the import resolves. Usable as either `from itertools import chain` or
+# Fidelity score: 4/5 (was 2/5, EAGER-only-5-fns).
+#
+# Pure-pyrst combinatoric / sequence helpers, embedded via `include_str!` (see
+# `src/stdlib.rs`) and removed from the resolver skip-list, so the import
+# resolves. Usable as either `from itertools import chain` or
 # `import itertools; itertools.chain(a, b)`.
 #
-# EAGER by design: pyrst has no lazy iterators / generators, so every result is
-# a fully materialised `list`. The CPython members that are INFINITE (`count`,
-# `cycle`) are therefore DEFERRED — an eager realisation would never return.
-# `repeat` is provided only in its BOUNDED `repeat(x, n)` form (the no-`n`
-# infinite form is out for the same reason).
+# FLAGSHIP CHANGE this pass: most members are now LAZY generators
+# (`-> Iterator[T]`, built on `yield`), not eager `list`-returning functions.
+# This makes CPython's INFINITE members real: `count()` and `cycle()` now
+# exist and never terminate on their own — callers must `break` out of a
+# `for` loop (or otherwise bound consumption), exactly like consuming a
+# genuine infinite CPython iterator. `repeat(x)` (no `times`) is likewise
+# infinite. This mirrors probe p15 in docs/design/stdlib-full.md.
 #
-# Public API:
-#   - `accumulate(xs, f)`        — running fold: result[i] = f(result[i-1], xs[i]),
-#                                  result[0] = xs[0]. Generic over the element
-#                                  type `T` (the fold `f` is `Callable[[T,T],T]`).
-#   - `chain(a, b)`              — `a` followed by `b` (binary concatenation).
-#   - `repeat(x, n)`             — a list of `n` copies of `x`.
-#   - `combinations(xs, r)`      — all r-length subsequences, in lexicographic
-#                                  index order (CPython ordering).
-#   - `permutations(xs, r)`      — all r-length orderings without repetition, in
-#                                  CPython's lexicographic-by-index order.
-#   - `product(a, b)`            — the cartesian product of `a` and `b` as
-#                                  `(x, y)` pairs (`a` is the outer loop).
+# Public API (CPython name/shape unless noted):
+#   - `count(start=0, step=1)            -> Iterator[int]`   INFINITE.
+#   - `cycle(xs)                         -> Iterator[T]`      INFINITE unless
+#                                                              `xs` is empty
+#                                                              (matches CPython:
+#                                                              an empty source
+#                                                              yields nothing).
+#   - `repeat(x, times=None)             -> Iterator[T]`      INFINITE when
+#                                                              `times` is
+#                                                              omitted/`None`,
+#                                                              else exactly
+#                                                              `times` copies.
+#   - `chain(a, b)                       -> Iterator[T]`      binary only —
+#                                                              see divergence.
+#   - `islice(xs, start, stop=None, step=1) -> Iterator[T]`   CPython's
+#                                                              2-arg form
+#                                                              `islice(xs, stop)`
+#                                                              is reached by
+#                                                              passing only
+#                                                              `start` (it is
+#                                                              then reinterpreted
+#                                                              as `stop`, with
+#                                                              `start` reset to
+#                                                              0) — see
+#                                                              divergence.
+#   - `takewhile(pred, xs)                -> Iterator[T]`
+#   - `dropwhile(pred, xs)                -> Iterator[T]`
+#   - `starmap(f, pairs)                  -> Iterator[R]`     2-tuple only —
+#                                                              see divergence.
+#   - `accumulate(xs, f)                  -> Iterator[T]`     `f` is mandatory
+#                                                              — see divergence
+#                                                              (no default-sum
+#                                                              form, no
+#                                                              `initial=`).
+#   - `zip_longest(a, b, fillvalue)        -> Iterator[tuple[T, T]]` same
+#                                                              element type on
+#                                                              both sides,
+#                                                              `fillvalue`
+#                                                              mandatory — see
+#                                                              divergence.
+#   - `groupby(xs, key)                    -> list[tuple[K, list[T]]]` EAGER
+#                                                              — see
+#                                                              divergence.
+#   - `tee(xs, n=2)                        -> list[list[T]]`  EAGER — see
+#                                                              divergence.
+#   - `combinations(xs, r)                 -> list[list[T]]`  unchanged
+#                                                              (eager; a
+#                                                              finite
+#                                                              combinatoric
+#                                                              enumeration,
+#                                                              matches
+#                                                              CPython's own
+#                                                              materialized-use
+#                                                              case).
+#   - `combinations_with_replacement(xs, r) -> list[list[T]]` NEW.
+#   - `permutations(xs, r)                 -> list[list[T]]`  unchanged.
+#   - `product(a, b)                       -> list[tuple[A, B]]` unchanged;
+#                                                              binary only —
+#                                                              see divergence.
 #
 # Implementation / language-fit notes:
-#   - `accumulate[T]` is GENERIC over the element type. The codegen now
-#     monomorphises a type parameter inside a generic function's
-#     `Callable[[T, …], …]` parameter: at a call site the inferred concrete `T`
-#     is substituted into the closure cast (`Rc<dyn Fn(i64,i64)->i64>`), so the
-#     fold callable is well-typed. The element-type binding comes from the
-#     concrete `xs` argument (`list[T]`), not the lambda body.
-#   - `product[A, B]` uses TWO type parameters so the two inputs may differ in
-#     element type (e.g. `product(["a","b"], [1,2])`), matching CPython where the
-#     factors are independent. (A single-`T` form would force both lists to the
-#     same element type.)
-#   - `combinations` reads its scratch `idx[j]` index into a `pos` LOCAL before
-#     subscripting `xs[pos]`: a directly-nested subscript `xs[idx[j]]` currently
-#     mis-codegens (an operator-precedence bug in the emitted Rust), so the
-#     one-line hoist keeps it correct.
-#   - DEFERRED to a later batch: `count` / `cycle` (infinite — eager would hang),
-#     `combinations_with_replacement`, `groupby`, `islice`, `starmap`, `tee`,
-#     `zip_longest`, and an n-ary `product` (variadics / *args needed).
+#   - Generators CANNOT take `Iterator[T]` as a parameter type (compiler
+#     limitation — no lazy-iterator-as-argument). Every function here that
+#     consumes a sequence therefore takes `list[T]` (already materialized);
+#     only the *output* is lazy. This means `islice`, `takewhile`, etc. cannot
+#     be chained directly onto `count()`/`cycle()` without an intermediate
+#     `list(...)` cutoff — chaining INFINITE generators through another
+#     generator is out of reach without Iterator-typed params. Consume
+#     infinite generators only via a `for` loop with an explicit `break`.
+#   - `accumulate[T]` remains GENERIC over the element type via a mandatory
+#     `Callable[[T, T], T]` fold, as before (monomorphized against the
+#     concrete `xs: list[T]` argument). We ATTEMPTED to add CPython's
+#     `func=None` (defaulting to `+`) and `initial=None` forms; both hit a
+#     genuine compiler codegen bug (verified with probes p3-p6 in
+#     `scratchpad/probes/`): reassigning a generic-`T` local via the generic
+#     `+` operator inside a loop body trips the block-scoped-shadow
+#     "reassigned to an incompatible type" invariant check (it misreads the
+#     monomorphized concrete type, e.g. `int`, as incompatible with the
+#     declared `T`), even though the reassignment is type-consistent. This is
+#     a compiler defect, not a language-design gap; documented here as
+#     deferred pending a compiler fix (not this card's scope — no compiler
+#     edits were made). `func` stays mandatory.
+#   - `starmap[T, R]` requires the fold callable to be bound to a
+#     type-annotated local (`f: Callable[[T, T], R] = lambda ...`) before the
+#     call when `R` is not independently inferable from a `list[T]` argument
+#     — passing a *naked* lambda literal directly as the `f` argument hit a
+#     monomorphization bug where the generic type parameters leak into the
+#     caller's `fn user_main` signature and fail to resolve (rustc E0425,
+#     verified with probes p9/p10). Not a design constraint of `starmap`
+#     itself; the fix is a one-line caller-side rebinding. `starmap` is
+#     2-tuple only (`tuple[T, T]`, homogeneous pair) — CPython's variadic
+#     `f(*args)` needs `*args`, which pyrst does not support (G4).
+#   - `chain`/`product` remain BINARY (`chain(a, b)`, `product(a, b)`).
+#     CPython's n-ary `chain(*iterables)` / `product(*iterables)` need
+#     `*args` (G4, out of scope for this pass — design-around documented in
+#     docs/design/stdlib-full.md §C.2).
+#   - `zip_longest[T]` requires `a` and `b` to share element type `T` and
+#     `fillvalue: T` to be given explicitly (no default `None`, since a
+#     generic `T | None` fill would change the yielded tuple's element type
+#     to `T | None` and complicate every consumer). CPython allows
+#     heterogeneous iterables with a single untyped `fillvalue=None`; that
+#     dynamic-typing behavior has no static equivalent here.
+#   - `groupby`/`tee` stay EAGER (return `list[...]`, not `Iterator[...]`):
+#     CPython's `groupby` yields a lazy *sub-iterator* per group and `tee`
+#     yields `n` independent lazy iterators — both need "a list of
+#     iterators", which pyrst cannot type (no `Iterator[T]` as a list element
+#     / no first-class iterator objects). The eager list-of-lists shape is
+#     the closest faithful approximation and is a genuine improvement over
+#     the previous total absence of these two functions.
+#   - `islice(xs, start, stop=None, step=1)`: CPython overloads arity —
+#     `islice(iterable, stop)` vs `islice(iterable, start, stop, step=None)` —
+#     which pyrst cannot express (no arg-count-based overloading). This
+#     single signature recovers both call shapes: passing one positional
+#     integer (`start` only, `stop` defaulted to `None`) is reinterpreted as
+#     "stop = start, start = 0", matching `islice(xs, 5)` producing the first
+#     5 items; passing all three reproduces `islice(xs, start, stop, step)`.
+#     HARDENING NOTE (found during review): this means an explicit
+#     open-ended 3-arg call, `islice(xs, 2, None)` (CPython: "from index 2 to
+#     the end"), is INDISTINGUISHABLE from the 1-arg call `islice(xs, 2)`
+#     (CPython: "first 2 items") — both leave `stop` at `None` inside the
+#     function body, and pyrst cannot tell how many positional arguments the
+#     caller actually wrote. The single-signature design picks the far more
+#     common "stop-only" reading, so `islice(xs, 2, None)` silently means
+#     "first 2 items", NOT "from index 2 onward" as in real CPython. This is
+#     inherent to lacking arg-count overloading (same root cause as the
+#     paragraph above), not newly introduced — there is no fix short of
+#     `*args`/overloading. Workaround for the open-ended case: pass an
+#     explicit real bound, `islice(xs, 2, len(xs))`.
+#     HARDENING FIX (found during review): `step < 1` and negative
+#     `start`/`stop` used to be unchecked — `step == 0` silently hung forever
+#     (index never advances), `step < 0` walked the index below 0 and
+#     Rust-panicked with an out-of-range index, and negative `start`/`stop`
+#     silently wrapped via pyrst's Python-style negative list indexing,
+#     producing garbage output instead of an error. All three now raise a
+#     catchable `ValueError`, matching CPython's own `ValueError` for these
+#     same inputs (verified against `python3`).
+#   - `combinations`/`permutations`/`combinations_with_replacement` stay
+#     eager finite-list generators (unbounded `r` against a finite `xs` is
+#     itself finite — no benefit to laziness here, and the existing
+#     odometer-index algorithm is reused/extended).
+#     HARDENING FIX (found during review): negative `r` used to be
+#     mishandled instead of erroring — `combinations`/
+#     `combinations_with_replacement` silently returned `[[]]` (treating a
+#     negative `r` the same as `r == 0`), while `permutations` wasted a full
+#     recursive traversal to return `[]` "by accident" (its termination
+#     check, `len(current) == r`, is simply never true for negative `r`).
+#     CPython raises `ValueError("r must be non-negative")` for all three;
+#     all three now do the same, verified against `python3`.
+#   - `combinations` still hoists `idx[j]` into a `pos` local before
+#     subscripting `xs[pos]` (nested-subscript codegen note carried over
+#     from the previous version).
+#   - Private helpers are prefixed `_itertools_` per stdlib convention; the
+#     permutations backtracking helper is `_itertools_perm_rec` (renamed this
+#     pass from the previously-unprefixed `_perm_rec`, closing the review's
+#     helper-prefix finding).
+#
+# Divergences / deferrals summary (CPython parity gaps that remain):
+#   - `chain`/`product`: n-ary form deferred (G4 — `*args`).
+#   - `accumulate`: `func=None` default-sum and `initial=` deferred (compiler
+#     codegen bug in generic-`T` `+`-reassignment inside a loop; see above).
+#   - `starmap`: variadic tuple width deferred (G4 — `*args`); 2-tuple only.
+#   - `zip_longest`: homogeneous-type-only, `fillvalue` mandatory (no
+#     `Optional`-widening trick that stays simple).
+#   - `groupby`/`tee`: eager (`list`) instead of lazy sub-iterators (no
+#     first-class iterator-as-value type).
+#   - `islice`: single-signature `(start, stop=None, step=1)` recovers both
+#     CPython call shapes but is not literally overloaded.
 
 
-def accumulate[T](xs: list[T], f: Callable[[T, T], T]) -> list[T]:
-    result: list[T] = []
+def count(start: int = 0, step: int = 1) -> Iterator[int]:
+    n: int = start
+    while True:
+        yield n
+        n = n + step
+
+
+def cycle[T](xs: list[T]) -> Iterator[T]:
     if len(xs) == 0:
-        return result
+        return
+    while True:
+        for x in xs:
+            yield x
+
+
+def repeat[T](x: T, times: int | None = None) -> Iterator[T]:
+    if times is None:
+        while True:
+            yield x
+    else:
+        n: int = times
+        i: int = 0
+        while i < n:
+            yield x
+            i = i + 1
+
+
+def chain[T](a: list[T], b: list[T]) -> Iterator[T]:
+    for x in a:
+        yield x
+    for y in b:
+        yield y
+
+
+def islice[T](xs: list[T], start: int, stop: int | None = None, step: int = 1) -> Iterator[T]:
+    # Guard against the two crash/hang modes discovered during hardening:
+    # a non-positive `step` used to either silently infinite-loop (step == 0,
+    # index never advances) or Rust-panic with an out-of-range index
+    # (negative step walks `i` below 0 forever). CPython raises ValueError
+    # for both; we now do the same instead of hanging/panicking.
+    if step < 1:
+        raise ValueError("Step for islice() must be a positive integer or None.")
+    lo: int = 0
+    hi: int = start
+    if stop is not None:
+        lo = start
+        hi: int = stop
+    # A negative `start`/`stop` used to silently wrap via pyrst's
+    # Python-style negative list indexing (`xs[-2]` == `xs[len(xs)-2]`),
+    # producing garbage output instead of CPython's ValueError. Guard it.
+    if lo < 0 or hi < 0:
+        raise ValueError("Indices for islice() must be None or an integer: 0 <= x <= sys.maxsize.")
+    i: int = lo
+    while i < hi and i < len(xs):
+        yield xs[i]
+        i = i + step
+
+
+def takewhile[T](pred: Callable[[T], bool], xs: list[T]) -> Iterator[T]:
+    for x in xs:
+        if not pred(x):
+            return
+        yield x
+
+
+def dropwhile[T](pred: Callable[[T], bool], xs: list[T]) -> Iterator[T]:
+    dropping: bool = True
+    for x in xs:
+        if dropping and pred(x):
+            continue
+        dropping = False
+        yield x
+
+
+def starmap[T, R](f: Callable[[T, T], R], pairs: list[tuple[T, T]]) -> Iterator[R]:
+    for pair in pairs:
+        a: T = pair[0]
+        b: T = pair[1]
+        yield f(a, b)
+
+
+def accumulate[T](xs: list[T], f: Callable[[T, T], T]) -> Iterator[T]:
+    if len(xs) == 0:
+        return
     acc: T = xs[0]
-    result.append(acc)
+    yield acc
     i: int = 1
     while i < len(xs):
         acc = f(acc, xs[i])
-        result.append(acc)
+        yield acc
         i = i + 1
-    return result
 
 
-def chain[T](a: list[T], b: list[T]) -> list[T]:
-    out: list[T] = []
-    for x in a:
-        out.append(x)
-    for y in b:
-        out.append(y)
+def zip_longest[T](a: list[T], b: list[T], fillvalue: T) -> Iterator[tuple[T, T]]:
+    n: int = len(a)
+    if len(b) > n:
+        n = len(b)
+    i: int = 0
+    while i < n:
+        av: T = fillvalue
+        bv: T = fillvalue
+        if i < len(a):
+            av = a[i]
+        if i < len(b):
+            bv = b[i]
+        yield (av, bv)
+        i = i + 1
+
+
+def groupby[T, K](xs: list[T], key: Callable[[T], K]) -> list[tuple[K, list[T]]]:
+    out: list[tuple[K, list[T]]] = []
+    i: int = 0
+    n: int = len(xs)
+    while i < n:
+        k: K = key(xs[i])
+        group: list[T] = [xs[i]]
+        j: int = i + 1
+        while j < n:
+            kj: K = key(xs[j])
+            if kj == k:
+                group.append(xs[j])
+                j = j + 1
+            else:
+                break
+        out.append((k, group))
+        i = j
     return out
 
 
-def repeat[T](x: T, n: int) -> list[T]:
-    out: list[T] = []
+def tee[T](xs: list[T], n: int = 2) -> list[list[T]]:
+    out: list[list[T]] = []
     i: int = 0
     while i < n:
-        out.append(x)
+        out.append(xs.copy())
         i = i + 1
     return out
 
@@ -85,6 +331,8 @@ def product[A, B](a: list[A], b: list[B]) -> list[tuple[A, B]]:
 
 
 def combinations[T](xs: list[T], r: int) -> list[list[T]]:
+    if r < 0:
+        raise ValueError("r must be non-negative")
     out: list[list[T]] = []
     n: int = len(xs)
     if r > n:
@@ -121,7 +369,47 @@ def combinations[T](xs: list[T], r: int) -> list[list[T]]:
             m = m + 1
 
 
+def combinations_with_replacement[T](xs: list[T], r: int) -> list[list[T]]:
+    if r < 0:
+        raise ValueError("r must be non-negative")
+    out: list[list[T]] = []
+    n: int = len(xs)
+    if n == 0:
+        if r == 0:
+            out.append([])
+        return out
+    # `idx` holds r NON-descending positions (repeats allowed), starting at
+    # [0, 0, …, 0] and advanced like an odometer whose max digit is n-1.
+    idx: list[int] = []
+    k: int = 0
+    while k < r:
+        idx.append(0)
+        k = k + 1
+    while True:
+        combo: list[T] = []
+        j: int = 0
+        while j < r:
+            pos: int = idx[j]
+            combo.append(xs[pos])
+            j = j + 1
+        out.append(combo)
+        i: int = r - 1
+        while i >= 0 and idx[i] == n - 1:
+            i = i - 1
+        if i < 0:
+            return out
+        idx[i] = idx[i] + 1
+        # Reset every position to the right of `i` to idx[i] (replacement
+        # allows repeating the same value, unlike `combinations`' idx[i]+1).
+        m: int = i + 1
+        while m < r:
+            idx[m] = idx[i]
+            m = m + 1
+
+
 def permutations[T](xs: list[T], r: int) -> list[list[T]]:
+    if r < 0:
+        raise ValueError("r must be non-negative")
     out: list[list[T]] = []
     n: int = len(xs)
     if r > n:
@@ -132,11 +420,11 @@ def permutations[T](xs: list[T], r: int) -> list[list[T]]:
         used.append(False)
         u = u + 1
     current: list[T] = []
-    _perm_rec(xs, r, used, current, out)
+    _itertools_perm_rec(xs, r, used, current, out)
     return out
 
 
-def _perm_rec[T](xs: list[T], r: int, used: Mut[list[bool]], current: Mut[list[T]], out: Mut[list[list[T]]]) -> None:
+def _itertools_perm_rec[T](xs: list[T], r: int, used: Mut[list[bool]], current: Mut[list[T]], out: Mut[list[list[T]]]) -> None:
     # Depth-first build of r-length orderings: pick each still-unused element in
     # index order, recurse, then backtrack. Visiting indices ascending yields
     # CPython's lexicographic-by-index permutation order.
@@ -149,7 +437,7 @@ def _perm_rec[T](xs: list[T], r: int, used: Mut[list[bool]], current: Mut[list[T
         if not used[i]:
             used[i] = True
             current.append(xs[i])
-            _perm_rec(xs, r, used, current, out)
+            _itertools_perm_rec(xs, r, used, current, out)
             current.pop()
             used[i] = False
         i = i + 1

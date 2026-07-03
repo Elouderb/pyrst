@@ -1,0 +1,144 @@
+# Parity test for the upgraded `functools` module: reduce (3-arg and 2-arg
+# forms, including empty-sequence edge cases and non-commutative folding),
+# partial (single-arg binding via closures), cmp_to_key (decorate-sort-
+# undecorate with an old-style comparator, including empty/singleton/
+# duplicate-key inputs), and Cache (memoization, including two distinct
+# compute functions against the same cache).
+#
+# parity: pyrst-only — `Cache` is a pyrst-only extension (CPython's
+# `functools.cache`/`lru_cache` are decorators pyrst cannot express; see
+# lib/functools.pyrs header), so `from functools import ... Cache` would
+# ImportError against the real CPython `functools` module. The `reduce` /
+# `partial` / `cmp_to_key` portions of this file WERE separately dual-run
+# verified byte-identical against `python3`'s real `functools` (modulo
+# pyrst's `partial`/`cmp_to_key` being int-specialized rather than fully
+# generic/variadic, `reduce`'s empty+no-init `ValueError` vs CPython's
+# `TypeError`, and unicode string reduce being exercised outside this file
+# since `Cache`'s presence makes the whole file pyrst-only — see module
+# header); only the combined file, which adds `Cache` for full-surface
+# coverage, is pyrst-only.
+from functools import reduce, partial, cmp_to_key, Cache, _functools_CmpKey
+
+
+def add(a: int, b: int) -> int:
+    return a + b
+
+
+def mul(a: int, b: int) -> int:
+    return a * b
+
+
+def sub(a: int, b: int) -> int:
+    return a - b
+
+
+def cmp_desc(a: int, b: int) -> int:
+    if a < b:
+        return 1
+    if a > b:
+        return -1
+    return 0
+
+
+def square(n: int) -> int:
+    return n * n
+
+
+def neg(n: int) -> int:
+    return -n
+
+
+def main() -> None:
+    nums: list[int] = [1, 2, 3, 4]
+
+    # reduce: 3-arg (explicit initializer) and 2-arg (no initializer).
+    print(reduce(add, nums, 0))
+    print(reduce(mul, nums, 1))
+    print(reduce(add, nums))
+    print(reduce(mul, [5]))
+
+    # reduce edge cases: empty+init, non-commutative op (order matters),
+    # negative numbers, single-element no-init, empty+no-init -> ValueError
+    # (documented divergence from CPython's TypeError — see module header).
+    empty: list[int] = []
+    print(reduce(add, empty, 0))
+    print(reduce(sub, [10, -3, 5]))
+    print(reduce(add, [-1, -2, -3]))
+    single: list[int] = [5]
+    print(reduce(mul, single))
+    try:
+        empty2: list[int] = []
+        print(reduce(add, empty2))
+    except ValueError as e:
+        print("ValueError:", e)
+
+    # partial: bind the first argument of a 2-arg function into a 1-arg closure.
+    add5: Callable[[int], int] = partial(add, 5)
+    print(add5(10))
+    print(add5(20))
+    times3: Callable[[int], int] = partial(mul, 3)
+    print(times3(7))
+    # partial edge cases: zero and negative bound arg / call arg.
+    zero_add: Callable[[int], int] = partial(add, 0)
+    print(zero_add(0))
+    neg_add: Callable[[int], int] = partial(add, -5)
+    print(neg_add(-5))
+
+    # cmp_to_key: old-style comparator -> key-wrapper objects, sorted directly
+    # (decorate-sort-undecorate; see lib/functools.pyrs header for why
+    # `sorted(xs, key=cmp_to_key(cmp))` composition isn't supported).
+    xs: list[int] = [3, 1, 4, 1, 5, 9, 2, 6]
+    key_fn: Callable[[int], _functools_CmpKey] = cmp_to_key(cmp_desc)
+    keyed: list[_functools_CmpKey] = [key_fn(x) for x in xs]
+    keyed_sorted: list[_functools_CmpKey] = sorted(keyed)
+    print([k.obj for k in keyed_sorted])
+
+    # cmp_to_key edge cases: empty, singleton, all-duplicate-keys inputs.
+    xs_empty: list[int] = []
+    keyed_empty: list[_functools_CmpKey] = [key_fn(x) for x in xs_empty]
+    keyed_empty_sorted: list[_functools_CmpKey] = sorted(keyed_empty)
+    print([k.obj for k in keyed_empty_sorted])
+
+    xs_one: list[int] = [7]
+    keyed_one: list[_functools_CmpKey] = [key_fn(x) for x in xs_one]
+    keyed_one_sorted: list[_functools_CmpKey] = sorted(keyed_one)
+    print([k.obj for k in keyed_one_sorted])
+
+    xs_dup: list[int] = [2, 2, 2]
+    keyed_dup: list[_functools_CmpKey] = [key_fn(x) for x in xs_dup]
+    keyed_dup_sorted: list[_functools_CmpKey] = sorted(keyed_dup)
+    print([k.obj for k in keyed_dup_sorted])
+
+    # Cache: memoize an expensive-looking computation.
+    cache: Cache[int, int] = Cache()
+    sq: Callable[[int], int] = square
+    print(cache.get(4, sq))
+    print(cache.get(4, sq))
+    print(cache.get(5, sq))
+    print(cache.get(4, sq))
+
+    # Cache edge case: a SECOND distinct compute function against the same
+    # cache instance. Bare top-level function names must be bound to a
+    # `Callable`-typed local first (`ng: Callable[[int], int] = neg`) before
+    # being passed to `.get()` — passing the bare name directly fails rustc
+    # codegen (E0308: expected `Rc<dyn Fn(K) -> V>`, found fn item) for a
+    # generic class method's `Callable` param, unlike a free function's
+    # `Callable` param; see module header. A key already cached (here, 0)
+    # returns the ORIGINALLY cached value regardless of which compute
+    # function is passed for a repeat lookup — that is `Cache`'s documented
+    # "look up or compute-and-store" semantics, not a bug.
+    cache2: Cache[int, int] = Cache()
+    ng: Callable[[int], int] = neg
+    print(cache2.get(0, sq))
+    print(cache2.get(-3, sq))
+    print(cache2.get(-3, ng))
+    print(cache2.get(0, ng))
+
+    # Cache.__eq__: two empty caches are equal; a populated cache is not
+    # equal to an empty one (compares by stored-entry count, documented in
+    # the class body as a divergence from CPython's caches, which have no
+    # equality operator at all since they aren't first-class objects).
+    cache3: Cache[int, int] = Cache()
+    cache4: Cache[int, int] = Cache()
+    print(cache3 == cache4)
+    print(cache3 == cache)

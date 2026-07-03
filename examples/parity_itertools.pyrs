@@ -1,0 +1,261 @@
+# parity: pyrst-only
+#
+# Reason: this exercises the FULL upgraded itertools surface, and one call
+# genuinely cannot be made to match both runtimes with a single source line.
+# pyrst's codegen does not support keyword arguments at a free-function call
+# site ("keyword arguments are only supported for class constructors in v0" —
+# a pre-existing compiler limitation, not an itertools design choice), so
+# every call in this file must pass `zip_longest`'s `fillvalue` positionally
+# (`zip_longest(a, b, 0)`). But real CPython's `itertools.zip_longest`
+# signature is `zip_longest(*iterables, fillvalue=None)` — `fillvalue` is
+# keyword-ONLY — so a bare positional 3rd argument is swallowed as a THIRD
+# iterable by real CPython (`TypeError: 'int' object is not iterable`) rather
+# than bound as the fill value. There is no positional call shape that means
+# "fillvalue" to CPython's real `itertools.zip_longest` and simultaneously
+# compiles under pyrst. Every other call in this file (`count`, `cycle`,
+# `repeat`, `chain`, `islice`, `takewhile`, `dropwhile`, `starmap`,
+# `accumulate`, `product`, `combinations`, `combinations_with_replacement`,
+# `permutations`) IS independently CPython-parity-verified (see notes.md).
+# `groupby`/`tee` are ALSO independently divergent-by-design (eager `list`
+# vs. CPython's lazy sub-iterators/tuple-of-iterators — see module header)
+# and are printed directly here rather than reshaped to match, since the
+# file is already pyrst-only. `zip_longest` alone would force the whole
+# file's marker even if `groupby`/`tee` were reshaped, since the harness
+# diffs the file as a whole. Expected output below was captured from the
+# pyrst binary and is fully deterministic (no randomness, no timing).
+from itertools import count, cycle, repeat, chain, islice, takewhile, dropwhile
+from itertools import starmap, accumulate, zip_longest, groupby, tee
+from itertools import product, combinations, combinations_with_replacement, permutations
+
+
+def is_even(x: int) -> bool:
+    return x % 2 == 0
+
+
+def is_small(x: int) -> bool:
+    return x < 4
+
+
+def add(a: int, b: int) -> int:
+    return a + b
+
+
+def mul(a: int, b: int) -> int:
+    return a * b
+
+
+def key_id(x: int) -> int:
+    return x
+
+
+def is_neg(x: int) -> bool:
+    return x < 0
+
+
+def str_len(x: str) -> int:
+    return len(x)
+
+
+def main() -> None:
+    # count(): infinite, break-bounded.
+    n: int = 0
+    for v in count(5, 2):
+        if n >= 4:
+            break
+        print(v)
+        n = n + 1
+
+    # cycle(): infinite, break-bounded.
+    n2: int = 0
+    for v in cycle([1, 2, 3]):
+        if n2 >= 7:
+            break
+        print(v)
+        n2 = n2 + 1
+
+    # cycle() over empty: yields nothing.
+    n3: int = 0
+    empty: list[int] = []
+    for v in cycle(empty):
+        n3 = n3 + 1
+    print(n3)
+
+    # repeat(): infinite form, break-bounded.
+    n4: int = 0
+    for v in repeat(9):
+        if n4 >= 3:
+            break
+        print(v)
+        n4 = n4 + 1
+
+    # repeat(): bounded form.
+    for v in repeat(7, 3):
+        print(v)
+
+    # chain(): binary.
+    for v in chain([1, 2], [3, 4, 5]):
+        print(v)
+
+    # islice(): 1-arg-shape (stop only).
+    xs: list[int] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    for v in islice(xs, 5):
+        print(v)
+
+    # islice(): 3-arg-shape (start, stop, step).
+    for v in islice(xs, 2, 8, 2):
+        print(v)
+
+    # takewhile()/dropwhile(): predicate first, matching CPython's arg order.
+    ys: list[int] = [1, 2, 3, 4, 1]
+    for v in takewhile(is_small, ys):
+        print(v)
+    for v in dropwhile(is_small, ys):
+        print(v)
+
+    # starmap(): function first, matching CPython's arg order; 2-tuple only.
+    # Bind the lambda to a typed local first (naked-lambda-literal-argument
+    # monomorphization limitation).
+    mulf: Callable[[int, int], int] = mul
+    for v in starmap(mulf, [(2, 5), (3, 2)]):
+        print(v)
+
+    # accumulate(): func mandatory (no default-sum form; see module header).
+    addf: Callable[[int, int], int] = add
+    for v in accumulate([1, 2, 3, 4], addf):
+        print(v)
+
+    # zip_longest(): homogeneous type, fillvalue mandatory (positional —
+    # see the "# parity: pyrst-only" note at the top of this file for why).
+    for pair in zip_longest([1, 2, 3], [4, 5], 0):
+        print(pair)
+
+    # groupby(): pyrst's group is already a materialized `list[T]` (see
+    # divergence note in the module header) — printed directly.
+    idf: Callable[[int], int] = key_id
+    for pair in groupby([1, 1, 2, 2, 2, 3, 1], idf):
+        print(pair)
+
+    # tee(): pyrst returns `list[list[T]]` (see divergence note) — index
+    # instead of unpack, print each copy directly.
+    teed: list[list[int]] = tee([1, 2, 3])
+    print(teed[0])
+    print(teed[1])
+
+    # product(): binary cartesian product.
+    print(product([1, 2], ["a", "b"]))
+
+    # combinations() / combinations_with_replacement() / permutations().
+    print(combinations([1, 2, 3], 2))
+    print(combinations_with_replacement([1, 2, 3], 2))
+    print(permutations([1, 2, 3], 2))
+
+    # --- Hardening pass: edge cases (empty/single/ties/negatives/unicode) ---
+
+    # Empty-input shapes: r=0 on empty -> [[]]; r>0 on empty -> [].
+    empty_i: list[int] = []
+    print(combinations(empty_i, 0))
+    print(combinations(empty_i, 2))
+    print(combinations_with_replacement(empty_i, 0))
+    print(combinations_with_replacement(empty_i, 2))
+    print(permutations(empty_i, 0))
+    print(product(empty_i, [1, 2]))
+    print(product([1, 2], empty_i))
+
+    # r=0 on a non-empty input -> [[]] for all three combinatoric fns.
+    print(permutations([1, 2, 3], 0))
+
+    # repeat(): times=0 and negative times both yield nothing.
+    for v in repeat(5, 0):
+        print(v)
+    for v in repeat(5, -3):
+        print(v)
+    print("repeat-edge-done")
+
+    # tee(): n=0 -> empty list of lists; over an empty source.
+    teed0: list[list[int]] = tee(empty_i, 3)
+    print(len(teed0))
+
+    # chain(): both sides empty -> yields nothing.
+    for v in chain(empty_i, empty_i):
+        print(v)
+    print("chain-empty-done")
+
+    # groupby(): non-contiguous duplicate keys stay separate groups (ties).
+    dup_key: Callable[[int], int] = key_id
+    for pair in groupby([1, 1, 2, 2, 2, 1], dup_key):
+        print(pair)
+
+    # groupby()/dropwhile()/takewhile()/accumulate(): negative numbers.
+    negs: list[int] = [-3, -2, -1, 0, 1]
+    is_neg_local: Callable[[int], bool] = is_neg
+    for v in takewhile(is_neg_local, negs):
+        print(v)
+    for v in dropwhile(is_neg_local, negs):
+        print(v)
+    addf2: Callable[[int, int], int] = add
+    negacc: list[int] = [-1, -2, 3, -4]
+    for v in accumulate(negacc, addf2):
+        print(v)
+
+    # count(): negative start and negative (and zero) step.
+    n5: int = 0
+    for v in count(-5, -2):
+        if n5 >= 3:
+            break
+        print(v)
+        n5 = n5 + 1
+
+    # unicode: groupby by str length, chain over unicode strings, cycle.
+    key_len_f: Callable[[str], int] = str_len
+    words: list[str] = ["café", "naïve", "hi", "yo", "日本語"]
+    for pair in groupby(words, key_len_f):
+        print(pair)
+    for v in chain(["a", "café", "日"], ["z"]):
+        print(v)
+    n6: int = 0
+    for v in cycle(["日", "本"]):
+        if n6 >= 5:
+            break
+        print(v)
+        n6 = n6 + 1
+
+    # zip_longest(): unequal lengths with a unicode fillvalue.
+    for pair in zip_longest(["a", "b", "c"], ["x"], "Z"):
+        print(pair)
+
+    # islice(): now-guarded error paths (step<1, negative indices) instead
+    # of the pre-hardening hang/panic/garbage-output — verify each raises
+    # a catchable ValueError, matching CPython's own ValueError here.
+    xs2: list[int] = [0, 1, 2, 3, 4, 5]
+    try:
+        for v in islice(xs2, 0, 6, 0):
+            print(v)
+    except ValueError as e:
+        print("caught:", e)
+    try:
+        for v in islice(xs2, 0, 6, -1):
+            print(v)
+    except ValueError as e:
+        print("caught:", e)
+    try:
+        for v in islice(xs2, -2, 6, 1):
+            print(v)
+    except ValueError as e:
+        print("caught:", e)
+
+    # combinations()/combinations_with_replacement()/permutations(): now
+    # raise ValueError for negative r (previously combinations and
+    # combinations_with_replacement silently returned [[]], matching r=0
+    # instead of erroring like CPython).
+    try:
+        print(combinations([1, 2, 3], -1))
+    except ValueError as e:
+        print("caught:", e)
+    try:
+        print(combinations_with_replacement([1, 2, 3], -1))
+    except ValueError as e:
+        print("caught:", e)
+    try:
+        print(permutations([1, 2, 3], -1))
+    except ValueError as e:
+        print("caught:", e)

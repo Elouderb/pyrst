@@ -1,0 +1,169 @@
+# Parity test for lib/math.pyrs (card 4c8f4147, docs/design/stdlib-full.md
+# §D row "math"). Dual-run under both the pyrst binary and python3's REAL
+# `math` module (math is @extern-backed, so per the design doc §"@extern /
+# @crate decorators" note this is a python3-reference golden, not a
+# same-source module golden — `import math` resolves to CPython's own
+# `math` in the python3 twin and to lib/math.pyrs under pyrst).
+#
+# Uses qualified `math.<fn>(...)` calls throughout (not `from math import
+# pow`/`round` etc.) — a bare imported `pow` collides with pyrst's builtin
+# `pow(int, int) -> int` codegen shortcut (an unrelated, pre-existing
+# compiler quirk, not a math-module concern); qualifying via `math.pow`
+# resolves correctly and is the safer, general convention anyway.
+#
+# Excluded from this dual-run file, with reasons (see lib/math.pyrs header):
+#   - `math.inf()` / `math.nan()` — pyrst exposes these as niladic @extern
+#     FUNCTIONS (module consts must be annotated literals; there is no
+#     inf/nan literal), but CPython's `math.inf`/`math.nan` are plain float
+#     ATTRIBUTES, not callables — `math.inf()` is a TypeError under CPython.
+#     Spot-verified separately via `pyrst build`+run only (see notes.md).
+#   - `floor`/`ceil`/`trunc` are wrapped in `int(...)` below specifically so
+#     the dual-run comparison lines up: CPython's `math.floor/ceil/trunc`
+#     already return `int`, while pyrst's return `float` (the gated **G6**
+#     int/float-overload delta) — `int(math.floor(x))` yields the same
+#     printed integer under both, without depending on the gated overload.
+
+import math
+
+
+def main() -> None:
+    print(math.sqrt(16.0))
+    print(int(math.floor(3.7)))
+    print(int(math.ceil(3.2)))
+    print(int(math.trunc(-3.7)))
+    print(math.exp(1.0))
+    print(math.log(math.e))
+    print(math.log2(8.0))
+    print(math.log10(1000.0))
+    print(math.sin(0.0))
+    print(math.cos(0.0))
+    print(math.tan(0.0))
+    print(math.asin(1.0))
+    print(math.acos(1.0))
+    print(math.atan(1.0))
+    print(math.pow(2.0, 10.0))
+    print(math.hypot(3.0, 4.0))
+    print(math.fabs(-3.5))
+    print(math.atan2(1.0, 1.0))
+    print(math.degrees(math.pi))
+    print(math.radians(180.0))
+    print(math.isnan(1.0))
+    print(math.isinf(1.0))
+    print(math.isfinite(1.0))
+    print(math.copysign(3.0, -1.0))
+    print(math.copysign(-3.0, 1.0))
+    print(math.fmod(7.0, 3.0))
+    print(math.fmod(-7.0, 3.0))
+    print(math.remainder(7.0, 3.0))
+    print(math.remainder(-7.0, 3.0))
+    print(math.modf(3.75))
+    print(math.dist([0.0, 0.0], [3.0, 4.0]))
+    print(math.prod([1.0, 2.0, 3.0, 4.0]))
+    print(math.gcd(12, 18))
+    print(math.gcd(-12, 18))
+    print(math.lcm(4, 6))
+    print(math.lcm(0, 5))
+    print(math.factorial(0))
+    print(math.factorial(5))
+    print(math.factorial(20))
+    print(math.comb(5, 2))
+    print(math.comb(5, 0))
+    print(math.comb(5, 5))
+    print(math.comb(5, 6))
+    print(math.perm(5, 2))
+    print(math.perm(5, 0))
+    print(math.perm(5, 5))
+    print(math.isqrt(0))
+    print(math.isqrt(1))
+    print(math.isqrt(10))
+    print(math.isqrt(99))
+    print(math.pi)
+    print(math.e)
+    print(math.tau)
+
+    # --- hardening: edge cases (ties, boundaries, errors) ---
+    # (infinity can't be constructed from a pyrst float literal — the lexer
+    # has no scientific-notation exponent syntax, and any op large enough to
+    # overflow to inf raises OverflowError under CPython's math.pow/**/exp
+    # instead of returning inf — so the modf(+-inf) fix is spot-verified
+    # pyrst-only below instead of in this dual-run section; see notes.md.)
+    print(math.modf(0.0))
+    print(math.modf(-0.0))
+    print(math.fmod(7.0, -3.0))
+    print(math.fmod(-7.0, -3.0))
+    print(math.remainder(1.0, 2.0))
+    print(math.remainder(3.0, 2.0))
+    print(math.copysign(0.0, -1.0))
+    print(math.copysign(-0.0, 1.0))
+    try:
+        print(math.dist([0.0, 0.0], [1.0]))
+    except ValueError as e:
+        print(str(e))
+    print(math.dist([], []))
+    print(math.prod([]) + 0.0)
+    print(math.gcd(0, 0))
+    print(math.lcm(-4, 6))
+    print(math.isqrt(9999))
+    print(math.isqrt(10000))
+    try:
+        print(math.comb(-1, 2))
+    except ValueError as e:
+        print(str(e))
+    try:
+        print(math.comb(2, -1))
+    except ValueError as e:
+        print(str(e))
+    try:
+        print(math.perm(-1, 2))
+    except ValueError as e:
+        print(str(e))
+    try:
+        print(math.perm(2, -1))
+    except ValueError as e:
+        print(str(e))
+    try:
+        print(math.factorial(-1))
+    except ValueError as e:
+        print(str(e))
+    try:
+        print(math.isqrt(-1))
+    except ValueError as e:
+        print(str(e))
+
+    # --- domain-error guards (the review finding): the domain-restricted
+    # functions now raise ValueError("math domain error") on out-of-domain
+    # inputs, exactly like CPython — so this whole block prints identically
+    # under pyrst and python3. Boundary/OK cases are probed alongside the
+    # errors (sqrt(-0.0) is NOT an error and returns -0.0; asin/acos accept
+    # the +-1.0 boundary).
+    try:
+        print(math.sqrt(-4.0))
+    except ValueError as e:
+        print(str(e))
+    print(math.sqrt(-0.0))
+    try:
+        print(math.log(0.0))
+    except ValueError as e:
+        print(str(e))
+    try:
+        print(math.log(-2.0))
+    except ValueError as e:
+        print(str(e))
+    try:
+        print(math.log2(0.0))
+    except ValueError as e:
+        print(str(e))
+    try:
+        print(math.log10(-1.0))
+    except ValueError as e:
+        print(str(e))
+    try:
+        print(math.asin(2.0))
+    except ValueError as e:
+        print(str(e))
+    try:
+        print(math.acos(-1.5))
+    except ValueError as e:
+        print(str(e))
+    print(math.asin(1.0))
+    print(math.acos(-1.0))

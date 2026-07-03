@@ -1,0 +1,103 @@
+5
+7
+9
+11
+1
+2
+3
+1
+2
+3
+1
+0
+9
+9
+9
+7
+7
+7
+1
+2
+3
+4
+5
+0
+1
+2
+3
+4
+2
+4
+6
+1
+2
+3
+4
+1
+10
+6
+1
+3
+6
+10
+(1, 4)
+(2, 5)
+(3, 0)
+(1, [1, 1])
+(2, [2, 2, 2])
+(3, [3])
+(1, [1])
+[1, 2, 3]
+[1, 2, 3]
+[(1, 'a'), (1, 'b'), (2, 'a'), (2, 'b')]
+[[1, 2], [1, 3], [2, 3]]
+[[1, 1], [1, 2], [1, 3], [2, 2], [2, 3], [3, 3]]
+[[1, 2], [1, 3], [2, 1], [2, 3], [3, 1], [3, 2]]
+[[]]
+[]
+[[]]
+[]
+[[]]
+[]
+[]
+[[]]
+repeat-edge-done
+3
+chain-empty-done
+(1, [1, 1])
+(2, [2, 2, 2])
+(1, [1])
+-3
+-2
+-1
+0
+1
+-1
+-3
+0
+-4
+-5
+-7
+-9
+(4, ['café'])
+(5, ['naïve'])
+(2, ['hi', 'yo'])
+(3, ['日本語'])
+a
+café
+日
+z
+日
+本
+日
+本
+日
+('a', 'x')
+('b', 'Z')
+('c', 'Z')
+caught: Step for islice() must be a positive integer or None.
+caught: Step for islice() must be a positive integer or None.
+caught: Indices for islice() must be None or an integer: 0 <= x <= sys.maxsize.
+caught: r must be non-negative
+caught: r must be non-negative
+caught: r must be non-negative

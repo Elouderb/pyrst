@@ -1,0 +1,68 @@
+# Dual-run parity golden for lib/string.pyrs.
+#
+# Exercises the full upgraded surface: all 9 constants (including the newly
+# expressible `whitespace` and `printable`) plus `capwords` in both its
+# whitespace-default and custom-separator forms. Runs byte-identical under
+# pyrst and python3 (harness prepends `from __future__ import annotations`).
+from string import (
+    ascii_lowercase,
+    ascii_uppercase,
+    ascii_letters,
+    digits,
+    hexdigits,
+    octdigits,
+    punctuation,
+    whitespace,
+    printable,
+    capwords
+)
+
+
+def main() -> None:
+    print(ascii_lowercase)
+    print(ascii_uppercase)
+    print(ascii_letters)
+    print(digits)
+    print(hexdigits)
+    print(octdigits)
+    print(punctuation)
+
+    # whitespace: print each char's ordinal (the chars themselves are
+    # non-printable/whitespace, so ordinals give a stable, readable golden).
+    ws_ords: list[int] = []
+    for c in whitespace:
+        ws_ords.append(ord(c))
+    print(ws_ords)
+    print(len(whitespace))
+
+    print(len(printable))
+    print(printable[0:10])
+    print(printable[10:36])
+    print(printable[36:62])
+    print(printable[62:94])
+
+    print(capwords("  hello   world  "))
+    print(capwords("the quick brown fox"))
+    print(capwords(""))
+    print(capwords("hello,world", ","))
+    print(capwords("a,,b", ","))
+    print(capwords("one-two-three", "-"))
+
+    # Edge cases: empty/whitespace-only input, case normalization, custom
+    # separators including one that also happens to be a whitespace char
+    # (sep=" " must NOT collapse runs the way the default whitespace-split
+    # does -- a real CPython behavioral distinction), leading/trailing
+    # separators, and tabs/newlines under the default splitter.
+    print(capwords("   "))
+    print(capwords("HELLO WORLD"))
+    print(capwords("single"))
+    print(capwords("a  b", " "))
+    print(capwords(",a,b,", ","))
+    print(capwords("a\tb\nc"))
+
+    # Empty separator is a CPython ValueError (str.split("") is illegal);
+    # capwords must reject it the same way rather than silently misbehaving.
+    try:
+        print(capwords("a,b", ""))
+    except ValueError as e:
+        print("caught:", str(e))

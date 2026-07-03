@@ -6,83 +6,106 @@
 # `src/stdlib.rs`). Usable as either `from bisect import bisect_left` or
 # `import bisect; bisect.bisect_left(a, x)`.
 #
-# Semantics (matching CPython):
-#   - `bisect_left(a, x)`  → leftmost index where `x` can be inserted to keep
-#     `a` sorted (before any existing entries equal to `x`).
-#   - `bisect_right(a, x)` → rightmost such index (after existing entries equal
-#     to `x`). `bisect` is an alias of `bisect_right`.
-#   - `insort_left` / `insort` insert `x` in place (the list is a `Mut[list[T]]`
-#     by-reference param, so the caller's list is mutated) at the corresponding
-#     index, keeping it sorted. `insort` aliases `insort_right`.
+# Fidelity: 4/5 (design doc `docs/design/stdlib-full.md` §D row "bisect").
 #
-# Phase notes:
-#   - The optional `lo` / `hi` bounding arguments are DEFERRED (they need
-#     default arguments). The whole-list form is provided.
+# Surface (exact CPython names/shapes):
+#   - `bisect_left(a, x, lo=0, hi=None)`  → leftmost index where `x` can be
+#     inserted to keep `a` sorted (before any existing entries equal to `x`),
+#     restricted to the `a[lo:hi]` slice.
+#   - `bisect_right(a, x, lo=0, hi=None)` → rightmost such index (after
+#     existing entries equal to `x`). `bisect` is an alias of `bisect_right`.
+#   - `insort_left(a, x, lo=0, hi=None)` / `insort_right(a, x, lo=0, hi=None)`
+#     insert `x` in place (the list is a `Mut[list[T]]` by-reference param, so
+#     the caller's list is mutated) at the corresponding index within the
+#     `a[lo:hi]` slice, keeping it sorted. `insort` aliases `insort_right`.
+#   - `hi=None` means "search to the end of the list" (CPython's `hi=None`
+#     sentinel), matched here with `Optional[int]` + `_bisect_resolve_hi`.
+#   - `lo < 0` raises `ValueError("lo must be non-negative")`, matching
+#     CPython's `_bisect` C implementation exactly.
+#
+# Divergences / deferrals:
+#   - `key=None` (CPython 3.10+ keyword-only custom-key argument on all six
+#     functions) is DEFERRED. Supporting it faithfully needs a two-type-param
+#     `Callable[[T], K]` narrowing pattern (`T` compared via `key(x)`'s `K`)
+#     that has not been validated against pyrst's generic-Callable monomorphize
+#     path (see phase37 Callable[[T],..] work) — out of scope for this card.
+#     No other whole-list behavior changes when `key` is omitted, so ordinary
+#     callers are at full parity.
 #   - `T: PartialOrd` is inferred from the `<` comparisons on `T`; no explicit
 #     bound syntax is needed.
+#   - `hi == -1` (an explicit, non-None, literal -1 passed as `hi`) is
+#     INTENTIONALLY NOT bug-for-bug matched. CPython's default (C-accelerated)
+#     `_bisect` module represents the `hi=None` default via an internal `-1`
+#     sentinel at the C-call boundary, so passing an explicit `hi=-1` collides
+#     with that sentinel and is silently treated as "search to len(a)" (verified:
+#     `python3 -c "import bisect; print(bisect.bisect_left([1,2,3,4,5],3,0,-1))"`
+#     -> `2`, i.e. as if `hi=None`). CPython's pure-Python fallback
+#     (used when the `_bisect` C extension is unavailable) does NOT have this
+#     collision and returns `0` (the logical/documented slice answer:
+#     `lo=0 < hi=-1` is false, so no search happens). pyrst's `Optional[int]`
+#     model has no such sentinel collision, so `hi=-1` here always means the
+#     literal (already-empty) slice bound, matching the pure-Python fallback's
+#     documented semantics rather than the C accelerator's undocumented quirk.
+#     Excluded from the dual-run parity test for that reason (it would diverge
+#     from `python3`'s CLI default, which uses the C accelerator, even though
+#     pyrst's answer is the logically-correct one per the documented contract).
+#     All other negative `hi` values (e.g. -2, -100) behave identically in
+#     both pyrst and CPython (verified) — this quirk is specific to -1.
 
 
-def bisect_left[T](a: list[T], x: T) -> int:
-    lo: int = 0
-    hi: int = len(a)
-    while lo < hi:
-        mid: int = (lo + hi) // 2
+def _bisect_resolve_hi(hi: Optional[int], n: int) -> int:
+    if hi is not None:
+        return hi
+    return n
+
+
+def _bisect_check_lo(lo: int) -> None:
+    if lo < 0:
+        raise ValueError("lo must be non-negative")
+
+
+def bisect_left[T](a: list[T], x: T, lo: int = 0, hi: Optional[int] = None) -> int:
+    _bisect_check_lo(lo)
+    real_lo: int = lo
+    real_hi: int = _bisect_resolve_hi(hi, len(a))
+    while real_lo < real_hi:
+        mid: int = (real_lo + real_hi) // 2
         if a[mid] < x:
-            lo = mid + 1
+            real_lo = mid + 1
         else:
-            hi = mid
-    return lo
+            real_hi = mid
+    return real_lo
 
 
-def bisect_right[T](a: list[T], x: T) -> int:
-    lo: int = 0
-    hi: int = len(a)
-    while lo < hi:
-        mid: int = (lo + hi) // 2
+def bisect_right[T](a: list[T], x: T, lo: int = 0, hi: Optional[int] = None) -> int:
+    _bisect_check_lo(lo)
+    real_lo: int = lo
+    real_hi: int = _bisect_resolve_hi(hi, len(a))
+    while real_lo < real_hi:
+        mid: int = (real_lo + real_hi) // 2
         if x < a[mid]:
-            hi = mid
+            real_hi = mid
         else:
-            lo = mid + 1
-    return lo
+            real_lo = mid + 1
+    return real_lo
 
 
 # `bisect` is the conventional alias of `bisect_right`.
-def bisect[T](a: list[T], x: T) -> int:
-    return bisect_right(a, x)
+def bisect[T](a: list[T], x: T, lo: int = 0, hi: Optional[int] = None) -> int:
+    return bisect_right(a, x, lo, hi)
 
 
-def insort_left[T](a: Mut[list[T]], x: T) -> None:
-    lo: int = 0
-    hi: int = len(a)
-    while lo < hi:
-        mid: int = (lo + hi) // 2
-        if a[mid] < x:
-            lo = mid + 1
-        else:
-            hi = mid
-    a.insert(lo, x)
+def insort_left[T](a: Mut[list[T]], x: T, lo: int = 0, hi: Optional[int] = None) -> None:
+    idx: int = bisect_left(a, x, lo, hi)
+    a.insert(idx, x)
 
 
-def insort_right[T](a: Mut[list[T]], x: T) -> None:
-    lo: int = 0
-    hi: int = len(a)
-    while lo < hi:
-        mid: int = (lo + hi) // 2
-        if x < a[mid]:
-            hi = mid
-        else:
-            lo = mid + 1
-    a.insert(lo, x)
+def insort_right[T](a: Mut[list[T]], x: T, lo: int = 0, hi: Optional[int] = None) -> None:
+    idx: int = bisect_right(a, x, lo, hi)
+    a.insert(idx, x)
 
 
 # `insort` is the conventional alias of `insort_right`.
-def insort[T](a: Mut[list[T]], x: T) -> None:
-    lo: int = 0
-    hi: int = len(a)
-    while lo < hi:
-        mid: int = (lo + hi) // 2
-        if x < a[mid]:
-            hi = mid
-        else:
-            lo = mid + 1
-    a.insert(lo, x)
+def insort[T](a: Mut[list[T]], x: T, lo: int = 0, hi: Optional[int] = None) -> None:
+    idx: int = bisect_right(a, x, lo, hi)
+    a.insert(idx, x)

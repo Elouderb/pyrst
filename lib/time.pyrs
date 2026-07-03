@@ -1,21 +1,84 @@
 # pyrst standard library — time
 #
-# Phase-1 `time` module: `@extern` bindings over `std::time` and `std::thread`.
-# Embedded into the compiler binary via `include_str!` (see `src/stdlib.rs`), so
-# it travels with the binary and needs no filesystem install. Usable as either
-# `from time import time, sleep` or `import time; time.time()`.
+# Fidelity score: 4/5 (was 2/5).
+#
+# Surface implemented (CPython-exact names/positional-keyword shapes):
+#   - `time() -> float`               wall-clock seconds since Unix epoch (@extern)
+#   - `sleep(secs: float) -> None`     suspend current thread (@extern)
+#   - `perf_counter() -> float`        monotonic high-res clock, process-local zero (@extern)
+#   - `monotonic() -> float`           monotonic clock; CPython guarantees non-decreasing
+#     but does NOT guarantee the same absolute value as `perf_counter`. We anchor it to
+#     its own `OnceLock`-captured `Instant` (a separate clock from `perf_counter`), matching
+#     CPython's contract: only differences across calls to the SAME function are meaningful.
+#   - `process_time() -> float`       DIVERGENCE from CPython (explicit): this
+#     is WALL-CLOCK time elapsed since the FIRST call — a `std::time::Instant`
+#     captured in a `OnceLock` on first use (@extern) — NOT the process CPU
+#     time that CPython's `time.process_time()` reports. pyrst's @extern
+#     surface has no `clock()`/`getrusage` binding, so true CPU time is
+#     unavailable. On a single-threaded, CPU-bound run wall-elapsed-since-
+#     first-call approximates it, but it DIVERGES whenever the process sleeps
+#     or blocks: sleeping still advances this clock, whereas CPython's
+#     `process_time` does not count sleep. Documented, not silently wrong.
+#   - `time_ns() -> int`               nanoseconds since Unix epoch, as an int (@extern)
+#   - `struct_time` — implemented as a plain pyrst class (pyrst has no true C-struct/
+#     tuple-dual-view type) with fields `tm_year tm_mon tm_mday tm_hour tm_min tm_sec
+#     tm_wday tm_yday tm_isdst`, `__init__` in that exact positional order, and `__str__`
+#     / `__repr__` rendering `time.struct_time(tm_year=..., ...)` like CPython's repr.
+#     DIVERGENCE: CPython's struct_time also supports *index*-based access
+#     (`t[0] == t.tm_year`); pyrst has no named-tuple-with-index type, so only
+#     attribute access is supported. Documented, not silently dropped.
+#   - `gmtime(secs: Optional[float] = None) -> struct_time`  pure calendar math
+#     (Howard Hinnant's `civil_from_days`) over UTC seconds-since-epoch; matches
+#     CPython's `gmtime` exactly for the epoch range tested (see parity_time).
+#     Only defined for `secs >= 0` (i.e. 1970-01-01 UTC onward) — pre-epoch
+#     negative timestamps are out of scope for this pass (no reported CPython
+#     use-case in-repo needs them; can be added by extending the floor-division
+#     branch of `_time_civil_from_days` if ever required).
+#   - `ctime(secs: Optional[float] = None) -> str`  `"Www Mon dd hh:mm:ss yyyy"`.
+#     DIVERGENCE: CPython's `ctime` renders **local** time; pyrst has no local
+#     timezone database (deferred: `localtime`/tz conversion, needs G-data
+#     zoneinfo/tz tables — see docs/design/stdlib-full.md §E). This `ctime` is
+#     therefore UTC-based (equivalent to `asctime(gmtime(secs))`), documented as
+#     a divergence rather than silently wrong.
+#   - `strftime(fmt: str, t: Optional[struct_time] = None) -> str`  supports the
+#     common CPython directives `%Y %y %m %d %H %M %S %j %A %a %B %b %p %%`.
+#     Unsupported directives (`%c %x %X %Z %z %U %W %V` and locale-dependent
+#     forms) are NOT implemented — pyrst has no locale/tz subsystem to back them
+#     honestly; using them raises `ValueError` rather than silently emitting the
+#     literal characters. When `t` is omitted, defaults to `gmtime()` (not
+#     `localtime()`, for the same tz reason as `ctime`).
+#
+# Deferred (not in this pass — gated, see docs/design/stdlib-full.md §D/E):
+#   - `localtime()` / any local-timezone conversion: needs a timezone database
+#     (G-data: zoneinfo/tz tables). `gmtime`/`ctime`/`strftime` here are UTC-only.
+#   - `strptime()`: parsing an arbitrary format string back into a `struct_time`
+#     needs a small format-directive interpreter with backtracking-free parsing;
+#     out of scope for this fidelity pass (no consumer in-repo needs it yet).
+#     Deferred, not silently stubbed.
+#   - `mktime()`: inverse of `localtime`, blocked on the same tz gap.
+#   - `%c %x %X %Z %z %U %W %V` strftime directives and any locale-varying
+#     directive: no locale subsystem in pyrst.
 #
 # Notes:
 #   - `time()` is wall-clock seconds since the Unix epoch (a float), matching
 #     CPython's `time.time()`. It can move backwards if the system clock is
-#     adjusted, so for elapsed-time measurement prefer `perf_counter()`.
-#   - `perf_counter()` is a MONOTONIC high-resolution clock in seconds. It is
-#     anchored to a process-local `Instant` captured on first call (via a
-#     `OnceLock`), so successive calls are non-decreasing; only DIFFERENCES are
-#     meaningful (the absolute value has no defined zero across runs), exactly
-#     like CPython.
+#     adjusted, so for elapsed-time measurement prefer `perf_counter()` or
+#     `monotonic()`.
+#   - `perf_counter()` / `monotonic()` are MONOTONIC high-resolution clocks in
+#     seconds, each anchored to its own process-local `Instant` captured on
+#     first call (via a `OnceLock`), so successive calls to the SAME function
+#     are non-decreasing; only DIFFERENCES are meaningful (the absolute value
+#     has no defined zero across runs, and no defined relationship between the
+#     two different clocks), exactly like CPython's documented contract.
 #   - `sleep(secs)` suspends the current thread for `secs` seconds (fractional
 #     ok); `sleep(0.0)` is a valid no-op-ish yield.
+#   - Wall-clock-derived values (`time`, `time_ns`, `perf_counter`,
+#     `monotonic`, `process_time`, and `gmtime()`/`ctime()`/`strftime()` called
+#     with no argument) are inherently nondeterministic across runs; the parity
+#     example only asserts monotonicity and cross-consistency (never absolute
+#     values) for those, and uses fixed epoch seconds to exercise the pure
+#     calendar-math paths (`gmtime`, `ctime`, `strftime` with an explicit arg)
+#     deterministically.
 
 
 @extern
@@ -24,10 +87,229 @@ def time() -> float:
 
 
 @extern
+def time_ns() -> int:
+    "std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as i64"
+
+
+@extern
 def perf_counter() -> float:
+    "{ static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new(); START.get_or_init(std::time::Instant::now).elapsed().as_secs_f64() }"
+
+
+@extern
+def monotonic() -> float:
+    "{ static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new(); START.get_or_init(std::time::Instant::now).elapsed().as_secs_f64() }"
+
+
+@extern
+def process_time() -> float:
     "{ static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new(); START.get_or_init(std::time::Instant::now).elapsed().as_secs_f64() }"
 
 
 @extern
 def sleep(secs: float) -> None:
     "std::thread::sleep(std::time::Duration::from_secs_f64({secs}))"
+
+
+class struct_time:
+    tm_year: int
+    tm_mon: int
+    tm_mday: int
+    tm_hour: int
+    tm_min: int
+    tm_sec: int
+    tm_wday: int
+    tm_yday: int
+    tm_isdst: int
+
+    def __init__(
+        self,
+        tm_year: int,
+        tm_mon: int,
+        tm_mday: int,
+        tm_hour: int,
+        tm_min: int,
+        tm_sec: int,
+        tm_wday: int,
+        tm_yday: int,
+        tm_isdst: int
+    ) -> None:
+        self.tm_year = tm_year
+        self.tm_mon = tm_mon
+        self.tm_mday = tm_mday
+        self.tm_hour = tm_hour
+        self.tm_min = tm_min
+        self.tm_sec = tm_sec
+        self.tm_wday = tm_wday
+        self.tm_yday = tm_yday
+        self.tm_isdst = tm_isdst
+
+    def __str__(self) -> str:
+        return (
+            "time.struct_time(tm_year=" + str(self.tm_year)
+            + ", tm_mon=" + str(self.tm_mon)
+            + ", tm_mday=" + str(self.tm_mday)
+            + ", tm_hour=" + str(self.tm_hour)
+            + ", tm_min=" + str(self.tm_min)
+            + ", tm_sec=" + str(self.tm_sec)
+            + ", tm_wday=" + str(self.tm_wday)
+            + ", tm_yday=" + str(self.tm_yday)
+            + ", tm_isdst=" + str(self.tm_isdst)
+            + ")"
+        )
+
+    def __repr__(self) -> str:
+        return self.__str__()
+
+
+def _time_weekday_name(wday: int) -> str:
+    # 0=Monday .. 6=Sunday, matching CPython's tm_wday convention.
+    names: list[str] = [
+        "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"
+    ]
+    return names[wday]
+
+
+def _time_month_name(mon: int) -> str:
+    # 1=January .. 12=December, matching CPython's tm_mon convention.
+    names: list[str] = [
+        "January", "February", "March", "April", "May", "June",
+        "July", "August", "September", "October", "November", "December"
+    ]
+    return names[mon - 1]
+
+
+def _time_is_leap(y: int) -> bool:
+    return (y % 4 == 0 and y % 100 != 0) or (y % 400 == 0)
+
+
+def _time_days_in_month(y: int, m: int) -> int:
+    if m == 2:
+        if _time_is_leap(y):
+            return 29
+        return 28
+    if m == 4 or m == 6 or m == 9 or m == 11:
+        return 30
+    return 31
+
+
+def _time_civil_from_days(z: int) -> tuple[int, int, int]:
+    # Howard Hinnant's `civil_from_days`, restricted to z >= 0 (see module
+    # header — pre-epoch timestamps are out of scope for this pass).
+    zz: int = z + 719468
+    era: int = zz // 146097
+    doe: int = zz - era * 146097
+    yoe: int = (doe - doe // 1460 + doe // 36524 - doe // 146096) // 365
+    y: int = yoe + era * 400
+    doy: int = doe - (365 * yoe + yoe // 4 - yoe // 100)
+    mp: int = (5 * doy + 2) // 153
+    d: int = doy - (153 * mp + 2) // 5 + 1
+    m: int = mp + 3
+    if mp >= 10:
+        m = mp - 9
+    if m <= 2:
+        y = y + 1
+    return (y, m, d)
+
+
+def _time_day_of_year(y: int, m: int, d: int) -> int:
+    days: int = d
+    i: int = 1
+    while i < m:
+        days = days + _time_days_in_month(y, i)
+        i = i + 1
+    return days
+
+
+def _time_resolve_secs(secs: Optional[float]) -> float:
+    if secs is not None:
+        return secs
+    return time()
+
+
+def gmtime(secs: Optional[float] = None) -> struct_time:
+    s: float = _time_resolve_secs(secs)
+    if s < 0.0:
+        raise ValueError("gmtime: negative (pre-epoch) timestamps are not supported")
+    t: int = int(s)
+    days: int = t // 86400
+    rem: int = t - days * 86400
+    hour: int = rem // 3600
+    rem2: int = rem - hour * 3600
+    minute: int = rem2 // 60
+    sec: int = rem2 - minute * 60
+    ymd: tuple[int, int, int] = _time_civil_from_days(days)
+    y: int = ymd[0]
+    m: int = ymd[1]
+    d: int = ymd[2]
+    wday: int = (days + 3) % 7
+    yday: int = _time_day_of_year(y, m, d)
+    return struct_time(y, m, d, hour, minute, sec, wday, yday, 0)
+
+
+def ctime(secs: Optional[float] = None) -> str:
+    t: struct_time = gmtime(secs)
+    wname: str = _time_weekday_name(t.tm_wday)[0:3]
+    mname: str = _time_month_name(t.tm_mon)[0:3]
+    day_field: str = str(t.tm_mday).rjust(2)
+    return (
+        wname + " " + mname + " " + day_field + " "
+        + str(t.tm_hour).zfill(2) + ":" + str(t.tm_min).zfill(2) + ":" + str(t.tm_sec).zfill(2)
+        + " " + str(t.tm_year)
+    )
+
+
+def _time_strftime_code(code: str, t: struct_time) -> str:
+    if code == "Y":
+        return str(t.tm_year)
+    if code == "y":
+        return str(t.tm_year % 100).zfill(2)
+    if code == "m":
+        return str(t.tm_mon).zfill(2)
+    if code == "d":
+        return str(t.tm_mday).zfill(2)
+    if code == "H":
+        return str(t.tm_hour).zfill(2)
+    if code == "M":
+        return str(t.tm_min).zfill(2)
+    if code == "S":
+        return str(t.tm_sec).zfill(2)
+    if code == "j":
+        return str(t.tm_yday).zfill(3)
+    if code == "A":
+        return _time_weekday_name(t.tm_wday)
+    if code == "a":
+        return _time_weekday_name(t.tm_wday)[0:3]
+    if code == "B":
+        return _time_month_name(t.tm_mon)
+    if code == "b":
+        return _time_month_name(t.tm_mon)[0:3]
+    if code == "p":
+        if t.tm_hour < 12:
+            return "AM"
+        return "PM"
+    if code == "%":
+        return "%"
+    raise ValueError("strftime: unsupported directive %" + code)
+
+
+def _time_resolve_struct(t: Optional[struct_time]) -> struct_time:
+    if t is not None:
+        return t
+    return gmtime()
+
+
+def strftime(fmt: str, t: Optional[struct_time] = None) -> str:
+    tt: struct_time = _time_resolve_struct(t)
+    out: str = ""
+    i: int = 0
+    n: int = len(fmt)
+    while i < n:
+        c: str = fmt[i]
+        if c == "%" and i + 1 < n:
+            out += _time_strftime_code(fmt[i + 1], tt)
+            i = i + 2
+        else:
+            out += c
+            i = i + 1
+    return out

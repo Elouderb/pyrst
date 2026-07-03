@@ -1,0 +1,29 @@
+True
+False
+['1', '22', '333']
+a#b#c#
+True
+False
+True
+False
+True
+False
+['1', '22', '333']
+XXX
+XXa
+('XXX', 3)
+('Xaa', 1)
+['a', 'b', 'c', 'd']
+['a', 'b', 'c,d']
+a\.b\+c\*d\?
+hello\ world!
+1_2\-3
+
+aaa
+('aaa', 0)
+['a,b,c,d']
+$5
+('$5', 1)
+['', '', '', '']
+['', 'a', 'b', 'c', '']
+True

@@ -4,33 +4,85 @@
 # `include_str!` (see `src/stdlib.rs`). Usable as either
 # `from math import sqrt` or `import math; math.sqrt(x)`.
 #
-# Two pieces, both general-purpose language features that math merely dogfoods:
-#   - MODULE-LEVEL CONSTANTS: `pi`/`e`/`tau` are top-level annotated-literal
-#     constants (`NAME: float = <literal>`). The f64 literals below ARE the exact
-#     IEEE-754 doubles for PI / E / TAU (same bit patterns as Rust's
-#     `std::f64::consts::{PI,E,TAU}`), so `math.pi` keeps its previous value.
-#   - @extern FUNCTION WRAPPERS over Rust's `f64` methods. Each body is a single
-#     Rust expression template (`{x}` is substituted with the param) emitted as
-#     the function's tail expression — matching the templates the former
-#     hardcoded codegen arm produced.
+# FIDELITY: 4/5 (was 3/5). Surface: 3 float consts (`pi`/`e`/`tau`) + 2
+# @extern niladic "constant" functions (`inf`/`nan`) + 33 @extern float
+# wrappers over Rust `f64` methods + 6 pure-pyrst int functions
+# (`gcd`/`lcm`/`factorial`/`comb`/`perm`/`isqrt`) + 2 pure-pyrst helpers
+# built on the extern primitives (`modf`/`dist`) + `prod` (float lists).
 #
-# Phase-1 notes:
-#   - float-specialized: arguments and results are `float` (pyrst generics are a
-#     later card). Pass floats (`math.sqrt(16.0)`); pyrst does not implicitly
-#     widen an int argument to a float parameter, so `math.sqrt(16)` is a type
-#     error — write `16.0`.
-#   - `floor`/`ceil`/`trunc` return `float` (Rust's `f64::floor` etc. yield
-#     `f64`), matching the previous hardcoded behavior; CPython returns `int`.
-#     An int-returning form arrives with a later overload/generics card.
-#   - `log(x)` is the natural log (Rust `f64::ln`). A two-argument
-#     `log(x, base)` form needs overloading and is deferred; use `log2`/`log10`
-#     for the common bases.
-#   - `inf` / `nan` are NOT provided: pyrst has no infinity / NaN LITERAL, so
-#     they cannot be expressed as annotated-literal constants (the only module
-#     constant form). They are deferred until pyrst grows such literals (or a
-#     `float("inf")` form). Likewise `fabs`/`atan2`/`degrees`/`radians`/
-#     `isnan`/`isinf`/`isfinite` are not yet migrated — add them as @extern
-#     wrappers when a program needs them.
+# Divergences from CPython (all documented, none silent):
+#   - DOMAIN ERRORS (now guarded — was the review finding that `sqrt(-4.0)`
+#     silently returned NaN): the six domain-restricted functions this module
+#     exposes now RAISE `ValueError("math domain error")` on their
+#     out-of-domain inputs, exactly matching CPython (boundary + inf/nan
+#     semantics verified against `python3`):
+#       - `sqrt(x)`   for x < 0        (sqrt(-0.0) is OK -> -0.0; nan -> nan)
+#       - `log(x)`/`log2(x)`/`log10(x)` for x <= 0  (incl. 0.0 and -0.0;
+#                                                    nan -> nan)
+#       - `asin(x)`/`acos(x)`         for |x| > 1   (boundaries +-1.0 OK;
+#                                                    nan -> nan; +-inf raise)
+#     These are implemented as pure-pyrst public wrappers over private
+#     `_math_<fn>_raw` @extern primitives (so the raw Rust `f64` method is
+#     called exactly once, after the guard). REMAINING (un-guarded) edges,
+#     kept honest here: `sin`/`cos`/`tan` on +-inf return NaN rather than
+#     raising CPython's domain error, and `pow`/`fmod`/`remainder` do not
+#     replicate CPython's (more intricate) domain rules — these thin @extern
+#     wrappers pass Rust's IEEE-754 result through unchanged on those edges.
+#   - FLOAT-SPECIALIZED: nearly every trig/exp/rounding function takes and
+#     returns `float` only (pyrst generics over numeric kinds are a later
+#     card). `math.sqrt(16)` is a type error in pyrst — write `16.0`.
+#   - `floor`/`ceil`/`trunc` return **float** (CPython returns `int`). This is
+#     the explicitly gated **G6** delta ("int/float overload") — deferred.
+#     `round()` (builtin, not in this module) is likewise int-returning in
+#     CPython and is not re-added here.
+#   - `log(x)` is natural log only; the two-argument `log(x, base)` overload
+#     needs the same G6 overloading machinery and is deferred — use
+#     `log2`/`log10`, or `log(x) / log(base)` for an arbitrary base.
+#   - `gcd`/`lcm` are 2-argument (`gcd(a, b)`), not CPython's variadic
+#     `gcd(*integers)` — pyrst has no `*args`. Chain calls for >2 arguments:
+#     `gcd(gcd(a, b), c)`.
+#   - `perm(n, k)` requires an explicit `k` (CPython defaults `k=None` to
+#     mean `k=n`; a default expression referencing another parameter isn't
+#     expressible in pyrst) — pass `perm(n, n)` explicitly for the full
+#     permutation count.
+#   - `prod` is `list[float] -> float` only; CPython's `math.prod` also
+#     accepts integer iterables (default `start=1`, an int). A generic
+#     int/float `prod` is the same G6-shaped overload gap — for an all-int
+#     product use `functools.reduce(operator.mul, xs, 1)`.
+#   - `inf`/`nan` are @extern NILADIC FUNCTIONS (`math.inf()`, `math.nan()`),
+#     not bare module constants — pyrst module consts must be
+#     annotated-literal (`NAME: T = <literal>`) and there is no infinity/NaN
+#     literal. Call them: `x: float = math.inf()`. (Matches the documented
+#     p08 finding in docs/design/stdlib-full.md.)
+#   - `isqrt`/`factorial`/`comb`/`perm`/`gcd`/`lcm` operate on pyrst's `int`
+#     (`i64`) — no arbitrary precision (**G9**, documented project-wide).
+#     `factorial(21)` and up overflow i64 and panic, matching pyrst's
+#     honest-overflow contract (CPython would return a bignum).
+#     `gcd`/`lcm`/`isqrt` on `i64::MIN`-adjacent inputs may overflow for the
+#     same reason; not specially guarded.
+#   - `dist` raises `ValueError("both points must have the same number of
+#     dimensions")` on length-mismatched inputs, matching CPython 3.8+
+#     (found during hardening review — the original draft silently
+#     truncated to `len(p)`, diverging from CPython).
+#   - `modf` special-cases +-infinity and +-0.0 to return `(copysign(0.0, x),
+#     x)` (CPython shape); a naive `x - trunc(x)` gives `(nan, inf)` for
+#     infinite `x` (`inf - inf` is NaN in IEEE 754) and gives `(0.0, -0.0)`
+#     instead of CPython's `(-0.0, -0.0)` for `x = -0.0` (`-0.0 - -0.0` is
+#     `+0.0`, losing the sign) — both found+fixed during hardening review.
+#   - `comb`/`perm` raise CPython's exact per-argument messages
+#     (`"n must be a non-negative integer"` / `"k must be a non-negative
+#     integer"`) rather than a combined "n and k" message
+#     (found+fixed during hardening review).
+#
+# Two authoring techniques, both general-purpose language features that this
+# module merely dogfoods:
+#   - MODULE-LEVEL CONSTANTS: `pi`/`e`/`tau` are top-level annotated-literal
+#     constants. The f64 literals are the exact IEEE-754 doubles for
+#     PI / E / TAU (same bit patterns as Rust's `std::f64::consts::{PI,E,TAU}`).
+#   - @extern FUNCTION WRAPPERS over Rust's `f64` methods. Each body is a
+#     single Rust expression template (`{x}` substituted with the param),
+#     emitted as the function's tail expression; a few use a `{ .. }` block
+#     template where more than one statement is needed (`inf`/`nan`/`remainder`).
 
 
 pi: float = 3.141592653589793
@@ -39,8 +91,17 @@ tau: float = 6.283185307179586
 
 
 @extern
-def sqrt(x: float) -> float:
+def _math_sqrt_raw(x: float) -> float:
     "({x}).sqrt()"
+
+
+def sqrt(x: float) -> float:
+    # CPython raises ValueError("math domain error") for x < 0. nan passes
+    # through (nan < 0.0 is False -> Rust returns nan); -0.0 is NOT < 0.0, so
+    # sqrt(-0.0) returns -0.0, exactly matching CPython.
+    if x < 0.0:
+        raise ValueError("math domain error")
+    return _math_sqrt_raw(x)
 
 
 @extern
@@ -64,18 +125,41 @@ def exp(x: float) -> float:
 
 
 @extern
-def log(x: float) -> float:
+def _math_log_raw(x: float) -> float:
     "({x}).ln()"
 
 
+def log(x: float) -> float:
+    # CPython raises ValueError("math domain error") for x <= 0 (incl. 0.0 and
+    # -0.0, since -0.0 <= 0.0 is True). nan passes through (nan <= 0.0 is
+    # False -> Rust returns nan); +inf -> inf.
+    if x <= 0.0:
+        raise ValueError("math domain error")
+    return _math_log_raw(x)
+
+
 @extern
-def log2(x: float) -> float:
+def _math_log2_raw(x: float) -> float:
     "({x}).log2()"
 
 
+def log2(x: float) -> float:
+    # Same domain as `log`: x <= 0 raises ValueError("math domain error").
+    if x <= 0.0:
+        raise ValueError("math domain error")
+    return _math_log2_raw(x)
+
+
 @extern
-def log10(x: float) -> float:
+def _math_log10_raw(x: float) -> float:
     "({x}).log10()"
+
+
+def log10(x: float) -> float:
+    # Same domain as `log`: x <= 0 raises ValueError("math domain error").
+    if x <= 0.0:
+        raise ValueError("math domain error")
+    return _math_log10_raw(x)
 
 
 @extern
@@ -94,13 +178,29 @@ def tan(x: float) -> float:
 
 
 @extern
-def asin(x: float) -> float:
+def _math_asin_raw(x: float) -> float:
     "({x}).asin()"
 
 
+def asin(x: float) -> float:
+    # CPython raises ValueError("math domain error") for |x| > 1 (so +-inf
+    # raise too). The boundaries +-1.0 are valid; nan passes through (both
+    # comparisons are False -> Rust returns nan).
+    if x < -1.0 or x > 1.0:
+        raise ValueError("math domain error")
+    return _math_asin_raw(x)
+
+
 @extern
-def acos(x: float) -> float:
+def _math_acos_raw(x: float) -> float:
     "({x}).acos()"
+
+
+def acos(x: float) -> float:
+    # Same domain as `asin`: |x| > 1 raises ValueError("math domain error").
+    if x < -1.0 or x > 1.0:
+        raise ValueError("math domain error")
+    return _math_acos_raw(x)
 
 
 @extern
@@ -116,3 +216,167 @@ def pow(x: float, y: float) -> float:
 @extern
 def hypot(x: float, y: float) -> float:
     "({x}).hypot({y})"
+
+
+@extern
+def inf() -> float:
+    "{ f64::INFINITY }"
+
+
+@extern
+def nan() -> float:
+    "{ f64::NAN }"
+
+
+@extern
+def fabs(x: float) -> float:
+    "({x}).abs()"
+
+
+@extern
+def atan2(y: float, x: float) -> float:
+    "({y}).atan2({x})"
+
+
+@extern
+def degrees(x: float) -> float:
+    "({x}).to_degrees()"
+
+
+@extern
+def radians(x: float) -> float:
+    "({x}).to_radians()"
+
+
+@extern
+def isnan(x: float) -> bool:
+    "({x}).is_nan()"
+
+
+@extern
+def isinf(x: float) -> bool:
+    "({x}).is_infinite()"
+
+
+@extern
+def isfinite(x: float) -> bool:
+    "({x}).is_finite()"
+
+
+@extern
+def copysign(x: float, y: float) -> float:
+    "({x}).copysign({y})"
+
+
+@extern
+def fmod(x: float, y: float) -> float:
+    "(({x}) % ({y}))"
+
+
+@extern
+def remainder(x: float, y: float) -> float:
+    "{ let n = (({x}) / ({y})).round_ties_even(); ({x}) - n * ({y}) }"
+
+
+def modf(x: float) -> tuple[float, float]:
+    if isinf(x):
+        return (copysign(0.0, x), x)
+    if x == 0.0:
+        return (copysign(0.0, x), x)
+    ip: float = trunc(x)
+    return (x - ip, ip)
+
+
+def dist(p: list[float], q: list[float]) -> float:
+    if len(p) != len(q):
+        raise ValueError("both points must have the same number of dimensions")
+    total: float = 0.0
+    i: int = 0
+    while i < len(p):
+        d: float = p[i] - q[i]
+        total = total + d * d
+        i = i + 1
+    return sqrt(total)
+
+
+def prod(xs: list[float]) -> float:
+    result: float = 1.0
+    for x in xs:
+        result = result * x
+    return result
+
+
+def gcd(a: int, b: int) -> int:
+    x: int = abs(a)
+    y: int = abs(b)
+    while y != 0:
+        t: int = y
+        y = x % y
+        x = t
+    return x
+
+
+def lcm(a: int, b: int) -> int:
+    if a == 0 or b == 0:
+        return 0
+    g: int = gcd(a, b)
+    x: int = abs(a // g)
+    y: int = abs(b)
+    return x * y
+
+
+def factorial(n: int) -> int:
+    if n < 0:
+        raise ValueError("factorial() not defined for negative values")
+    result: int = 1
+    i: int = 2
+    while i <= n:
+        result = result * i
+        i = i + 1
+    return result
+
+
+def comb(n: int, k: int) -> int:
+    if n < 0:
+        raise ValueError("n must be a non-negative integer")
+    if k < 0:
+        raise ValueError("k must be a non-negative integer")
+    if k > n:
+        return 0
+    kk: int = k
+    if n - kk < kk:
+        kk = n - kk
+    result: int = 1
+    i: int = 0
+    while i < kk:
+        result = result * (n - i) // (i + 1)
+        i = i + 1
+    return result
+
+
+def perm(n: int, k: int) -> int:
+    if n < 0:
+        raise ValueError("n must be a non-negative integer")
+    if k < 0:
+        raise ValueError("k must be a non-negative integer")
+    if k > n:
+        return 0
+    result: int = 1
+    i: int = 0
+    while i < k:
+        result = result * (n - i)
+        i = i + 1
+    return result
+
+
+def isqrt(n: int) -> int:
+    if n < 0:
+        raise ValueError("isqrt() argument must be nonnegative")
+    if n == 0:
+        return 0
+    x: int = n
+    y: int = (x + 1) // 2
+    while y < x:
+        x = y
+        y = (x + n // x) // 2
+    return x

@@ -1,0 +1,57 @@
+from statistics import mean, fmean, median, median_low, median_high, mode, multimode, variance, stdev, pvariance, pstdev, geometric_mean, quantiles
+
+
+def main() -> None:
+    xs: list[float] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]
+    ys: list[float] = [1.0, 2.0, 3.0, 4.0]
+
+    print(mean(xs))
+    print(mean(ys))
+
+    print(fmean(xs))
+    print(fmean(xs, [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]))
+    print(fmean(xs, [2.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]))
+    print(fmean([1.0, 2.0, 3.0], [0.0, 0.0, 1.0]))
+
+    print(median(xs))
+    print(median(ys))
+    print(median_low(ys))
+    print(median_high(ys))
+    print(median([-3.0, -1.0, -2.0]))
+    print(median_low([1.0]))
+    print(median_high([1.0]))
+
+    modes: list[float] = [1.0, 1.0, 2.0, 3.0, 3.0, 3.0, 3.0, 4.0]
+    print(mode(modes))
+    tied: list[float] = [1.0, 1.0, 2.0, 2.0, 3.0]
+    print(mode(tied))
+    print(multimode(modes))
+    print(multimode(tied))
+    print(mode([3.0, 1.0, 1.0, 2.0, 2.0]))
+    print(multimode([3.0, 1.0, 1.0, 2.0, 2.0]))
+    print(mode([-1.0, -1.0, 2.0]))
+    print(multimode([5.0, 5.0, 5.0]))
+
+    print(variance(xs))
+    print(stdev(xs))
+    m: float = mean(xs)
+    print(variance(xs, m))
+    print(stdev(xs, m))
+    print(variance([1.0, 1.0, 1.0, 1.0], 1.0))
+    print(stdev([1.0, 1.0, 1.0, 1.0], 1.0))
+
+    print(pvariance(xs))
+    print(pstdev(xs))
+    print(pvariance(xs, m))
+    print(pstdev(xs, m))
+    print(pvariance([2.0, 2.0, 2.0]))
+
+    print(geometric_mean([54.0, 24.0, 36.0]))
+    print(geometric_mean([1.0, 1.0, 1.0]))
+    print(geometric_mean([2.0]))
+
+    data: list[float] = [0.0, 0.25, 0.25, 1.25, 1.5, 1.75, 2.75, 3.25]
+    print(quantiles(data))
+
+    data2: list[float] = [1.0, 2.0, 2.0, 3.0, 4.0, 7.0, 9.0]
+    print(quantiles(data2))

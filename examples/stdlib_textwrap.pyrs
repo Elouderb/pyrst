@@ -1,6 +1,7 @@
 # Stdlib `textwrap`: the embedded pure-pyrst text helpers — `wrap` (greedy word
 # wrap to a width), `fill` (`wrap` joined by newlines), `shorten` (collapse
-# whitespace + truncate at a word boundary with a " ..." placeholder), `indent`
+# whitespace + truncate at a word boundary with a " [...]" default
+# placeholder, matching CPython), `indent`
 # (prefix non-empty lines) and `dedent` (strip the common leading whitespace).
 # All are built only from pyrst `str` methods (split / splitlines / strip / join
 # / len / slice / char-iteration). `textwrap` is embedded (lib/textwrap.pyrs ->
@@ -14,7 +15,7 @@
 # Deterministic — fixed strings and widths:
 #   wrap("the quick brown fox", 10) -> ['the quick', 'brown fox']
 #   fill(...)                       -> "the quick\nbrown fox"
-#   shorten("a b c d e", 7)         -> "a b ..."
+#   shorten("a b c d e", 7)         -> "a [...]"
 #   indent("alpha\nbeta", "> ")     -> "> alpha\n> beta"
 #   dedent("    x\n    y\n      z") -> "x\ny\n  z"
 import textwrap
@@ -27,3 +28,15 @@ def main() -> None:
     print("[" + shorten("a b c d e", 7) + "]")
     print(textwrap.indent("alpha\nbeta", "> "))
     print(textwrap.dedent("    x\n    y\n      z"))
+
+    # pyrst-only: initial_indent / subsequent_indent / break_long_words.
+    # CPython's real wrap()/fill() only accept these as keyword-only args
+    # (TypeError if passed positionally on CPython), so this coverage can't
+    # be dual-run against real python3 — hand-verified against
+    # `python3 -c "textwrap.wrap(..., initial_indent=..., ...)"` instead
+    # (see notes.md). All calls below use pure positional args (this
+    # build's keyword-call codegen gap, see module header).
+    print(textwrap.wrap("the quick brown fox jumps", 10, ">>> ", ".. "))
+    print(textwrap.wrap("supercalifragilisticexpialidocious", 10, "", "", False))
+    print(textwrap.wrap("supercalifragilisticexpialidocious", 10, "", "", True))
+    print(textwrap.fill("alpha beta gamma delta", 12, "- ", "  "))

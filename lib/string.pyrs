@@ -4,29 +4,75 @@
 # `src/stdlib.rs`). Usable as either `from string import capwords` or
 # `import string; string.capwords(s)`, and the constants as `string.digits`.
 #
-# Two pieces, both ordinary language features `string` merely dogfoods:
-#   - MODULE-LEVEL CONSTANTS: top-level annotated string literals
-#     (`NAME: str = "..."`). The values below are CPython's exact `string.*`
-#     constants (same characters and order), so `string.ascii_lowercase` etc.
-#     match Python.
-#   - PURE-PYRST HELPER: `capwords` splits on whitespace, capitalizes each word,
-#     and rejoins with a single space — using only str methods (`split`,
-#     `capitalize`, `join`).
+# Fidelity: 4/5 — every CPython `string.*` constant is now expressible
+# (the `\x0b`/vertical-tab byte is written as a literal control character in
+# this source file; `\t \n \r \f` use the lexer's escapes, and `\b \f` support
+# landed in commit c82ff60). `capwords` matches CPython's `(s, sep=None)`
+# signature exactly, including its whitespace-splitting default and custom-
+# separator behavior. Only `Template` / `Formatter` (classes) remain deferred.
 #
-# Phase notes:
-#   - `capwords(s, sep)` in CPython takes an optional separator; pyrst has no
-#     default-argument / overload support yet, so only the whitespace-splitting
-#     1-argument form is provided. `s.split()` (no argument) splits on runs of
-#     whitespace and drops empty fields; the words are rejoined with a single
-#     space — matching `capwords` with the default `sep=None`. A `sep` form
-#     arrives with default-argument support.
-#   - `whitespace` is DEFERRED: CPython's value is `' \t\n\r\x0b\x0c'`, which
-#     includes the vertical tab (\x0b) and form feed (\x0c). pyrst string
-#     literals support only the escapes `\n \t \r \\ \' \" \0` (no `\xNN` hex
-#     escape — see src/lexer.rs), so the exact value cannot be expressed. Rather
-#     than ship a silently-wrong constant, `whitespace` waits for `\x` escapes.
-#     The seven other constants below are fully expressible and match CPython.
-#   - `Template` / `Formatter` (classes) are out of scope for this batch.
+# Constants (verbatim CPython values/order — verified against `python3 -c
+# "import string; print(repr(string.X))"` for every name below):
+#   - ascii_lowercase, ascii_uppercase, ascii_letters, digits, hexdigits,
+#     octdigits, punctuation: unchanged from the prior revision.
+#   - whitespace: ' \t\n\r\x0b\x0c' (6 chars: space, tab, LF, CR, vertical
+#     tab, form feed). Previously DEFERRED because pyrst string literals had
+#     no `\xNN` hex escape. `\t \n \r` were already lexer escapes; `\f` (form
+#     feed, 0x0c) gained an escape in c82ff60; the vertical tab (0x0b) still
+#     has no named escape, so it is embedded as the literal control byte
+#     0x0b directly in this source file (the lexer accepts any raw non-`\n`
+#     byte inside a single-line string — verified: a file with a literal
+#     0x0b/0x0c byte in a string literal compiles and round-trips `ord()`
+#     correctly under both pyrst and python3). This constant is NOT lexer-
+#     gated any more; it is fully implemented.
+#   - printable: digits + ascii_letters + punctuation + whitespace, in that
+#     exact order (matches CPython's `string.printable` byte-for-byte).
+#
+# Functions:
+#   - capwords(s, sep=None): now matches CPython's full 2-argument form.
+#     `sep=None` splits on runs of whitespace (`s.split()`, dropping empty
+#     fields) and rejoins with a single space. A supplied `sep` splits with
+#     that exact separator (`s.split(sep)`, keeping empty fields — e.g.
+#     `capwords("a,,b", ",") == "A,,B"`) and rejoins with `sep`. `_string_
+#     split_words` is a private helper factoring the `sep is None` dispatch
+#     (pyrst's Optional[T] narrowing does not survive re-assigning a
+#     narrowed value into an outer `str`-typed local across a block, so the
+#     dispatch is split into small helper functions/expressions instead of a
+#     single reassigned local — see docs/design notes on block-scoped
+#     shadow reassignment).
+#
+# Reviewer hardening (w1-hardener, card e1b9369d):
+#   - capwords(s, "") now raises ValueError("empty separator"), matching
+#     CPython's `str.split("")` rejection. Previously an empty `sep` fell
+#     through to the runtime `.split(sep)` builtin, which (unlike CPython)
+#     does not error on an empty separator and instead splits between every
+#     character -- silently producing nonsense output instead of failing
+#     loudly. Guarded here since it's cheap and matches user expectations.
+#   - KNOWN DIVERGENCE (compiler-level, out of scope for this module):
+#     `capwords()` calls the builtin `.capitalize()` string method, whose
+#     codegen (`src/codegen/exprs.rs`) slices the first character off by
+#     BYTE index (`&s[1..]`), not by char index. For any word whose first
+#     character is multi-byte UTF-8 (e.g. "öäü"), this panics at runtime
+#     with "byte index is not a char boundary" instead of producing
+#     CPython's "Öäü". Same bug affects the unrelated `.title()` builtin.
+#     This is a pre-existing defect in the shared string-builtin codegen,
+#     not something introduced by or fixable within lib/string.pyrs (no
+#     compiler changes in scope for this card) -- flagged here for the
+#     integrator/lead to file as its own follow-up card. The parity golden
+#     below intentionally avoids non-ASCII capwords input for this reason
+#     (it would crash the pyrst binary outright, not just produce a wrong
+#     answer, so no dual-run golden can even be authored for it yet).
+#
+# Deferred (out of scope for this batch, unchanged from prior revision):
+#   - `Template` / `Formatter` (classes): CPython's `Template.substitute`
+#     takes a mapping **or** `**kwargs`; pyrst has no `**kwargs`. A
+#     mapping-only `substitute(template, mapping: dict[str, str])` could be
+#     built, but `Template` also supports attribute-style `$identifier`
+#     placeholder scanning via regex internally guarded by class state
+#     (`idpattern`, `braceidpattern`, `flags` as overridable class
+#     attributes) that pyrst's class model does not support customizing at
+#     the language level used here. Left deferred rather than shipping a
+#     partial/misleading `Template`.
 
 
 ascii_lowercase: str = "abcdefghijklmnopqrstuvwxyz"
@@ -36,11 +82,26 @@ digits: str = "0123456789"
 hexdigits: str = "0123456789abcdefABCDEF"
 octdigits: str = "01234567"
 punctuation: str = "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~"
+whitespace: str = " \t\n\r\f"
+printable: str = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~ \t\n\r\f"
 
 
-def capwords(s: str) -> str:
-    words: list[str] = s.split()
+def _string_split_words(s: str, sep: Optional[str]) -> list[str]:
+    if sep is None:
+        return s.split()
+    else:
+        actual_sep: str = sep
+        if actual_sep == "":
+            raise ValueError("empty separator")
+        return s.split(actual_sep)
+
+
+def capwords(s: str, sep: Optional[str] = None) -> str:
+    words: list[str] = _string_split_words(s, sep)
     capped: list[str] = []
     for w in words:
         capped.append(w.capitalize())
-    return " ".join(capped)
+    if sep is None:
+        return " ".join(capped)
+    else:
+        return sep.join(capped)

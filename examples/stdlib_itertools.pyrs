@@ -1,8 +1,10 @@
-# Stdlib `itertools`: the embedded pure-pyrst EAGER subset — `accumulate`
-# (int running fold), `chain` (binary concat), `repeat` (n copies), `product`
-# (cartesian pairs, two type params so the factors may differ in element type),
-# `combinations` and `permutations` (r-length index-ordered selections over a
-# generic `list[T]`). `itertools` is embedded (lib/itertools.pyrs -> include_str!
+# Stdlib `itertools`: the embedded pure-pyrst subset — `accumulate`
+# (int running fold), `chain` (binary concat) and `repeat` (n copies) are LAZY
+# generators (CPython-faithful) and are materialized with `list(...)` before
+# printing; `product` (cartesian pairs, two type params so the factors may
+# differ in element type), `combinations` and `permutations` (r-length
+# index-ordered selections over a generic `list[T]`) remain eager lists.
+# `itertools` is embedded (lib/itertools.pyrs -> include_str!
 # -> src/stdlib.rs) and was REMOVED from the resolver skip-list so the import
 # resolves; no local `itertools.pyrs` next to this file.
 #
@@ -24,9 +26,9 @@ from itertools import accumulate
 
 
 def main() -> None:
-    print(accumulate([1, 2, 3, 4], lambda a, b: a + b))
-    print(itertools.chain([1, 2], [3, 4]))
-    print(itertools.repeat("x", 3))
+    print(list(accumulate([1, 2, 3, 4], lambda a, b: a + b)))
+    print(list(itertools.chain([1, 2], [3, 4])))
+    print(list(itertools.repeat("x", 3)))
     print(itertools.product(["a", "b"], [1, 2]))
     print(itertools.combinations([1, 2, 3], 2))
     print(itertools.permutations([1, 2, 3], 2))

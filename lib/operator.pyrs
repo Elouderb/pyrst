@@ -5,10 +5,75 @@
 # Embedded via `include_str!` (see `src/stdlib.rs`). Usable as either
 # `from operator import add` or `import operator; operator.add(2, 3)`.
 #
-# Phase-1 limit: int-specialized. pyrst generics are a later card, so these take
-# and return `int`. (A float/str overload set arrives with generics.) `mod` is
-# spelled `mod_` to stay clear of any reserved word; the others mirror CPython's
-# `operator` names.
+# Fidelity score: 4 (near drop-in). Exact CPython names/positional shapes,
+# with two forced exceptions: `mod` is spelled `mod_` (reserved-word clash)
+# and CPython's `contains` is spelled `contains_` here — the bare name
+# `contains` collides with a compiler-internal method identifier used to
+# resolve `list`/`str`/`set` `.contains`-shaped calls (src/typeck/flow.rs),
+# so a free function named exactly `contains` cannot be defined in the flat
+# stdlib namespace (same class of forced rename as `mod_`).
+#
+# W1 upgrade over the phase-1 int-only baseline (11 fns, score 2):
+#   - all 6 comparisons (`lt le gt ge eq ne`) are now GENERIC over any `T`
+#     supporting the corresponding operator (int, float, str, list[...],
+#     user classes with the matching dunder) — pyrst's generics-v2 bound
+#     inference covers `< <= > >= == !=`, and this genericity is real:
+#     verified that the SAME imported generic name can be called at two
+#     different concrete types within one program (e.g. `lt(2, 3)` then,
+#     elsewhere, `lt("abc", "abd")`).
+#   - added `itemgetter`, `truth`, `not_`, `contains_`, `concat` (the delta
+#     list from docs/design/stdlib-full.md §D).
+#
+# Divergences (documented, not silent):
+#   - `add`/`sub`/`mul` stay INT-SPECIALIZED (not widened to generic `T`
+#     like the comparisons): a generic `add[T]` type-checks fine when
+#     CALLED directly, but pyrst's `functools.reduce(f, xs, init)` — the
+#     #1 real-world consumer of `operator.add`/`operator.mul` — takes `f`
+#     as a bare function VALUE of a concrete `Callable[[int, int], int]`
+#     type, and a generic function passed as a bare value (not called) does
+#     not get monomorphized/coerced to that concrete callable type
+#     (`expected Callable[[int, int], int], found Callable[[T, T], T]`).
+#     Verified this breaks the shipped `examples/combo_reduce_operator.pyrs`
+#     and `examples/stdlib_functools.pyrs` goldens, both of which do
+#     `reduce(add, ..., ...)` / `reduce(mul, ..., ...)`. Reverted to
+#     int-specialized to preserve that (more common) usage; `lt`/`le`/etc.
+#     have no such existing by-value consumer so were left generic.
+#   - `floordiv`/`mod_` stay INT-SPECIALIZED: pyrst's generics-v2 bound
+#     inference does not cover `//`/`%` (only `+ - * < <= > >= == !=` are
+#     inferred), so a generic `T` version does not type-check today. This is
+#     a compiler-level gap, not specific to this module.
+#   - `itemgetter` is INT-SPECIALIZED to `list[int]` (`Callable[[list[int]],
+#     int]`): its type parameter `T` would appear ONLY in the return type,
+#     and pyrst does not support explicit type arguments at a call site nor
+#     return-type-directed inference, so `T` cannot be resolved from
+#     `itemgetter(i)` alone. Deferred pending that compiler feature
+#     (non-G-numbered — a generics-inference gap, not a named gate).
+#   - `contains_`/`concat` are specialized to `list[T]` (pyrst's general
+#     sequence type); for `str`, use the native `in` operator and `+`
+#     directly — both are already first-class pyrst operators and need no
+#     wrapper.
+#   - `attrgetter`/`methodcaller` are DEFERRED — they require resolving an
+#     attribute/method by a runtime string name, i.e. reflection. pyrst is
+#     AOT-compiled with no runtime object model (same C-cluster rationale as
+#     `inspect`/`getattr`-by-string in docs/design/stdlib-full.md §C.3); there
+#     is no compiler feature that unlocks this without abandoning that axiom.
+#   - `is_`/`is_not` (identity comparison) are OUT OF SCOPE: pyrst assignment
+#     and argument passing are value-semantic (deep-copy), so CPython's
+#     identity check has no faithful analogue for plain values.
+#   - unary `neg`/`pos`/`abs` are DEFERRED: pyrst's generics-v2 bound
+#     inference does not cover unary operators on a type parameter, and
+#     pyrst's grammar has no unary `+` at all (`pos` couldn't even be written
+#     for a concrete type). Not in this card's delta list; left for a future
+#     pass alongside the `//`/`%` generic-bound gap above.
+#   - `truth`/`not_` are INT-SPECIALIZED (not generic over `T`), unlike real
+#     CPython's `operator.truth`/`operator.not_` which accept any object via
+#     `bool(obj)`. Confirmed via a standalone probe: pyrst's generics-v2
+#     bound inference does not cover truthiness (`if a:` on a bare type
+#     parameter `T`) -- "cannot use as a condition a value of generic type T
+#     (this operation on a type parameter is not supported -- generics v2
+#     infers bounds only for comparison, equality, arithmetic, Display, and
+#     Hash)". Same class of compiler-level gap as item 4 (`floordiv`/`mod_`);
+#     left for a future pass alongside it.
 
 
 def add(a: int, b: int) -> int:
@@ -31,25 +96,56 @@ def mod_(a: int, b: int) -> int:
     return a % b
 
 
-def lt(a: int, b: int) -> bool:
+def lt[T](a: T, b: T) -> bool:
     return a < b
 
 
-def le(a: int, b: int) -> bool:
+def le[T](a: T, b: T) -> bool:
     return a <= b
 
 
-def gt(a: int, b: int) -> bool:
+def gt[T](a: T, b: T) -> bool:
     return a > b
 
 
-def ge(a: int, b: int) -> bool:
+def ge[T](a: T, b: T) -> bool:
     return a >= b
 
 
-def eq(a: int, b: int) -> bool:
+def eq[T](a: T, b: T) -> bool:
     return a == b
 
 
-def ne(a: int, b: int) -> bool:
+def ne[T](a: T, b: T) -> bool:
     return a != b
+
+
+def truth(a: int) -> bool:
+    if a != 0:
+        return True
+    return False
+
+
+def not_(a: int) -> bool:
+    if a != 0:
+        return False
+    return True
+
+
+def contains_[T](xs: list[T], v: T) -> bool:
+    return v in xs
+
+
+def concat[T](a: list[T], b: list[T]) -> list[T]:
+    result: list[T] = []
+    for x in a:
+        result.append(x)
+    for x in b:
+        result.append(x)
+    return result
+
+
+def itemgetter(i: int) -> Callable[[list[int]], int]:
+    def _operator_itemgetter_get(xs: list[int]) -> int:
+        return xs[i]
+    return _operator_itemgetter_get

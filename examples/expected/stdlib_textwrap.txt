@@ -1,9 +1,15 @@
 ['the quick', 'brown fox']
 the quick
 brown fox
-[a b ...]
+[a [...]]
 > alpha
 > beta
 x
 y
   z
+['>>> the', '.. quick', '.. brown', '.. fox', '.. jumps']
+['supercalifragilisticexpialidocious']
+['supercalif', 'ragilistic', 'expialidoc', 'ious']
+- alpha beta
+  gamma
+  delta

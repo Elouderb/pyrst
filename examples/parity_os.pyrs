@@ -1,0 +1,145 @@
+# parity: pyrst-only
+# Parity test for lib/os.pyrs (card 97260dad, docs/design/stdlib-full.md §D
+# row "os"). The `os` module is @extern/@crate-backed end to end (Rust
+# std::env/std::path/std::fs/std::process plus @crate("getrandom", "0.2")),
+# so it is out of literal same-source dual-run scope (`@extern`/`@crate` are
+# not real Python syntax; see stdlib-full.md's dual-run-scope note). Every
+# function's *semantics* was instead cross-checked against python3's real
+# `os` module one-by-one while writing lib/os.pyrs (see notes.md for the
+# transcript). This golden asserts DETERMINISTIC facts only:
+#   - constants (`os.sep`, `len(os.linesep)`) — fixed POSIX values
+#   - booleans/derived values for path predicates, stat, rename, walk, cleanup
+#   - `getpid() > 0` and `getcwd() != ""` (never the raw, machine-dependent
+#     values)
+#   - `len(urandom(n)) == n` and each byte in 0..=255 (never the random
+#     content itself — os.urandom is a CSPRNG, non-deterministic by design)
+#
+# Hardening pass (w1-hardener, card 97260dad) added edge cases: `urandom(0)`
+# (empty, no crash), `urandom(-1)` (raises, caught, no process abort),
+# `makedirs(.., exist_ok=True)` on an already-existing dir (succeeds) and the
+# default `exist_ok=False` on an already-existing dir (raises, caught), `walk`
+# on an empty directory (yields itself once with empty dirs/files), POSIX
+# `rename` overwrite semantics (dst replaced, matching CPython's os.rename on
+# POSIX), and a unicode filename round-trip (write/stat/basename/remove).
+#
+# The test creates all its scratch files/dirs under /tmp and removes every
+# one of them before exiting (no leftover state).
+
+from os import getenv, getcwd, basename, path_exists, read_file, write_file
+from os import join, dirname, isfile, isdir, listdir, mkdir, remove
+from os import sep, linesep, getpid, rename, rmdir, makedirs, urandom, stat, walk
+
+
+def main() -> None:
+    base: str = join("/tmp", "pyrst_parity_os_scratch")
+
+    # --- makedirs / mkdir / write_file / read_file --------------------------
+    makedirs(base)
+    write_file(join(base, "a.txt"), "hello")
+    mkdir(join(base, "sub"))
+    write_file(join(join(base, "sub"), "b.txt"), "world!!")
+
+    print(sep)
+    print(len(linesep))
+    print(read_file(join(base, "a.txt")))
+
+    # --- predicates -----------------------------------------------------------
+    print(isfile(join(base, "a.txt")))
+    print(isdir(join(base, "sub")))
+    print(isfile(join(base, "sub")))
+    print(basename(join(base, "a.txt")))
+    print(dirname(join(base, "a.txt")) == base)
+
+    # --- stat -----------------------------------------------------------------
+    st = stat(join(base, "a.txt"))
+    print(st.st_size)
+    print(st.st_mtime > 0.0)
+
+    # --- listdir (sorted for determinism) --------------------------------------
+    print(sorted(listdir(base)))
+
+    # --- rename -----------------------------------------------------------------
+    rename(join(base, "a.txt"), join(base, "c.txt"))
+    print(path_exists(join(base, "a.txt")))
+    print(path_exists(join(base, "c.txt")))
+
+    # --- walk (sorted for determinism; listdir order is fs-dependent, like
+    # CPython's own os.walk) -----------------------------------------------------
+    results: list[str] = []
+    for dirpath, dirs, files in walk(base):
+        results.append(dirpath + "|" + ",".join(sorted(dirs)) + "|" + ",".join(sorted(files)))
+    for r in sorted(results):
+        print(r)
+
+    # --- urandom (non-deterministic content; deterministic shape) ---------------
+    b: list[int] = urandom(16)
+    print(len(b))
+    in_range: bool = True
+    for v in b:
+        if v < 0 or v > 255:
+            in_range = False
+    print(in_range)
+
+    # urandom(0) edge case -> empty list, no crash
+    z: list[int] = urandom(0)
+    print(len(z))
+
+    # urandom(negative) -> raises (caught), never crashes the process
+    try:
+        neg: list[int] = urandom(-1)
+        print("no error")
+    except Exception as e:
+        print("urandom(-1) raised")
+
+    # --- makedirs exist_ok edge cases -----------------------------------------
+    # exist_ok=True (positional; pyrst v0 does not yet support keyword call
+    # syntax for @extern-backed functions) on an already-existing dir succeeds
+    makedirs(join(base, "sub"), True)
+    print(isdir(join(base, "sub")))
+
+    # exist_ok=False (default) on an already-existing dir raises (caught)
+    try:
+        makedirs(join(base, "sub"))
+        print("no error")
+    except Exception as e:
+        print("makedirs exist_ok=False raised")
+
+    # --- walk on an empty directory: yields itself once, no dirs/files --------
+    empty_dir: str = join(base, "empty")
+    mkdir(empty_dir)
+    empty_results: list[str] = []
+    for dirpath, dirs, files in walk(empty_dir):
+        empty_results.append(dirpath + "|" + str(len(dirs)) + "|" + str(len(files)))
+    for r in empty_results:
+        print(r)
+    rmdir(empty_dir)
+
+    # --- rename overwrite semantics (POSIX rename replaces an existing dst,
+    # like CPython's os.rename on POSIX) ---------------------------------------
+    write_file(join(base, "src_r.txt"), "src-content")
+    write_file(join(base, "dst_r.txt"), "dst-content")
+    rename(join(base, "src_r.txt"), join(base, "dst_r.txt"))
+    print(path_exists(join(base, "src_r.txt")))
+    print(read_file(join(base, "dst_r.txt")))
+    remove(join(base, "dst_r.txt"))
+
+    # --- unicode filename round-trip ------------------------------------------
+    uni_path: str = join(base, "héllo_日本語.txt")
+    write_file(uni_path, "data")
+    print(isfile(uni_path))
+    print(basename(uni_path))
+    uni_st = stat(uni_path)
+    print(uni_st.st_size)
+    remove(uni_path)
+
+    # --- cleanup ------------------------------------------------------------
+    remove(join(base, "c.txt"))
+    remove(join(join(base, "sub"), "b.txt"))
+    rmdir(join(base, "sub"))
+    rmdir(base)
+    print(path_exists(base))
+
+    # --- process/env facts (derived only, never raw) -----------------------
+    print(getpid() > 0)
+    print(getcwd() != "")
+    print(getenv("PYRST_PARITY_OS_NOPE_XYZ", "fallback"))

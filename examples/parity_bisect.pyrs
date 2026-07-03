@@ -1,0 +1,149 @@
+# parity: dual-run
+# Exercises the full upgraded bisect surface: bisect_left/right + lo/hi
+# bounding args, the bisect/insort aliases, the lo<0 ValueError guard, and
+# edge cases (empty/single-element lists, all-duplicate runs, negative
+# numbers, unicode strings, lo==hi, lo>hi, hi==0, boundary `hi` values, and
+# an out-of-range `hi` producing a caught IndexError). Every case here was
+# independently verified byte-identical against the real CPython `bisect`
+# module before being folded in.
+#
+# NOT included here (by design): `hi == -1` passed explicitly. CPython's
+# C-accelerated `_bisect` module (the default under a plain `python3`
+# invocation) collides an explicit `hi=-1` with its internal "hi=None"
+# sentinel and silently treats it as "search to len(a)", while pyrst (and
+# CPython's pure-Python fallback) correctly treat it as the literal
+# already-empty `[lo:-1]` bound. See the divergence note in `lib/bisect.pyrs`
+# — including this case here would make the dual-run byte-diff fail against
+# `python3`'s default C-accelerated behavior even though pyrst's answer is
+# the documented/logical one.
+#
+# Value-semantics note: each insort test below uses a FRESH list literal
+# rather than `b: list[int] = a` — pyrst assignment deep-copies (`b` and `a`
+# are independent lists), while plain Python assignment aliases the same
+# list object, so a shared-then-mutated list would silently diverge between
+# the two interpreters. Fresh literals sidestep the divergence entirely.
+from bisect import bisect_left, bisect_right, bisect, insort_left, insort_right, insort
+
+
+def custom_insort(a: list[int], x: int) -> list[int]:
+    # local helper name deliberately shadowing the module's own private
+    # convention-adjacent name to prove no collision with lib internals.
+    b: list[int] = a
+    insort(b, x)
+    return b
+
+
+def main() -> None:
+    a: list[int] = [1, 3, 3, 5, 7, 7, 9]
+
+    print(bisect_left(a, 3))
+    print(bisect_right(a, 3))
+    print(bisect(a, 3))
+
+    print(bisect_left(a, 3, 1, 5))
+    print(bisect_right(a, 3, 1, 5))
+    print(bisect_left(a, 7, 0, 4))
+    print(bisect_right(a, 7, 0, 4))
+
+    print(bisect_left(a, 3, 2))
+    print(bisect_right(a, 3, 2))
+
+    b: list[int] = [1, 3, 3, 5, 7, 7, 9]
+    insort_left(b, 3, 1, 5)
+    print(b)
+
+    c: list[int] = [1, 3, 3, 5, 7, 7, 9]
+    insort_right(c, 3, 1, 5)
+    print(c)
+
+    d: list[int] = [2, 4, 6]
+    insort(d, 5)
+    print(d)
+
+    e: list[int] = custom_insort([1, 2, 4], 3)
+    print(e)
+
+    caught: bool = False
+    try:
+        bisect_left(a, 3, -1)
+    except ValueError:
+        caught = True
+    print(caught)
+
+    caught_right: bool = False
+    try:
+        bisect_right(a, 3, -5)
+    except ValueError:
+        caught_right = True
+    print(caught_right)
+
+    caught_insort: bool = False
+    try:
+        f: list[int] = [1, 2, 3]
+        insort_left(f, 2, -1)
+    except ValueError:
+        caught_insort = True
+    print(caught_insort)
+
+    # empty list
+    empty: list[int] = []
+    print(bisect_left(empty, 5))
+    print(bisect_right(empty, 5))
+
+    # single element: equal, less, greater
+    single: list[int] = [5]
+    print(bisect_left(single, 5))
+    print(bisect_right(single, 5))
+    print(bisect_left(single, 3))
+    print(bisect_left(single, 7))
+
+    # all-duplicate run
+    dup: list[int] = [2, 2, 2, 2]
+    print(bisect_left(dup, 2))
+    print(bisect_right(dup, 2))
+
+    # negative numbers
+    neg: list[int] = [-5, -3, -1, 0, 2]
+    print(bisect_left(neg, -3))
+    print(bisect_right(neg, -3))
+
+    # lo == hi (empty slice) and lo > hi
+    a5: list[int] = [1, 2, 3, 4, 5]
+    print(bisect_left(a5, 3, 2, 2))
+    print(bisect_left(a5, 3, 4, 2))
+
+    # hi == 0 and negative hi other than -1 (see header note on -1)
+    print(bisect_left(a5, 3, 0, -2))
+    print(bisect_left(a5, 3, 0, -100))
+
+    a3: list[int] = [1, 2, 3]
+    print(bisect_left(a3, 2, 0, 0))
+    print(bisect_left(a3, 2, 3))
+
+    # unicode strings (char-indexed comparison)
+    strs: list[str] = ["apple", "banana", "cherry"]
+    print(bisect_left(strs, "banana"))
+    uni: list[str] = ["café", "zoo", "日本語"]
+    print(bisect_left(uni, "zoo"))
+
+    # hi beyond len(a): both raise/propagate an IndexError
+    caught_index: bool = False
+    try:
+        oob: list[int] = [1, 2, 3]
+        print(bisect_left(oob, 2, 0, 10))
+    except IndexError:
+        caught_index = True
+    print(caught_index)
+
+    # insort ties: leftmost vs rightmost insertion among equal runs
+    ties_left: list[int] = [1, 1, 1]
+    insort_left(ties_left, 1)
+    print(ties_left)
+    ties_right: list[int] = [1, 1, 1]
+    insort_right(ties_right, 1)
+    print(ties_right)
+
+    # insort into an empty list
+    into_empty: list[int] = []
+    insort(into_empty, 5)
+    print(into_empty)

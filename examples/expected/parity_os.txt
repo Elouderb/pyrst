@@ -1,0 +1,31 @@
+/
+1
+hello
+True
+True
+False
+a.txt
+True
+5
+True
+['a.txt', 'sub']
+False
+True
+/tmp/pyrst_parity_os_scratch/sub||b.txt
+/tmp/pyrst_parity_os_scratch|sub|c.txt
+16
+True
+0
+urandom(-1) raised
+True
+makedirs exist_ok=False raised
+/tmp/pyrst_parity_os_scratch/empty|0|0
+False
+src-content
+True
+héllo_日本語.txt
+4
+False
+True
+True
+fallback

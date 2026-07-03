@@ -295,7 +295,9 @@ else
         base=$(basename "$f" .pyrs)
         parity_count=$((parity_count + 1))
 
-        if grep -q '# parity: pyrst-only' "$f"; then
+        # -a: treat the file as text even if a stray binary byte sneaks in;
+        # a NUL once made grep skip the marker and force a bogus dual-run.
+        if grep -aq '# parity: pyrst-only' "$f"; then
             echo "SKIPPED [parity: pyrst-only]: $base"
             parity_skipped=$((parity_skipped + 1))
             parity_skipped_names+=("$base")

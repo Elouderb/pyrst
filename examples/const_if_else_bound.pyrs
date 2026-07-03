@@ -1,0 +1,17 @@
+# W0-b: a module const bound on EVERY branch of an if/else is DEFINITELY bound at
+# the join, so the read after is legal (Python runs fine). Exercises the
+# definite-bound every-path merge (an if WITHOUT else stays a reject — see
+# const_if_noelse_fail).
+X: int = 10
+
+def pick(cond: bool) -> int:
+    if cond:
+        X = 5
+    else:
+        X = 7
+    return X
+
+def main() -> None:
+    print(pick(True))
+    print(pick(False))
+    print(X)

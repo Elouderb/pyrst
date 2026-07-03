@@ -1,0 +1,16 @@
+# W0-b: a guarded match capture whose GUARD reads its own just-bound capture is
+# legal (the capture binds before the guard runs), even when the capture name
+# collides with a module constant. Exercises per-arm guard scoping.
+M: int = 5
+
+def classify(x: int) -> str:
+    match x:
+        case M if M > 100:
+            return "big:" + str(M)
+        case M:
+            return "small:" + str(M)
+
+def main() -> None:
+    print(classify(200))
+    print(classify(10))
+    print(M)

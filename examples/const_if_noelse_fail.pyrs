@@ -1,0 +1,9 @@
+# W0-b negative: a module const bound only in an if WITHOUT else is NOT bound on
+# the fall-through path, so the read after is `UnboundLocalError` in Python (when
+# cond is false). Honest check error.
+X: int = 10
+def main() -> None:
+    cond: bool = False
+    if cond:
+        X = 5
+    print(X)

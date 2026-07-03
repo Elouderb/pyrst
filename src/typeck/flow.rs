@@ -1055,9 +1055,13 @@ fn shallow_stmt_reads(s: &Stmt, out: &mut HashSet<String>) {
         Stmt::While { cond, .. } => expr_reads(cond, out),
         Stmt::For { iter, .. } => expr_reads(iter, out),
         Stmt::With { ctx_expr, .. } => expr_reads(ctx_expr, out),
-        Stmt::Match { subject, arms, .. } => {
+        Stmt::Match { subject, .. } => {
+            // Only the subject is read at the whole-statement level; each arm's
+            // GUARD is read AFTER that arm's capture binds, so guard reads are
+            // checked per-arm inside `walk_unbound_local` (not here) — otherwise a
+            // guard reading its own capture (`case M if M > 100`) would be flagged
+            // as read-before-bound (review comment 211 Bug B).
             expr_reads(subject, out);
-            for arm in arms { if let Some(g) = &arm.guard { expr_reads(g, out); } }
         }
         _ => {}
     }
@@ -1066,11 +1070,18 @@ fn shallow_stmt_reads(s: &Stmt, out: &mut HashSet<String>) {
 /// In-order worker for [`detect_module_const_unbound_local`]. For each statement,
 /// its OWN reads are checked BEFORE its own binds take effect (so `n = n + 1`,
 /// whose RHS reads a not-yet-in-scope shadowed const, is flagged). A plain assign
-/// at THIS level records its target in `in_scope`; child blocks are walked with
-/// [`walk_block`], which binds their block-local targets (For / With-as /
-/// except-as / Match capture) for the body only and restores `in_scope` at the
-/// block's close — mirroring codegen's `scope_enter`/`scope_exit`, so a top-level
-/// `let mut` persists while a nested/loop binding is block-scoped.
+/// at this level records its target in `in_scope`. Control-flow children are
+/// walked via [`walk_block_bound`], which returns the names DEFINITELY bound at the
+/// block's normal exit; the caller then decides whether those persist:
+///   - an `if` promotes only names bound on EVERY branch of an exhaustive set
+///     (all of `then` + every elif body + a present `else`) — the definite-bound
+///     merge (review comment 211 Bug A);
+///   - a `match` promotes names bound in EVERY arm of an exhaustive match (one with
+///     an unguarded wildcard / capture catch-all);
+///   - a `for`/`while` loop body, a `with`, and a `try`/`except`/`finally` are
+///     CONSERVATIVE — their bindings do not persist (the loop may run zero times;
+///     an `except`/`finally`/`with` binding may be skipped when the guarded region
+///     raises mid-way), matching Python's own may-be-unbound outcome there.
 fn walk_unbound_local(
     stmts: &[Stmt],
     shadowed: &HashSet<String>,
@@ -1092,32 +1103,87 @@ fn walk_unbound_local(
                 for t in targets { in_scope.insert(t.clone()); }
             }
             Stmt::If { then, elifs, else_, .. } => {
-                walk_block(then, shadowed, in_scope, &[])?;
-                for (_, b) in elifs { walk_block(b, shadowed, in_scope, &[])?; }
-                if let Some(b) = else_ { walk_block(b, shadowed, in_scope, &[])?; }
+                // Each branch is analyzed from the pre-`if` scope (the primary
+                // `cond` was read-checked above; the elif conditions are checked
+                // here — they are evaluated only when the earlier conditions were
+                // false, still before any branch binds).
+                let mut deltas = vec![walk_block_bound(then, shadowed, in_scope, &[])?];
+                for (ec, b) in elifs {
+                    let mut ereads = HashSet::new();
+                    expr_reads(ec, &mut ereads);
+                    for r in &ereads {
+                        if shadowed.contains(r) && !in_scope.contains(r) {
+                            return Err(unbound_local_const_error(r, ec.span()));
+                        }
+                    }
+                    deltas.push(walk_block_bound(b, shadowed, in_scope, &[])?);
+                }
+                // Definite-bound merge: only with an `else` is the branch set
+                // exhaustive, so a name bound in ALL branches is bound on every
+                // path and promotes to the outer scope. No `else` → a fall-through
+                // path binds nothing, so promote nothing (stays may-be-unbound).
+                if let Some(b) = else_ {
+                    deltas.push(walk_block_bound(b, shadowed, in_scope, &[])?);
+                    if let Some((first, rest)) = deltas.split_first() {
+                        let mut common = first.clone();
+                        for d in rest { common.retain(|n| d.contains(n)); }
+                        in_scope.extend(common);
+                    }
+                }
             }
-            Stmt::While { body, .. } => walk_block(body, shadowed, in_scope, &[])?,
-            Stmt::For { targets, body, .. } => walk_block(body, shadowed, in_scope, targets)?,
+            Stmt::While { body, .. } => { walk_block_bound(body, shadowed, in_scope, &[])?; }
+            Stmt::For { targets, body, .. } => { walk_block_bound(body, shadowed, in_scope, targets)?; }
             Stmt::With { as_name, body, .. } => {
                 let extra: Vec<String> = as_name.iter().cloned().collect();
-                walk_block(body, shadowed, in_scope, &extra)?;
+                walk_block_bound(body, shadowed, in_scope, &extra)?;
             }
             Stmt::Try { body, handlers, else_, finally_, .. } => {
-                walk_block(body, shadowed, in_scope, &[])?;
+                walk_block_bound(body, shadowed, in_scope, &[])?;
                 for h in handlers {
                     let extra: Vec<String> = h.exc_name.iter().cloned().collect();
-                    walk_block(&h.body, shadowed, in_scope, &extra)?;
+                    walk_block_bound(&h.body, shadowed, in_scope, &extra)?;
                 }
-                if let Some(b) = else_ { walk_block(b, shadowed, in_scope, &[])?; }
-                if let Some(b) = finally_ { walk_block(b, shadowed, in_scope, &[])?; }
+                if let Some(b) = else_ { walk_block_bound(b, shadowed, in_scope, &[])?; }
+                if let Some(b) = finally_ { walk_block_bound(b, shadowed, in_scope, &[])?; }
             }
             Stmt::Match { arms, .. } => {
+                let mut arm_deltas: Vec<HashSet<String>> = Vec::new();
+                let mut exhaustive = false;
                 for arm in arms {
-                    let extra: Vec<String> = match &arm.pattern {
+                    let cap: Vec<String> = match &arm.pattern {
                         MatchPattern::Capture(nm) => vec![nm.clone()],
                         _ => vec![],
                     };
-                    walk_block(&arm.body, shadowed, in_scope, &extra)?;
+                    // The capture binds BEFORE the guard runs, so both the guard
+                    // and the body see it (Bug B).
+                    let mut arm_in = in_scope.clone();
+                    for c in &cap { arm_in.insert(c.clone()); }
+                    if let Some(g) = &arm.guard {
+                        let mut greads = HashSet::new();
+                        expr_reads(g, &mut greads);
+                        for r in &greads {
+                            if shadowed.contains(r) && !arm_in.contains(r) {
+                                return Err(unbound_local_const_error(r, g.span()));
+                            }
+                        }
+                    }
+                    let mut body_in = arm_in.clone();
+                    walk_unbound_local(&arm.body, shadowed, &mut body_in)?;
+                    let mut delta: HashSet<String> = body_in.difference(in_scope).cloned().collect();
+                    for c in &cap { delta.remove(c); }
+                    arm_deltas.push(delta);
+                    if arm.guard.is_none()
+                        && matches!(&arm.pattern, MatchPattern::Wildcard | MatchPattern::Capture(_))
+                    {
+                        exhaustive = true;
+                    }
+                }
+                if exhaustive {
+                    if let Some((first, rest)) = arm_deltas.split_first() {
+                        let mut common = first.clone();
+                        for d in rest { common.retain(|n| d.contains(n)); }
+                        in_scope.extend(common);
+                    }
                 }
             }
             _ => {}
@@ -1126,22 +1192,23 @@ fn walk_unbound_local(
     Ok(())
 }
 
-/// Walk a child BLOCK in its own scope: the `extra` names (a loop / with / except
-/// / match target) bind for the body only, and EVERY binding made inside the block
-/// is discarded at its close (a block shadow) — matching codegen's block scoping,
-/// so a name bound only inside a block does not count as in-scope for a read after
-/// the block.
-fn walk_block(
+/// Walk a child BLOCK in its own scope and RETURN the names it DEFINITELY bound at
+/// its normal exit (relative to the entry `in_scope`, excluding the block's own
+/// `extra` targets — a `for`/`with`/`except`/`match` target is block-scoped and
+/// never persists). The caller merges (or discards) that delta per its control-flow
+/// semantics. `in_scope` is not mutated.
+fn walk_block_bound(
     body: &[Stmt],
     shadowed: &HashSet<String>,
-    in_scope: &mut HashSet<String>,
+    in_scope: &HashSet<String>,
     extra: &[String],
-) -> Result<()> {
-    let snapshot = in_scope.clone();
-    for e in extra { in_scope.insert(e.clone()); }
-    let res = walk_unbound_local(body, shadowed, in_scope);
-    *in_scope = snapshot;
-    res
+) -> Result<HashSet<String>> {
+    let mut local = in_scope.clone();
+    for e in extra { local.insert(e.clone()); }
+    walk_unbound_local(body, shadowed, &mut local)?;
+    let mut delta: HashSet<String> = local.difference(in_scope).cloned().collect();
+    for e in extra { delta.remove(e); }
+    Ok(delta)
 }
 
 /// The honest error for the Python `UnboundLocalError` hole (p09): a module

@@ -30,6 +30,69 @@ impl<'a> Codegen<'a> {
         }
     }
 
+    /// (Bug C) The RETURN type of a `sort`/`sorted` `key=` lambda over a container
+    /// of type `src_ty` — a `Float` key needs the `partial_cmp` comparator (`f64`
+    /// is not `Ord`). Ports the `sorted(...)` key-return inference so the in-place
+    /// `list.sort(key=...)` picks the same comparator; `Unknown` (the common
+    /// `Ord`-key case) drives `sort_by_key`.
+    pub(crate) fn sort_key_ret_ty(&self, key_expr: &Expr, src_ty: &Ty) -> Ty {
+        if let Expr::Lambda { body, .. } = key_expr {
+            match body.as_ref() {
+                Expr::Attr { name, .. } => {
+                    if let Ty::List(elem) | Ty::Iterator(elem) = src_ty {
+                        if let Ty::Class(cls, _) = elem.as_ref() {
+                            if let Some(c) = self.ctx.classes.get(cls.as_str()) {
+                                if let Some(f) = c.fields.iter().find(|f| &f.name == name) {
+                                    return Ty::from_type_expr(&f.ty, f.span).unwrap_or(Ty::Unknown);
+                                }
+                            }
+                        }
+                    }
+                }
+                Expr::Call { callee, .. } => {
+                    if let Expr::Attr { name, .. } = callee.as_ref() {
+                        if let Ty::List(elem) | Ty::Iterator(elem) = src_ty {
+                            if let Ty::Class(cls, _) = elem.as_ref() {
+                                if let Some(sig) = self.ctx.get_method(cls.as_str(), name) {
+                                    return sig.ret.clone();
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ty::Unknown
+    }
+
+    /// (Bug C) Emit a `sort`/`sorted` `key=` expression's body as a Rust snippet
+    /// that reads the element as `__x` — the lambda parameter is bound to the
+    /// container's element type (list/set/generator elem, or dict KEY) so a
+    /// tuple/field/method body lowers correctly, then renamed to `__x`. A non-lambda
+    /// key (a function value) is emitted directly. Shared with the in-place
+    /// `list.sort(key=...)` path (mirrors the `sorted(...)` key-code extraction).
+    pub(crate) fn emit_sort_key_code(&mut self, key_expr: &Expr, src_ty: &Ty) -> Result<String> {
+        if let Expr::Lambda { params, body, .. } = key_expr {
+            let param_name = params.first().map(|(n, _)| n.clone()).unwrap_or_else(|| "__x".to_string());
+            let key_param_ty = match src_ty {
+                Ty::List(inner) | Ty::Set(inner) | Ty::Iterator(inner) => (**inner).clone(),
+                Ty::Dict(k, _) => (**k).clone(),
+                _ => Ty::Unknown,
+            };
+            let saved = self.locals.get(&param_name).cloned();
+            self.locals.insert(param_name.clone(), key_param_ty);
+            let body_s = self.emit_expr(body)?;
+            match saved {
+                Some(ty) => { self.locals.insert(param_name.clone(), ty); }
+                None => { self.locals.remove(param_name.as_str()); }
+            }
+            Ok(Self::replace_identifier(&body_s, escape_ident(&param_name).as_str(), "__x"))
+        } else {
+            self.emit_expr(key_expr)
+        }
+    }
+
     /// (card cc7ae370, item 1) Thin wrapper: collects any subscript-index temps
     /// hoisted for a MUTATING-method receiver (`grid[len(grid) - 1].append(x)`)
     /// and wraps the whole emitted call in a `{ let __idxN = ..; <call> }` block so
@@ -530,23 +593,55 @@ impl<'a> Codegen<'a> {
                         return Ok(Some(format!("{}.reverse()", obj_s)));
                     }
                     if name == "sort" {
-                        // (W0-b, p12b) `.sort()` needs `Ord`; a float or a
-                        // `__lt__`-comparable class element is only `PartialOrd`,
-                        // so route through the partial_cmp comparator — mirrors the
-                        // `sorted(...)` no-key path. An `Ord` element (int/str/bool)
-                        // still emits the plain `.sort()` (byte-identical).
-                        let elem_ty = match self.type_of_expr(obj.as_ref()) {
-                            Ty::List(inner) => *inner,
+                        // Only `key` / `reverse` are valid `list.sort` kwargs — an
+                        // unknown one (e.g. `.sort(bogus=1)`) is a TypeError in
+                        // Python and would otherwise be silently ignored here.
+                        if let Some((k, _)) = kwargs.iter().find(|(n, _)| n != "key" && n != "reverse") {
+                            return Err(crate::diag::Error::Codegen(format!(
+                                "list.sort() has no keyword argument `{}` (only `key` and `reverse`)",
+                                k
+                            )));
+                        }
+                        let list_ty = self.type_of_expr(obj.as_ref());
+                        let elem_ty = match &list_ty {
+                            Ty::List(inner) => (**inner).clone(),
                             _ => Ty::Unknown,
                         };
+                        let rev_expr = kwargs.iter().find(|(n, _)| n == "reverse").map(|(_, e)| e);
+                        // (Bug C) `list.sort(key=...)` — mirror the `sorted(..., key=)`
+                        // comparator (the kwarg used to be silently dropped, sorting
+                        // as if no key were given). Supports `key` alone and
+                        // `key`+`reverse` (a REVERSED-COMPARATOR stable sort).
+                        if let Some((_, key_expr)) = kwargs.iter().find(|(n, _)| n == "key") {
+                            let float_key = matches!(self.sort_key_ret_ty(key_expr, &list_ty), Ty::Float);
+                            let key_code = self.emit_sort_key_code(key_expr, &list_ty)?;
+                            let key_cmp = if float_key {
+                                "ka.partial_cmp(&kb).unwrap_or(::std::cmp::Ordering::Equal)"
+                            } else {
+                                "ka.cmp(&kb)"
+                            };
+                            if let Some(re) = rev_expr {
+                                let rev = self.emit_expr(re)?;
+                                return Ok(Some(format!(
+                                    "{}.sort_by(|a, b| {{ let ka = {{ let __x = a.clone(); {} }}; let kb = {{ let __x = b.clone(); {} }}; let __ord = {}; if {} {{ __ord.reverse() }} else {{ __ord }} }})",
+                                    obj_s, key_code, key_code, key_cmp, rev
+                                )));
+                            }
+                            if float_key {
+                                return Ok(Some(format!(
+                                    "{}.sort_by(|a, b| {{ let ka = {{ let __x = a.clone(); {} }}; let kb = {{ let __x = b.clone(); {} }}; {} }})",
+                                    obj_s, key_code, key_code, key_cmp
+                                )));
+                            }
+                            return Ok(Some(format!("{}.sort_by_key(|__x| {})", obj_s, key_code)));
+                        }
                         // (W0 follow-up) `list.sort(reverse=True)` used to silently
-                        // drop `reverse` (kwargs never reached the builtin method
-                        // arms). Emit a REVERSED-COMPARATOR stable sort — identical
-                        // to the `sorted(..., reverse=)` no-key path — so equal
-                        // elements keep their input order (Python's stable reverse),
-                        // rather than `.sort();.reverse()` which would flip them.
-                        if let Some((_, rev_expr)) = kwargs.iter().find(|(n, _)| n == "reverse") {
-                            let rev = self.emit_expr(rev_expr)?;
+                        // drop `reverse`. Emit a REVERSED-COMPARATOR stable sort —
+                        // equal elements keep input order (Python's stable reverse),
+                        // not `.sort();.reverse()` which would flip them. No kwargs =
+                        // the plain element-typed sort (Ord / partial_cmp).
+                        if let Some(re) = rev_expr {
+                            let rev = self.emit_expr(re)?;
                             let cmp = if self.elem_needs_partial_cmp(&elem_ty) {
                                 "a.partial_cmp(b).unwrap_or(::std::cmp::Ordering::Equal)"
                             } else {

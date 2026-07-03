@@ -1,0 +1,26 @@
+# Bug C: in-place `list.sort(key=...)` used to silently ignore `key` and sort as if
+# unkeyed. Now mirrors `sorted(..., key=)`: key alone, key+reverse (stable reversed
+# comparator), over int/str/__lt__-class-by-field. python3-verified.
+class Rec:
+    key: int
+    tag: str
+    def __init__(self, key: int, tag: str) -> None:
+        self.key = key
+        self.tag = tag
+
+def main() -> None:
+    xs: list[int] = [3, 1, 2]
+    xs.sort(key=lambda x: -x)
+    print(xs)
+    ws: list[str] = ["bbb", "a", "cc"]
+    ws.sort(key=lambda w: len(w))
+    print(ws)
+    ws.sort(key=lambda w: len(w), reverse=True)
+    print(ws)
+    recs: list[Rec] = [Rec(1, "a"), Rec(2, "b"), Rec(1, "c"), Rec(2, "d")]
+    recs.sort(key=lambda r: r.key)
+    for r in recs:
+        print(r.key, r.tag)
+    recs.sort(key=lambda r: r.key, reverse=True)
+    for r in recs:
+        print(r.key, r.tag)

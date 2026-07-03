@@ -1,0 +1,10 @@
+# W0-b negative: a `match` capture reusing the module const `M` makes it a
+# function-local; the read AFTER the match may be unbound (no arm matched), an
+# `UnboundLocalError` shape.
+M: int = 5
+def main() -> None:
+    x: int = 10
+    match x:
+        case M:
+            print(M)
+    print(M)

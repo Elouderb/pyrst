@@ -1,0 +1,17 @@
+# W0-b follow-up: a `match` capture pattern (`case M:`) binding a name that is ALSO
+# a module constant used to read the STALE const in the arm body (codegen resolved
+# the name to `const_names`, not the arm-local binding). Now the capture is a real
+# local: reading it in the arm sees the captured subject value. python3-verified.
+M: int = 5
+
+def classify(x: int) -> str:
+    match x:
+        case 0:
+            return "zero"
+        case M:
+            return "got " + str(M)
+
+def main() -> None:
+    print(classify(0))
+    print(classify(10))
+    print(M)

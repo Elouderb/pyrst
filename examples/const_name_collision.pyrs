@@ -1,29 +1,29 @@
 # Regression: module-const NAME mangling (card 08a32eb5 follow-up).
 #
-# A module const lowers to a top-level Rust `const`. A lowercase const name
-# (`k`, `i`, `v`) would, WITHOUT mangling, become a Rust CONSTANT PATTERN at any
-# pattern position in the generated crate — the dict-repr closure `|(k, v)|`, a
-# `for i in ...` target, a match arm — silently capturing that name as the const
-# (rustc E0308 / E0425). Each const here is emitted as `__pyrst_const_<name>` and
-# referenced by that mangled name, so it can never collide:
-#   - `k` / `v` collide with the runtime PyRepr dict closure `|(k, v)|`.
-#   - `i` collides with the `for i in range(3)` loop target below (the loop var
-#     shadows the const INSIDE the loop; the const is read again AFTER it).
+# A lowercase const name (`k`, `v`, `i`) is emitted as `__pyrst_const_<name>` so it
+# can never be captured as a Rust const PATTERN in the generated crate (the
+# dict-repr closure `|(k, v)|`, a `for` target, a `match` capture) — which would
+# silently rebind it. This golden is Python-FAITHFUL: no const is reassigned
+# (assigning a const's name inside a function makes it a function-local
+# `UnboundLocalError` — see the module_const_*_fail negatives); each const is only
+# READ, alongside runtime constructs whose internal patterns would collide with an
+# un-mangled const.
 k: int = 100
 v: str = "vee"
 i: int = 99
 
 
 def main() -> None:
-    # `k`/`v` are read while a dict (whose PyRepr uses a `|(k, v)|` closure) is
-    # also printed, proving the const names don't bind into that closure.
+    # `k`/`v` collide with the runtime dict-repr closure `|(k, v)|`: printing a
+    # dict proves the const names do not bind into that closure.
     d: dict[str, int] = {"a": 1, "b": 2}
     print(d)
     print(k)
     print(v)
-    # `i` const read, then a loop reusing `i` as its target (the loop var shadows
-    # the const inside the loop), then the const read again after the loop.
+    # `i` const read alongside a loop that uses a DIFFERENT target name — the const
+    # stays the const throughout (a loop REUSING `i` would be a shadow, now an
+    # honest check error, exercised by const_for_target_fail).
     print(i)
-    for i in range(3):
-        print(i)
+    for idx in range(3):
+        print(idx)
     print(i)

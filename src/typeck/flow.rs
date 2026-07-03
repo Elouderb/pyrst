@@ -915,26 +915,35 @@ fn reassign_value_ty(value: &Expr, env: &FuncEnv) -> Ty {
     check_expr(value, &mut env.clone()).unwrap_or(Ty::Unknown)
 }
 
-/// (W0-b, honesty hole p09) Reject the Python `UnboundLocalError` that pyrst
-/// would otherwise leak as a raw rustc E0425 at build. A TOP-LEVEL (function-body
-/// depth-0) plain assignment `n = ..` / `n += ..` to a MODULE CONSTANT's name
-/// makes `n` a function-scope local for the WHOLE function (codegen lowers it to a
-/// top-level `let mut n`), so READING `n` before that `let` executes is an error.
+/// (W0-b, honesty hole p09) Enforce Python's ACTUAL scoping rule for a module
+/// constant whose name is also assigned inside a function, so pyrst never (a)
+/// leaks a raw rustc E0425 nor (b) silently produces wrong output by reading the
+/// stale module const where Python would see the function-local.
 ///
-/// The trigger is precisely a TOP-LEVEL plain assign: a `for`/`with`/`except`/
-/// `match` target, or a plain assign NESTED inside a block, is BLOCK-scoped —
-/// codegen emits a block shadow and reads OUTSIDE that block still resolve to the
-/// module const, so those never leak (e.g. `for i in range(3)` where `i` is also a
-/// const, read before/after the loop, stays valid). A pure shadow (`PI = 3.0`
-/// with no prior read) also stays legal and Python-faithful (`let mut PI = ..`).
-/// So this fires ONLY on a read of a top-level-assigned const before its binding —
-/// `counter = counter + 1`, `print(counter); counter = 5`, `counter += 1`.
+/// **The rule.** In Python, ANY binding of a name anywhere in a function body
+/// (plain / augmented assign, tuple unpack, a `for` / `with … as` / `except … as`
+/// / `match` capture target, at ANY nesting depth other than a nested `def`/`class`
+/// — those are separate scopes) makes that name a function-LOCAL for the WHOLE
+/// function. Reading it on a path where the binding may not yet have executed is
+/// an `UnboundLocalError`. So: a read of such a shadowed const that is not
+/// definitely-bound before it is REJECTED here; a read that a preceding binding
+/// dominates is accepted (codegen resolves it to the local — and the match-capture
+/// name-resolution bug that used to read the stale const is fixed in codegen).
 ///
-/// `consts` = module-constant names (the `ctx.vars` keys); `params` = the
-/// function's parameter names (bound at entry — a param sharing a const name is
-/// NOT a shadow, so seed them as in-scope). `in_scope` is tracked with block
-/// scoping that mirrors codegen's `scope_enter`/`scope_exit`, so the analysis
-/// matches exactly which reads codegen would leave undeclared.
+/// This deliberately REPLACES the earlier block-scope compromise, which matched
+/// codegen's (non-Python) block scoping and thereby kept three silent
+/// wrong-output shapes alive (a `for`/`with`/`match`-target const read after the
+/// block, and an `except`-as const read after the handler). Under the new rule
+/// those post-block reads are honest check errors (Python raises there too, or the
+/// value would be wrong), and an in-block read of the block's own target stays
+/// legal. A pure straight-line shadow (`PI = 3.0; print(PI)`) and a read-only use
+/// of a const are both untouched.
+///
+/// `consts` = module-constant names (`ctx.vars` keys); `params` = the function's
+/// own parameter names (bound at entry — a param sharing a const name is NOT a
+/// shadow, so they seed the in-scope set). Nested `def`s are re-checked as their
+/// own scopes (a const shadowed only inside a closure would otherwise still leak
+/// E0425 — review probe7).
 pub(crate) fn detect_module_const_unbound_local(
     body: &[Stmt],
     consts: &HashSet<String>,
@@ -943,25 +952,88 @@ pub(crate) fn detect_module_const_unbound_local(
     if consts.is_empty() {
         return Ok(());
     }
-    // Only a TOP-LEVEL plain assign function-local-izes a const (a nested / loop /
-    // with / except / match binding is block-scoped and reads the const instead).
-    let top_assigned: HashSet<String> = body
-        .iter()
-        .filter_map(|s| match s {
-            Stmt::Assign { target, .. } | Stmt::AugAssign { target, .. } => Some(target.clone()),
-            _ => None,
-        })
-        .collect();
+    // A module const BOUND anywhere in THIS scope (any binding form, any nesting
+    // except nested def/class bodies) is a function-local for the whole function.
+    let mut local_names = HashSet::new();
+    collect_bound_names(body, &mut local_names);
+    collect_augassign_targets(body, &mut local_names);
     let shadowed: HashSet<String> = consts
         .iter()
-        .filter(|c| top_assigned.contains(*c) && !params.contains(*c))
+        .filter(|c| local_names.contains(*c) && !params.contains(*c))
         .cloned()
         .collect();
-    if shadowed.is_empty() {
-        return Ok(());
+    if !shadowed.is_empty() {
+        let mut in_scope: HashSet<String> = params.clone();
+        walk_unbound_local(body, &shadowed, &mut in_scope)?;
     }
-    let mut in_scope: HashSet<String> = params.clone();
-    walk_unbound_local(body, &shadowed, &mut in_scope)
+    // Recurse into every nested `def` as its OWN scope: a const shadowed only
+    // inside a closure is invisible to this scope's `local_names`, so without this
+    // the E0425 leak reappears there (review comment 208 BLOCKER, probe7).
+    check_nested_defs(body, consts)?;
+    Ok(())
+}
+
+/// Re-run [`detect_module_const_unbound_local`] on every nested `def` found in
+/// `body` (recursing control-flow blocks to reach a def defined inside one), each
+/// as its OWN function scope seeded with that def's own parameter names. The
+/// nested def's body is then itself scanned for deeper nested defs by the
+/// recursive `detect_*` call.
+fn check_nested_defs(body: &[Stmt], consts: &HashSet<String>) -> Result<()> {
+    for s in body {
+        match s {
+            Stmt::Func(f) => {
+                let fparams: HashSet<String> = f.params.iter().map(|p| p.name.clone()).collect();
+                detect_module_const_unbound_local(&f.body, consts, &fparams)?;
+            }
+            Stmt::If { then, elifs, else_, .. } => {
+                check_nested_defs(then, consts)?;
+                for (_, b) in elifs { check_nested_defs(b, consts)?; }
+                if let Some(b) = else_ { check_nested_defs(b, consts)?; }
+            }
+            Stmt::While { body, .. }
+            | Stmt::For { body, .. }
+            | Stmt::With { body, .. } => check_nested_defs(body, consts)?,
+            Stmt::Try { body, handlers, else_, finally_, .. } => {
+                check_nested_defs(body, consts)?;
+                for h in handlers { check_nested_defs(&h.body, consts)?; }
+                if let Some(b) = else_ { check_nested_defs(b, consts)?; }
+                if let Some(b) = finally_ { check_nested_defs(b, consts)?; }
+            }
+            Stmt::Match { arms, .. } => {
+                for arm in arms { check_nested_defs(&arm.body, consts)?; }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// `AugAssign` targets anywhere in `stmts` (recursing control-flow blocks but not
+/// nested def/class bodies) — the one binding form `collect_bound_names` omits.
+fn collect_augassign_targets(stmts: &[Stmt], out: &mut HashSet<String>) {
+    for s in stmts {
+        match s {
+            Stmt::AugAssign { target, .. } => { out.insert(target.clone()); }
+            Stmt::If { then, elifs, else_, .. } => {
+                collect_augassign_targets(then, out);
+                for (_, b) in elifs { collect_augassign_targets(b, out); }
+                if let Some(b) = else_ { collect_augassign_targets(b, out); }
+            }
+            Stmt::While { body, .. }
+            | Stmt::For { body, .. }
+            | Stmt::With { body, .. } => collect_augassign_targets(body, out),
+            Stmt::Try { body, handlers, else_, finally_, .. } => {
+                collect_augassign_targets(body, out);
+                for h in handlers { collect_augassign_targets(&h.body, out); }
+                if let Some(b) = else_ { collect_augassign_targets(b, out); }
+                if let Some(b) = finally_ { collect_augassign_targets(b, out); }
+            }
+            Stmt::Match { arms, .. } => {
+                for arm in arms { collect_augassign_targets(&arm.body, out); }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// The reads in a statement's OWN expressions (its value / condition / iterable /

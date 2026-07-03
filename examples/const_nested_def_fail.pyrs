@@ -1,0 +1,11 @@
+# W0-b negative: a module const reassigned inside a NESTED def is a local of that
+# closure; reading it before the assignment is `UnboundLocalError` (Python), and a
+# raw rustc E0425 leak previously.
+K: int = 10
+def outer() -> int:
+    def inner() -> int:
+        K = K + 1
+        return K
+    return inner()
+def main() -> None:
+    print(outer())

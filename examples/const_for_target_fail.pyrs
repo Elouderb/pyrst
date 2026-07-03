@@ -1,0 +1,7 @@
+# W0-b negative: a module const reused as a `for` target is a function-local; the
+# read AFTER the loop is `UnboundLocalError` in Python (the loop may be empty).
+N: int = 99
+def main() -> None:
+    for N in range(3):
+        print(N)
+    print(N)

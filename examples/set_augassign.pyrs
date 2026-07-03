@@ -1,0 +1,21 @@
+# W0-c follow-up: set augmented assignment (`|=` `&=` `-=` `^=`) — Rust HashSet has
+# no compound-assignment trait, so these desugar to `s = s <op> t` through the set
+# algebra lowering. Previously check-OK / build-FAIL. python3-verified.
+def main() -> None:
+    a: set[int] = {1, 2, 3}
+    a |= {3, 4, 5}
+    print(sorted(a))
+    b: set[int] = {1, 2, 3, 4, 5}
+    b &= {2, 4, 6}
+    print(sorted(b))
+    c: set[int] = {1, 2, 3, 4, 5}
+    c -= {2, 4}
+    print(sorted(c))
+    d: set[str] = {"a", "b", "c"}
+    d ^= {"b", "c", "d"}
+    print(sorted(d))
+    # accumulate via |= across a loop
+    acc: set[int] = set()
+    for part in [{1, 2}, {2, 3}, {3, 4}]:
+        acc |= part
+    print(sorted(acc))

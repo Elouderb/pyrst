@@ -43,9 +43,10 @@ impl<'a> Codegen<'a> {
         &mut self,
         callee: &Box<Expr>,
         args: &[Expr],
+        kwargs: &[(String, Expr)],
     ) -> Result<Option<String>> {
         let mut recv_prelude = Vec::new();
-        let result = self.emit_method_call_on_attr_inner(callee, args, &mut recv_prelude)?;
+        let result = self.emit_method_call_on_attr_inner(callee, args, kwargs, &mut recv_prelude)?;
         Ok(result.map(|s| Self::hoist_wrap(&recv_prelude, s)))
     }
 
@@ -54,6 +55,7 @@ impl<'a> Codegen<'a> {
         &mut self,
         callee: &Box<Expr>,
         args: &[Expr],
+        kwargs: &[(String, Expr)],
         recv_prelude: &mut Vec<String>,
     ) -> Result<Option<String>> {
                 // Method call with attribute callee — handle method name remapping
@@ -537,6 +539,24 @@ impl<'a> Codegen<'a> {
                             Ty::List(inner) => *inner,
                             _ => Ty::Unknown,
                         };
+                        // (W0 follow-up) `list.sort(reverse=True)` used to silently
+                        // drop `reverse` (kwargs never reached the builtin method
+                        // arms). Emit a REVERSED-COMPARATOR stable sort — identical
+                        // to the `sorted(..., reverse=)` no-key path — so equal
+                        // elements keep their input order (Python's stable reverse),
+                        // rather than `.sort();.reverse()` which would flip them.
+                        if let Some((_, rev_expr)) = kwargs.iter().find(|(n, _)| n == "reverse") {
+                            let rev = self.emit_expr(rev_expr)?;
+                            let cmp = if self.elem_needs_partial_cmp(&elem_ty) {
+                                "a.partial_cmp(b).unwrap_or(::std::cmp::Ordering::Equal)"
+                            } else {
+                                "a.cmp(b)"
+                            };
+                            return Ok(Some(format!(
+                                "{}.sort_by(|a, b| {{ let __ord = {}; if {} {{ __ord.reverse() }} else {{ __ord }} }})",
+                                obj_s, cmp, rev
+                            )));
+                        }
                         return Ok(Some(format!("{}{}", obj_s, self.sort_suffix_for_elem(&elem_ty))));
                     }
                     if name == "clear" {
@@ -2555,6 +2575,7 @@ impl<'a> Codegen<'a> {
         match_val: &str,
         arms: &[crate::ast::MatchArm],
         is_first: bool,
+        subj_ty: &Ty,
     ) -> Result<()> {
         use crate::ast::MatchPattern;
         let Some((arm, rest)) = arms.split_first() else {
@@ -2575,10 +2596,10 @@ impl<'a> Codegen<'a> {
         if always_matches {
             if is_first {
                 // No `if`/`else` wrapper: emit the body unconditionally.
-                self.emit_match_arm_body(match_val, capture_name.as_deref(), &arm.body)?;
+                self.emit_match_arm_body(match_val, capture_name.as_deref(), &arm.body, subj_ty)?;
             } else {
                 self.line("} else {");
-                self.emit_match_arm_body(match_val, capture_name.as_deref(), &arm.body)?;
+                self.emit_match_arm_body(match_val, capture_name.as_deref(), &arm.body, subj_ty)?;
                 self.line("}");
             }
             return Ok(());
@@ -2597,6 +2618,12 @@ impl<'a> Codegen<'a> {
             let bind = escape_ident(name);
             self.line(&format!("let mut {} = {}.clone();", bind, match_val));
             self.declared.insert(name.clone());
+            // (W0-b) Record the capture as a LOCAL of the subject's type so a read
+            // of it in the guard/body resolves to this binding — not to a
+            // same-named module constant (`const_names`-vs-`locals` resolution in
+            // emit_expr's Ident arm). Save/restore around the whole guarded block
+            // so it does not leak past the arm.
+            let cap_saved = self.locals.insert(name.clone(), subj_ty.clone());
             let g = self.emit_expr(guard)?;
             self.line(&format!("if {} {{", g));
             self.indent += 1;
@@ -2610,7 +2637,11 @@ impl<'a> Codegen<'a> {
                 self.line("}");
             } else {
                 // Continue the remaining arms inside this guard's `else`.
-                self.emit_match_arms(match_val, rest, false)?;
+                self.emit_match_arms(match_val, rest, false, subj_ty)?;
+            }
+            match cap_saved {
+                Some(t) => { self.locals.insert(name.clone(), t); }
+                None => { self.locals.remove(name.as_str()); }
             }
             self.indent -= 1;
             self.line("}");
@@ -2640,7 +2671,7 @@ impl<'a> Codegen<'a> {
         if rest.is_empty() {
             self.line("}");
         } else {
-            self.emit_match_arms(match_val, rest, false)?;
+            self.emit_match_arms(match_val, rest, false, subj_ty)?;
         }
         Ok(())
     }
@@ -2656,6 +2687,7 @@ impl<'a> Codegen<'a> {
         match_val: &str,
         capture_name: Option<&str>,
         body: &[crate::ast::Stmt],
+        subj_ty: &Ty,
     ) -> Result<()> {
         self.indent += 1;
         // (card 575bcf3a) Isolate the arm body's block-scope emission state; the
@@ -2666,6 +2698,13 @@ impl<'a> Codegen<'a> {
             self.line(&format!("let mut {} = {}.clone();", bind, match_val));
             // The binding is a `let`-declared local for the rest of this arm.
             self.declared.insert(name.to_string());
+            // (W0-b) Record it in `locals` with the subject's type so a read of the
+            // capture inside the body resolves to THIS local — not to a same-named
+            // module constant (emit_expr's Ident arm prefers a `const_names` entry
+            // only when the name is absent from `locals`). Previously a `case M:`
+            // capturing a const-named subject read the stale const (silent wrong
+            // output). `scope_exit` below restores `locals`, so it does not leak.
+            self.locals.insert(name.to_string(), subj_ty.clone());
         }
         for s in body {
             self.emit_stmt(s)?;

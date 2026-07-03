@@ -376,7 +376,7 @@ def ipow(base: int, exp: int) -> int:
             span: Span::DUMMY,
         });
         let args = vec![Expr::Str("/a/b.txt".into(), Span::DUMMY)];
-        let out = cg.emit_method_call_on_attr(&callee, &args)
+        let out = cg.emit_method_call_on_attr(&callee, &args, &[])
             .expect("emit must succeed")
             .expect("a tracked module call must be handled by emit_method_call_on_attr");
         assert!(out.starts_with("basename("),
@@ -407,7 +407,7 @@ def ipow(base: int, exp: int) -> int:
             span: Span::DUMMY,
         });
         let args = vec![Expr::Float(16.0, Span::DUMMY)];
-        let out = cg.emit_method_call_on_attr(&callee, &args)
+        let out = cg.emit_method_call_on_attr(&callee, &args, &[])
             .expect("emit must succeed")
             .expect("a tracked module call must be handled by emit_method_call_on_attr");
         assert!(out.starts_with("sqrt("),

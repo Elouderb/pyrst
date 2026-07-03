@@ -1,0 +1,28 @@
+# W0 follow-up: `list.sort(reverse=True)` used to silently ignore `reverse`. It now
+# emits a reversed-comparator STABLE sort (equal elements keep input order), across
+# int / str / float / a user `__lt__` class. python3-verified.
+class Rec:
+    key: int
+    tag: str
+    def __init__(self, key: int, tag: str) -> None:
+        self.key = key
+        self.tag = tag
+    def __lt__(self, other: Rec) -> bool:
+        return self.key < other.key
+
+def main() -> None:
+    xs: list[int] = [3, 1, 4, 1, 5, 9, 2, 6]
+    xs.sort()
+    print(xs)
+    xs.sort(reverse=True)
+    print(xs)
+    ys: list[str] = ["banana", "apple", "cherry"]
+    ys.sort(reverse=True)
+    print(ys)
+    zs: list[float] = [3.0, 1.0, 2.0]
+    zs.sort(reverse=True)
+    print(zs)
+    recs: list[Rec] = [Rec(1, "a"), Rec(2, "b"), Rec(1, "c"), Rec(2, "d")]
+    recs.sort(reverse=True)
+    for r in recs:
+        print(r.key, r.tag)

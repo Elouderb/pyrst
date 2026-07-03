@@ -1,0 +1,10 @@
+# W0-b negative: `except ... as E` makes the module const `E` a function-local;
+# Python deletes it at the handler's end, so the read after the try raises
+# `UnboundLocalError`.
+E: int = 7
+def main() -> None:
+    try:
+        raise ValueError("x")
+    except ValueError as E:
+        print(2)
+    print(E)

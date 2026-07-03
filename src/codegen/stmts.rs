@@ -435,8 +435,28 @@ impl<'a> Codegen<'a> {
                     }
                 }
             }
-            Stmt::AugAssign { target, op, value, .. } => {
+            Stmt::AugAssign { target, op, value, span } => {
                 let target_ty = self.locals.get(target.as_str()).cloned().unwrap_or(Ty::Unknown);
+                // (W0-c) Set augmented assignment `s |= t` / `&=` / `-=` / `^=`:
+                // Rust `HashSet` has no compound-assignment trait, so desugar to
+                // `s = s <op> t` through the set-algebra BinOp lowering (the set
+                // typing now exists). This closes the check-OK / build-FAIL gap the
+                // reviewer flagged, Python-faithfully (`set.__ior__` etc.). The RHS
+                // is emitted ONCE, inside the synthesized BinOp.
+                if matches!(target_ty, Ty::Set(_))
+                    && matches!(op, BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Sub)
+                {
+                    let desugar = Expr::BinOp {
+                        op: *op,
+                        lhs: Box::new(Expr::Ident(target.clone(), *span)),
+                        rhs: Box::new(value.clone()),
+                        span: *span,
+                    };
+                    let rhs = self.emit_expr(&desugar)?;
+                    let tgt = self.shadow_read_name(target).unwrap_or_else(|| escape_ident(target));
+                    self.line(&format!("{} = {};", tgt, rhs));
+                    return Ok(());
+                }
                 // (card 12052b4c) `xs += ys` (list target, Add) lowers to
                 // `xs.extend(<rhs>)` and `s += t` (str target, Add) lowers to
                 // `s += &(<rhs>)` below — both need the RHS built through the uniform
@@ -934,9 +954,10 @@ impl<'a> Codegen<'a> {
                 // Clone (do not move) a non-Copy scrutinee place so it stays usable
                 // after the match — uniform clone-on-use.
                 let subj = self.emit_consuming(subject)?;
+                let subj_ty = self.type_of_expr(subject);
                 let temp_var = "__match_val".to_string();
                 self.line(&format!("let {} = {};", temp_var, subj));
-                self.emit_match_arms(&temp_var, arms, true)?;
+                self.emit_match_arms(&temp_var, arms, true, &subj_ty)?;
             }
             // (first-class functions, Increment 2) A NESTED `def` lowers to a
             // NAMED local closure `let <name> = Rc::new(move |..| { <block> }) as
@@ -1564,7 +1585,7 @@ impl<'a> Codegen<'a> {
 
                 if let Some(__s) = self.emit_super_method_call(callee, args)? { return Ok(__s); }
 
-                if let Some(__s) = self.emit_method_call_on_attr(callee, args)? { return Ok(__s); }
+                if let Some(__s) = self.emit_method_call_on_attr(callee, args, kwargs)? { return Ok(__s); }
 
                 self.emit_plain_func_call(callee, args, kwargs)
     }

@@ -15,6 +15,42 @@ pub(crate) fn binop_symbol(op: BinOp) -> &'static str {
     }
 }
 
+/// (W0-c, p20) The ELEMENT type of a set-algebra result (`&` `|` `^` `-`) when
+/// the operands permit it. Python overloads these on sets for intersection /
+/// union / symmetric-difference / difference; codegen lowers them to `HashSet`
+/// operations that preserve the set type. Returns `Some(elem)` when both operands
+/// are sets with a common element type, OR one is a set and the other is
+/// `Unknown` — a not-yet-inferred operand (a `set()` literal types `set[Unknown]`;
+/// a loop variable is `Unknown` in the divergence post-pass), yielding the known
+/// element. Returns `None` when neither operand is a set or the element types
+/// genuinely conflict, so the caller falls through to the honest bitwise /
+/// arithmetic rules. Single source of truth shared by `check_expr` (the gate) and
+/// `infer_expr_ty` (codegen's `type_of_expr`), so a NESTED set-op is typed as a
+/// set on both sides and the two never drift.
+pub(crate) fn set_binop_result_elem(l: &Ty, r: &Ty) -> Option<Ty> {
+    match (l, r) {
+        (Ty::Set(le), Ty::Set(re)) => {
+            if **le == Ty::Unknown {
+                Some((**re).clone())
+            } else if **re == Ty::Unknown {
+                Some((**le).clone())
+            } else if le == re {
+                Some((**le).clone())
+            } else {
+                None
+            }
+        }
+        (Ty::Set(le), Ty::Unknown) => Some((**le).clone()),
+        (Ty::Unknown, Ty::Set(re)) => Some((**re).clone()),
+        _ => None,
+    }
+}
+
+/// Whether `op` is one of the four set-algebra operators (`&` `|` `^` `-`).
+pub(crate) fn is_set_algebra_op(op: BinOp) -> bool {
+    matches!(op, BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Sub)
+}
+
 /// Pure inference oracle — the single source of truth for expression types.
 ///
 /// A side-effect-free port of codegen's `type_of_expr` (codegen.rs:264-548) with
@@ -60,6 +96,16 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
         Expr::BinOp { lhs, op, rhs, .. } => {
             let l = infer_expr_ty(lhs, locals, ctx);
             let r = infer_expr_ty(rhs, locals, ctx);
+            // (W0-c, p20) Set algebra `& | ^ -` -> the set type, mirroring
+            // `check_expr`. Codegen's `type_of_expr` delegates here, so a NESTED
+            // set-op operand (`(a - b) | (c & a)`) is seen as a set and the outer
+            // op fires the `HashSet` lowering instead of an invalid owned-`HashSet`
+            // bitwise op.
+            if is_set_algebra_op(*op) {
+                if let Some(elem) = set_binop_result_elem(&l, &r) {
+                    return Ty::Set(Box::new(elem));
+                }
+            }
             match op {
                 // D5: Python `**` always yields a float (split out of the
                 // int-biased arithmetic arm below — codegen's bug).
@@ -1951,6 +1997,30 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                     // Add/Sub/Mul on `T op T` -> `T`.
                     _ => l,
                 });
+            }
+            // (W0-a, honesty hole p05) `str % x` is Python %-formatting, which
+            // pyrst does not implement. codegen would emit Rust `String % _`
+            // (E0369) — a check-passes / build-fails leak. Reject it honestly
+            // here with the f-string fix. GUARDED on a `Str` lhs so integer /
+            // float modulo (`a % b`) is completely untouched.
+            if *op == BinOp::Mod && matches!(l, Ty::Str) {
+                return Err(Error::Type {
+                    span: *span,
+                    msg: "string %-formatting (`\"...\" % x`) is not supported; \
+                          use an f-string instead, e.g. f\"{x}\"".to_string(),
+                });
+            }
+            // (W0-c, p20) Set algebra: `&`/`|`/`^`/`-` over sets yield the set
+            // type (see `set_binop_result_elem`). MUST precede the blanket
+            // bitwise->`Int` rule below (correct only for integer bit-twiddling)
+            // and the same-type arithmetic rule (which typed `set - set` but not
+            // `set & set`); makes the former flow.rs `reassign_value_ty` set
+            // special-case dead. A set with a non-set, or conflicting element
+            // types, falls through to the honest rejection below.
+            if is_set_algebra_op(*op) {
+                if let Some(elem) = set_binop_result_elem(&l, &r) {
+                    return Ok(Ty::Set(Box::new(elem)));
+                }
             }
             match op {
                 BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le

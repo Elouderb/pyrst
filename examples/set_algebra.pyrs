@@ -1,0 +1,20 @@
+# W0-c (p20): faithful set algebra — union `|`, intersection `&`, difference `-`,
+# symmetric difference `^`, and a chained expression. `sorted(...)` pins the
+# output order so the golden is deterministic. python3-verified.
+def main() -> None:
+    a: set[int] = {1, 2, 3, 4}
+    b: set[int] = {3, 4, 5, 6}
+    print(sorted(a | b))
+    print(sorted(a & b))
+    print(sorted(a - b))
+    print(sorted(a ^ b))
+    chained: set[int] = (a | b) - (a & b)
+    print(sorted(chained))
+    print(len(a | b), len(a & b), len(a - b), len(a ^ b))
+    words: set[str] = {"rare", "common"}
+    more: set[str] = {"rare", "epic"}
+    print(sorted(words | more))
+    acc: set[int] = set()
+    for part in [a, b, chained]:
+        acc = acc | part
+    print(sorted(acc))

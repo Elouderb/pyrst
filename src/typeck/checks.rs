@@ -658,6 +658,11 @@ pub(crate) fn check_one_func(f: &Func, ctx: &TyCtx) -> Result<()> {
     // missed (a param `xs: list[int]` reassigned to a generator in a block).
     let entry_env = env.clone();
     check_body(&f.body, &mut env)?;
+    // (W0-b, honesty hole p09) Reject the module-constant `UnboundLocalError`
+    // (assign-to-a-const's-name shadows it local, and reading it before that
+    // assignment is an error) that would otherwise leak as a raw rustc E0425.
+    let module_consts: std::collections::HashSet<String> = ctx.vars.keys().cloned().collect();
+    detect_module_const_unbound_local(&f.body, &module_consts, &env.params)?;
     check_all_paths_return(&f.body, &env, &f.name, f.span)?;
     // (fix-b) Reject the residual non-sibling silent value-drop: a bare outer-scope
     // local reassigned to a divergent type inside a single nested block and read
@@ -1045,6 +1050,11 @@ pub(crate) fn check_one_method(c: &ClassDef, method: &Func, ctx: &TyCtx) -> Resu
     collect_returned_param_idents(&method.body, &env.params, &mut env.returned_params);
     let entry_env = env.clone();
     check_body(&method.body, &mut env)?;
+    // (W0-b, honesty hole p09) Same module-constant `UnboundLocalError` guard as
+    // free functions — a method body that reassigns a module const's name and
+    // reads it beforehand would otherwise leak rustc E0425.
+    let module_consts: std::collections::HashSet<String> = ctx.vars.keys().cloned().collect();
+    detect_module_const_unbound_local(&method.body, &module_consts, &env.params)?;
     check_all_paths_return(&method.body, &env, &method.name, method.span)?;
     detect_read_after_conflicting_reassign(&method.body, &entry_env)?;
     Ok(())

@@ -1,0 +1,8 @@
+# W0-b (p09): a module constant assigned inside a function becomes a function
+# local (Python scoping; no `global` yet), so reading it before that assignment
+# is an UnboundLocalError — an honest CHECK error, not a rustc E0425 leak.
+counter: int = 0
+
+def bump() -> None:
+    counter = counter + 1
+    print(counter)

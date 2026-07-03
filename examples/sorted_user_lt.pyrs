@@ -1,0 +1,23 @@
+# W0-b (p12b): sorted() over a user class ordered by its own `__lt__` (which
+# lowers to `impl PartialOrd`), plus reverse= and the in-place list.sort() — all
+# via the partial_cmp comparator (the class has PartialOrd, not Ord). python3-verified.
+class Card:
+    rank: int
+    name: str
+    def __init__(self, rank: int, name: str) -> None:
+        self.rank = rank
+        self.name = name
+    def __lt__(self, other: Card) -> bool:
+        return self.rank < other.rank
+
+def main() -> None:
+    cards: list[Card] = [Card(3, "three"), Card(1, "one"), Card(2, "two")]
+    for c in sorted(cards):
+        print(c.rank, c.name)
+    print("---")
+    for c in sorted(cards, reverse=True):
+        print(c.rank, c.name)
+    print("---")
+    cards.sort()
+    for c in cards:
+        print(c.rank, c.name)

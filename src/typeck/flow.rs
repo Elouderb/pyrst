@@ -902,27 +902,193 @@ pub(crate) fn read_after_reassign_error(name: &str, outer: &Ty, inner: &Ty, span
     }
 }
 
-/// The type of a reassignment's RHS for the divergence decision, correcting a
-/// known `check_expr` blind spot: it blanket-types the bitwise operators
-/// (`|`, `&`, `^`, `<<`, `>>`) as `Int`, but Python overloads `|`/`&`/`^`/`-` for
-/// SET ALGEBRA (union / intersection / symmetric-difference / difference), which
-/// codegen emits as `HashSet` operations that PRESERVE the set type. Without this,
-/// a set accumulator `s = s | t` (which reads `s` on the loop back-edge, so it is
-/// live) would look like a `set → int` type change and be falsely rejected. The
-/// correction fires ONLY when `check_expr` returned `Int` AND an operand is a
-/// `Set`, so it never hides a real divergence (a `Set` value into a non-`Set`
-/// outer slot stays divergent).
+/// The type of a reassignment's RHS for the divergence decision. Thin wrapper
+/// over `check_expr` (matching the `Unpack` path's inline `check_expr`).
+///
+/// (W0-c) This used to carry a set-algebra special-case: `check_expr` blanket-
+/// typed `|`/`&`/`^` as `Int`, so a set accumulator `s = s | t` looked like a
+/// `set -> int` type change and was falsely flagged as divergent. `check_expr`
+/// now types set `&`/`|`/`^`/`-` over two sets as the set type directly, so that
+/// correction is dead and has been removed — the wrapper simply returns the
+/// checked type.
 fn reassign_value_ty(value: &Expr, env: &FuncEnv) -> Ty {
-    let t = check_expr(value, &mut env.clone()).unwrap_or(Ty::Unknown);
-    if matches!(t, Ty::Int) {
-        if let Expr::BinOp { op: BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Sub, lhs, rhs, .. } = value {
-            let lt = check_expr(lhs, &mut env.clone()).unwrap_or(Ty::Unknown);
-            if matches!(lt, Ty::Set(_)) { return lt; }
-            let rt = check_expr(rhs, &mut env.clone()).unwrap_or(Ty::Unknown);
-            if matches!(rt, Ty::Set(_)) { return rt; }
+    check_expr(value, &mut env.clone()).unwrap_or(Ty::Unknown)
+}
+
+/// (W0-b, honesty hole p09) Reject the Python `UnboundLocalError` that pyrst
+/// would otherwise leak as a raw rustc E0425 at build. A TOP-LEVEL (function-body
+/// depth-0) plain assignment `n = ..` / `n += ..` to a MODULE CONSTANT's name
+/// makes `n` a function-scope local for the WHOLE function (codegen lowers it to a
+/// top-level `let mut n`), so READING `n` before that `let` executes is an error.
+///
+/// The trigger is precisely a TOP-LEVEL plain assign: a `for`/`with`/`except`/
+/// `match` target, or a plain assign NESTED inside a block, is BLOCK-scoped —
+/// codegen emits a block shadow and reads OUTSIDE that block still resolve to the
+/// module const, so those never leak (e.g. `for i in range(3)` where `i` is also a
+/// const, read before/after the loop, stays valid). A pure shadow (`PI = 3.0`
+/// with no prior read) also stays legal and Python-faithful (`let mut PI = ..`).
+/// So this fires ONLY on a read of a top-level-assigned const before its binding —
+/// `counter = counter + 1`, `print(counter); counter = 5`, `counter += 1`.
+///
+/// `consts` = module-constant names (the `ctx.vars` keys); `params` = the
+/// function's parameter names (bound at entry — a param sharing a const name is
+/// NOT a shadow, so seed them as in-scope). `in_scope` is tracked with block
+/// scoping that mirrors codegen's `scope_enter`/`scope_exit`, so the analysis
+/// matches exactly which reads codegen would leave undeclared.
+pub(crate) fn detect_module_const_unbound_local(
+    body: &[Stmt],
+    consts: &HashSet<String>,
+    params: &HashSet<String>,
+) -> Result<()> {
+    if consts.is_empty() {
+        return Ok(());
+    }
+    // Only a TOP-LEVEL plain assign function-local-izes a const (a nested / loop /
+    // with / except / match binding is block-scoped and reads the const instead).
+    let top_assigned: HashSet<String> = body
+        .iter()
+        .filter_map(|s| match s {
+            Stmt::Assign { target, .. } | Stmt::AugAssign { target, .. } => Some(target.clone()),
+            _ => None,
+        })
+        .collect();
+    let shadowed: HashSet<String> = consts
+        .iter()
+        .filter(|c| top_assigned.contains(*c) && !params.contains(*c))
+        .cloned()
+        .collect();
+    if shadowed.is_empty() {
+        return Ok(());
+    }
+    let mut in_scope: HashSet<String> = params.clone();
+    walk_unbound_local(body, &shadowed, &mut in_scope)
+}
+
+/// The reads in a statement's OWN expressions (its value / condition / iterable /
+/// subject / guards) — SHALLOW: it does NOT descend into child block bodies (the
+/// caller recurses those) nor into a nested `def`'s captures (a separate scope).
+fn shallow_stmt_reads(s: &Stmt, out: &mut HashSet<String>) {
+    match s {
+        Stmt::Expr(e) | Stmt::Yield(e, _) => expr_reads(e, out),
+        Stmt::Assign { value, .. } => expr_reads(value, out),
+        Stmt::AugAssign { target, value, .. } => { out.insert(target.clone()); expr_reads(value, out); }
+        Stmt::Unpack { value, .. } => expr_reads(value, out),
+        Stmt::Return(Some(e), _) => expr_reads(e, out),
+        Stmt::Raise { exc: Some(e), .. } => expr_reads(e, out),
+        Stmt::Assert { cond, msg, .. } => { expr_reads(cond, out); if let Some(m) = msg { expr_reads(m, out); } }
+        Stmt::Del { target, .. } => expr_reads(target, out),
+        Stmt::AttrAssign { obj, value, .. } => { expr_reads(obj, out); expr_reads(value, out); }
+        Stmt::IndexAssign { obj, idx, value, .. } => { expr_reads(obj, out); expr_reads(idx, out); expr_reads(value, out); }
+        Stmt::If { cond, .. } => expr_reads(cond, out),
+        Stmt::While { cond, .. } => expr_reads(cond, out),
+        Stmt::For { iter, .. } => expr_reads(iter, out),
+        Stmt::With { ctx_expr, .. } => expr_reads(ctx_expr, out),
+        Stmt::Match { subject, arms, .. } => {
+            expr_reads(subject, out);
+            for arm in arms { if let Some(g) = &arm.guard { expr_reads(g, out); } }
+        }
+        _ => {}
+    }
+}
+
+/// In-order worker for [`detect_module_const_unbound_local`]. For each statement,
+/// its OWN reads are checked BEFORE its own binds take effect (so `n = n + 1`,
+/// whose RHS reads a not-yet-in-scope shadowed const, is flagged). A plain assign
+/// at THIS level records its target in `in_scope`; child blocks are walked with
+/// [`walk_block`], which binds their block-local targets (For / With-as /
+/// except-as / Match capture) for the body only and restores `in_scope` at the
+/// block's close — mirroring codegen's `scope_enter`/`scope_exit`, so a top-level
+/// `let mut` persists while a nested/loop binding is block-scoped.
+fn walk_unbound_local(
+    stmts: &[Stmt],
+    shadowed: &HashSet<String>,
+    in_scope: &mut HashSet<String>,
+) -> Result<()> {
+    for s in stmts {
+        let mut reads = HashSet::new();
+        shallow_stmt_reads(s, &mut reads);
+        for r in &reads {
+            if shadowed.contains(r) && !in_scope.contains(r) {
+                return Err(unbound_local_const_error(r, stmt_span(s)));
+            }
+        }
+        match s {
+            Stmt::Assign { target, .. } | Stmt::AugAssign { target, .. } => {
+                in_scope.insert(target.clone());
+            }
+            Stmt::Unpack { targets, .. } => {
+                for t in targets { in_scope.insert(t.clone()); }
+            }
+            Stmt::If { then, elifs, else_, .. } => {
+                walk_block(then, shadowed, in_scope, &[])?;
+                for (_, b) in elifs { walk_block(b, shadowed, in_scope, &[])?; }
+                if let Some(b) = else_ { walk_block(b, shadowed, in_scope, &[])?; }
+            }
+            Stmt::While { body, .. } => walk_block(body, shadowed, in_scope, &[])?,
+            Stmt::For { targets, body, .. } => walk_block(body, shadowed, in_scope, targets)?,
+            Stmt::With { as_name, body, .. } => {
+                let extra: Vec<String> = as_name.iter().cloned().collect();
+                walk_block(body, shadowed, in_scope, &extra)?;
+            }
+            Stmt::Try { body, handlers, else_, finally_, .. } => {
+                walk_block(body, shadowed, in_scope, &[])?;
+                for h in handlers {
+                    let extra: Vec<String> = h.exc_name.iter().cloned().collect();
+                    walk_block(&h.body, shadowed, in_scope, &extra)?;
+                }
+                if let Some(b) = else_ { walk_block(b, shadowed, in_scope, &[])?; }
+                if let Some(b) = finally_ { walk_block(b, shadowed, in_scope, &[])?; }
+            }
+            Stmt::Match { arms, .. } => {
+                for arm in arms {
+                    let extra: Vec<String> = match &arm.pattern {
+                        MatchPattern::Capture(nm) => vec![nm.clone()],
+                        _ => vec![],
+                    };
+                    walk_block(&arm.body, shadowed, in_scope, &extra)?;
+                }
+            }
+            _ => {}
         }
     }
-    t
+    Ok(())
+}
+
+/// Walk a child BLOCK in its own scope: the `extra` names (a loop / with / except
+/// / match target) bind for the body only, and EVERY binding made inside the block
+/// is discarded at its close (a block shadow) — matching codegen's block scoping,
+/// so a name bound only inside a block does not count as in-scope for a read after
+/// the block.
+fn walk_block(
+    body: &[Stmt],
+    shadowed: &HashSet<String>,
+    in_scope: &mut HashSet<String>,
+    extra: &[String],
+) -> Result<()> {
+    let snapshot = in_scope.clone();
+    for e in extra { in_scope.insert(e.clone()); }
+    let res = walk_unbound_local(body, shadowed, in_scope);
+    *in_scope = snapshot;
+    res
+}
+
+/// The honest error for the Python `UnboundLocalError` hole (p09): a module
+/// constant read before the local assignment that shadows it. Points at the same
+/// two facts the message needs — the name is module-constant / immutable, and
+/// module-level mutable state is not yet supported — without promising the lift.
+fn unbound_local_const_error(name: &str, span: Span) -> Error {
+    Error::Type {
+        span,
+        msg: format!(
+            "`{0}` is a module constant, but it is assigned inside this function, \
+             which (per Python scoping) makes `{0}` a local for the whole function \
+             — so reading it here, before that local assignment, is an error \
+             (Python raises `UnboundLocalError`). Module constants are immutable \
+             and module-level mutable state is not yet supported; use a distinct \
+             local name, or pass `{0}` in as a parameter and return the new value.",
+            name
+        ),
+    }
 }
 
 /// (fix-b) Entry point: reject a bare outer-scope local reassigned to a divergent

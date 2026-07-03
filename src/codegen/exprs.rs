@@ -1,6 +1,35 @@
 use super::*;
 
 impl<'a> Codegen<'a> {
+    /// (W0-b, honesty hole p12b) Whether a `Vec<elem>` must be sorted with the
+    /// `partial_cmp` comparator instead of `.sort()`. Rust's `.sort()` needs
+    /// `Ord`, which `f64` lacks (only `PartialOrd`) and which a user class with a
+    /// `__lt__` also lacks — `__lt__` lowers to `impl PartialOrd` only (no `Ord`;
+    /// see codegen/items.rs). Both cases therefore need
+    /// `.sort_by(|a, b| a.partial_cmp(b)...)`. Mirrors the pre-existing float path
+    /// and extends it to comparable user classes, closing the `sorted(list_of_obj)`
+    /// -> rustc E0277 leak.
+    pub(crate) fn elem_needs_partial_cmp(&self, elem: &Ty) -> bool {
+        match elem {
+            Ty::Float => true,
+            // A class is `Ord`-sortable only via a `__lt__` dunder, which emits
+            // `PartialOrd` (not `Ord`); so it always needs the partial_cmp path.
+            Ty::Class(cls, _) => self.ctx.get_method(cls, "__lt__").is_some(),
+            _ => false,
+        }
+    }
+
+    /// The `.sort*()` call suffix for a `Vec<elem>`: the `partial_cmp` comparator
+    /// for `f64` / a `__lt__`-comparable class (see [`Self::elem_needs_partial_cmp`]),
+    /// else the plain `.sort()` (which requires `Ord`).
+    pub(crate) fn sort_suffix_for_elem(&self, elem: &Ty) -> String {
+        if self.elem_needs_partial_cmp(elem) {
+            ".sort_by(|a, b| a.partial_cmp(b).unwrap_or(::std::cmp::Ordering::Equal))".to_string()
+        } else {
+            ".sort()".to_string()
+        }
+    }
+
     /// (card cc7ae370, item 1) Thin wrapper: collects any subscript-index temps
     /// hoisted for a MUTATING-method receiver (`grid[len(grid) - 1].append(x)`)
     /// and wraps the whole emitted call in a `{ let __idxN = ..; <call> }` block so
@@ -499,7 +528,16 @@ impl<'a> Codegen<'a> {
                         return Ok(Some(format!("{}.reverse()", obj_s)));
                     }
                     if name == "sort" {
-                        return Ok(Some(format!("{}.sort()", obj_s)));
+                        // (W0-b, p12b) `.sort()` needs `Ord`; a float or a
+                        // `__lt__`-comparable class element is only `PartialOrd`,
+                        // so route through the partial_cmp comparator — mirrors the
+                        // `sorted(...)` no-key path. An `Ord` element (int/str/bool)
+                        // still emits the plain `.sort()` (byte-identical).
+                        let elem_ty = match self.type_of_expr(obj.as_ref()) {
+                            Ty::List(inner) => *inner,
+                            _ => Ty::Unknown,
+                        };
+                        return Ok(Some(format!("{}{}", obj_s, self.sort_suffix_for_elem(&elem_ty))));
                     }
                     if name == "clear" {
                         return Ok(Some(format!("{}.clear()", obj_s)));
@@ -1344,16 +1382,21 @@ impl<'a> Codegen<'a> {
                                     }
                                 }));
                             } else {
-                                // Check if this is a float list to handle Ord constraint
-                                // (a float GENERATOR needs the same partial_cmp
-                                // treatment — f64 isn't Ord — once collected).
-                                let is_float_list = matches!(&list_ty,
-                                    Ty::List(inner) | Ty::Iterator(inner) if inner.as_ref() == &Ty::Float);
-                                let sort_code = if is_float_list {
-                                    ".sort_by(|a, b| a.partial_cmp(b).unwrap_or(::std::cmp::Ordering::Equal))".to_string()
-                                } else {
-                                    ".sort()".to_string()
+                                // Pick the comparator by the ELEMENT type being
+                                // sorted (list/generator/set element, or dict KEY).
+                                // `f64` and a user class with `__lt__` are only
+                                // `PartialOrd`, so both need `.sort_by(partial_cmp)`
+                                // rather than `.sort()` (which requires `Ord`) —
+                                // see `sort_suffix_for_elem`. This generalises the
+                                // former float-only check to comparable user classes
+                                // (closing the `sorted(list_of_obj)` E0277 leak, W0
+                                // p12b) and to `set[float]`/float-keyed dicts.
+                                let elem_ty = match &list_ty {
+                                    Ty::List(inner) | Ty::Iterator(inner) | Ty::Set(inner) => (**inner).clone(),
+                                    Ty::Dict(k, _) => (**k).clone(),
+                                    _ => Ty::Unknown,
                                 };
+                                let sort_code = self.sort_suffix_for_elem(&elem_ty);
 
                                 // `sorted` operates on a Vec. A list arg is cloned
                                 // directly; a set is materialized from its elements;

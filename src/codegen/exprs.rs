@@ -988,8 +988,29 @@ impl<'a> Codegen<'a> {
                                     // Regular expression: wrap in closure that calls the key function
                                     self.emit_expr(key_expr)?
                                 };
+                                // (REVIEW FOLLOW-UP on 577b04f, items 1+3) The
+                                // former `__list.iter().min_by_key(|__x| ..)` had
+                                // two bugs, both fixed by this manual fold:
+                                //  (1) `__x` inside `min_by_key`'s closure is
+                                //  `&Self::Item` = `&&Elem` (double reference,
+                                //  since `.iter()`'s Item is already `&Elem`) —
+                                //  method calls auto-deref through this fine, but
+                                //  a plain HELPER FUNCTION call in the key body
+                                //  (`helper(__x)`) does not get that coercion and
+                                //  fails E0308 (unlike `sorted`'s key= arm, whose
+                                //  closure binds `__x` to an OWNED clone). Binding
+                                //  `__x` via `let __x = __ref.clone();` here
+                                //  matches `sorted`'s shape exactly, fixing it.
+                                //  (2) Tie-breaking: `min_by_key` already returns
+                                //  the FIRST minimal element on a tie, matching
+                                //  Python's `min()` — an explicit `<` (not `<=`)
+                                //  fold preserves that (keep the earlier winner
+                                //  unless a STRICTLY smaller key is found).
+                                // A side benefit: `<`/`>` need only `PartialOrd`
+                                // (not the `Ord` `min_by_key`/`max_by_key`
+                                // require), so a FLOAT-valued key now compiles too.
                                 return Ok(Some(format!(
-                                    "{{ let __list = {}; __list.iter().min_by_key(|__x| {}).map(|__x| __x.clone()).unwrap_or_default() }}",
+                                    "{{ let __list = {}; let mut __best: Option<(_, _)> = None; for __ref in __list.iter() {{ let __x = __ref.clone(); let __k = {}; let __take = match &__best {{ None => true, Some((__bk, _)) => __k < *__bk }}; if __take {{ __best = Some((__k, __x)); }} }} __best.map(|(_, __v)| __v).unwrap_or_default() }}",
                                     a, key_code
                                 )));
                             } else if args.len() == 1 {
@@ -1009,13 +1030,29 @@ impl<'a> Codegen<'a> {
                                         _ => format!("{}.min().unwrap_or(0)", src),
                                     }));
                                 }
+                                // (REVIEW FOLLOW-UP on 577b04f, item 2) `.copied()`
+                                // requires `Copy`, which a non-Copy element type
+                                // (e.g. `str`) does not implement — `.cloned()`
+                                // requires only `Clone` and covers both Copy and
+                                // non-Copy element types uniformly. `.unwrap_or(0)`
+                                // likewise only typechecks for an Int element;
+                                // `.unwrap_or_default()` works for Int (0), Str
+                                // (""), and Bool (false) alike.
                                 return Ok(Some(match elem_ty {
                                     Ty::Float => format!("{{ let mut __min = f64::INFINITY; for __x in {}.iter() {{ if __x < &__min {{ __min = *__x; }} }} __min }}", a),
-                                    _ => format!("{}.iter().copied().min().unwrap_or(0)", a),
+                                    _ => format!("{}.iter().cloned().min().unwrap_or_default()", a),
                                 }));
                             } else {
-                                let a = self.emit_expr(&args[0])?;
-                                let b = self.emit_expr(&args[1])?;
+                                // (REVIEW FOLLOW-UP on 577b04f, item 4) The 2-arg
+                                // scalar shape bare-moved both args via
+                                // `emit_expr` — fine for a Copy type (int/float),
+                                // but an E0382 use-after-move on reuse for a
+                                // non-Copy arg (str/object). Route through
+                                // `emit_consuming` like every other consuming
+                                // position (a Copy arg is unaffected — its own
+                                // `is_copy_type` check keeps it bare).
+                                let a = self.emit_consuming(&args[0])?;
+                                let b = self.emit_consuming(&args[1])?;
                                 return Ok(Some(format!("::std::cmp::min({}, {})", a, b)));
                             }
                         }
@@ -1064,8 +1101,22 @@ impl<'a> Codegen<'a> {
                                     // Regular expression: wrap in closure that calls the key function
                                     self.emit_expr(key_expr)?
                                 };
+                                // (REVIEW FOLLOW-UP on 577b04f, items 1+3) See the
+                                // `min` key= arm above for the full explanation.
+                                // Unlike `min_by_key` (already first-wins, same as
+                                // Python), Rust's `max_by_key` returns the LAST
+                                // maximal element on a tie — Python's `max()`
+                                // returns the FIRST. This manual fold uses `>`
+                                // (STRICTLY greater) so an equal-or-lesser
+                                // candidate never replaces the earlier winner,
+                                // reproducing Python's first-wins tie rule; it
+                                // also binds `__x` to an OWNED clone (not the
+                                // double-referenced closure item), fixing a
+                                // helper-function-in-key-body E0308, and needs
+                                // only `PartialOrd` (not `Ord`), so a float key
+                                // now compiles too.
                                 return Ok(Some(format!(
-                                    "{{ let __list = {}; __list.iter().max_by_key(|__x| {}).map(|__x| __x.clone()).unwrap_or_default() }}",
+                                    "{{ let __list = {}; let mut __best: Option<(_, _)> = None; for __ref in __list.iter() {{ let __x = __ref.clone(); let __k = {}; let __take = match &__best {{ None => true, Some((__bk, _)) => __k > *__bk }}; if __take {{ __best = Some((__k, __x)); }} }} __best.map(|(_, __v)| __v).unwrap_or_default() }}",
                                     a, key_code
                                 )));
                             } else if args.len() == 1 {
@@ -1085,13 +1136,20 @@ impl<'a> Codegen<'a> {
                                         _ => format!("{}.max().unwrap_or(0)", src),
                                     }));
                                 }
+                                // (REVIEW FOLLOW-UP on 577b04f, item 2) See the
+                                // `min` arm above: `.cloned()`/`.unwrap_or_default()`
+                                // work for both Copy and non-Copy element types.
                                 return Ok(Some(match elem_ty {
                                     Ty::Float => format!("{{ let mut __max = f64::NEG_INFINITY; for __x in {}.iter() {{ if __x > &__max {{ __max = *__x; }} }} __max }}", a),
-                                    _ => format!("{}.iter().copied().max().unwrap_or(0)", a),
+                                    _ => format!("{}.iter().cloned().max().unwrap_or_default()", a),
                                 }));
                             } else {
-                                let a = self.emit_expr(&args[0])?;
-                                let b = self.emit_expr(&args[1])?;
+                                // (REVIEW FOLLOW-UP on 577b04f, item 4) See the
+                                // `min` arm above: route both scalar args through
+                                // `emit_consuming` so a non-Copy arg is cloned
+                                // (not moved), fixing E0382 on reuse.
+                                let a = self.emit_consuming(&args[0])?;
+                                let b = self.emit_consuming(&args[1])?;
                                 return Ok(Some(format!("::std::cmp::max({}, {})", a, b)));
                             }
                         }

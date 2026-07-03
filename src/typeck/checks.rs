@@ -1272,7 +1272,7 @@ pub(crate) fn collect_calls_from_stmt(stmt: &Stmt, called: &mut std::collections
 
 pub(crate) fn collect_calls_from_expr(expr: &Expr, called: &mut std::collections::HashSet<String>) {
     match expr {
-        Expr::Call { callee, args, .. } => {
+        Expr::Call { callee, args, kwargs, .. } => {
             if let Expr::Ident(name, _) = callee.as_ref() {
                 called.insert(name.clone());
             } else if let Expr::Attr { obj, name, .. } = callee.as_ref() {
@@ -1290,6 +1290,17 @@ pub(crate) fn collect_calls_from_expr(expr: &Expr, called: &mut std::collections
                 collect_calls_from_expr(callee, called);
             }
             for arg in args { collect_calls_from_expr(arg, called); }
+            // (REVIEW FOLLOW-UP on 577b04f, item 3) A KWARG expression (e.g.
+            // `key=lambda w: helper(w)` on `sorted`/`min`/`max`) previously went
+            // untraversed — this arm destructured `{ callee, args, .. }`,
+            // silently dropping `kwargs`. A helper function referenced ONLY
+            // inside a kwarg's lambda body was therefore invisible to this
+            // "which functions are called" walk, so dead-code elimination
+            // pruned its definition and codegen still emitted a call to it —
+            // check-passes/build-fails ("cannot find function" E0425). Not
+            // specific to min/max: `sorted(xs, key=lambda w: helper(w))` with
+            // no other reference to `helper` hit the identical bug.
+            for (_, v) in kwargs { collect_calls_from_expr(v, called); }
         }
         Expr::BinOp { lhs, rhs, .. } => {
             collect_calls_from_expr(lhs, called);

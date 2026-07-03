@@ -8,3 +8,16 @@ fig
 banana
 fig
 ['banana', 'kiwi', 'fig', 'date']
+fig
+fig
+9
+5
+Alice
+Charlie
+fig
+banana
+['banana', 'kiwi', 'fig', 'date']
+apple
+banana
+banana
+apple

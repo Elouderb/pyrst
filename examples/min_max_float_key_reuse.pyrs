@@ -1,5 +1,6 @@
-# CARD bd2bd472: two pre-existing min/max gaps, fixed together.
+# CARD bd2bd472: min/max gaps, fixed together (initial pass + review follow-up).
 #
+# INITIAL PASS:
 # (1) `infer_expr_ty` (the pure inference oracle `type_of_expr` delegates to)
 # had NO arm for a bare `min`/`max` call — it fell through to the generic
 # `ctx.funcs.get("min"/"max")` path, whose hardcoded builtin `FuncSig`
@@ -22,7 +23,44 @@
 # `.clone()` a reusable place, bare for an owned temp), matching `sorted`'s
 # convention and Python's value semantics.
 #
+# REVIEW FOLLOW-UP (independent review of the initial pass found 4 MORE
+# pre-existing bugs via blast-radius probing of this same neighborhood,
+# fixed here on top):
+#
+# (3) `max(xs, key=...)` on TIED keys returned the LAST maximal element
+# (Rust's `max_by_key` tie rule) instead of Python's FIRST. `min` was
+# already correct (Rust's `min_by_key` is also first-wins). Fixed by
+# replacing both `min_by_key`/`max_by_key` with a manual first-wins fold
+# (accumulator replaced only on a STRICTLY better key).
+#
+# (4) min/max plain form (no `key=`) over `list[str]` type-checked fine but
+# leaked a raw rustc E0277/E0599 at build (`.iter().copied()` requires
+# `Copy`, which `String` does not implement). Fixed by using `.cloned()`
+# (needs only `Clone`) and `.unwrap_or_default()` (works for Int/Str/Bool
+# alike, not just Int's literal `0`).
+#
+# (5) A plain helper function called inside a min/max `key=` lambda body
+# over a non-Copy element leaked a raw rustc E0308 (`__x: &&String` double
+# reference — `.iter()`'s item is already `&Elem`, and `min_by_key`'s
+# closure takes `&Self::Item`). The same fold rewrite that fixed (3) binds
+# `__x` to an OWNED `.clone()` of the element (mirroring `sorted`'s key=
+# shape), which also fixes this. A SIBLING bug in the same neighborhood
+# (not min/max-specific) was found while verifying this: a helper function
+# referenced ONLY inside ANY kwarg expression (`key=`, on `sorted` too) was
+# invisible to dead-code elimination's "which functions are called" walk
+# (it only traversed `Call`'s `args`, not `kwargs`) and got silently pruned
+# — check-passes/build-fails ("cannot find function"). Fixed by also
+# traversing kwargs in `collect_calls_from_expr`.
+#
+# (6) The 2-arg scalar `min(a, b)`/`max(a, b)` form bare-moved both args —
+# fine for a Copy type (int/float), but E0382 use-after-move on reuse for a
+# non-Copy arg (str/object). Fixed by routing both args through
+# `emit_consuming` (a Copy arg is unaffected).
+#
 # Every line below is python3-verified.
+def word_len(s: str) -> int:
+    return len(s)
+
 def main() -> None:
     # (1) Whole-number float results must still print with a trailing
     # ".0" (python3: "2.0" / "4.0"), and a non-whole result is unaffected.
@@ -57,5 +95,42 @@ def main() -> None:
     print(also_shortest)
     # python3: ['banana', 'kiwi', 'fig', 'date'] (still intact, not moved)
     print(words)
+
+    # (3) tie-breaking: max() must return the FIRST maximal element on a
+    # tie (matches Python); min() already did, pinned here too. Multiple
+    # ties, str-length and int-modulo keys.
+    tied: list[str] = ["fig", "abc", "xyz", "cat", "dog"]
+    # python3: fig / fig (all 3-char; max/min both return the FIRST tie)
+    print(max(tied, key=lambda w: len(w)))
+    print(min(tied, key=lambda w: len(w)))
+    tied_nums: list[int] = [5, 3, 9, 9, 2, 9, 1]
+    # python3: 9 / 5 (9 appears 3x, tied at key 4; first 9 wins both ways)
+    print(max(tied_nums, key=lambda v: v % 5))
+    print(min(tied_nums, key=lambda v: v % 5))
+
+    # (4) plain min/max over list[str], no key= — lexicographic, like Python.
+    names: list[str] = ["Charlie", "Alice", "Bob"]
+    # python3: Alice / Charlie
+    print(min(names))
+    print(max(names))
+
+    # (5) a helper function (not a lambda body's own operators/method calls)
+    # called inside a key= lambda over a non-Copy (str) element.
+    # python3: fig / banana
+    print(min(words, key=lambda w: word_len(w)))
+    print(max(words, key=lambda w: word_len(w)))
+    # python3: ['banana', 'kiwi', 'fig', 'date'] (still intact)
+    print(words)
+
+    # (6) 2-arg scalar min/max reuse — must not move non-Copy args.
+    a: str = "banana"
+    b: str = "apple"
+    lo = min(a, b)
+    hi = max(a, b)
+    # python3: apple / banana / banana / apple
+    print(lo)
+    print(hi)
+    print(a)
+    print(b)
 
 main()

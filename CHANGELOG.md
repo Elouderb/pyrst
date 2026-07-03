@@ -2,6 +2,23 @@
 
 All notable changes to pyrst are documented here. This project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.1.3] — 2026-07-03
+
+The idiom release: the Python you actually write now works. Every fix python3-verified; three adversarial review rounds on the final batch alone.
+
+### Now working (all CPython-faithful)
+
+- **Augmented assignment:** `s += "x"`, `s += s`, `list += list` (including `xs += xs`, doubling like Python; the right-hand list stays usable). Invalid combinations (`set |=`, `str -=`, …) get honest pyrst errors instead of raw rustc leaks.
+- **Duplicate unpack targets:** `a, a = 1, 2` gives Python's left-to-right last-wins, with evaluation order preserved under side effects.
+- **`zip` with 3–4 arguments** (flat tuples like CPython; 5+ is an honest "nest zip calls" error) and **`zip`/`enumerate` over strings**.
+- **Tuple-keyed sorting:** `sorted(pairs, key=lambda t: t[0])` — the key-lambda parameter now knows its element type (`min`/`max` had the same bug). **Nested tuple indexing** (`t[0][1]`, any depth) compiles as field access; dynamic or out-of-range tuple indexes are clear errors.
+- **Closures:** a nested `def` clones its non-`Copy` captures (the documented value-semantics snapshot) — reading a variable after a closure captures it now works; two closures over the same variable; returned closures. Capturing a generator or a `Mut[T]` by-reference parameter is an honest error with a verified workaround in the message.
+- **`min`/`max`:** results are properly typed (whole-number float results print `2.0`, not `2` — eleven expected-output lines in five older examples were corrected against python3); `key=` sources are reusable; **`max(key=)` ties now return the first element like Python** (was Rust's last-wins — silent wrong output); string/bool arguments work; helper functions inside `key=` lambdas work (they were also being dead-code-pruned — fixed, affected `sorted` too); 2-arg forms don't consume their arguments; **empty `min()`/`max()` raises a catchable `ValueError`** with CPython's message (the float paths silently returned ±infinity).
+
+### Quality
+
+- `./test_all.sh`: 310/310 positive examples (+9), 140/140 negative fixtures (+4) at both gates; 524 `cargo test` cases; 0 compiler warnings; 5× full-corpus emit byte-stable. The no-known-wrong-output claim was re-verified: two silent-wrong bugs found by this release's reviews (max-tie-breaking, empty-min defaults) were fixed before tagging.
+
 ## [0.1.2] — 2026-07-02
 
 Lazy generators and the silent-miscompile purge. Every change was independently code-reviewed with adversarial probing; runtime semantics were verified against CPython (python3) throughout. As of this release there are **no known cases where an accepted program produces wrong output**.

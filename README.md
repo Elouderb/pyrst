@@ -36,9 +36,9 @@ def main() -> None:
 
 ## Status
 
-**v0.1.2.** Full compiler pipeline (lexer → parser → resolver → type checker → Rust codegen → `rustc`), end-to-end.
+**v0.1.3.** Full compiler pipeline (lexer → parser → resolver → type checker → Rust codegen → `rustc`), end-to-end.
 
-`./test_all.sh`: **301/301 positive examples** build + run with matching output, **136/136 negative fixtures** correctly rejected (at both `check` and `build`), plus multi-file import demos. **524 in-crate `cargo test` cases**, 0 compiler warnings, CI green. Generators are **lazy** (infinite generators are safe); slice semantics are CPython-exact (verified against python3 on a 5,700+-case oracle); builtin runtime errors are catchable by their Python exception type; emitted Rust is rustfmt-formatted and deterministic. There are **no known cases where an accepted program produces wrong output** — every such bug found by this release's adversarial reviews was fixed or is honestly rejected at `check`.
+`./test_all.sh`: **310/310 positive examples** build + run with matching output, **140/140 negative fixtures** correctly rejected (at both `check` and `build`), plus multi-file import demos. **524 in-crate `cargo test` cases**, 0 compiler warnings, CI green. Generators are **lazy** (infinite generators are safe); slice semantics are CPython-exact (verified against python3 on a 5,700+-case oracle); builtin runtime errors are catchable by their Python exception type; emitted Rust is rustfmt-formatted and deterministic. There are **no known cases where an accepted program produces wrong output** — every such bug found by this release's adversarial reviews was fixed or is honestly rejected at `check`.
 
 pyrst is **not** a Python-compatible subset or a Python runtime — it's its own statically typed language with Python-flavored syntax.
 
@@ -104,7 +104,7 @@ Both `import math; math.sqrt(x)` and `from math import sqrt` forms work, includi
 
 By design (see [SPEC.md](SPEC.md) / [PYTHON_COMPATIBILITY.md](PYTHON_COMPATIBILITY.md)): not Python-compatible; multiple inheritance, metaclasses, dynamic attribute access, `eval`/`exec`, and shared-mutable aliasing (`Rc`/`RefCell`) are out.
 
-Current v0.1.2 gaps (tracked, with workarounds):
+Current v0.1.3 gaps (tracked, with workarounds):
 - **Generators (`yield`) are lazy**, but a few shapes are deferred: `Iterator[T]` as a *parameter* type, generator **methods** (`yield` in a class method), `yield` inside `try`/`except`/`finally`, nested generator `def`s, generator expressions (`(x for x in ...)`), and explicit `next(g)`. Every non-lazy consumption (`len`/`gen[i]`/slicing/`reversed`/`str`/binops/`x in gen`/passing a generator where `list[T]` is required) is an honest `pyrst check` error suggesting `list(gen)` to materialize — see [PYTHON_COMPATIBILITY.md](PYTHON_COMPATIBILITY.md#generators-yield).
 - **Generic classes** can't be instantiated via a *qualified* name (`collections.deque[int]()`); use a flat import (`from collections import deque; d: deque[int] = deque()`).
 - **Generic methods inside a class** (`def m[U](self)`) are not yet supported (top-level generic functions are).

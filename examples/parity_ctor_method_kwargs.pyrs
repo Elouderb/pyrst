@@ -1,0 +1,80 @@
+# parity_ctor_method_kwargs.pyrs — dual-run CPython parity golden for the W1.5
+# review fix round, items B (constructor kwargs bind __init__ PARAMETERS) and C
+# (method kwargs / default-fill route through the same Optional-wrap / Callable
+# cast as the free-function path).
+#
+# Every shape is executed BOTH by pyrst and, unmodified, by real python3 (the
+# harness prepends `from __future__ import annotations`); a byte mismatch fails
+# the suite.
+#
+# Item B coverage:
+#   - a class whose __init__ PARAMETER names (a, b) differ from its FIELD names
+#     (x, y): `Renamed(a=1, b=2)` binds the __init__ params exactly like CPython
+#     (previously a check-pass / build-fail split — see the negatives
+#     fail_ctor_kwargs_{unknown,dup,missing} for the honest check errors);
+#   - a @dataclass constructed with a POSITIONAL arg MIXED with a keyword arg
+#     (`Point(1, y=2)`): the positional used to be silently dropped;
+#   - out-of-order keyword construction (`Point(y=20, x=10)`).
+# Item C coverage:
+#   - a method with an `Optional[int] = None` default filled at the call site;
+#   - a lambda passed into a method's `Optional[Callable]` slot (needs the
+#     Rc<dyn Fn> cast BEFORE the Some-wrap — the method path used to emit a bare
+#     `emit_consuming`, dropping both).
+from dataclasses import dataclass
+
+
+class Renamed:
+    x: int
+    y: int
+
+    def __init__(self, a: int, b: int) -> None:
+        self.x = a
+        self.y = b
+
+
+@dataclass
+class Point:
+    x: int
+    y: int
+
+
+class Widget:
+    base: int
+
+    def __init__(self, base: int) -> None:
+        self.base = base
+
+    def scale(self, factor: int, offset: Optional[int] = None) -> int:
+        if offset is not None:
+            return self.base * factor + offset
+        return self.base * factor
+
+    def apply(self, x: int, f: Optional[Callable[[int], int]] = None) -> int:
+        if f is not None:
+            return f(x)
+        return x
+
+
+def main() -> None:
+    # item B: __init__ param-name kwargs (fields x/y, params a/b)
+    r: Renamed = Renamed(a=1, b=2)
+    print(r.x)
+    print(r.y)
+    r2: Renamed = Renamed(b=20, a=10)
+    print(r2.x)
+    print(r2.y)
+    # item B: @dataclass positional + keyword mix, and out-of-order keywords
+    p: Point = Point(1, y=2)
+    print(p.x)
+    print(p.y)
+    q: Point = Point(y=20, x=10)
+    print(q.x)
+    print(q.y)
+    # item C: method Optional[int]=None default (call-site fill + keyword)
+    w: Widget = Widget(10)
+    print(w.scale(2))
+    print(w.scale(2, offset=5))
+    print(w.scale(factor=3))
+    # item C: lambda into a method Optional[Callable] slot
+    print(w.apply(5))
+    print(w.apply(5, f=lambda v: v * 2))

@@ -1,0 +1,33 @@
+# (W1.5, card f21369d7) Constructor KEYWORD arguments on a GENERIC class work
+# like they do on plain classes: `Box(item=5)` infers T=int through the
+# keyword slot (previously a misleading "`Box.__init__` takes 1 argument(s)
+# but 0 were given" — the ctor kwargs never reached the __init__ unifier),
+# and mixed positional+keyword ctor calls bind per-slot. python3-diffed
+# (output byte-identical under both runtimes during the W1.5 pass).
+class Box[T]:
+    item: T
+
+    def __init__(self, item: T) -> None:
+        self.item = item
+
+
+class Pair[A, B]:
+    a: A
+    b: B
+
+    def __init__(self, a: A, b: B) -> None:
+        self.a = a
+        self.b = b
+
+
+def main() -> None:
+    b: Box[int] = Box(item=5)
+    print(b.item)
+    s: Box[str] = Box(item="hi")
+    print(s.item)
+    p: Pair[int, str] = Pair(1, b="x")
+    print(p.a)
+    print(p.b)
+    q: Pair[str, int] = Pair(b=2, a="y")
+    print(q.a)
+    print(q.b)

@@ -1,0 +1,84 @@
+# parity_kwargs.pyrs — dual-run CPython parity golden for the kwargs v1
+# keyword→positional mapping (card 8a7b7714, landed in the W1.5 pass).
+#
+# This file is executed BOTH by the pyrst binary and, unmodified (harness
+# prepends `from __future__ import annotations`), by real python3 — so every
+# keyword-call shape here is oracle-checked byte-for-byte against CPython.
+#
+# Coverage:
+#   - flat user functions: keyword binding, out-of-order keywords, defaults,
+#     keyword-only spelling of a required param;
+#   - CPython call-site evaluation order: keyword VALUES evaluate left-to-right
+#     in SOURCE order even when their parameter slots invert;
+#   - generic functions: a type parameter bound through a keyword slot;
+#   - user methods: call-site default fill (`g.greet()`) + keyword binding;
+#   - stdlib CPython keyword signatures — including textwrap options that are
+#     KEYWORD-ONLY in real CPython (`initial_indent=`, `placeholder=`), which
+#     were unrepresentable in a dual-run file before the mapping landed.
+import textwrap
+import statistics
+import bisect
+import heapq
+
+
+def greet(name: str, sep: str = "-", times: int = 1) -> str:
+    return name + sep + str(times)
+
+
+def combine(a: int, b: int, c: int) -> int:
+    return a * 100 + b * 10 + c
+
+
+def side(x: int) -> int:
+    print("eval " + str(x))
+    return x
+
+
+def rep[T](x: T, times: int = 2) -> list[T]:
+    out: list[T] = []
+    i: int = 0
+    while i < times:
+        out.append(x)
+        i = i + 1
+    return out
+
+
+class Greeter:
+    name: str
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    def greet(self, times: int = 2, sep: str = "*") -> str:
+        return self.name + sep + str(times)
+
+
+def main() -> None:
+    # ── flat user function: keyword binding / order / defaults ───────────────
+    print(greet("a", times=3))
+    print(greet("a", sep="*", times=2))
+    print(greet("a", times=2, sep="*"))
+    print(greet(name="n"))
+    # ── CPython left-to-right call-site evaluation: `c=` is written before
+    # `b=`, so side(3) prints before side(2) even though slot order inverts ──
+    print(combine(1, c=side(3), b=side(2)))
+    # ── generic function: T bound through a keyword slot ─────────────────────
+    print(rep("x", times=3))
+    print(rep(x=7))
+    # ── methods: call-site default fill + keyword binding ────────────────────
+    g: Greeter = Greeter("hi")
+    print(g.greet())
+    print(g.greet(times=3))
+    print(g.greet(sep="+", times=5))
+    # ── stdlib keyword signatures (kw-only in real CPython for textwrap) ─────
+    print(textwrap.fill("the quick brown fox jumps over the lazy dog", width=15))
+    print(textwrap.fill("indent me please now", width=12, initial_indent="> ", subsequent_indent=".."))
+    print(textwrap.shorten("hello world how are you", 15, placeholder="..."))
+    print(statistics.quantiles([1.0, 2.0, 3.0, 4.0], n=2))
+    print(statistics.quantiles([1.0, 2.0, 3.0, 4.0], n=4, method="inclusive"))
+    xs: list[int] = [1, 3, 5, 7]
+    print(bisect.bisect_left(xs, 4, lo=0, hi=4))
+    bisect.insort(xs, 4, lo=0)
+    print(xs)
+    print(heapq.nlargest(2, iterable=[5, 1, 9, 3]))
+    print(heapq.nsmallest(n=2, iterable=[5, 1, 9, 3]))

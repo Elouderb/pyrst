@@ -1,0 +1,12 @@
+# (kwargs v1, card 8a7b7714) A keyword argument whose parameter slot is ALREADY
+# filled — here `text` is bound positionally by "hi" AND by keyword — is a
+# CHECK-time error: "`wrap` got multiple values for argument `text`", matching
+# CPython's TypeError for the same call shape.
+# This file must be rejected by BOTH `pyrst check` and `pyrst build`.
+def wrap(text: str, width: int = 70) -> str:
+    return text + str(width)
+
+
+def main() -> None:
+    # ERROR: `text` is given both positionally and by keyword.
+    print(wrap("hi", text="bye"))

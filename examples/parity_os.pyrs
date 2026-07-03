@@ -128,6 +128,14 @@ def main() -> None:
     write_file(uni_path, "data")
     print(isfile(uni_path))
     print(basename(uni_path))
+
+    # --- W1.5: basename/dirname posixpath STRING-logic edge matrix (every
+    # line python3-verified against os.path.basename/dirname; the flat
+    # os.basename spelling itself is the G3 divergence keeping this file
+    # pyrst-only). ---
+    edges: list[str] = ["a/b/c", "a/b/", "/", "", ".", "..", "a", "a//b", "//x", "trailing/", "/abs/path", "a/.", "///", "x/.."]
+    for ep in edges:
+        print(basename(ep) + "|" + dirname(ep))
     uni_st = stat(uni_path)
     print(uni_st.st_size)
     remove(uni_path)

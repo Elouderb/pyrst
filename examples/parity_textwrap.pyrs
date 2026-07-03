@@ -6,24 +6,17 @@
 # REAL CPython textwrap module, so this is a genuine oracle comparison, not
 # a self-check.
 #
-# Scope: the part of the upgraded surface that is positionally compatible
-# with CPython's actual signatures (`wrap(text, width=70, **kwargs)`,
-# `fill(text, width=70, **kwargs)`, `shorten(text, width, **kwargs)`,
-# `indent(text, prefix, predicate=None)`, `dedent(text)`). CPython's `wrap`/
-# `fill`/`shorten` only accept `text`/`width` positionally — every other
-# option (`initial_indent`, `subsequent_indent`, `break_long_words`,
-# `placeholder`, ...) is keyword-only in real CPython. This build's codegen
-# only threads named keyword-call bindings correctly into class
-# constructors (a plain/cross-module keyword call either hard-errors or
-# silently substitutes the parameter's default — see lib/textwrap.pyrs
-# header), so a single shared source cannot pass those options identically
-# to both engines. Those options are therefore verified pyrst-side only,
-# in examples/stdlib_textwrap.pyrs (checked by hand against python3
-# one-off snippets during development — see notes), not in this dual-run
-# file.
+# Scope (widened twice): originally only the positionally-compatible slice of
+# the surface; since kwargs v1 (W1.5) the KEYWORD-ONLY CPython options
+# (`initial_indent=`, `subsequent_indent=`, `break_long_words=`,
+# `placeholder=`) run here too, same source under both engines. The W1.5
+# section at the bottom also locks the DEFAULT TextWrapper pipeline
+# (expand_tabs at real 8-column tab stops, replace_whitespace,
+# drop_whitespace incl. the leading-run-on-line-0 rule) against real
+# python3 across tab/newline/mixed-whitespace inputs.
 #
-# This file DOES verify, byte-for-byte against real CPython, the biggest
-# behavioral upgrade: `shorten`'s default placeholder is now `" [...]"`
+# This file also verifies, byte-for-byte against real CPython, the W1
+# behavioral upgrade: `shorten`'s default placeholder is `" [...]"`
 # (CPython's actual default), replacing the v1 module's fixed `" ..."`.
 import textwrap
 from textwrap import shorten
@@ -62,3 +55,27 @@ def main() -> None:
     print(textwrap.dedent("\t\tx\n\t\ty"))
     print(textwrap.indent("", "> "))
     print(textwrap.indent("a\n\nb", "> "))
+
+    # --- W1.5: the DEFAULT TextWrapper pipeline (expand_tabs=True at 8-col
+    # tab stops, replace_whitespace=True over \t\n\x0b\x0c\r, and
+    # drop_whitespace=True incl. the leading-run-on-line-0 rule) — every line
+    # here runs byte-identical under real python3 textwrap. ---
+    print(textwrap.wrap("the quick\tbrown fox\njumps  over   the lazy dog", 12))
+    print(textwrap.wrap("   leading and trailing   ", 10))
+    print(textwrap.wrap("a  b   c    d", 5))
+    print(textwrap.wrap("tab\there and\tthere", 10))
+    print(textwrap.fill("fill\tthis  text\nnow", 8))
+    print(textwrap.wrap("col0\tstop col8\tstop", 24))
+
+    # --- W1.5 (kwargs v1): CPython's keyword-only options, same source both
+    # runtimes. ---
+    print(textwrap.wrap(sentence, width=15, initial_indent="* ", subsequent_indent="  "))
+    print(textwrap.fill(sentence, width=20, initial_indent="> "))
+    print(textwrap.wrap("nobreak supercalifragilistic", 6, break_long_words=False))
+    print(shorten("hello superlongwordhere", 12, placeholder="..."))
+
+    # --- W1.5: shorten's eager placeholder guard (CPython message). ---
+    try:
+        print(textwrap.shorten("a", 3))
+    except ValueError as e:
+        print(e)

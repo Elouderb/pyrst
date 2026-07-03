@@ -5,10 +5,12 @@
 # for T (int from `f` vs str from `xs`) — a type error that pyrst must catch
 # at the typecheck level ("conflicting types for type parameter `T`").
 #
-# (This fixture previously passed a str as the INIT accumulator; with the
-# stdlib-fidelity wave's generic signature, `init: Optional[T]` does not yet
-# participate in typeck unification — a known compiler gap — so the mismatch
-# is staged on the `f` vs `xs` params instead, which unification does check.)
+# (This fixture stages the conflict on the `f` vs `xs` parameters — the
+# canonical unification shape. NOTE (W1.5): the `init: Optional[T]` unification
+# gap that earlier versions of this comment described is now CLOSED — card
+# 6e6b33ab taught `unify_typevar` to unify a bare actual against an
+# `Optional[T]` inner, so an init-accumulator mismatch is ALSO caught at check;
+# that shape is locked separately by `fail_optional_generic_mismatch.pyrs`.)
 
 from functools import reduce
 from operator import add

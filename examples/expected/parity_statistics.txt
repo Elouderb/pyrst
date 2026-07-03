@@ -35,3 +35,24 @@
 2.0
 [0.25, 1.375, 2.5]
 [2.0, 3.0, 7.0]
+[0.8, 1.6, 2.0, 2.2, 3.0, 3.8, 5.8, 7.8, 9.4]
+[2.0, 3.0, 5.5]
+4.525
+mean requires at least one data point
+fmean requires at least one data point
+data and weights must be the same length
+no median for empty data
+no mode for empty data
+[]
+variance requires at least two data points
+stdev requires at least two data points
+pvariance requires at least one data point
+pstdev requires at least one data point
+geometric mean requires a non-empty dataset containing positive numbers
+geometric mean requires a non-empty dataset containing positive numbers
+must have at least two data points
+n must be at least 1
+Unknown method: 'nope'
+sum of weights must be non-zero
+sum of weights must be non-zero
+sum of weights must be non-zero

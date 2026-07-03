@@ -1,6 +1,9 @@
 # pyrst standard library — itertools (LAZY, W1 fidelity upgrade)
 #
-# Fidelity score: 4/5 (was 2/5, EAGER-only-5-fns).
+# Fidelity score: 4/5 (was 2/5 EAGER-only; W1.5 closed accumulate to the
+# full CPython form and made every defaulted param keyword-callable — the
+# remaining structural gaps are G4: n-ary chain/product, variadic starmap,
+# plus eager groupby/tee and the islice single-signature ambiguity).
 #
 # Pure-pyrst combinatoric / sequence helpers, embedded via `include_str!` (see
 # `src/stdlib.rs`) and removed from the resolver skip-list, so the import
@@ -44,11 +47,26 @@
 #   - `dropwhile(pred, xs)                -> Iterator[T]`
 #   - `starmap(f, pairs)                  -> Iterator[R]`     2-tuple only —
 #                                                              see divergence.
-#   - `accumulate(xs, f)                  -> Iterator[T]`     `f` is mandatory
-#                                                              — see divergence
-#                                                              (no default-sum
-#                                                              form, no
-#                                                              `initial=`).
+#   - `accumulate(xs, func=None, initial=None) -> Iterator[T]` (W1.5) FULL
+#                                                              CPython form:
+#                                                              default-sum via
+#                                                              `+` when func is
+#                                                              None, initial=
+#                                                              yields the seed
+#                                                              first (len+1
+#                                                              yields); keyword-
+#                                                              callable. EDGE:
+#                                                              the default-sum
+#                                                              over `str`
+#                                                              elements fails
+#                                                              at BUILD (Rust
+#                                                              String lacks
+#                                                              Add<String> for
+#                                                              the inferred
+#                                                              generic bound) —
+#                                                              loud, documented;
+#                                                              pass func= for
+#                                                              str folds.
 #   - `zip_longest(a, b, fillvalue)        -> Iterator[tuple[T, T]]` same
 #                                                              element type on
 #                                                              both sides,
@@ -84,19 +102,16 @@
 #     `list(...)` cutoff — chaining INFINITE generators through another
 #     generator is out of reach without Iterator-typed params. Consume
 #     infinite generators only via a `for` loop with an explicit `break`.
-#   - `accumulate[T]` remains GENERIC over the element type via a mandatory
-#     `Callable[[T, T], T]` fold, as before (monomorphized against the
-#     concrete `xs: list[T]` argument). We ATTEMPTED to add CPython's
-#     `func=None` (defaulting to `+`) and `initial=None` forms; both hit a
-#     genuine compiler codegen bug (verified with probes p3-p6 in
-#     `scratchpad/probes/`): reassigning a generic-`T` local via the generic
-#     `+` operator inside a loop body trips the block-scoped-shadow
-#     "reassigned to an incompatible type" invariant check (it misreads the
-#     monomorphized concrete type, e.g. `int`, as incompatible with the
-#     declared `T`), even though the reassignment is type-consistent. This is
-#     a compiler defect, not a language-design gap; documented here as
-#     deferred pending a compiler fix (not this card's scope — no compiler
-#     edits were made). `func` stays mandatory.
+#   - (W1.5) `accumulate[T]` now ships CPython's `func=None` (default `+`)
+#     and `initial=` forms — the W1 blocker (the inference oracle typed a
+#     generic `T + T` as `int`, tripping the block-shadow divergence check)
+#     was FIXED compiler-side in this pass (card 71cbd940: TypeVar-preserving
+#     arithmetic inference + a borrowing Optional-narrowing unwrap +
+#     `Rc<dyn Fn>`-cast for lambdas into `Optional[Callable]` slots). The
+#     `initial=` branch births `acc` from a single-assignment `seed: T`
+#     binding (the hoist prescan types locals from their INITIALIZER, so
+#     `acc: T = initial` would still carry `T | None` into the divergence
+#     check — documented residue of the same card).
 #   - `starmap[T, R]` requires the fold callable to be bound to a
 #     type-annotated local (`f: Callable[[T, T], R] = lambda ...`) before the
 #     call when `R` is not independently inferable from a `list[T]` argument
@@ -173,8 +188,8 @@
 #
 # Divergences / deferrals summary (CPython parity gaps that remain):
 #   - `chain`/`product`: n-ary form deferred (G4 — `*args`).
-#   - `accumulate`: `func=None` default-sum and `initial=` deferred (compiler
-#     codegen bug in generic-`T` `+`-reassignment inside a loop; see above).
+#   - `accumulate`: FULL CPython form since W1.5 (see above); only the
+#     default-sum-over-`str` build-time bound edge remains.
 #   - `starmap`: variadic tuple width deferred (G4 — `*args`); 2-tuple only.
 #   - `zip_longest`: homogeneous-type-only, `fillvalue` mandatory (no
 #     `Optional`-widening trick that stays simple).
@@ -265,16 +280,45 @@ def starmap[T, R](f: Callable[[T, T], R], pairs: list[tuple[T, T]]) -> Iterator[
         yield f(a, b)
 
 
-def accumulate[T](xs: list[T], f: Callable[[T, T], T]) -> Iterator[T]:
-    if len(xs) == 0:
-        return
-    acc: T = xs[0]
-    yield acc
-    i: int = 1
-    while i < len(xs):
-        acc = f(acc, xs[i])
+def accumulate[T](xs: list[T], func: Optional[Callable[[T, T], T]] = None, initial: Optional[T] = None) -> Iterator[T]:
+    # (W1.5, unlocked by card 71cbd940's compiler fixes) CPython's FULL form:
+    # `func=None` defaults to `+` (running sum), `initial=` prepends a seed
+    # value (yielded first, then folded through — len(xs)+1 yields). The two
+    # fold loops are deliberately duplicated: `acc` must be BORN inside the
+    # narrowing branch for the initial= case (a fresh `acc: T = initial`
+    # binding — reassigning an outer acc to the narrowed Optional is a
+    # check-time divergence error), and generators cannot share the loop via
+    # a helper without materializing.
+    n: int = len(xs)
+    if initial is not None:
+        # `seed` is a single-assignment narrowing binding; `acc` is then BORN
+        # from a plainly-T initializer — the hoist prescan types a local from
+        # its INITIALIZER (`acc: T = initial` would carry T | None into the
+        # divergence check and trip it; see card 71cbd940).
+        seed: T = initial
+        acc: T = seed
         yield acc
-        i = i + 1
+        i: int = 0
+        while i < n:
+            if func is None:
+                acc = acc + xs[i]
+            else:
+                acc = func(acc, xs[i])
+            yield acc
+            i = i + 1
+        return
+    if n == 0:
+        return
+    acc2: T = xs[0]
+    yield acc2
+    j: int = 1
+    while j < n:
+        if func is None:
+            acc2 = acc2 + xs[j]
+        else:
+            acc2 = func(acc2, xs[j])
+        yield acc2
+        j = j + 1
 
 
 def zip_longest[T](a: list[T], b: list[T], fillvalue: T) -> Iterator[tuple[T, T]]:

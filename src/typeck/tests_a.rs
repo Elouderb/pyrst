@@ -1802,7 +1802,6 @@ use super::test_support::*;
     fn byref_arg_constructor_temporary_is_rejected() {
         // A constructor/call result is equally a temporary, not a place.
         let ctx = ctx_with_byref_fn("touch", "slot", Ty::Int);
-        let mut env = make_env(&ctx);
         // `helper()` returns Unknown; the place-check fires BEFORE arg-type
         // compatibility, so the diagnostic is the by-reference one.
         let temp = call_fn("helper", vec![]);
@@ -1943,10 +1942,11 @@ use super::test_support::*;
     // Uniform check-time kwargs gate (card d8a1ed83)
     // =========================================================================
 
-    /// A keyword argument on a FLAT free-function call is an honest check-time
-    /// error (previously a check hole that only failed at codegen).
+    /// (kwargs v1, card 8a7b7714) A keyword argument on a FLAT free-function
+    /// call now MAPS to its parameter slot at check time (it was the honesty-
+    /// stopgap rejection before the mapping landed).
     #[test]
-    fn kwargs_gate_rejects_flat_function_call() {
+    fn kwargs_map_accepts_flat_function_call() {
         let src = "\
 def wrap(text: str, width: int) -> str:
     return text
@@ -1954,18 +1954,41 @@ def wrap(text: str, width: int) -> str:
 def main() -> None:
     print(wrap(\"hi\", width=10))
 ";
-        let err = check_src(src).expect_err("flat-fn kwarg must be rejected");
-        let msg = format!("{:?}", err);
         assert!(
-            msg.contains("keyword arguments are not supported here"),
-            "expected the kwargs-gate message, got: {msg}"
+            check_src(src).is_ok(),
+            "a mappable keyword argument on a flat function must pass check"
         );
     }
 
-    /// A keyword argument on a USER METHOD call is rejected at check time
-    /// (previously silently dropped, leaking a rustc E0061 at build).
+    /// (kwargs v1) The three mapping errors are check-time and CPython-shaped:
+    /// unknown keyword, duplicate binding, missing required parameter.
     #[test]
-    fn kwargs_gate_rejects_user_method_call() {
+    fn kwargs_map_rejects_unknown_duplicate_missing() {
+        let base = "\
+def wrap(text: str, width: int = 70) -> str:
+    return text
+
+def main() -> None:
+    print(wrap(CALL))
+";
+        let unknown = base.replace("CALL", "\"hi\", bogus=10");
+        let msg = format!("{:?}", check_src(&unknown).expect_err("unknown kwarg"));
+        assert!(msg.contains("unexpected keyword argument `bogus`"), "got: {msg}");
+
+        let duplicate = base.replace("CALL", "\"hi\", text=\"bye\"");
+        let msg = format!("{:?}", check_src(&duplicate).expect_err("duplicate kwarg"));
+        assert!(msg.contains("got multiple values for argument `text`"), "got: {msg}");
+
+        let missing = base.replace("CALL", "width=10");
+        let msg = format!("{:?}", check_src(&missing).expect_err("missing required"));
+        assert!(msg.contains("missing a required argument: `text`"), "got: {msg}");
+    }
+
+    /// (kwargs v1) A keyword argument on a USER METHOD call maps too
+    /// (previously rejected by the stopgap gate); an unknown keyword on the
+    /// method is still a check-time error.
+    #[test]
+    fn kwargs_map_accepts_user_method_call() {
         let src = "\
 class Greeter:
     name: str
@@ -1979,9 +2002,24 @@ def main() -> None:
     print(g.greet(times=3))
 ";
         assert!(
-            check_src(src).is_err(),
-            "a keyword argument on a user method must be rejected at check time"
+            check_src(src).is_ok(),
+            "a mappable keyword argument on a user method must pass check"
         );
+        let bad = src.replace("times=3", "bogus=3");
+        let msg = format!("{:?}", check_src(&bad).expect_err("unknown method kwarg"));
+        assert!(msg.contains("unexpected keyword argument `bogus`"), "got: {msg}");
+    }
+
+    /// (kwargs v1) Builtin stubs stay positional-only — CPython's builtins
+    /// reject keyword arguments (`abs(x=5)` is a TypeError there too).
+    #[test]
+    fn kwargs_map_keeps_builtins_positional_only() {
+        let src = "\
+def main() -> None:
+    print(abs(x=5))
+";
+        let msg = format!("{:?}", check_src(src).expect_err("builtin kwarg"));
+        assert!(msg.contains("takes no keyword arguments"), "got: {msg}");
     }
 
     /// An UNKNOWN keyword on a modeled builtin (`list.sort(bogus=1)`) is now a
@@ -2032,4 +2070,66 @@ def main() -> None:
             check_src(builtins).is_ok(),
             "sorted(reverse=)/list.sort(reverse=)/max(key=) must pass"
         );
+    }
+
+    /// (W1.5 fix B) Constructor keyword arguments bind the __init__ PARAMETERS,
+    /// not the field names. A class whose __init__ params (a, b) differ from its
+    /// fields (x, y) accepts `C(a=1, b=2)` and rejects a FIELD-name keyword
+    /// (`C(x=1)`) at CHECK time, naming `<Class>.__init__` — closing the old
+    /// check-pass / build-fail split.
+    #[test]
+    fn ctor_kwargs_bind_init_params() {
+        let src = "\
+class Renamed:
+    x: int
+    y: int
+    def __init__(self, a: int, b: int) -> None:
+        self.x = a
+        self.y = b
+
+def main() -> None:
+    r: Renamed = Renamed(a=1, b=2)
+    print(r.x)
+";
+        assert!(
+            check_src(src).is_ok(),
+            "constructor kwargs must bind __init__ params (a, b), not fields"
+        );
+        let bad = src.replace("Renamed(a=1, b=2)", "Renamed(x=1, y=2)");
+        let msg = format!("{:?}", check_src(&bad).expect_err("field-name ctor kwarg"));
+        assert!(
+            msg.contains("`Renamed.__init__` got an unexpected keyword argument `x`"),
+            "got: {msg}"
+        );
+    }
+
+    /// (W1.5 fix B) A class WITHOUT __init__ is a struct-literal whose fields are
+    /// matched via a synthesized field-order signature: a duplicate (positional +
+    /// keyword) binding, a missing required field, and an unknown keyword are all
+    /// honest CHECK-time errors (the positional was previously SILENTLY dropped).
+    #[test]
+    fn ctor_kwargs_no_init_reject_dup_missing_unknown() {
+        let base = "\
+class Point:
+    x: int
+    y: int
+
+def main() -> None:
+    p: Point = Point(CALL)
+    print(p.x)
+";
+        let ok = base.replace("CALL", "1, y=2");
+        assert!(check_src(&ok).is_ok(), "positional+keyword mix must pass");
+
+        let dup = base.replace("CALL", "1, x=2");
+        let msg = format!("{:?}", check_src(&dup).expect_err("dup field binding"));
+        assert!(msg.contains("got multiple values for argument `x`"), "got: {msg}");
+
+        let missing = base.replace("CALL", "1");
+        let msg = format!("{:?}", check_src(&missing).expect_err("missing field"));
+        assert!(msg.contains("missing a required argument: `y`"), "got: {msg}");
+
+        let unknown = base.replace("CALL", "bogus=1");
+        let msg = format!("{:?}", check_src(&unknown).expect_err("unknown field kwarg"));
+        assert!(msg.contains("got an unexpected keyword argument `bogus`"), "got: {msg}");
     }

@@ -4,7 +4,9 @@
 # `include_str!` (see `src/stdlib.rs`). Usable as either
 # `from statistics import mean` or `import statistics; statistics.mean(xs)`.
 #
-# Fidelity: 4/5 (CPython `statistics` module).
+# Fidelity: 4.5/5 (CPython `statistics` module; W1.5 divergence-closing pass —
+# degenerate-input guards + keyword calls landed; the remaining gap is the
+# StatisticsError TYPE name, see below).
 #
 # Implemented surface (float-specialized; pyrst generics for a numeric
 # `Real`-like bound are a later card, matching the design row):
@@ -20,26 +22,26 @@
 #   - `variance`/`stdev` used to be population-only in a previous revision;
 #     they are now CPython-accurate SAMPLE forms (N-1). The population forms
 #     live under their CPython names `pvariance`/`pstdev`.
-#   - `quantiles`' `n` and `method` are ordinary keyword-defaultable params,
-#     not Python's keyword-*only* (`*,`) params — pyrst has no bare `*`
-#     separator, so callers may pass them positionally in pyrst
-#     (`quantiles(data, 10, "inclusive")`) where CPython requires
-#     `quantiles(data, n=10, method="inclusive")`. Additionally, pyrst v0
-#     does not support `name=value` keyword syntax at a plain-function call
-#     site at all (only for class constructors), so the two languages can
-#     never be driven with the *same* source line once `n`/`method` are
-#     overridden. Verified equal by hand with a positional pyrst call vs.
-#     a keyword CPython call on identical data (see notes.md); the shared
-#     dual-run parity file therefore only exercises the default
-#     `n=4, method="exclusive"` path (a bare `quantiles(data)` call, which
-#     is valid and behaves identically in both languages).
-#   - CPython raises `StatisticsError` (a `ValueError` subclass) on empty
-#     input, one-element `variance`/`stdev`, a mixed-sign/zero
-#     `geometric_mean`, etc. pyrst has no `StatisticsError` type yet, so
-#     these edge cases are DEFERRED: pyrst instead produces `inf`/`nan`/a
-#     runtime division-by-zero rather than a typed exception. Documented
-#     here; parity tests avoid empty/degenerate inputs so behavior stays
-#     identical to CPython on the covered surface.
+#   - (W1.5, kwargs v1) `quantiles(data, n=10, method="inclusive")` keyword
+#     calls now work — the SAME source line runs under both languages (the
+#     dual-run parity file exercises them; see examples/parity_kwargs.pyrs
+#     and parity_statistics.pyrs). pyrst additionally accepts the params
+#     positionally (no keyword-ONLY `*` marker — documented superset).
+#   - (W1.5) DEGENERATE INPUTS now raise with CPython's exact MESSAGE text:
+#     mean/fmean ("<fn> requires at least one data point"), fmean weights
+#     mismatch ("data and weights must be the same length"), median family
+#     ("no median for empty data"), mode ("no mode for empty data"),
+#     variance/stdev ("<fn> requires at least two data points"),
+#     pvariance/pstdev ("<fn> requires at least one data point"),
+#     geometric_mean ("geometric mean requires a non-empty dataset
+#     containing positive numbers" — empty OR any x <= 0), quantiles
+#     ("n must be at least 1" / "must have at least two data points" /
+#     "Unknown method: '<m>'"). TYPE-NAME DIVERGENCE (honest, remaining):
+#     CPython raises StatisticsError (a ValueError subclass) for all but the
+#     quantiles unknown-method case; pyrst has no StatisticsError class, so
+#     these raise the closest builtin — ValueError — with the identical
+#     message. `except ValueError` catches BOTH runtimes' errors (CPython's
+#     StatisticsError IS a ValueError), so dual-run error paths still match.
 #   - `mode`/`multimode` here operate on `list[float]` only (CPython's
 #     versions are polymorphic over any hashable). Tie-breaking matches
 #     CPython: the first value encountered (in input order) among those
@@ -65,12 +67,20 @@ def _statistics_sqrt(x: float) -> float:
 
 
 def mean(xs: list[float]) -> float:
+    # (W1.5) CPython StatisticsError message, raised as ValueError (pyrst has
+    # no StatisticsError class — type-name divergence documented in header).
+    if len(xs) == 0:
+        raise ValueError("mean requires at least one data point")
     return sum(xs) / len(xs)
 
 
 def fmean(xs: list[float], weights: list[float] | None = None) -> float:
     if weights is not None:
         ws: list[float] = weights
+        # (W1.5) CPython's message for a length mismatch (covers the empty-
+        # data-with-weights case too, exactly like CPython).
+        if len(ws) != len(xs):
+            raise ValueError("data and weights must be the same length")
         total: float = 0.0
         wtotal: float = 0.0
         i: int = 0
@@ -79,11 +89,23 @@ def fmean(xs: list[float], weights: list[float] | None = None) -> float:
             total = total + x * w
             wtotal = wtotal + w
             i = i + 1
+        # (W1.5 fix F1) A zero weight sum — empty weights, all-zero weights, or
+        # weights that offset to zero — used to divide by zero SILENTLY (nan/inf).
+        # CPython raises StatisticsError("sum of weights must be non-zero"); pyrst
+        # raises it as ValueError (no StatisticsError class — see header; it is a
+        # ValueError subclass, so `except ValueError` + print(e) dual-runs).
+        if wtotal == 0.0:
+            raise ValueError("sum of weights must be non-zero")
         return total / wtotal
+    if len(xs) == 0:
+        raise ValueError("fmean requires at least one data point")
     return sum(xs) / len(xs)
 
 
 def median(xs: list[float]) -> float:
+    # (W1.5) CPython StatisticsError message (as ValueError, see header).
+    if len(xs) == 0:
+        raise ValueError("no median for empty data")
     ordered: list[float] = sorted(xs)
     n: int = len(ordered)
     if n % 2 == 0:
@@ -92,6 +114,8 @@ def median(xs: list[float]) -> float:
 
 
 def median_low(xs: list[float]) -> float:
+    if len(xs) == 0:
+        raise ValueError("no median for empty data")
     ordered: list[float] = sorted(xs)
     n: int = len(ordered)
     if n % 2 == 0:
@@ -100,6 +124,8 @@ def median_low(xs: list[float]) -> float:
 
 
 def median_high(xs: list[float]) -> float:
+    if len(xs) == 0:
+        raise ValueError("no median for empty data")
     ordered: list[float] = sorted(xs)
     n: int = len(ordered)
     return ordered[n // 2]
@@ -124,6 +150,10 @@ def _statistics_counts(xs: list[float]) -> tuple[list[float], list[int]]:
 
 
 def mode(xs: list[float]) -> float:
+    # (W1.5) CPython StatisticsError message (as ValueError, see header);
+    # previously an unguarded counts[0] panic.
+    if len(xs) == 0:
+        raise ValueError("no mode for empty data")
     values, counts = _statistics_counts(xs)
     best_i: int = 0
     best_c: int = counts[0]
@@ -154,6 +184,10 @@ def multimode(xs: list[float]) -> list[float]:
 
 
 def variance(xs: list[float], xbar: float | None = None) -> float:
+    # (W1.5) CPython StatisticsError message (as ValueError, see header);
+    # previously len==1 divided by zero (inf) and len==0 panicked.
+    if len(xs) < 2:
+        raise ValueError("variance requires at least two data points")
     m: float = mean(xs)
     if xbar is not None:
         v: float = xbar
@@ -165,10 +199,16 @@ def variance(xs: list[float], xbar: float | None = None) -> float:
 
 
 def stdev(xs: list[float], xbar: float | None = None) -> float:
+    # (W1.5) CPython raises stdev's OWN message, not variance's.
+    if len(xs) < 2:
+        raise ValueError("stdev requires at least two data points")
     return _statistics_sqrt(variance(xs, xbar))
 
 
 def pvariance(xs: list[float], mu: float | None = None) -> float:
+    # (W1.5) CPython StatisticsError message (as ValueError, see header).
+    if len(xs) == 0:
+        raise ValueError("pvariance requires at least one data point")
     m: float = mean(xs)
     if mu is not None:
         v: float = mu
@@ -180,12 +220,22 @@ def pvariance(xs: list[float], mu: float | None = None) -> float:
 
 
 def pstdev(xs: list[float], mu: float | None = None) -> float:
+    # (W1.5) CPython raises pstdev's OWN message, not pvariance's.
+    if len(xs) == 0:
+        raise ValueError("pstdev requires at least one data point")
     return _statistics_sqrt(pvariance(xs, mu))
 
 
 def geometric_mean(xs: list[float]) -> float:
+    # (W1.5) CPython 3.12's message for empty data OR any non-positive value
+    # (as ValueError, see header); previously ln(<=0) silently produced
+    # nan/-inf.
+    if len(xs) == 0:
+        raise ValueError("geometric mean requires a non-empty dataset containing positive numbers")
     total: float = 0.0
     for x in xs:
+        if x <= 0.0:
+            raise ValueError("geometric mean requires a non-empty dataset containing positive numbers")
         total = total + _statistics_ln(x)
     return _statistics_exp(total / len(xs))
 
@@ -204,6 +254,15 @@ def _statistics_exp(x: float) -> float:
 # interpolation arithmetic (integer `j`/`delta`, then one float division)
 # matches bit-for-bit rather than accumulating float rounding differently.
 def quantiles(xs: list[float], n: int = 4, method: str = "exclusive") -> list[float]:
+    # (W1.5) CPython's guards, message-exact: n < 1, fewer than two data
+    # points (StatisticsError-as-ValueError, see header), and the unknown-
+    # method ValueError (a real ValueError in CPython too).
+    if n < 1:
+        raise ValueError("n must be at least 1")
+    if len(xs) < 2:
+        raise ValueError("must have at least two data points")
+    if method != "exclusive" and method != "inclusive":
+        raise ValueError(f"Unknown method: '{method}'")
     ordered: list[float] = sorted(xs)
     ld: int = len(ordered)
     result: list[float] = []

@@ -1,0 +1,20 @@
+# (kwargs v1, card 8a7b7714) The keyword→positional mapping runs for USER
+# METHOD calls too (`g.greet(times=3)` is now valid) — and validates the
+# keyword names against the method's real signature, so an unknown keyword on a
+# method is a CHECK-time error: "`Greeter.greet` got an unexpected keyword
+# argument `bogus`".
+# This file must be rejected by BOTH `pyrst check` and `pyrst build`.
+class Greeter:
+    name: str
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    def greet(self, times: int = 1) -> str:
+        return self.name + str(times)
+
+
+def main() -> None:
+    g: Greeter = Greeter("hi")
+    # ERROR: `greet` has no parameter named `bogus`.
+    print(g.greet(bogus=3))

@@ -1,0 +1,20 @@
+# (W1.5 fix B) A constructor keyword argument binds an __init__ PARAMETER, not a
+# field. `Renamed`'s fields are x/y but its __init__ params are a/b, so `x` names
+# no __init__ parameter — a CHECK-time error: "`Renamed.__init__` got an
+# unexpected keyword argument `x`" (CPython raises the same TypeError). Before the
+# fix this passed `check` (x IS a field) and then FAILED at build (::new maps to
+# params), a check-pass/build-fail split.
+# This file must be rejected by BOTH `pyrst check` and `pyrst build`.
+class Renamed:
+    x: int
+    y: int
+
+    def __init__(self, a: int, b: int) -> None:
+        self.x = a
+        self.y = b
+
+
+def main() -> None:
+    # ERROR: `x` is a field, not an __init__ parameter (the params are a, b).
+    r: Renamed = Renamed(x=1, y=2)
+    print(r.x)

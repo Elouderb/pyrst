@@ -15,26 +15,149 @@ pub(crate) fn binop_symbol(op: BinOp) -> &'static str {
     }
 }
 
-/// (card d8a1ed83) The uniform check-time kwargs gate. Called with a NON-EMPTY
-/// `kwargs`; returns `Ok(())` only when the call site is one pyrst actually
-/// MODELS a keyword argument for, otherwise an honest `Error::Type`.
+/// (kwargs v1, card 8a7b7714) Where each parameter SLOT of a keyword-bearing
+/// call gets its value: a positional argument, a keyword argument, or the
+/// parameter's declared default. Produced by [`map_kwargs_to_slots`] and shared
+/// by the checking path (which validates provided slots) and codegen (which
+/// lowers the call as a full positional call in parameter order).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArgSlot {
+    /// Filled by positional argument `args[i]`.
+    Pos(usize),
+    /// Filled by the VALUE of keyword argument `kwargs[j]`.
+    Kw(usize),
+    /// Filled by the parameter's declared default expression.
+    Default,
+}
+
+/// (kwargs v1, card 8a7b7714) The keyword→positional mapping: given a resolved
+/// signature (param names + defaults, self-exclusive for methods), the number of
+/// POSITIONAL arguments at the call, and the keyword arguments, produce one
+/// [`ArgSlot`] per declared parameter. CPython semantics: positional arguments
+/// fill parameters left-to-right; each keyword argument binds the parameter of
+/// that name; every remaining parameter takes its default. Check-time errors
+/// (CPython-shaped, pyrst-worded):
+///   - a keyword that names no parameter        → "unexpected keyword argument";
+///   - a keyword whose slot is already filled
+///     (positionally or by an earlier keyword)  → "multiple values for argument";
+///   - an unfilled parameter with no default    → "missing a required argument";
+///   - more positional arguments than parameters → the classic arity error.
 ///
-/// Modeled sites (kept passing — the W0 machinery lowers these correctly):
-///   - a class CONSTRUCTOR `C(field=..)` — the kwarg names are validated as
-///     field names by the constructor arm, so any name is admitted here;
-///   - the free builtins `sorted(.., key=, reverse=)` and `min`/`max(.., key=)`;
-///   - the `list.sort(key=, reverse=)` method (receiver statically a list).
+/// pyrst has no keyword-only (`*`) marker, so every parameter is
+/// positional-or-keyword — a deliberate, documented superset of signatures that
+/// use `*` in CPython (calls valid there are valid here; pyrst additionally
+/// accepts the positional spelling).
+pub fn map_kwargs_to_slots(
+    site: &str,
+    sig: &FuncSig,
+    n_pos: usize,
+    kwargs: &[(String, Expr)],
+    span: Span,
+) -> Result<Vec<ArgSlot>> {
+    let n_params = sig.params.len();
+    if n_pos > n_params {
+        return Err(Error::Type {
+            span,
+            msg: format!(
+                "function `{}` takes {} argument(s), {} given",
+                site,
+                n_params,
+                n_pos + kwargs.len()
+            ),
+        });
+    }
+    let mut slots: Vec<Option<ArgSlot>> = vec![None; n_params];
+    for (i, slot) in slots.iter_mut().take(n_pos).enumerate() {
+        *slot = Some(ArgSlot::Pos(i));
+    }
+    for (j, (kw, _)) in kwargs.iter().enumerate() {
+        let p = sig
+            .params
+            .iter()
+            .position(|(n, _)| n == kw)
+            .ok_or_else(|| Error::Type {
+                span,
+                msg: format!("`{}` got an unexpected keyword argument `{}`", site, kw),
+            })?;
+        if slots[p].is_some() {
+            return Err(Error::Type {
+                span,
+                msg: format!("`{}` got multiple values for argument `{}`", site, kw),
+            });
+        }
+        slots[p] = Some(ArgSlot::Kw(j));
+    }
+    slots
+        .into_iter()
+        .enumerate()
+        .map(|(p, s)| match s {
+            Some(s) => Ok(s),
+            None => {
+                if sig.param_defaults.get(p).is_some_and(|d| d.is_some()) {
+                    Ok(ArgSlot::Default)
+                } else {
+                    Err(Error::Type {
+                        span,
+                        msg: format!(
+                            "`{}` missing a required argument: `{}`",
+                            site, sig.params[p].0
+                        ),
+                    })
+                }
+            }
+        })
+        .collect()
+}
+
+/// (kwargs v1) The provided (parameter-slot, argument-expression) pairs of a
+/// keyword-bearing call in EVALUATION order: positional arguments left-to-right,
+/// then keyword VALUES in their source order — exactly CPython's call-site
+/// evaluation order — each paired with the parameter slot it fills. `Default`
+/// slots contribute nothing (the callee-signature default is injected by
+/// codegen, in slot position). Shared by the checking loop and codegen so the
+/// two walk the same pairs.
+pub fn kwargs_provided_in_eval_order<'a>(
+    args: &'a [Expr],
+    kwargs: &'a [(String, Expr)],
+    slots: &[ArgSlot],
+) -> Vec<(usize, &'a Expr)> {
+    let mut provided: Vec<(usize, &'a Expr)> = args.iter().enumerate().collect();
+    let mut kw_order: Vec<(usize, usize)> = slots
+        .iter()
+        .enumerate()
+        .filter_map(|(p, s)| match s {
+            ArgSlot::Kw(j) => Some((*j, p)),
+            _ => None,
+        })
+        .collect();
+    kw_order.sort_by_key(|(j, _)| *j);
+    for (j, p) in kw_order {
+        provided.push((p, &kwargs[j].1));
+    }
+    provided
+}
+
+/// (card d8a1ed83, reshaped by kwargs v1 / card 8a7b7714) The uniform check-time
+/// kwargs gate. Called with a NON-EMPTY `kwargs`; returns `Ok(())` only when the
+/// call site is one pyrst MODELS keyword arguments for, otherwise an honest
+/// `Error::Type`.
 ///
-/// For those builtin sites the kwarg NAMES are ALSO restricted to the modeled
-/// set, so an unknown kwarg (`xs.sort(bogus=1)`, `sorted(xs, foo=1)`) is now a
-/// CHECK-time error too — closing the check/build asymmetry logged on card
-/// 5ca2030a (`.sort` unknown-kwarg previously only failed at build).
+/// Admitted sites:
+///   - a class CONSTRUCTOR `C(field=..)` — kwarg names are validated as field
+///     names by the constructor arm;
+///   - the free builtins `sorted(.., key=, reverse=)` and `min`/`max(.., key=)`
+///     and the `list.sort(key=, reverse=)` method — their kwarg NAMES are
+///     restricted to the modeled set here;
+///   - (kwargs v1) a USER or MODULE function — flat (`fill(text, width=10)`) or
+///     qualified (`textwrap.fill(text, width=10)`) — and a user METHOD on a
+///     class instance (`g.greet(times=3)`): the keyword→positional mapping in
+///     the corresponding call branch validates names/duplicates/missing and the
+///     call lowers as a full positional call.
 ///
-/// Every OTHER call site — a flat free function, a qualified module function, or
-/// a user/builtin method — previously threaded kwargs through and then dropped
-/// them (silently, or as a late codegen / rustc error). It is rejected here with
-/// a message pointing at the positional form. Full keyword→positional CALL
-/// fidelity is a deliberately-deferred follow-up; this is the honesty stopgap.
+/// Still rejected (honest, check-time): keyword arguments on builtin stubs
+/// (`abs(x=5)` — CPython builtins are positional-only), on `@staticmethod`
+/// calls via the class name, on function-valued locals / lambdas, and on
+/// builtin container methods.
 fn reject_unmodeled_kwargs(
     callee: &Expr,
     kwargs: &[(String, Expr)],
@@ -56,22 +179,70 @@ fn reject_unmodeled_kwargs(
             if !modeled.is_empty() {
                 return reject_unknown_kwarg_names(kwargs, modeled, name, span);
             }
+            // (kwargs v1) Builtin stubs stay positional-only: CPython's builtins
+            // reject keyword arguments (`abs(x=5)` is a TypeError), and mapping
+            // onto a stub's invented param name would accept what CPython
+            // rejects.
+            if env.ctx.builtin_funcs.contains(name.as_str()) {
+                return Err(Error::Type {
+                    span,
+                    msg: format!("`{}` takes no keyword arguments", name),
+                });
+            }
+            // (kwargs v1) A user or module function with a real signature: the
+            // flat-call branch runs the keyword→positional mapping.
+            if env.ctx.funcs.contains_key(name.as_str()) {
+                return Ok(());
+            }
         }
         Expr::Attr { obj, name, .. } => {
+            // (kwargs v1) Qualified module function `X.f(kw=..)`: the qualified
+            // module branch runs the mapping.
+            if let Expr::Ident(base, _) = obj.as_ref() {
+                if env
+                    .ctx
+                    .module_funcs
+                    .get(base)
+                    .is_some_and(|fns| fns.iter().any(|n| n == name))
+                {
+                    return Ok(());
+                }
+                // `ClassName.method(kw=..)` (static-style call): stays
+                // positional-only in v1 — fall through to the rejection below
+                // WITHOUT type-checking the class name as a value expression.
+                if env.ctx.classes.contains_key(base.as_str()) {
+                    return Err(Error::Type {
+                        span,
+                        msg: format!(
+                            "keyword arguments are not supported on `{}.{}` \
+                             (a static-style class-name call); pass the argument \
+                             positionally",
+                            base, name
+                        ),
+                    });
+                }
+            }
             // (c) list.sort(key=, reverse=): only when the receiver is statically
             // a list. Re-deriving the receiver type here is idempotent for the
             // place receivers `.sort` takes and propagates any of its own errors.
-            if name == "sort" && matches!(check_expr(obj, env)?, Ty::List(_)) {
+            let obj_ty = check_expr(obj, env)?;
+            if name == "sort" && matches!(obj_ty, Ty::List(_)) {
                 return reject_unknown_kwarg_names(kwargs, &["key", "reverse"], "list.sort", span);
+            }
+            // (kwargs v1) A user METHOD on a class instance: the method branch
+            // runs the mapping (inheritance-aware via get_method).
+            if let Ty::Class(cls, _) = &obj_ty {
+                if env.ctx.get_method(cls, name).is_some() {
+                    return Ok(());
+                }
             }
         }
         _ => {}
     }
     Err(Error::Type {
         span,
-        msg: "keyword arguments are not supported here in v0 (only class \
-              constructors and builtin key=/reverse=); pass the argument \
-              positionally"
+        msg: "keyword arguments are not supported at this call site; pass the \
+              argument positionally"
             .into(),
     })
 }
@@ -218,6 +389,18 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
                         Ty::Str
                     } else if l == Ty::Float || r == Ty::Float {
                         Ty::Float
+                    } else if matches!(l, Ty::TypeVar(_)) {
+                        // (W1.5, card 71cbd940) Arithmetic over a GENERIC
+                        // operand yields the type variable, not the int bias:
+                        // `acc + xs[i]` with `acc: T` is `T` (the inferred
+                        // Add bound guarantees T op T -> T), so a
+                        // guard-narrowed generic reassignment (`acc = acc +
+                        // xs[i]` under `if f is None`) is a same-type
+                        // rebinding instead of a bogus "T before the block,
+                        // int inside" divergence.
+                        l
+                    } else if matches!(r, Ty::TypeVar(_)) {
+                        r
                     } else {
                         Ty::Int
                     }
@@ -1257,32 +1440,57 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
             // Check if this is a class constructor or function call.
             match callee.as_ref() {
                 Expr::Ident(name, _) => {
-                    if let Some(_class_def) = env.ctx.classes.get(name.as_str()) {
-                        // Constructor call: check that kwarg field names are valid (including inherited fields).
-                        let all_fields = env.ctx.get_all_fields(name.as_str());
-                        for (kw, val) in kwargs {
-                            if !all_fields.iter().any(|f| &f.name == kw) {
-                                return Err(Error::Type {
-                                    span: *span,
-                                    msg: format!("class `{}` has no field `{}`", name, kw),
-                                });
+                    if env.ctx.classes.contains_key(name.as_str()) {
+                        // (W1.5 fix B) CPython binds constructor arguments to the
+                        // class's __init__ PARAMETERS. When __init__ exists, map
+                        // positionals + keywords onto its (self-exclusive)
+                        // signature via the SHARED mapper — closing the old
+                        // check-pass / build-fail split for a class whose __init__
+                        // param names differ from its field names
+                        // (`__init__(self, a, b)` assigning `self.x`/`self.y`,
+                        // called `C(a=1, b=2)`), and turning an unknown / duplicate
+                        // / missing / too-many argument into an honest check-time
+                        // error naming `<Class>.__init__`. The slot-aligned arg
+                        // types (default holes `Unknown`, non-binding) feed generic
+                        // type-argument inference; a plain class ignores them and
+                        // yields `Ty::Class(name, [])` (unchanged).
+                        //
+                        // A class WITHOUT __init__ is a struct-literal: a BARE
+                        // `C()` keeps the zero-init (struct-default) idiom, else the
+                        // arguments are matched against a synthesized field-order
+                        // parameter list (every field required — partial explicit
+                        // construction was already a build error) so dup / unknown /
+                        // missing become check errors and the codegen positional +
+                        // keyword merge stays honest.
+                        let init_key = format!("{}.__init__", name);
+                        if let Some(sig) = env.ctx.funcs.get(&init_key).cloned() {
+                            let slots = map_kwargs_to_slots(&init_key, &sig, args.len(), kwargs, *span)?;
+                            let mut arg_tys = vec![Ty::Unknown; sig.params.len()];
+                            for (p, a) in kwargs_provided_in_eval_order(args, kwargs, &slots) {
+                                arg_tys[p] = check_expr(a, env)?;
                             }
-                            check_expr(val, env)?;
+                            check_class_instantiation(name, &arg_tys, env.ctx, *span)?
+                        } else if args.is_empty() && kwargs.is_empty() {
+                            check_class_instantiation(name, &[], env.ctx, *span)?
+                        } else {
+                            let fields = env.ctx.get_all_fields(name.as_str());
+                            let synth = FuncSig {
+                                params: fields
+                                    .iter()
+                                    .map(|f| {
+                                        (f.name.clone(), Ty::from_type_expr(&f.ty, f.span).unwrap_or(Ty::Unknown))
+                                    })
+                                    .collect(),
+                                ret: Ty::Class(name.to_string(), vec![]),
+                                param_defaults: vec![None; fields.len()],
+                                param_by_ref: Vec::new(),
+                            };
+                            let slots = map_kwargs_to_slots(name, &synth, args.len(), kwargs, *span)?;
+                            for (_p, a) in kwargs_provided_in_eval_order(args, kwargs, &slots) {
+                                check_expr(a, env)?;
+                            }
+                            check_class_instantiation(name, &[], env.ctx, *span)?
                         }
-                        // Generics v2: collect the positional argument types and,
-                        // for a GENERIC class, infer its type arguments by unifying
-                        // `__init__`'s scoped param types against them
-                        // (`Box(5)` -> `Box[int]`). A conflicting binding
-                        // (`Pair(1, 1)` against `Pair[A, B]` is fine; an
-                        // inconsistent same-var binding is reported) surfaces as an
-                        // honest error at `span`. A non-generic class takes the
-                        // early return inside the helper and yields the legacy
-                        // `Ty::Class(name, [])` — unchanged behaviour.
-                        let mut arg_tys = Vec::with_capacity(args.len());
-                        for a in args {
-                            arg_tys.push(check_expr(a, env)?);
-                        }
-                        check_class_instantiation(name, &arg_tys, env.ctx, *span)?
                     } else if (name == "min" || name == "max") && args.len() == 1 {
                         // Single-iterable min/max: the result is the element type
                         // of the list/set argument. A `key=`/other kwarg may also
@@ -1432,9 +1640,24 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                             "print" | "range" | "len" | "str" | "int" | "float" | "bool" | "enumerate" | "zip"
                             | "abs" | "min" | "max" | "sorted" | "sum" | "input" | "list" | "dict" | "tuple" | "set"
                             | "getattr" | "setattr" | "hasattr" | "open");
+                        // (kwargs v1) A keyword-bearing call to a USER or MODULE
+                        // function runs the keyword→positional mapping, which
+                        // subsumes the legacy arity check (unknown / duplicate /
+                        // missing / too-many-positional are its errors). The
+                        // modeled builtins (`sorted`/`min`/`max`, all variadic)
+                        // keep their legacy path — their stub sigs carry invented
+                        // param names the mapper must never bind against.
+                        let kw_slots: Option<Vec<ArgSlot>> = if !kwargs.is_empty()
+                            && !variadic
+                            && !env.ctx.builtin_funcs.contains(name.as_str())
+                        {
+                            Some(map_kwargs_to_slots(name, sig, args.len(), kwargs, *span)?)
+                        } else {
+                            None
+                        };
                         // Count required parameters (those without defaults)
                         let required = sig.param_defaults.iter().take_while(|d| d.is_none()).count();
-                        if !variadic && (got < required || got > expected) {
+                        if kw_slots.is_none() && !variadic && (got < required || got > expected) {
                             return Err(Error::Type {
                                 span: *span,
                                 msg: format!(
@@ -1454,8 +1677,24 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                         let is_generic = env.ctx.generic_funcs
                             .get(name.as_str())
                             .is_some_and(|tps| !tps.is_empty());
-                        let mut arg_tys: Vec<Ty> = Vec::with_capacity(args.len());
-                        for (i, a) in args.iter().enumerate() {
+                        // (kwargs v1) The provided (slot, expr) pairs in CPython
+                        // evaluation order. Without kwargs this is exactly
+                        // `enumerate(args)` and the loop below is byte-identical
+                        // to the legacy positional loop; with kwargs the keyword
+                        // values are appended in source order, each aligned to
+                        // its mapped parameter slot, and `arg_tys` is built
+                        // SLOT-ALIGNED (default holes stay `Ty::Unknown`, which
+                        // unification treats as no-information).
+                        let provided: Vec<(usize, &Expr)> = match &kw_slots {
+                            None => args.iter().enumerate().collect(),
+                            Some(slots) => kwargs_provided_in_eval_order(args, kwargs, slots),
+                        };
+                        let mut arg_tys: Vec<Ty> = if kw_slots.is_some() {
+                            vec![Ty::Unknown; expected]
+                        } else {
+                            Vec::with_capacity(args.len())
+                        };
+                        for (i, a) in provided {
                             // EPIC-4 V2: an argument bound to a by-reference
                             // (`Mut[T]`) param must be a PLACE — an lvalue we can
                             // take `&mut` of (variable / field / index). A
@@ -1554,7 +1793,11 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                                     }
                                 }
                             }
-                            arg_tys.push(arg_ty);
+                            if kw_slots.is_some() {
+                                arg_tys[i] = arg_ty;
+                            } else {
+                                arg_tys.push(arg_ty);
+                            }
                         }
                         if is_generic {
                             // Unify the declared (type-var-bearing) params against
@@ -1654,12 +1897,21 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                                         span: *attr_span,
                                         msg: format!("module `{}` function `{}` has no signature", modname, name),
                                     })?;
-                                    // Arity (positional only; module @extern fns are
-                                    // not variadic and take no kwargs).
+                                    // Arity. (kwargs v1) A keyword-bearing
+                                    // qualified call runs the keyword→positional
+                                    // mapping instead, which subsumes this check
+                                    // (unknown / duplicate / missing / too many
+                                    // positional are its errors).
                                     let expected = sig.params.len();
                                     let got = args.len() + kwargs.len();
+                                    let diag_label = format!("{}.{}", modname, name);
+                                    let kw_slots: Option<Vec<ArgSlot>> = if !kwargs.is_empty() {
+                                        Some(map_kwargs_to_slots(&diag_label, &sig, args.len(), kwargs, *span)?)
+                                    } else {
+                                        None
+                                    };
                                     let required = sig.param_defaults.iter().take_while(|d| d.is_none()).count();
-                                    if got < required || got > expected {
+                                    if kw_slots.is_none() && (got < required || got > expected) {
                                         return Err(Error::Type {
                                             span: *span,
                                             msg: format!(
@@ -1679,14 +1931,29 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                                     // non-generic qualified call (`string.capwords`)
                                     // is unchanged — concrete params are still checked
                                     // and the declared return is returned.
-                                    let arg_tys = args.iter()
-                                        .map(|a| check_expr(a, env))
-                                        .collect::<Result<Vec<_>>>()?;
-                                    let diag_label = format!("{}.{}", modname, name);
+                                    // (kwargs v1) With kwargs, build the argument
+                                    // types SLOT-ALIGNED (evaluating in CPython
+                                    // call order: positionals, then keyword values
+                                    // in source order; default holes stay
+                                    // `Ty::Unknown`). Without kwargs this is the
+                                    // legacy positional collection, unchanged.
+                                    let arg_tys: Vec<Ty> = match &kw_slots {
+                                        None => args.iter()
+                                            .map(|a| check_expr(a, env))
+                                            .collect::<Result<Vec<_>>>()?,
+                                        Some(slots) => {
+                                            let mut tys = vec![Ty::Unknown; expected];
+                                            for (p, a) in
+                                                kwargs_provided_in_eval_order(args, kwargs, slots)
+                                            {
+                                                tys[p] = check_expr(a, env)?;
+                                            }
+                                            tys
+                                        }
+                                    };
                                     let result = check_call_arg_types_and_result(
                                         name, &diag_label, &sig, &arg_tys, env.ctx, *span,
                                     )?;
-                                    for (_, v) in kwargs { check_expr(v, env)?; }
                                     return Ok(result);
                                 } else {
                                     // X IS a tracked module but defines no such `f`.
@@ -1706,7 +1973,40 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                         reject_typevar_op(&obj_ty, "call a method on", *span)?;
                         if let Ty::Class(class_name, _) = &obj_ty {
                             let key = format!("{}.{}", class_name, name);
-                            if let Some(sig) = env.ctx.funcs.get(&key).cloned() {
+                            // (kwargs v1) Fall back to the inheritance-aware
+                            // `get_method` so an INHERITED method call resolves
+                            // here too (its arity and keyword mapping are then
+                            // checked like an own-class method; the returned type
+                            // is the same `subst_class_member(ret)` the generic
+                            // attr fallback produced before).
+                            let resolved_sig = env.ctx.funcs.get(&key).cloned()
+                                .or_else(|| env.ctx.get_method(class_name, name));
+                            if let Some(sig) = resolved_sig {
+                                // (kwargs v1) Keyword→positional mapping for
+                                // method calls; without kwargs, a default-aware
+                                // ARITY check (methods previously leaked a raw
+                                // rustc E0061 on wrong arity — now check-time).
+                                let site = format!("{}.{}", class_name, name);
+                                let kw_slots: Option<Vec<ArgSlot>> = if !kwargs.is_empty() {
+                                    Some(map_kwargs_to_slots(&site, &sig, args.len(), kwargs, *span)?)
+                                } else {
+                                    let expected = sig.params.len();
+                                    let required = sig
+                                        .param_defaults
+                                        .iter()
+                                        .take_while(|d| d.is_none())
+                                        .count();
+                                    if args.len() < required || args.len() > expected {
+                                        return Err(Error::Type {
+                                            span: *span,
+                                            msg: format!(
+                                                "method `{}` takes {} argument(s), {} given",
+                                                site, expected, args.len()
+                                            ),
+                                        });
+                                    }
+                                    None
+                                };
                                 // (EPIC-4 V2-c) Enforce the by-reference (`Mut[T]`)
                                 // place-requirement at METHOD call sites too (it was
                                 // already enforced for free functions in V2-ab). An
@@ -1718,7 +2018,15 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                                 // (mirrors the resolver alignment fixed in STEP 0).
                                 let method_sig = env.ctx.get_method(class_name, name);
                                 if let Some(msig) = &method_sig {
-                                    for (i, a) in args.iter().enumerate() {
+                                    // (kwargs v1) The place-requirement covers a
+                                    // by-ref param bound by KEYWORD too — the
+                                    // provided pairs align each argument (positional
+                                    // or keyword value) with its parameter slot.
+                                    let by_ref_pairs: Vec<(usize, &Expr)> = match &kw_slots {
+                                        None => args.iter().enumerate().collect(),
+                                        Some(slots) => kwargs_provided_in_eval_order(args, kwargs, slots),
+                                    };
+                                    for (i, a) in by_ref_pairs {
                                         if msig.param_by_ref.get(i).copied().unwrap_or(false)
                                             && !is_place_expr(a)
                                         {
@@ -1736,6 +2044,9 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                                     }
                                 }
                                 for a in args { check_expr(a, env)?; }
+                                // (kwargs v1) Keyword VALUES are checked for their
+                                // own errors too (undefined names, bad exprs).
+                                for (_, v) in kwargs { check_expr(v, env)?; }
                                 // Generics v2: the registered sig's return may
                                 // contain the class's type vars (`get(self) -> T`).
                                 // Substitute the RECEIVER instance's type args

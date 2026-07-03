@@ -725,13 +725,41 @@ impl<'a> Codegen<'a> {
         cls: &str,
         method_name: &str,
         args: &[Expr],
+        kwargs: &[(String, Expr)],
         parts: &[String],
+        span: crate::diag::Span,
     ) -> Result<String> {
-        let method_by_ref: Vec<bool> = self
-            .ctx
-            .get_method(cls, method_name)
-            .map(|sig| sig.param_by_ref.clone())
-            .unwrap_or_default();
+        let sig = self.ctx.get_method(cls, method_name);
+        // (kwargs v1, card 8a7b7714) A keyword-bearing OR under-applied
+        // (default-taking) method call builds its FULL positional part list from
+        // the keyword→slot mapping: positional args left-to-right, each keyword
+        // value in its named parameter's slot, declared defaults injected into
+        // the unfilled slots. This also closes the long-standing method-default
+        // hole (`g.greet()` with a defaulted param previously leaked rustc
+        // E0061 — free functions filled trailing defaults, methods never did).
+        // typeck already validated the mapping; re-deriving it is deterministic.
+        if let Some(sig) = &sig {
+            if !kwargs.is_empty() || args.len() < sig.params.len() {
+                let site = format!("{}.{}", cls, method_name);
+                let slots =
+                    crate::typeck::map_kwargs_to_slots(&site, sig, args.len(), kwargs, span)?;
+                // (item A + C) Lower via the shared slot mapper: it preserves
+                // CPython's source-order call-site evaluation (hoisting EVERY
+                // out-of-order argument, positionals included) and — with
+                // `coerced = true` — applies the SAME Optional-wrap / `Callable`
+                // cast the free-call path uses (the method path previously emitted
+                // a plain `emit_consuming`, silently dropping both). Per-slot
+                // coercion targets come from the method signature's param types.
+                let param_tys: Vec<Ty> = sig.params.iter().map(|(_, t)| t.clone()).collect();
+                let (prelude, mparts) =
+                    self.emit_slotted_args(&slots, args, kwargs, sig, &param_tys, /*coerced=*/ true)?;
+                return Ok(Self::hoist_wrap(
+                    &prelude,
+                    format!("{}.{}({})", obj_s, method_name, mparts.join(", ")),
+                ));
+            }
+        }
+        let method_by_ref: Vec<bool> = sig.map(|sig| sig.param_by_ref).unwrap_or_default();
         if method_by_ref.iter().any(|&b| b) {
             let mut mparts = Vec::with_capacity(args.len());
             for (i, a) in args.iter().enumerate() {
@@ -961,6 +989,157 @@ impl<'a> Codegen<'a> {
             Some(t) if self.ty_has_func(t) => self.emit_into_func_slot(arg, t),
             _ => self.emit_consuming(arg),
         }
+    }
+
+    /// (kwargs v1) Emit one call argument `a` into parameter SLOT `p`, applying
+    /// the site's argument→slot coercion.
+    ///
+    /// `coerced == true` (free-function AND method calls) applies the FULL
+    /// coercion the free-call path has always used: a function name / lambda into
+    /// a `Callable` (or `Optional[Callable]`) slot is cast to `Rc<dyn Fn>`, a
+    /// raw-struct / subclass into a polymorphic-base slot is wrapped in its
+    /// variant, and a bare value into an `Optional[T]` slot is `Some(..)`-wrapped
+    /// (a `None` literal stays `None`). This is what routes the METHOD kwargs /
+    /// default-fill path through the same emission as the free path — previously
+    /// it emitted a plain `emit_consuming`, dropping the Optional-wrap and the
+    /// `Callable` cast (so a method's `Optional[int] = None` default filled with a
+    /// bare value, or a lambda into a method's `Optional[Callable]` slot, miscompiled).
+    ///
+    /// `coerced == false` (constructor `::new`) routes through
+    /// [`Self::emit_arg_into_slot`] (poly-base / `Callable` / clone-on-use),
+    /// matching the long-standing constructor struct-field emission.
+    pub(crate) fn emit_call_arg_value(
+        &mut self,
+        a: &Expr,
+        param_tys: &[Ty],
+        p: usize,
+        coerced: bool,
+    ) -> Result<String> {
+        if !coerced {
+            return self.emit_arg_into_slot(a, param_tys.get(p));
+        }
+        let s = match param_tys.get(p) {
+            Some(pt @ Ty::Func(..)) => self.emit_into_func_slot(a, pt)?,
+            Some(Ty::Option(inner))
+                if matches!(**inner, Ty::Func(..)) && !matches!(a, Expr::None_(_)) =>
+            {
+                self.emit_into_func_slot(a, inner)?
+            }
+            Some(pt) if self.ty_has_poly_base(pt) => self.emit_into_base_slot(a, pt)?,
+            _ => self.emit_consuming(a)?,
+        };
+        Ok(match param_tys.get(p) {
+            Some(pt) => self.coerce_to_option(s, a, pt),
+            None => s,
+        })
+    }
+
+    /// (kwargs v1 — call-site evaluation-order fix) Lower a keyword / default-
+    /// filled call's argument list in PARAMETER-SLOT order, returning
+    /// `(prelude, call_parts)`. The caller wraps the assembled call with
+    /// [`Self::hoist_wrap`]`(&prelude, format!("<callee>({})", call_parts.join(", ")))`.
+    ///
+    /// CPython evaluates call arguments left-to-right in SOURCE order (positionals
+    /// first, then keywords as written) BEFORE binding them to parameter slots.
+    /// When the provided arguments already sit in ascending slot order every part
+    /// emits INLINE in slot order — byte-identical to a positional call, so the
+    /// hot in-order path is unchanged. Otherwise EVERY provided argument is
+    /// hoisted into a source-ordered `let __argN` temp so its side effects run in
+    /// source order; a by-reference (`Mut[T]`) argument instead hoists only its
+    /// place-prelude (subscript-index side effects) into the shared prelude while
+    /// the `&mut place` borrow stays inline at its slot (borrow legality
+    /// unchanged). Default-filled slots always emit their declared default inline
+    /// in slot position (a signature default has no call-site side effect to order).
+    ///
+    /// This single helper is shared by all three keyword-bearing call sites
+    /// (`emit_plain_func_call`, `emit_user_method_call`, the constructor `::new`
+    /// path) — the reviews found the same eval-order miscompile independently in
+    /// each because the hoist logic used to be triplicated.
+    ///
+    /// `param_tys` supplies per-slot coercion targets and `coerced` selects the
+    /// coercion strategy (see [`Self::emit_call_arg_value`]); `sig` supplies
+    /// `param_by_ref` and `param_defaults`.
+    pub(crate) fn emit_slotted_args(
+        &mut self,
+        slots: &[crate::typeck::ArgSlot],
+        args: &[Expr],
+        kwargs: &[(String, Expr)],
+        sig: &crate::typeck::FuncSig,
+        param_tys: &[Ty],
+        coerced: bool,
+    ) -> Result<(Vec<String>, Vec<String>)> {
+        use crate::typeck::ArgSlot;
+        let n = slots.len();
+        // Source (evaluation) order of the PROVIDED args: positionals left-to-
+        // right, then keyword values in source order — each tagged with the slot
+        // it fills. Exactly CPython's call-site evaluation order.
+        let eval_order = crate::typeck::kwargs_provided_in_eval_order(args, kwargs, slots);
+        // Hoist exactly when the provided args are NOT already in ascending slot
+        // order (a keyword binds an earlier slot than a later-written argument).
+        let needs_hoist = eval_order.windows(2).any(|w| w[0].0 > w[1].0);
+
+        let mut call_part: Vec<Option<String>> = vec![None; n];
+        let mut prelude: Vec<String> = Vec::new();
+
+        if needs_hoist {
+            for (rank, (p, a)) in eval_order.iter().enumerate() {
+                let p = *p;
+                if sig.param_by_ref.get(p).copied().unwrap_or(false) {
+                    // Hoist the place's index side effects into the shared prelude
+                    // (at this arg's SOURCE position); keep the `&mut` borrow
+                    // inline at its slot so borrow legality is unchanged. The
+                    // shared `prelude` gives each hoisted `__idxN` a unique name.
+                    let place = self.emit_place_hoisted(a, &mut prelude)?;
+                    call_part[p] = Some(self.byref_borrow(a, &place));
+                } else {
+                    let v = self.emit_call_arg_value(a, param_tys, p, coerced)?;
+                    let tmp = format!("__arg{}", rank);
+                    prelude.push(format!("let {} = {};", tmp, v));
+                    call_part[p] = Some(tmp);
+                }
+            }
+        } else {
+            // In slot order (matches the legacy emission order → byte-identical).
+            for (p, s) in slots.iter().enumerate() {
+                let a = match s {
+                    ArgSlot::Pos(i) => &args[*i],
+                    ArgSlot::Kw(j) => &kwargs[*j].1,
+                    ArgSlot::Default => continue,
+                };
+                if sig.param_by_ref.get(p).copied().unwrap_or(false) {
+                    let mut aprelude = Vec::new();
+                    let place = self.emit_place_hoisted(a, &mut aprelude)?;
+                    let borrow = self.byref_borrow(a, &place);
+                    call_part[p] = Some(Self::hoist_wrap(&aprelude, borrow));
+                } else {
+                    call_part[p] = Some(self.emit_call_arg_value(a, param_tys, p, coerced)?);
+                }
+            }
+        }
+
+        // Assemble parts in slot order; fill each Default slot inline with the
+        // parameter's declared default.
+        let mut call_parts = Vec::with_capacity(n);
+        for (p, s) in slots.iter().enumerate() {
+            match call_part[p].take() {
+                Some(part) => call_parts.push(part),
+                None => {
+                    debug_assert!(matches!(s, ArgSlot::Default));
+                    match sig.param_defaults.get(p).and_then(|d| d.as_ref()) {
+                        Some(e) => {
+                            let e = e.clone();
+                            call_parts.push(self.emit_expr(&e)?);
+                        }
+                        None => {
+                            return Err(crate::diag::Error::Codegen(
+                                "missing required argument".into(),
+                            ))
+                        }
+                    }
+                }
+            }
+        }
+        Ok((prelude, call_parts))
     }
 
     /// (first-class functions) Emit value expression `value` into a slot whose

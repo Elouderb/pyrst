@@ -1,0 +1,106 @@
+# random_freefns.pyrs — pinned golden for stdlib `random`'s FREE-FUNCTION
+# surface: choice / shuffle / sample / choices (W1.5 MT19937 pass).
+#
+# These are free functions in pyrst (`choice(rng, xs)`) because pyrst classes
+# cannot carry generic methods — CPython spells them as methods
+# (`rng.choice(xs)`), so this file cannot dual-run under python3 (the
+# METHOD surface is dual-run in examples/parity_random.pyrs). Every sequence
+# pinned here was ORACLE-VERIFIED byte-for-byte against the CPython method
+# forms during the W1.5 pass (scratchpad twin: same seeds, `r.choice`/
+# `r.shuffle`/`r.sample`/`r.choices` under python3 3.12 produce these exact
+# lines), so the golden IS CPython's output — only the call shape differs.
+#
+# Also pins the error-path edges (CPython messages) and the getrandbits(62)
+# overflow regression loop from the review pass.
+from random import Random, choice, shuffle, sample, choices
+
+
+def main() -> None:
+    # choice: uniformly-chosen elements via _randbelow.
+    r: Random = Random(42)
+    picks: list[int] = []
+    i: int = 0
+    while i < 6:
+        picks.append(choice(r, [10, 20, 30, 40, 50, 60]))
+        i = i + 1
+    print(picks)
+
+    # shuffle: Fisher-Yates, j = _randbelow(i + 1).
+    r = Random(42)
+    xs: list[int] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    shuffle(r, xs)
+    print(xs)
+
+    # sample: pool-swap branch (n <= setsize) and the k == n permutation.
+    r = Random(42)
+    print(sample(r, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9], 5))
+    print(sample(r, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9], 10))
+    print(sample(r, xs, 0))
+
+    # choices: uniform (floor(random() * n)) and cumulative-weights forms,
+    # plus the k = 1 default via kwargs.
+    r = Random(42)
+    print(choices(r, [1, 2, 3], None, 5))
+    print(choices(r, [1, 2, 3], [0.1, 0.8, 0.1], 5))
+    print(choices(r, [1, 2, 3]))
+    print(choices(r, [1, 2, 3], k=4))
+    print(choices(r, [4, 5, 6], None, 0))
+
+    # unicode elements through choice/shuffle/sample (element ops — codepoint
+    # width doesn't matter).
+    r = Random(7)
+    words: list[str] = ["café", "naïve", "日本語", "a", "😀"]
+    print(choice(r, words))
+    shuffle(r, words)
+    print(words)
+    print(sample(r, words, len(words)))
+
+    # ── error paths (CPython messages, python3-verified) ─────────────────────
+    ys: list[int] = [1, 2, 3]
+    try:
+        print(sample(r, ys, 99))
+    except ValueError as e:
+        print(f"sample error: {e}")
+    try:
+        print(choices(r, ys, [1.0, 2.0], 3))
+    except ValueError as e:
+        print(f"choices error: {e}")
+    empty_ints: list[int] = []
+    try:
+        print(choice(r, empty_ints))
+    except IndexError as e:
+        print(f"choice empty error: {e}")
+    try:
+        print(choices(r, empty_ints, None, 1))
+    except IndexError as e:
+        print(f"choices empty error: {e}")
+    try:
+        print(choices(r, ys, [0.0, 0.0, 0.0], 2))
+    except ValueError as e:
+        print(f"choices zero-weight error: {e}")
+    try:
+        print(r.getrandbits(63))
+    except ValueError as e:
+        print(f"getrandbits(63) error: {e}")
+    try:
+        print(r.gammavariate(0.0, 1.0))
+    except ValueError as e:
+        print(f"gammavariate error: {e}")
+
+    # getrandbits(k > 32) overflow regression (review finding on the old
+    # module): a seeded loop of large-k draws runs clean, every value in
+    # [0, 2**62).
+    r3: Random = Random(682)
+    grb: list[int] = []
+    i3: int = 0
+    while i3 < 10:
+        grb.append(r3.getrandbits(62))
+        grb.append(r3.getrandbits(40))
+        i3 = i3 + 1
+    print(grb)
+    cap62: int = 4611686018427387904
+    all_in_range: bool = True
+    for g in grb:
+        if g < 0 or g >= cap62:
+            all_in_range = False
+    print(all_in_range)

@@ -1,28 +1,28 @@
 # parity: pyrst-only
 #
-# Reason: this exercises the FULL upgraded itertools surface, and one call
-# genuinely cannot be made to match both runtimes with a single source line.
-# pyrst's codegen does not support keyword arguments at a free-function call
-# site ("keyword arguments are only supported for class constructors in v0" —
-# a pre-existing compiler limitation, not an itertools design choice), so
-# every call in this file must pass `zip_longest`'s `fillvalue` positionally
-# (`zip_longest(a, b, 0)`). But real CPython's `itertools.zip_longest`
-# signature is `zip_longest(*iterables, fillvalue=None)` — `fillvalue` is
-# keyword-ONLY — so a bare positional 3rd argument is swallowed as a THIRD
-# iterable by real CPython (`TypeError: 'int' object is not iterable`) rather
-# than bound as the fill value. There is no positional call shape that means
-# "fillvalue" to CPython's real `itertools.zip_longest` and simultaneously
-# compiles under pyrst. Every other call in this file (`count`, `cycle`,
-# `repeat`, `chain`, `islice`, `takewhile`, `dropwhile`, `starmap`,
-# `accumulate`, `product`, `combinations`, `combinations_with_replacement`,
-# `permutations`) IS independently CPython-parity-verified (see notes.md).
-# `groupby`/`tee` are ALSO independently divergent-by-design (eager `list`
-# vs. CPython's lazy sub-iterators/tuple-of-iterators — see module header)
-# and are printed directly here rather than reshaped to match, since the
-# file is already pyrst-only. `zip_longest` alone would force the whole
-# file's marker even if `groupby`/`tee` were reshaped, since the harness
-# diffs the file as a whole. Expected output below was captured from the
-# pyrst binary and is fully deterministic (no randomness, no timing).
+# Reason: `groupby` and `tee` are DESIGN-divergent — pyrst materializes them
+# EAGERLY (a `list`, and a tuple of `list`s) where CPython yields LAZY
+# sub-iterators / a tuple of independent iterators — so their printed form
+# cannot match CPython from a single source line; that alone forces this
+# whole-file marker (the harness diffs the file as a unit). This file also
+# passes `zip_longest`'s `fillvalue` POSITIONALLY (`zip_longest(a, b, 0)`),
+# matching its pinned golden; CPython's `zip_longest(*iterables,
+# fillvalue=None)` makes `fillvalue` KEYWORD-only, so a bare positional 3rd
+# argument is read as a THIRD iterable there (`TypeError: 'int' object is not
+# iterable`).
+#
+# (CORRECTION, W1.5: free-function KEYWORD arguments now WORK under pyrst —
+# kwargs v1 — so `zip_longest(a, b, fillvalue=0)` WOULD dual-run; the earlier
+# reason here, that "pyrst's codegen does not support keyword arguments at a
+# free-function call site", was STALE. `groupby`/`tee` keep this file
+# pyrst-only regardless of the `zip_longest` call shape.)
+#
+# Every OTHER call in this file (`count`, `cycle`, `repeat`, `chain`,
+# `islice`, `takewhile`, `dropwhile`, `starmap`, `accumulate`, `product`,
+# `combinations`, `combinations_with_replacement`, `permutations`) IS
+# independently CPython-parity-verified (see notes.md). Expected output below
+# was captured from the pyrst binary and is fully deterministic (no
+# randomness, no timing).
 from itertools import count, cycle, repeat, chain, islice, takewhile, dropwhile
 from itertools import starmap, accumulate, zip_longest, groupby, tee
 from itertools import product, combinations, combinations_with_replacement, permutations
@@ -259,3 +259,13 @@ def main() -> None:
         print(permutations([1, 2, 3], -1))
     except ValueError as e:
         print("caught:", e)
+    # --- W1.5 (card 71cbd940 unlock): accumulate's FULL CPython form —
+    # func=None default-sum and initial= (seed yielded first). Values
+    # python3-verified during the pass. ---
+    print(list(accumulate([1, 2, 3, 4])))
+    print(list(accumulate([1, 2, 3], func=lambda a, b: a * b)))
+    print(list(accumulate([1, 2, 3], initial=10)))
+    print(list(accumulate([2.0, 3.0], initial=1.5)))
+    acc_empty: list[int] = []
+    print(list(accumulate(acc_empty)))
+    print(list(accumulate(acc_empty, initial=5)))

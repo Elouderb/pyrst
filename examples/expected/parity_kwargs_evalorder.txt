@@ -1,0 +1,25 @@
+eval A
+eval B
+eval C
+ACB
+eval 1
+eval 3
+eval 2
+123
+eval A
+eval B
+eval C
+S:ACB
+eval A
+eval B
+eval C
+ACB
+eval A
+eval amt5
+eval idx1
+pay A
+195
+eval A
+eval B
+eval C
+ABC

@@ -55,3 +55,87 @@ def main() -> None:
 
     data2: list[float] = [1.0, 2.0, 2.0, 3.0, 4.0, 7.0, 9.0]
     print(quantiles(data2))
+
+    # --- W1.5 (kwargs v1): keyword shapes — CPython's n/method are
+    # keyword-only there; the same line now runs in both runtimes. ---
+    print(quantiles(data2, n=10))
+    print(quantiles(data2, n=4, method="inclusive"))
+    print(fmean([3.5, 4.0, 5.25], weights=[0.2, 0.3, 0.5]))
+
+    # --- W1.5: degenerate inputs raise CPython's exact MESSAGES. CPython's
+    # StatisticsError subclasses ValueError, so `except ValueError` catches
+    # both runtimes' errors and `print(e)` byte-matches. ---
+    empty: list[float] = []
+    try:
+        print(mean(empty))
+    except ValueError as e:
+        print(e)
+    try:
+        print(fmean(empty))
+    except ValueError as e:
+        print(e)
+    try:
+        print(fmean([1.0, 2.0], weights=[1.0]))
+    except ValueError as e:
+        print(e)
+    try:
+        print(median(empty))
+    except ValueError as e:
+        print(e)
+    try:
+        print(mode(empty))
+    except ValueError as e:
+        print(e)
+    print(multimode(empty))
+    try:
+        print(variance([1.0]))
+    except ValueError as e:
+        print(e)
+    try:
+        print(stdev([1.0]))
+    except ValueError as e:
+        print(e)
+    try:
+        print(pvariance(empty))
+    except ValueError as e:
+        print(e)
+    try:
+        print(pstdev(empty))
+    except ValueError as e:
+        print(e)
+    try:
+        print(geometric_mean(empty))
+    except ValueError as e:
+        print(e)
+    try:
+        print(geometric_mean([2.0, -1.0]))
+    except ValueError as e:
+        print(e)
+    try:
+        print(quantiles([1.0]))
+    except ValueError as e:
+        print(e)
+    try:
+        print(quantiles(data2, n=0))
+    except ValueError as e:
+        print(e)
+    try:
+        print(quantiles(data2, method="nope"))
+    except ValueError as e:
+        print(e)
+    # (W1.5 fix F1) fmean with a degenerate weight sum — all-zero, offsetting,
+    # or empty weights — used to divide by zero SILENTLY (nan/inf); now CPython's
+    # StatisticsError("sum of weights must be non-zero"), raised as ValueError so
+    # `except ValueError` + print(e) dual-runs byte-identically.
+    try:
+        print(fmean([1.0, 2.0, 3.0], [0.0, 0.0, 0.0]))
+    except ValueError as e:
+        print(e)
+    try:
+        print(fmean([1.0, 2.0], [1.0, -1.0]))
+    except ValueError as e:
+        print(e)
+    try:
+        print(fmean([], []))
+    except ValueError as e:
+        print(e)

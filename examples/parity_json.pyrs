@@ -62,7 +62,8 @@ def main() -> None:
     grin: JsonValue = loads('"\\ud83d\\ude00"')
     print(str(len(grin.as_str())))                 # 1  (one astral char, not two code units)
     print(str(grin.as_str() == chr(128512)))        # True (matches U+1F600 GRINNING FACE)
-    print(dumps(grin))                              # "😀"  (re-serializes as raw UTF-8, ensure_ascii not implemented)
+    print(dumps(grin))                              # "\\ud83d\\ude00"  (W1.5: ensure_ascii=True default re-escapes the pair, like CPython)
+    print(dumps(grin, ensure_ascii=False))          # "😀"  (raw UTF-8 on request, like CPython)
 
     # a lone (unpaired) high surrogate still raises — permanent divergence
     try:
@@ -211,5 +212,21 @@ def main() -> None:
     # sort_keys recurses into nested objects, not just the top level
     print(dumps(loads('{"b": {"z": 1, "a": 2}, "a": 1}'), None, True))
     # {"a": 1, "b": {"a": 2, "z": 1}}
+
+    # ── W1.5: ensure_ascii=True DEFAULT (CPython parity) ────────────────────────
+    # Every char above U+007E leaves as a lower-case \uXXXX escape; astral
+    # codepoints leave as UTF-16 surrogate pairs. All outputs below were
+    # byte-diffed against python3 json.dumps during the W1.5 pass.
+    print(dumps(json_str("héllo wörld")))          # BMP accents -> é / ö
+    print(dumps(json_str("日本語")))                # CJK -> 日本語
+    print(dumps(json_str("mix é日😀z")))            # BMP + astral surrogate pair, mixed
+    print(dumps(json_str("héllo"), ensure_ascii=False))   # raw UTF-8 on request
+    # keys are escaped too, in both compact and indent forms
+    accents: JsonValue = loads('{"kéy": ["vàl", "😀"]}')
+    print(dumps(accents))
+    print(dumps(accents, indent=2))
+    print(dumps(accents, indent=2, ensure_ascii=False))
+    # kwargs v1: CPython keyword spellings work (they are keyword-only there)
+    print(dumps(accents, sort_keys=True, ensure_ascii=True))
 
     print("done")

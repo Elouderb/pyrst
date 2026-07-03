@@ -1,7 +1,9 @@
 # pyrst standard library — os
 #
 # Fidelity-upgrade pass (card 97260dad, docs/design/stdlib-full.md §D row
-# "os"): fidelity score 3/5. A handful of deterministic `@extern` bindings
+# "os"): fidelity score 3.5/5 (W1.5: basename/dirname are now CPython
+# posixpath-exact pure string logic; flat names — no os.path namespace — stay
+# the G3 gap). A handful of deterministic `@extern` bindings
 # over Rust std (`std::env`, `std::path`, `std::fs`, `std::process`) plus one
 # `@crate("getrandom", ...)` binding for `urandom`. This file is EMBEDDED into
 # the pyrst compiler binary via `include_str!` (see `src/stdlib.rs`), so it
@@ -55,16 +57,14 @@
 #     the negative-to-usize cast blow up as a raw `Vec` "capacity overflow"
 #     panic; matches CPython's `ValueError` in spirit (still a generic pyrst
 #     panic, not a typed exception class — see the unwrap-panic note above).
-#   - PRE-EXISTING divergence, not touched by this pass (documented here for
-#     hardening-pass honesty, hardener review of card 97260dad): `basename`/
-#     `dirname` wrap Rust's `std::path::Path` component logic, which differs
-#     from CPython's pure string-splitting `os.path.basename`/`dirname` on a
-#     few edge inputs — e.g. `basename("/tmp/foo/")` is `"foo"` in pyrst vs
-#     `""` in CPython (Rust drops a trailing separator before taking the final
-#     component), and `basename(".")`/`basename("..")` are `""` in pyrst (Rust
-#     does not treat `.`/`..` as a file-name component) vs `"."`/`".."` in
-#     CPython. Out of this card's scope (the row targets only the 9 new
-#     bindings; `basename`/`dirname` are unchanged), flagged for a future pass.
+#   - (W1.5: FIXED) `basename`/`dirname` are now CPython posixpath's pure
+#     STRING logic (pure-pyrst defs, no Rust Path backing): trailing slashes
+#     (`basename("/tmp/foo/") == ""`, `dirname("a/b/") == "a/b"`), `"."`/
+#     `".."` returned verbatim by basename, all-slash heads preserved
+#     (`dirname("//x") == "//"`), double slashes, and multibyte components
+#     all byte-match python3's os.path (16-case oracle matrix). The names
+#     stay FLAT (`os.basename`, not `os.path.basename` — dotted submodules
+#     are G3).
 
 
 @extern
@@ -77,9 +77,14 @@ def getcwd() -> str:
     "std::env::current_dir().unwrap().to_string_lossy().into_owned()"
 
 
-@extern
 def basename(p: str) -> str:
-    "std::path::Path::new(&{p}).file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()"
+    # (W1.5) CPython posixpath.basename is PURE STRING logic: everything after
+    # the last "/" (may be empty for a trailing slash; "." and ".." are
+    # returned verbatim). The old Rust Path::file_name() backing silently
+    # diverged on exactly those edges (basename("a/b/") was "b" instead of "",
+    # basename("..") was "" instead of "..") — python3-diffed now.
+    parts: list[str] = p.split("/")
+    return parts[len(parts) - 1]
 
 
 @extern
@@ -108,9 +113,32 @@ def join(a: str, b: str) -> str:
     "std::path::Path::new(&{a}).join(&{b}).to_string_lossy().into_owned()"
 
 
-@extern
 def dirname(p: str) -> str:
-    "std::path::Path::new(&{p}).parent().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()"
+    # (W1.5) CPython posixpath.dirname, pure string logic: everything up to
+    # (and excluding) the last "/", with trailing slashes stripped UNLESS the
+    # head is all slashes ("//x" -> "//", "/" -> "/"). The old Rust
+    # Path::parent() backing diverged on trailing-slash and "."/".." inputs
+    # (dirname("a/b/") was "a" instead of "a/b") — python3-diffed now.
+    parts: list[str] = p.split("/")
+    n: int = len(parts)
+    if n == 1:
+        return ""
+    head_parts: list[str] = []
+    i: int = 0
+    while i < n - 1:
+        head_parts.append(parts[i])
+        i = i + 1
+    head: str = "/".join(head_parts) + "/"
+    all_slash: bool = True
+    for ch in head:
+        if ch != "/":
+            all_slash = False
+    if not all_slash:
+        end: int = len(head)
+        while end > 0 and head[end - 1] == "/":
+            end = end - 1
+        head = head[0:end]
+    return head
 
 
 @extern

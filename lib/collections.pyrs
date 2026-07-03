@@ -52,12 +52,17 @@
 #       iteration" would make output vary run-to-run for the SAME binary on
 #       tied counts. Documented, not silent; deterministic across runs.
 #
-# Generic classes (Tier-2 batch 2, rounded out this pass):
-#   - `deque[T]` → double-ended queue backed by a `list[T]`. O(1) at the right
-#     end (`append`/`pop`); O(n) at the left end (`appendleft`/`popleft`, a
-#     list shift) — a faithful API, not CPython's O(1)-both-ends complexity.
-#     NEW this pass: `set_maxlen`, `rotate`, `extend`, `extendleft`, `count`,
-#     `remove`, `clear`.
+# Generic classes (Tier-2 batch 2; deque re-engineered in W1.5):
+#   - `deque[T]` → double-ended queue over a two-stack ring (front reversed +
+#     back), amortized O(1) at BOTH ends (`append`/`appendleft`/`pop`/
+#     `popleft`/`rotate`) — CPython's deque complexity; the former
+#     O(n)-left-end divergence is GONE. Contents are read via `to_list()`
+#     (left-to-right, = CPython's `list(d)`); `pop`/`popleft` on an empty
+#     deque raise CPython's exact IndexError("pop from an empty deque"), and
+#     `peek`/`peekleft` (the `d[-1]`/`d[0]` stand-ins) raise
+#     IndexError("deque index out of range").
+#     Surface: `set_maxlen`, `rotate`, `extend`, `extendleft`, `count`,
+#     `remove`, `clear`, `size`, `is_empty`, `peek`, `peekleft`, `to_list`.
 #     - `set_maxlen(n)`: CPython's `maxlen` is a CONSTRUCTOR keyword
 #       (`deque(iterable, maxlen=n)`); pyrst's zero-arg `deque()` + default-arg
 #       lowering in a generic `__init__` does not thread a default through the
@@ -68,7 +73,14 @@
 #       Setting it trims existing overflow from the LEFT, matching CPython.
 #     - `rotate(n)`: n>0 rotates right (last `n` to the front), n<0 rotates
 #       left; matches CPython `deque.rotate`.
-#     - `remove(x)` raises `ValueError` if `x` is not present (matches CPython).
+#     - `remove(x)` raises `ValueError` if `x` is not present. Message: CPython
+#       3.12's `ValueError("%R is not in deque")` — the missing value's REPR.
+#       KNOWN DIVERGENCE (documented, NOT silent — the value still raises): a
+#       generic `T` element lowers its `repr` to Display formatting, so a STR
+#       element prints UNQUOTED here ("zz is not in deque" vs CPython's "'zz' is
+#       not in deque"); int/float/bool messages are byte-exact. The real
+#       generic-repr fix (quoting str via `%r`) is tracked by card 09152b3a — it
+#       is deliberately NOT faked here.
 #   - `defaultdict[K, V]` → dict that materialises a missing key's value from a
 #     zero-arg `default_factory: Callable[[], V]` on `get`. NOT a `dict`
 #     subclass (no generic-class subclassing); the useful operations are
@@ -232,37 +244,92 @@ def counter_elements[T](counts: dict[T, int]) -> list[T]:
 
 
 class deque[T]:
-    # A double-ended queue over a `list[T]`. `append`/`pop` act on the right end
-    # (O(1)); `appendleft`/`popleft` act on the left end (O(n), a list shift).
-    items: list[T]
+    # (W1.5) A double-ended queue over TWO stacks: `front` holds the LEFT
+    # segment REVERSED (leftmost element last), `back` holds the right segment
+    # in order (rightmost element last); the logical sequence is
+    # reversed(front) + back. Every end operation is an O(1) list push/pop,
+    # with an occasional HALF-SPLIT rebalance when one side runs dry — so
+    # `append`/`appendleft`/`pop`/`popleft`/`rotate` are all amortized O(1),
+    # matching CPython's deque complexity at both ends (the old backing-list
+    # version shifted the whole list on `appendleft`/`popleft` — the
+    # documented O(n)-left-end divergence is GONE). Use `to_list()` for the
+    # logical contents (the old `.items` field no longer exists).
+    front: list[T]
+    back: list[T]
     maxlen: int
 
     def __init__(self) -> None:
-        self.items = []
+        self.front = []
+        self.back = []
         self.maxlen = -1
 
     def set_maxlen(self, n: int) -> None:
         # See module header: maxlen is applied post-construction (compiler
         # gap around default-arg lowering in a generic zero-arg __init__).
+        # Trims existing overflow from the LEFT, like CPython's constructor.
         self.maxlen = n
-        while self.maxlen >= 0 and len(self.items) > self.maxlen:
-            self.items.pop(0)
+        while self.maxlen >= 0 and len(self.front) + len(self.back) > self.maxlen:
+            self.popleft()
 
-    def _enforce_maxlen_right(self) -> None:
-        if self.maxlen >= 0 and len(self.items) > self.maxlen:
-            self.items.pop(0)
+    def to_list(self) -> list[T]:
+        # The logical contents, left to right (what CPython shows as
+        # `deque([...])` / `list(d)`).
+        out: list[T] = []
+        i: int = len(self.front) - 1
+        while i >= 0:
+            out.append(self.front[i])
+            i = i - 1
+        for x in self.back:
+            out.append(x)
+        return out
 
-    def _enforce_maxlen_left(self) -> None:
-        if self.maxlen >= 0 and len(self.items) > self.maxlen:
-            self.items.pop()
+    def _rebalance_from_back(self) -> None:
+        # `front` is empty: move the LEFT half of `back` into `front`
+        # (reversed) so a popleft chain stays amortized O(1).
+        nb: int = len(self.back)
+        half: int = (nb + 1) // 2
+        newfront: list[T] = []
+        i: int = half - 1
+        while i >= 0:
+            newfront.append(self.back[i])
+            i = i - 1
+        newback: list[T] = []
+        j: int = half
+        while j < nb:
+            newback.append(self.back[j])
+            j = j + 1
+        self.front = newfront
+        self.back = newback
+
+    def _rebalance_from_front(self) -> None:
+        # `back` is empty: move the RIGHT half of the logical sequence (the
+        # low-index half of the reversed `front` stack) into `back`.
+        nf: int = len(self.front)
+        half: int = (nf + 1) // 2
+        newback: list[T] = []
+        i: int = half - 1
+        while i >= 0:
+            newback.append(self.front[i])
+            i = i - 1
+        newfront: list[T] = []
+        j: int = half
+        while j < nf:
+            newfront.append(self.front[j])
+            j = j + 1
+        self.front = newfront
+        self.back = newback
 
     def append(self, x: T) -> None:
-        self.items.append(x)
-        self._enforce_maxlen_right()
+        self.back.append(x)
+        if self.maxlen >= 0 and len(self.front) + len(self.back) > self.maxlen:
+            # Full: discard from the OPPOSITE (left) end, like CPython.
+            self.popleft()
 
     def appendleft(self, x: T) -> None:
-        self.items.insert(0, x)
-        self._enforce_maxlen_left()
+        self.front.append(x)
+        if self.maxlen >= 0 and len(self.front) + len(self.back) > self.maxlen:
+            # Full: discard from the OPPOSITE (right) end, like CPython.
+            self.pop()
 
     def extend(self, xs: list[T]) -> None:
         for x in xs:
@@ -275,61 +342,98 @@ class deque[T]:
             self.appendleft(x)
 
     def pop(self) -> T:
-        # Remove + return the RIGHTMOST element. Empty -> list.pop() on empty
-        # panics (IndexError-style), matching pyrst's bare `list.pop()`.
-        return self.items.pop()
+        # Remove + return the RIGHTMOST element. CPython's exact empty-deque
+        # message (shared by pop and popleft).
+        if len(self.back) == 0:
+            if len(self.front) == 0:
+                raise IndexError("pop from an empty deque")
+            self._rebalance_from_front()
+        return self.back.pop()
 
     def popleft(self) -> T:
         # Remove + return the LEFTMOST element.
-        return self.items.pop(0)
+        if len(self.front) == 0:
+            if len(self.back) == 0:
+                raise IndexError("pop from an empty deque")
+            self._rebalance_from_back()
+        return self.front.pop()
 
     def peek(self) -> T:
-        # The rightmost element WITHOUT removing it.
-        return self.items[len(self.items) - 1]
+        # The rightmost element WITHOUT removing it (CPython: d[-1]; the
+        # empty-deque message is CPython's index-error message).
+        if len(self.back) > 0:
+            return self.back[len(self.back) - 1]
+        if len(self.front) > 0:
+            return self.front[0]
+        raise IndexError("deque index out of range")
 
     def peekleft(self) -> T:
-        # The leftmost element WITHOUT removing it.
-        return self.items[0]
+        # The leftmost element WITHOUT removing it (CPython: d[0]).
+        if len(self.front) > 0:
+            return self.front[len(self.front) - 1]
+        if len(self.back) > 0:
+            return self.back[0]
+        raise IndexError("deque index out of range")
 
     def rotate(self, n: int) -> None:
         # n > 0 rotates right (last n elements move to the front); n < 0
-        # rotates left. Matches CPython `deque.rotate`.
-        ln: int = len(self.items)
+        # rotates left. Matches CPython `deque.rotate`. Each step is an
+        # amortized-O(1) pop+push; like CPython, the shorter direction is
+        # taken (identical result).
+        ln: int = len(self.front) + len(self.back)
         if ln == 0:
             return
         steps: int = n % ln
-        i: int = 0
-        while i < steps:
-            x: T = self.items.pop()
-            self.items.insert(0, x)
-            i = i + 1
+        if steps == 0:
+            return
+        if steps > ln // 2:
+            k: int = ln - steps
+            i: int = 0
+            while i < k:
+                x: T = self.popleft()
+                self.append(x)
+                i = i + 1
+        else:
+            j: int = 0
+            while j < steps:
+                y: T = self.pop()
+                self.appendleft(y)
+                j = j + 1
 
     def count(self, x: T) -> int:
-        # Delegate to the backing list's own `count` (identical semantics).
-        return self.items.count(x)
+        # Both stacks hold disjoint segments; counting is order-independent.
+        return self.front.count(x) + self.back.count(x)
 
     def remove(self, x: T) -> None:
-        # DELIBERATE non-delegation (not `self.items.remove(x)`): the list
-        # builtin's not-found message is NOT CPython-faithful for a deque,
-        # whereas CPython's `deque.remove` raises the exact
-        # ValueError("deque.remove(x): x not in deque") below. The hand-rolled
-        # scan preserves that message for fidelity.
+        # Remove the LEFTMOST occurrence. Message fidelity: CPython 3.12's
+        # `deque.remove` raises ValueError("%R is not in deque" % value) —
+        # the value's REPR followed by " is not in deque" (python3-verified;
+        # the pre-3.12 "deque.remove(x): x not in deque" spelling is gone).
+        # KNOWN EDGE: `repr` of a GENERIC `T` lowers to Display formatting,
+        # so a `str` element prints UNQUOTED here ("zz is not in deque" vs
+        # CPython's "'zz' is not in deque") — exact for int/float/bool
+        # elements, quote-less for str (compiler-level generic-repr gap,
+        # documented not silent). O(n), same as CPython's own scan.
+        xs: list[T] = self.to_list()
         i: int = 0
-        while i < len(self.items):
-            if self.items[i] == x:
-                self.items.pop(i)
+        while i < len(xs):
+            if xs[i] == x:
+                xs.pop(i)
+                self.front = []
+                self.back = xs
                 return
             i = i + 1
-        raise ValueError("deque.remove(x): x not in deque")
+        raise ValueError(f"{repr(x)} is not in deque")
 
     def clear(self) -> None:
-        self.items = []
+        self.front = []
+        self.back = []
 
     def size(self) -> int:
-        return len(self.items)
+        return len(self.front) + len(self.back)
 
     def is_empty(self) -> bool:
-        return len(self.items) == 0
+        return len(self.front) + len(self.back) == 0
 
 
 class defaultdict[K, V]:

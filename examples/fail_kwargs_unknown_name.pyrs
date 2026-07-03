@@ -1,0 +1,13 @@
+# (kwargs v1, card 8a7b7714) A keyword argument that names NO parameter of the
+# callee is a CHECK-time error: "`wrap` got an unexpected keyword argument
+# `bogus`" — CPython raises TypeError for the same shape. Before the
+# keyword→positional mapping this was caught by the blanket kwargs gate; now the
+# mapping itself validates the name against the real signature.
+# This file must be rejected by BOTH `pyrst check` and `pyrst build`.
+def wrap(text: str, width: int = 70) -> str:
+    return text + str(width)
+
+
+def main() -> None:
+    # ERROR: `wrap` has no parameter named `bogus`.
+    print(wrap("hi", bogus=10))

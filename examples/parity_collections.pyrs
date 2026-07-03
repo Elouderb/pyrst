@@ -64,18 +64,18 @@ def main() -> None:
     d.append(2)
     d.append(3)
     d.extend([4, 5])
-    print(d.items)                              # [1, 2, 3, 4, 5]
+    print(d.to_list())                              # [1, 2, 3, 4, 5]
     d.extendleft([9, 8])
-    print(d.items)                              # [8, 9, 1, 2, 3, 4, 5]
+    print(d.to_list())                              # [8, 9, 1, 2, 3, 4, 5]
     print(d.count(9))                            # 1
     d.remove(9)
-    print(d.items)                               # [8, 1, 2, 3, 4, 5]
+    print(d.to_list())                               # [8, 1, 2, 3, 4, 5]
     d.rotate(2)
-    print(d.items)                               # [4, 5, 8, 1, 2, 3]
+    print(d.to_list())                               # [4, 5, 8, 1, 2, 3]
     d.rotate(-2)
-    print(d.items)                               # [8, 1, 2, 3, 4, 5]
+    print(d.to_list())                               # [8, 1, 2, 3, 4, 5]
     d.clear()
-    print(d.items)                               # []
+    print(d.to_list())                               # []
 
     dm: deque[int] = deque()
     dm.set_maxlen(3)
@@ -83,9 +83,48 @@ def main() -> None:
     dm.append(2)
     dm.append(3)
     dm.append(4)
-    print(dm.items)                              # [2, 3, 4]  (left trimmed)
+    print(dm.to_list())                              # [2, 3, 4]  (left trimmed)
     dm.appendleft(0)
-    print(dm.items)                              # [0, 2, 3]  (right trimmed)
+    print(dm.to_list())                              # [0, 2, 3]  (right trimmed)
+
+    # --- W1.5 two-stack ring: rotate/extendleft/maxlen edge matrix + CPython
+    # error messages (every value python3-diffed against collections.deque
+    # during the pass; amortized O(1) both ends, rebalance boundary crossed
+    # by the alternating drain below) ---
+    dm.rotate(1)
+    print(dm.to_list())                              # [3, 0, 2]
+    dm.rotate(-4)
+    print(dm.to_list())                              # [0, 2, 3]
+    dz: deque[int] = deque()
+    dz.set_maxlen(0)
+    dz.append(9)
+    dz.appendleft(8)
+    print(dz.to_list())                              # []  (maxlen=0 stays empty)
+    de: deque[int] = deque()
+    try:
+        de.pop()
+    except IndexError as epop:
+        print(epop)                                  # pop from an empty deque
+    try:
+        de.popleft()
+    except IndexError as epopl:
+        print(epopl)                                 # pop from an empty deque
+    try:
+        de.remove(1)
+    except ValueError as erem:
+        print(erem)                                  # 1 is not in deque
+    drain: deque[int] = deque()
+    drain.extend([0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
+    order: list[int] = []
+    di: int = 0
+    while di < 10:
+        if di % 2 == 0:
+            order.append(drain.popleft())
+        else:
+            order.append(drain.pop())
+        di = di + 1
+    print(order)                                     # [0, 9, 1, 8, 2, 7, 3, 6, 4, 5]
+    print(drain.is_empty())                          # True
 
     # --- defaultdict rounding-out (NEW: pop/setdefault/update/keys/values/items/clear) ---
     dd: defaultdict[str, int] = defaultdict(lambda: -1)

@@ -113,6 +113,23 @@ impl<'a> Codegen<'a> {
         Ok(result.map(|s| Self::hoist_wrap(&recv_prelude, s)))
     }
 
+    /// (W1.5 fix E) Emit the `let __fill = ..;` binding for `str.ljust`/`rjust`/
+    /// `center`. When a 2nd argument (fillchar) is present it is bound and
+    /// runtime-checked to be exactly one character — CPython raises
+    /// `TypeError: The fill character must be exactly one character long`
+    /// otherwise. Absent, the pad character is a single space (no check needed).
+    /// The caller pads with `__fill.repeat(n)` in place of the old hardcoded space.
+    fn justify_fillchar(parts: &[String]) -> String {
+        if parts.len() >= 2 {
+            format!(
+                "let __fill = {}; if __fill.chars().count() != 1 {{ panic!(\"TypeError\\0The fill character must be exactly one character long\"); }}",
+                parts[1]
+            )
+        } else {
+            "let __fill = \" \";".to_string()
+        }
+    }
+
     #[allow(clippy::borrowed_box)]
     pub(crate) fn emit_method_call_on_attr_inner(
         &mut self,
@@ -147,13 +164,11 @@ impl<'a> Codegen<'a> {
                         if self.ctx.module_funcs.get(modname).is_some_and(|fns| fns.iter().any(|n| n == name)) {
                             let span = callee.span();
                             let flat_callee: Box<Expr> = Box::new(Expr::Ident(name.clone(), span));
-                            // (card d8a1ed83) Forward `kwargs` (NOT `&[]`) so a
-                            // kwarg on a qualified module call is no longer
-                            // silently DROPPED here (the json.dumps(indent=4)
-                            // bug): emit_plain_func_call's non-empty-kwargs error
-                            // fires as the codegen backstop. In practice the
-                            // typeck kwargs gate already rejects it at check time,
-                            // so this only ever triggers defensively.
+                            // (card d8a1ed83, kwargs v1) Forward `kwargs` (NOT
+                            // `&[]`) so a kwarg on a qualified module call flows
+                            // into emit_plain_func_call's keyword→positional
+                            // mapping (`textwrap.fill(text, width=10)` lowers
+                            // exactly like the flat `fill(text, width=10)`).
                             return Ok(Some(self.emit_plain_func_call(&flat_callee, args, kwargs)?));
                         }
                     }
@@ -164,7 +179,22 @@ impl<'a> Codegen<'a> {
                             if let Some(method_def) = class_def.methods.iter().find(|m| &m.name == name) {
                                 if method_def.decorators.contains(&"staticmethod".to_string()) {
                                     let parts: Result<Vec<_>> = args.iter().map(|a| self.emit_consuming(a)).collect();
-                                    let parts = parts?;
+                                    let mut parts = parts?;
+                                    // (kwargs v1) Trailing-default fill for a
+                                    // static call, mirroring free functions
+                                    // (previously leaked rustc E0061).
+                                    if let Some(sig) = self.ctx.get_method(class_name, name) {
+                                        if parts.len() < sig.params.len() {
+                                            let start = sig.param_defaults.len()
+                                                .saturating_sub(sig.params.len() - parts.len());
+                                            for def_expr in &sig.param_defaults[start..] {
+                                                if let Some(e) = def_expr {
+                                                    let e = e.clone();
+                                                    parts.push(self.emit_expr(&e)?);
+                                                }
+                                            }
+                                        }
+                                    }
                                     return Ok(Some(format!("{}::{}({})", class_name, name, parts.join(", "))));
                                 }
                             }
@@ -231,7 +261,9 @@ impl<'a> Codegen<'a> {
                     // pre-existing EPIC-5 lowering.
                     if let Ty::Class(cls, _) = self.type_of_expr(obj.as_ref()) {
                         if self.ctx.get_method(&cls, name).is_some() {
-                            return self.emit_user_method_call(&obj_s, &cls, name, args, &parts).map(Some);
+                            return self
+                                .emit_user_method_call(&obj_s, &cls, name, args, kwargs, &parts, callee.span())
+                                .map(Some);
                         }
                         // Not a method — a `Callable` FIELD invoked as `obj.f(args)`.
                         // The field holds an `Rc<dyn Fn(..) -> ..>`, so Rust needs the
@@ -279,10 +311,12 @@ impl<'a> Codegen<'a> {
                     // Special case: len() as method
                     if name == "len" {
                         // str length is character count, not UTF-8 byte count.
+                        // (W1.5) PARENTHESIZED: a bare `x.len() as i64 < n`
+                        // makes rustc parse `i64<` as generic arguments.
                         if matches!(self.type_of_expr(obj.as_ref()), Ty::Str) {
-                            return Ok(Some(format!("{}.chars().count() as i64", obj_s)));
+                            return Ok(Some(format!("({}.chars().count() as i64)", obj_s)));
                         }
-                        return Ok(Some(format!("{}.len() as i64", obj_s)));
+                        return Ok(Some(format!("({}.len() as i64)", obj_s)));
                     }
 
                     // Special case: get() for dicts. Arg-count-aware, mirroring
@@ -334,14 +368,30 @@ impl<'a> Codegen<'a> {
                         )));
                     }
                     if name == "expandtabs" {
+                        // (W1.5, textwrap pipeline) REAL CPython tab-stop
+                        // semantics: each '\t' pads to the next multiple of
+                        // `tabsize` from the current COLUMN, which resets on
+                        // '\n'/'\r'; tabsize <= 0 deletes tabs. The previous
+                        // lowering (`replace('\t', " ".repeat(n))`) padded a
+                        // fixed width regardless of column — python3-diffed
+                        // wrong for any text with a non-empty prefix before
+                        // the tab ("a\tb".expandtabs(8) is "a       b", 7
+                        // pad spaces, not 8).
                         let tab_size = if !parts.is_empty() {
-                            format!("{} as usize", parts[0])
+                            format!("{}", parts[0])
                         } else {
-                            "8usize".to_string()
+                            "8i64".to_string()
                         };
                         return Ok(Some(format!(
-                            "{{ let __s = {}.clone(); let __tab_size = {}; \
-                            __s.replace('\\t', &\" \".repeat(__tab_size)) }}",
+                            "{{ let __s = {}.clone(); let __t: i64 = {}; \
+                            let __tab = if __t < 1 {{ 0usize }} else {{ __t as usize }}; \
+                            let mut __out = String::new(); let mut __col = 0usize; \
+                            for __ch in __s.chars() {{ \
+                            if __ch == '\\t' {{ if __tab > 0 {{ let __pad = __tab - (__col % __tab); \
+                            for _ in 0..__pad {{ __out.push(' '); }} __col += __pad; }} }} \
+                            else if __ch == '\\n' || __ch == '\\r' {{ __out.push(__ch); __col = 0; }} \
+                            else {{ __out.push(__ch); __col += 1; }} }} \
+                            __out }}",
                             obj_s, tab_size
                         )));
                     }
@@ -411,47 +461,99 @@ impl<'a> Codegen<'a> {
                         return Ok(Some(format!("({}.chars().all(|c| !c.is_control()))", obj_s)));
                     }
                     if name == "istitle" {
+                        // (W1.5 fix E) CPython's exact single-pass cased-run rule
+                        // (unicodeobject.c unicode_istitle_impl), replacing the old
+                        // whitespace-word predicate that wrongly answered True on
+                        // uncased-separated words (`"A1a".istitle()` -> True, python3
+                        // False; `"A1A"` -> False, python3 True). An UPPER/TITLECASE
+                        // char must NOT follow a cased char; a LOWERCASE char MUST
+                        // follow a cased char; any UNCASED char (digit/space/punct)
+                        // resets the run; the whole string must contain >=1 cased
+                        // char. `__is_upper` also admits titlecase (Lt) digraphs —
+                        // neither is_uppercase nor is_lowercase, but with distinct
+                        // upper AND lower mappings — matching Py_UNICODE_ISTITLE.
                         return Ok(Some(format!(
-                            "(!{}.is_empty() && {}.split_whitespace().all(|word| if word.is_empty() {{ true }} else {{ word.chars().next().unwrap().is_uppercase() && word[1..].chars().all(|c| !c.is_alphabetic() || c.is_lowercase()) }}))",
-                            obj_s, obj_s
+                            "{{ let mut __cased = false; let mut __prev_cased = false; let mut __ok = true; for __c in {}.chars() {{ let __is_upper = __c.is_uppercase() || (!__c.is_lowercase() && __c.to_uppercase().next() != Some(__c) && __c.to_lowercase().next() != Some(__c)); if __is_upper {{ if __prev_cased {{ __ok = false; break; }} __prev_cased = true; __cased = true; }} else if __c.is_lowercase() {{ if !__prev_cased {{ __ok = false; break; }} __prev_cased = true; __cased = true; }} else {{ __prev_cased = false; }} }} (__ok && __cased) }}",
+                            obj_s
                         )));
                     }
 
                     // Additional string methods
                     if name == "capitalize" {
+                        // (W1.5, card b671f313) CHAR-based, CPython-exact: the
+                        // old `&__s[1..]` BYTE slice panicked on a multibyte
+                        // first char (capwords("héllo") crash). Now: first
+                        // char TITLECASED (__py_titlecase — ß -> "Ss", ǆ -> ǅ,
+                        // like python3), rest = the FULL string's
+                        // to_lowercase() minus the first char's lowered bytes,
+                        // so the Final_Sigma context is preserved
+                        // ("ΑΣ".capitalize() == "Ας", python3-diffed).
                         return Ok(Some(format!(
-                            "{{ let __s = {}.clone(); if __s.is_empty() {{ __s }} else {{ format!(\"{{}}{{}}\" , __s.chars().next().unwrap().to_uppercase(), &__s[1..].to_lowercase()) }} }}",
+                            "{{ let __s = {}.clone(); match __s.chars().next() {{ None => __s, Some(__c0) => {{ let __low = __s.to_lowercase(); let __skip: usize = __c0.to_lowercase().map(|c| c.len_utf8()).sum(); format!(\"{{}}{{}}\", __py_titlecase(__c0), &__low[__skip..]) }} }} }}",
                             obj_s
                         )));
                     }
                     if name == "title" {
+                        // (W1.5, card b671f313) Same byte-slice crash fixed
+                        // (multibyte-initial words), same titlecase+context-
+                        // lower treatment per word. KNOWN DIVERGENCE (kept,
+                        // documented): word boundaries are WHITESPACE here
+                        // (split_whitespace + single-space join); CPython
+                        // titles after ANY non-cased char ("don't".title() is
+                        // "Don'T" there, "Don't" here) and preserves the
+                        // original whitespace.
                         return Ok(Some(format!(
-                            "{{ let __s = {}.clone(); __s.split_whitespace().map(|w| if w.is_empty() {{ w.to_string() }} else {{ format!(\"{{}}{{}}\" , w.chars().next().unwrap().to_uppercase(), &w[1..].to_lowercase()) }} ).collect::<Vec<_>>().join(\" \") }}",
+                            "{{ let __s = {}.clone(); __s.split_whitespace().map(|w| match w.chars().next() {{ None => w.to_string(), Some(__c0) => {{ let __low = w.to_lowercase(); let __skip: usize = __c0.to_lowercase().map(|c| c.len_utf8()).sum(); format!(\"{{}}{{}}\", __py_titlecase(__c0), &__low[__skip..]) }} }} ).collect::<Vec<_>>().join(\" \") }}",
                             obj_s
                         )));
                     }
                     if name == "zfill" && !parts.is_empty() {
+                        // (W1.5, card b671f313 audit) Width was compared in
+                        // BYTES (multibyte strings silently under/over-padded)
+                        // and a leading sign was zero-padded on the WRONG side
+                        // ("-42".zfill(5) gave "00-42", CPython gives
+                        // "-0042"). Now: char-count width, sign kept first.
                         return Ok(Some(format!(
-                            "{{ let __width = {} as usize; let __s = {}.clone(); if __s.len() >= __width {{ __s }} else {{ format!(\"{{:0>width$}}\" , __s, width = __width) }} }}",
+                            "{{ let __width = {} as usize; let __s = {}.clone(); let __n = __s.chars().count(); if __n >= __width {{ __s }} else {{ let (__sign, __body) = if __s.starts_with('+') || __s.starts_with('-') {{ __s.split_at(1) }} else {{ (\"\", __s.as_str()) }}; format!(\"{{}}{{}}{{}}\", __sign, \"0\".repeat(__width - __n), __body) }} }}",
                             parts[0], obj_s
                         )));
                     }
                     if name == "ljust" && !parts.is_empty() {
+                        // (W1.5, card b671f313 audit) BYTE-length width bug
+                        // fixed: pad by CHAR count like CPython.
+                        // (W1.5 fix E) The optional 2nd arg (fillchar) is now
+                        // HONORED — it used to be silently ignored (always padded
+                        // with a space). CPython requires exactly one char, else
+                        // TypeError.
+                        let fill = Self::justify_fillchar(&parts);
                         return Ok(Some(format!(
-                            "{{ let __width = {} as usize; let __s = {}.clone(); if __s.len() >= __width {{ __s }} else {{ format!(\"{{:<width$}}\" , __s, width = __width) }} }}",
-                            parts[0], obj_s
+                            "{{ let __width = {} as usize; let __s = {}.clone(); {} let __n = __s.chars().count(); if __n >= __width {{ __s }} else {{ format!(\"{{}}{{}}\", __s, __fill.repeat(__width - __n)) }} }}",
+                            parts[0], obj_s, fill
                         )));
                     }
                     if name == "rjust" && !parts.is_empty() {
+                        // (W1.5, card b671f313 audit) BYTE-length width bug
+                        // fixed: pad by CHAR count like CPython.
+                        // (W1.5 fix E) fillchar now honored (see ljust).
+                        let fill = Self::justify_fillchar(&parts);
                         return Ok(Some(format!(
-                            "{{ let __width = {} as usize; let __s = {}.clone(); if __s.len() >= __width {{ __s }} else {{ format!(\"{{:>width$}}\" , __s, width = __width) }} }}",
-                            parts[0], obj_s
+                            "{{ let __width = {} as usize; let __s = {}.clone(); {} let __n = __s.chars().count(); if __n >= __width {{ __s }} else {{ format!(\"{{}}{{}}\", __fill.repeat(__width - __n), __s) }} }}",
+                            parts[0], obj_s, fill
                         )));
                     }
                     if name == "center" && !parts.is_empty() {
+                        // (W1.5, card b671f313 audit) BYTE-length width bug
+                        // fixed + CPython's exact left-margin rule:
+                        // left = marg/2 + (marg & width & 1) — the old
+                        // (total+1)/2 flipped which side gets the odd space
+                        // for even widths ("abc".center(6) is " abc  " in
+                        // CPython, not "  abc ").
+                        // (W1.5 fix E) fillchar now honored (see ljust) — the
+                        // byte-width rewrite still hardcoded a space fill.
+                        let fill = Self::justify_fillchar(&parts);
                         return Ok(Some(format!(
-                            "{{ let __width = {} as usize; let __s = {}.clone(); if __s.len() >= __width {{ __s }} else {{ let __total = __width - __s.len(); let __left = (__total + 1) / 2; let __right = __total / 2; format!(\"{{}}{{}}{{}}\" , \" \".repeat(__left), __s, \" \".repeat(__right)) }} }}",
-                            parts[0], obj_s
+                            "{{ let __width = {} as usize; let __s = {}.clone(); {} let __n = __s.chars().count(); if __n >= __width {{ __s }} else {{ let __marg = __width - __n; let __left = __marg / 2 + (__marg & __width & 1); format!(\"{{}}{{}}{{}}\", __fill.repeat(__left), __s, __fill.repeat(__marg - __left)) }} }}",
+                            parts[0], obj_s, fill
                         )));
                     }
                     if name == "swapcase" {
@@ -591,10 +693,17 @@ impl<'a> Codegen<'a> {
                         return Ok(Some(format!("{{ let __idx = {}.iter().position(|__x| *__x == {}).unwrap_or_else(|| panic!(\"ValueError\\0value not found\")); {}.remove(__idx); }}", obj_s, parts[0], obj_s)));
                     }
                     if name == "index" && !parts.is_empty() {
-                        return Ok(Some(format!("{}.iter().position(|__x| *__x == {}).unwrap_or_else(|| panic!(\"ValueError\\0value not found\")) as i64", obj_s, parts[0])));
+                        // (W1.5 fix D) Parenthesize the `as i64` cast — an
+                        // unparenthesized `EXPR as i64` as the LEFTMOST operand of
+                        // a comparison (`xs.index(v) < n`) is misparsed by rustc as
+                        // generic arguments (`i64 < .. >`), the same E0747-class
+                        // ambiguity fixed for len() this epic.
+                        return Ok(Some(format!("({}.iter().position(|__x| *__x == {}).unwrap_or_else(|| panic!(\"ValueError\\0value not found\")) as i64)", obj_s, parts[0])));
                     }
                     if name == "count" && !parts.is_empty() {
-                        return Ok(Some(format!("{}.iter().filter(|__x| **__x == {}).count() as i64", obj_s, parts[0])));
+                        // (W1.5 fix D) Parenthesize the `as i64` cast — see index above
+                        // (`xs.count(1) < len(xs)` died at rustc without the parens).
+                        return Ok(Some(format!("({}.iter().filter(|__x| **__x == {}).count() as i64)", obj_s, parts[0])));
                     }
                     if name == "reverse" {
                         return Ok(Some(format!("{}.reverse()", obj_s)));
@@ -799,13 +908,52 @@ impl<'a> Codegen<'a> {
                                     }
                                 }
                             }
+                            // (kwargs v1 + card f21369d7) Bind every argument
+                            // to its `__init__` PARAM SLOT via the shared
+                            // keyword→positional mapping: positional
+                            // left-to-right, keywords by name, declared
+                            // defaults into the holes. The OLD code appended
+                            // keyword values in SOURCE order — an
+                            // out-of-order keyword ctor call (`C(b=2, a=1)`)
+                            // silently passed `(2, 1)` positionally, a
+                            // miscompile whenever the swapped params shared a
+                            // type. Out-of-slot-order keyword values are
+                            // hoisted into source-ordered temps so side
+                            // effects still run left-to-right (CPython call
+                            // order), mirroring emit_plain_func_call.
+                            if !kwargs.is_empty() {
+                                let init_key = format!("{}.__init__", name);
+                                if let Some(mut sig) = self.ctx.funcs.get(&init_key).cloned() {
+                                    let slots = crate::typeck::map_kwargs_to_slots(
+                                        &init_key, &sig, args.len(), kwargs, callee.span(),
+                                    )?;
+                                    // (item A) Shared slot mapper: source-order
+                                    // hoist (positionals AND keyword values) +
+                                    // declared-default fill, mirroring the free-fn
+                                    // and method call sites. `coerced = false`
+                                    // keeps the constructor's `emit_arg_into_slot`
+                                    // emission (poly-base wrap / `Callable` cast /
+                                    // clone-on-use) against the `__init__` param
+                                    // (already substituted for a generic class).
+                                    // The constructor path emits every param by
+                                    // VALUE (like the positional path below), so
+                                    // clear `param_by_ref` — a `Mut[T]` ctor param
+                                    // is not a modeled `::new` shape today.
+                                    sig.param_by_ref = Vec::new();
+                                    let param_tys: Vec<Ty> =
+                                        init_params.iter().map(|(_, t)| t.clone()).collect();
+                                    let (prelude, call_parts) = self.emit_slotted_args(
+                                        &slots, args, kwargs, &sig, &param_tys, /*coerced=*/ false,
+                                    )?;
+                                    return Ok(Some(Self::hoist_wrap(
+                                        &prelude,
+                                        format!("{}::new({})", name, call_parts.join(", ")),
+                                    )));
+                                }
+                            }
                             let mut call_parts = Vec::new();
                             for (i, a) in args.iter().enumerate() {
                                 call_parts.push(self.emit_arg_into_slot(a, init_params.get(i).map(|(_, t)| t))?);
-                            }
-                            for (kw, v) in kwargs {
-                                let pt = init_params.iter().find(|(n, _)| n == kw).map(|(_, t)| t);
-                                call_parts.push(self.emit_arg_into_slot(v, pt)?);
                             }
                             return Ok(Some(format!("{}::new({})", name, call_parts.join(", "))));
                         }
@@ -851,9 +999,26 @@ impl<'a> Codegen<'a> {
                             return Ok(Some(format!("{} {{ {} }}", name, parts.join(", "))));
                         }
 
-                        // Keyword-args form.
+                        // Keyword-args form (possibly MIXED with positional args).
                         if !kwargs.is_empty() {
                             let mut parts = Vec::new();
+                            // (W1.5 fix B) Positional args bind to the LEADING
+                            // fields (declaration order) — they used to be SILENTLY
+                            // DROPPED whenever a call mixed positionals with
+                            // keywords (`Point(1, y=2)` emitted `Point { y: 2 }`,
+                            // losing the `1`). Emitting the positionals first, then
+                            // the keywords in written order, also preserves CPython
+                            // left-to-right call-site evaluation: a Rust struct
+                            // literal evaluates its field initializers in the order
+                            // written, which is exactly positionals-then-keywords
+                            // source order. typeck (map_kwargs_to_slots against the
+                            // synthesized field signature) has already rejected any
+                            // duplicate / unknown / missing / too-many argument.
+                            for (field_name, arg) in all_field_names.iter().zip(args.iter()) {
+                                let fty = self.class_field_type(&class_def, field_name);
+                                let v = self.emit_arg_into_slot(arg, fty.as_ref())?;
+                                parts.push(format!("{}: {}", escape_ident(field_name), v));
+                            }
                             for (kw, val) in kwargs {
                                 let fty = self.class_field_type(&class_def, kw);
                                 let v = self.emit_arg_into_slot(val, fty.as_ref())?;
@@ -1040,10 +1205,14 @@ impl<'a> Codegen<'a> {
                             let a = self.emit_expr(&args[0])?;
                             // Python len() of a str is the CHARACTER count, not the
                             // UTF-8 byte count. Collections keep .len().
+                            // (W1.5) PARENTHESIZED: a bare `x.len() as i64 < n`
+                            // (len leftmost in a `<`/`<=` comparison) makes rustc
+                            // parse `i64<` as generic arguments (E0658-style
+                            // parse error); the parens keep every context valid.
                             if matches!(self.type_of_expr(&args[0]), Ty::Str) {
-                                return Ok(Some(format!("{}.chars().count() as i64", a)));
+                                return Ok(Some(format!("({}.chars().count() as i64)", a)));
                             }
-                            return Ok(Some(format!("{}.len() as i64", a)));
+                            return Ok(Some(format!("({}.len() as i64)", a)));
                         }
                         "str" => {
                             let a = self.emit_expr(&args[0])?;

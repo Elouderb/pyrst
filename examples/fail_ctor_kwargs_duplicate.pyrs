@@ -1,0 +1,14 @@
+# (W1.5 fix B) A constructor that fills the same field both positionally and by
+# keyword is a CHECK-time error: "`Point` got multiple values for argument `x`"
+# (CPython raises the same TypeError). Before the fix the struct-literal path
+# silently dropped the positional and kept the keyword.
+# This file must be rejected by BOTH `pyrst check` and `pyrst build`.
+class Point:
+    x: int
+    y: int
+
+
+def main() -> None:
+    # ERROR: positional `1` and keyword `x=2` both bind field `x`.
+    p: Point = Point(1, x=2)
+    print(p.x)

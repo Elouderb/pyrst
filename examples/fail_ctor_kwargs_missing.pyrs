@@ -1,0 +1,16 @@
+# (W1.5 fix B) A constructor that leaves a required field unfilled is a CHECK-time
+# error: "`Point` missing a required argument: `y`". A no-__init__ class is a
+# struct-literal whose fields are all required for explicit construction (a bare
+# `Point()` zero-inits, but a partial `Point(1)` cannot leave `y` unset); before
+# the fix this was a late build error (missing struct field), now it is honest at
+# check time via the synthesized field-order signature.
+# This file must be rejected by BOTH `pyrst check` and `pyrst build`.
+class Point:
+    x: int
+    y: int
+
+
+def main() -> None:
+    # ERROR: field `y` is never provided.
+    p: Point = Point(1)
+    print(p.x)

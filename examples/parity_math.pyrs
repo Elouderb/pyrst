@@ -167,3 +167,49 @@ def main() -> None:
         print(str(e))
     print(math.asin(1.0))
     print(math.acos(-1.0))
+
+    # --- W1.5: 2-arg log + pow/fmod/remainder domain-edge parity (the
+    # +-inf-INPUT edges live in the module header + dev probes only: spelling
+    # infinity is `math.inf()` in pyrst — a niladic fn, not python3's
+    # constant — so those shapes cannot dual-run). ---
+    print(math.log(8.0, 2.0))
+    print(math.log(100.0, 10.0))
+    print(math.log(10.0, 0.5))
+    try:
+        print(math.log(10.0, 1.0))
+    except ZeroDivisionError as e:
+        print(str(e))
+    try:
+        print(math.log(10.0, 0.0))
+    except ValueError as e:
+        print(str(e))
+    try:
+        print(math.log(-1.0, 2.0))
+    except ValueError as e:
+        print(str(e))
+    print(math.fmod(5.5, 2.0))
+    print(math.fmod(-5.5, 2.0))
+    try:
+        print(math.fmod(1.0, 0.0))
+    except ValueError as e:
+        print(str(e))
+    print(math.pow(2.0, 10.0))
+    print(math.pow(-2.0, 3.0))
+    print(math.pow(0.0, 0.0))
+    try:
+        print(math.pow(-1.0, 0.5))
+    except ValueError as e:
+        print(str(e))
+    try:
+        print(math.pow(0.0, -2.0))
+    except ValueError as e:
+        print(str(e))
+    try:
+        print(math.pow(10.0, 400.0))
+    except OverflowError as e:
+        print(str(e))
+    print(math.remainder(5.5, 2.0))
+    try:
+        print(math.remainder(1.0, 0.0))
+    except ValueError as e:
+        print(str(e))

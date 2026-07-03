@@ -82,3 +82,20 @@ math domain error
 math domain error
 1.5707963267948966
 3.141592653589793
+3.0
+2.0
+-3.3219280948873626
+float division by zero
+math domain error
+math domain error
+1.5
+-1.5
+math domain error
+1024.0
+-8.0
+1.0
+math domain error
+math domain error
+math range error
+-0.5
+math domain error

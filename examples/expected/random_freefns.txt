@@ -1,0 +1,22 @@
+[60, 10, 10, 60, 30, 20]
+[7, 3, 2, 8, 5, 6, 9, 4, 0, 1]
+[1, 0, 4, 9, 6]
+[2, 1, 8, 4, 3, 0, 6, 5, 9, 7]
+[]
+[2, 1, 1, 1, 3]
+[2, 2, 1, 2, 1]
+[1]
+[2, 1, 1, 2]
+[]
+日本語
+['😀', 'café', '日本語', 'a', 'naïve']
+['😀', 'naïve', 'café', 'a', '日本語']
+sample error: Sample larger than population or is negative
+choices error: The number of weights does not match the population
+choice empty error: Cannot choose from an empty sequence
+choices empty error: list index out of range
+choices zero-weight error: Total of weights must be greater than zero
+getrandbits(63) error: number of bits must be in [0, 62] (pyrst int is i64; CPython allows arbitrary k)
+gammavariate error: gammavariate: alpha and beta must be > 0.0
+[1077836398983698485, 636514280624, 1824768936701867058, 1055108350016, 3996417946400308373, 639322662406, 1920480399143422819, 1057806453850, 914548321006651036, 1011102635253, 4255759216510735009, 184436880453, 3816751827873656386, 278339698994, 2827626228601773305, 46290191186, 3840431470055368515, 14275183314, 4063730792061987963, 986344950361]
+True

@@ -6,7 +6,9 @@
 # `src/stdlib.rs`). Usable as either `from bisect import bisect_left` or
 # `import bisect; bisect.bisect_left(a, x)`.
 #
-# Fidelity: 4/5 (design doc `docs/design/stdlib-full.md` §D row "bisect").
+# Fidelity: 4.5/5 (W1.5: `lo=`/`hi=` KEYWORD calls now work — kwargs v1 —
+# so CPython call shapes run as-is; `key=` is the one remaining gap, needing
+# two-type-param Callable defaults). Design doc §D row "bisect".
 #
 # Surface (exact CPython names/shapes):
 #   - `bisect_left(a, x, lo=0, hi=None)`  → leftmost index where `x` can be

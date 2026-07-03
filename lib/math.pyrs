@@ -4,7 +4,10 @@
 # `include_str!` (see `src/stdlib.rs`). Usable as either
 # `from math import sqrt` or `import math; math.sqrt(x)`.
 #
-# FIDELITY: 4/5 (was 3/5). Surface: 3 float consts (`pi`/`e`/`tau`) + 2
+# FIDELITY: 4.5/5 (W1.5 divergence-closing pass; was 4/5 — 2-arg log landed,
+# every remaining domain edge guarded with CPython error shapes; the G6
+# float-returning floor/ceil/trunc and the niladic inf()/nan() call shape are
+# the documented remaining gaps). Surface: 3 float consts (`pi`/`e`/`tau`) + 2
 # @extern niladic "constant" functions (`inf`/`nan`) + 33 @extern float
 # wrappers over Rust `f64` methods + 6 pure-pyrst int functions
 # (`gcd`/`lcm`/`factorial`/`comb`/`perm`/`isqrt`) + 2 pure-pyrst helpers
@@ -23,11 +26,16 @@
 #                                                    nan -> nan; +-inf raise)
 #     These are implemented as pure-pyrst public wrappers over private
 #     `_math_<fn>_raw` @extern primitives (so the raw Rust `f64` method is
-#     called exactly once, after the guard). REMAINING (un-guarded) edges,
-#     kept honest here: `sin`/`cos`/`tan` on +-inf return NaN rather than
-#     raising CPython's domain error, and `pow`/`fmod`/`remainder` do not
-#     replicate CPython's (more intricate) domain rules — these thin @extern
-#     wrappers pass Rust's IEEE-754 result through unchanged on those edges.
+#     called exactly once, after the guard). (W1.5) The formerly un-guarded
+#     edges are now guarded too, python3-verified:
+#       - `sin`/`cos`/`tan` on +-inf raise ValueError("math domain error");
+#       - `pow` implements CPython's full rule set (pow(1, any)/pow(any, 0)
+#         are 1.0 even for nan/inf; pow(+-0, negative finite) and a
+#         nan-from-finite-inputs result raise ValueError; an infinite result
+#         from finite inputs raises OverflowError("math range error"));
+#       - `fmod(x, 0)` / `fmod(+-inf, y)` raise ValueError (nan inputs
+#         propagate);
+#       - `remainder(x, 0)` / `remainder(+-inf, y)` raise ValueError.
 #   - FLOAT-SPECIALIZED: nearly every trig/exp/rounding function takes and
 #     returns `float` only (pyrst generics over numeric kinds are a later
 #     card). `math.sqrt(16)` is a type error in pyrst — write `16.0`.
@@ -35,9 +43,10 @@
 #     the explicitly gated **G6** delta ("int/float overload") — deferred.
 #     `round()` (builtin, not in this module) is likewise int-returning in
 #     CPython and is not re-added here.
-#   - `log(x)` is natural log only; the two-argument `log(x, base)` overload
-#     needs the same G6 overloading machinery and is deferred — use
-#     `log2`/`log10`, or `log(x) / log(base)` for an arbitrary base.
+#   - (W1.5) `log(x, base=None)`: CPython's two-argument form is now offered
+#     (log(x)/log(base), CPython's own computation), incl. base <= 0 ->
+#     ValueError and base == 1 -> ZeroDivisionError; `log2`/`log10` remain the
+#     specialized fast forms.
 #   - `gcd`/`lcm` are 2-argument (`gcd(a, b)`), not CPython's variadic
 #     `gcd(*integers)` — pyrst has no `*args`. Chain calls for >2 arguments:
 #     `gcd(gcd(a, b), c)`.
@@ -129,12 +138,25 @@ def _math_log_raw(x: float) -> float:
     "({x}).ln()"
 
 
-def log(x: float) -> float:
+def log(x: float, base: float | None = None) -> float:
     # CPython raises ValueError("math domain error") for x <= 0 (incl. 0.0 and
-    # -0.0, since -0.0 <= 0.0 is True). nan passes through (nan <= 0.0 is
-    # False -> Rust returns nan); +inf -> inf.
+    # -0.0; the raw Rust ln() would return -inf/nan instead). nan passes the
+    # guard (nan <= 0.0 is False -> Rust returns nan); +inf -> inf.
+    # (W1.5) TWO-ARGUMENT form `log(x, base)` = log(x) / log(base), exactly
+    # CPython's computation (two C-double logs and one division), with
+    # CPython's error shapes: base <= 0 -> ValueError("math domain error"),
+    # base == 1 -> ZeroDivisionError("float division by zero") — both
+    # python3-verified.
     if x <= 0.0:
         raise ValueError("math domain error")
+    if base is not None:
+        b: float = base
+        if b <= 0.0:
+            raise ValueError("math domain error")
+        den: float = _math_log_raw(b)
+        if den == 0.0:
+            raise ZeroDivisionError("float division by zero")
+        return _math_log_raw(x) / den
     return _math_log_raw(x)
 
 
@@ -163,18 +185,40 @@ def log10(x: float) -> float:
 
 
 @extern
-def sin(x: float) -> float:
+def _math_sin_raw(x: float) -> float:
     "({x}).sin()"
 
 
+def sin(x: float) -> float:
+    # (W1.5) CPython raises ValueError("math domain error") for +-inf
+    # (C sin(inf) is nan + EDOM); nan passes through.
+    if isinf(x):
+        raise ValueError("math domain error")
+    return _math_sin_raw(x)
+
+
 @extern
-def cos(x: float) -> float:
+def _math_cos_raw(x: float) -> float:
     "({x}).cos()"
 
 
+def cos(x: float) -> float:
+    # (W1.5) Same +-inf domain guard as `sin`.
+    if isinf(x):
+        raise ValueError("math domain error")
+    return _math_cos_raw(x)
+
+
 @extern
-def tan(x: float) -> float:
+def _math_tan_raw(x: float) -> float:
     "({x}).tan()"
+
+
+def tan(x: float) -> float:
+    # (W1.5) Same +-inf domain guard as `sin`.
+    if isinf(x):
+        raise ValueError("math domain error")
+    return _math_tan_raw(x)
 
 
 @extern
@@ -209,8 +253,32 @@ def atan(x: float) -> float:
 
 
 @extern
-def pow(x: float, y: float) -> float:
+def _math_powf_raw(x: float, y: float) -> float:
     "({x}).powf({y})"
+
+
+def pow(x: float, y: float) -> float:
+    # (W1.5) CPython math.pow domain/range rules (python3-verified):
+    #   - pow(1, anything) and pow(anything, 0) are 1.0 (even nan/inf);
+    #   - nan otherwise propagates;
+    #   - pow(+-0, negative finite) -> ValueError (pow(+-0, -inf) is +inf, NO
+    #     error, per C99);
+    #   - a nan result from finite inputs (negative base, non-integer exp)
+    #     -> ValueError("math domain error");
+    #   - an infinite result from finite inputs -> OverflowError("math range
+    #     error").
+    if x == 1.0 or y == 0.0:
+        return 1.0
+    if isnan(x) or isnan(y):
+        return nan()
+    if x == 0.0 and y < 0.0 and isfinite(y):
+        raise ValueError("math domain error")
+    r: float = _math_powf_raw(x, y)
+    if isnan(r):
+        raise ValueError("math domain error")
+    if isinf(r) and isfinite(x) and isfinite(y):
+        raise OverflowError("math range error")
+    return r
 
 
 @extern
@@ -269,13 +337,38 @@ def copysign(x: float, y: float) -> float:
 
 
 @extern
-def fmod(x: float, y: float) -> float:
+def _math_fmod_raw(x: float, y: float) -> float:
     "(({x}) % ({y}))"
 
 
+def fmod(x: float, y: float) -> float:
+    # (W1.5) CPython raises ValueError("math domain error") exactly when the
+    # C fmod result is nan while neither input is (fmod(x, 0), fmod(+-inf, y));
+    # a nan INPUT propagates without error. Rust's float % IS C fmod.
+    r: float = _math_fmod_raw(x, y)
+    if isnan(r) and not isnan(x) and not isnan(y):
+        raise ValueError("math domain error")
+    return r
+
+
 @extern
-def remainder(x: float, y: float) -> float:
+def _math_remainder_raw(x: float, y: float) -> float:
     "{ let n = (({x}) / ({y})).round_ties_even(); ({x}) - n * ({y}) }"
+
+
+def remainder(x: float, y: float) -> float:
+    # (W1.5) CPython raises ValueError("math domain error") for remainder(x, 0)
+    # and remainder(+-inf, y); a nan input propagates. remainder(x, +-inf) = x
+    # for finite x (no error).
+    if isnan(x) or isnan(y):
+        return nan()
+    if isinf(x) or y == 0.0:
+        raise ValueError("math domain error")
+    if isinf(y):
+        # remainder(finite x, +-inf) = x (C99); the raw formula would compute
+        # 0 * inf = nan.
+        return x
+    return _math_remainder_raw(x, y)
 
 
 def modf(x: float) -> tuple[float, float]:

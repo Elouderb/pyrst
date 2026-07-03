@@ -25,3 +25,32 @@ A  B
 ,A,B,
 A B C
 caught: empty separator
+Héllo Wörld
+Sseta Test
+日本語 Abc
+Émile,Zola
+Héllo wörld
+Sseta
+Ας
+Émile
+**abc**
+abc---
+000abc
+**héllo**
+.x..
+  abc  
+abc   
+   abc
+False
+True
+False
+True
+False
+False
+True
+False
+True
+True
+True
+True
+True

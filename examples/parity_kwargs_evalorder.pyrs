@@ -1,0 +1,102 @@
+# parity_kwargs_evalorder.pyrs — dual-run CPython parity golden PINNING the
+# W1.5 review BLOCKER fix (item A): call-site evaluation order for keyword /
+# constructor calls that mix a SIDE-EFFECTING POSITIONAL argument with
+# OUT-OF-ORDER keyword arguments.
+#
+# CPython evaluates every call argument left-to-right in SOURCE order
+# (positionals first, then keywords as written) BEFORE binding them to
+# parameter slots. Before the fix pyrst hoisted only keyword VALUES into
+# source-order temps and left the positional INLINE in the call (which Rust
+# runs AFTER the prelude), so a side-effecting positional evaluated AFTER the
+# keyword side effects — `h(A(), z=B(), y=C())` printed `B C A` instead of
+# `A B C`. The same bug lived in the free-fn, method and constructor sites.
+#
+# Every shape here is executed BOTH by pyrst and, unmodified, by real python3;
+# a byte mismatch FAILS the suite. The committed parity_kwargs.pyrs did NOT
+# catch this because its out-of-order case used a literal (`1`) as the
+# positional (no side effect).
+
+
+def side(tag: str) -> str:
+    print("eval " + tag)
+    return tag
+
+
+def three(a: str, y: str, z: str) -> str:
+    return a + y + z
+
+
+def combine(a: int, b: int, c: int) -> int:
+    return a * 100 + b * 10 + c
+
+
+class Rec:
+    a: str
+    y: str
+    z: str
+
+    def __init__(self, a: str, y: str, z: str) -> None:
+        self.a = a
+        self.y = y
+        self.z = z
+
+    def label(self) -> str:
+        return self.a + self.y + self.z
+
+
+class Sink:
+    tag: str
+
+    def __init__(self, tag: str) -> None:
+        self.tag = tag
+
+    def take(self, a: str, y: str, z: str) -> str:
+        return self.tag + ":" + a + y + z
+
+
+class Account:
+    balance: int
+
+    def __init__(self, balance: int) -> None:
+        self.balance = balance
+
+
+def at(i: int) -> int:
+    print("eval idx" + str(i))
+    return i
+
+
+def amount(x: int) -> int:
+    print("eval amt" + str(x))
+    return x
+
+
+def pay(tag: str, acct: Mut[Account], amt: int) -> None:
+    acct.balance = acct.balance - amt
+    print("pay " + tag)
+
+
+def main() -> None:
+    # ── free function: side-effecting positional + out-of-order keywords ──────
+    # source order A, B, C -> "eval A", "eval B", "eval C"; bindings a=A,y=C,z=B
+    print(three(side("A"), z=side("B"), y=side("C")))
+    print(combine(side_int(1), c=side_int(3), b=side_int(2)))
+    # ── method: same shape on obj.method(...) ────────────────────────────────
+    s: Sink = Sink("S")
+    print(s.take(side("A"), z=side("B"), y=side("C")))
+    # ── constructor: same shape on Cls(...) ──────────────────────────────────
+    r: Rec = Rec(side("A"), z=side("B"), y=side("C"))
+    print(r.label())
+    # ── by-reference (Mut[T]) keyword mixed with a side-effecting positional
+    # and an out-of-order value keyword: the by-ref place's index side effect
+    # must run in SOURCE position too (it used to run at slot position) ───────
+    accounts: list[Account] = [Account(100), Account(200)]
+    pay(side("A"), amt=amount(5), acct=accounts[at(1)])
+    print(accounts[1].balance)
+    # ── in-order keywords after a side-effecting positional stay byte-identical
+    print(three(side("A"), y=side("B"), z=side("C")))
+
+
+def side_int(n: int) -> int:
+    print("eval " + str(n))
+    return n

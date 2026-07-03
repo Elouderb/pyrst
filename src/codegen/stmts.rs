@@ -619,8 +619,13 @@ impl<'a> Codegen<'a> {
                 let then_saved = then_narrow.map(|(var, _, inner)| {
                     // (EPIC-6) `var` names an existing Optional local; both the new
                     // shadow binding and the `.unwrap()` read escape identically.
+                    // (W1.5, card 71cbd940) `.clone().unwrap()` — a BORROWING
+                    // unwrap: the bare `.unwrap()` MOVED the Option, which is
+                    // E0382 when the narrowing guard sits inside a loop (the
+                    // accumulate2 shape: `if f is None: .. else: f(acc, ..)`
+                    // re-entered per iteration). pyrst locals are all Clone.
                     let var_e = escape_ident(var);
-                    self.line(&format!("let {} = {}.unwrap();", var_e, var_e));
+                    self.line(&format!("let {} = {}.clone().unwrap();", var_e, var_e));
                     let prev = self.locals.insert(var.clone(), inner.clone());
                     (var.clone(), prev)
                 });
@@ -647,9 +652,10 @@ impl<'a> Codegen<'a> {
                     let else_narrow = narrowed.as_ref()
                         .filter(|(_, is_not_none, _)| !*is_not_none && elifs.is_empty());
                     let else_saved = else_narrow.map(|(var, _, inner)| {
-                        // (EPIC-6) Same escape as the THEN-branch narrowing above.
+                        // (EPIC-6) Same escape + borrowing-unwrap rationale as the
+                        // THEN-branch narrowing above.
                         let var_e = escape_ident(var);
-                        self.line(&format!("let {} = {}.unwrap();", var_e, var_e));
+                        self.line(&format!("let {} = {}.clone().unwrap();", var_e, var_e));
                         let prev = self.locals.insert(var.clone(), inner.clone());
                         (var.clone(), prev)
                     });
@@ -1604,6 +1610,42 @@ impl<'a> Codegen<'a> {
         args: &[Expr],
         kwargs: &[(String, Expr)],
     ) -> Result<String> {
+                // (kwargs v1, card 8a7b7714) A keyword-bearing call maps each
+                // keyword to its parameter slot and lowers as a FULL positional
+                // call in parameter order (defaults injected into unfilled
+                // slots). typeck already validated the mapping; re-deriving it
+                // here is deterministic. A keyword on a callee WITHOUT a known
+                // signature (function-valued local, lambda) cannot be mapped —
+                // typeck rejects it, this is the defensive backstop.
+                let kw_sig: Option<crate::typeck::FuncSig> = if !kwargs.is_empty() {
+                    let sig = if let Expr::Ident(n, _) = callee.as_ref() {
+                        self.ctx.funcs.get(n.as_str()).cloned()
+                    } else {
+                        None
+                    };
+                    match sig {
+                        Some(s) => Some(s),
+                        None => {
+                            return Err(crate::diag::Error::Codegen(
+                                "keyword arguments require a callee with a known signature \
+                                 (a user function, module function, or method)"
+                                    .into(),
+                            ));
+                        }
+                    }
+                } else {
+                    None
+                };
+                let kw_slots: Option<Vec<crate::typeck::ArgSlot>> = match (&kw_sig, callee.as_ref()) {
+                    (Some(sig), Expr::Ident(n, _)) => Some(crate::typeck::map_kwargs_to_slots(
+                        n,
+                        sig,
+                        args.len(),
+                        kwargs,
+                        callee.span(),
+                    )?),
+                    _ => None,
+                };
                 // Regular function call (not a class).
                 // (EPIC-5) Look up the callee signature so an argument flowing
                 // into an `Optional[T]` parameter is wrapped (`Some(..)` for a
@@ -1638,13 +1680,33 @@ impl<'a> Codegen<'a> {
                         // and let the concrete value arguments (`a, b: T`) drive the
                         // substitution. A named-function arg keeps its real
                         // `Ty::Func` type (a reliable binding source).
-                        let arg_tys: Vec<Ty> = args.iter()
-                            .map(|a| if matches!(a, Expr::Lambda { .. }) {
-                                Ty::Unknown
-                            } else {
-                                self.type_of_expr(a)
-                            })
-                            .collect();
+                        // (kwargs v1) With kwargs the binding sources are built
+                        // SLOT-ALIGNED (keyword values in their mapped slots,
+                        // default holes `Unknown` — non-binding), so unification
+                        // sees each type at its declared parameter position.
+                        let arg_tys: Vec<Ty> = match &kw_slots {
+                            None => args.iter()
+                                .map(|a| if matches!(a, Expr::Lambda { .. }) {
+                                    Ty::Unknown
+                                } else {
+                                    self.type_of_expr(a)
+                                })
+                                .collect(),
+                            Some(slots) => slots.iter()
+                                .map(|s| {
+                                    let a = match s {
+                                        crate::typeck::ArgSlot::Pos(i) => &args[*i],
+                                        crate::typeck::ArgSlot::Kw(j) => &kwargs[*j].1,
+                                        crate::typeck::ArgSlot::Default => return Ty::Unknown,
+                                    };
+                                    if matches!(a, Expr::Lambda { .. }) {
+                                        Ty::Unknown
+                                    } else {
+                                        self.type_of_expr(a)
+                                    }
+                                })
+                                .collect(),
+                        };
                         if let Some(subst) =
                             crate::typeck::generic_call_param_subst(n.as_str(), &arg_tys, self.ctx)
                         {
@@ -1664,47 +1726,54 @@ impl<'a> Codegen<'a> {
                 } else {
                     Vec::new()
                 };
+                // (kwargs v1 — item A) A keyword-bearing call lowers through the
+                // shared slot mapper, which preserves CPython's source-order
+                // call-site evaluation (hoisting EVERY out-of-order argument —
+                // positionals AND keyword values — into source-ordered temps,
+                // while a by-reference arg hoists only its place-prelude) and
+                // injects declared defaults into the unfilled slots. `coerced =
+                // true` applies the Optional-wrap / `Callable` cast / poly-base
+                // wrap per param slot.
+                if let Some(slots) = &kw_slots {
+                    let sig = kw_sig.as_ref().expect("kw slots imply a resolved signature");
+                    let (prelude, call_parts) =
+                        self.emit_slotted_args(slots, args, kwargs, sig, &param_tys, /*coerced=*/ true)?;
+                    let callee_s = self.emit_expr(callee)?;
+                    let callee_s = if matches!(callee.as_ref(), Expr::Lambda { .. }) {
+                        format!("({})", callee_s)
+                    } else {
+                        callee_s
+                    };
+                    return Ok(Self::hoist_wrap(
+                        &prelude,
+                        format!("{}({})", callee_s, call_parts.join(", ")),
+                    ));
+                }
+
+                // No keyword arguments: emit each positional argument in order.
+                // A by-reference (`Mut[T]`) arg borrows the caller's PLACE so the
+                // callee's mutation persists — typeck already required `a` to be a
+                // place (Ident/Attr/Index), so `&mut place` is sound; `byref_borrow`
+                // emits `&mut *x` for a forwarded `&mut T` param (E0596), and
+                // `emit_place_hoisted` lifts any subscript index into a `{ let
+                // __idxN = ..; &mut .. }` block so the index temp evaluates before
+                // the borrow (E0502). Every other arg routes through
+                // `emit_call_arg_value` (Func / Optional[Callable] cast, poly-base
+                // wrap, Optional[T] Some-wrap, else clone-on-use).
                 let mut parts = Vec::with_capacity(args.len());
                 for (i, a) in args.iter().enumerate() {
                     if param_by_ref.get(i).copied().unwrap_or(false) {
-                        // By-reference arg: borrow the caller's PLACE so the
-                        // callee's mutation persists. typeck already required `a`
-                        // to be a place (Ident/Attr/Index), so `emit_place` is
-                        // valid and `&mut` of it is a sound mutable borrow. No
-                        // clone, no Option coercion — we pass the storage itself.
-                        // `byref_borrow` emits an explicit reborrow (`&mut *x`)
-                        // when `a` names one of this function's own `&mut T`
-                        // params (forwarded-by-reference, e.g. a recursive call),
-                        // avoiding the E0596 double-`&mut`.
-                        // (card cc7ae370, item 1) Hoist any subscript index in the
-                        // arg place (`f(grid[len(grid) - 1])`) and wrap `&mut place`
-                        // in a `{ let __idxN = ..; &mut .. }` block so the index
-                        // temp evaluates before the borrow is taken (E0502).
                         let mut aprelude = Vec::new();
                         let place = self.emit_place_hoisted(a, &mut aprelude)?;
                         let borrow = self.byref_borrow(a, &place);
                         parts.push(Self::hoist_wrap(&aprelude, borrow));
                         continue;
                     }
-                    // (EPIC-5 C2-2b-i) A raw-struct argument into a polymorphic-base
-                    // parameter (`feed(dog)` where `feed(a: Animal)`) is WRAPPED in
-                    // the right `Animal__` variant (replaces the C1 gate).
-                    // (first-class functions) A function NAME / lambda argument into
-                    // a `Callable[..]` parameter (`apply_to_all(inc, ..)`) is wrapped
-                    // into the `Rc<dyn Fn>` slot. Other params keep clone-on-use.
-                    let s = match param_tys.get(i) {
-                        Some(pt @ Ty::Func(..)) => self.emit_into_func_slot(a, pt)?,
-                        Some(pt) if self.ty_has_poly_base(pt) => self.emit_into_base_slot(a, pt)?,
-                        _ => self.emit_consuming(a)?,
-                    };
-                    let s = match param_tys.get(i) {
-                        Some(pt) => self.coerce_to_option(s, a, pt),
-                        None => s,
-                    };
-                    parts.push(s);
+                    parts.push(self.emit_call_arg_value(a, &param_tys, i, /*coerced=*/ true)?);
                 }
 
-                // Inject default arguments for named functions
+                // Inject default arguments for named functions (positional-only
+                // under-application).
                 if let Expr::Ident(n, _) = callee.as_ref() {
                     if let Some(sig) = self.ctx.funcs.get(n.as_str()).cloned() {
                         let expected = sig.params.len();
@@ -1728,14 +1797,6 @@ impl<'a> Codegen<'a> {
                 } else {
                     callee_s
                 };
-
-                // kwargs on a non-class call site are an error in v0.
-                if !kwargs.is_empty() {
-                    return Err(crate::diag::Error::Codegen(
-                        "keyword arguments are only supported for class constructors in v0".into()
-                    ));
-                }
-
                 Ok(format!("{}({})", callee_s, parts.join(", ")))
     }
 

@@ -1,6 +1,8 @@
 # pyrst standard library — heapq
 #
-# Fidelity score: 4 (near drop-in). Pure-pyrst binary MIN-heap over a
+# Fidelity score: 4 (near drop-in; W1.5: nlargest/nsmallest accept `n=`/
+# `iterable=` keyword calls like CPython — kwargs v1; `key=` remains the
+# documented gap). Pure-pyrst binary MIN-heap over a
 # `list[T]` whose elements are ordered (the `<` operator on `T` infers
 # `T: PartialOrd` — generics v2). The list itself IS the heap (as in CPython):
 # index 0 is the smallest element, children of `i` are at `2*i+1` and `2*i+2`.

@@ -1,10 +1,11 @@
 # Stdlib `random`: the embedded pure-pyrst SEEDABLE generator. Because pyrst has
-# no mutable module-level state, `random` is a `Random` CLASS holding a mutable
-# `seed: int`, advanced by a Numerical-Recipes LCG
-# (seed = (1664525*seed + 1013904223) mod 2^32) on every draw. `random` is
-# embedded (lib/random.pyrs -> include_str! -> src/stdlib.rs); it was never in
-# the resolver skip-list, so the import resolves; no local `random.pyrs` next to
-# this file.
+# no mutable module-level state, `random` is a `Random` CLASS holding the
+# generator state — since the W1.5 pass a full MERSENNE TWISTER (MT19937) with
+# CPython's exact derivation chain, so seeded sequences are BIT-IDENTICAL to
+# CPython's `random.Random` (see examples/parity_random.pyrs for the dual-run
+# proof). `random` is embedded (lib/random.pyrs -> include_str! ->
+# src/stdlib.rs); it was never in the resolver skip-list, so the import
+# resolves; no local `random.pyrs` next to this file.
 #
 # Exercises BOTH import forms:
 #   - FLAT `from random import Random` for construction — a qualified
@@ -18,16 +19,16 @@
 # value unless `Mut`), so they advance the SAME generator and stay reproducible.
 #
 # DETERMINISTIC by construction: a fixed seed (42) makes the entire draw sequence
-# reproducible — that is the whole point. The golden pins THIS LCG's actual
-# output, in call order:
+# reproducible — that is the whole point. The golden pins MT19937's actual
+# output (oracle-checked: `Random(42).randint(1,6)` x5 -> [6, 1, 1, 6, 3] under
+# python3 too), in call order:
 #   five r.randint(1, 6)        — a dice roll sequence
 #   choice(r, ["rock","paper","scissors"])
 #   r.randrange(100)            — an int in [0, 100)
 #   r.random()                  — a float in [0, 1)
 #   r.uniform(10.0, 20.0)       — a float in [10, 20]
-# Then a SEPARATE Random(7) drives `shuffle([1,2,3,4,5])` -> [1, 3, 5, 2, 4], a
-# visibly non-trivial Fisher–Yates permutation (a fresh seed is used so the
-# permutation is clearly not the identity).
+# Then a SEPARATE Random(7) drives `shuffle([1,2,3,4,5])` -> [5, 1, 4, 2, 3]
+# (python3-identical), a visibly non-trivial Fisher–Yates permutation.
 # Re-running yields the IDENTICAL lines every time (no wall-clock / OS entropy).
 import random
 from random import Random

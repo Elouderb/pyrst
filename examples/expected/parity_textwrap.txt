@@ -33,3 +33,18 @@ y
 > a
 
 > b
+['the quick', 'brown fox', 'jumps  over', 'the lazy dog']
+['   leading', 'and', 'trailing']
+['a  b', 'c', 'd']
+['tab', 'here and', 'there']
+fill
+this
+text now
+['col0    stop col8', 'stop']
+['* the quick', '  brown fox', '  jumps over', '  the lazy dog']
+> the quick brown
+fox jumps over the
+lazy dog
+['nobreak', 'supercalifragilistic']
+hello...
+placeholder too large for max width

@@ -2,27 +2,18 @@
 # module (card 90eb1f2d). Exercises the full surface: the original 11
 # int-specialized fns (all 6 comparisons — lt/le/gt/ge/eq/ne — are now
 # GENERIC, verified across int, float, str, and list[int] calls to the SAME
-# imported name in one program; add/sub/mul/floordiv/mod_ stay int-specialized,
+# imported name in one program; add/sub/mul/floordiv/mod stay int-specialized,
 # see lib/operator.pyrs header for why), plus the W1 additions (itemgetter,
-# truth, not_, contains_, concat). CPython's `contains` is spelled
-# `contains_` here (see lib/operator.pyrs header for the forced-rename
-# reason, same class of issue as the pre-existing `mod_`).
+# truth, not_, contains, concat) — all under exact CPython names since W1.5.
 #
-# parity: pyrst-only
-#
-# NOT dual-run despite being deterministic pure arithmetic/comparisons/
-# sequence ops: this file imports `mod_` and `contains_`, two names FORCED
-# to diverge from CPython's real `operator.mod`/`operator.contains` (see
-# lib/operator.pyrs header) — real CPython's `operator` module has no
-# `mod_`/`contains_`, so `from operator import mod_, contains_` raises
-# ImportError under python3 and a same-source dual-run cannot pass. Every
-# OTHER name imported below (add/sub/mul/floordiv/lt/le/gt/ge/eq/ne/truth/
-# not_/concat/itemgetter) is an exact CPython name; manually verified
-# (w1drop/operator/notes.md) that the subset excluding mod_/contains_
-# dual-runs byte-identical against python3.
-from operator import add, sub, mul, floordiv, mod_
+# (W1.5) DUAL-RUN at last: `mod` and `contains` now ship under their REAL
+# CPython names (the forced `mod_`/`contains_` renames are back-compat
+# aliases only), so this file imports exact CPython names throughout and the
+# SAME source runs byte-identical under python3 — the former pyrst-only
+# opt-out reason is gone.
+from operator import add, sub, mul, floordiv, mod
 from operator import lt, le, gt, ge, eq, ne
-from operator import truth, not_, contains_, concat, itemgetter
+from operator import truth, not_, contains, concat, itemgetter
 
 
 def main() -> None:
@@ -38,12 +29,12 @@ def main() -> None:
 
     # --- int-only floordiv/mod_ ---
     print(floordiv(7, 2))     # 3
-    print(mod_(7, 2))         # 1
+    print(mod(7, 2))         # 1
     # edge: negative dividend/divisor (Python floor semantics, not C truncation)
     print(floordiv(-7, 2))    # -4
     print(floordiv(7, -2))    # -4
-    print(mod_(-7, 2))        # 1
-    print(mod_(7, -2))        # -1
+    print(mod(-7, 2))        # 1
+    print(mod(7, -2))        # -1
 
     # --- generic comparisons: int ---
     print(lt(2, 3))           # True
@@ -92,14 +83,14 @@ def main() -> None:
     print(not_(-5))           # False
 
     # --- contains_ (generic over list[T]) ---
-    print(contains_([1, 2, 3], 2))          # True
-    print(contains_([1, 2, 3], 9))          # False
-    print(contains_(["a", "b", "c"], "b"))  # True
+    print(contains([1, 2, 3], 2))          # True
+    print(contains([1, 2, 3], 9))          # False
+    print(contains(["a", "b", "c"], "b"))  # True
     # edge: empty list, duplicates
-    print(contains_(empty_a, 1))            # False
+    print(contains(empty_a, 1))            # False
     dup: list[int] = [1, 1, 2, 2, 3]
-    print(contains_(dup, 1))                # True
-    print(contains_(dup, 4))                # False
+    print(contains(dup, 1))                # True
+    print(contains(dup, 4))                # False
 
     # --- concat (generic over list[T]) ---
     print(concat([1, 2], [3, 4]))          # [1, 2, 3, 4]

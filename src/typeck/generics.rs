@@ -194,9 +194,18 @@ pub(crate) fn unify_typevar(
             }
             _ => Ok(()),
         },
+        // (W1.5, card 6e6b33ab) An `Optional[T]` param participates in
+        // unification: an already-Optional actual unifies structurally; the
+        // `None` literal carries no information; and — the previously-skipped
+        // case — a BARE actual (which the call-site coerces into the Option
+        // slot with `Some(..)`) unifies its type against the inner `T`, so
+        // `pick(1, "s")` against `pick[T](x: T, y: Optional[T] = None)` is a
+        // check-time "conflicting types for type parameter `T`" instead of a
+        // leaked rustc E0308 at build.
         Ty::Option(d) => match actual {
             Ty::Option(a) => unify_typevar(d, a, type_params, subst),
-            _ => Ok(()),
+            Ty::NoneVal => Ok(()),
+            other => unify_typevar(d, other, type_params, subst),
         },
         Ty::Tuple(ds) => match actual {
             Ty::Tuple(as_) if ds.len() == as_.len() => {

@@ -24,7 +24,7 @@ def main() -> None:
     # Seed-42 dice simulation
     rng: Random = Random(42)
     rolls: list[int] = simulate_dice_rolls(rng, 12)
-    print(rolls)                            # exact sequence from LCG seed 42
+    print(rolls)                            # exact sequence from MT19937 seed 42 (CPython-identical)
 
     # Basic stats on rolls (all int but stats wants float-like)
     floated: list[float] = [float(r) for r in rolls]

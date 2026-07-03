@@ -18,6 +18,7 @@ True
 café
 1
 True
+"\ud83d\ude00"
 "😀"
 err: surrogate \uD800 is not supported
 err: surrogate \uDC00 is not supported
@@ -72,4 +73,22 @@ true
 "hi"
 null
 {"a": 1, "b": {"a": 2, "z": 1}}
+"h\u00e9llo w\u00f6rld"
+"\u65e5\u672c\u8a9e"
+"mix \u00e9\u65e5\ud83d\ude00z"
+"héllo"
+{"k\u00e9y": ["v\u00e0l", "\ud83d\ude00"]}
+{
+  "k\u00e9y": [
+    "v\u00e0l",
+    "\ud83d\ude00"
+  ]
+}
+{
+  "kéy": [
+    "vàl",
+    "😀"
+  ]
+}
+{"k\u00e9y": ["v\u00e0l", "\ud83d\ude00"]}
 done

@@ -1,0 +1,18 @@
+# (W1.5, card 6e6b33ab) An `Optional[T]` parameter PARTICIPATES in generic
+# unification: a bare argument flowing into the Option slot binds/checks the
+# inner `T`, so a conflicting binding — `pick(1, "s")` binds T=int through `x`
+# and then offers str through `y: Optional[T]` — is a CHECK-time
+# "conflicting types for type parameter `T`" error. Before this fix the shape
+# passed `pyrst check` and leaked a Rust-shaped E0308 at build (the original
+# fail_reduce_type_mismatch str-init-vs-int-reduce hole, restaged during W1).
+# This file must be rejected by BOTH `pyrst check` and `pyrst build`.
+def pick[T](x: T, y: Optional[T] = None) -> T:
+    if y is not None:
+        v: T = y
+        return v
+    return x
+
+
+def main() -> None:
+    # ERROR: T is bound to int by `x` but str flows into `y: Optional[T]`.
+    print(pick(1, "s"))

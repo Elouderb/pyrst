@@ -60,23 +60,32 @@
 #     range-checked BEFORE conversion, so it raises a catchable ValueError instead
 #     of an i64-overflow panic. A pyrst exception is the honest failure mode.
 #
-# FIDELITY SCORE: 4 / 5 (docs/design/stdlib-full.md §D "json" row). Surface:
-# `loads`, `dumps(v, indent=None, sort_keys=False)`, the `JsonValue` class
-# (predicates/accessors/navigation), and the private parser/serializer
-# helpers below (all now prefixed `_json_` per stdlib convention — the parser
-# class `_json_Parser` and the top-level helpers `_json_is_digit` /
-# `_json_is_ws` / `_json_hex_digit` / `_json_u4hex` / `_json_u4hex_lower` /
-# `_json_i64_fits` / `_json_escape_string` were renamed this pass from their
-# previously-unprefixed forms, closing the review's helper-prefix finding).
+# FIDELITY SCORE: 4 / 5 (docs/design/stdlib-full.md §D "json" row; the API
+# SHAPE divergence — tagged JsonValue instead of native dynamic types — keeps
+# this below 4.5 even though the serialized-STRING behavior is now
+# CPython-exact incl. ensure_ascii). Surface: `loads`,
+# `dumps(v, indent=None, sort_keys=False, ensure_ascii=True)`, the `JsonValue`
+# class (predicates/accessors/navigation), and the private parser/serializer
+# helpers below (all prefixed `_json_` per stdlib convention).
 #
-# THIS PASS (closing docs/design/stdlib-full.md §D "json" deltas):
+# W1 pass + W1.5 divergence-closing pass:
 #   - `dumps(v, indent=None, sort_keys=False)` — CPython's two most-used
 #     `dumps` keyword params, matched byte-for-byte against `json.dumps`
 #     (2-space/1-tab/etc pretty-printing with `,`/`: ` separators when
 #     `indent` is given; `sort_keys=True` sorts object keys before emission;
 #     a negative `indent` clamps to 0, matching CPython). Multi-line output
 #     recurses through `_json_dumps_rec(v, has_indent, indent, level,
-#     sort_keys)` so each nesting level gets its own pad width.
+#     sort_keys, ensure_ascii)` so each nesting level gets its own pad width.
+#   - (W1.5) `ensure_ascii=True` DEFAULT, matching CPython: every char above
+#     U+007E serializes as a lower-case `\uXXXX` escape — BMP directly,
+#     astral codepoints as UTF-16 surrogate PAIRS (`😀` -> `😀`) —
+#     byte-identical to `json.dumps` (python3-diffed for BMP, astral, and
+#     mixed strings, keys and values, compact and indent forms).
+#     `ensure_ascii=False` passes UTF-8 through verbatim, also matching.
+#   - (W1.5, kwargs v1) `dumps(v, indent=2, sort_keys=True)` KEYWORD calls now
+#     work — the former positional-only call-site divergence is GONE (CPython's
+#     `dumps` params are keyword-only; pyrst additionally accepts them
+#     positionally in declared order, a documented superset).
 #   - surrogate-PAIR decoding: `\uD800`-`\uDBFF` immediately followed by a
 #     `\uDC00`-`\uDFFF` low surrogate now JOINS into one astral codepoint
 #     (`😀` round-trips), matching CPython. A lone/unpaired surrogate (either
@@ -96,18 +105,10 @@
 #     `lib/json.pyrs` can accept a file handle as a parameter. Callers can
 #     work around this today with `os.read_file(path)` + `loads(...)` and
 #     `dumps(...)` + `os.write_file(path, s)`.
-#   - `separators=`, `skipkeys=`, `ensure_ascii=`, `check_circular=`,
-#     `allow_nan=`, `cls=`, `default=`, `**kw` — real CPython `dumps` params
-#     not in the design row's required delta set; `ensure_ascii`'s absence
-#     means non-ASCII chars serialize as literal UTF-8 rather than `\uXXXX`
-#     escapes (CPython's default `ensure_ascii=True` would escape them) —
-#     documented, not silently wrong.
-#   - CALL-SITE SHAPE: CPython's real `dumps` signature is keyword-ONLY after
-#     `obj` (`def dumps(obj, *, indent=None, sort_keys=False, ...)`). pyrst
-#     supports keyword args only at class-constructor call sites (v0), not
-#     for plain functions, so `dumps(v, indent=2, sort_keys=True)` cannot be
-#     written — callers must pass `indent`/`sort_keys` POSITIONALLY, in
-#     declared order: `dumps(v, 2, True)`. Documented divergence, not a bug.
+#   - `separators=`, `skipkeys=`, `check_circular=`, `allow_nan=`, `cls=`,
+#     `default=`, `**kw` — remaining real CPython `dumps` params, still not
+#     offered (each is a niche override of a default this module already
+#     matches; `ensure_ascii=` landed in W1.5 and is no longer on this list).
 #   - `loads` does NOT accept the non-standard `Infinity`/`-Infinity`/`NaN`
 #     literal tokens that CPython's parser also accepts by default (outside
 #     strict JSON grammar) — unexpected-character error instead. `dumps`,
@@ -663,7 +664,7 @@ def loads(text: str) -> JsonValue:
     return value
 
 
-def _json_escape_string(s: str) -> str:
+def _json_escape_string(s: str, ensure_ascii: bool) -> str:
     # Escape a Python/JSON string body (without the surrounding quotes). Mirrors
     # the parser's escape set: control chars get their short escapes; `"` and `\`
     # are backslash-escaped; everything else passes through verbatim.
@@ -675,10 +676,13 @@ def _json_escape_string(s: str) -> str:
     # matching CPython's `json.dumps` (e.g. a bare NUL -> `\u0000`, not a raw
     # byte). Emitting it unescaped would silently produce INVALID JSON that a
     # conforming reader must reject.
+    # (W1.5 fix F3) Single forward pass over the characters. The old `while i <
+    # len(s): c = s[i]` form re-scanned the UTF-8 string from the start on EVERY
+    # `s[i]` and `len(s)` (pyrst string indexing is by char position), making
+    # escaping O(n^2); no lookahead is needed here, so `for c in s` is a linear
+    # single pass. Output is byte-identical.
     out: str = "\""
-    i: int = 0
-    while i < len(s):
-        c: str = s[i]
+    for c in s:
         code: int = ord(c)
         if c == "\"":
             out += "\\\""
@@ -701,13 +705,24 @@ def _json_escape_string(s: str) -> str:
             # generic 4-hex-digit escape, RFC-required. LOWER-case hex digits,
             # matching CPython's json.dumps (the review casing fix).
             out += "\\u" + _json_u4hex_lower(code)
+        elif ensure_ascii and code > 126:
+            # (W1.5) CPython's default `ensure_ascii=True`: every char above
+            # U+007E leaves as a `\uXXXX` escape — BMP chars directly, astral
+            # chars (>= U+10000) as a UTF-16 SURROGATE PAIR, exactly like
+            # CPython's c_encode_basestring_ascii.
+            if code < 65536:
+                out += "\\u" + _json_u4hex_lower(code)
+            else:
+                astral: int = code - 65536
+                hi_sur: int = 55296 + astral // 1024
+                lo_sur: int = 56320 + astral % 1024
+                out += "\\u" + _json_u4hex_lower(hi_sur) + "\\u" + _json_u4hex_lower(lo_sur)
         else:
             out += c
-        i = i + 1
     return out + "\""
 
 
-def dumps(v: JsonValue, indent: Optional[int] = None, sort_keys: bool = False) -> str:
+def dumps(v: JsonValue, indent: Optional[int] = None, sort_keys: bool = False, ensure_ascii: bool = True) -> str:
     # Serialize a JsonValue to a VALID JSON string, matching CPython's
     # `json.dumps(obj, indent=..., sort_keys=...)`:
     #   - `indent=None` (default): COMPACT form — a single space after each
@@ -731,10 +746,14 @@ def dumps(v: JsonValue, indent: Optional[int] = None, sort_keys: bool = False) -
     #     regardless of this flag. `sort_keys=False` and `sort_keys=True`
     #     therefore currently produce IDENTICAL pyrst output.
     #
-    # CALL-SITE NOTE: pyrst supports keyword args only at class-constructor
-    # call sites (v0), so callers pass `indent`/`sort_keys` POSITIONALLY, in
-    # this declared order — `dumps(v, 2, True)` — unlike CPython's real
-    # keyword-only `dumps(obj, *, indent=None, ..., sort_keys=False, ...)`.
+    #   - `ensure_ascii=True` (default, W1.5): non-ASCII chars leave as
+    #     lower-case `\uXXXX` escapes (surrogate pairs for astral codepoints),
+    #     byte-identical to CPython; `ensure_ascii=False` passes UTF-8 through.
+    #
+    # CALL-SITE NOTE: since kwargs v1 (W1.5), `dumps(v, indent=2,
+    # sort_keys=True, ensure_ascii=False)` keyword calls work exactly like
+    # CPython's keyword-only signature; pyrst additionally accepts the params
+    # positionally in declared order (documented superset).
     has_indent: bool = False
     ind: int = 0
     if indent is not None:
@@ -742,10 +761,10 @@ def dumps(v: JsonValue, indent: Optional[int] = None, sort_keys: bool = False) -
         n: int = indent
         if n > 0:
             ind = n
-    return _json_dumps_rec(v, has_indent, ind, 0, sort_keys)
+    return _json_dumps_rec(v, has_indent, ind, 0, sort_keys, ensure_ascii)
 
 
-def _json_dumps_rec(v: JsonValue, has_indent: bool, indent: int, level: int, sort_keys: bool) -> str:
+def _json_dumps_rec(v: JsonValue, has_indent: bool, indent: int, level: int, sort_keys: bool, ensure_ascii: bool) -> str:
     # The recursive worker behind `dumps`. `level` is the current nesting
     # depth (0 at the root); `indent * level` spaces precede a closing
     # bracket, `indent * (level + 1)` precede each element/member line.
@@ -775,7 +794,7 @@ def _json_dumps_rec(v: JsonValue, has_indent: bool, indent: int, level: int, sor
             return "-Infinity"
         return str(v.fl)
     if v.kind == 4:
-        return _json_escape_string(v.s)
+        return _json_escape_string(v.s, ensure_ascii)
     if v.kind == 5:
         if len(v.arr) == 0:
             return "[]"
@@ -785,7 +804,7 @@ def _json_dumps_rec(v: JsonValue, has_indent: bool, indent: int, level: int, sor
             while i < len(v.arr):
                 if i > 0:
                     out += ", "
-                out += _json_dumps_rec(v.arr[i], has_indent, indent, level, sort_keys)
+                out += _json_dumps_rec(v.arr[i], has_indent, indent, level, sort_keys, ensure_ascii)
                 i = i + 1
             return out + "]"
         pad: str = " " * (indent * (level + 1))
@@ -795,7 +814,7 @@ def _json_dumps_rec(v: JsonValue, has_indent: bool, indent: int, level: int, sor
         while pi < len(v.arr):
             if pi > 0:
                 pretty += ",\n"
-            pretty += pad + _json_dumps_rec(v.arr[pi], has_indent, indent, level + 1, sort_keys)
+            pretty += pad + _json_dumps_rec(v.arr[pi], has_indent, indent, level + 1, sort_keys, ensure_ascii)
             pi = pi + 1
         return pretty + "\n" + closepad + "]"
     if v.kind == 6:
@@ -826,7 +845,7 @@ def _json_dumps_rec(v: JsonValue, has_indent: bool, indent: int, level: int, sor
                 if not first:
                     parts += ", "
                 key: str = keys[j]
-                parts += _json_escape_string(key) + ": " + _json_dumps_rec(v.obj[key], has_indent, indent, level, sort_keys)
+                parts += _json_escape_string(key, ensure_ascii) + ": " + _json_dumps_rec(v.obj[key], has_indent, indent, level, sort_keys, ensure_ascii)
                 first = False
                 j = j + 1
             return parts + "}"
@@ -838,7 +857,7 @@ def _json_dumps_rec(v: JsonValue, has_indent: bool, indent: int, level: int, sor
             if oj > 0:
                 opretty += ",\n"
             okey: str = keys[oj]
-            opretty += opad + _json_escape_string(okey) + ": " + _json_dumps_rec(v.obj[okey], has_indent, indent, level + 1, sort_keys)
+            opretty += opad + _json_escape_string(okey, ensure_ascii) + ": " + _json_dumps_rec(v.obj[okey], has_indent, indent, level + 1, sort_keys, ensure_ascii)
             oj = oj + 1
         return opretty + "\n" + oclosepad + "}"
     raise ValueError("dumps: unknown JsonValue kind " + str(v.kind))

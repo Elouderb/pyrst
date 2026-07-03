@@ -4,7 +4,9 @@
 # `src/stdlib.rs`). Usable as either `from string import capwords` or
 # `import string; string.capwords(s)`, and the constants as `string.digits`.
 #
-# Fidelity: 4/5 — every CPython `string.*` constant is now expressible
+# Fidelity: 4.5/5 (W1.5: capwords/capitalize are unicode-exact, incl.
+# titlecase and Final_Sigma; Template/Formatter stay the documented G-gated
+# gap) — every CPython `string.*` constant is now expressible
 # (the `\x0b`/vertical-tab byte is written as a literal control character in
 # this source file; `\t \n \r \f` use the lexer's escapes, and `\b \f` support
 # landed in commit c82ff60). `capwords` matches CPython's `(s, sep=None)`
@@ -48,20 +50,16 @@
 #     does not error on an empty separator and instead splits between every
 #     character -- silently producing nonsense output instead of failing
 #     loudly. Guarded here since it's cheap and matches user expectations.
-#   - KNOWN DIVERGENCE (compiler-level, out of scope for this module):
-#     `capwords()` calls the builtin `.capitalize()` string method, whose
-#     codegen (`src/codegen/exprs.rs`) slices the first character off by
-#     BYTE index (`&s[1..]`), not by char index. For any word whose first
-#     character is multi-byte UTF-8 (e.g. "öäü"), this panics at runtime
-#     with "byte index is not a char boundary" instead of producing
-#     CPython's "Öäü". Same bug affects the unrelated `.title()` builtin.
-#     This is a pre-existing defect in the shared string-builtin codegen,
-#     not something introduced by or fixable within lib/string.pyrs (no
-#     compiler changes in scope for this card) -- flagged here for the
-#     integrator/lead to file as its own follow-up card. The parity golden
-#     below intentionally avoids non-ASCII capwords input for this reason
-#     (it would crash the pyrst binary outright, not just produce a wrong
-#     answer, so no dual-run golden can even be authored for it yet).
+#   - (W1.5, card b671f313: FIXED) the former multibyte `.capitalize()`
+#     byte-slice panic is GONE: the compiler's string-builtin codegen is now
+#     char-based AND CPython-exact — first char TITLECASED (ß -> "Ss",
+#     digraphs, polytonic Greek), rest lowercased with Final_Sigma context
+#     ("ΑΣ".capitalize() == "Ας"). `capwords` therefore handles unicode
+#     input byte-identically to python3 (é/ß/CJK cases now IN the dual-run
+#     parity golden). The sibling emitters (`title`, `istitle`, `zfill`,
+#     `ljust`, `rjust`, `center`) were audited in the same pass: byte-slice
+#     and byte-width bugs fixed (char counts, sign-aware zfill, CPython's
+#     center margin rule).
 #
 # Deferred (out of scope for this batch, unchanged from prior revision):
 #   - `Template` / `Formatter` (classes): CPython's `Template.substitute`

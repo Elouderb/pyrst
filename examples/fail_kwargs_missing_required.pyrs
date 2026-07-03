@@ -1,0 +1,12 @@
+# (kwargs v1, card 8a7b7714) A call whose keyword mapping leaves a NON-DEFAULT
+# parameter unfilled is a CHECK-time error: "`wrap` missing a required
+# argument: `text`" — CPython raises TypeError ("missing 1 required positional
+# argument") for the same shape.
+# This file must be rejected by BOTH `pyrst check` and `pyrst build`.
+def wrap(text: str, width: int = 70) -> str:
+    return text + str(width)
+
+
+def main() -> None:
+    # ERROR: `text` has no default and no argument fills it.
+    print(wrap(width=10))

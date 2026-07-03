@@ -1,0 +1,9 @@
+# (kwargs v1, card 8a7b7714) Builtin stubs stay POSITIONAL-ONLY: CPython's own
+# builtins reject keyword arguments (`abs(x=5)` is a TypeError there), and the
+# pyrst stubs carry invented parameter names the mapper must never bind against
+# (accepting `abs(x=5)` would accept what CPython rejects). Check-time error:
+# "`abs` takes no keyword arguments".
+# This file must be rejected by BOTH `pyrst check` and `pyrst build`.
+def main() -> None:
+    # ERROR: builtins take no keyword arguments (CPython parity).
+    print(abs(x=5))

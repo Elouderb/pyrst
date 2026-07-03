@@ -66,3 +66,49 @@ def main() -> None:
         print(capwords("a,b", ""))
     except ValueError as e:
         print("caught:", str(e))
+
+    # (W1.5, card b671f313) UNICODE capwords/capitalize — the former
+    # multibyte byte-slice panic is fixed and the mapping is CPython-exact:
+    # titlecased first char (ß -> Ss), Final_Sigma-aware lowered tail.
+    print(capwords("héllo wörld"))
+    print(capwords("ßeta test"))
+    print(capwords("日本語 abc"))
+    print(capwords("émile,zola", ","))
+    print("héllo wörld".capitalize())
+    print("ßeta".capitalize())
+    print("ΑΣ".capitalize())
+    print("émile".capitalize())
+
+    # (W1.5 review fix round, item E) ljust/rjust/center now HONOR the optional
+    # fillchar (it used to be silently ignored, always padding with a space).
+    print("abc".center(7, "*"))
+    print("abc".ljust(6, "-"))
+    print("abc".rjust(6, "0"))
+    print("héllo".center(9, "*"))
+    print("x".center(4, "."))
+    print("abc".center(7))
+    print("abc".ljust(6))
+    print("abc".rjust(6))
+
+    # (W1.5 review fix round, item E) istitle now follows CPython's exact
+    # cased-run rule (an uncased char resets the run; a lowercase char must
+    # follow a cased char), instead of the old whitespace-word predicate that
+    # answered wrong on digit-containing words.
+    print("A1a".istitle())
+    print("A1A".istitle())
+    print("1a".istitle())
+    print("Aa1Aa".istitle())
+    print("".istitle())
+    print("123".istitle())
+    print("Hello World".istitle())
+    print("ABC".istitle())
+    print("Ab2C".istitle())
+
+    # (W1.5 review fix round, item D) list.count()/index() as the LEFTMOST
+    # operand of a comparison now parenthesize their `as i64` cast (rustc
+    # otherwise reads `as i64 <` as generic arguments and rejects it).
+    nums: list[int] = [1, 1, 2, 3, 1]
+    print(nums.count(1) < len(nums))
+    print(nums.index(2) < len(nums))
+    print(nums.count(1) >= 3)
+    print(nums.index(3) <= 3)

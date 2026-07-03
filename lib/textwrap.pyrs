@@ -6,25 +6,21 @@
 # change. Usable as either `from textwrap import wrap` or
 # `import textwrap; textwrap.wrap(t, 30)`.
 #
-# Fidelity: 4/5 (design doc §D target for this module). Upgraded from the
-# positional-only v1 surface by adding the default-arg options now supported
-# by pyrst (`def f(x: T, y: U = default) -> R`).
+# Fidelity: 4.5/5 (W1.5 divergence-closing pass; was 4/5). `wrap` is now a
+# faithful port of CPython TextWrapper._wrap_chunks with the DEFAULT pipeline:
+# _munge_whitespace (expand_tabs=True at real 8-column tab stops +
+# replace_whitespace=True over \t\n\x0b\x0c\r) feeding a whitespace-run
+# chunker, with drop_whitespace=True's exact rules (whitespace dropped at
+# line breaks, a purely-LEADING run preserved on line 0, interior runs
+# preserved when the line doesn't break there). python3-diffed across
+# tab/newline/mixed-whitespace inputs in the dual-run parity golden.
 #
-# ***CALLING CONVENTION CAVEAT (verified against this build)***: pass every
-# argument POSITIONALLY. Named keyword-call syntax at a call site
-# (`wrap(text, width=8, break_long_words=False)`) currently only threads
-# correctly into class constructors — for a plain function (including a
-# cross-module stdlib call like this one) the codegen either rejects it
-# (same-file function: "codegen error: keyword arguments are only supported
-# for class constructors in v0") or, observed here, silently ignores the
-# named value and uses that parameter's default instead (no error — a
-# silent miscompile). This is a pre-existing compiler limitation, not
-# something this module works around; every example/parity call below uses
-# positional args (including simply omitting *trailing* defaulted args,
-# which works correctly) to stay on the safe path.
+# KEYWORD CALLS (kwargs v1, W1.5): `wrap(text, width=8, initial_indent="> ")`
+# etc. now work — the former positional-only caveat is GONE. CPython's
+# options are keyword-only; pyrst additionally accepts them positionally in
+# declared order (documented superset).
 #
-# Public API (exact CPython names + positional shapes — call positionally,
-# see the caveat above):
+# Public API (exact CPython names):
 #   - `wrap(text, width=70, initial_indent="", subsequent_indent="",
 #           break_long_words=True)` — greedy word wrap: split on whitespace,
 #     then pack words into lines no longer than `width` (counting any
@@ -55,23 +51,21 @@
 #
 # Divergences / deferrals from full CPython `textwrap.TextWrapper` parity:
 #   - `width` is measured in CHARACTERS (pyrst `len(str)` is the char
-#     count), same as before.
-#   - `drop_whitespace` (default True in CPython) is NOT exposed as a
-#     keyword: this module always drops whitespace between words the way
-#     CPython's default does (chunks are produced by `.split()`, which
-#     already discards runs of whitespace). Reproducing CPython's
-#     `drop_whitespace=False` behaviour requires preserving whitespace RUNS
-#     as their own wrappable chunks (CPython's regex-based chunker); pyrst
-#     has no regex module yet, so this is deferred (not requested by the
-#     design row's callout, which names only
-#     `width`/`initial_indent`/`subsequent_indent`).
-#   - `expand_tabs`, `replace_whitespace`, `tabsize`, `fix_sentence_endings`,
-#     `break_on_hyphens`, `max_lines` (CPython `TextWrapper` extras): not
-#     implemented; the design row's explicit ask is
-#     `width`/`initial_indent`/`subsequent_indent` (+ `break_long_words`
-#     added here since it changes wrap's line-breaking algorithm materially
-#     and is a simple boolean). Deferred, undocumented as gated (no G-ref in
-#     the design row for these) — simply out of scope for this pass.
+#     count), same as CPython's len()-based accounting.
+#   - (W1.5) the DEFAULT pipeline behaviors `expand_tabs=True` (tabsize 8,
+#     real tab stops — backed by the fixed compiler `expandtabs` builtin),
+#     `replace_whitespace=True`, and `drop_whitespace=True` (incl. the
+#     leading-whitespace-run-on-line-0 rule) are now IMPLEMENTED and
+#     python3-verified; what stays unexposed is turning them OFF (the
+#     `expand_tabs=False` / `replace_whitespace=False` /
+#     `drop_whitespace=False` / `tabsize=` keywords — each would be a new
+#     param whose non-default path needs its own verified pipeline; deferred,
+#     not silently wrong).
+#   - `break_on_hyphens` (default True in CPython): NOT implemented — this
+#     module's chunker never splits at hyphens, so hyphenated words wrap
+#     whole. Equivalent to CPython's `break_on_hyphens=False`; hyphen-free
+#     text matches CPython's defaults exactly. `fix_sentence_endings` and
+#     `max_lines` also stay deferred.
 #   - `indent`'s `predicate` keyword (CPython: `predicate=None`, a callable
 #     `str -> bool` deciding which lines get prefixed) is deferred: pyrst
 #     does not support passing a bare function/lambda value into a stdlib
@@ -83,16 +77,12 @@
 #     example corpus does not feed `indent` whitespace-only lines, so the
 #     two agree on the tested inputs.
 #   - `dedent` has no keyword options in CPython either; unchanged.
-#   - `shorten` divergence: CPython raises `ValueError("placeholder too
-#     large for max width")` up front whenever
-#     `len(placeholder.lstrip()) > width` (checked unconditionally, even if
-#     the input text would not actually need truncating — e.g.
-#     `shorten("a", 3)` raises because the default placeholder, once
-#     stripped, is 5 chars > width 3). This module does not replicate that
-#     eager raise; instead, if even a single word cannot fit alongside the
-#     placeholder, it falls back to returning the bare (stripped)
-#     placeholder. Normal truncating cases (width large enough to hold at
-#     least the placeholder) are verified byte-identical to CPython.
+#   - (W1.5) `shorten` now replicates CPython's EAGER
+#     `ValueError("placeholder too large for max width")` whenever
+#     `len(placeholder.lstrip()) > width` (checked up front, even when the
+#     input would not need truncating), and returns the bare LEFT-stripped
+#     placeholder when no word fits alongside it — both python3-verified;
+#     the former divergence note here is gone.
 #
 # HARDENING PASS (w1-hardener, card 8f4c4088):
 #   - DEFECT FIXED: `wrap`/`fill`/`shorten` silently accepted `width <= 0`
@@ -102,20 +92,26 @@
 #     for `width <= 0`. Both `wrap` and `shorten` now raise
 #     `ValueError("invalid width " + str(width) + " (must be > 0)")` up
 #     front to match (`fill` inherits this via its call to `wrap`).
-#   - DIVERGENCE FOUND, documented (not fixed — out of scope, see
-#     `drop_whitespace` deferral above): CPython's default chunker
-#     preserves a purely-leading whitespace run as part of the FIRST
-#     wrapped line (e.g. `textwrap.wrap("   leading and trailing   ", 10)`
-#     -> `['   leading', 'and', 'trailing']` — note the 3 leading spaces
-#     survive on line 0 even though `drop_whitespace` defaults to `True`).
-#     This module's chunker is `text.split()`, which discards ALL
-#     whitespace including any leading run, so it returns
-#     `['leading', 'and', 'trailing']` for the same input (no leading
-#     spaces on line 0). This is a direct consequence of the already-
-#     documented `drop_whitespace`/regex-chunker deferral, not a new gap,
-#     but is called out explicitly here since it's easy to trip over with
-#     leading-whitespace input specifically (trailing whitespace and
-#     interior whitespace runs both match CPython correctly — verified).
+#   - (W1.5) LEADING-WHITESPACE RUN — now MATCHES CPython (the earlier
+#     "this module's chunker is text.split()" note here was STALE, superseded
+#     by the W1.5 `_textwrap_chunks` rewrite below): CPython's default
+#     chunker preserves a purely-leading whitespace run on the FIRST wrapped
+#     line, e.g. `textwrap.wrap("   leading and trailing   ", 10)` ->
+#     `['   leading', 'and', 'trailing']` (the 3 leading spaces survive on
+#     line 0 even with `drop_whitespace=True`). `_textwrap_chunks` keeps
+#     whitespace runs as their OWN chunks (it is NOT `text.split()`) and the
+#     drop-whitespace rule preserves the line-0 leading run, so pyrst returns
+#     the same list (python3-verified). Trailing and interior whitespace runs
+#     match CPython as well.
+#   - (W1.5 fix F4) PERFORMANCE NOTE (no behavior change): breaking an
+#     over-long word (`break_long_words=True`, the CPython default) slices it
+#     one line-width at a time (`head[0:space_left]` then
+#     `chunks[ci] = head[space_left:]`). pyrst string slicing is by CHARACTER
+#     position (a UTF-8 scan from the start), so repeatedly re-slicing the
+#     shrinking tail of a single very long unbreakable word is O(L^2/width)
+#     in that word's length L. This is the honest cost of char-accurate
+#     slicing; ordinary text (words no wider than `width`) never reaches it.
+#     Documented, not a correctness issue.
 #   - Verified additional edge cases match CPython exactly (folded into
 #     `examples/parity_textwrap.pyrs` as dual-run assertions): empty text,
 #     whitespace-only text, exact-width-tie words, single long word needing
@@ -124,67 +120,101 @@
 #     with `indent` (blank line correctly left unprefixed).
 
 
+def _textwrap_munge(text: str) -> str:
+    # CPython TextWrapper._munge_whitespace with the DEFAULTS: expand_tabs=True
+    # (tabsize=8, real tab-stop semantics — columns reset on \n/\r), then
+    # replace_whitespace=True (each of \t \n \x0b \x0c \r becomes one space;
+    # \t is already gone after expandtabs). chr(11)/chr(12) spell the vertical
+    # tab / form feed without relying on lexer escapes.
+    t: str = text.expandtabs(8)
+    t = t.replace("\n", " ")
+    t = t.replace("\r", " ")
+    t = t.replace(chr(11), " ")
+    t = t.replace(chr(12), " ")
+    return t
+
+
+def _textwrap_chunks(text: str) -> list[str]:
+    # CPython TextWrapper._split with the SIMPLE splitter (wordsep_simple_re,
+    # the one CPython uses for break_on_hyphens=False): alternating runs of
+    # whitespace and non-whitespace, whitespace runs KEPT as their own chunks.
+    # After _textwrap_munge all whitespace is literal spaces.
+    chunks: list[str] = []
+    cur: str = ""
+    cur_is_space: bool = False
+    for ch in text:
+        is_space: bool = ch == " "
+        if len(cur) == 0 or is_space == cur_is_space:
+            cur += ch
+        else:
+            chunks.append(cur)
+            cur = ch
+        cur_is_space = is_space
+    if len(cur) > 0:
+        chunks.append(cur)
+    return chunks
+
+
 def wrap(text: str, width: int = 70, initial_indent: str = "", subsequent_indent: str = "", break_long_words: bool = True) -> list[str]:
+    # A faithful port of CPython TextWrapper._wrap_chunks with the DEFAULT
+    # options (drop_whitespace=True, no max_lines), fed by _munge_whitespace +
+    # the simple whitespace-run chunker above. Consequences (all CPython
+    # behaviors the old split()-based version missed):
+    #   - tabs expand at 8-column tab stops, then \n/\v\f\r become spaces;
+    #   - interior whitespace RUNS survive when a line is not broken there
+    #     ("a  b" keeps its two spaces);
+    #   - a purely-LEADING whitespace run stays on the first line;
+    #   - whitespace at a line BREAK is dropped (drop_whitespace default).
     if width <= 0:
         raise ValueError("invalid width " + str(width) + " (must be > 0)")
-    words: list[str] = text.split()
+    chunks: list[str] = _textwrap_chunks(_textwrap_munge(text))
     lines: list[str] = []
-    current: str = ""
-    for w in words:
+    ci: int = 0
+    n: int = len(chunks)
+    while ci < n:
+        cur_line: list[str] = []
+        cur_len: int = 0
         indent: str = initial_indent
         if len(lines) > 0:
             indent = subsequent_indent
         avail: int = width - len(indent)
-        # Greedy pack: does `w` still fit on the current line? Test the length
-        # arithmetically (`len(current) + 1 space + len(w)`) instead of
-        # building a throwaway `candidate` string and copying it into
-        # `current`, so the accepted case grows `current` IN PLACE via `+=`
-        # rather than the O(n^2) `current = current + " " + w` full-copy. An
-        # empty `current` always accepts the first word (over-width handled by
-        # the break-long-words logic below), matching the prior behavior.
-        if len(current) == 0:
-            current = w
-        elif len(current) + 1 + len(w) <= avail:
-            current += " " + w
-        else:
-            lines.append(indent + current)
-            current = w
-        # Recompute the indent/width budget for the line `current` now
-        # lives on (it may have just moved to a new line above).
-        indent2: str = initial_indent
-        if len(lines) > 0:
-            indent2 = subsequent_indent
-        avail2: int = width - len(indent2)
-        # If `current` is now exactly the just-added word and it alone
-        # overflows this line's budget, either break it across multiple
-        # lines (break_long_words) or let it stand alone over-width
-        # (matches CPython's break_long_words=False).
-        if current == w and len(w) > avail2:
-            if break_long_words:
-                remaining: str = w
-                while len(remaining) > avail2:
-                    indent3: str = initial_indent
-                    if len(lines) > 0:
-                        indent3 = subsequent_indent
-                    avail3: int = width - len(indent3)
-                    if avail3 <= 0:
-                        break
-                    lines.append(indent3 + remaining[0:avail3])
-                    remaining = remaining[avail3:]
-                    indent2 = indent3
-                    avail2 = avail3
-                current = remaining
+        # First chunk on the line is whitespace: drop it, unless this is the
+        # very beginning of the text (no lines emitted yet).
+        if len(lines) > 0 and len(chunks[ci].strip()) == 0:
+            ci = ci + 1
+            if ci >= n:
+                break
+        while ci < n:
+            l: int = len(chunks[ci])
+            if cur_len + l <= avail:
+                cur_line.append(chunks[ci])
+                cur_len = cur_len + l
+                ci = ci + 1
             else:
-                indent3 = initial_indent
-                if len(lines) > 0:
-                    indent3 = subsequent_indent
-                lines.append(indent3 + current)
-                current = ""
-    if len(current) > 0:
-        indent = initial_indent
-        if len(lines) > 0:
-            indent = subsequent_indent
-        lines.append(indent + current)
+                break
+        # The next chunk alone is bigger than the whole line budget:
+        # CPython _handle_long_word.
+        if ci < n and len(chunks[ci]) > avail:
+            space_left: int = avail - cur_len
+            if avail < 1:
+                space_left = 1
+            if break_long_words:
+                head: str = chunks[ci]
+                cur_line.append(head[0:space_left])
+                chunks[ci] = head[space_left:]
+            elif len(cur_line) == 0:
+                cur_line.append(chunks[ci])
+                ci = ci + 1
+            cur_len = 0
+            for piece in cur_line:
+                cur_len = cur_len + len(piece)
+        # The last chunk on the line is all whitespace: drop it
+        # (drop_whitespace default).
+        if len(cur_line) > 0 and len(cur_line[len(cur_line) - 1].strip()) == 0:
+            dropped: str = cur_line.pop()
+            cur_len = cur_len - len(dropped)
+        if len(cur_line) > 0:
+            lines.append(indent + "".join(cur_line))
     return lines
 
 
@@ -195,12 +225,18 @@ def fill(text: str, width: int = 70, initial_indent: str = "", subsequent_indent
 def shorten(text: str, width: int, placeholder: str = " [...]") -> str:
     if width <= 0:
         raise ValueError("invalid width " + str(width) + " (must be > 0)")
+    # (W1.5) CPython's eager guard (TextWrapper._wrap_chunks under max_lines):
+    # a placeholder that cannot fit the width at all raises up front, even
+    # when the input would not need truncating. Message python3-verified.
+    if len(placeholder.lstrip()) > width:
+        raise ValueError("placeholder too large for max width")
     words: list[str] = text.split()
     collapsed: str = " ".join(words)
     if len(collapsed) <= width:
         return collapsed
     # Too long: pack whole words until the next word (plus `placeholder`)
-    # would overflow `width`.
+    # would overflow `width` — equivalent to CPython's max_lines=1 pop-back
+    # loop for single-space-joined word chunks.
     budget: int = width - len(placeholder)
     result: str = ""
     for w in words:
@@ -216,7 +252,9 @@ def shorten(text: str, width: int, placeholder: str = " [...]") -> str:
         else:
             break
     if len(result) == 0:
-        return placeholder.strip()
+        # No word fits alongside the placeholder: CPython emits the bare
+        # LEFT-stripped placeholder as the whole line.
+        return placeholder.lstrip()
     return result + placeholder
 
 

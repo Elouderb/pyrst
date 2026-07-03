@@ -321,6 +321,16 @@ pub struct TyCtx {
     /// like `generic_funcs`; method/field resolution then degrades to the
     /// non-substituted (type-var-bearing) signature, never a crash.
     pub generic_classes: HashMap<String, Vec<String>>,
+    /// (kwargs v1) The names SEEDED into `funcs` by `TyCtx::new()` — i.e. the
+    /// builtin stubs (`print`, `abs`, `chr`, ...), whose `FuncSig`s carry
+    /// placeholder param names and EMPTY `param_defaults`. The keyword→positional
+    /// mapper must never run against those stubs: CPython's builtins are
+    /// positional-only (`abs(x=5)` is a TypeError), and mapping onto a stub's
+    /// invented param name would ACCEPT what CPython rejects. A user or module
+    /// function that SHADOWS a builtin name replaces the `funcs` entry but the
+    /// name stays in this set — the resolver already errors on stdlib collisions,
+    /// and a root-program shadow keeps the (stricter) positional-only behavior.
+    pub builtin_funcs: std::collections::HashSet<String>,
 }
 
 impl TyCtx {
@@ -431,7 +441,11 @@ impl TyCtx {
         vars.insert("dict".into(), Ty::Dict(Box::new(Ty::Str), Box::new(Ty::Unknown)));
         vars.insert("set".into(), Ty::Set(Box::new(Ty::Unknown)));
 
-        Self { funcs, classes: HashMap::new(), vars, module_funcs: HashMap::new(), module_consts: HashMap::new(), generic_funcs: HashMap::new(), generic_func_bodies: HashMap::new(), generic_classes: HashMap::new() }
+        // (kwargs v1) Snapshot the seeded builtin names BEFORE any user/module
+        // function is merged in, so the keyword→positional mapper can tell a
+        // real user signature from a builtin stub (see `builtin_funcs` docs).
+        let builtin_funcs: std::collections::HashSet<String> = funcs.keys().cloned().collect();
+        Self { funcs, classes: HashMap::new(), vars, module_funcs: HashMap::new(), module_consts: HashMap::new(), generic_funcs: HashMap::new(), generic_func_bodies: HashMap::new(), generic_classes: HashMap::new(), builtin_funcs }
     }
 
     pub fn get_all_fields(&self, class_name: &str) -> Vec<crate::ast::Param> {

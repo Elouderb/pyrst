@@ -494,6 +494,39 @@ impl<A: PyRepr, B: PyRepr, C: PyRepr, D: PyRepr, E: PyRepr, F: PyRepr> PyRepr fo
 /// OSError:` catches them (exact-name match; OSError is not in the builtin
 /// descendant hierarchy). readlines() strips line endings (a documented
 /// deviation from CPython, which keeps them).
+/// (W1.5, card b671f313) Python `str.title()`-class TITLECASE of one char.
+/// Rust std has no `to_titlecase`; Python's first-char mapping differs from
+/// `to_uppercase` for (a) the Unicode digraph letters (Dž Lj Nj Dz families —
+/// single-char Lt forms), (b) the polytonic-Greek prosgegrammeni letters
+/// (U+1F8x/9x/Ax + U+1FB3/C3/F3 map to their Lt forms, NOT the two-char
+/// uppercase expansion), and (c) multi-char uppercase expansions (ß -> "Ss",
+/// not "SS": first char of the expansion stays upper, the rest lowers).
+/// Everything else falls through to `to_uppercase` (single char), matching
+/// CPython's title mapping on the tested corpus (python3-diffed).
+const TITLECASE_PRELUDE: &str = r#"fn __py_titlecase(c: char) -> String {
+    match c {
+        '\u{01C4}' | '\u{01C5}' | '\u{01C6}' => "\u{01C5}".to_string(),
+        '\u{01C7}' | '\u{01C8}' | '\u{01C9}' => "\u{01C8}".to_string(),
+        '\u{01CA}' | '\u{01CB}' | '\u{01CC}' => "\u{01CB}".to_string(),
+        '\u{01F1}' | '\u{01F2}' | '\u{01F3}' => "\u{01F2}".to_string(),
+        '\u{1F80}'..='\u{1F87}' | '\u{1F90}'..='\u{1F97}' | '\u{1FA0}'..='\u{1FA7}' =>
+            char::from_u32(c as u32 + 8).unwrap_or(c).to_string(),
+        '\u{1F88}'..='\u{1F8F}' | '\u{1F98}'..='\u{1F9F}' | '\u{1FA8}'..='\u{1FAF}' => c.to_string(),
+        '\u{1FB3}' => "\u{1FBC}".to_string(),
+        '\u{1FC3}' => "\u{1FCC}".to_string(),
+        '\u{1FF3}' => "\u{1FFC}".to_string(),
+        '\u{1FBC}' | '\u{1FCC}' | '\u{1FFC}' => c.to_string(),
+        _ => {
+            let mut out = String::new();
+            for (i, u) in c.to_uppercase().enumerate() {
+                if i == 0 { out.push(u); } else { out.extend(u.to_lowercase()); }
+            }
+            out
+        }
+    }
+}
+"#;
+
 const FILE_PRELUDE: &str = r#"struct PyFile { inner: std::fs::File }
 impl PyFile {
     fn read(&mut self) -> String {
@@ -746,6 +779,7 @@ pub fn emit_program(modules: &[(Module, String)], ctx: &TyCtx) -> Result<String>
     // `Normal` means the body fell through (so `else` runs). See `emit_try`.
     cg.line("enum __PyrstTryFlow<R> { Normal, Return(R), Break, Continue }");
     cg.line(REPR_PRELUDE);
+    cg.line(TITLECASE_PRELUDE);
     cg.line(FILE_PRELUDE);
     // (LAZY-GEN V1-b) The lazy-generator runtime (Gen<T>/Co<T>/YieldNow).
     // Emitted unconditionally like the preludes above; dead when a program has

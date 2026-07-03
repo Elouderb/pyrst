@@ -18,6 +18,14 @@
 []
 [2, 3, 4]
 [0, 2, 3]
+[3, 0, 2]
+[0, 2, 3]
+[]
+pop from an empty deque
+pop from an empty deque
+1 is not in deque
+[0, 9, 1, 8, 2, 7, 3, 6, 4, 5]
+True
 -1
 [('x', 1), ('y', 5)]
 [('x', 1), ('y', 5), ('z', 9)]

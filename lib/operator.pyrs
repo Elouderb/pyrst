@@ -5,13 +5,12 @@
 # Embedded via `include_str!` (see `src/stdlib.rs`). Usable as either
 # `from operator import add` or `import operator; operator.add(2, 3)`.
 #
-# Fidelity score: 4 (near drop-in). Exact CPython names/positional shapes,
-# with two forced exceptions: `mod` is spelled `mod_` (reserved-word clash)
-# and CPython's `contains` is spelled `contains_` here — the bare name
-# `contains` collides with a compiler-internal method identifier used to
-# resolve `list`/`str`/`set` `.contains`-shaped calls (src/typeck/flow.rs),
-# so a free function named exactly `contains` cannot be defined in the flat
-# stdlib namespace (same class of forced rename as `mod_`).
+# Fidelity score: 4.5 (near drop-in; W1.5). Exact CPython names — keyword
+# calls too (kwargs v1) —
+# (W1.5) with NO forced renames left: `mod` and `contains` now ship under
+# their REAL CPython names (the old reserved-word / identifier clashes no
+# longer reproduce — escape_ident emits `r#mod`); `mod_`/`contains_` remain
+# as back-compat aliases from the W1 era.
 #
 # W1 upgrade over the phase-1 int-only baseline (11 fns, score 2):
 #   - all 6 comparisons (`lt le gt ge eq ne`) are now GENERIC over any `T`
@@ -92,8 +91,16 @@ def floordiv(a: int, b: int) -> int:
     return a // b
 
 
-def mod_(a: int, b: int) -> int:
+def mod(a: int, b: int) -> int:
+    # (W1.5) CPython's REAL name: the reserved-word clash is gone — codegen's
+    # escape_ident emits `r#mod` (EPIC-6), probe-verified to compile and
+    # dispatch as a value/Callable too. `mod_` stays as a back-compat alias.
     return a % b
+
+
+def mod_(a: int, b: int) -> int:
+    # Back-compat alias for the pre-W1.5 forced rename; prefer `mod`.
+    return mod(a, b)
 
 
 def lt[T](a: T, b: T) -> bool:
@@ -132,8 +139,16 @@ def not_(a: int) -> bool:
     return True
 
 
-def contains_[T](xs: list[T], v: T) -> bool:
+def contains[T](xs: list[T], v: T) -> bool:
+    # (W1.5) CPython's REAL name: the former compiler-identifier clash no
+    # longer reproduces (probe-verified: flat call, qualified call, and
+    # Callable-value dispatch all work). `contains_` stays as an alias.
     return v in xs
+
+
+def contains_[T](xs: list[T], v: T) -> bool:
+    # Back-compat alias for the pre-W1.5 forced rename; prefer `contains`.
+    return contains(xs, v)
 
 
 def concat[T](a: list[T], b: list[T]) -> list[T]:

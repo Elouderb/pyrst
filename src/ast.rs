@@ -92,6 +92,19 @@ pub struct ClassDef {
     pub fields: Vec<Param>,
     pub methods: Vec<Func>,
     pub is_dataclass: bool,
+    /// (card 6f69d4a3) Every decorator name written above the `class` in source
+    /// order (e.g. `["dataclass"]`, or `["made_up"]`). EMPTY for an undecorated
+    /// class. typeck runs this through `validate_decorators` so an UNRECOGNIZED
+    /// class decorator is an honest check error instead of being silently swallowed
+    /// (the pre-card behavior: only `dataclass` was ever inspected, every other
+    /// name dropped). `is_dataclass` stays the derived convenience flag.
+    pub decorators: Vec<String>,
+    /// (card 6f69d4a3) True when `@dataclass(...)` was written WITH arguments
+    /// (any non-empty parens, e.g. `@dataclass(order=True)`). Only the BARE
+    /// `@dataclass` is supported initially; typeck honest-rejects a dataclass whose
+    /// flag arguments (order=/frozen=/eq=/repr=/init=/slots=/…) are present, rather
+    /// than silently ignoring a requested `order=`/`frozen=` semantics change.
+    pub dataclass_has_args: bool,
     pub span: Span,
     /// Generics v2 (PEP 695): the declared type parameters of a parametric
     /// generic CLASS, e.g. `["T"]` for `class Box[T]:` or `["A", "B"]` for

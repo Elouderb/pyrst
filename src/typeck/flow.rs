@@ -116,6 +116,651 @@ pub(crate) fn unify_elem_types(a: Ty, b: Ty, widen_numeric: bool, ctx: &TyCtx) -
 ///
 /// Stays permissive on `Unknown` (e.g. `set()` / `{}` with no concrete inner):
 /// only a concrete `Ty::Float` is rejected, never `Unknown`.
+/// (card e131f8b0) Walk a module and collect every class NAME used as a `dict`
+/// KEY or `set` ELEMENT (recursing through list/tuple/Optional/Callable wrappers
+/// and into function/method bodies for local annotations). The result seeds
+/// `TyCtx::hash_key_classes`, which drives both the codegen `Eq/Hash/Ord` derives
+/// and the check-time hashability validation. Candidates are bare `Named` type
+/// names in a key/element position that are not primitives — the checker resolves
+/// each against `ctx.classes` and validates its eligibility.
+pub(crate) fn collect_hash_key_classes(m: &Module, out: &mut std::collections::HashSet<String>) {
+    for s in &m.stmts {
+        collect_stmt_key_classes(s, out);
+    }
+}
+
+fn collect_stmt_key_classes(s: &Stmt, out: &mut std::collections::HashSet<String>) {
+    match s {
+        Stmt::Class(c) => {
+            for f in &c.fields {
+                collect_te_key_classes(&f.ty, out);
+            }
+            for meth in &c.methods {
+                collect_fn_key_classes(meth, out);
+            }
+        }
+        Stmt::Func(f) => collect_fn_key_classes(f, out),
+        Stmt::Assign { ty: Some(te), .. } => collect_te_key_classes(te, out),
+        Stmt::If { then, elifs, else_, .. } => {
+            then.iter().for_each(|s| collect_stmt_key_classes(s, out));
+            for (_, b) in elifs {
+                b.iter().for_each(|s| collect_stmt_key_classes(s, out));
+            }
+            if let Some(b) = else_ {
+                b.iter().for_each(|s| collect_stmt_key_classes(s, out));
+            }
+        }
+        Stmt::While { body, .. } | Stmt::For { body, .. } | Stmt::With { body, .. } => {
+            body.iter().for_each(|s| collect_stmt_key_classes(s, out));
+        }
+        Stmt::Try { body, handlers, else_, finally_, .. } => {
+            body.iter().for_each(|s| collect_stmt_key_classes(s, out));
+            for h in handlers {
+                h.body.iter().for_each(|s| collect_stmt_key_classes(s, out));
+            }
+            if let Some(b) = else_ {
+                b.iter().for_each(|s| collect_stmt_key_classes(s, out));
+            }
+            if let Some(b) = finally_ {
+                b.iter().for_each(|s| collect_stmt_key_classes(s, out));
+            }
+        }
+        Stmt::Match { arms, .. } => {
+            for a in arms {
+                a.body.iter().for_each(|s| collect_stmt_key_classes(s, out));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_fn_key_classes(f: &Func, out: &mut std::collections::HashSet<String>) {
+    for p in &f.params {
+        collect_te_key_classes(&p.ty, out);
+    }
+    collect_te_key_classes(&f.ret, out);
+    for s in &f.body {
+        collect_stmt_key_classes(s, out);
+    }
+}
+
+fn collect_te_key_classes(te: &TypeExpr, out: &mut std::collections::HashSet<String>) {
+    if let TypeExpr::Generic(n, args) = te {
+        match (n.as_str(), args.as_slice()) {
+            ("dict", [k, _v]) => add_if_class_name(k, out),
+            ("set", [e]) => add_if_class_name(e, out),
+            _ => {}
+        }
+        for a in args {
+            collect_te_key_classes(a, out);
+        }
+    } else if let TypeExpr::Tuple(ts) = te {
+        ts.iter().for_each(|t| collect_te_key_classes(t, out));
+    } else if let TypeExpr::Func(args, ret) = te {
+        args.iter().for_each(|t| collect_te_key_classes(t, out));
+        collect_te_key_classes(ret, out);
+    }
+}
+
+fn add_if_class_name(te: &TypeExpr, out: &mut std::collections::HashSet<String>) {
+    if let TypeExpr::Named(n) = te {
+        // Primitives are valid hashable keys directly (str/int/bool); float is
+        // rejected separately by `require_hashable`. Any other bare name is a
+        // candidate user class to validate + derive Eq/Hash/Ord for.
+        if !matches!(n.as_str(), "int" | "str" | "bool" | "float") {
+            out.insert(n.clone());
+        }
+    }
+}
+
+/// (enabler-fix-2 #1a/#1c) FINALIZE `hash_key_classes` over the WHOLE program,
+/// after every class is registered and every module AST is available. The
+/// per-module annotation scan (`collect_hash_key_classes`) records only classes
+/// named DIRECTLY in a `dict`/`set` annotation; two closures it misses caused
+/// codegen to emit a struct deriving `Eq/Hash/Ord` whose FIELD did not, or to
+/// skip the derive entirely — both leaking rustc E0277/E0599:
+///
+///   (1a) TRANSITIVE — a hash-key class with a user-class FIELD (directly, or
+///        inside a tuple) needs that nested class to derive too. Close the set
+///        under "Named/Tuple field class of a member" to a fixed point. Only
+///        Named/Tuple fields propagate: a `list`/`dict`/`set`/`Optional`/`Callable`
+///        field makes the OWNER ineligible (no derive, so no field requirement).
+///
+///   (1c) ANNOTATION-LESS LITERAL — a `dict`/`set` literal (or comprehension)
+///        keyed by class VALUES with no annotation never reached the annotation
+///        scan. Add a key/element that is a CONSTRUCTOR CALL `C(..)` for a known
+///        class `C` (the common `{Node(1): ...}` form). A variable/opaque key
+///        still needs an annotation (no per-scope inference here — documented in
+///        PYTHON_COMPATIBILITY.md). Codegen then adds the derive for the eligible
+///        case; `check_class_prelude` still validates `class_hash_eligible` for
+///        every member, so an INELIGIBLE class added here stays an honest error.
+pub fn finalize_hash_key_classes(modules: &[(Module, String)], ctx: &mut TyCtx) {
+    // (1c) constructor-call keys/elements of dict/set literals + comprehensions.
+    let classes: std::collections::HashSet<String> = ctx.classes.keys().cloned().collect();
+    let mut found = std::collections::HashSet::new();
+    for (m, _) in modules {
+        for s in &m.stmts {
+            hk_scan_stmt(s, &classes, &mut found);
+        }
+    }
+    ctx.hash_key_classes.extend(found);
+
+    // (1a) transitive closure over user-class Named/Tuple field types. Monotone
+    // fixed point (a finite class set, insert-only), so it terminates.
+    loop {
+        let current: Vec<String> = ctx.hash_key_classes.iter().cloned().collect();
+        let mut to_add: Vec<String> = Vec::new();
+        for cname in &current {
+            for f in ctx.get_all_fields(cname) {
+                hk_field_class_names(&f.ty, &mut to_add);
+            }
+        }
+        let mut added = false;
+        for n in to_add {
+            if ctx.classes.contains_key(&n) && ctx.hash_key_classes.insert(n) {
+                added = true;
+            }
+        }
+        if !added {
+            break;
+        }
+    }
+}
+
+/// Push every class name reachable through a hash-key field TYPE — a bare `Named`
+/// or a `Tuple` of such. `list`/`dict`/`set`/`Optional`/`Callable` (`Generic`/
+/// `Func`) are intentionally NOT traversed: such a field makes its owner
+/// ineligible (`field_hashable` rejects it), so the owner never derives and its
+/// element class carries no derive requirement from this position.
+fn hk_field_class_names(te: &TypeExpr, out: &mut Vec<String>) {
+    match te {
+        TypeExpr::Named(n) => out.push(n.clone()),
+        TypeExpr::Tuple(ts) => ts.iter().for_each(|t| hk_field_class_names(t, out)),
+        _ => {}
+    }
+}
+
+/// Add class `C` when `key` is a constructor call `C(..)` for a known class.
+fn hk_add_ctor_key(key: &Expr, classes: &std::collections::HashSet<String>, out: &mut std::collections::HashSet<String>) {
+    if let Expr::Call { callee, .. } = key {
+        if let Expr::Ident(c, _) = callee.as_ref() {
+            if classes.contains(c) {
+                out.insert(c.clone());
+            }
+        }
+    }
+}
+
+fn hk_scan_stmt(s: &Stmt, classes: &std::collections::HashSet<String>, out: &mut std::collections::HashSet<String>) {
+    match s {
+        Stmt::Class(c) => {
+            for f in &c.fields {
+                if let Some(d) = &f.default { hk_scan_expr(d, classes, out); }
+            }
+            for meth in &c.methods {
+                for st in &meth.body { hk_scan_stmt(st, classes, out); }
+            }
+        }
+        Stmt::Func(f) => { for st in &f.body { hk_scan_stmt(st, classes, out); } }
+        Stmt::Assign { value, .. } | Stmt::AugAssign { value, .. }
+        | Stmt::Unpack { value, .. } | Stmt::Expr(value)
+        | Stmt::Return(Some(value), _) | Stmt::Yield(value, _)
+        | Stmt::Del { target: value, .. } => hk_scan_expr(value, classes, out),
+        Stmt::AttrAssign { obj, value, .. } => { hk_scan_expr(obj, classes, out); hk_scan_expr(value, classes, out); }
+        Stmt::IndexAssign { obj, idx, value, .. } => {
+            hk_scan_expr(obj, classes, out); hk_scan_expr(idx, classes, out); hk_scan_expr(value, classes, out);
+        }
+        Stmt::If { cond, then, elifs, else_, .. } => {
+            hk_scan_expr(cond, classes, out);
+            then.iter().for_each(|s| hk_scan_stmt(s, classes, out));
+            for (c, b) in elifs {
+                hk_scan_expr(c, classes, out);
+                b.iter().for_each(|s| hk_scan_stmt(s, classes, out));
+            }
+            if let Some(b) = else_ { b.iter().for_each(|s| hk_scan_stmt(s, classes, out)); }
+        }
+        Stmt::While { cond, body, .. } => {
+            hk_scan_expr(cond, classes, out);
+            body.iter().for_each(|s| hk_scan_stmt(s, classes, out));
+        }
+        Stmt::For { iter, body, .. } => {
+            hk_scan_expr(iter, classes, out);
+            body.iter().for_each(|s| hk_scan_stmt(s, classes, out));
+        }
+        Stmt::With { ctx_expr, body, .. } => {
+            hk_scan_expr(ctx_expr, classes, out);
+            body.iter().for_each(|s| hk_scan_stmt(s, classes, out));
+        }
+        Stmt::Assert { cond, msg, .. } => {
+            hk_scan_expr(cond, classes, out);
+            if let Some(msg) = msg { hk_scan_expr(msg, classes, out); }
+        }
+        Stmt::Raise { exc, .. } => { if let Some(e) = exc { hk_scan_expr(e, classes, out); } }
+        Stmt::Try { body, handlers, else_, finally_, .. } => {
+            body.iter().for_each(|s| hk_scan_stmt(s, classes, out));
+            for h in handlers { h.body.iter().for_each(|s| hk_scan_stmt(s, classes, out)); }
+            if let Some(b) = else_ { b.iter().for_each(|s| hk_scan_stmt(s, classes, out)); }
+            if let Some(b) = finally_ { b.iter().for_each(|s| hk_scan_stmt(s, classes, out)); }
+        }
+        Stmt::Match { subject, arms, .. } => {
+            hk_scan_expr(subject, classes, out);
+            for a in arms { a.body.iter().for_each(|s| hk_scan_stmt(s, classes, out)); }
+        }
+        _ => {}
+    }
+}
+
+fn hk_scan_expr(e: &Expr, classes: &std::collections::HashSet<String>, out: &mut std::collections::HashSet<String>) {
+    match e {
+        Expr::Dict(kvs, _) => {
+            for (k, v) in kvs {
+                hk_add_ctor_key(k, classes, out);
+                hk_scan_expr(k, classes, out);
+                hk_scan_expr(v, classes, out);
+            }
+        }
+        Expr::Set(xs, _) => {
+            for x in xs {
+                hk_add_ctor_key(x, classes, out);
+                hk_scan_expr(x, classes, out);
+            }
+        }
+        Expr::DictComp { key, val, iter, cond, .. } => {
+            hk_add_ctor_key(key, classes, out);
+            hk_scan_expr(key, classes, out);
+            hk_scan_expr(val, classes, out);
+            hk_scan_expr(iter, classes, out);
+            if let Some(c) = cond { hk_scan_expr(c, classes, out); }
+        }
+        Expr::SetComp { elt, iter, cond, .. } => {
+            hk_add_ctor_key(elt, classes, out);
+            hk_scan_expr(elt, classes, out);
+            hk_scan_expr(iter, classes, out);
+            if let Some(c) = cond { hk_scan_expr(c, classes, out); }
+        }
+        Expr::ListComp { elt, iter, cond, .. } => {
+            hk_scan_expr(elt, classes, out);
+            hk_scan_expr(iter, classes, out);
+            if let Some(c) = cond { hk_scan_expr(c, classes, out); }
+        }
+        Expr::List(xs, _) | Expr::Tuple(xs, _) => xs.iter().for_each(|x| hk_scan_expr(x, classes, out)),
+        Expr::Call { callee, args, kwargs, .. } => {
+            hk_scan_expr(callee, classes, out);
+            args.iter().for_each(|a| hk_scan_expr(a, classes, out));
+            kwargs.iter().for_each(|(_, v)| hk_scan_expr(v, classes, out));
+        }
+        Expr::Attr { obj, .. } => hk_scan_expr(obj, classes, out),
+        Expr::Index { obj, idx, .. } => { hk_scan_expr(obj, classes, out); hk_scan_expr(idx, classes, out); }
+        Expr::Slice { obj, start, stop, step, .. } => {
+            hk_scan_expr(obj, classes, out);
+            for o in [start, stop, step].into_iter().flatten() { hk_scan_expr(o, classes, out); }
+        }
+        Expr::BinOp { lhs, rhs, .. } => { hk_scan_expr(lhs, classes, out); hk_scan_expr(rhs, classes, out); }
+        Expr::UnOp { expr, .. } => hk_scan_expr(expr, classes, out),
+        Expr::Lambda { body, .. } => hk_scan_expr(body, classes, out),
+        Expr::IfExp { test, body, orelse, .. } => {
+            hk_scan_expr(test, classes, out);
+            hk_scan_expr(body, classes, out);
+            hk_scan_expr(orelse, classes, out);
+        }
+        Expr::FStr(parts, _) => {
+            for p in parts {
+                if let FStrPart::Interp(x, _) = p { hk_scan_expr(x, classes, out); }
+            }
+        }
+        _ => {}
+    }
+}
+
+// ─── (enabler-fix-1 #3) Class-constant promotion scan ────────────────────────
+// A class-body binding `NAME: T = <literal>` becomes an associated `const` (an enum
+// member) ONLY when it is actually USED as `ClassName.NAME` and NEVER written — so a
+// mutable "options/record with defaults" (`class Options: verbose: bool = False`
+// mutated via `o.verbose = True`, or a `class Pt: x:int=0` constructed `Pt(5)`) stays
+// an ordinary instance field. This mirrors the hash-key derive philosophy
+// (usage-gated). The scan gathers the whole-program signals below; the decision is
+// finalized in `collect_promoted_consts` and stored in `TyCtx::promoted_consts`.
+
+#[derive(Default)]
+struct ConstPromotionScan {
+    /// (receiver-class, field) from a `ClassName.FIELD` READ (class-name receiver).
+    reads: HashSet<(String, String)>,
+    /// (owner-class, field) from a `self.FIELD = ..` write inside a method body.
+    self_writes: HashSet<(String, String)>,
+    /// (receiver-class, field) from a `ClassName.FIELD = ..` write (class receiver).
+    class_writes: HashSet<(String, String)>,
+    /// field names written through an INSTANCE `<expr>.FIELD = ..` (non-class recv).
+    instance_written: HashSet<String>,
+    /// class names instantiated via `ClassName(..)`.
+    instantiated: HashSet<String>,
+}
+
+fn scan_const_stmt(s: &Stmt, owner: Option<&str>, classes: &HashSet<String>, acc: &mut ConstPromotionScan) {
+    match s {
+        Stmt::Class(c) => {
+            for f in &c.fields {
+                if let Some(d) = &f.default {
+                    scan_const_expr(d, classes, acc);
+                }
+            }
+            // A method body runs with `self` bound to THIS class.
+            for meth in &c.methods {
+                for st in &meth.body {
+                    scan_const_stmt(st, Some(&c.name), classes, acc);
+                }
+            }
+        }
+        // A nested function inherits the enclosing owner (a closure inside a method
+        // still writes `self.FIELD` of that method's class).
+        Stmt::Func(f) => {
+            for st in &f.body {
+                scan_const_stmt(st, owner, classes, acc);
+            }
+        }
+        Stmt::AttrAssign { obj, attr, value, .. } => {
+            match obj.as_ref() {
+                Expr::Ident(n, _) if n == "self" && owner.is_some() => {
+                    acc.self_writes.insert((owner.unwrap().to_string(), attr.clone()));
+                }
+                Expr::Ident(n, _) if classes.contains(n) => {
+                    acc.class_writes.insert((n.clone(), attr.clone()));
+                }
+                _ => {
+                    acc.instance_written.insert(attr.clone());
+                }
+            }
+            scan_const_expr(obj, classes, acc);
+            scan_const_expr(value, classes, acc);
+        }
+        Stmt::IndexAssign { obj, idx, value, .. } => {
+            scan_const_expr(obj, classes, acc);
+            scan_const_expr(idx, classes, acc);
+            scan_const_expr(value, classes, acc);
+        }
+        Stmt::Assign { value, .. } => scan_const_expr(value, classes, acc),
+        Stmt::AugAssign { value, .. } => scan_const_expr(value, classes, acc),
+        Stmt::Unpack { value, .. } => scan_const_expr(value, classes, acc),
+        Stmt::Expr(e) => scan_const_expr(e, classes, acc),
+        Stmt::Return(Some(e), _) => scan_const_expr(e, classes, acc),
+        Stmt::Yield(e, _) => scan_const_expr(e, classes, acc),
+        Stmt::If { cond, then, elifs, else_, .. } => {
+            scan_const_expr(cond, classes, acc);
+            then.iter().for_each(|s| scan_const_stmt(s, owner, classes, acc));
+            for (c, b) in elifs {
+                scan_const_expr(c, classes, acc);
+                b.iter().for_each(|s| scan_const_stmt(s, owner, classes, acc));
+            }
+            if let Some(b) = else_ {
+                b.iter().for_each(|s| scan_const_stmt(s, owner, classes, acc));
+            }
+        }
+        Stmt::While { cond, body, .. } => {
+            scan_const_expr(cond, classes, acc);
+            body.iter().for_each(|s| scan_const_stmt(s, owner, classes, acc));
+        }
+        Stmt::For { iter, body, .. } => {
+            scan_const_expr(iter, classes, acc);
+            body.iter().for_each(|s| scan_const_stmt(s, owner, classes, acc));
+        }
+        Stmt::Assert { cond, msg, .. } => {
+            scan_const_expr(cond, classes, acc);
+            if let Some(m) = msg { scan_const_expr(m, classes, acc); }
+        }
+        Stmt::Raise { exc, .. } => {
+            if let Some(e) = exc { scan_const_expr(e, classes, acc); }
+        }
+        Stmt::Del { target, .. } => scan_const_expr(target, classes, acc),
+        Stmt::With { ctx_expr, body, .. } => {
+            scan_const_expr(ctx_expr, classes, acc);
+            body.iter().for_each(|s| scan_const_stmt(s, owner, classes, acc));
+        }
+        Stmt::Try { body, handlers, else_, finally_, .. } => {
+            body.iter().for_each(|s| scan_const_stmt(s, owner, classes, acc));
+            for h in handlers {
+                h.body.iter().for_each(|s| scan_const_stmt(s, owner, classes, acc));
+            }
+            if let Some(b) = else_ { b.iter().for_each(|s| scan_const_stmt(s, owner, classes, acc)); }
+            if let Some(b) = finally_ { b.iter().for_each(|s| scan_const_stmt(s, owner, classes, acc)); }
+        }
+        Stmt::Match { subject, arms, .. } => {
+            scan_const_expr(subject, classes, acc);
+            for a in arms {
+                a.body.iter().for_each(|s| scan_const_stmt(s, owner, classes, acc));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn scan_const_expr(e: &Expr, classes: &HashSet<String>, acc: &mut ConstPromotionScan) {
+    match e {
+        Expr::Attr { obj, name, .. } => {
+            if let Expr::Ident(x, _) = obj.as_ref() {
+                if classes.contains(x) {
+                    acc.reads.insert((x.clone(), name.clone()));
+                }
+            }
+            scan_const_expr(obj, classes, acc);
+        }
+        Expr::Call { callee, args, kwargs, .. } => {
+            if let Expr::Ident(c, _) = callee.as_ref() {
+                if classes.contains(c) {
+                    acc.instantiated.insert(c.clone());
+                }
+            }
+            scan_const_expr(callee, classes, acc);
+            args.iter().for_each(|a| scan_const_expr(a, classes, acc));
+            kwargs.iter().for_each(|(_, v)| scan_const_expr(v, classes, acc));
+        }
+        Expr::Index { obj, idx, .. } => {
+            scan_const_expr(obj, classes, acc);
+            scan_const_expr(idx, classes, acc);
+        }
+        Expr::Slice { obj, start, stop, step, .. } => {
+            scan_const_expr(obj, classes, acc);
+            for o in [start, stop, step].into_iter().flatten() {
+                scan_const_expr(o, classes, acc);
+            }
+        }
+        Expr::BinOp { lhs, rhs, .. } => {
+            scan_const_expr(lhs, classes, acc);
+            scan_const_expr(rhs, classes, acc);
+        }
+        Expr::UnOp { expr, .. } => scan_const_expr(expr, classes, acc),
+        Expr::List(xs, _) | Expr::Tuple(xs, _) | Expr::Set(xs, _) => {
+            xs.iter().for_each(|x| scan_const_expr(x, classes, acc));
+        }
+        Expr::Dict(kvs, _) => {
+            for (k, v) in kvs {
+                scan_const_expr(k, classes, acc);
+                scan_const_expr(v, classes, acc);
+            }
+        }
+        Expr::ListComp { elt, iter, cond, .. } | Expr::SetComp { elt, iter, cond, .. } => {
+            scan_const_expr(elt, classes, acc);
+            scan_const_expr(iter, classes, acc);
+            if let Some(c) = cond { scan_const_expr(c, classes, acc); }
+        }
+        Expr::DictComp { key, val, iter, cond, .. } => {
+            scan_const_expr(key, classes, acc);
+            scan_const_expr(val, classes, acc);
+            scan_const_expr(iter, classes, acc);
+            if let Some(c) = cond { scan_const_expr(c, classes, acc); }
+        }
+        Expr::Lambda { body, .. } => scan_const_expr(body, classes, acc),
+        Expr::IfExp { test, body, orelse, .. } => {
+            scan_const_expr(test, classes, acc);
+            scan_const_expr(body, classes, acc);
+            scan_const_expr(orelse, classes, acc);
+        }
+        Expr::FStr(parts, _) => {
+            for p in parts {
+                if let FStrPart::Interp(x, _) = p {
+                    scan_const_expr(x, classes, acc);
+                }
+            }
+        }
+        // Int/Float/Str/Bool/None_/Ident: leaves, no class-const usage.
+        _ => {}
+    }
+}
+
+/// (enabler-fix-1 #3) Compute the promoted class constants over the WHOLE program
+/// and store them in `ctx.promoted_consts`. A field of class `C` promotes iff it has
+/// a literal default, `C` is not a `@dataclass`, it is READ as `C.FIELD` (or via a
+/// subclass) somewhere, and it is never written (`self.FIELD=` in `C`/a subclass, a
+/// `C.FIELD=` class write, or — for an INSTANTIATED class — an external instance
+/// write). This is the single source of truth both typeck and codegen consult.
+pub(crate) fn collect_promoted_consts(modules: &[(Module, String)], ctx: &mut TyCtx) {
+    let classes: HashSet<String> = ctx.classes.keys().cloned().collect();
+    let mut acc = ConstPromotionScan::default();
+    for (m, _) in modules {
+        for s in &m.stmts {
+            scan_const_stmt(s, None, &classes, &mut acc);
+        }
+    }
+    // Resolve each read/write to the class that DECLARES the field (base-chain), so
+    // an inherited-const read (`Sub.KIND`) promotes the defining class (`Base`).
+    let mut promote_reads: HashSet<(String, String)> = HashSet::new();
+    for (x, f) in &acc.reads {
+        if let Some(d) = ctx.defining_class(x, f) {
+            promote_reads.insert((d, f.clone()));
+        }
+    }
+    let mut denied: HashSet<(String, String)> = HashSet::new();
+    for (m, f) in acc.self_writes.iter().chain(acc.class_writes.iter()) {
+        if let Some(d) = ctx.defining_class(m, f) {
+            denied.insert((d, f.clone()));
+        }
+    }
+    let mut out: std::collections::HashMap<String, HashSet<String>> = std::collections::HashMap::new();
+    for (cname, cd) in &ctx.classes {
+        if cd.is_dataclass {
+            continue;
+        }
+        for f in &cd.fields {
+            let is_lit = matches!(
+                f.default,
+                Some(Expr::Int(..)) | Some(Expr::Float(..)) | Some(Expr::Str(..)) | Some(Expr::Bool(..))
+            );
+            if !is_lit {
+                continue;
+            }
+            let key = (cname.clone(), f.name.clone());
+            let read_as_const = promote_reads.contains(&key);
+            let written = denied.contains(&key)
+                || (acc.instantiated.contains(cname) && acc.instance_written.contains(&f.name));
+            if read_as_const && !written {
+                out.entry(cname.clone()).or_default().insert(f.name.clone());
+            }
+        }
+    }
+    ctx.promoted_consts = out;
+}
+
+/// (card e131f8b0) Whether class `cname` can soundly derive `Eq + Hash` (and the
+/// `Ord` pyrst needs for deterministic sorted-key iteration) so it may be used as
+/// a `dict` key / `set` element. Returns `Ok(())` when eligible, or `Err(reason)`
+/// naming the blocking field/dunder — the caller turns that into an honest CHECK
+/// error, mirroring CPython's `unhashable type` rule.
+///
+/// A class is eligible iff: it defines no user `__eq__` (a derived `Hash` could
+/// then disagree with `==`) and no user `__lt__` (a custom order conflicts with
+/// the derived total order); it is not a polymorphic base (its Rust form is a
+/// companion enum without a uniform derive); and every field (transitively) is
+/// itself hashable-orderable — `int`/`str`/`bool`, a tuple of such, or a nested
+/// eligible class. `float`/`list`/`dict`/`set`/`Callable`/`Optional` fields make
+/// it ineligible (their Rust forms are not `Eq`/`Hash`).
+pub(crate) fn class_hash_eligible(cname: &str, ctx: &TyCtx) -> std::result::Result<(), String> {
+    let mut visited = std::collections::HashSet::new();
+    class_hash_eligible_rec(cname, ctx, &mut visited)
+}
+
+fn class_hash_eligible_rec(
+    cname: &str,
+    ctx: &TyCtx,
+    visited: &mut std::collections::HashSet<String>,
+) -> std::result::Result<(), String> {
+    if !visited.insert(cname.to_string()) {
+        // Already on the current path — a cyclic field graph; treat as eligible
+        // for THIS edge (the cycle can only close through an Optional field, which
+        // is rejected below on its own, so this never yields a false positive).
+        return Ok(());
+    }
+    if ctx.get_method(cname, "__eq__").is_some() {
+        return Err(format!(
+            "class `{}` defines `__eq__`, so a derived `Hash` cannot be guaranteed \
+             to agree with it (Python's `a == b` must imply `hash(a) == hash(b)`)",
+            cname
+        ));
+    }
+    if ctx.get_method(cname, "__lt__").is_some() {
+        return Err(format!(
+            "class `{}` defines a custom `__lt__`, which conflicts with the derived \
+             total order pyrst needs to iterate a class-keyed dict/set in sorted order",
+            cname
+        ));
+    }
+    // (enabler-fix-2 #1d) A POLYMORPHIC BASE (a class some other class derives
+    // from) lowers to a companion enum `B__`, not a uniform struct, so it carries
+    // NO uniform Eq/Hash/Ord derive — using it as a dict key / set element leaked
+    // rustc E0599 on the enum. The doc above already CLAIMED this rejection; make
+    // it real. Reached both for a directly-keyed base and for a base-typed FIELD of
+    // another key class (the recursion). Key on a concrete leaf class instead.
+    if ctx.classes.values().any(|cd| cd.bases.iter().any(|b| b == cname)) {
+        return Err(format!(
+            "class `{}` is a polymorphic base (it has subclasses), so it lowers to a \
+             companion enum with no uniform Eq/Hash/Ord derive and cannot be a dict \
+             key / set element; key on a concrete leaf subclass instead",
+            cname
+        ));
+    }
+    for f in ctx.get_all_fields(cname) {
+        let ty = Ty::from_type_expr(&f.ty, f.span)
+            .map_err(|_| format!("field `{}` has an unresolved type", f.name))?;
+        field_hashable(&f.name, &ty, ctx, visited)?;
+    }
+    Ok(())
+}
+
+fn field_hashable(
+    fname: &str,
+    ty: &Ty,
+    ctx: &TyCtx,
+    visited: &mut std::collections::HashSet<String>,
+) -> std::result::Result<(), String> {
+    match ty {
+        Ty::Int | Ty::Str | Ty::Bool => Ok(()),
+        Ty::Tuple(ts) => {
+            for t in ts {
+                field_hashable(fname, t, ctx, visited)?;
+            }
+            Ok(())
+        }
+        Ty::Class(n, _) => class_hash_eligible_rec(n, ctx, visited)
+            .map_err(|inner| format!("field `{}` (class `{}`) is not hashable: {}", fname, n, inner)),
+        Ty::Float => Err(format!(
+            "field `{}` is `float` — f64 is not Eq/Hash, so the class cannot be a dict key / set element",
+            fname
+        )),
+        Ty::List(_) => Err(format!("field `{}` is a list (Vec is not Hash/Eq)", fname)),
+        Ty::Dict(..) => Err(format!("field `{}` is a dict (HashMap is not Hash/Eq)", fname)),
+        Ty::Set(_) => Err(format!("field `{}` is a set (HashSet is not Hash/Eq)", fname)),
+        Ty::Func(..) => Err(format!(
+            "field `{}` is a Callable (Rc<dyn Fn> is not Hash/Eq)",
+            fname
+        )),
+        Ty::Option(_) => Err(format!(
+            "field `{}` is Optional — an Optional field is not supported in a hashable key class",
+            fname
+        )),
+        other => Err(format!(
+            "field `{}` has type `{:?}` which is not hashable",
+            fname, other
+        )),
+    }
+}
+
 pub(crate) fn require_hashable(ty: &Ty, span: Span, position: &str) -> Result<()> {
     if matches!(ty, Ty::Float) {
         return Err(Error::Type {
@@ -1810,6 +2455,31 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             // opaque, so this is an honest error (it would otherwise emit a
             // tuple-pattern bind against an opaque `T` and fail rustc).
             reject_typevar_op(&val_ty, "unpack", *span)?;
+            // (enabler-fix-2 #2) A statically-known tuple RHS whose ARITY differs
+            // from the target count is a CHECK error — CPython raises a ValueError
+            // at runtime, but pyrst knows the arity at compile time, so it leaked to
+            // rustc (E0308) before. Names expected/got in CPython's own wording. An
+            // EMPTY `Ty::Tuple` is the unknown-shape placeholder (e.g. `tuple(xs)`),
+            // not a real 0-tuple, so it is exempt; a `list[T]` RHS is length-checked
+            // at RUNTIME by codegen (`__py_unpack_list`), never here.
+            if let Ty::Tuple(tys) = &val_ty {
+                if !tys.is_empty() && tys.len() != targets.len() {
+                    let detail = if tys.len() > targets.len() {
+                        format!("too many values to unpack (expected {})", targets.len())
+                    } else {
+                        format!("not enough values to unpack (expected {}, got {})", targets.len(), tys.len())
+                    };
+                    return Err(Error::Type {
+                        span: *span,
+                        msg: format!(
+                            "cannot unpack a {}-element tuple into {} name{}: {} \
+                             (the tuple arity is statically known)",
+                            tys.len(), targets.len(),
+                            if targets.len() == 1 { "" } else { "s" }, detail
+                        ),
+                    });
+                }
+            }
             let elem_tys = match &val_ty {
                 Ty::Tuple(tys) => tys.clone(),
                 _ => vec![Ty::Unknown; targets.len()],
@@ -1892,6 +2562,21 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             // `list[T]`/`dict[K, V]` whose ELEMENT is a type var is fine and
             // yields the element/key type below.
             reject_typevar_op(&iter_ty, "iterate over", *span)?;
+            // (enabler-fix-2 #2) Iterating a fixed-shape TUPLE is an honest CHECK
+            // error. A pyrst tuple lowers to a Rust tuple, which is NOT iterable
+            // (the old `.into_iter()`/`.iter()` emission was a rustc E0599). DESIGN
+            // CALL: tuples (esp. the `(str,str,str)` partition family) are meant to
+            // be DESTRUCTURED, not iterated — direct them there rather than silently
+            // building an array temp. An empty `Ty::Tuple` is the unknown-shape
+            // placeholder, left permissive.
+            if matches!(&iter_ty, Ty::Tuple(tys) if !tys.is_empty()) {
+                return Err(Error::Type {
+                    span: *span,
+                    msg: "cannot iterate a tuple directly — destructure it \
+                          (`a, b, c = t`) or convert with `list(t)` first"
+                        .to_string(),
+                });
+            }
             // Determine element type from iterator type
             let elem_ty = match &iter_ty {
                 // LAZY-GEN V1-a: a generator result (`Ty::Iterator`) yields the same
@@ -2436,8 +3121,13 @@ pub(crate) const STR_METHODS: &[&str] = &[
     "islower", "isspace", "isalnum", "isidentifier", "isnumeric", "isprintable",
     "istitle", "capitalize", "title", "zfill", "ljust", "rjust",
     "center", "swapcase", "len",
-    // NOTE: casefold/encode/isdecimal/rsplit/format removed — codegen cannot
-    // emit them and they are absent from the example corpus (card 36f66dd2).
+    // (card 49170944) casefold/rsplit/translate are now emittable (codegen wired).
+    // casefold is SIMPLE-casefold (Unicode `to_lowercase`): it matches CPython's
+    // str.casefold for ASCII / İ / Σ but NOT for full-fold chars (ß stays ß, not
+    // "ss"; ﬁ stays ﬁ, not "fi") — see PYTHON_COMPATIBILITY.md.
+    "casefold", "rsplit", "translate",
+    // NOTE: encode/isdecimal/format stay removed — codegen cannot emit them
+    // (card 36f66dd2).
 ];
 pub(crate) const LIST_METHODS: &[&str] = &[
     "append", "extend", "insert", "remove", "pop", "index", "count",
@@ -2491,11 +3181,19 @@ pub fn builtin_method_ret(recv: &Ty, method: &str) -> Ty {
             "upper" | "lower" | "strip" | "lstrip" | "rstrip" | "replace"
             | "capitalize" | "title" | "swapcase" | "zfill"
             | "ljust" | "rjust" | "center" | "removeprefix" | "removesuffix"
-            | "expandtabs" | "join" => Ty::Str,
-            // NOTE: casefold/encode/format/rsplit removed from str arms —
-            // codegen cannot emit them (card 36f66dd2 stopgap).
-            "split" | "splitlines" | "partition" | "rpartition" => {
-                Ty::List(Box::new(Ty::Str))
+            | "expandtabs" | "join"
+            // (card 49170944) casefold -> str (simple-casefold, see STR_METHODS
+            // note); translate -> str (applies an int->int code-point map).
+            | "casefold" | "translate" => Ty::Str,
+            // NOTE: encode/format removed from str arms — codegen cannot emit
+            // them (card 36f66dd2 stopgap).
+            // (card 49170944) rsplit joins split/splitlines as list[str]; but
+            // partition/rpartition return a 3-TUPLE (str, str, str) — CPython's
+            // real shape — so `head, sep, tail = s.partition("=")` unpacks (and
+            // repr matches). This diverged from CPython as a `list` before.
+            "split" | "splitlines" | "rsplit" => Ty::List(Box::new(Ty::Str)),
+            "partition" | "rpartition" => {
+                Ty::Tuple(vec![Ty::Str, Ty::Str, Ty::Str])
             }
             "find" | "rfind" | "index" | "rindex" | "count" => Ty::Int,
             "startswith" | "endswith" | "isdigit" | "isalpha" | "isupper" | "islower"

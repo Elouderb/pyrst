@@ -719,6 +719,12 @@ pub enum TypeVarBound {
     Sub,
     Mul,
     Display,
+    /// `repr(x)` on a bare `T` lowers to `x.py_repr()` (the CPython-parity
+    /// `PyRepr` trait), NOT `format!("{}", x)`. This is what makes a generic
+    /// function quote a `str` element the way CPython's `%r` does (e.g.
+    /// `deque.remove`'s "'x' is not in deque" message) instead of the unquoted
+    /// Display form. Distinct from `Display` (str/print/f-string keep Display).
+    Repr,
 }
 
 impl TypeVarBound {
@@ -736,6 +742,7 @@ impl TypeVarBound {
             TypeVarBound::Sub => format!("std::ops::Sub<Output = {}>", t),
             TypeVarBound::Mul => format!("std::ops::Mul<Output = {}>", t),
             TypeVarBound::Display => "std::fmt::Display".to_string(),
+            TypeVarBound::Repr => "PyRepr".to_string(),
         }
     }
 }
@@ -890,6 +897,62 @@ pub fn infer_func_typevar_bounds(f: &Func, ctx: &TyCtx) -> BoundMap {
         out.entry(tp.clone()).or_default().insert(TypeVarBound::Clone);
     }
     out
+}
+
+/// (enabler-fix-2 #1b) Honest CHECK error when a user CLASS is bound to a type
+/// variable that generic function `name` uses in a HASHABLE position — a `dict`
+/// key / `set` element, surfaced as an inferred `Hash` bound — UNLESS that class
+/// already derives `Eq`/`Hash` (it is in `ctx.hash_key_classes`).
+///
+/// pyrst does NOT monomorphize: it emits ONE generic Rust fn with a `T: Hash + Eq`
+/// bound, so a class that never keys a CONCRETE `dict`/`set` never gains those
+/// derives and the call leaked rustc E0277/E0599 ("Node: Hash not satisfied"). The
+/// derive cannot be threaded through a type parameter after the fact, so this is a
+/// documented limitation (PYTHON_COMPATIBILITY.md): key the class CONCRETELY
+/// (`dict[C, _]` / `set[C]`) somewhere to opt it in. A class that DOES so passes
+/// through unaffected — this only rejects the otherwise-silent-build-fail case, so
+/// it never regresses a program that already compiled.
+pub fn reject_class_key_through_generic(
+    name: &str,
+    arg_tys: &[Ty],
+    ctx: &TyCtx,
+    span: Span,
+) -> Result<()> {
+    let body = match ctx.generic_func_bodies.get(name) {
+        Some(b) => b,
+        None => return Ok(()),
+    };
+    let bounds = infer_func_typevar_bounds(body, ctx);
+    // Cheap exit: no type var needs Hash, so no class-key hazard exists.
+    if !bounds.values().any(|s| s.contains(&TypeVarBound::Hash)) {
+        return Ok(());
+    }
+    let subst = match generic_call_param_subst(name, arg_tys, ctx) {
+        Some(s) => s,
+        None => return Ok(()),
+    };
+    for (tv, tv_bounds) in &bounds {
+        if !tv_bounds.contains(&TypeVarBound::Hash) {
+            continue;
+        }
+        if let Some(Ty::Class(cn, _)) = subst.get(tv) {
+            if !ctx.hash_key_classes.contains(cn) {
+                return Err(Error::Type {
+                    span,
+                    msg: format!(
+                        "user class `{}` reaches a dict-key / set-element position inside \
+                         generic `{}` (via type parameter `{}`), but pyrst cannot thread the \
+                         required Eq/Hash derive through a type parameter (it emits one generic \
+                         function, not a monomorphized copy). Key `{}` CONCRETELY somewhere \
+                         (`dict[{}, _]` or `set[{}]`) to opt it into the derive, or use a \
+                         concrete container instead of the generic",
+                        cn, name, tv, cn, cn, cn
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Generics v2: infer the per-TYPE-VARIABLE Rust trait-bound set for one generic
@@ -1494,12 +1557,21 @@ pub(crate) fn infer_bounds_expr(
             }
         }
         Expr::Call { callee, args, kwargs, .. } => {
-            // `print`/`str`/`repr`/`ascii` of a bare `T` -> Display.
+            // `print`/`str`/`ascii` of a bare `T` -> Display (Display formatting).
+            // `repr` of a bare `T` -> Repr: it lowers to `x.py_repr()`, so the
+            // type var needs the `PyRepr` bound, not Display — this is what quotes
+            // str elements in a generic context (deque.remove's `%r` message).
             if let Expr::Ident(n, _) = callee.as_ref() {
-                if matches!(n.as_str(), "print" | "str" | "repr" | "ascii") {
+                if matches!(n.as_str(), "print" | "str" | "ascii") {
                     for a in args {
                         if let Ty::TypeVar(tn) = infer_expr_ty(a, locals, ctx) {
                             add_bound(bounds, &tn, TypeVarBound::Display);
+                        }
+                    }
+                } else if n == "repr" {
+                    for a in args {
+                        if let Ty::TypeVar(tn) = infer_expr_ty(a, locals, ctx) {
+                            add_bound(bounds, &tn, TypeVarBound::Repr);
                         }
                     }
                 }

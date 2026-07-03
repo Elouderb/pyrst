@@ -1,20 +1,20 @@
 def main() -> None:
     s: str = "hello-world-python"
 
-    # partition
-    parts: list[str] = s.partition("-")
+    # partition returns a 3-TUPLE (str, str, str) — CPython's real shape.
+    parts: tuple[str, str, str] = s.partition("-")
     print(parts[0])
     print(parts[1])
     print(parts[2])
 
-    # rpartition
-    rparts: list[str] = s.rpartition("-")
-    print(rparts[0])
-    print(rparts[1])
-    print(rparts[2])
+    # tuple unpacking (the idiomatic configparser/csv pattern)
+    head, sep, tail = s.rpartition("-")
+    print(head)
+    print(sep)
+    print(tail)
 
-    # partition with non-existent separator
-    nparts: list[str] = s.partition("_")
-    print(nparts[0])
-    print(nparts[1])
-    print(nparts[2])
+    # partition with non-existent separator: (whole, "", "")
+    a, b, c = s.partition("_")
+    print(a)
+    print(b)
+    print(c)

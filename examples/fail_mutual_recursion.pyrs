@@ -1,0 +1,16 @@
+# NEGATIVE (enabler-fix-1 #4c): mutually-recursive class fields (A holds Optional[B],
+# B holds Optional[A]) lower to two un-boxed Rust structs of infinite size (E0072).
+# pyrst rejects the cross-class field cycle honestly instead of leaking rustc E0072.
+class A:
+    b: Optional[B]
+    def __init__(self) -> None:
+        self.b = None
+
+class B:
+    a: Optional[A]
+    def __init__(self) -> None:
+        self.a = None
+
+def main() -> None:
+    x: A = A()
+    print(1)

@@ -98,6 +98,8 @@ use super::*;
             fields: vec![],
             methods: vec![],
             is_dataclass: false,
+            decorators: vec![],
+            dataclass_has_args: false,
             span: Span::DUMMY,
             type_params: vec![],
         }

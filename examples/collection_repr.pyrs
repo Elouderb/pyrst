@@ -18,7 +18,8 @@ def main() -> None:
     print(f"data: {nums}")
     label: str = str([7, 8, 9])
     print(label)
-    # str elements with a quote are escaped (valid repr).
+    # str repr uses CPython's quote-choice: a string with a ' and no " prints in
+    # double quotes ("it's"), otherwise single quotes ('ok') — valid repr either way.
     print(["it's", "ok"])
     # empty collections: set() vs [] vs {}.
     e_set: set[int] = set()

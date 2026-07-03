@@ -1,0 +1,8 @@
+1 2
+60
+name pyrst
+8 13
+200 100
+not enough values to unpack (expected 2, got 1)
+too many values to unpack (expected 2)
+not enough values to unpack (expected 2, got 0)

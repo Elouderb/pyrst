@@ -1,0 +1,20 @@
+# W2 card 4ca1c4b4: repr() of a user-class instance routes through the class's
+# __repr__ (CPython uses __repr__ ONLY — never __str__ — and otherwise falls back
+# to `<C object at 0x..>`). pyrst has no stable object identity to print, so a
+# class WITHOUT a __repr__ (here Temp defines __str__ but no __repr__) is rejected
+# at typeck rather than either silently borrowing __str__ (wrong output) or
+# emitting a `PyRepr`-not-satisfied rustc wall. Define __repr__, or use str().
+# This file must be rejected by BOTH `pyrst check` and `pyrst build`.
+class Temp:
+    c: int
+
+    def __init__(self, c: int) -> None:
+        self.c = c
+
+    def __str__(self) -> str:
+        return str(self.c) + "C"
+
+
+def main() -> None:
+    t: Temp = Temp(21)
+    print(repr(t))

@@ -149,6 +149,10 @@ impl Parser {
                 // collected alongside the bare decorator names and attached to the
                 // `Func` below. Each entry is a (crate_name, version) pair.
                 let mut crate_deps: Vec<(String, String)> = Vec::new();
+                // (card 6f69d4a3) True once a `@dataclass(...)` with any arguments
+                // is seen — typeck honest-rejects flag args (only bare @dataclass
+                // is supported initially).
+                let mut dataclass_has_args = false;
                 while matches!(self.peek(), Tok::At) {
                     self.bump(); // consume '@'
                     let mut deco_name = String::new();
@@ -175,9 +179,15 @@ impl Parser {
                         let dep = self.parse_crate_decorator_args()?;
                         crate_deps.push(dep);
                     } else if matches!(self.peek(), Tok::LParen) {
-                        // Skip decorator arguments e.g. @decorator(arg)
+                        // Skip decorator arguments e.g. @decorator(arg). (card
+                        // 6f69d4a3) For @dataclass, RECORD whether any arguments were
+                        // present (non-empty parens) so typeck honest-rejects
+                        // unsupported flag args (order=/frozen=/eq=/repr=/init=/…).
+                        self.bump(); // consume '('
+                        if deco_name == "dataclass" && !matches!(self.peek(), Tok::RParen) {
+                            dataclass_has_args = true;
+                        }
                         let mut depth = 1i32;
-                        self.bump();
                         while depth > 0 && !matches!(self.peek(), Tok::Eof) {
                             match self.peek() {
                                 Tok::LParen => { depth += 1; self.bump(); }
@@ -199,7 +209,12 @@ impl Parser {
                     }
                     Tok::Class => {
                         let mut c = self.parse_class()?;
+                        // (card 6f69d4a3) Attach ALL class decorators (not just
+                        // dataclass) so typeck can honest-reject unknown ones, and
+                        // flag whether @dataclass carried arguments.
                         c.is_dataclass = decorators.contains(&"dataclass".to_string());
+                        c.decorators = decorators;
+                        c.dataclass_has_args = dataclass_has_args;
                         Ok(Stmt::Class(c))
                     }
                     _ => self.parse_stmt()
@@ -590,7 +605,7 @@ impl Parser {
             }
         }
         self.expect(&Tok::Dedent, "class body")?;
-        Ok(ClassDef { name, bases, fields, methods, is_dataclass: false, span, type_params })
+        Ok(ClassDef { name, bases, fields, methods, is_dataclass: false, decorators: Vec::new(), dataclass_has_args: false, span, type_params })
     }
 
     fn parse_try(&mut self) -> Result<Stmt> {

@@ -1,0 +1,81 @@
+# DUAL-RUN parity (W2 cards 4ca1c4b4 + 09152b3a): repr()/str() must be
+# byte-identical to CPython. Covers repr(float) incl. scientific notation
+# (str==repr for floats in Py3), the repr(str) quote-choice matrix, containers/
+# tuples (recursive), None + Optional, a user class routed through __repr__
+# (even when __str__ also exists), and generic repr() that quotes a str element.
+#
+# Dict keys are written pre-sorted so pyrst's sorted-key rendering matches
+# CPython's insertion order; multi-element SETS are intentionally omitted here
+# (pyrst sorts set entries, CPython does not) — the pinned collection_repr golden
+# covers the sorted-set divergence separately.
+
+class Vec2:
+    x: int
+    y: int
+    def __init__(self, x: int, y: int) -> None:
+        self.x = x
+        self.y = y
+    def __str__(self) -> str:
+        return "Vec2(" + str(self.x) + ", " + str(self.y) + ")"
+    def __repr__(self) -> str:
+        return "Vec2(x=" + str(self.x) + ", y=" + str(self.y) + ")"
+
+
+def label[T](x: T) -> str:
+    return "value=" + repr(x)
+
+
+def main() -> None:
+    # repr(float): whole floats keep .0, round-trips are shortest, and the
+    # scientific-notation thresholds (decpt <= -4 or > 16) match CPython.
+    print(repr(1.0))
+    print(repr(100.0))
+    print(repr(-0.5))
+    print(repr(10.0 / 3.0))
+    print(repr(10000000000000000.0))
+    print(repr(0.00001))
+
+    # (enabler-fix-1 #2) EXACT decimal ties: CPython's dtoa rounds half-to-EVEN,
+    # Rust's shortest formatting rounds the magnitude half-UP. These land on ties
+    # and must match CPython's even choice (e.g. "...812.2", not "...812.3").
+    print(repr(-887777373534812.25))
+    print(repr(0.5))
+    print(repr(2.5))
+    print(repr(1.5))
+    print(repr(0.375))
+    print(repr(1234567890123456.2))
+
+    # repr(str) quote-choice + escapes.
+    print(repr("abc"))
+    print(repr("it's"))
+    print(repr("a\"b"))
+    print(repr("both ' and \""))
+    print(repr("back\\slash"))
+    print(repr("tab\tnl\n"))
+
+    # scalars, None, containers.
+    print(repr(42))
+    print(repr(True))
+    print(repr(None))
+    print(repr([1, 2, 3]))
+    print(repr([["a"], ["b's"]]))
+    print(repr((1, "x", True)))
+    print(repr({"a": 1, "b": 2, "c": 3}))
+    print(str((1.0, "q")))
+
+    # Optional value: reprs the payload, or None.
+    ov: int | None = 7
+    print(repr(ov))
+    nv: int | None = None
+    print(repr(nv))
+
+    # class: str() uses __str__, repr() uses __repr__ (both defined), and a
+    # container reprs its class elements via __repr__.
+    v: Vec2 = Vec2(1, 2)
+    print(str(v))
+    print(repr(v))
+    print([v, Vec2(3, 4)])
+
+    # generic repr(): a str element is quoted, an int is bare (deque.remove shape).
+    print(label("zz"))
+    print(label(99))

@@ -1,0 +1,58 @@
+# DUAL-RUN parity (W2 card 03eb4e2c): class-level constants (enum members).
+# `NAME: T = <literal>` in a class body becomes an associated const (Rust
+# `ClassName::NAME`), reachable as `Color.RED` (class name), `self.RED` (in a
+# method), and `inst.RED` (an instance) — all the same value. A field that is
+# ever assigned via `self.field = ..` stays a mutable instance field (Counter).
+
+class Color:
+    RED: int = 1
+    GREEN: int = 2
+    BLUE: int = 3
+
+class HTTP:
+    GET: str = "GET"
+    POST: str = "POST"
+
+class Flags:
+    ON: bool = True
+    OFF: bool = False
+
+class Circle:
+    PI: float = 3.14
+    r: float
+    def __init__(self, r: float) -> None:
+        self.r = r
+    def area(self) -> float:
+        # class-name const access AND self field access in one expr
+        return Circle.PI * self.r * self.r
+    def pi_via_self(self) -> float:
+        return self.PI
+
+class Counter:
+    # literal default BUT mutated below -> stays an instance field, not a const
+    count: int = 0
+    def inc(self) -> None:
+        self.count += 1
+    def get(self) -> int:
+        return self.count
+
+
+def main() -> None:
+    print(Color.RED)
+    print(Color.GREEN)
+    print(Color.BLUE)
+    print(HTTP.GET)
+    print(HTTP.POST)
+    print(Flags.ON)
+    print(Flags.OFF)
+
+    c: Circle = Circle(2.0)
+    print(c.area())
+    print(c.pi_via_self())
+    print(c.PI)
+
+    n: Counter = Counter()
+    n.inc()
+    n.inc()
+    n.inc()
+    print(n.get())

@@ -1,0 +1,49 @@
+# DUAL-RUN parity (W2 card 9695f8a1): unpacking a LIST value into N targets
+# works like CPython — including the `k, v = s.split("=")` idiom — and a length
+# mismatch raises CPython 3.12's EXACT, catchable ValueError. Composes with the
+# existing tuple-unpack machinery: declare, reassign-in-loop, and nested-block
+# reassignment all behave the same whether the RHS is a tuple or a list.
+def main() -> None:
+    # fresh declaration from a list literal and a typed list variable.
+    a, b = [1, 2]
+    print(a, b)
+    xs: list[int] = [10, 20, 30]
+    p, q, r = xs
+    print(p + q + r)
+
+    # the split() idiom (the widest W2 use: csv/configparser/shlex/datetime).
+    key, val = "name=pyrst".split("=")
+    print(key, val)
+
+    # reassignment inside a loop (list RHS): Fibonacci via list-unpack swap.
+    f0, f1 = [0, 1]
+    n: int = 0
+    while n < 6:
+        f0, f1 = [f1, f0 + f1]
+        n = n + 1
+    print(f0, f1)
+
+    # nested-block reassignment of pre-existing bindings.
+    lo, hi = [100, 200]
+    if hi > lo:
+        lo, hi = [hi, lo]
+    print(lo, hi)
+
+    # too FEW values -> catchable ValueError (CPython-exact text).
+    try:
+        c, d = [1]
+    except ValueError as e:
+        print(str(e))
+
+    # too MANY values -> catchable ValueError.
+    try:
+        c, d = [1, 2, 3]
+    except ValueError as e:
+        print(str(e))
+
+    # empty list into 2 targets.
+    empty: list[int] = []
+    try:
+        c, d = empty
+    except ValueError as e:
+        print(str(e))

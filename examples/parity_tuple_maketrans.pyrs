@@ -1,0 +1,15 @@
+# DUAL-RUN parity (enabler-fix-2): len() of a fixed-shape tuple = const arity
+# (#2), and str.maketrans equal-length + the unequal-length ValueError caught
+# with CPython's exact message (#5). Byte-checked against python3 3.12.
+def main() -> None:
+    t: tuple[str, str, str] = "a=b=c".partition("=")
+    print(len(t))
+    pair: tuple[int, str] = (1, "x")
+    print(len(pair))
+    table: dict[int, int] = str.maketrans("abc", "xyz")
+    print("cabbage".translate(table))
+    try:
+        bad: dict[int, int] = str.maketrans("abc", "xy")
+        print("no error")
+    except ValueError as e:
+        print("ValueError:", e)

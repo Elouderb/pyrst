@@ -1,0 +1,13 @@
+# NEGATIVE (enabler-fix-1 #4d): a BARE (non-Optional) self-referential field cannot
+# be boxed with the Option-shaped combinators codegen uses. Only `Optional[Node]` is
+# supported; a bare `next: Node` is an honest check error (it built an
+# un-initializable Box<Node> field and aborted at runtime before).
+class Node:
+    val: int
+    next: Node
+    def __init__(self, val: int) -> None:
+        self.val = val
+
+def main() -> None:
+    n: Node = Node(1)
+    print(n.val)

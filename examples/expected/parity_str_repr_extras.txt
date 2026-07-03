@@ -1,0 +1,13 @@
+'h\xe9llo'
+"a'b"
+'\x85'
+'na\xefve caf\xe9'
+'\x85'
+'\u200b'
+'\ufeff'
+'\xad'
+'\u2028'
+'café'
+'tab\tend'
+οδυσσευσ
+hello world

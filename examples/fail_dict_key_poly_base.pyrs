@@ -1,0 +1,16 @@
+# (enabler-fix-2 #1d) A polymorphic BASE (a class with subclasses) lowers to a
+# companion enum with no uniform Eq/Hash/Ord derive, so it cannot be a dict key /
+# set element. Honest error at BOTH `pyrst check` and `pyrst build`.
+class Base:
+    v: int
+    def __init__(self, v: int) -> None:
+        self.v = v
+
+class Derived(Base):
+    def __init__(self, v: int) -> None:
+        self.v = v
+
+def main() -> None:
+    d: dict[Base, int] = {}
+    d[Base(1)] = 5
+    print(len(d))

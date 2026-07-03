@@ -758,6 +758,169 @@ pub(crate) fn iterator_materialize_error(problem: &str, fix: &str, span: Span) -
     }
 }
 
+/// Whether class `name` (or any transitive base) defines a `__repr__` method.
+/// Used to gate `repr(instance)`: CPython's repr uses __repr__ ONLY, so a class
+/// lacking one has no faithful repr in pyrst (no `<C object at 0x..>` identity).
+/// `visited` guards against inheritance cycles.
+pub(crate) fn class_defines_repr(
+    ctx: &TyCtx,
+    name: &str,
+    visited: &mut std::collections::HashSet<String>,
+) -> bool {
+    if !visited.insert(name.to_string()) {
+        return false;
+    }
+    if let Some(cd) = ctx.classes.get(name) {
+        if cd.methods.iter().any(|m| m.name == "__repr__") {
+            return true;
+        }
+        return cd.bases.iter().any(|b| class_defines_repr(ctx, b, visited));
+    }
+    false
+}
+
+/// (enabler-fix-1 #5) Whether a value of type `ty` can be `repr`'d — i.e. codegen
+/// can emit `.py_repr()` for it. Primitives, `None`, and generic/unknown positions
+/// are reprable; containers/`Optional`/tuples recurse; a first-class function is
+/// NOT (a `Callable` field has no repr); a user class is reprable only if it (or an
+/// ancestor) defines `__repr__` OR it is a non-generic `@dataclass` with no user
+/// `__str__`/`__repr__` (which gets a SYNTHESIZED repr — matching codegen's guard).
+/// Shared by the dataclass-field-reprability check and the print/str/repr sites so
+/// a container/`Optional` of a non-repr class is an HONEST error instead of a leaked
+/// rustc E0599 / E0277.
+pub(crate) fn type_is_reprable(ctx: &TyCtx, ty: &Ty) -> bool {
+    match ty {
+        Ty::List(e) | Ty::Set(e) | Ty::Iterator(e) | Ty::Option(e) => type_is_reprable(ctx, e),
+        Ty::Dict(k, v) => type_is_reprable(ctx, k) && type_is_reprable(ctx, v),
+        Ty::Tuple(ts) => ts.iter().all(|t| type_is_reprable(ctx, t)),
+        Ty::Class(cn, _) => class_is_reprable(ctx, cn),
+        Ty::Func(..) => false,
+        _ => true,
+    }
+}
+
+/// (enabler-fix-1 #5) Whether an INSTANCE of class `cn` has a repr codegen can
+/// emit. A synthesized-repr dataclass returns `true` WITHOUT recursing into its own
+/// fields (those are validated when THAT class's prelude runs), so a mutually
+/// field-referential dataclass pair cannot loop here.
+fn class_is_reprable(ctx: &TyCtx, cn: &str) -> bool {
+    let mut seen = std::collections::HashSet::new();
+    if class_defines_repr(ctx, cn, &mut seen) {
+        return true;
+    }
+    ctx.classes.get(cn).is_some_and(|cd| {
+        cd.is_dataclass
+            && cd.type_params.is_empty()
+            && !cd.methods.iter().any(|m| m.name == "__str__" || m.name == "__repr__")
+    })
+}
+
+/// (enabler-fix-1 #5b) A dataclass's fields in CPython MRO order: fields inherited
+/// from `@dataclass` BASES first (bases-before-own, recursively), then this class's
+/// own — a field REDEFINED in a subclass keeps its original position but takes the
+/// new default (CPython semantics). Only dataclass ancestors contribute fields (a
+/// plain base's annotations are not dataclass fields). Drives the
+/// non-default-after-default order check across the inheritance chain.
+pub(crate) fn dataclass_fields_in_order(c: &ClassDef, ctx: &TyCtx) -> Vec<Param> {
+    fn collect(
+        cname: &str,
+        ctx: &TyCtx,
+        out: &mut Vec<Param>,
+        seen: &mut std::collections::HashSet<String>,
+    ) {
+        if !seen.insert(cname.to_string()) {
+            return;
+        }
+        if let Some(cd) = ctx.classes.get(cname) {
+            for b in &cd.bases {
+                if ctx.classes.get(b).is_some_and(|bd| bd.is_dataclass) {
+                    collect(b, ctx, out, seen);
+                }
+            }
+            for f in &cd.fields {
+                if let Some(existing) = out.iter_mut().find(|e| e.name == f.name) {
+                    *existing = f.clone();
+                } else {
+                    out.push(f.clone());
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    collect(&c.name, ctx, &mut out, &mut seen);
+    out
+}
+
+/// (enabler-fix-1 #4) The class references of a field type reachable through
+/// `Option`/`Tuple` only — a `Vec`/`Dict`/`Set` is heap indirection that BREAKS the
+/// Rust size cycle, so it is not followed (a `list[Node]` self-reference compiles).
+fn collect_inline_class_refs(ty: &Ty, out: &mut Vec<String>) {
+    match ty {
+        Ty::Class(n, _) => out.push(n.clone()),
+        Ty::Option(inner) => collect_inline_class_refs(inner, out),
+        Ty::Tuple(ts) => ts.iter().for_each(|t| collect_inline_class_refs(t, out)),
+        _ => {}
+    }
+}
+
+/// (enabler-fix-1 #4d) Whether a field type inline-references its OWN class.
+fn field_has_inline_self_ref(ty: &Ty, cname: &str) -> bool {
+    let mut refs = Vec::new();
+    collect_inline_class_refs(ty, &mut refs);
+    refs.iter().any(|r| r == cname)
+}
+
+/// (enabler-fix-1 #4d) The ONLY self-referential field shape codegen supports:
+/// `Optional[<Self>]` -> `Option<Box<Self>>`, with Option-shaped box/unbox
+/// combinators (codegen/analysis.rs). A bare `next: Node` or a tuple-nested
+/// self-reference has no valid combinator and is rejected.
+fn is_supported_self_ref_shape(ty: &Ty, cname: &str) -> bool {
+    matches!(ty, Ty::Option(inner) if matches!(&**inner, Ty::Class(n, _) if n == cname))
+}
+
+/// (enabler-fix-1 #4c) The inline (Option/Tuple-reachable) OWN-field class edges of
+/// `cname`, excluding self (a self-loop is boxed and handled separately).
+fn inline_field_class_edges(cname: &str, ctx: &TyCtx) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(cd) = ctx.classes.get(cname) {
+        for f in &cd.fields {
+            if let Ok(ty) = Ty::from_type_expr(&f.ty, f.span) {
+                let mut refs = Vec::new();
+                collect_inline_class_refs(&ty, &mut refs);
+                for r in refs {
+                    if r != cname && !out.contains(&r) {
+                        out.push(r);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// (enabler-fix-1 #4c) Whether `start` is in a MUTUAL field-recursion cycle —
+/// reachable from itself through inline (non-heap) field references passing through
+/// at least one OTHER class (`A{b:Optional[B]}; B{a:Optional[A]}`). Such a pair
+/// lowers to two un-boxed Rust structs of infinite size (E0072). Direct
+/// self-reference (a single-class loop) is boxed and is NOT flagged here.
+pub(crate) fn in_mutual_field_cycle(start: &str, ctx: &TyCtx) -> bool {
+    let mut stack: Vec<String> = inline_field_class_edges(start, ctx);
+    let mut visited = std::collections::HashSet::new();
+    while let Some(c) = stack.pop() {
+        if c == start {
+            return true;
+        }
+        if !visited.insert(c.clone()) {
+            continue;
+        }
+        for nb in inline_field_class_edges(&c, ctx) {
+            stack.push(nb);
+        }
+    }
+    false
+}
+
 /// (LAZY-GEN V1-d) Reject a generator (`Ty::Iterator`) value flowing into a
 /// concrete `list[T]` slot — a function argument, a `return`, or an annotated
 /// assignment. `types_compatible` already returns `false` for this pair (the V1-a
@@ -865,6 +1028,85 @@ pub(crate) fn is_iterator_type_expr(t: &TypeExpr) -> bool {
 /// Per-CLASS checks that run before (and gate) the method checks: multiple
 /// inheritance and explicit field-annotation validation. Fail-fast.
 pub(crate) fn check_class_prelude(c: &ClassDef, ctx: &TyCtx) -> Result<()> {
+    // (card 6f69d4a3) HONESTY: only `@dataclass` is a recognized CLASS decorator.
+    // Every other class decorator (even `@totally_made_up`) was silently swallowed
+    // before this card — make it a check error, mirroring `validate_decorators` for
+    // functions. (`@staticmethod`/`@property`/`@extern` are function/method
+    // decorators, not class ones, so they are not admitted here.)
+    for dec in &c.decorators {
+        if dec != "dataclass" {
+            return Err(Error::Type {
+                span: c.span,
+                msg: format!(
+                    "class decorator `@{}` is not supported (only `@dataclass` is recognized)",
+                    dec
+                ),
+            });
+        }
+    }
+    // (card 6f69d4a3) Only the BARE `@dataclass` is supported initially. Flag
+    // arguments (order=/frozen=/eq=/repr=/init=/slots=/…) would each change
+    // synthesized semantics; honest-reject them rather than silently ignore a
+    // requested `order=True`/`frozen=True`.
+    if c.dataclass_has_args {
+        return Err(Error::Type {
+            span: c.span,
+            msg: "`@dataclass(...)` flag arguments (order=, frozen=, eq=, repr=, \
+                  init=, slots=, …) are not yet supported — use the bare `@dataclass`"
+                .to_string(),
+        });
+    }
+    // (card 6f69d4a3) CPython's dataclass rule: a field WITHOUT a default may not
+    // follow a field WITH a default (the synthesized __init__ would put a
+    // non-default parameter after a default one). CPython raises `TypeError` at
+    // class-definition time; pyrst reports it at check.
+    if c.is_dataclass {
+        // (enabler-fix-1 #5b) Walk the dataclass base chain (bases-before-own) so a
+        // DEFAULTED inherited field forces every later field to have a default too —
+        // CPython raises `TypeError: non-default argument 'y' follows default
+        // argument` for `@dataclass class Sub(Base): y:int` when `Base.x` is
+        // defaulted. The old own-fields-only scan missed the inherited default.
+        let mut seen_default = false;
+        for f in &dataclass_fields_in_order(c, ctx) {
+            if f.default.is_some() {
+                seen_default = true;
+            } else if seen_default {
+                return Err(Error::Type {
+                    span: f.span,
+                    msg: format!(
+                        "non-default dataclass field `{}` follows a field with a default value",
+                        f.name
+                    ),
+                });
+            }
+        }
+        // (enabler-fix-1 #5a) A @dataclass with no user __str__/__repr__ SYNTHESIZES
+        // a __repr__ that calls `.py_repr()` on EVERY own field (codegen/items.rs).
+        // A field whose type is NOT reprable (a class without __repr__, or a
+        // container/Optional/tuple of one) check-PASSED and then leaked rustc E0599.
+        // Require reprability at CHECK, matching the codegen synth guard (non-generic
+        // dataclass, no user __str__/__repr__).
+        if c.type_params.is_empty()
+            && !c.methods.iter().any(|m| m.name == "__str__" || m.name == "__repr__")
+        {
+            for f in &c.fields {
+                let fty = Ty::from_type_expr(&f.ty, f.span)?;
+                if !type_is_reprable(ctx, &fty) {
+                    return Err(Error::Type {
+                        span: f.span,
+                        msg: format!(
+                            "@dataclass `{}` field `{}` has a type with no repr: pyrst \
+                             synthesizes `{}`'s `__repr__` from every field's `repr()`, but \
+                             this field's type has no `__repr__`. Define `__repr__` on the \
+                             field's class (or a `__str__`/`__repr__` on `{}`).",
+                            c.name, f.name, c.name, c.name
+                        ),
+                    });
+                }
+            }
+        }
+    }
+
     // Reject multiple inheritance.
     if c.bases.len() > 1 {
         return Err(Error::Type {
@@ -908,6 +1150,82 @@ pub(crate) fn check_class_prelude(c: &ClassDef, ctx: &TyCtx) -> Result<()> {
     // A non-generic class has empty `type_params`, identical to the legacy path.
     for field in &c.fields {
         Ty::from_type_expr_scoped(&field.ty, field.span, &c.type_params)?;
+    }
+
+    // (enabler-fix-1 #4d) Self-referential field SHAPE gate. codegen boxes an inline
+    // self-reference to break the E0072 size cycle, but the box/unbox combinators
+    // are Option-shaped, so ONLY `Optional[<Self>]` is supported. A bare `next: Node`
+    // builds an un-initializable `Box<Node>` field (runtime abort) and a tuple-nested
+    // self-reference feeds a non-Option value into the `.map()` unbox — reject both.
+    for f in &c.fields {
+        if let Ok(fty) = Ty::from_type_expr_scoped(&f.ty, f.span, &c.type_params) {
+            if field_has_inline_self_ref(&fty, &c.name) && !is_supported_self_ref_shape(&fty, &c.name) {
+                return Err(Error::Type {
+                    span: f.span,
+                    msg: format!(
+                        "self-referential field `{}` on class `{}` must be spelled \
+                         `Optional[{}]` (a bare or tuple-nested self-reference is not \
+                         supported — only `Optional[{}]` is boxed)",
+                        f.name, c.name, c.name, c.name
+                    ),
+                });
+            }
+        }
+    }
+
+    // (enabler-fix-1 #4c) Mutual field recursion (`A{b:Optional[B]}; B{a:Optional[A]}`)
+    // lowers to two un-boxed structs of infinite size (rustc E0072) — it check-passed
+    // and build-failed before. Detect the cross-class field cycle and reject honestly;
+    // a direct self-reference (`Optional[<Self>]`) is boxed and unaffected.
+    if in_mutual_field_cycle(&c.name, ctx) {
+        return Err(Error::Type {
+            span: c.span,
+            msg: format!(
+                "class `{}` is part of a mutually-recursive class-field cycle, which is \
+                 not supported (the Rust structs would be infinitely sized); break the \
+                 cycle (e.g. hold one side behind a `list[...]`)",
+                c.name
+            ),
+        });
+    }
+
+    // (card 03eb4e2c) Reject a duplicate field / class-constant name in a class
+    // body. A second `NAME: T = ..` (an instance field OR a class-level const like
+    // an enum member) would silently shadow the first in the emitted struct / impl.
+    // Class-body names must be unique. (Init-discovered fields are deduped against
+    // these names by `extract_init_fields`, so this only fires on genuine
+    // user-written duplicates.)
+    {
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for field in &c.fields {
+            if !seen.insert(field.name.as_str()) {
+                return Err(Error::Type {
+                    span: field.span,
+                    msg: format!(
+                        "duplicate field or class constant `{}` in class `{}`",
+                        field.name, c.name
+                    ),
+                });
+            }
+        }
+    }
+
+    // (card e131f8b0) If this class is used ANYWHERE as a dict KEY / set ELEMENT,
+    // it must be able to derive `Eq + Hash` (+ `Ord` for sorted-key iteration).
+    // Reject an ineligible key class (a float / list / dict / set / Callable /
+    // Optional field, or a user `__eq__`/`__lt__`) with an HONEST error naming the
+    // cause — Python's `unhashable type: 'C'` analog — instead of leaking rustc's
+    // opaque `Node: Eq / Node: Hash not satisfied` at build.
+    if ctx.hash_key_classes.contains(&c.name) {
+        if let Err(reason) = class_hash_eligible(&c.name, ctx) {
+            return Err(Error::Type {
+                span: c.span,
+                msg: format!(
+                    "class `{}` is used as a dict key / set element but is not hashable: {}",
+                    c.name, reason
+                ),
+            });
+        }
     }
 
     // A `Callable` field lowers to `Rc<dyn Fn(..) -> ..>`, which has no `Default`,

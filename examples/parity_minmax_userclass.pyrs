@@ -1,0 +1,53 @@
+# DUAL-RUN parity (W2 card ebd703d9): min()/max() over a list of a user class
+# whose only ordering is __lt__ (PartialOrd, not Ord) must work and preserve
+# CPython's FIRST-WINS tie rule (min/max both return the FIRST extremal element).
+# Routes through the same PartialOrd comparator sorted() uses. Covers the 1-arg
+# list form, the 2-arg form, and key= (incl. a key that returns a user class).
+
+class Item:
+    rank: int
+    tag: str
+    def __init__(self, rank: int, tag: str) -> None:
+        self.rank = rank
+        self.tag = tag
+    def __lt__(self, other: Item) -> bool:
+        return self.rank < other.rank
+
+
+class Score:
+    v: int
+    def __init__(self, v: int) -> None:
+        self.v = v
+    def __lt__(self, other: Score) -> bool:
+        return self.v < other.v
+
+
+class Player:
+    name: str
+    score: Score
+    def __init__(self, name: str, score: Score) -> None:
+        self.name = name
+        self.score = score
+
+
+def main() -> None:
+    # 1-arg list form; the two rank-1 items exercise the first-wins tie rule.
+    xs: list[Item] = [Item(3, "a"), Item(1, "b"), Item(1, "c"), Item(2, "d")]
+    lo: Item = min(xs)
+    hi: Item = max(xs)
+    print(lo.rank, lo.tag)
+    print(hi.rank, hi.tag)
+
+    # 2-arg form (tie keeps the FIRST argument).
+    p: Item = Item(3, "p")
+    q: Item = Item(3, "q")
+    print(min(p, q).tag)
+    print(max(p, q).tag)
+
+    # key= over a user-class list: an int key, and a key returning a user class.
+    m2: Item = min(xs, key=lambda it: it.rank)
+    print(m2.rank, m2.tag)
+    ps: list[Player] = [Player("x", Score(30)), Player("y", Score(10)), Player("z", Score(20))]
+    best: Player = max(ps, key=lambda pl: pl.score)
+    worst: Player = min(ps, key=lambda pl: pl.score)
+    print(best.name, worst.name)

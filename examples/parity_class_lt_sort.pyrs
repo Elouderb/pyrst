@@ -1,0 +1,18 @@
+# DUAL-RUN parity (enabler-fix-1 #1): a user class WITH __lt__ is fully ordered —
+# sorted()/min()/max()/< all work and match CPython. The __lt__ guard rejects only
+# classes WITHOUT __lt__; this regression-guards that ordered classes still sort.
+class P:
+    x: int
+    def __init__(self, x: int) -> None:
+        self.x = x
+    def __lt__(self, other: P) -> bool:
+        return self.x < other.x
+
+def main() -> None:
+    xs: list[P] = [P(3), P(1), P(2)]
+    ys: list[P] = sorted(xs)
+    print([p.x for p in ys])
+    print(min(xs).x)
+    print(max(xs).x)
+    print(P(1) < P(2))
+    print(P(2) < P(1))

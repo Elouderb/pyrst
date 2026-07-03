@@ -130,6 +130,31 @@ impl<'a> Codegen<'a> {
         }
     }
 
+    /// (enabler-fix-2 #3) STR-mode lowering of an `Option<T>` value at a
+    /// print()/str()/f-string site. CPython holds the payload OR None: it prints
+    /// the payload via `str()` (a `str` shows UNQUOTED — `Some("x")` -> `x`) when
+    /// present, else the literal `None`. This mirrors the PyRepr `Option` impl but
+    /// with STR (Display) semantics for the inner value — `repr(opt)` still routes
+    /// through PyRepr (quoted). Without this an un-narrowed `Option<T>` reached
+    /// `println!("{}", opt)` and leaked rustc E0277 (`Option<T>: !Display`).
+    /// `depth` uniquely names the match binding so a nested `Optional[Optional[T]]`
+    /// does not shadow. The inner formatting reuses the exact per-type str rules
+    /// the three call sites apply to a bare value (float/bool/container/…).
+    fn emit_str_option(&self, raw: &str, inner: &Ty, depth: usize) -> String {
+        let v = format!("__optv{}", depth);
+        let inner_form = match inner {
+            Ty::Float => format!("__py_fmt_float(*{})", v),
+            Ty::Bool => format!("__py_fmt_bool(*{})", v),
+            Ty::List(_) | Ty::Set(_) | Ty::Dict(_, _) | Ty::Tuple(_) => format!("({}).py_repr()", v),
+            Ty::Option(i2) => self.emit_str_option(&v, i2, depth + 1),
+            _ => format!("format!(\"{{}}\", {})", v),
+        };
+        format!(
+            "(match &({}) {{ Some({}) => {}, None => \"None\".to_string() }})",
+            raw, v, inner_form
+        )
+    }
+
     #[allow(clippy::borrowed_box)]
     pub(crate) fn emit_method_call_on_attr_inner(
         &mut self,
@@ -140,6 +165,28 @@ impl<'a> Codegen<'a> {
     ) -> Result<Option<String>> {
                 // Method call with attribute callee — handle method name remapping
                 if let Expr::Attr { obj, name, .. } = callee.as_ref() {
+                    // (card 49170944) `str.maketrans(x, y)` -> a `HashMap<i64, i64>`
+                    // code-point map (zip the from/to chars as ords). Feeds
+                    // `s.translate(table)`. 2-arg equal-length form is the honest
+                    // subset (the 3-arg delete form is out of scope).
+                    if name == "maketrans"
+                        && matches!(obj.as_ref(), Expr::Ident(sn, _) if sn == "str")
+                        && args.len() == 2
+                    {
+                        let from = self.emit_expr(&args[0])?;
+                        let to = self.emit_expr(&args[1])?;
+                        // (enabler-fix-2 #5) CPython raises `ValueError: the first two
+                        // maketrans arguments must have equal length` on unequal
+                        // lengths; the old code SILENTLY zip-truncated to the shorter
+                        // (a silent miscompile). Emit the exact, CATCHABLE ValueError
+                        // (NUL-delimited "Type\0msg" convention every runtime error
+                        // uses). Compare CODE POINTS (chars, not UTF-8 bytes), matching
+                        // CPython's per-character length.
+                        return Ok(Some(format!(
+                            "{{ let __mt_from: Vec<char> = ({}).chars().collect(); let __mt_to: Vec<char> = ({}).chars().collect(); if __mt_from.len() != __mt_to.len() {{ panic!(\"ValueError\\0the first two maketrans arguments must have equal length\"); }} __mt_from.into_iter().zip(__mt_to).map(|(__a, __b)| (__a as i64, __b as i64)).collect::<::std::collections::HashMap<i64, i64>>() }}",
+                            from, to
+                        )));
+                    }
                     // Qualified module call `X.f(args)` for a REAL imported module
                     // (card 81db88e0). When X is a tracked module name and f is one
                     // of its functions, lower the call to the FLAT function `f(args)`
@@ -178,19 +225,30 @@ impl<'a> Codegen<'a> {
                         if let Some(class_def) = self.ctx.classes.get(class_name.as_str()) {
                             if let Some(method_def) = class_def.methods.iter().find(|m| &m.name == name) {
                                 if method_def.decorators.contains(&"staticmethod".to_string()) {
-                                    let parts: Result<Vec<_>> = args.iter().map(|a| self.emit_consuming(a)).collect();
-                                    let mut parts = parts?;
-                                    // (kwargs v1) Trailing-default fill for a
-                                    // static call, mirroring free functions
-                                    // (previously leaked rustc E0061).
-                                    if let Some(sig) = self.ctx.get_method(class_name, name) {
+                                    // (enabler-fix-1 #6) Coerce every positional arg AND
+                                    // every filled default into its parameter slot
+                                    // (Some-wrap an `Optional[T]`, cast a `Callable`,
+                                    // wrap a poly-base). The old path emitted positionals
+                                    // via a bare emit_consuming and defaults via a bare
+                                    // emit_expr, so a value into an `Optional[T]`
+                                    // static-method slot leaked rustc E0308.
+                                    let sig = self.ctx.get_method(class_name, name);
+                                    let param_tys: Vec<Ty> = sig
+                                        .as_ref()
+                                        .map(|s| s.params.iter().map(|(_, t)| t.clone()).collect())
+                                        .unwrap_or_default();
+                                    let mut parts: Vec<String> = Vec::with_capacity(args.len());
+                                    for (i, a) in args.iter().enumerate() {
+                                        parts.push(self.emit_arg_into_slot(a, param_tys.get(i))?);
+                                    }
+                                    if let Some(sig) = &sig {
                                         if parts.len() < sig.params.len() {
                                             let start = sig.param_defaults.len()
                                                 .saturating_sub(sig.params.len() - parts.len());
-                                            for def_expr in &sig.param_defaults[start..] {
+                                            for (off, def_expr) in sig.param_defaults[start..].iter().enumerate() {
                                                 if let Some(e) = def_expr {
                                                     let e = e.clone();
-                                                    parts.push(self.emit_expr(&e)?);
+                                                    parts.push(self.emit_call_arg_value(&e, &param_tys, start + off, /*coerced=*/ true)?);
                                                 }
                                             }
                                         }
@@ -259,10 +317,30 @@ impl<'a> Codegen<'a> {
                     // the base's signature, and `obj_s.name(..)` resolves to the
                     // companion enum `cls__`'s dispatch method — identical to the
                     // pre-existing EPIC-5 lowering.
-                    if let Ty::Class(cls, _) = self.type_of_expr(obj.as_ref()) {
+                    if let Ty::Class(cls, cls_args) = self.type_of_expr(obj.as_ref()) {
+                        // `x.__str__()` / `x.__repr__()` are Python's stringify
+                        // dunders. pyrst lowers __str__/__repr__ to the Display impl
+                        // and the `PyRepr` trait — NOT inherent methods (they are
+                        // skipped in the inherent impl block) — so a direct method
+                        // call must route to those, not to a non-existent
+                        // `self.__str__()`/`self.__repr__()`. This makes the common
+                        // `def __repr__(self): return self.__str__()` delegation
+                        // (e.g. time.struct_time) compile. Display already resolves
+                        // __str__-or-__repr__ per CPython's str() fallback.
+                        if name == "__str__" && args.is_empty() && kwargs.is_empty() {
+                            return Ok(Some(format!("format!(\"{{}}\", {})", obj_s)));
+                        }
+                        if name == "__repr__" && args.is_empty() && kwargs.is_empty() {
+                            return Ok(Some(format!("({}).py_repr()", obj_s)));
+                        }
                         if self.ctx.get_method(&cls, name).is_some() {
+                            // (card e10df981) Reconstruct the receiver instance type
+                            // (with its type args) so the method-call path can
+                            // substitute the class's type vars into the sig's param
+                            // types. Empty args (non-generic receiver) => no-op subst.
+                            let recv_ty = Ty::Class(cls.clone(), cls_args.clone());
                             return self
-                                .emit_user_method_call(&obj_s, &cls, name, args, kwargs, &parts, callee.span())
+                                .emit_user_method_call(&obj_s, &cls, name, args, kwargs, &parts, callee.span(), &recv_ty)
                                 .map(Some);
                         }
                         // Not a method — a `Callable` FIELD invoked as `obj.f(args)`.
@@ -396,21 +474,85 @@ impl<'a> Codegen<'a> {
                         )));
                     }
                     if name == "partition" && !parts.is_empty() {
+                        // (card 49170944) Return a 3-TUPLE (String, String, String)
+                        // — CPython's real shape — so `head, sep, tail =
+                        // s.partition("=")` unpacks (typeck types this as
+                        // Tuple(Str,Str,Str)). Was a `vec![..]` (list) before, which
+                        // diverged from CPython and blocked the idiomatic unpack.
                         return Ok(Some(format!(
                             "{{ let __s = {}.clone(); let __sep = {}; \
                             if let Some(__idx) = __s.find(__sep.as_str()) {{ \
-                            vec![__s[..__idx].to_string(), __sep.clone(), __s[__idx + __sep.len()..].to_string()] \
-                            }} else {{ vec![__s, String::new(), String::new()] }} }}",
+                            (__s[..__idx].to_string(), __sep.clone(), __s[__idx + __sep.len()..].to_string()) \
+                            }} else {{ (__s, String::new(), String::new()) }} }}",
                             obj_s, parts[0]
                         )));
                     }
                     if name == "rpartition" && !parts.is_empty() {
+                        // (card 49170944) 3-TUPLE like partition; the no-match case
+                        // puts the whole string in the LAST slot (CPython semantics).
                         return Ok(Some(format!(
                             "{{ let __s = {}.clone(); let __sep = {}; \
                             if let Some(__idx) = __s.rfind(__sep.as_str()) {{ \
-                            vec![__s[..__idx].to_string(), __sep.clone(), __s[__idx + __sep.len()..].to_string()] \
-                            }} else {{ vec![String::new(), String::new(), __s] }} }}",
+                            (__s[..__idx].to_string(), __sep.clone(), __s[__idx + __sep.len()..].to_string()) \
+                            }} else {{ (String::new(), String::new(), __s) }} }}",
                             obj_s, parts[0]
+                        )));
+                    }
+                    // (card 49170944) casefold(): SIMPLE-casefold.
+                    // (enabler-fix-2 #7) CONTEXT-FREE: fold each char INDEPENDENTLY
+                    // via `char::to_lowercase` — NOT `str::to_lowercase`, which applies
+                    // the Unicode SpecialCasing final-sigma rule (a word-final Σ ->
+                    // ς / U+03C2) and so diverged from CPython, whose casefold is
+                    // context-free (every Σ -> σ / U+03C3). Per-char folding matches
+                    // CPython for ASCII / İ / word-final Σ and all 1:1 mappings.
+                    // STILL simple-fold only: ß stays ß and ﬁ stays ﬁ (CPython
+                    // full-folds them to "ss" / "fi") — the full-fold table is out of
+                    // scope; documented precisely in PYTHON_COMPATIBILITY.md.
+                    if name == "casefold" {
+                        return Ok(Some(format!(
+                            "{}.chars().flat_map(|__c| __c.to_lowercase()).collect::<String>()",
+                            obj_s
+                        )));
+                    }
+                    // (card 49170944) rsplit(sep[, maxsplit]) — python3-exact. Rust's
+                    // `rsplitn` yields pieces RIGHT-to-LEFT, so collect + reverse to
+                    // restore CPython's left-to-right list. A negative maxsplit (or
+                    // absent) means unlimited == plain `split`. The 1-arg form is
+                    // exactly `split` (no limit). The no-sep whitespace form is out of
+                    // scope here (honest-rejected: rsplit requires a separator).
+                    if name == "rsplit" {
+                        if parts.is_empty() {
+                            return Err(crate::diag::Error::Codegen(
+                                "`rsplit()` without a separator is not supported — pass a \
+                                 separator (rsplit(sep) or rsplit(sep, maxsplit))".into(),
+                            ));
+                        }
+                        if parts.len() >= 2 {
+                            return Ok(Some(format!(
+                                "{{ let __s = {}.clone(); let __sep = {}; let __n: i64 = {}; \
+                                if __n < 0 {{ __s.split(__sep.as_str()).map(|p| p.to_string()).collect::<Vec<String>>() }} \
+                                else {{ let mut __v: Vec<String> = __s.rsplitn((__n as usize) + 1, __sep.as_str()).map(|p| p.to_string()).collect(); __v.reverse(); __v }} }}",
+                                obj_s, parts[0], parts[1]
+                            )));
+                        }
+                        return Ok(Some(format!(
+                            "{}.split({}.as_str()).map(|p| p.to_string()).collect::<Vec<String>>()",
+                            obj_s, parts[0]
+                        )));
+                    }
+                    // (card 49170944) translate(table): apply an int->int code-point
+                    // map (`dict[int, int]`, e.g. from str.maketrans). Each char whose
+                    // code point is a key is replaced by chr(value); others pass
+                    // through unchanged. The delete form (None values / 3-arg
+                    // maketrans) needs `dict[int, Optional[int]]` and is out of scope
+                    // (honest subset — documented).
+                    if name == "translate" && !parts.is_empty() {
+                        return Ok(Some(format!(
+                            "{{ let __t = &{}; {}.chars().map(|__c| \
+                            match __t.get(&(__c as i64)) {{ \
+                            Some(&__r) => ::std::char::from_u32(__r as u32).unwrap_or(__c), \
+                            None => __c }}).collect::<String>() }}",
+                            parts[0], obj_s
                         )));
                     }
                     if name == "find" && !parts.is_empty() {
@@ -960,38 +1102,78 @@ impl<'a> Codegen<'a> {
 
                         // Class constructor: emit a Rust struct literal.
                         // Use inherited + own fields for positional.
+                        // (enabler-fix-1 #3a) EXCLUDE promoted class constants — they
+                        // are associated `const`s, not struct fields (items.rs excludes
+                        // them from the struct too), so counting one as a required ctor
+                        // arg gave the wrong arity / a bogus struct-field init.
                         let mut all_field_names: Vec<String> = Vec::new();
                         for base in &class_def.bases {
                             if let Some(bd) = self.ctx.classes.get(base.as_str()).cloned() {
                                 for f in &bd.fields {
-                                    if !all_field_names.contains(&f.name) {
+                                    if !all_field_names.contains(&f.name)
+                                        && !self.is_class_const_field(name, &f.name)
+                                    {
                                         all_field_names.push(f.name.clone());
                                     }
                                 }
                             }
                         }
                         for f in &class_def.fields {
-                            if !all_field_names.contains(&f.name) {
+                            if !all_field_names.contains(&f.name)
+                                && !self.is_class_const_field(name, &f.name)
+                            {
                                 all_field_names.push(f.name.clone());
                             }
                         }
 
                         if !args.is_empty() && kwargs.is_empty() {
                             // Positional args to a class constructor.
-                            if args.len() != all_field_names.len() {
+                            if args.len() > all_field_names.len() {
                                 return Err(crate::diag::Error::Codegen(format!(
                                     "class `{}` has {} fields but {} positional arguments given",
                                     name, all_field_names.len(), args.len()
                                 )));
                             }
+                            // (card 6f69d4a3) Fewer positionals than fields is valid
+                            // when the TRAILING fields have DEFAULTS (a @dataclass
+                            // `port: int = 8080`): fill each omitted field with its
+                            // default value. typeck already rejected an omitted field
+                            // that has NO default (map_kwargs_to_slots), so a missing
+                            // default here is a defensive codegen error only.
+                            let all_params = self.ctx.get_all_fields(name.as_str());
                             let mut parts = Vec::new();
-                            for (field_name, arg) in all_field_names.iter().zip(args.iter()) {
+                            for (i, field_name) in all_field_names.iter().enumerate() {
                                 // (EPIC-5 C2-3) The struct field lowers to `B__` for
                                 // a polymorphic-base field, so a raw-struct/subclass
                                 // value wraps in its variant (same as the ctor/new
                                 // path above).
                                 let fty = self.class_field_type(&class_def, field_name);
-                                let v = self.emit_arg_into_slot(arg, fty.as_ref())?;
+                                let v = if i < args.len() {
+                                    self.emit_arg_into_slot(&args[i], fty.as_ref())?
+                                } else {
+                                    match all_params
+                                        .iter()
+                                        .find(|p| &p.name == field_name)
+                                        .and_then(|p| p.default.as_ref())
+                                    {
+                                        Some(d) => self.emit_arg_into_slot(d, fty.as_ref())?,
+                                        None => {
+                                            return Err(crate::diag::Error::Codegen(format!(
+                                                "class `{}` missing a required argument: `{}`",
+                                                name, field_name
+                                            )))
+                                        }
+                                    }
+                                };
+                                // (enabler-fix-1 #4a) Box a self-referential field
+                                // value: the struct stores `Option<Box<Node>>`, so a
+                                // direct struct-literal ctor (dataclass / no-__init__)
+                                // must `.map(Box::new)` the value here (the `self.x=..`
+                                // boxing path never runs for direct construction).
+                                let v = match &fty {
+                                    Some(ft) => self.box_recursive_field_value(name, ft, v),
+                                    None => v,
+                                };
                                 // (EPIC-6) Escape a keyword field name in the
                                 // positional struct-literal init.
                                 parts.push(format!("{}: {}", escape_ident(field_name), v));
@@ -1017,11 +1199,21 @@ impl<'a> Codegen<'a> {
                             for (field_name, arg) in all_field_names.iter().zip(args.iter()) {
                                 let fty = self.class_field_type(&class_def, field_name);
                                 let v = self.emit_arg_into_slot(arg, fty.as_ref())?;
+                                // (enabler-fix-1 #4a) Box a self-referential field.
+                                let v = match &fty {
+                                    Some(ft) => self.box_recursive_field_value(name, ft, v),
+                                    None => v,
+                                };
                                 parts.push(format!("{}: {}", escape_ident(field_name), v));
                             }
                             for (kw, val) in kwargs {
                                 let fty = self.class_field_type(&class_def, kw);
                                 let v = self.emit_arg_into_slot(val, fty.as_ref())?;
+                                // (enabler-fix-1 #4a) Box a self-referential field.
+                                let v = match &fty {
+                                    Some(ft) => self.box_recursive_field_value(name, ft, v),
+                                    None => v,
+                                };
                                 // (EPIC-6) Escape a keyword field name in the
                                 // keyword-arg struct-literal init.
                                 parts.push(format!("{}: {}", escape_ident(kw), v));
@@ -1040,8 +1232,27 @@ impl<'a> Codegen<'a> {
                                     })
                                 });
                             let default = if let Some(f) = field {
-                                let ty = Ty::from_type_expr(&f.ty, f.span)?;
-                                self.zeroed_default(&ty)
+                                // (enabler-fix-1 #3) Honor a field's DECLARED default
+                                // in a zero-arg construction (`Options()` with `level:
+                                // int = 1`). Before the usage-gated promotion, such a
+                                // literal-defaulted field was always a const, so this
+                                // path only ever saw undefaulted fields and zeroed them
+                                // — an unpromoted defaulted instance field would have
+                                // been silently zeroed (`level` -> 0 instead of 1).
+                                match &f.default {
+                                    Some(d) => {
+                                        let fty = self.class_field_type(&class_def, fname);
+                                        let v = self.emit_arg_into_slot(d, fty.as_ref())?;
+                                        match &fty {
+                                            Some(ft) => self.box_recursive_field_value(name, ft, v),
+                                            None => v,
+                                        }
+                                    }
+                                    None => {
+                                        let ty = Ty::from_type_expr(&f.ty, f.span)?;
+                                        self.zeroed_default(&ty)
+                                    }
+                                }
                             } else {
                                 "Default::default()".to_string()
                             };
@@ -1076,6 +1287,8 @@ impl<'a> Codegen<'a> {
                                 Ty::Bool => format!("__py_fmt_bool({})", raw),
                                 Ty::List(_) | Ty::Set(_) | Ty::Dict(_, _) | Ty::Tuple(_) =>
                                     format!("({}).py_repr()", raw),
+                                // (enabler-fix-2 #3) print(opt) -> payload-or-None.
+                                Ty::Option(inner) => self.emit_str_option(&raw, inner.as_ref(), 0),
                                 _ => raw,
                             };
                             parts.push(formatted);
@@ -1202,6 +1415,21 @@ impl<'a> Codegen<'a> {
                 if let Expr::Ident(n, _) = callee.as_ref() {
                     match n.as_str() {
                         "len" => {
+                            let arg_ty = self.type_of_expr(&args[0]);
+                            // (enabler-fix-2 #2) len() of a statically-shaped tuple is
+                            // its CONST arity — a Rust tuple has no `.len()` (the old
+                            // `.len()` emission was a rustc E0599). Still EVALUATE the
+                            // argument (Python evaluates it before taking len), so any
+                            // side effect is preserved; then yield the arity. Only a
+                            // KNOWN, NON-EMPTY arity qualifies — an empty `Ty::Tuple`
+                            // is the unknown-shape placeholder (e.g. `tuple(xs)`), left
+                            // to the fall-through rather than mis-reported as 0.
+                            if let Ty::Tuple(tys) = &arg_ty {
+                                if !tys.is_empty() {
+                                    let a = self.emit_expr(&args[0])?;
+                                    return Ok(Some(format!("{{ let _ = &({}); {}i64 }}", a, tys.len())));
+                                }
+                            }
                             let a = self.emit_expr(&args[0])?;
                             // Python len() of a str is the CHARACTER count, not the
                             // UTF-8 byte count. Collections keep .len().
@@ -1209,7 +1437,7 @@ impl<'a> Codegen<'a> {
                             // (len leftmost in a `<`/`<=` comparison) makes rustc
                             // parse `i64<` as generic arguments (E0658-style
                             // parse error); the parens keep every context valid.
-                            if matches!(self.type_of_expr(&args[0]), Ty::Str) {
+                            if matches!(arg_ty, Ty::Str) {
                                 return Ok(Some(format!("({}.chars().count() as i64)", a)));
                             }
                             return Ok(Some(format!("({}.len() as i64)", a)));
@@ -1224,6 +1452,8 @@ impl<'a> Codegen<'a> {
                                 Ty::Bool => return Ok(Some(format!("__py_fmt_bool({})", a))),
                                 Ty::List(_) | Ty::Set(_) | Ty::Dict(_, _) | Ty::Tuple(_) =>
                                     return Ok(Some(format!("({}).py_repr()", a))),
+                                // (enabler-fix-2 #3) str(opt) -> payload-or-None.
+                                Ty::Option(inner) => return Ok(Some(self.emit_str_option(&a, inner.as_ref(), 0))),
                                 _ => return Ok(Some(format!("format!(\"{{}}\" , {})", a))),
                             }
                         }
@@ -1379,9 +1609,30 @@ impl<'a> Codegen<'a> {
                                 // (e.g. `str`) does not implement — `.cloned()`
                                 // requires only `Clone` and covers both Copy and
                                 // non-Copy element types uniformly.
-                                return Ok(Some(match elem_ty {
-                                    Ty::Float => format!("{{ let mut __min = f64::INFINITY; let mut __seen = false; for __x in {}.iter() {{ __seen = true; if __x < &__min {{ __min = *__x; }} }} if !__seen {{ panic!(\"ValueError\\0min() iterable argument is empty\"); }} __min }}", a),
-                                    _ => format!("{}.iter().cloned().min().unwrap_or_else(|| panic!(\"ValueError\\0min() iterable argument is empty\"))", a),
+                                // (W2 card ebd703d9) A user class with only `__lt__`
+                                // is `PartialOrd`, not `Ord`, so `.min()` (which needs
+                                // `Ord`) is an E0277 build wall — the same honesty
+                                // hole `sorted()` already closed. Route it through a
+                                // FIRST-WINS `<` fold (replace only on a STRICTLY
+                                // smaller element) so ties keep the earliest element,
+                                // exactly like CPython's `min()`. `elem_needs_partial_cmp`
+                                // is the same predicate `sorted()` uses.
+                                let is_cmp_class = matches!(&elem_ty, Ty::Class(..))
+                                    && self.elem_needs_partial_cmp(&elem_ty);
+                                return Ok(Some(if matches!(elem_ty, Ty::Float) {
+                                    format!("{{ let mut __min = f64::INFINITY; let mut __seen = false; for __x in {}.iter() {{ __seen = true; if __x < &__min {{ __min = *__x; }} }} if !__seen {{ panic!(\"ValueError\\0min() iterable argument is empty\"); }} __min }}", a)
+                                } else if is_cmp_class {
+                                    // (enabler-fix-2 #8a) Compare by REFERENCE and
+                                    // clone ONLY the winner (was: clone EVERY element
+                                    // into `__x` each iteration). `&Elem: PartialOrd`
+                                    // delegates to `Elem`, so `__ref < __b` compares
+                                    // in place; `__best` holds a borrow into `__src`
+                                    // (bound first, temporary-lifetime-extended so it
+                                    // outlives the fold) and is `.cloned()` once at the
+                                    // end. First-wins ties preserved -> byte-identical.
+                                    format!("{{ let __src = &({}); let mut __best: Option<&_> = None; for __ref in __src.iter() {{ let __take = match __best {{ None => true, Some(__b) => __ref < __b }}; if __take {{ __best = Some(__ref); }} }} __best.cloned().unwrap_or_else(|| panic!(\"ValueError\\0min() iterable argument is empty\")) }}", a)
+                                } else {
+                                    format!("{}.iter().cloned().min().unwrap_or_else(|| panic!(\"ValueError\\0min() iterable argument is empty\"))", a)
                                 }));
                             } else {
                                 // (REVIEW FOLLOW-UP on 577b04f, item 4) The 2-arg
@@ -1394,6 +1645,16 @@ impl<'a> Codegen<'a> {
                                 // `is_copy_type` check keeps it bare).
                                 let a = self.emit_consuming(&args[0])?;
                                 let b = self.emit_consuming(&args[1])?;
+                                // (W2 card ebd703d9) `::std::cmp::min` needs `Ord`,
+                                // which neither `f64` nor a `__lt__`-only class has —
+                                // both were silent 2-arg build-fails. Route those
+                                // through a FIRST-WINS `<` form (tie keeps the FIRST
+                                // arg, like CPython's `min(a, b)`); Ord scalars
+                                // (int/str/bool) keep the stdlib call.
+                                let arg_ty = self.type_of_expr(&args[0]);
+                                if self.elem_needs_partial_cmp(&arg_ty) {
+                                    return Ok(Some(format!("{{ let __a = {}; let __b = {}; if __b < __a {{ __b }} else {{ __a }} }}", a, b)));
+                                }
                                 return Ok(Some(format!("::std::cmp::min({}, {})", a, b)));
                             }
                         }
@@ -1488,9 +1749,22 @@ impl<'a> Codegen<'a> {
                                 // (REVIEW FOLLOW-UP on 577b04f, item 2) See the
                                 // `min` arm above: `.cloned()` works for both Copy
                                 // and non-Copy element types.
-                                return Ok(Some(match elem_ty {
-                                    Ty::Float => format!("{{ let mut __max = f64::NEG_INFINITY; let mut __seen = false; for __x in {}.iter() {{ __seen = true; if __x > &__max {{ __max = *__x; }} }} if !__seen {{ panic!(\"ValueError\\0max() iterable argument is empty\"); }} __max }}", a),
-                                    _ => format!("{}.iter().cloned().max().unwrap_or_else(|| panic!(\"ValueError\\0max() iterable argument is empty\"))", a),
+                                // (W2 card ebd703d9) A `__lt__`-only class is
+                                // `PartialOrd`, not `Ord`: route through a FIRST-WINS
+                                // `>` fold (replace only on a STRICTLY greater
+                                // element) so a tie keeps the EARLIEST element, exactly
+                                // like CPython's `max()` (Rust's `.max()` would keep
+                                // the last, and also needs `Ord`).
+                                let is_cmp_class = matches!(&elem_ty, Ty::Class(..))
+                                    && self.elem_needs_partial_cmp(&elem_ty);
+                                return Ok(Some(if matches!(elem_ty, Ty::Float) {
+                                    format!("{{ let mut __max = f64::NEG_INFINITY; let mut __seen = false; for __x in {}.iter() {{ __seen = true; if __x > &__max {{ __max = *__x; }} }} if !__seen {{ panic!(\"ValueError\\0max() iterable argument is empty\"); }} __max }}", a)
+                                } else if is_cmp_class {
+                                    // (enabler-fix-2 #8a) Compare by REFERENCE, clone
+                                    // only the winner — see the mirror note in `min`.
+                                    format!("{{ let __src = &({}); let mut __best: Option<&_> = None; for __ref in __src.iter() {{ let __take = match __best {{ None => true, Some(__b) => __ref > __b }}; if __take {{ __best = Some(__ref); }} }} __best.cloned().unwrap_or_else(|| panic!(\"ValueError\\0max() iterable argument is empty\")) }}", a)
+                                } else {
+                                    format!("{}.iter().cloned().max().unwrap_or_else(|| panic!(\"ValueError\\0max() iterable argument is empty\"))", a)
                                 }));
                             } else {
                                 // (REVIEW FOLLOW-UP on 577b04f, item 4) See the
@@ -1499,6 +1773,15 @@ impl<'a> Codegen<'a> {
                                 // (not moved), fixing E0382 on reuse.
                                 let a = self.emit_consuming(&args[0])?;
                                 let b = self.emit_consuming(&args[1])?;
+                                // (W2 card ebd703d9) See the `min` 2-arg arm: `f64`
+                                // and a `__lt__`-only class are `PartialOrd`, not
+                                // `Ord`. FIRST-WINS `>` form (tie keeps the FIRST
+                                // arg, like CPython's `max(a, b)`); Ord scalars keep
+                                // the stdlib call.
+                                let arg_ty = self.type_of_expr(&args[0]);
+                                if self.elem_needs_partial_cmp(&arg_ty) {
+                                    return Ok(Some(format!("{{ let __a = {}; let __b = {}; if __b > __a {{ __b }} else {{ __a }} }}", a, b)));
+                                }
                                 return Ok(Some(format!("::std::cmp::max({}, {})", a, b)));
                             }
                         }
@@ -1870,14 +2153,22 @@ impl<'a> Codegen<'a> {
                             if args.len() != 1 {
                                 return Err(crate::diag::Error::Codegen("repr requires exactly 1 argument".into()));
                             }
-                            let obj_type = self.type_of_expr(&args[0]);
+                            // A bare `None` literal has an ambiguous `Option<T>`
+                            // type (T uninferred), so `.py_repr()` can't resolve —
+                            // and its repr is always the constant `'None'` anyway.
+                            if matches!(&args[0], Expr::None_(_)) {
+                                return Ok(Some("\"None\".to_string()".to_string()));
+                            }
+                            // Route EVERY other type through the CPython-parity
+                            // `PyRepr` trait: floats keep their `.0`/scientific form,
+                            // strs get the `%r` quote-choice matrix, containers/tuples
+                            // recurse, an `Optional[X]` value reprs its payload or
+                            // `None`, and a user class routes through its `__repr__`
+                            // (via the per-class `impl PyRepr`). A class without
+                            // `__repr__` is rejected at CHECK time (see `check_expr`),
+                            // so no Display-fallback silent miscompile survives here.
                             let a = self.emit_expr(&args[0])?;
-                            let repr_expr = match obj_type {
-                                Ty::Str => format!("format!(\"'{{}}'\", {})", a),
-                                Ty::Bool => format!("format!(\"{{}}\" , if {} {{ \"True\" }} else {{ \"False\" }})", a),
-                                _ => format!("format!(\"{{}}\" , {})", a),
-                            };
-                            return Ok(Some(repr_expr));
+                            return Ok(Some(format!("({}).py_repr()", a)));
                         }
                         "ascii" => {
                             if args.len() != 1 {
@@ -1887,10 +2178,12 @@ impl<'a> Codegen<'a> {
                             let a = self.emit_expr(&args[0])?;
                             let ascii_expr = match obj_type {
                                 Ty::Str => {
-                                    format!(
-                                        "format!(\"'{{}}'\", {}.escape_default())",
-                                        a
-                                    )
+                                    // (enabler-fix-2 #4) ascii() = repr()'s quote-choice
+                                    // matrix + escape EVERY non-ASCII code point as
+                                    // \xXX/\uXXXX/\UXXXXXXXX. The old `escape_default`
+                                    // used Rust's escaping (e.g. `\u{e9}`, wrong quote
+                                    // logic); `__py_ascii` is the shared CPython engine.
+                                    format!("__py_ascii(&({}))", a)
                                 }
                                 Ty::Bool => {
                                     format!("format!(\"{{}}\" , if {} {{ \"True\" }} else {{ \"False\" }})", a)
@@ -2054,6 +2347,8 @@ impl<'a> Codegen<'a> {
                                         Ty::Bool => format!("__py_fmt_bool({})", raw),
                                         Ty::List(_) | Ty::Set(_) | Ty::Dict(_, _) | Ty::Tuple(_) =>
                                             format!("({}).py_repr()", raw),
+                                        // (enabler-fix-2 #3) f"{opt}" -> payload-or-None.
+                                        Ty::Option(inner) => self.emit_str_option(&raw, inner.as_ref(), 0),
                                         _ => raw,
                                     };
                                     args.push(arg);
@@ -2315,6 +2610,47 @@ impl<'a> Codegen<'a> {
                 self.emit_call(callee, args, kwargs)?
             }
             Expr::Attr { obj, name, .. } => {
+                // (card 03eb4e2c) Class-level CONSTANT (enum member) access:
+                // `Color.RED` (class name), `self.RED` (inside a method), and
+                // `inst.RED` (an instance) all lower to the associated const
+                // `Color::RED`. A str const is stored as `&str`, so recover a
+                // `String` with `.to_string()` (mirrors module-const handling).
+                // This MUST run before `emit_expr(obj)` below — for a class-name
+                // receiver `emit_expr(Color)` is not a value and would not compile.
+                {
+                    let const_class: Option<String> = match obj.as_ref() {
+                        Expr::Ident(cn, _) if self.ctx.classes.contains_key(cn.as_str()) => {
+                            Some(cn.clone())
+                        }
+                        _ => match self.type_of_expr(obj) {
+                            Ty::Class(cn, _) => Some(cn),
+                            _ => None,
+                        },
+                    };
+                    if let Some(cn) = const_class {
+                        if self.is_class_const_field(&cn, name) {
+                            // (enabler-fix-1 #3c) A const lives on the impl of the class
+                            // that DECLARES it, so an inherited access (`Sub.KIND`) must
+                            // resolve to the defining class (`Base::KIND`) — emitting
+                            // `Sub::KIND` was an E0599 (Sub's impl has no such const).
+                            let dc = self.ctx.defining_class(&cn, name).unwrap_or_else(|| cn.clone());
+                            let is_str = matches!(
+                                self.ctx
+                                    .classes
+                                    .get(dc.as_str())
+                                    .and_then(|cd| cd.fields.iter().find(|f| f.name == *name))
+                                    .and_then(|f| f.default.as_ref()),
+                                Some(Expr::Str(..))
+                            );
+                            let path = format!("{}::{}", dc, escape_ident(name));
+                            return Ok(if is_str {
+                                format!("{}.to_string()", path)
+                            } else {
+                                path
+                            });
+                        }
+                    }
+                }
                 // Qualified MODULE CONSTANT `X.CONST` for a REAL imported module:
                 // when X is a tracked module and CONST is one of its module-level
                 // constants, lower to the MANGLED Rust `const __pyrst_const_CONST`
@@ -2369,9 +2705,30 @@ impl<'a> Codegen<'a> {
                     // by emit_companion_enum.
                     format!("{}.__field_{}()", o, name)
                 } else {
-                    // (EPIC-6) Ordinary struct-field read: escape a keyword field
-                    // name so it matches the (escaped) struct field definition.
-                    format!("{}.{}", o, escape_ident(name))
+                    // (card 30e4fdd0) A boxed-recursive field STORES `Option<Box<Node>>`.
+                    // As an RVALUE, UNBOX it back to the type system's Box-blind
+                    // `Option<Node>`: `.clone().map(|__b| *__b)` deep-clones (pyrst
+                    // value semantics — the documented aliasing divergence from
+                    // Python's reference semantics) and unboxes each element. A
+                    // non-recursive field keeps the ordinary clone-on-use read.
+                    let boxed_recursive = if let Ty::Class(cn, _) = self.type_of_expr(obj) {
+                        self.ctx
+                            .classes
+                            .get(&cn)
+                            .cloned()
+                            .and_then(|cd| self.class_field_type(&cd, name))
+                            .is_some_and(|ft| self.field_needs_box(&cn, &ft))
+                    } else {
+                        false
+                    };
+                    if boxed_recursive {
+                        // (EPIC-6) escape the keyword field name as elsewhere.
+                        format!("{}.{}.clone().map(|__b| *__b)", o, escape_ident(name))
+                    } else {
+                        // (EPIC-6) Ordinary struct-field read: escape a keyword field
+                        // name so it matches the (escaped) struct field definition.
+                        format!("{}.{}", o, escape_ident(name))
+                    }
                 }
             }
             Expr::Index { obj, idx, .. } => {

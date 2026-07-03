@@ -1,0 +1,9 @@
+# NEGATIVE (enabler-fix-1 #1): min()/max() over a user class WITHOUT __lt__ (and no
+# key=) is a check error — CPython raises TypeError. Pass key= or define __lt__.
+class Node:
+    a: int
+    b: int
+
+def main() -> None:
+    xs: list[Node] = [Node(2, 1), Node(1, 2)]
+    print(min(xs).a)

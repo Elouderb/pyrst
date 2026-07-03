@@ -1,0 +1,32 @@
+# DUAL-RUN parity (enabler-fix-2 #3): print()/str()/f-string of an un-narrowed
+# Optional[T] — payload-or-None, str semantics (a str shows UNQUOTED). Covers
+# int, str, and a class (with __str__ so python3's print is deterministic), in
+# BOTH Some and None states. Byte-checked against python3 3.12.
+class Box:
+    v: int
+    def __init__(self, v: int) -> None:
+        self.v = v
+    def __str__(self) -> str:
+        return "Box(" + str(self.v) + ")"
+
+def show_int(x: int | None) -> None:
+    print(x)
+
+def show_str(x: str | None) -> None:
+    print(x)
+
+def show_box(x: Box | None) -> None:
+    print(x)
+
+def main() -> None:
+    show_int(42)
+    show_int(None)
+    show_str("hi")
+    show_str(None)
+    show_box(Box(7))
+    show_box(None)
+    a: int | None = 5
+    b: int | None = None
+    print(f"a={a} b={b}")
+    print(str(a))
+    print(str(b))

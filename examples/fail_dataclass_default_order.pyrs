@@ -1,0 +1,7 @@
+@dataclass
+class Bad:
+    x: int = 5
+    y: int
+
+def main() -> None:
+    print(Bad(1, 2).x)

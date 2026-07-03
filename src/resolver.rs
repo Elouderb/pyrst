@@ -347,6 +347,11 @@ pub(crate) fn merge_ctx_from_module(m: &Module, ctx: &mut TyCtx, is_root: bool) 
             _ => {}
         }
     }
+    // (card e131f8b0) Record every class used as a dict KEY / set ELEMENT anywhere
+    // in this module (field / param / return / local annotations), accumulating
+    // across modules into the shared ctx. Codegen adds `Eq/Hash/Ord` derives for a
+    // class in this set; `check` validates each is hashable (`class_hash_eligible`).
+    crate::typeck::collect_hash_key_classes(m, &mut ctx.hash_key_classes);
     Ok(())
 }
 
@@ -458,7 +463,7 @@ pub fn resolve(root_path: &Path) -> Result<ResolvedProgram> {
     }
 
     // Build output: (Module, source_text) pairs in dependency order
-    let modules = resolver
+    let modules: Vec<(Module, String)> = resolver
         .order
         .iter()
         .map(|p| {
@@ -466,6 +471,17 @@ pub fn resolve(root_path: &Path) -> Result<ResolvedProgram> {
             (m, src)
         })
         .collect();
+
+    // (enabler-fix-1 #3) Finalize class-constant promotion over the WHOLE program
+    // (needs every class registered AND every read/write site across all modules),
+    // so typeck and codegen share one usage-gated decision.
+    crate::typeck::collect_promoted_consts(&modules, &mut ctx);
+
+    // (enabler-fix-2 #1a/#1c) Close `hash_key_classes` over the WHOLE program:
+    // TRANSITIVE user-class fields of a key class (nested classes need the derive
+    // too) + annotation-less constructor-keyed dict/set literals. Runs after every
+    // module's annotation scan has accumulated into `ctx.hash_key_classes`.
+    crate::typeck::finalize_hash_key_classes(&modules, &mut ctx);
 
     Ok(ResolvedProgram { modules, ctx })
 }

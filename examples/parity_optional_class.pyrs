@@ -1,0 +1,43 @@
+# DUAL-RUN parity (W2 card 30e4fdd0 part a): assigning a BARE class value to an
+# Optional[Class] FIELD now Some-wraps — at ctor-param seeding, method-body
+# `self.field = obj`, a freshly-constructed `self.field = Inner(v)`, and the
+# `None` case — mirroring the local-declaration and return positions that already
+# coerced. Read back via LOCAL-binding narrowing (pyrst narrows a local, not an
+# attribute chain, so `s = self.slot; if s is not None: s.v`).
+
+class Inner:
+    v: int
+    def __init__(self, v: int) -> None:
+        self.v = v
+
+class Holder:
+    slot: Optional[Inner]
+    tag: str
+    def __init__(self, slot: Optional[Inner], tag: str) -> None:
+        self.slot = slot           # ctor: bare Inner into an Optional param slot
+        self.tag = tag
+    def fill(self, x: Inner) -> None:
+        self.slot = x              # method: bare Inner value into Optional field
+    def seed(self, v: int) -> None:
+        self.slot = Inner(v)       # method: fresh Inner into Optional field
+    def clear(self) -> None:
+        self.slot = None           # None into Optional field
+    def slot_v(self) -> int:
+        s: Optional[Inner] = self.slot
+        if s is not None:
+            return s.v
+        return -1
+
+
+def main() -> None:
+    h: Holder = Holder(Inner(7), "a")   # bare Inner into an Optional ctor param
+    print(h.slot_v())                   # 7
+    print(h.tag)                        # a
+    h.fill(Inner(5))
+    print(h.slot_v())                   # 5
+    h.seed(9)
+    print(h.slot_v())                   # 9
+    h.clear()
+    print(h.slot_v())                   # -1
+    empty: Holder = Holder(None, "b")   # None into an Optional ctor param
+    print(empty.slot_v())               # -1

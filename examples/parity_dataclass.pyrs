@@ -1,0 +1,62 @@
+# DUAL-RUN parity (W2 card 6f69d4a3): @dataclass synthesis. pyrst synthesizes
+# __init__ (annotated fields in order, defaults honored), __repr__ (CPython's
+# `ClassName(field=value, ...)`, field VALUES routed through repr so a str is
+# quoted and a float keeps its `.0`), and __eq__ (structural — the derived
+# PartialEq matches CPython's tuple comparison). `from dataclasses import
+# dataclass` is a no-op import in pyrst and the real import under python3, so the
+# same source dual-runs.
+
+from dataclasses import dataclass
+
+@dataclass
+class Point:
+    x: int
+    y: int
+
+@dataclass
+class Named:
+    label: str
+    weight: float
+
+@dataclass
+class Config:
+    host: str
+    port: int = 8080
+
+@dataclass
+class Empty:
+    pass
+
+@dataclass
+class Base:
+    x: int
+
+@dataclass
+class Derived(Base):
+    y: int
+
+
+def main() -> None:
+    p: Point = Point(1, 2)
+    print(repr(p))                     # Point(x=1, y=2)
+    print(p)                           # Point(x=1, y=2)  (str == repr, no __str__)
+    print(p == Point(1, 2))            # True
+    print(p != Point(2, 1))            # True
+    print(p == Point(2, 1))            # False
+
+    n: Named = Named("hi", 3.5)
+    print(repr(n))                     # Named(label='hi', weight=3.5)
+
+    c1: Config = Config("localhost")           # default port honored
+    print(repr(c1))                    # Config(host='localhost', port=8080)
+    c2: Config = Config("example.com", 9000)
+    print(repr(c2))                    # Config(host='example.com', port=9000)
+    print(c1 == Config("localhost"))   # True
+    print(c1 == c2)                    # False
+
+    print(repr(Empty()))               # Empty()
+    print(Empty() == Empty())          # True
+
+    d: Derived = Derived(1, 2)         # inherited field order (x, y)
+    print(repr(d))                     # Derived(x=1, y=2)
+    print(d.x + d.y)                   # 3

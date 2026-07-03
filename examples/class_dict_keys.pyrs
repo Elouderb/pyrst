@@ -1,0 +1,52 @@
+# pyrst-only golden (W2 card e131f8b0): user classes as dict KEYS / set ELEMENTS.
+# pyrst gives an eligible class STRUCTURAL Eq + Hash (derived), so `Node(1, "a")`
+# equals another `Node(1, "a")` used as a key — pyrst's documented VALUE semantics.
+# CPython would use REFERENCE identity for a class without __eq__/__hash__ (each
+# `Node(..)` is a distinct key), so this is a pyrst-only golden, NOT a python3
+# dual-run. Sorted-key iteration of class keys is lexicographic by field
+# DECLARATION order ((id, name) here) — the order the derived Ord compares.
+
+class Node:
+    id: int
+    name: str
+    def __init__(self, id: int, name: str) -> None:
+        self.id = id
+        self.name = name
+
+
+def main() -> None:
+    # dict[Node, int]: insert / update / lookup / len / membership
+    weight: dict[Node, int] = {}
+    weight[Node(2, "b")] = 20
+    weight[Node(1, "a")] = 10
+    weight[Node(1, "a")] = 15          # update: same structural key
+    print(len(weight))                 # 2
+    print(weight[Node(1, "a")])        # 15
+    print(Node(2, "b") in weight)      # True
+    print(Node(9, "z") in weight)      # False
+
+    # sorted-key iteration (lexicographic by (id, name))
+    for n in weight:
+        print(n.id, n.name, weight[n])
+
+    # set[Node]: structural dedup
+    seen: set[Node] = set()
+    seen.add(Node(1, "a"))
+    seen.add(Node(1, "a"))
+    seen.add(Node(3, "c"))
+    print(len(seen))                   # 2
+
+    # graphlib-shaped: adjacency dict[Node, list[Node]] (nodes as keys)
+    a: Node = Node(1, "a")
+    b: Node = Node(2, "b")
+    c: Node = Node(3, "c")
+    graph: dict[Node, list[Node]] = {}
+    graph[a] = [b, c]
+    graph[b] = [c]
+    graph[c] = []
+    total_edges: int = 0
+    for src in graph:
+        total_edges = total_edges + len(graph[src])
+    print(total_edges)                 # 3
+    print(len(graph[a]))               # 2
+    print(a in graph)                  # True

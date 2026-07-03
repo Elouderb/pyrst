@@ -1,0 +1,12 @@
+# NEGATIVE (enabler-fix-1 #1): ordering-comparing a user class WITHOUT __lt__ is a
+# check error — CPython raises `TypeError: '<' not supported between instances`.
+# A class used as a dict KEY derives Ord from field order (codegen), but that must
+# NOT make it `<`-comparable; the honest gate is a real __lt__.
+class Node:
+    a: int
+    b: int
+
+def main() -> None:
+    d: dict[Node, int] = {}
+    d[Node(1, 2)] = 5
+    print(Node(1, 2) < Node(2, 1))

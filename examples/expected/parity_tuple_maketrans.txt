@@ -1,0 +1,4 @@
+3
+2
+zxyyxge
+ValueError: the first two maketrans arguments must have equal length

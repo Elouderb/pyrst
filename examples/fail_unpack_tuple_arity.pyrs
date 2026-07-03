@@ -1,0 +1,8 @@
+# (enabler-fix-2 #2) Unpacking a statically-known 3-tuple into 2 names is a
+# check-time error (CPython raises ValueError at runtime; pyrst knows the arity
+# statically). Rejected at BOTH `pyrst check` and `pyrst build`.
+def main() -> None:
+    a: str = ""
+    b: str = ""
+    a, b = "x=y=z".partition("=")
+    print(a + b)

@@ -1,0 +1,7 @@
+# (enabler-fix-2 #2) Membership `in` over a tuple is unsupported — a Rust tuple
+# has no `.contains`. Test against a list instead. Rejected at BOTH
+# `pyrst check` and `pyrst build`.
+def main() -> None:
+    t: tuple[str, str, str] = "a=b".partition("=")
+    if "a" in t:
+        print("found")

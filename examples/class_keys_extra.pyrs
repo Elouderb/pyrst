@@ -1,0 +1,32 @@
+# (enabler-fix-2 #1a/#1c) User classes as dict keys — TRANSITIVE (a key class
+# with a user-class FIELD: the nested class also derives Eq/Hash/Ord) and
+# ANNOTATION-LESS (a dict literal keyed by constructor calls, no annotation).
+# pyrst uses STRUCTURAL value-equality for class keys (Node(1) == Node(1)), which
+# diverges from CPython's reference identity, so this is a pyrst golden, not a
+# python3 dual-run. See PYTHON_COMPATIBILITY.md.
+class Inner:
+    x: int
+    def __init__(self, x: int) -> None:
+        self.x = x
+
+class Outer:
+    inner: Inner
+    tag: str
+    def __init__(self, inner: Inner, tag: str) -> None:
+        self.inner = inner
+        self.tag = tag
+
+class Node:
+    id: int
+    def __init__(self, id: int) -> None:
+        self.id = id
+
+def main() -> None:
+    d: dict[Outer, int] = {}
+    d[Outer(Inner(1), "a")] = 10
+    d[Outer(Inner(2), "b")] = 20
+    print(len(d))
+    print(d[Outer(Inner(1), "a")])
+    counts = {Node(1): "one", Node(2): "two", Node(1): "dup"}
+    print(len(counts))
+    print(counts[Node(2)])

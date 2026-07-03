@@ -507,10 +507,11 @@ use super::test_support::*;
 
     #[test]
     fn method_ret_str_partition() {
-        // partition is modelled as list[str] (not a tuple), per the source comment.
+        // (card 49170944) partition/rpartition now return a 3-TUPLE (str,str,str)
+        // — CPython's real shape — so `a, sep, b = s.partition("=")` unpacks.
         assert_eq!(
             builtin_method_ret(&Ty::Str, "partition"),
-            Ty::List(Box::new(Ty::Str))
+            Ty::Tuple(vec![Ty::Str, Ty::Str, Ty::Str])
         );
     }
 
@@ -518,6 +519,16 @@ use super::test_support::*;
     fn method_ret_str_rpartition() {
         assert_eq!(
             builtin_method_ret(&Ty::Str, "rpartition"),
+            Ty::Tuple(vec![Ty::Str, Ty::Str, Ty::Str])
+        );
+    }
+
+    #[test]
+    fn method_ret_str_casefold_and_rsplit() {
+        // (card 49170944) casefold -> str; rsplit -> list[str].
+        assert_eq!(builtin_method_ret(&Ty::Str, "casefold"), Ty::Str);
+        assert_eq!(
+            builtin_method_ret(&Ty::Str, "rsplit"),
             Ty::List(Box::new(Ty::Str))
         );
     }
@@ -1676,7 +1687,7 @@ use super::test_support::*;
     /// them back here without wiring codegen they will hit this test first.
     #[test]
     fn removed_unemittable_methods_absent_from_str_table() {
-        let unemittable = ["casefold", "encode", "isdecimal", "rsplit", "format"];
+        let unemittable = ["encode", "isdecimal", "format"];
         for m in &unemittable {
             assert!(
                 !STR_METHODS.contains(m),
@@ -1703,7 +1714,7 @@ use super::test_support::*;
     /// check runs before builtin_method_ret, so Unknown is the right sentinel.
     #[test]
     fn removed_str_methods_return_unknown_from_builtin_method_ret() {
-        let unemittable = ["casefold", "encode", "isdecimal", "rsplit", "format"];
+        let unemittable = ["encode", "isdecimal", "format"];
         for m in &unemittable {
             assert_eq!(
                 builtin_method_ret(&Ty::Str, m),

@@ -1,0 +1,8 @@
+@totally_made_up
+class Foo:
+    x: int
+    def __init__(self, x: int) -> None:
+        self.x = x
+
+def main() -> None:
+    print(Foo(1).x)

@@ -331,6 +331,27 @@ pub struct TyCtx {
     /// name stays in this set — the resolver already errors on stdlib collisions,
     /// and a root-program shadow keeps the (stricter) positional-only behavior.
     pub builtin_funcs: std::collections::HashSet<String>,
+    /// (card e131f8b0) Class names used ANYWHERE in the program as a `dict` KEY or
+    /// a `set` ELEMENT (`dict[Node, _]`, `set[Node]`, incl. nested inside
+    /// list/tuple/Optional and in field / param / return / local annotations).
+    /// A concrete user class in such a position needs `#[derive(Eq, Hash)]` (and
+    /// `Ord` for the sorted-key iteration pyrst dicts/sets do) — codegen adds those
+    /// derives for a class in this set (see `Codegen::emit_class`), and `check`
+    /// requires every such class to be hashable (`class_hash_eligible`) or reports
+    /// an honest error naming the offending field. Populated by the resolver
+    /// (`collect_hash_key_classes`); empty for programs that never key on a class,
+    /// so their emission is byte-for-byte unchanged.
+    pub hash_key_classes: std::collections::HashSet<String>,
+    /// (enabler-fix-1 #3) Class-level CONSTANTS promoted to associated Rust `const`s
+    /// (enum members): DEFINING-class name -> its OWN field names that are promoted.
+    /// A field promotes iff it has a literal default, its class is not a `@dataclass`,
+    /// it is READ somewhere as `ClassName.FIELD` (class-name receiver — the "usage
+    /// gate"), and it is NEVER written (no `self.FIELD=` in the class or a subclass,
+    /// no `ClassName.FIELD=`, and not an instance field of an instantiated class that
+    /// is externally written). Computed once over the whole program by the resolver
+    /// (`collect_promoted_consts`), so typeck and codegen share ONE decision. Empty
+    /// for programs without enum-style class constants (emission byte-for-byte same).
+    pub promoted_consts: std::collections::HashMap<String, std::collections::HashSet<String>>,
 }
 
 impl TyCtx {
@@ -445,7 +466,43 @@ impl TyCtx {
         // function is merged in, so the keyword→positional mapper can tell a
         // real user signature from a builtin stub (see `builtin_funcs` docs).
         let builtin_funcs: std::collections::HashSet<String> = funcs.keys().cloned().collect();
-        Self { funcs, classes: HashMap::new(), vars, module_funcs: HashMap::new(), module_consts: HashMap::new(), generic_funcs: HashMap::new(), generic_func_bodies: HashMap::new(), generic_classes: HashMap::new(), builtin_funcs }
+        Self { funcs, classes: HashMap::new(), vars, module_funcs: HashMap::new(), module_consts: HashMap::new(), generic_funcs: HashMap::new(), generic_func_bodies: HashMap::new(), generic_classes: HashMap::new(), builtin_funcs, hash_key_classes: std::collections::HashSet::new(), promoted_consts: std::collections::HashMap::new() }
+    }
+
+    /// (enabler-fix-1 #3) The class that DECLARES `field` as an own field, walking
+    /// `cname`'s base chain (inclusive, bases-nearest-first). Used to resolve an
+    /// inherited class-constant access (`Sub.KIND` -> `Base`) and to key the shared
+    /// promotion decision by the field's defining class.
+    pub fn defining_class(&self, cname: &str, field: &str) -> Option<String> {
+        let mut stack = vec![cname.to_string()];
+        let mut seen = std::collections::HashSet::new();
+        while let Some(c) = stack.pop() {
+            if !seen.insert(c.clone()) {
+                continue;
+            }
+            if let Some(cd) = self.classes.get(&c) {
+                if cd.fields.iter().any(|f| f.name == field) {
+                    return Some(c);
+                }
+                for b in &cd.bases {
+                    stack.push(b.clone());
+                }
+            }
+        }
+        None
+    }
+
+    /// (enabler-fix-1 #3) THE shared class-constant-promotion predicate: whether
+    /// `cname.field` (possibly inherited) lowers to an associated `const` rather than
+    /// an instance struct field. Resolves `field` to its defining class, then
+    /// consults the whole-program-computed `promoted_consts`. Both typeck (ctor-sig /
+    /// mutation gating, `ClassName.FIELD` typing) and codegen (struct-field exclusion,
+    /// const emission, `ClassName::FIELD` access) call this — one source of truth.
+    pub fn is_promoted_const(&self, cname: &str, field: &str) -> bool {
+        match self.defining_class(cname, field) {
+            Some(d) => self.promoted_consts.get(&d).is_some_and(|s| s.contains(field)),
+            None => false,
+        }
     }
 
     pub fn get_all_fields(&self, class_name: &str) -> Vec<crate::ast::Param> {

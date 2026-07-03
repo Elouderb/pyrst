@@ -1,0 +1,26 @@
+# DUAL-RUN parity (W2 card 04c830ff): scientific-notation float literals
+# (1e-5, 2.5E3, 1e+3, 1E10, leading-dot .5e3, underscore 1_0e2) must lex to the
+# same f64 values CPython produces AND str()/print round-trip byte-identically
+# (str==repr for floats in Py3, incl. the sci-notation thresholds this exercises).
+def main() -> None:
+    print(1e5)
+    print(1e10)
+    print(1E10)
+    print(1e-5)
+    print(1e+3)
+    print(2.5e3)
+    print(2.5E3)
+    print(.5e3)
+    print(1_0e2)
+    print(1e1_0)
+    print(1.5e-3)
+    # large/small magnitudes cross the scientific-notation print thresholds.
+    print(1e16)
+    print(1e-4)
+    print(6.022e23)
+    # str() round-trip.
+    print(str(1e-5))
+    print(str(2.5e3))
+    x: float = 1e20
+    print(x)
+    print(x + 1.0)

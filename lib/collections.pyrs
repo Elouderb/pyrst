@@ -75,12 +75,10 @@
 #       left; matches CPython `deque.rotate`.
 #     - `remove(x)` raises `ValueError` if `x` is not present. Message: CPython
 #       3.12's `ValueError("%R is not in deque")` — the missing value's REPR.
-#       KNOWN DIVERGENCE (documented, NOT silent — the value still raises): a
-#       generic `T` element lowers its `repr` to Display formatting, so a STR
-#       element prints UNQUOTED here ("zz is not in deque" vs CPython's "'zz' is
-#       not in deque"); int/float/bool messages are byte-exact. The real
-#       generic-repr fix (quoting str via `%r`) is tracked by card 09152b3a — it
-#       is deliberately NOT faked here.
+#       BYTE-EXACT for every element type: `repr(x)` of a generic `T` now routes
+#       through the `PyRepr` trait (W2 card 09152b3a), so a STR element quotes
+#       CPython-style ("'zz' is not in deque"), matching int/float/bool. The old
+#       generic-repr→Display gap (unquoted str) is fixed.
 #   - `defaultdict[K, V]` → dict that materialises a missing key's value from a
 #     zero-arg `default_factory: Callable[[], V]` on `get`. NOT a `dict`
 #     subclass (no generic-class subclassing); the useful operations are
@@ -409,11 +407,10 @@ class deque[T]:
         # `deque.remove` raises ValueError("%R is not in deque" % value) —
         # the value's REPR followed by " is not in deque" (python3-verified;
         # the pre-3.12 "deque.remove(x): x not in deque" spelling is gone).
-        # KNOWN EDGE: `repr` of a GENERIC `T` lowers to Display formatting,
-        # so a `str` element prints UNQUOTED here ("zz is not in deque" vs
-        # CPython's "'zz' is not in deque") — exact for int/float/bool
-        # elements, quote-less for str (compiler-level generic-repr gap,
-        # documented not silent). O(n), same as CPython's own scan.
+        # BYTE-EXACT for every element type incl. str: `repr(x)` of a generic
+        # `T` routes through the `PyRepr` trait (W2 card 09152b3a), so a str
+        # element quotes CPython-style ("'zz' is not in deque"). O(n), same as
+        # CPython's own scan.
         xs: list[T] = self.to_list()
         i: int = 0
         while i < len(xs):

@@ -1,0 +1,9 @@
+class FP:
+    x: float
+    def __init__(self, x: float) -> None:
+        self.x = x
+
+def main() -> None:
+    d: dict[FP, int] = {}
+    d[FP(1.0)] = 5
+    print(len(d))

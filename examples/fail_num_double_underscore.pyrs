@@ -1,0 +1,6 @@
+# W2 card 474eabae: an underscore separator must sit strictly BETWEEN digits, so
+# a doubled underscore (`1__000`) is a CPython SyntaxError. pyrst rejects it at
+# LEX time. Rejected by BOTH `pyrst check` and `pyrst build`.
+def main() -> None:
+    x: int = 1__000
+    print(x)

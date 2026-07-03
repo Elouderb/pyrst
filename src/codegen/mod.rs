@@ -430,6 +430,116 @@ fn try_fold_const(expr: &Expr) -> Option<Expr> {
     None
 }
 
+/// CPython-parity `str`/`repr`/`print` rendering of an `f64`. Emitted once in
+/// the preamble (before REPR_PRELUDE, whose `PyRepr for f64` delegates here).
+/// See the emission-site comment in `emit_program` for the algorithm.
+const FLOAT_FMT_HELPER: &str = r#"fn __py_fmt_float(x: f64) -> String {
+    if x.is_nan() { return "nan".to_string(); }
+    if x.is_infinite() { return if x < 0.0 { "-inf".to_string() } else { "inf".to_string() }; }
+    let neg = x.is_sign_negative();
+    let mag = x.abs();
+    // Rust's `{:e}` is Ryū SHORTEST, but it breaks an EXACT decimal tie by rounding
+    // the magnitude half-UP, whereas CPython's dtoa rounds half-to-EVEN
+    // (repr(-887777373534812.25) is "-887777373534812.2", not "...812.3"). Rust's
+    // FIXED-precision formatter DOES round half-to-even, so: take the shortest digit
+    // COUNT from `{:e}` (the CPython-shortest length), then RE-EMIT the value at that
+    // length via `{:.*e}` to recover the even tie-break. Re-parse the fixed output's
+    // OWN exponent, since an even-up carry (…95 -> …0 with carry) can shift decpt.
+    // The re-emitted length round-trips: for a non-tie it equals the shortest; for a
+    // tie both candidates round-trip and half-even picks the even one.
+    let short = format!("{:e}", mag);
+    let short_mant = short.split_once('e').map(|(m, _)| m).unwrap_or(&short);
+    let ndig = short_mant.bytes().filter(|&c| c != b'.').count().max(1);
+    let e = format!("{:.*e}", ndig - 1, mag);
+    let (mant, exp_s) = e.split_once('e').unwrap();
+    let exp: i32 = exp_s.parse().unwrap();
+    let digits: String = mant.chars().filter(|&c| c != '.').collect();
+    let decpt = exp + 1;
+    let ndigits = digits.len() as i32;
+    let use_exp = decpt <= -4 || decpt > 16;
+    let mut out = String::new();
+    if neg { out.push('-'); }
+    if use_exp {
+        out.push_str(&digits[..1]);
+        if ndigits > 1 { out.push('.'); out.push_str(&digits[1..]); }
+        let e2 = decpt - 1;
+        out.push('e');
+        if e2 < 0 { out.push('-'); } else { out.push('+'); }
+        let ea = e2.abs();
+        if ea < 10 { out.push('0'); }
+        out.push_str(&ea.to_string());
+    } else if decpt <= 0 {
+        out.push_str("0.");
+        for _ in 0..(-decpt) { out.push('0'); }
+        out.push_str(&digits);
+    } else if decpt >= ndigits {
+        out.push_str(&digits);
+        for _ in 0..(decpt - ndigits) { out.push('0'); }
+        out.push_str(".0");
+    } else {
+        out.push_str(&digits[..decpt as usize]);
+        out.push('.');
+        out.push_str(&digits[decpt as usize..]);
+    }
+    out
+}
+"#;
+
+/// CPython-parity `repr`/`ascii` of a `str`, sharing ONE quote-choice + escape
+/// engine (`__py_str_escape`). Quote matrix (the `%r` rule): default single
+/// quotes, switch to double iff the string has a `'` and no `"` (so
+/// `repr("it's") == "\"it's\""`); always escape backslash + the chosen quote; map
+/// `\n`/`\t`/`\r`.
+///
+/// `repr` (`ascii_only=false`) escapes every char CPython treats as
+/// NON-PRINTABLE that this engine covers: ASCII controls (`< 0x20`, `0x7f`), the
+/// C1 controls (`U+0080..=U+009F`), and the common format/invisible code points
+/// (`U+00AD`; `U+200B..=U+200F`; `U+2028..=U+202E`; `U+FEFF`) — as `\xXX`
+/// (`<=0xff`), `\uXXXX` (`<=0xffff`), or `\UXXXXXXXX`. DOCUMENTED GAP: the exotic
+/// Cf/Cn categories outside those ranges are still passed through rather than
+/// `\u`-escaped (the full Unicode "printable" table is out of scope) — see
+/// PYTHON_COMPATIBILITY.md. `ascii` (`ascii_only=true`) additionally escapes
+/// EVERY non-ASCII char (`>= 0x80`), which is exactly `ascii()`'s contract.
+const STR_REPR_HELPER: &str = r#"fn __py_repr_should_escape(u: u32) -> bool {
+    u < 0x20 || u == 0x7f
+        || (0x80..=0x9f).contains(&u)
+        || u == 0xad
+        || (0x200b..=0x200f).contains(&u)
+        || (0x2028..=0x202e).contains(&u)
+        || u == 0xfeff
+}
+fn __py_char_escape(u: u32) -> String {
+    if u <= 0xff { format!("\\x{:02x}", u) }
+    else if u <= 0xffff { format!("\\u{:04x}", u) }
+    else { format!("\\U{:08x}", u) }
+}
+fn __py_str_escape(s: &str, ascii_only: bool) -> String {
+    let has_single = s.contains('\'');
+    let has_double = s.contains('"');
+    let quote = if has_single && !has_double { '"' } else { '\'' };
+    let mut out = String::new();
+    out.push(quote);
+    for c in s.chars() {
+        let u = c as u32;
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            c if c == quote => { out.push('\\'); out.push(c); }
+            _ if (ascii_only && u >= 0x80) || __py_repr_should_escape(u) => {
+                out.push_str(&__py_char_escape(u));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push(quote);
+    out
+}
+fn __py_str_repr(s: &str) -> String { __py_str_escape(s, false) }
+fn __py_ascii(s: &str) -> String { __py_str_escape(s, true) }
+"#;
+
 /// Prelude implementing CPython-style `repr` for collections, used by
 /// print()/str()/f-strings so `print([1, 2, 3])` yields `[1, 2, 3]` — str
 /// elements quoted, bools as True/False, floats via __py_fmt_float, nested
@@ -441,28 +551,21 @@ const REPR_PRELUDE: &str = r#"trait PyRepr { fn py_repr(&self) -> String; }
 impl PyRepr for i64 { fn py_repr(&self) -> String { format!("{}", self) } }
 impl PyRepr for f64 { fn py_repr(&self) -> String { __py_fmt_float(*self) } }
 impl PyRepr for bool { fn py_repr(&self) -> String { __py_fmt_bool(*self) } }
-impl PyRepr for String {
-    fn py_repr(&self) -> String {
-        let mut s = String::from("'");
-        for c in self.chars() {
-            match c {
-                '\\' => s.push_str("\\\\"),
-                '\'' => s.push_str("\\'"),
-                '\n' => s.push_str("\\n"),
-                '\t' => s.push_str("\\t"),
-                '\r' => s.push_str("\\r"),
-                _ => s.push(c),
-            }
-        }
-        s.push('\'');
-        s
-    }
-}
+impl PyRepr for String { fn py_repr(&self) -> String { __py_str_repr(self) } }
+impl PyRepr for str { fn py_repr(&self) -> String { __py_str_repr(self) } }
 impl<T: PyRepr> PyRepr for Vec<T> {
     fn py_repr(&self) -> String {
         let xs: Vec<String> = self.iter().map(|x| x.py_repr()).collect();
         format!("[{}]", xs.join(", "))
     }
+}
+impl<T: PyRepr> PyRepr for Option<T> {
+    fn py_repr(&self) -> String {
+        match self { Some(x) => x.py_repr(), None => "None".to_string() }
+    }
+}
+impl<T: PyRepr> PyRepr for ::std::boxed::Box<T> {
+    fn py_repr(&self) -> String { (**self).py_repr() }
 }
 impl<T: PyRepr> PyRepr for std::collections::HashSet<T> {
     fn py_repr(&self) -> String {
@@ -671,9 +774,16 @@ pub fn emit_program(modules: &[(Module, String)], ctx: &TyCtx) -> Result<String>
     cg.line("#![allow(unused_parens, unused_variables, unused_mut, dead_code, unused_imports, non_upper_case_globals, non_camel_case_types, unreachable_code, unused_assignments)]");
     cg.line("use std::io::Write;");
     cg.line("");
-    cg.line("fn __py_fmt_float(x: f64) -> String {");
-    cg.line("    if x.fract() == 0.0 { format!(\"{:.1}\", x) } else { format!(\"{}\", x) }");
-    cg.line("}");
+    // CPython-parity float formatting (str==repr for floats in Python 3). Uses
+    // the shortest round-tripping digit string + decimal exponent that Rust's
+    // `{:e}` already computes (Grisu/Ryū), then applies CPython's
+    // `format_float_short('r')` presentation rules: exponential iff
+    // `decpt <= -4 || decpt > 16`, a trailing `.0` on integral values, a
+    // sign-and-≥2-digit exponent, and `inf`/`-inf`/`nan` specials. This makes
+    // `str(1e16)`/`repr(1.0)`/`print(1e-5)` all byte-identical to python3
+    // (validated against a broad magnitude battery), replacing the old
+    // `{:.1}`-or-`{}` form that never emitted scientific notation.
+    cg.line(FLOAT_FMT_HELPER);
     cg.line("fn __py_fmt_bool(x: bool) -> String {");
     cg.line("    if x { \"True\".to_string() } else { \"False\".to_string() }");
     cg.line("}");
@@ -708,6 +818,17 @@ pub fn emit_program(modules: &[(Module, String)], ctx: &TyCtx) -> Result<String>
     cg.line("fn __py_ipow(base: i64, exp: i64) -> i64 {");
     cg.line("    if exp < 0 { panic!(\"ValueError\\0negative exponent for integer ** integer\"); }");
     cg.line("    base.pow(exp as u32)");
+    cg.line("}");
+    // List-unpacking length check (`a, b = xs` where xs is a list). Panics with
+    // CPython 3.12's EXACT ValueError text — "not enough values to unpack
+    // (expected N, got G)" when short, "too many values to unpack (expected N)"
+    // when long — via the catchable `ValueError\0..` payload the try/except
+    // dispatcher matches. Returns the validated Vec so callers index each target.
+    cg.line("fn __py_unpack_list<T>(v: Vec<T>, n: usize) -> Vec<T> {");
+    cg.line("    let got = v.len();");
+    cg.line("    if got < n { panic!(\"ValueError\\0not enough values to unpack (expected {}, got {})\", n, got); }");
+    cg.line("    if got > n { panic!(\"ValueError\\0too many values to unpack (expected {})\", n); }");
+    cg.line("    v");
     cg.line("}");
     // List index/slice reads. The BASE is passed by shared reference (`&[T]`) so
     // only the returned ELEMENT is cloned — an indexed loop is O(n) instead of
@@ -778,6 +899,7 @@ pub fn emit_program(modules: &[(Module, String)], ctx: &TyCtx) -> Result<String>
     // return value, `Break`/`Continue` re-target the loop enclosing the try, and
     // `Normal` means the body fell through (so `else` runs). See `emit_try`.
     cg.line("enum __PyrstTryFlow<R> { Normal, Return(R), Break, Continue }");
+    cg.line(STR_REPR_HELPER);
     cg.line(REPR_PRELUDE);
     cg.line(TITLECASE_PRELUDE);
     cg.line(FILE_PRELUDE);

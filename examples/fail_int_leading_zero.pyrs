@@ -1,0 +1,6 @@
+# W2 card 474eabae: a nonzero DECIMAL integer with a leading zero (`08`) is a
+# CPython SyntaxError (leading zeros are reserved for the 0o octal form). pyrst
+# rejects it at LEX time. Rejected by BOTH `pyrst check` and `pyrst build`.
+def main() -> None:
+    x: int = 08
+    print(x)

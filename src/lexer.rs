@@ -164,6 +164,150 @@ fn fmt_byte(b: u8) -> String {
     }
 }
 
+/// Lex a numeric literal starting at `bytes[i]` — a decimal digit, or a `.`
+/// immediately followed by a digit (the leading-dot float `.5`). Returns the
+/// token and the index just past it.
+///
+/// Implements CPython's numeric-literal grammar (every accept/reject below
+/// python3-diffed): base prefixes `0x`/`0o`/`0b` (case-insensitive) parsed as
+/// i64; underscore separators allowed STRICTLY between two base digits (plus one
+/// optional `_` right after a base prefix, `0x_FF`) and an error anywhere else
+/// (`1__0`, `1000_`, `1e_5`, `0xFF_`); a nonzero DECIMAL leading zero rejected
+/// (`007`/`08`) while all-zero (`0`, `00`, `0_0`) is allowed; fractions and
+/// `e`/`E` exponents with an optional sign and REQUIRED digits (`1e`, `1e+` are
+/// errors). Trailing-dot (`1.`) is deliberately NOT consumed as a float — it
+/// stays int + `.` so a digit-started token followed by `.` then a non-digit can
+/// never silently change meaning; the (rare) dot-then-exponent `1.e3` is thus an
+/// honest downstream parse error rather than a silent miscompile. Values are
+/// i64/f64; anything out of that range is an honest Lex error.
+fn lex_number(bytes: &[u8], i: usize, line: u32, col: u32) -> Result<(Tok, usize)> {
+    let len = bytes.len();
+    let lex_err = |end: usize, msg: &str| Error::Lex {
+        span: Span::new(i, end, line, col),
+        msg: msg.into(),
+    };
+    // Consume `digit (_ digit | digit)*` for `is_d`: an underscore advances ONLY
+    // when the next byte is a valid digit, so it is never leading, trailing, or
+    // doubled. Returns (end_index, digit_count).
+    fn scan<F: Fn(u8) -> bool>(bytes: &[u8], start: usize, is_d: F) -> (usize, usize) {
+        let len = bytes.len();
+        if start >= len || !is_d(bytes[start]) {
+            return (start, 0);
+        }
+        let mut j = start;
+        let mut count = 0usize;
+        loop {
+            if j < len && is_d(bytes[j]) {
+                count += 1;
+                j += 1;
+            } else if j + 1 < len && bytes[j] == b'_' && is_d(bytes[j + 1]) {
+                j += 1;
+            } else {
+                break;
+            }
+        }
+        (j, count)
+    }
+
+    // --- base-prefixed integer: 0x / 0o / 0b (case-insensitive) ---
+    if bytes[i] == b'0' && i + 1 < len && matches!(bytes[i + 1], b'x' | b'X' | b'o' | b'O' | b'b' | b'B') {
+        let (radix, name): (u32, &str) = match bytes[i + 1] {
+            b'x' | b'X' => (16, "hexadecimal"),
+            b'o' | b'O' => (8, "octal"),
+            _ => (2, "binary"),
+        };
+        let is_d = move |b: u8| match radix {
+            16 => b.is_ascii_hexdigit(),
+            8 => (b'0'..=b'7').contains(&b),
+            _ => b == b'0' || b == b'1',
+        };
+        let mut j = i + 2;
+        // One optional underscore is permitted directly after the base prefix.
+        if j < len && bytes[j] == b'_' {
+            j += 1;
+        }
+        let (j2, cnt) = scan(bytes, j, &is_d);
+        j = j2;
+        if cnt == 0 {
+            return Err(lex_err(j, &format!("invalid {} integer literal", name)));
+        }
+        if j < len && bytes[j] == b'_' {
+            return Err(lex_err(j + 1, &format!("invalid {} integer literal: trailing underscore", name)));
+        }
+        let cleaned: String = bytes[(i + 2)..j]
+            .iter()
+            .filter(|&&b| b != b'_')
+            .map(|&b| b as char)
+            .collect();
+        let value = i64::from_str_radix(&cleaned, radix)
+            .map_err(|_| lex_err(j, "integer literal out of range"))?;
+        return Ok((Tok::Int(value), j));
+    }
+
+    // --- decimal integer or float ---
+    let mut j = i;
+    let mut is_float = false;
+    // Integer part (empty only for the leading-dot form, where bytes[i] == '.').
+    let (j2, _int_cnt) = scan(bytes, j, |b| b.is_ascii_digit());
+    j = j2;
+    if j < len && bytes[j] == b'_' {
+        return Err(lex_err(j + 1, "invalid decimal literal: misplaced underscore"));
+    }
+    // A '.' immediately followed by '_' is a malformed numeric literal (CPython
+    // rejects `1._5`). pyrst has no `<int-literal>._attr` form, so reject it
+    // honestly here instead of lexing `1` + `.` + `_5` (attribute access that
+    // would silently build-fail).
+    if j < len && bytes[j] == b'.' && j + 1 < len && bytes[j + 1] == b'_' {
+        return Err(lex_err(j + 2, "invalid decimal literal: misplaced underscore"));
+    }
+    // Fraction: a '.' consumed only when a digit follows it (leading-dot `.5`
+    // also lands here with an empty integer part). Trailing-dot is left alone.
+    if j < len && bytes[j] == b'.' && j + 1 < len && bytes[j + 1].is_ascii_digit() {
+        is_float = true;
+        j += 1;
+        let (j3, _frac) = scan(bytes, j, |b| b.is_ascii_digit());
+        j = j3;
+        if j < len && bytes[j] == b'_' {
+            return Err(lex_err(j + 1, "invalid decimal literal: misplaced underscore"));
+        }
+    }
+    // Exponent: (e|E) [+|-] digits — the digits are REQUIRED.
+    if j < len && (bytes[j] == b'e' || bytes[j] == b'E') {
+        let mut k = j + 1;
+        if k < len && (bytes[k] == b'+' || bytes[k] == b'-') {
+            k += 1;
+        }
+        if k < len && bytes[k].is_ascii_digit() {
+            is_float = true;
+            let (j4, _exp) = scan(bytes, k, |b| b.is_ascii_digit());
+            j = j4;
+            if j < len && bytes[j] == b'_' {
+                return Err(lex_err(j + 1, "invalid decimal literal: misplaced underscore"));
+            }
+        } else {
+            return Err(lex_err(k, "invalid float literal: exponent has no digits"));
+        }
+    }
+
+    let cleaned: String = bytes[i..j]
+        .iter()
+        .filter(|&&b| b != b'_')
+        .map(|&b| b as char)
+        .collect();
+    if is_float {
+        let v = cleaned.parse::<f64>().map_err(|_| lex_err(j, "invalid float literal"))?;
+        Ok((Tok::Float(v), j))
+    } else {
+        // CPython forbids a nonzero decimal with a leading zero (`007`, `08`), but
+        // allows an all-zero run (`0`, `00`, `0_0`).
+        if cleaned.len() > 1 && cleaned.starts_with('0') && cleaned.bytes().any(|b| b != b'0') {
+            return Err(lex_err(j, "invalid decimal literal: leading zeros are not permitted (use 0o for octal)"));
+        }
+        let v = cleaned.parse::<i64>().map_err(|_| lex_err(j, "integer literal out of range"))?;
+        Ok((Tok::Int(v), j))
+    }
+}
+
 pub fn lex(src: &str) -> Result<Vec<Token>> {
     let bytes = src.as_bytes();
     let mut tokens: Vec<Token> = Vec::new();
@@ -491,34 +635,15 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
             continue;
         }
 
-        // Number
-        if c.is_ascii_digit() {
-            let mut j = i;
-            while j < bytes.len() && bytes[j].is_ascii_digit() {
-                j += 1;
-            }
-            let mut is_float = false;
-            if j < bytes.len() && bytes[j] == b'.'
-                && j + 1 < bytes.len() && bytes[j + 1].is_ascii_digit()
-            {
-                is_float = true;
-                j += 1;
-                while j < bytes.len() && bytes[j].is_ascii_digit() {
-                    j += 1;
-                }
-            }
-            let text = std::str::from_utf8(&bytes[i..j]).unwrap();
-            let tok = if is_float {
-                Tok::Float(text.parse().map_err(|_| Error::Lex {
-                    span: Span::new(i, j, line, col),
-                    msg: "invalid float literal".into(),
-                })?)
-            } else {
-                Tok::Int(text.parse().map_err(|_| Error::Lex {
-                    span: Span::new(i, j, line, col),
-                    msg: "integer literal out of range".into(),
-                })?)
-            };
+        // Number — decimal / hex / octal / binary ints (with `_` separators),
+        // floats, scientific notation, and the leading-dot float `.5`. The `.`
+        // case is intercepted HERE (before the Dot operator below) only when a
+        // digit follows, so ordinary attribute access `obj.attr` is untouched.
+        // The full CPython numeric grammar lives in `lex_number`.
+        if c.is_ascii_digit()
+            || (c == b'.' && i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit())
+        {
+            let (tok, j) = lex_number(bytes, i, line, col)?;
             tokens.push(Token { tok, span: Span::new(i, j, line, col) });
             i = j;
             continue;

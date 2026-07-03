@@ -1,0 +1,69 @@
+# DUAL-RUN parity (W2 card 30e4fdd0 part b): self-referential class fields.
+#   - A `next: Optional[Node]` INLINE self-reference lowers to `Option<Box<Node>>`
+#     (Box breaks the E0072 infinite-size cycle); codegen box/unboxes at the field
+#     boundary so the type system's Box-blind `Optional[Node]` view stays consistent.
+#   - A `kids: list[Node]` tree needs NO boxing (the Vec is already indirection).
+#
+# VALUE-SEMANTICS NOTE (documented divergence): pyrst has VALUE semantics, so
+# `a.next = b` stores a DEEP CLONE of `b` at assignment time (`Box<Node>: Clone`
+# clones the pointee). Build a linked list TAIL-FIRST / immutably (below) so no
+# post-assignment aliasing is needed — then pyrst matches CPython exactly. The
+# head-first-then-mutate idiom (`a.next = b; b.next = c`) DIVERGES: pyrst's clone
+# does not see the later `b.next = c`, CPython's reference does. See
+# PYTHON_COMPATIBILITY.md.
+
+class Node:
+    val: int
+    next: Optional[Node]
+    def __init__(self, val: int) -> None:
+        self.val = val
+        self.next = None
+
+
+def cons(val: int, rest: Optional[Node]) -> Node:
+    n: Node = Node(val)
+    n.next = rest              # Some-wrap + Box at the recursive field boundary
+    return n
+
+
+def sum_list(head: Optional[Node]) -> int:
+    if head is not None:
+        return head.val + sum_list(head.next)   # unbox read of `next`
+    return 0
+
+
+def length(head: Optional[Node]) -> int:
+    if head is not None:
+        return 1 + length(head.next)
+    return 0
+
+
+class Tree:
+    val: int
+    kids: list[Tree]
+    def __init__(self, val: int) -> None:
+        self.val = val
+        self.kids = []
+    def add(self, k: Tree) -> None:
+        self.kids.append(k)
+    def total(self) -> int:
+        t: int = self.val
+        for k in self.kids:
+            t = t + k.total()
+        return t
+
+
+def main() -> None:
+    # linked list, built TAIL-FIRST: 10 -> 20 -> 30
+    lst: Node = cons(10, cons(20, cons(30, None)))
+    print(lst.val)              # 10
+    print(sum_list(lst))        # 60
+    print(length(lst))          # 3
+
+    # tree via list-of-children (no boxing needed): add children before the parent
+    root: Tree = Tree(1)
+    left: Tree = Tree(2)
+    left.add(Tree(4))
+    root.add(left)
+    root.add(Tree(3))
+    print(root.total())         # 10

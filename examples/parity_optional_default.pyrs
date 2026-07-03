@@ -1,0 +1,22 @@
+# DUAL-RUN parity (enabler-fix-1 #6): an OMITTED `Optional[T] = <non-None literal>`
+# default is Some-wrapped at the call boundary — for a free function AND a static
+# method — instead of emitting a bare value into an Option<T> slot (was rustc E0308).
+def describe(opt: Optional[int] = 5) -> int:
+    if opt is not None:
+        return opt
+    return 0
+
+class Calc:
+    @staticmethod
+    def scale(x: int, factor: Optional[int] = 3) -> int:
+        if factor is not None:
+            return x * factor
+        return x
+
+def main() -> None:
+    print(describe())
+    print(describe(10))
+    print(describe(None))
+    print(Calc.scale(4))
+    print(Calc.scale(4, 5))
+    print(Calc.scale(4, None))

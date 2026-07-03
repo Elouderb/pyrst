@@ -425,6 +425,25 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
                     }
                 }
             }
+            // (card 03eb4e2c) A class-NAME receiver `ClassName.FIELD` — e.g. an
+            // enum-member const `Color.RED` — types as the field's declared type.
+            // The bare class-name `Ident` otherwise infers to `Unknown` (it is not
+            // a local), which would drop bool/float formatting at a print site
+            // (`print(Flags.ON)` -> "true" instead of "True"). Instance receivers
+            // are handled by the `infer_expr_ty(obj)` path below.
+            if let Expr::Ident(cn, _) = obj.as_ref() {
+                if ctx.classes.contains_key(cn.as_str()) {
+                    // (enabler-fix-1 #3c) Resolve an INHERITED class-constant access
+                    // (`Sub.KIND` where `KIND` is declared on a base) via the base
+                    // chain. The old own-fields-only lookup inferred `Unknown`, so an
+                    // inherited const dropped its bool/float print formatting and
+                    // typed as nothing usable.
+                    let all = ctx.get_all_fields(cn.as_str());
+                    if let Some(f) = all.iter().find(|f| f.name == *name) {
+                        return Ty::from_type_expr(&f.ty, f.span).unwrap_or(Ty::Unknown);
+                    }
+                }
+            }
             // D7: resolve the field inheritance-aware via `get_all_fields`
             // (codegen reads `c.fields` directly and misses inherited fields).
             let recv = infer_expr_ty(obj, locals, ctx);
@@ -445,6 +464,19 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
             Ty::Unknown
         }
         Expr::Call { callee, args, .. } => {
+            // (card 49170944) `str.maketrans(x, y)` is a STATIC str call that builds
+            // an int->int code-point translation table (`dict[int, int]`) for
+            // `s.translate(table)`. Recognized structurally (callee is the attr
+            // `maketrans` on the bare name `str`) so it never depends on how `str`
+            // itself types. The honest subset is the 2-arg equal-length form; the
+            // 3-arg delete form is out of scope (would need dict[int, Optional[int]]).
+            if let Expr::Attr { obj, name, .. } = callee.as_ref() {
+                if name == "maketrans"
+                    && matches!(obj.as_ref(), Expr::Ident(sn, _) if sn == "str")
+                {
+                    return Ty::Dict(Box::new(Ty::Int), Box::new(Ty::Int));
+                }
+            }
             if let Expr::Ident(n, _) = callee.as_ref() {
                 match n.as_str() {
                     "float" => Ty::Float,
@@ -684,6 +716,13 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
             // literal like `[1, 2.0]` is typed `List(Float)`.
             Ty::List(Box::new(infer_list_elem_ty(elems, locals, ctx)))
         }
+        Expr::Tuple(elems, _) => {
+            // Mirror check_expr's tuple arm so this codegen-side oracle knows an
+            // INLINE tuple literal's element types. Without it a bare `(1, "x")`
+            // typed Unknown, so `print`/`str`/`repr` fell to the Display fallback
+            // (a `(f64, String)` build wall) instead of routing through PyRepr.
+            Ty::Tuple(elems.iter().map(|e| infer_expr_ty(e, locals, ctx)).collect())
+        }
         Expr::Dict(pairs, _) => {
             // D6: fold ALL pairs, unifying key types and value types
             // independently (codegen uses the first pair only). On a both-concrete
@@ -846,7 +885,6 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
             let ret = infer_expr_ty(body, &inner, ctx);
             Ty::Func(vec![Ty::Unknown; params.len()], Box::new(ret))
         }
-        _ => Ty::Unknown,
     }
 }
 
@@ -1402,6 +1440,39 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
             }
         }
         Expr::Call { callee, args, kwargs, span } => {
+            // (card 49170944) `str.maketrans(x, y)` STATIC call -> `dict[int, int]`
+            // translation table. Check the two string args, reject kwargs / wrong
+            // arity, then type as the dict. Matched structurally so it is
+            // independent of how the bare name `str` types.
+            if let Expr::Attr { obj, name, .. } = callee.as_ref() {
+                if name == "maketrans"
+                    && matches!(obj.as_ref(), Expr::Ident(sn, _) if sn == "str")
+                {
+                    if !kwargs.is_empty() {
+                        return Err(Error::Type {
+                            span: *span,
+                            msg: "str.maketrans does not take keyword arguments".into(),
+                        });
+                    }
+                    if args.len() != 2 {
+                        return Err(Error::Type {
+                            span: *span,
+                            msg: "str.maketrans(x, y): only the 2-argument (equal-length \
+                                  from/to) form is supported".into(),
+                        });
+                    }
+                    for a in args {
+                        let at = check_expr(a, env)?;
+                        if !matches!(at, Ty::Str) {
+                            return Err(Error::Type {
+                                span: *span,
+                                msg: "str.maketrans(x, y) requires str arguments".into(),
+                            });
+                        }
+                    }
+                    return Ok(Ty::Dict(Box::new(Ty::Int), Box::new(Ty::Int)));
+                }
+            }
             // Generics v2 (generic CLASSES): an EXPLICIT type-argument constructor
             // `Box[int](5)` parses as a CALL whose callee is `Box[int]` — an
             // `Index` of the class name. pyrst infers a generic class's type args
@@ -1436,6 +1507,45 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
             // `pyrst build`, so no keyword argument is ever silently discarded.
             if !kwargs.is_empty() {
                 reject_unmodeled_kwargs(callee.as_ref(), kwargs, env, *span)?;
+            }
+            // (enabler-fix-1 #1) Ordering builtins (`sorted`/`min`/`max`) over
+            // USER-CLASS operands REQUIRE a defined `__lt__` (walking the base
+            // chain) UNLESS a `key=` selects a different sort key. A class used as a
+            // dict KEY silently derives `Ord` from field-declaration order
+            // (codegen/items.rs), and a non-key class leaked a raw rustc E0277 — both
+            // let a program CPython REJECTS (`TypeError: '<' not supported between
+            // instances`) build and RUN. The honest gate is a real `__lt__`,
+            // independent of hash-key status. Uses the non-erroring inference oracle
+            // so a malformed argument still surfaces its own error in the arms below.
+            if let Expr::Ident(bn, _) = callee.as_ref() {
+                if matches!(bn.as_str(), "sorted" | "min" | "max")
+                    && !args.is_empty()
+                    && !kwargs.iter().any(|(k, _)| k == "key")
+                {
+                    let operand_tys: Vec<Ty> = if args.len() == 1 {
+                        match infer_expr_ty(&args[0], &env.locals, env.ctx) {
+                            Ty::List(e) | Ty::Set(e) | Ty::Iterator(e) => vec![*e],
+                            other => vec![other],
+                        }
+                    } else {
+                        args.iter().map(|a| infer_expr_ty(a, &env.locals, env.ctx)).collect()
+                    };
+                    for t in &operand_tys {
+                        if let Ty::Class(cn, _) = t {
+                            if env.ctx.get_method(cn, "__lt__").is_none() {
+                                return Err(Error::Type {
+                                    span: *span,
+                                    msg: format!(
+                                        "`{}` over instances of class `{}` requires a `__lt__` \
+                                         method (Python raises `TypeError: '<' not supported \
+                                         between instances of '{}'`); define `__lt__` or pass `key=`",
+                                        bn, cn, cn
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                }
             }
             // Check if this is a class constructor or function call.
             match callee.as_ref() {
@@ -1473,7 +1583,15 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                         } else if args.is_empty() && kwargs.is_empty() {
                             check_class_instantiation(name, &[], env.ctx, *span)?
                         } else {
-                            let fields = env.ctx.get_all_fields(name.as_str());
+                            // (enabler-fix-1 #3a) EXCLUDE promoted class constants from
+                            // the synthesized ctor signature — they are associated
+                            // `const`s, not instance fields, so counting one as a ctor
+                            // param gave the wrong arity (a check-pass / build-fail).
+                            let fields: Vec<_> = env.ctx
+                                .get_all_fields(name.as_str())
+                                .into_iter()
+                                .filter(|f| !env.ctx.is_promoted_const(name, &f.name))
+                                .collect();
                             let synth = FuncSig {
                                 params: fields
                                     .iter()
@@ -1482,7 +1600,13 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                                     })
                                     .collect(),
                                 ret: Ty::Class(name.to_string(), vec![]),
-                                param_defaults: vec![None; fields.len()],
+                                // (card 6f69d4a3) Honor field DEFAULTS in the
+                                // synthesized (dataclass / no-__init__) constructor
+                                // signature so `Config("localhost")` fills a defaulted
+                                // `port: int = 8080` instead of erroring "missing a
+                                // required argument" — matching CPython's synthesized
+                                // __init__. Was `vec![None; ..]` (all required).
+                                param_defaults: fields.iter().map(|f| f.default.clone()).collect(),
                                 param_by_ref: Vec::new(),
                             };
                             let slots = map_kwargs_to_slots(name, &synth, args.len(), kwargs, *span)?;
@@ -1763,6 +1887,62 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                                     _ => {}
                                 }
                             }
+                            // `repr(instance)` of a user class routes through the
+                            // class's __repr__ (per-class `impl PyRepr`). CPython's
+                            // repr uses __repr__ ONLY — never __str__ — and falls
+                            // back to `<C object at 0x..>` when absent. pyrst has no
+                            // stable object identity to print, so a class WITHOUT a
+                            // __repr__ (in itself or any ancestor) is an HONEST error
+                            // here rather than either silently borrowing __str__
+                            // (wrong output) or a later rustc `PyRepr` build wall.
+                            if name == "repr" {
+                                if let Ty::Class(cn, _) = &arg_ty {
+                                    let mut seen = std::collections::HashSet::new();
+                                    // (card 6f69d4a3) A @dataclass with no user
+                                    // __str__/__repr__ gets a SYNTHESIZED __repr__
+                                    // (`ClassName(field=value)`), so repr() is valid
+                                    // on it — matches the codegen synthesis guard.
+                                    let dataclass_synth_repr = env.ctx.classes.get(cn).is_some_and(|cd| {
+                                        cd.is_dataclass
+                                            && !cd.methods.iter().any(|m| m.name == "__str__" || m.name == "__repr__")
+                                    });
+                                    if !class_defines_repr(env.ctx, cn, &mut seen)
+                                        && !dataclass_synth_repr
+                                    {
+                                        return Err(Error::Type {
+                                            span: *span,
+                                            msg: format!(
+                                                "repr() of `{}` requires a `__repr__` method (pyrst has no default object repr; define __repr__ or use str())",
+                                                cn
+                                            ),
+                                        });
+                                    }
+                                }
+                            }
+                            // (enabler-fix-1 #5a / wf#18) print()/str()/repr()/ascii()
+                            // of a CONTAINER renders every element via `.py_repr()`
+                            // (codegen's PyRepr), so a container whose element class has
+                            // no `__repr__` (nor a synthesized-dataclass repr) leaked
+                            // rustc E0599. Require element reprability at CHECK. A BARE
+                            // class arg is untouched (print/str use its Display/__str__,
+                            // which does not need __repr__).
+                            if matches!(name.as_str(), "print" | "str" | "repr" | "ascii")
+                                && matches!(
+                                    arg_ty,
+                                    Ty::List(_) | Ty::Set(_) | Ty::Dict(..) | Ty::Tuple(_) | Ty::Iterator(_)
+                                )
+                                && !type_is_reprable(env.ctx, &arg_ty)
+                            {
+                                return Err(Error::Type {
+                                    span: *span,
+                                    msg: format!(
+                                        "{}() of this container renders each element via \
+                                         repr(), but an element type has no `__repr__` — \
+                                         define `__repr__` on the element's class",
+                                        name
+                                    ),
+                                });
+                            }
                             // Concrete-only positional arg-type check (skip variadic builtins).
                             // Only fires when BOTH param and arg types are concrete and
                             // incompatible. Int->Float is explicitly allowed (Python coercion).
@@ -1800,6 +1980,11 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                             }
                         }
                         if is_generic {
+                            // (enabler-fix-2 #1b) A user class bound to a Hash-position
+                            // type var that would not otherwise derive Eq/Hash is an
+                            // honest error here — pyrst can't thread the derive through
+                            // a type parameter (was a rustc E0277/E0599 build wall).
+                            reject_class_key_through_generic(name, &arg_tys, env.ctx, *span)?;
                             // Unify the declared (type-var-bearing) params against
                             // the actual argument types: surfaces a conflicting
                             // binding ("conflicting types for type parameter `T`")
@@ -2347,6 +2532,21 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                         &format!("list(g) {} xs", binop_symbol(*op)), *span),
                 });
             }
+            // (enabler-fix-2 #2) Membership over a fixed-shape TUPLE is an honest
+            // CHECK error: a pyrst tuple lowers to a Rust tuple with no `.contains`
+            // (the old emission was a rustc E0599). Direct to a list or destructure,
+            // mirroring the for-in tuple rejection. An empty `Ty::Tuple` is the
+            // unknown-shape placeholder, left permissive.
+            if matches!(op, BinOp::In | BinOp::NotIn)
+                && matches!(&r, Ty::Tuple(tys) if !tys.is_empty())
+            {
+                return Err(Error::Type {
+                    span: *span,
+                    msg: "membership (`in`) over a tuple is not supported — test \
+                          against a list (`x in [a, b, c]`) or destructure the tuple"
+                        .to_string(),
+                });
+            }
             // Generics v2: a SUPPORTED binary operator on two values of the SAME
             // type variable (`T op T`) is now LEGAL — codegen emits the inferred
             // trait bound (`PartialOrd` / `PartialEq` / `Add<Output=T>` / ...) in
@@ -2430,6 +2630,31 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
             if is_set_algebra_op(*op) {
                 if let Some(elem) = set_binop_result_elem(&l, &r) {
                     return Ok(Ty::Set(Box::new(elem)));
+                }
+            }
+            // (enabler-fix-1 #1) An ORDERING comparison (`< <= > >=`) over a
+            // USER-CLASS operand REQUIRES a defined `__lt__` (base chain). Without
+            // it CPython raises `TypeError: '<' not supported between instances`,
+            // yet pyrst accepted `Node(1) < Node(2)` and ran it (a dict-key class
+            // derives `Ord` from field-declaration order in codegen/items.rs; a
+            // non-key class leaked rustc E0277). Independent of hash-key status.
+            // `==`/`!=` are unaffected (structural `PartialEq`); `Optional` operands
+            // were already rejected above (narrow first).
+            if matches!(op, BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge) {
+                for operand in [&l, &r] {
+                    if let Ty::Class(cn, _) = operand {
+                        if env.ctx.get_method(cn, "__lt__").is_none() {
+                            return Err(Error::Type {
+                                span: *span,
+                                msg: format!(
+                                    "class `{}` does not support `<`/`<=`/`>`/`>=` \
+                                     comparison: define a `__lt__` method (Python raises \
+                                     `TypeError: '<' not supported between instances of '{}'`)",
+                                    cn, cn
+                                ),
+                            });
+                        }
+                    }
                 }
             }
             match op {

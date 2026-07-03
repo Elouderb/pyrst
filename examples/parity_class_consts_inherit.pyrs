@@ -1,0 +1,27 @@
+# DUAL-RUN parity (enabler-fix-1 #3): inherited class constants read via a SUBCLASS
+# (Sub.KIND resolves to Base::KIND), the subclass's own const, and a mutable
+# "options with defaults" record whose fields are NEVER read as Options.FIELD and so
+# stay ordinary (externally writable) instance fields — not promoted to consts.
+class Base:
+    KIND: int = 7
+    NAME: str = "base"
+
+class Sub(Base):
+    EXTRA: int = 99
+
+class Options:
+    verbose: bool = False
+    level: int = 1
+
+def main() -> None:
+    print(Sub.KIND)
+    print(Sub.NAME)
+    print(Sub.EXTRA)
+    print(Base.KIND)
+    o: Options = Options()
+    print(o.verbose)
+    print(o.level)
+    o.verbose = True
+    o.level = 5
+    print(o.verbose)
+    print(o.level)

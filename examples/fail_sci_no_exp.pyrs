@@ -1,0 +1,6 @@
+# W2 card 04c830ff: a float exponent must have at least one digit, so a bare
+# `1e` (or `1e+`) is a CPython SyntaxError. pyrst rejects it at LEX time.
+# Rejected by BOTH `pyrst check` and `pyrst build`.
+def main() -> None:
+    x: float = 1e
+    print(x)

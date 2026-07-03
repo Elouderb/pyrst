@@ -1,0 +1,15 @@
+# DUAL-RUN parity (enabler-fix-1 #4): a @dataclass with an Optional[self] field. The
+# auto-ctor boxes the recursive field at construction, and the synthesized __repr__
+# terminates via PyRepr-for-Box (None prints None). Built tail-first (value semantics
+# match CPython for an immutable spine).
+from dataclasses import dataclass
+
+@dataclass
+class Node:
+    val: int
+    next: Optional[Node]
+
+def main() -> None:
+    n: Node = Node(1, Node(2, Node(3, None)))
+    print(n.val)
+    print(repr(n))

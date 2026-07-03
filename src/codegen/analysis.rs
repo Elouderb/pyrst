@@ -728,6 +728,12 @@ impl<'a> Codegen<'a> {
         kwargs: &[(String, Expr)],
         parts: &[String],
         span: crate::diag::Span,
+        // (card e10df981) The receiver's full instance type, e.g.
+        // `Ty::Class("Box", [Int])`. Threaded so the kwargs / default-fill path can
+        // substitute the class's type args into the (type-var-bearing) method
+        // signature — a bare `Ty::Class(cls, [])` (non-generic receiver) leaves the
+        // substitution empty, so every non-generic call is byte-for-byte unchanged.
+        recv_ty: &Ty,
     ) -> Result<String> {
         let sig = self.ctx.get_method(cls, method_name);
         // (kwargs v1, card 8a7b7714) A keyword-bearing OR under-applied
@@ -739,7 +745,18 @@ impl<'a> Codegen<'a> {
         // E0061 — free functions filled trailing defaults, methods never did).
         // typeck already validated the mapping; re-deriving it is deterministic.
         if let Some(sig) = &sig {
-            if !kwargs.is_empty() || args.len() < sig.params.len() {
+            // (card e10df981) A FULLY-APPLIED POSITIONAL call on a GENERIC-CLASS
+            // receiver also needs the slotted path: its raw `parts` (the fall-through
+            // below) are emitted with NO knowledge of the concrete slot type, so a
+            // lambda passed positionally into a `Callable[[T], T]` slot leaks a bare
+            // `T` (E0308/E0425 at build) exactly like the kwargs case. Force the
+            // substituted-`param_tys` emission when the receiver is generic (its type
+            // subst is non-empty) AND some param type still carries a class type var.
+            // Guarded on the receiver being generic, so every NON-generic method call
+            // keeps its byte-for-byte `parts` path untouched.
+            let force_slotted = !crate::typeck::class_type_subst(recv_ty, self.ctx).is_empty()
+                && sig.params.iter().any(|(_, t)| crate::typeck::ty_contains_typevar(t));
+            if !kwargs.is_empty() || args.len() < sig.params.len() || force_slotted {
                 let site = format!("{}.{}", cls, method_name);
                 let slots =
                     crate::typeck::map_kwargs_to_slots(&site, sig, args.len(), kwargs, span)?;
@@ -750,7 +767,20 @@ impl<'a> Codegen<'a> {
                 // cast the free-call path uses (the method path previously emitted
                 // a plain `emit_consuming`, silently dropping both). Per-slot
                 // coercion targets come from the method signature's param types.
-                let param_tys: Vec<Ty> = sig.params.iter().map(|(_, t)| t.clone()).collect();
+                // (card e10df981) For a GENERIC-CLASS receiver those types still
+                // carry the class's `Ty::TypeVar`s — `get_method` lowers the sig with
+                // the class type params in scope but does NOT substitute the
+                // instance's args (its doc defers that to the call site). Substitute
+                // them with the receiver's concrete args now, exactly as the free
+                // path does, so a lambda cast into a `Callable[[T], T]` slot lowers to
+                // `Rc<dyn Fn(i64) -> i64>` instead of leaking a bare `T` (E0425 at
+                // build). `subst_class_member` is a no-op for a non-generic receiver,
+                // so every existing method call is byte-for-byte unchanged.
+                let param_tys: Vec<Ty> = sig
+                    .params
+                    .iter()
+                    .map(|(_, t)| crate::typeck::subst_class_member(t, recv_ty, self.ctx))
+                    .collect();
                 let (prelude, mparts) =
                     self.emit_slotted_args(&slots, args, kwargs, sig, &param_tys, /*coerced=*/ true)?;
                 return Ok(Self::hoist_wrap(
@@ -987,6 +1017,18 @@ impl<'a> Codegen<'a> {
             // wraps identically. Values already of `Ty::Func` pass through as a
             // cheap `Rc` clone inside `emit_into_func_slot`.
             Some(t) if self.ty_has_func(t) => self.emit_into_func_slot(arg, t),
+            // (card 30e4fdd0) An `Optional[T]` parameter slot (a constructor's
+            // `slot: Optional[Inner]`, a struct-literal field): Some-wrap a bare `T`
+            // value passed positionally, exactly like the free-function call path
+            // (`emit_call_arg_value`, coerced) and the local-decl / return / field-
+            // assign positions. `coerce_to_option` is a no-op for a `None` literal,
+            // an already-`Option` value, or a non-Option slot, so this only ADDS the
+            // wrap that was missing (a bare value into an Optional ctor slot was
+            // rustc E0308 before).
+            Some(t) if matches!(t, Ty::Option(_)) => {
+                let s = self.emit_consuming(arg)?;
+                Ok(self.coerce_to_option(s, arg, t))
+            }
             _ => self.emit_consuming(arg),
         }
     }
@@ -1128,7 +1170,14 @@ impl<'a> Codegen<'a> {
                     match sig.param_defaults.get(p).and_then(|d| d.as_ref()) {
                         Some(e) => {
                             let e = e.clone();
-                            call_parts.push(self.emit_expr(&e)?);
+                            // (enabler-fix-1 #6) Route an OMITTED default through the
+                            // same slot coercion as a provided arg — a bare emit_expr
+                            // dropped the `Some(..)` wrap for an `Optional[T] = <lit>`
+                            // default (`opt: Optional[int] = 5` filled `5` into an
+                            // `Option<i64>` slot -> rustc E0308). emit_call_arg_value
+                            // applies coerce_to_option (and the Callable / poly-base
+                            // casts) in both the coerced and constructor paths.
+                            call_parts.push(self.emit_call_arg_value(&e, param_tys, p, coerced)?);
                         }
                         None => {
                             return Err(crate::diag::Error::Codegen(
@@ -1442,6 +1491,111 @@ impl<'a> Codegen<'a> {
         };
         self.line(&decl);
         Ok(())
+    }
+
+    /// (card 30e4fdd0) True when a field of lowered type `ty` on class `cname`
+    /// contains an INLINE self-reference to `cname` — reachable through
+    /// `Option`/`Tuple` but NOT behind a heap-allocated `Vec`/`HashMap`/`HashSet`
+    /// (which already break the cycle). Such a field makes the Rust struct
+    /// infinite-size (E0072: `next: Option<Node>` inside `Node`), so codegen boxes
+    /// the recursive occurrence (`Option<Box<Node>>`) and box/unboxes at the field
+    /// boundary. A `list[Node]` self-reference is NOT boxed — the `Vec` is already
+    /// indirection, so trees-via-list compile directly.
+    pub(crate) fn field_needs_box(&self, cname: &str, ty: &Ty) -> bool {
+        fn inline_self_ref(ty: &Ty, cname: &str) -> bool {
+            match ty {
+                Ty::Class(n, _) => n == cname,
+                Ty::Option(inner) => inline_self_ref(inner, cname),
+                Ty::Tuple(ts) => ts.iter().any(|t| inline_self_ref(t, cname)),
+                _ => false,
+            }
+        }
+        inline_self_ref(ty, cname)
+    }
+
+    /// (enabler-fix-1 #4a) Box a STRUCT-LITERAL field value for a self-referential
+    /// (boxed) field: the struct stores `Option<Box<Self>>`, so a `Some(payload)`
+    /// value is boxed via `.map(Box::new)` (None unchanged), matching the AttrAssign
+    /// write combinator. A non-recursive field passes through unchanged. Used at the
+    /// dataclass / no-__init__ constructor call sites, which build the struct
+    /// directly (the `self.x = ..` boxing path never runs for them).
+    pub(crate) fn box_recursive_field_value(&self, cname: &str, fty: &Ty, v: String) -> String {
+        if self.field_needs_box(cname, fty) {
+            format!("({}).map(::std::boxed::Box::new)", v)
+        } else {
+            v
+        }
+    }
+
+    /// (card 30e4fdd0) Rust type for a boxed-recursive field: wrap each INLINE
+    /// self-reference to `cname` in `Box<..>` (`Option<Node>` ->
+    /// `Option<Box<Node>>`). Non-recursive positions lower via the ordinary
+    /// `rust_ty`, so a mixed tuple `(int, Node)` boxes only the `Node`.
+    pub(crate) fn rust_ty_box_recursive(&self, ty: &Ty, cname: &str) -> String {
+        match ty {
+            Ty::Class(n, _) if n == cname => format!("Box<{}>", self.rust_ty(ty)),
+            Ty::Option(inner) => {
+                format!("Option<{}>", self.rust_ty_box_recursive(inner, cname))
+            }
+            Ty::Tuple(ts) => {
+                let parts: Vec<String> = ts
+                    .iter()
+                    .map(|t| self.rust_ty_box_recursive(t, cname))
+                    .collect();
+                if parts.len() == 1 {
+                    format!("({},)", parts[0])
+                } else {
+                    format!("({})", parts.join(", "))
+                }
+            }
+            _ => self.rust_ty(ty),
+        }
+    }
+
+    /// (card 03eb4e2c; enabler-fix-1 #3) True when class `cname`'s field `field`
+    /// (own OR inherited) is a promoted CLASS-LEVEL CONSTANT (enum member) rather than
+    /// an instance struct field — it lowers to an associated `const`
+    /// (`DefiningClass::FIELD`), is excluded from the struct definition + constructor,
+    /// and is accessed via `DefiningClass::FIELD`.
+    ///
+    /// Delegates to the SHARED, whole-program predicate `TyCtx::is_promoted_const`
+    /// (usage-gated: read as `ClassName.FIELD` AND never written) so typeck and
+    /// codegen agree exactly. The old own-fields-only, self-write-only heuristic
+    /// over-promoted a mutable "options with defaults" record (external `o.x = ..`
+    /// or `X(5)` construction) into a `const` — a check-pass / build-fail hole.
+    pub(crate) fn is_class_const_field(&self, cname: &str, field: &str) -> bool {
+        self.ctx.is_promoted_const(cname, field)
+    }
+
+    /// (card 03eb4e2c) The class-level constant fields declared in `cname`'s OWN
+    /// body, in declaration order — emitted as associated `const`s in its impl.
+    pub(crate) fn class_const_fields(&self, cname: &str) -> Vec<crate::ast::Param> {
+        let Some(cd) = self.ctx.classes.get(cname) else { return vec![]; };
+        cd.fields
+            .iter()
+            .filter(|f| self.is_class_const_field(cname, &f.name))
+            .cloned()
+            .collect()
+    }
+
+    /// (card 03eb4e2c) The Rust `const NAME: T = <lit>;` declaration for a
+    /// class-level constant field. Mirrors `emit_const_decl`'s literal formatting
+    /// (str -> `&str`, whole-number float -> `f64` suffix) but is UNMANGLED — the
+    /// const lives in the class impl namespace (`ClassName::NAME`).
+    pub(crate) fn class_const_decl(&self, f: &crate::ast::Param) -> Result<String> {
+        let n = escape_ident(&f.name);
+        Ok(match &f.default {
+            Some(Expr::Int(v, _)) => format!("const {}: i64 = {};", n, v),
+            Some(Expr::Float(v, _)) => format!("const {}: f64 = {}f64;", n, v),
+            Some(Expr::Bool(v, _)) => format!("const {}: bool = {};", n, v),
+            Some(Expr::Str(v, _)) => format!("const {}: &str = {:?};", n, v),
+            _ => {
+                return Err(crate::diag::Error::Codegen(format!(
+                    "class constant `{}` must be an int/float/str/bool literal",
+                    f.name
+                )))
+            }
+        })
     }
 
     /// Whether an lvalue / receiver chain bottoms out at the `self` receiver —

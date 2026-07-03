@@ -1,0 +1,10 @@
+# W2 card 9695f8a1: LIST-unpacking `a, b = xs` is supported (runtime length
+# check), but STAR-unpack `a, *rest = xs` (PEP 3132 catch-all target) is NOT —
+# it has no faithful fixed-arity lowering. pyrst rejects it honestly at parse
+# time rather than silently mis-binding. This file must be rejected by BOTH
+# `pyrst check` and `pyrst build`.
+def main() -> None:
+    xs: list[int] = [1, 2, 3, 4]
+    a, *rest = xs
+    print(a)
+    print(rest)

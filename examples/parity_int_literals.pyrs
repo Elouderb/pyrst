@@ -1,0 +1,24 @@
+# DUAL-RUN parity (W2 card 474eabae): non-decimal integer literals (hex/octal/
+# binary, case-insensitive prefix) and underscore digit separators must lex to
+# the same i64 values CPython produces. Also exercises the module-const pattern
+# for stat-style permission masks: with 0o/0x/0b literals now supported, a
+# combined mask is written as a DIRECT octal literal (module-const EXPRESSIONS
+# like `A | B` remain honestly rejected — see fail_* / the card notes).
+
+S_IRWXU: int = 0o700
+FLAGS: int = 0xFF_FF
+
+
+def main() -> None:
+    # hex
+    print(0x1F, 0xFF, 0Xff, 0xdead_beef)
+    # octal
+    print(0o755, 0O17, 0o0)
+    # binary
+    print(0b1010, 0B11, 0b1111_0000)
+    # underscore separators in decimal
+    print(1_000, 1_000_000, 10_0)
+    # underscore right after a base prefix
+    print(0x_FF, 0o_17, 0b_1010)
+    # module-level constants (direct octal / hex literal masks)
+    print(S_IRWXU, FLAGS)

@@ -1,0 +1,16 @@
+# DUAL-RUN parity (enabler-fix-2 #8a): min()/max() over a user class with __lt__
+# now compares by REFERENCE and clones only the winner — same element chosen
+# (first-wins ties), so output is byte-identical to python3 3.12.
+class Item:
+    k: int
+    def __init__(self, k: int) -> None:
+        self.k = k
+    def __lt__(self, other: Item) -> bool:
+        return self.k < other.k
+    def __str__(self) -> str:
+        return "Item(" + str(self.k) + ")"
+
+def main() -> None:
+    xs: list[Item] = [Item(3), Item(1), Item(2), Item(1)]
+    print(min(xs))
+    print(max(xs))

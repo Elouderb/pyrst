@@ -1,0 +1,7 @@
+# (enabler-fix-2 #2) Iterating a fixed-shape tuple directly is unsupported — a
+# Rust tuple is not iterable. Destructure it instead. Rejected at BOTH
+# `pyrst check` and `pyrst build`.
+def main() -> None:
+    t: tuple[str, str, str] = "a=b".partition("=")
+    for x in t:
+        print(x)

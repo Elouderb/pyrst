@@ -1,0 +1,39 @@
+# DUAL-RUN parity (W2 card 49170944): str builtins batch — casefold (simple
+# Unicode lowercase), rsplit(sep[, maxsplit]), partition/rpartition as 3-TUPLES
+# (unpackable), and translate + str.maketrans. Every line is byte-checked against
+# python3. casefold NOTE: pyrst casefold is Unicode simple-lowercase — it matches
+# CPython for ASCII / İ / Σ but NOT full-fold chars (ß stays ß, not "ss"; ﬁ stays
+# ﬁ, not "fi"); see PYTHON_COMPATIBILITY.md. This golden uses only ASCII casefold
+# so the dual-run is exact regardless of that documented divergence.
+
+def main() -> None:
+    # casefold (ASCII — exact vs CPython)
+    print("HeLLo WORLD".casefold())          # hello world
+    print("STRASSE".casefold())              # strasse
+
+    # partition -> 3-tuple, unpackable (the configparser/csv idiom)
+    k, sep, v = "key=value=x".partition("=")
+    print(k)                                 # key
+    print(sep)                               # =
+    print(v)                                 # value=x
+
+    # rpartition -> 3-tuple (splits at the LAST separator)
+    a, s2, b = "a.b.c".rpartition(".")
+    print(a)                                 # a.b
+    print(s2)                                # .
+    print(b)                                 # c
+
+    # partition with a missing separator: (whole, "", "")
+    w1, w2, w3 = "nope".partition("=")
+    print(w1)                                # nope
+    print(len(w2))                           # 0
+    print(len(w3))                           # 0
+
+    # rsplit(sep, maxsplit) — right-limited, but result is left-to-right
+    print("a,b,c,d".rsplit(",", 1))          # ['a,b,c', 'd']
+    print("a,b,c,d".rsplit(",", 2))          # ['a,b', 'c', 'd']
+    print("a,b,c,d".rsplit(","))             # ['a', 'b', 'c', 'd']
+
+    # translate via str.maketrans (int->int code-point map)
+    table: dict[int, int] = str.maketrans("abc", "xyz")
+    print("cabbage".translate(table))        # zxyyxge

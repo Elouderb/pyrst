@@ -1,0 +1,13 @@
+# NEGATIVE (enabler-fix-1 #5a / wf#18): print()/str() of a CONTAINER renders each
+# element via repr(). A list of a class with only __str__ (no __repr__) is an honest
+# check error (was a leaked rustc E0599), matching the bare-repr(class) rule.
+class S:
+    x: int
+    def __init__(self, x: int) -> None:
+        self.x = x
+    def __str__(self) -> str:
+        return "S"
+
+def main() -> None:
+    xs: list[S] = [S(1), S(2)]
+    print(xs)

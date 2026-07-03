@@ -349,6 +349,31 @@ impl<'a> Codegen<'a> {
                 // a statically-known tuple of matching arity), mirroring the
                 // liveness/divergence analyses so the decisions agree.
                 let vt = self.type_of_expr(value);
+                // LIST-unpacking (`a, b = xs` where the RHS is a list[T], incl. the
+                // `a, b = "x=1".split("=")` idiom): a Rust tuple-destructure of a
+                // `Vec` is E0308, so lower to a RUNTIME length check + per-element
+                // read instead. Bind the whole RHS to one temp FIRST (fully
+                // evaluated, swap-safe, and never re-reads a target), length-check
+                // it with CPython's exact ValueError text, then dispatch each target
+                // through the shared per-target helper (declare / reassign / shadow /
+                // duplicate-last-wins) — the same helper the tuple mixed path uses,
+                // so declare-vs-reassign, nested-block scoping, and repeated targets
+                // all behave identically to tuple-unpack. Tuple RHS keeps the
+                // static-arity destructuring paths below (no length check needed).
+                if let Ty::List(elem) = &vt {
+                    let elem_ty = (**elem).clone();
+                    let n = targets.len();
+                    let v = self.emit_expr(value)?;
+                    let base = self.shadow_counter;
+                    self.shadow_counter += 1;
+                    let tmp = format!("__pyrst_lunpack_{}", base);
+                    self.line(&format!("let {} = __py_unpack_list({}, {});", tmp, v, n));
+                    for (i, t) in targets.iter().enumerate() {
+                        let rhs = format!("{}[{}].clone()", tmp, i);
+                        self.emit_unpack_target(t, &rhs, &elem_ty);
+                    }
+                    return Ok(());
+                }
                 let comp_tys: Vec<Ty> = match &vt {
                     Ty::Tuple(tys) if tys.len() == targets.len() => tys.clone(),
                     _ => vec![Ty::Unknown; targets.len()],
@@ -908,7 +933,42 @@ impl<'a> Codegen<'a> {
                         }
                     }
                 }
+                // (card 30e4fdd0) Some-wrap a bare value assigned to an
+                // Optional[Class] FIELD, mirroring the local-declaration and return
+                // positions (which already coerce). Field-assign was the one
+                // Optional-coercion position that didn't wrap, so `self.slot = Inner(5)`
+                // where `slot: Optional[Inner]` leaked rustc E0308 (`expected
+                // Option<Inner>, found Inner`). The field type is resolved from the
+                // receiver's class (inheritance-aware); `coerce_to_option` is a no-op
+                // for a non-Optional field / an already-Optional value / a `None`
+                // literal, so every existing field write is byte-for-byte unchanged.
+                let field_info = if let Ty::Class(cn, _) = self.type_of_expr(obj) {
+                    self.ctx
+                        .classes
+                        .get(&cn)
+                        .cloned()
+                        .and_then(|cd| self.class_field_type(&cd, attr))
+                        .map(|ft| (cn, ft))
+                } else {
+                    None
+                };
                 let v = self.emit_consuming(value)?;
+                let v = if let Some((cn, ft)) = &field_info {
+                    let coerced = self.coerce_to_option(v, value, ft);
+                    // (card 30e4fdd0) A boxed-recursive field STORES `Option<Box<Node>>`
+                    // (the struct boxes the inline self-reference to break E0072).
+                    // Box the (Some-wrapped) value at the write boundary:
+                    // `.map(Box::new)` boxes the inner value and leaves `None`
+                    // unchanged, keeping storage consistent with the boxed field type
+                    // while the type system still sees a Box-blind `Option<Node>`.
+                    if self.field_needs_box(cn, ft) {
+                        format!("({}).map(::std::boxed::Box::new)", coerced)
+                    } else {
+                        coerced
+                    }
+                } else {
+                    v
+                };
                 // The base must be emitted as a *place* (lvalue), not the
                 // clone-based rvalue emit_expr produces for Attr/Index.
                 // (card cc7ae370, item 1) Hoist every subscript index in the base
@@ -1780,9 +1840,15 @@ impl<'a> Codegen<'a> {
                         if parts.len() < expected && !sig.param_defaults.is_empty() {
                             let defaults_needed = expected - parts.len();
                             let defaults_start = sig.param_defaults.len().saturating_sub(defaults_needed);
-                            for def_expr in &sig.param_defaults[defaults_start..] {
+                            for (off, def_expr) in sig.param_defaults[defaults_start..].iter().enumerate() {
+                                let pidx = defaults_start + off;
                                 match def_expr {
-                                    Some(e) => parts.push(self.emit_expr(e)?),
+                                    // (enabler-fix-1 #6) Coerce a filled default into
+                                    // its slot (Some-wrap an `Optional[T]=<lit>`
+                                    // default, Callable / poly-base casts) instead of
+                                    // a bare emit_expr, which emitted `describe(5i64)`
+                                    // into an `Option<i64>` slot -> rustc E0308.
+                                    Some(e) => parts.push(self.emit_call_arg_value(e, &param_tys, pidx, /*coerced=*/ true)?),
                                     None => return Err(crate::diag::Error::Codegen("missing required argument".into())),
                                 }
                             }

@@ -1,0 +1,2 @@
+1
+Node(val=1, next=Node(val=2, next=Node(val=3, next=None)))

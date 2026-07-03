@@ -1,0 +1,16 @@
+# NEGATIVE (enabler-fix-1 #5b): CPython's dataclass rule "a non-default field may not
+# follow a default field" applies ACROSS the inheritance chain. `Base.x` has a
+# default, so `Sub.y` (no default) is an honest check error (TypeError in CPython).
+from dataclasses import dataclass
+
+@dataclass
+class Base:
+    x: int = 0
+
+@dataclass
+class Sub(Base):
+    y: int
+
+def main() -> None:
+    s: Sub = Sub(1, 2)
+    print(s.y)

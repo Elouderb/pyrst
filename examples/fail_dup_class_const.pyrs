@@ -1,0 +1,5 @@
+class C:
+    RED: int = 1
+    RED: int = 2
+def main() -> None:
+    print(C.RED)

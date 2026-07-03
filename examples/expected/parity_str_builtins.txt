@@ -1,0 +1,15 @@
+hello world
+strasse
+key
+=
+value=x
+a.b
+.
+c
+nope
+0
+0
+['a,b,c', 'd']
+['a,b', 'c', 'd']
+['a', 'b', 'c', 'd']
+zxyyxge

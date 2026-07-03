@@ -1,0 +1,5 @@
+# W2 card 474eabae: a base prefix with no digits (`0x`) is a CPython SyntaxError.
+# pyrst rejects it at LEX time. Rejected by BOTH `pyrst check` and `pyrst build`.
+def main() -> None:
+    x: int = 0x
+    print(x)

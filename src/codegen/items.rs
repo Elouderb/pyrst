@@ -420,10 +420,19 @@ impl<'a> Codegen<'a> {
         // (a manual one-level walk dropped grandparent fields).
         let mut all_fields: Vec<Param> = Vec::new();
         for f in self.ctx.get_all_fields(&c.name) {
+            // (card 03eb4e2c) Class-level CONSTANTS (enum members) are lowered to
+            // associated `const`s, NOT instance struct fields — exclude them from
+            // the struct definition, the derive analysis, and the constructor.
+            if self.is_class_const_field(&c.name, &f.name) {
+                continue;
+            }
             if !all_fields.iter().any(|ef: &Param| ef.name == f.name) {
                 all_fields.push(f);
             }
         }
+        // (card 03eb4e2c) The class-level constant fields to emit as associated
+        // `const`s in this class's impl block (own body, declaration order).
+        let const_fields: Vec<Param> = self.class_const_fields(&c.name);
 
         // Full transitive method set (own methods win, then inherited via MRO),
         // so a subclass that INHERITS a dunder or a grandparent method emits it
@@ -464,7 +473,23 @@ impl<'a> Codegen<'a> {
                 .map(|ty| self.ty_has_func(&ty))
                 .unwrap_or(false)
         });
-        let pe = if has_eq || field_blocks_eq || has_func_field { "" } else { ", PartialEq" };
+        let pe_base = if has_eq || field_blocks_eq || has_func_field { "" } else { ", PartialEq" };
+        // (card e131f8b0) A class used as a dict KEY / set ELEMENT additionally
+        // derives `Eq + Hash` (insert / lookup / `in` / `len`) and
+        // `PartialOrd + Ord` (deterministic SORTED-key iteration — "sorted" for a
+        // class key means lexicographic by field DECLARATION order). Only classes
+        // that PASS `class_hash_eligible` reach here (check rejects the ineligible
+        // ones), and an eligible class always has `, PartialEq` above (no user
+        // `__eq__`, no Callable / polymorphic-base field), so appending the four
+        // marker/order derives is always well-formed. Guard on `pe_base` being
+        // non-empty so a defensive mismatch never emits `Eq` without `PartialEq`.
+        let is_hash_key = self.ctx.hash_key_classes.contains(&c.name)
+            && crate::typeck::class_hash_eligible(&c.name, self.ctx).is_ok();
+        let pe = if is_hash_key && !pe_base.is_empty() {
+            ", PartialEq, Eq, Hash, PartialOrd, Ord"
+        } else {
+            pe_base
+        };
         let dbg = if has_func_field { "" } else { ", Debug" };
         // Only derive Default when every field actually implements Default.
         // Copy classes (all-primitive fields) don't derive Default, so an outer
@@ -505,9 +530,20 @@ impl<'a> Codegen<'a> {
             // so a `value: T` field lowers to the Rust generic `T` (not a `T`
             // struct). Empty for a non-generic class.
             let ty = Ty::from_type_expr_scoped(&f.ty, f.span, &c.type_params)?;
+            // (card 30e4fdd0) A field with an INLINE self-reference (`next:
+            // Optional[Node]` inside `Node`) is boxed to break the infinite-size
+            // cycle (E0072): `next: Option<Box<Node>>`. codegen box/unboxes at the
+            // field boundary (Attr read unboxes, AttrAssign write boxes), so the
+            // type system's Box-blind `Option<Node>` view stays consistent.
+            // Non-recursive fields lower via the ordinary `rust_ty` unchanged.
+            let field_ty_str = if self.field_needs_box(&c.name, &ty) {
+                self.rust_ty_box_recursive(&ty, &c.name)
+            } else {
+                self.rust_ty(&ty)
+            };
             // (EPIC-6) Escape a keyword field name in the struct definition; every
             // field read/write/init escapes the same way so they stay in sync.
-            self.line(&format!("{}: {},", escape_ident(&f.name), self.rust_ty(&ty)));
+            self.line(&format!("{}: {},", escape_ident(&f.name), field_ty_str));
         }
         self.indent -= 1;
         self.line("}");
@@ -546,11 +582,24 @@ impl<'a> Codegen<'a> {
         let has_regular_methods = resolved_methods.iter().any(|m|
             m.name != "__init__" && !dunder_trait_names.contains(&m.name.as_str())) || has_lt;
 
-        if has_init || has_regular_methods || (is_dataclass && !has_init) {
+        if has_init || has_regular_methods || (is_dataclass && !has_init) || !const_fields.is_empty() {
             // Generics v2: `impl<T: Clone + ..> Box<T> { .. }`. Bounds clause +
             // type-args; both empty for a non-generic class (`impl Point { .. }`).
             self.line(&format!("impl{} {}{} {{", impl_generics, c.name, ty_args));
             self.indent += 1;
+
+            // (card 03eb4e2c) Class-level constants (enum members) first: emit each
+            // as an associated `const NAME: T = <lit>;` so `Color.RED` lowers to
+            // `Color::RED` (see the Expr::Attr access path). A const-only class
+            // (`class Color: RED: int = 1`, no __init__/methods) reaches here purely
+            // on `!const_fields.is_empty()` and emits an empty struct + its consts.
+            for cf in &const_fields {
+                let decl = self.class_const_decl(cf)?;
+                self.line(&decl);
+            }
+            if !const_fields.is_empty() {
+                self.line("");
+            }
 
             // Emit new() constructor when __init__ is defined.
             if has_init {
@@ -644,7 +693,23 @@ impl<'a> Codegen<'a> {
                     })
                     .collect();
                 let param_strs = param_strs?;
-                let field_inits: Vec<_> = all_fields.iter().map(|f| escape_ident(&f.name)).collect();
+                // (enabler-fix-1 #4a) Box each self-referential field at construction:
+                // the struct stores `Option<Box<Node>>` (field_needs_box lowers the
+                // inline self-reference), while the ctor param keeps the type-system's
+                // Box-blind `Option<Node>`. `.map(Box::new)` boxes the Some payload and
+                // leaves None, matching the AttrAssign write combinator. A non-recursive
+                // field uses the init shorthand. Without this the auto-ctor assigned an
+                // `Option<Node>` into an `Option<Box<Node>>` field -> rustc E0308.
+                let field_inits: Result<Vec<String>> = all_fields.iter().map(|f| {
+                    let ty = Ty::from_type_expr(&f.ty, f.span)?;
+                    let name = escape_ident(&f.name);
+                    Ok(if self.field_needs_box(&c.name, &ty) {
+                        format!("{}: ({}).map(::std::boxed::Box::new)", name, name)
+                    } else {
+                        name
+                    })
+                }).collect();
+                let field_inits = field_inits?;
                 self.line(&format!("fn new({}) -> Self {{", param_strs.join(", ")));
                 self.indent += 1;
                 self.line(&format!("{} {{ {} }}", c.name, field_inits.join(", ")));
@@ -707,6 +772,24 @@ impl<'a> Codegen<'a> {
                         self.line("}");
                         self.line("");
                     }
+                    // Special handling for __repr__: emit an inherent `__repr_impl`
+                    // helper that the per-class `impl PyRepr` (below) calls, so
+                    // `repr(x)`/generic `x.py_repr()` route through the user's
+                    // __repr__ EVEN when the class ALSO defines __str__ (in which
+                    // case Display is sourced from __str__, not __repr__). Mirrors
+                    // the __lt__/__lt_impl split. Returns String (str on all paths).
+                    if m.name == "__repr__" {
+                        let saved_ret = std::mem::replace(&mut self.current_ret_ty, Ty::Str);
+                        self.line("fn __repr_impl(&self) -> String {");
+                        self.indent += 1;
+                        self.locals.insert("self".into(), self_class_ty.clone());
+                        for s in &m.body { self.emit_stmt(s)?; }
+                        self.locals.remove("self");
+                        self.indent -= 1;
+                        self.line("}");
+                        self.line("");
+                        self.current_ret_ty = saved_ret;
+                    }
                     continue;
                 }
                 self.emit_func(m, Some(&class_name))?;
@@ -746,18 +829,28 @@ impl<'a> Codegen<'a> {
                     self.indent += 1;
                     self.line("fn fmt(&self, __f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {");
                     self.indent += 1;
-                    self.locals.insert("self".into(), self_class_ty.clone());
-                    let body = &m.body;
-                    let split_at = if body.is_empty() { 0 } else { body.len() - 1 };
-                    for s in &body[..split_at] { self.emit_stmt(s)?; }
-                    if let Some(Stmt::Return(Some(e), _)) = body.last() {
-                        let s = self.emit_expr(e)?;
-                        self.line(&format!("write!(__f, \"{{}}\", {})", s));
+                    if m.name == "__repr__" {
+                        // (enabler-fix-2 #8b) When __repr__ is the Display source (no
+                        // __str__), delegate to the already-emitted inherent
+                        // `__repr_impl` helper (the same body `impl PyRepr` calls)
+                        // instead of RE-EMITTING the __repr__ body verbatim — the two
+                        // copies were identical. __str__ has no shared helper, so it
+                        // still emits inline below.
+                        self.line("write!(__f, \"{}\", self.__repr_impl())");
                     } else {
-                        if let Some(s) = body.last() { self.emit_stmt(s)?; }
-                        self.line("Ok(())");
+                        self.locals.insert("self".into(), self_class_ty.clone());
+                        let body = &m.body;
+                        let split_at = if body.is_empty() { 0 } else { body.len() - 1 };
+                        for s in &body[..split_at] { self.emit_stmt(s)?; }
+                        if let Some(Stmt::Return(Some(e), _)) = body.last() {
+                            let s = self.emit_expr(e)?;
+                            self.line(&format!("write!(__f, \"{{}}\", {})", s));
+                        } else {
+                            if let Some(s) = body.last() { self.emit_stmt(s)?; }
+                            self.line("Ok(())");
+                        }
+                        self.locals.remove("self");
                     }
-                    self.locals.remove("self");
                     self.indent -= 1;
                     self.line("}");
                     self.indent -= 1;
@@ -889,6 +982,70 @@ impl<'a> Codegen<'a> {
                 }
                 _ => {}
             }
+        }
+
+        // CPython-parity `repr` of an instance: when the class (or an ancestor)
+        // defines __repr__, emit `impl PyRepr for C` delegating to the inherent
+        // `__repr_impl` helper. This is what `repr(x)` lowers to (`x.py_repr()`)
+        // and what a container/generic uses to repr an element. A class WITHOUT
+        // __repr__ gets no PyRepr impl — `repr()` of such an instance is an
+        // honest CHECK-time error (`check_expr`), matching CPython's rule that
+        // repr uses __repr__ only (never __str__), just without faking the
+        // `<C object at 0x..>` default.
+        if c_methods.iter().any(|m| m.name == "__repr__") {
+            self.line(&format!("impl{} PyRepr for {} {{", impl_generics, recv_ty_str));
+            self.indent += 1;
+            self.line("fn py_repr(&self) -> String { self.__repr_impl() }");
+            self.indent -= 1;
+            self.line("}");
+            self.line("");
+        }
+
+        // (card 6f69d4a3) @dataclass synthesizes __repr__ + __eq__. __eq__ comes
+        // free from the derived `PartialEq` (structural, field-wise — matching
+        // CPython's tuple comparison). __repr__ is synthesized HERE as CPython's
+        // `ClassName(field=value, ...)` — with each field VALUE routed through the
+        // batch-A `PyRepr` (`.py_repr()`), so a str field is quoted (`name='a'`)
+        // and a float keeps its `.0`, exactly like `dataclasses`. Emitted as BOTH
+        // `Display` (for str()/print(), since a dataclass defines no __str__) and
+        // `PyRepr` (for repr()). Only when the dataclass supplies NEITHER a user
+        // __str__ NOR __repr__ (else those win, deduped above) and is non-generic
+        // (a generic dataclass would need a `T: PyRepr` bound the inference does
+        // not add — an out-of-scope edge).
+        if is_dataclass && display_source.is_none() && c.type_params.is_empty() {
+            let parts: Vec<String> = all_fields
+                .iter()
+                .map(|f| {
+                    format!(
+                        "format!(\"{}={{}}\", self.{}.py_repr())",
+                        f.name,
+                        escape_ident(&f.name)
+                    )
+                })
+                .collect();
+            // PyRepr: `ClassName(f1=<repr>, f2=<repr>)` (empty dataclass -> `C()`).
+            self.line(&format!("impl PyRepr for {} {{", c.name));
+            self.indent += 1;
+            self.line("fn py_repr(&self) -> String {");
+            self.indent += 1;
+            self.line(&format!("let __parts: Vec<String> = vec![{}];", parts.join(", ")));
+            self.line(&format!("format!(\"{}({{}})\", __parts.join(\", \"))", c.name));
+            self.indent -= 1;
+            self.line("}");
+            self.indent -= 1;
+            self.line("}");
+            self.line("");
+            // Display delegates to the same synthesized repr (str()/print()).
+            self.line(&format!("impl ::std::fmt::Display for {} {{", c.name));
+            self.indent += 1;
+            self.line("fn fmt(&self, __f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {");
+            self.indent += 1;
+            self.line("write!(__f, \"{}\", self.py_repr())");
+            self.indent -= 1;
+            self.line("}");
+            self.indent -= 1;
+            self.line("}");
+            self.line("");
         }
 
         self.current_class = None;
@@ -1056,6 +1213,12 @@ impl<'a> Codegen<'a> {
         // otherwise emit two identical `__field_<f>` methods (rustc E0592).
         let mut accessor_fields: Vec<Param> = Vec::new();
         for f in self.ctx.get_all_fields(base) {
+            // (enabler-fix-1 #3) A promoted class constant is an associated `const`,
+            // not a struct field, so it has no `x.<name>` to read — skip it (else the
+            // accessor emitted `x.KIND` on a const -> rustc E0609).
+            if self.is_class_const_field(base, &f.name) {
+                continue;
+            }
             if !accessor_fields.iter().any(|ef: &Param| ef.name == f.name) {
                 accessor_fields.push(f);
             }

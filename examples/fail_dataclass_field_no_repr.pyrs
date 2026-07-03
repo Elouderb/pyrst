@@ -1,0 +1,17 @@
+# NEGATIVE (enabler-fix-1 #5a): a @dataclass synthesizes a __repr__ that calls
+# .py_repr() on every field. A field whose class has no __repr__ (Plain) is an honest
+# check error (was a leaked rustc E0599 on print/repr of the dataclass).
+from dataclasses import dataclass
+
+class Plain:
+    x: int
+    def __init__(self, x: int) -> None:
+        self.x = x
+
+@dataclass
+class Holder:
+    p: Plain
+
+def main() -> None:
+    h: Holder = Holder(Plain(3))
+    print(h)

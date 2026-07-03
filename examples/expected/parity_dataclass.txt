@@ -1,0 +1,14 @@
+Point(x=1, y=2)
+Point(x=1, y=2)
+True
+True
+False
+Named(label='hi', weight=3.5)
+Config(host='localhost', port=8080)
+Config(host='example.com', port=9000)
+True
+False
+Empty()
+True
+Derived(x=1, y=2)
+3

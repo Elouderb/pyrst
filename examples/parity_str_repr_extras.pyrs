@@ -1,0 +1,20 @@
+# DUAL-RUN parity (enabler-fix-2): ascii() escaping (#4), repr() of non-ASCII
+# control/invisible code points (#6), and context-FREE casefold incl. a
+# WORD-FINAL sigma (#7). Every line is byte-checked against python3 3.12.
+def main() -> None:
+    # ascii(): repr quote matrix + \xXX/\uXXXX escaping of every non-ASCII char.
+    print(ascii("héllo"))
+    print(ascii("a'b"))
+    print(ascii(chr(0x85)))
+    print(ascii("naïve café"))
+    # repr(): C1 controls + common Cf invisibles now escaped (printable é passes).
+    print(repr(chr(0x85)))
+    print(repr(chr(0x200b)))
+    print(repr(chr(0xfeff)))
+    print(repr(chr(0xad)))
+    print(repr(chr(0x2028)))
+    print(repr("café"))
+    print(repr("tab\tend"))
+    # casefold(): context-free — a WORD-FINAL Σ folds to σ (U+03C3), not ς.
+    print("ΟΔΥΣΣΕΥΣ".casefold())
+    print("HeLLo WORLD".casefold())

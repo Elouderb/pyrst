@@ -1,0 +1,18 @@
+# (enabler-fix-2 #1b) A user class reaching a dict-key position ONLY through a
+# generic type parameter cannot get the Eq/Hash derive (pyrst emits one generic
+# fn, not a monomorphized copy). Honest error — key the class concretely to opt
+# in. Rejected at BOTH `pyrst check` and `pyrst build`.
+class Node:
+    x: int
+    def __init__(self, x: int) -> None:
+        self.x = x
+
+def tally[T](items: list[T]) -> dict[T, int]:
+    d: dict[T, int] = {}
+    for it in items:
+        d[it] = 1
+    return d
+
+def main() -> None:
+    ns: list[Node] = [Node(1), Node(2)]
+    print(len(tally(ns)))

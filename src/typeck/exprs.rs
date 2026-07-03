@@ -15,6 +15,93 @@ pub(crate) fn binop_symbol(op: BinOp) -> &'static str {
     }
 }
 
+/// (card d8a1ed83) The uniform check-time kwargs gate. Called with a NON-EMPTY
+/// `kwargs`; returns `Ok(())` only when the call site is one pyrst actually
+/// MODELS a keyword argument for, otherwise an honest `Error::Type`.
+///
+/// Modeled sites (kept passing — the W0 machinery lowers these correctly):
+///   - a class CONSTRUCTOR `C(field=..)` — the kwarg names are validated as
+///     field names by the constructor arm, so any name is admitted here;
+///   - the free builtins `sorted(.., key=, reverse=)` and `min`/`max(.., key=)`;
+///   - the `list.sort(key=, reverse=)` method (receiver statically a list).
+///
+/// For those builtin sites the kwarg NAMES are ALSO restricted to the modeled
+/// set, so an unknown kwarg (`xs.sort(bogus=1)`, `sorted(xs, foo=1)`) is now a
+/// CHECK-time error too — closing the check/build asymmetry logged on card
+/// 5ca2030a (`.sort` unknown-kwarg previously only failed at build).
+///
+/// Every OTHER call site — a flat free function, a qualified module function, or
+/// a user/builtin method — previously threaded kwargs through and then dropped
+/// them (silently, or as a late codegen / rustc error). It is rejected here with
+/// a message pointing at the positional form. Full keyword→positional CALL
+/// fidelity is a deliberately-deferred follow-up; this is the honesty stopgap.
+fn reject_unmodeled_kwargs(
+    callee: &Expr,
+    kwargs: &[(String, Expr)],
+    env: &mut FuncEnv,
+    span: Span,
+) -> Result<()> {
+    match callee {
+        Expr::Ident(name, _) => {
+            // (a) Class constructor: field-name kwargs are validated downstream.
+            if env.ctx.classes.contains_key(name.as_str()) {
+                return Ok(());
+            }
+            // (b) Modeled free builtins — restrict the kwarg names too.
+            let modeled: &[&str] = match name.as_str() {
+                "sorted" => &["key", "reverse"],
+                "min" | "max" => &["key"],
+                _ => &[],
+            };
+            if !modeled.is_empty() {
+                return reject_unknown_kwarg_names(kwargs, modeled, name, span);
+            }
+        }
+        Expr::Attr { obj, name, .. } => {
+            // (c) list.sort(key=, reverse=): only when the receiver is statically
+            // a list. Re-deriving the receiver type here is idempotent for the
+            // place receivers `.sort` takes and propagates any of its own errors.
+            if name == "sort" && matches!(check_expr(obj, env)?, Ty::List(_)) {
+                return reject_unknown_kwarg_names(kwargs, &["key", "reverse"], "list.sort", span);
+            }
+        }
+        _ => {}
+    }
+    Err(Error::Type {
+        span,
+        msg: "keyword arguments are not supported here in v0 (only class \
+              constructors and builtin key=/reverse=); pass the argument \
+              positionally"
+            .into(),
+    })
+}
+
+/// Reject the first entry of `kwargs` whose name is not in `modeled` (the keyword
+/// names a builtin site actually supports), naming the site. Used by the kwargs
+/// gate for sorted/min/max/list.sort so an unsupported keyword is a CHECK error.
+fn reject_unknown_kwarg_names(
+    kwargs: &[(String, Expr)],
+    modeled: &[&str],
+    site: &str,
+    span: Span,
+) -> Result<()> {
+    if let Some((kw, _)) = kwargs.iter().find(|(k, _)| !modeled.contains(&k.as_str())) {
+        let allowed = modeled
+            .iter()
+            .map(|m| format!("{}=", m))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(Error::Type {
+            span,
+            msg: format!(
+                "`{}` does not support the keyword argument `{}` (supported: {})",
+                site, kw, allowed
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// (W0-c, p20) The ELEMENT type of a set-algebra result (`&` `|` `^` `-`) when
 /// the operands permit it. Python overloads these on sets for intersection /
 /// union / symmetric-difference / difference; codegen lowers them to `HashSet`
@@ -1154,6 +1241,18 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                         });
                     }
                 }
+            }
+            // (card d8a1ed83) Uniform check-time kwargs gate. A call carrying
+            // keyword arguments is honest ONLY at a site pyrst actually MODELS a
+            // kwarg for — a class constructor, or the builtin key=/reverse= of
+            // sorted/min/max/list.sort. Every other call (flat free fn, qualified
+            // module fn, user/builtin method) previously threaded kwargs through
+            // and then DROPPED them: silently (json.dumps(indent=4) printed
+            // compact), or as a late codegen error, or a leaked rustc E0061.
+            // Reject those HERE — this pass runs for both `pyrst check` and
+            // `pyrst build`, so no keyword argument is ever silently discarded.
+            if !kwargs.is_empty() {
+                reject_unmodeled_kwargs(callee.as_ref(), kwargs, env, *span)?;
             }
             // Check if this is a class constructor or function call.
             match callee.as_ref() {

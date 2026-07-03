@@ -350,6 +350,86 @@ pub(crate) fn merge_ctx_from_module(m: &Module, ctx: &mut TyCtx, is_root: bool) 
     Ok(())
 }
 
+/// (card 6c8b4a39) Detect two DIFFERENT imported modules that define the same
+/// top-level public name (func / class / const). pyrst's module namespace is
+/// FLAT — every module's top-level names merge into one `ctx.funcs`/`ctx.classes`
+/// under their bare name — so co-importing e.g. `operator` (`def sub`) and `re`
+/// (`def sub`) let whichever imported SECOND silently overwrite the first, and
+/// even a QUALIFIED `operator.sub(...)` then type-checked against re's signature
+/// (a silent wrong-function miscompile once two colliders share an arity). Make
+/// it an honest error instead.
+///
+/// Scope, mirroring the two deliberate-shadow paths preserved by this card:
+///   - The ROOT module is SKIPPED (it is last in topological order). A user
+///     file's own top-level `def` deliberately shadows an imported name
+///     (last-write-wins in the merge) — unchanged; only imported×imported
+///     duplicates error.
+///   - A LOCAL user module shadowing an EMBEDDED stdlib module of the same name
+///     is resolved at import time (a local `<dir>/os.pyrs` wins over embedded
+///     `os`), so only ONE module of a given stem ever enters `order`; comparing
+///     by owning module NAME (source-file stem) means this never fires here.
+///
+/// `main` is excluded (a non-root module's `main` is not merged, and is not a
+/// public API). Const detection matches the merge's `module_consts` rule
+/// (annotated const-literal globals).
+fn detect_cross_module_collisions(
+    order: &[PathBuf],
+    cache: &HashMap<PathBuf, (Module, String)>,
+) -> Result<()> {
+    // top-level public name -> (owning imported module name, its source text).
+    let mut owner: HashMap<String, String> = HashMap::new();
+    let total = order.len();
+    for (idx, path) in order.iter().enumerate() {
+        // The root program's own top-level names are allowed to shadow imports.
+        if idx + 1 == total {
+            continue;
+        }
+        let (m, src) = &cache[path];
+        let module_name: String = m
+            .source_path
+            .as_ref()
+            .and_then(|p| p.file_stem())
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+
+        for s in &m.stmts {
+            // Collect this statement's top-level public name and a span to blame.
+            let named: Option<(&str, Span)> = match s {
+                Stmt::Func(f) if f.name != "main" => Some((f.name.as_str(), f.span)),
+                Stmt::Class(c) => Some((c.name.as_str(), c.span)),
+                Stmt::Assign { target, ty: Some(_), value, span }
+                    if crate::typeck::is_const_literal(value) =>
+                {
+                    Some((target.as_str(), *span))
+                }
+                _ => None,
+            };
+            let Some((name, span)) = named else { continue };
+            match owner.get(name) {
+                // Same module re-declaring its own name (or an intra-module
+                // duplicate) is not a cross-module collision — not our concern.
+                Some(prev) if prev == &module_name => {}
+                Some(prev) => {
+                    return Err(Error::Type {
+                        span,
+                        msg: format!(
+                            "name `{}` is provided by both `{}` and `{}`; pyrst's \
+                             module namespace is flat (real per-module namespacing \
+                             is the G3 epic) — a program cannot import both",
+                            name, prev, module_name
+                        ),
+                    })
+                    .map_err(|e| e.with_render_source(m.source_path.clone(), src));
+                }
+                None => {
+                    owner.insert(name.to_string(), module_name.clone());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Resolve all imports from a root .pyrs file and return a merged program.
 pub fn resolve(root_path: &Path) -> Result<ResolvedProgram> {
     let abs_root = root_path.canonicalize().map_err(|e| crate::diag::Error::Io(e))?;
@@ -357,6 +437,10 @@ pub fn resolve(root_path: &Path) -> Result<ResolvedProgram> {
 
     let mut resolver = Resolver::new();
     resolver.visit(abs_root.clone(), root_dir, Span::DUMMY)?;
+
+    // (card 6c8b4a39) Reject co-importing two modules that share a top-level
+    // public name BEFORE the flat merge silently picks a last-write-wins winner.
+    detect_cross_module_collisions(&resolver.order, &resolver.cache)?;
 
     // Build merged context from all modules in dependency order
     let mut ctx = TyCtx::new();
@@ -533,5 +617,55 @@ class Account:
             Err(other) => panic!("expected ImportNotFound for `notamodule`, got: {:?}", other),
         }
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    /// Card 6c8b4a39: co-importing two modules that define the SAME top-level
+    /// public name (`operator` and `re` both `def sub`) is an honest error naming
+    /// both modules — never a silent last-import-wins overwrite.
+    #[test]
+    fn cross_module_name_collision_is_rejected() {
+        let root = temp_root(
+            "import operator\nimport re\n\ndef main() -> None:\n    print(operator.sub(5, 3))\n    print(re.sub(\"a\", \"b\", \"banana\"))\n",
+        );
+        // resolve() wraps the collision Type error in `Error::Sourced` (for the
+        // rendered snippet); its Display delegates to the inner message, so match
+        // on the message text rather than the outer variant.
+        match resolve(&root) {
+            Ok(_) => panic!("co-importing operator and re (both define `sub`) must not resolve"),
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("`sub`") && msg.contains("operator") && msg.contains("re"),
+                    "collision error must name `sub` and both modules, got: {msg}"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    /// The collision guard must NOT over-reject: importing ONLY `re` (its `sub`
+    /// uncontested) resolves cleanly, and `re.sub` is registered.
+    #[test]
+    fn single_import_of_a_colliding_module_still_resolves() {
+        let root = temp_root(
+            "import re\n\ndef main() -> None:\n    print(re.sub(\"a\", \"b\", \"banana\"))\n",
+        );
+        let prog = resolve(&root).expect("importing `re` alone must resolve");
+        assert!(prog.ctx.funcs.contains_key("sub"), "re.sub must be registered");
+    }
+
+    /// A ROOT (user-file) top-level `def` that shadows an imported name is
+    /// PRESERVED (last-write-wins, root shadows import) — only imported×imported
+    /// duplicates are a collision. Here the root defines its own `sub` while
+    /// importing `re` (which also defines `sub`); resolution must succeed.
+    #[test]
+    fn root_def_shadowing_imported_name_is_allowed() {
+        let root = temp_root(
+            "import re\n\ndef sub(a: int, b: int) -> int:\n    return a - b\n\ndef main() -> None:\n    print(sub(5, 3))\n",
+        );
+        assert!(
+            resolve(&root).is_ok(),
+            "a root def may shadow an imported name (only imported x imported collides)"
+        );
     }
 }

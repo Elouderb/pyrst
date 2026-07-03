@@ -1938,3 +1938,98 @@ use super::test_support::*;
             Ty::Iterator(Box::new(Ty::Int))
         );
     }
+
+    // =========================================================================
+    // Uniform check-time kwargs gate (card d8a1ed83)
+    // =========================================================================
+
+    /// A keyword argument on a FLAT free-function call is an honest check-time
+    /// error (previously a check hole that only failed at codegen).
+    #[test]
+    fn kwargs_gate_rejects_flat_function_call() {
+        let src = "\
+def wrap(text: str, width: int) -> str:
+    return text
+
+def main() -> None:
+    print(wrap(\"hi\", width=10))
+";
+        let err = check_src(src).expect_err("flat-fn kwarg must be rejected");
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("keyword arguments are not supported here"),
+            "expected the kwargs-gate message, got: {msg}"
+        );
+    }
+
+    /// A keyword argument on a USER METHOD call is rejected at check time
+    /// (previously silently dropped, leaking a rustc E0061 at build).
+    #[test]
+    fn kwargs_gate_rejects_user_method_call() {
+        let src = "\
+class Greeter:
+    name: str
+    def __init__(self, name: str) -> None:
+        self.name = name
+    def greet(self, times: int) -> str:
+        return self.name
+
+def main() -> None:
+    g: Greeter = Greeter(\"hi\")
+    print(g.greet(times=3))
+";
+        assert!(
+            check_src(src).is_err(),
+            "a keyword argument on a user method must be rejected at check time"
+        );
+    }
+
+    /// An UNKNOWN keyword on a modeled builtin (`list.sort(bogus=1)`) is now a
+    /// check-time error — closes the check/build asymmetry from card 5ca2030a.
+    #[test]
+    fn kwargs_gate_rejects_unknown_kwarg_on_sort() {
+        let src = "\
+def main() -> None:
+    xs: list[int] = [3, 1, 2]
+    xs.sort(bogus=1)
+    print(xs[0])
+";
+        let err = check_src(src).expect_err("unknown kwarg on list.sort must be rejected");
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("does not support the keyword argument `bogus`"),
+            "expected the unknown-kwarg message, got: {msg}"
+        );
+    }
+
+    /// The MODELED sites keep passing: a class constructor's field kwargs, and
+    /// the builtin key=/reverse= of sorted and list.sort.
+    #[test]
+    fn kwargs_gate_allows_constructor_and_builtin_kwargs() {
+        let ctor = "\
+class Point:
+    x: int
+    y: int
+    def __init__(self, x: int, y: int) -> None:
+        self.x = x
+        self.y = y
+
+def main() -> None:
+    p: Point = Point(x=1, y=2)
+    print(p.x)
+";
+        assert!(check_src(ctor).is_ok(), "constructor field kwargs must pass");
+
+        let builtins = "\
+def main() -> None:
+    xs: list[int] = [3, 1, 2]
+    ys: list[int] = sorted(xs, reverse=True)
+    xs.sort(reverse=True)
+    m: int = max(xs, key=lambda v: -v)
+    print(ys[0] + xs[0] + m)
+";
+        assert!(
+            check_src(builtins).is_ok(),
+            "sorted(reverse=)/list.sort(reverse=)/max(key=) must pass"
+        );
+    }

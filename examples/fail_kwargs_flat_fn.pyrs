@@ -1,0 +1,14 @@
+# P0 (card d8a1ed83): a keyword argument on a FLAT (bare-name) free-function call
+# was a check-time HOLE — `fill(text, width=10)` passed `pyrst check` and only
+# failed later at codegen ("keyword arguments are only supported for class
+# constructors in v0") — loud but late. The uniform kwargs gate makes it an
+# honest error at CHECK time. pyrst v0 only models keyword arguments for class
+# constructors and the builtin key=/reverse= of sorted/min/max/list.sort.
+# This file must be rejected by BOTH `pyrst check` and `pyrst build`.
+from textwrap import fill
+
+
+def main() -> None:
+    # ERROR: keyword argument on a flat free-function call is not modeled in v0.
+    s: str = fill("the quick brown fox jumps over", width=10)
+    print(s)

@@ -1,0 +1,18 @@
+# (card 6c8b4a39): pyrst's module namespace is FLAT — every imported module's
+# top-level names merge into one table under their bare name. `operator` defines
+# `def sub(a, b)` and `re` defines `def sub(pattern, repl, string, count=0)`, so
+# co-importing both let whichever imported SECOND silently OWN `sub`, and even a
+# qualified `operator.sub(5, 3)` type-checked against re's 4-arg signature (a
+# silent wrong-function miscompile once two colliders share an arity). This is
+# now an honest check-time error naming both modules. Renaming is NOT the fix —
+# both are legitimate CPython public APIs. Real per-module namespacing is the G3
+# epic. This file must be rejected by BOTH `pyrst check` and `pyrst build`.
+import operator
+import re
+
+
+def main() -> None:
+    # ERROR: `sub` is provided by both `operator` and `re` — a program cannot
+    # import both while the module namespace is flat.
+    print(operator.sub(5, 3))
+    print(re.sub("a", "b", "banana"))

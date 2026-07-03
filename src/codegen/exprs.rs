@@ -147,7 +147,14 @@ impl<'a> Codegen<'a> {
                         if self.ctx.module_funcs.get(modname).is_some_and(|fns| fns.iter().any(|n| n == name)) {
                             let span = callee.span();
                             let flat_callee: Box<Expr> = Box::new(Expr::Ident(name.clone(), span));
-                            return Ok(Some(self.emit_plain_func_call(&flat_callee, args, &[])?));
+                            // (card d8a1ed83) Forward `kwargs` (NOT `&[]`) so a
+                            // kwarg on a qualified module call is no longer
+                            // silently DROPPED here (the json.dumps(indent=4)
+                            // bug): emit_plain_func_call's non-empty-kwargs error
+                            // fires as the codegen backstop. In practice the
+                            // typeck kwargs gate already rejects it at check time,
+                            // so this only ever triggers defensively.
+                            return Ok(Some(self.emit_plain_func_call(&flat_callee, args, kwargs)?));
                         }
                     }
 

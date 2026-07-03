@@ -1,0 +1,15 @@
+# P0 (card d8a1ed83): a keyword argument on a QUALIFIED module call was silently
+# DROPPED. `textwrap.fill(text, width=10)` type-checked and built, then ran with
+# `width` IGNORED (the default 70 was used) — a silent-wrong miscompile, exactly
+# like `json.dumps(v, indent=4)` printing compact. pyrst v0 only models keyword
+# arguments for class constructors and the builtin key=/reverse= of
+# sorted/min/max/list.sort; a qualified module call is not one of those. The
+# honest behavior is a CHECK-time error pointing at the positional form.
+# This file must be rejected by BOTH `pyrst check` and `pyrst build`.
+import textwrap
+
+
+def main() -> None:
+    # ERROR: keyword argument on a qualified module function is not modeled in v0.
+    s: str = textwrap.fill("the quick brown fox jumps over", width=10)
+    print(s)

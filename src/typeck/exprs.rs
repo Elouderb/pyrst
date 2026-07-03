@@ -244,6 +244,31 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
                             Ty::List(Box::new(Ty::Unknown))
                         }
                     }
+                    // (CARD bd2bd472) `min`/`max` previously had NO arm here, so a
+                    // bare `min(xs)`/`max(xs)` call fell through to the generic
+                    // `n => {..}` branch below, which resolves via `ctx.funcs.get`
+                    // — the hardcoded builtin `FuncSig` for "min"/"max" declares
+                    // `ret: Ty::Unknown` unconditionally (2-arg scalar shape,
+                    // `typeck/types.rs`). That starved this ORACLE of the element
+                    // type for the single-iterable form, so `print(min([4.0, 2.0]))`
+                    // inferred `Unknown` for the call and skipped `__py_fmt_float`
+                    // formatting, printing "2" instead of Python's "2.0". Mirror
+                    // `check_expr`'s already-correct single-iterable min/max typing
+                    // (element type of the List/Set/Iterator argument) here too — a
+                    // `key=` kwarg does not change the RESULT's type (the winning
+                    // element is still a member of the source, key= only picks
+                    // which one), so this covers both the bare and `key=` forms.
+                    // The 2-arg scalar shape (`min(a, b)`) is NOT specially typed by
+                    // `check_expr` either (falls through to the same Unknown
+                    // `FuncSig`), so it is intentionally left to the `n => {..}`
+                    // fallback below — purely additive/widening, never narrows an
+                    // existing `types_compatible` result.
+                    "min" | "max" if args.len() == 1 => {
+                        match infer_expr_ty(&args[0], locals, ctx) {
+                            Ty::List(elem) | Ty::Set(elem) | Ty::Iterator(elem) => *elem,
+                            _ => Ty::Unknown,
+                        }
+                    }
                     n => {
                         // A class constructor yields an instance; a named user
                         // function yields its declared return type; a func-VALUED
@@ -454,13 +479,29 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
             };
             Ty::Dict(Box::new(field_ty(key)), Box::new(field_ty(val)))
         }
-        Expr::Index { obj, .. } => {
+        Expr::Index { obj, idx, .. } => {
             // D1: a Str receiver yields Str (codegen lacks this arm). Dict[k] is
             // the value type; List[i] is the element type.
             match infer_expr_ty(obj, locals, ctx) {
                 Ty::Dict(_, val_ty) => *val_ty,
                 Ty::List(elem_ty) => *elem_ty,
                 Ty::Str => Ty::Str,
+                // (CARD a40d603e) A Tuple receiver with a LITERAL integer index
+                // selects that field's type — mirrors codegen's `emit_expr` Index
+                // arm, which lowers `t[N]` (N a literal) to Rust field access
+                // (`.N`). Without this arm, a CHAINED tuple index (`t[0][1]`)
+                // left the inner `t[0]` untyped (`Unknown`) here, so the outer
+                // index's receiver type was lost and codegen's tuple-vs-list
+                // dispatch fell through to the list-indexing path for a
+                // non-Vec tuple field — a raw rustc E0599/E0308 leak, not an
+                // honest pyrst error. A non-literal index has no single result
+                // type for a fixed-size Rust tuple; stay permissively `Unknown`
+                // here (the pure oracle never errors) — `check_expr`'s own
+                // Index arm is the one that REJECTS it honestly.
+                Ty::Tuple(elems) => match idx.as_ref() {
+                    Expr::Int(n, _) => elems.get(*n as usize).cloned().unwrap_or(Ty::Unknown),
+                    _ => Ty::Unknown,
+                },
                 _ => Ty::Unknown,
             }
         }
@@ -1759,6 +1800,37 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
             if matches!(obj_ty, Ty::Iterator(_)) {
                 return Err(iterator_materialize_error(
                     "is not subscriptable (no random access)", "list(g)[i]", *span));
+            }
+            // (CARD a40d603e) A tuple compiles to a fixed-size, heterogeneous Rust
+            // tuple — only a LITERAL integer index has a single well-defined
+            // field type, and codegen's `emit_expr` Index arm only lowers that
+            // literal-int-on-Tuple shape (to `.N` field access). Python allows a
+            // dynamic `t[i]` (raising `IndexError` at runtime for an out-of-range
+            // `i`), but pyrst cannot: reject a non-literal or out-of-range index
+            // here with a clear pyrst-level message instead of leaking the raw
+            // rustc error a non-literal index previously fell through to (the
+            // list-indexing path applied to a non-`Vec` tuple field).
+            if let Ty::Tuple(elems) = &obj_ty {
+                return match idx.as_ref() {
+                    Expr::Int(n, _) if *n >= 0 && (*n as usize) < elems.len() => {
+                        Ok(elems[*n as usize].clone())
+                    }
+                    Expr::Int(n, _) => Err(Error::Type {
+                        span: *span,
+                        msg: format!(
+                            "tuple index {} out of range for a {}-element tuple",
+                            n, elems.len()
+                        ),
+                    }),
+                    _ => Err(Error::Type {
+                        span: *span,
+                        msg: "tuple index must be a literal integer (e.g. `t[0]`); \
+                              pyrst compiles a tuple to a fixed-size Rust tuple, so a \
+                              dynamic index (`t[i]`) has no single field type — Python \
+                              allows this at runtime but pyrst cannot"
+                            .to_string(),
+                    }),
+                };
             }
             match obj_ty {
                 Ty::List(inner) => *inner,

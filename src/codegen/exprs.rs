@@ -942,7 +942,16 @@ impl<'a> Codegen<'a> {
                         "min" => {
                             if let Some((_, key_expr)) = kwargs.iter().find(|(n, _)| n == "key") {
                                 // min with key parameter
-                                let a = self.emit_expr(&args[0])?;
+                                // (CARD bd2bd472) `emit_expr` on a variable source
+                                // emits it BARE, so `let __list = {a};` below MOVED
+                                // it — reusing the source after `min(xs, key=..)`
+                                // hit a genuine E0382, unlike `sorted`'s key= arm
+                                // (which explicitly `.clone()`s its list source).
+                                // Route through the shared ownership-decision point
+                                // (`emit_consuming`: `.clone()` a reusable place,
+                                // bare for an owned temp) so the source stays
+                                // usable afterward, matching Python value semantics.
+                                let a = self.emit_consuming(&args[0])?;
                                 // Check if key_expr is a Lambda to handle it specially
                                 let key_code = if let Expr::Lambda { params, body, .. } = key_expr {
                                     // Lambda: extract parameter name and body, rename param to __x
@@ -1013,7 +1022,12 @@ impl<'a> Codegen<'a> {
                         "max" => {
                             if let Some((_, key_expr)) = kwargs.iter().find(|(n, _)| n == "key") {
                                 // max with key parameter
-                                let a = self.emit_expr(&args[0])?;
+                                // (CARD bd2bd472) See the `min` key= arm above: route
+                                // through `emit_consuming` so a reusable source
+                                // variable is cloned (not moved) into `__list`,
+                                // matching `sorted`'s clone convention and Python
+                                // value semantics (reuse-after works).
+                                let a = self.emit_consuming(&args[0])?;
                                 // Check if key_expr is a Lambda to handle it specially
                                 let key_code = if let Expr::Lambda { params, body, .. } = key_expr {
                                     // Lambda: extract parameter name and body, rename param to __x

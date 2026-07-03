@@ -1,0 +1,10 @@
+2.0
+4.0
+2.3
+76.0
+91.5
+['banana', 'kiwi', 'fig', 'date']
+fig
+banana
+fig
+['banana', 'kiwi', 'fig', 'date']

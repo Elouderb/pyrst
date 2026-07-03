@@ -1,0 +1,45 @@
+# CARD a40d603e: indexing into a tuple ELEMENT of a tuple (`t[0][1]` where
+# `t: tuple[tuple[int, str], int]`) leaked a raw rustc error.
+#
+# ROOT CAUSE: `infer_expr_ty` (the pure inference oracle codegen's
+# `type_of_expr` delegates to) had NO `Ty::Tuple` case in its `Index` arm at
+# all — a Tuple receiver always fell to `Unknown`, discarding the LITERAL
+# index needed to pick a field's type. For a single-level `t[0]` this was
+# invisible: codegen's own `emit_expr` Index arm special-cases a literal-int
+# index on a `Ty::Tuple` receiver directly (computed by calling
+# `type_of_expr` on the receiver EXPRESSION, i.e. the plain `Ident` `t`,
+# which the oracle already types correctly via `locals`). But for the outer
+# index of `t[0][1]`, the receiver is `t[0]` itself — an `Index` expression —
+# and the oracle's missing Tuple arm meant `type_of_expr(t[0])` was always
+# `Unknown`, so the outer `[1]` fell through to the LIST-indexing lowering
+# (`__py_list_get`/bounds-checked clone) applied to a non-`Vec` tuple field —
+# raw rustc E0599/E0308 at build, with `pyrst check` silently accepting it.
+#
+# FIX: the oracle's `Index` arm now reads the literal index off a `Tuple`
+# receiver and returns that field's type (recursing correctly through a
+# chained index), so codegen's tuple-vs-list dispatch sees the right
+# receiver type at every level. `check_expr` (the user-facing typechecker)
+# gained the matching case too, REJECTING a non-literal or out-of-range
+# tuple index with a clear pyrst-level message instead of the same raw
+# rustc leak (Python allows a dynamic `t[i]` at runtime; pyrst's tuples are
+# fixed-size Rust tuples and cannot).
+#
+# Every line below is python3-verified.
+def main() -> None:
+    t: tuple[tuple[int, str], int] = ((1, "a"), 99)
+    # python3: a / 1 / 99 / (1, 'a') / ((1, 'a'), 99)
+    print(t[0][1])
+    print(t[0][0])
+    print(t[1])
+    print(t[0])
+    print(t)
+
+    # Mixed types on both sides of the outer tuple, nested two ways.
+    pair: tuple[tuple[float, bool], tuple[str, int]] = ((3.5, True), ("z", 7))
+    # python3: 3.5 / True / z / 7
+    print(pair[0][0])
+    print(pair[0][1])
+    print(pair[1][0])
+    print(pair[1][1])
+
+main()

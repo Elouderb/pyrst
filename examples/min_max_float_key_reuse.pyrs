@@ -1,0 +1,61 @@
+# CARD bd2bd472: two pre-existing min/max gaps, fixed together.
+#
+# (1) `infer_expr_ty` (the pure inference oracle `type_of_expr` delegates to)
+# had NO arm for a bare `min`/`max` call — it fell through to the generic
+# `ctx.funcs.get("min"/"max")` path, whose hardcoded builtin `FuncSig`
+# declares `ret: Ty::Unknown` unconditionally (it only models the 2-arg
+# scalar shape). So `print(min([4.0, 2.0]))` inferred `Unknown` for the
+# call and skipped `__py_fmt_float` formatting, printing Rust's raw `{}`
+# Display of a whole `f64` — "2" — instead of Python's "2.0". This affected
+# every downstream use of a min/max RESULT: a direct `print(min(xs))`, and
+# an un-annotated local (`m = min(xs)`) whose own type comes from this same
+# oracle. Fixed by mirroring `check_expr`'s already-correct single-iterable
+# min/max typing (element type of the List/Set/Iterator argument) in the
+# oracle too — a `key=` kwarg doesn't change the RESULT's type (the winning
+# element is still a member of the source), so this covers both forms.
+#
+# (2) min/max's `key=` codegen lowered its source with a bare `let __list =
+# {a};`, which MOVED a variable source (unlike `sorted`'s key= arm, which
+# explicitly `.clone()`s it) — reusing the source list after `min(xs,
+# key=..)` hit a genuine E0382 "use of moved value". Fixed by routing the
+# source through `emit_consuming` (the shared ownership-decision point:
+# `.clone()` a reusable place, bare for an owned temp), matching `sorted`'s
+# convention and Python's value semantics.
+#
+# Every line below is python3-verified.
+def main() -> None:
+    # (1) Whole-number float results must still print with a trailing
+    # ".0" (python3: "2.0" / "4.0"), and a non-whole result is unaffected.
+    print(min([4.0, 2.0]))
+    print(max([4.0, 2.0]))
+    print(min([4.5, 2.3]))
+
+    # The same oracle drives an UN-ANNOTATED local's type, not just a
+    # direct print(min(...)) — this is the exact shape that silently
+    # miscompiled 5 unrelated pre-existing goldens (grade_processor,
+    # inventory_system, product_catalog, weather_analyzer, employee_system),
+    # each corrected in this same card.
+    scores: list[float] = [88.0, 91.5, 80.0, 76.0]
+    lowest_score = min(scores)
+    highest_score = max(scores)
+    # python3: 76.0 / 91.5
+    print(lowest_score)
+    print(highest_score)
+
+    # (2) key= reuse-after: `words` must stay usable (not moved) across
+    # BOTH a min(..., key=..) and a max(..., key=..) call, and a second
+    # min(..., key=..) call on the same variable.
+    words: list[str] = ["banana", "kiwi", "fig", "date"]
+    shortest = min(words, key=lambda w: len(w))
+    longest = max(words, key=lambda w: len(w))
+    # python3: ['banana', 'kiwi', 'fig', 'date'] / fig / banana
+    print(words)
+    print(shortest)
+    print(longest)
+    also_shortest = min(words, key=lambda w: len(w))
+    # python3: fig
+    print(also_shortest)
+    # python3: ['banana', 'kiwi', 'fig', 'date'] (still intact, not moved)
+    print(words)
+
+main()

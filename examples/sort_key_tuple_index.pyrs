@@ -12,22 +12,23 @@
 # reversed comparator (`reverse=True` on equal keys must NOT flip their
 # relative order).
 #
-# `min`/`max` results are captured into an EXPLICITLY typed variable rather
-# than printed directly: `infer_expr_ty` (the pure oracle, distinct from
-# `check_expr`) has no arm for a bare `min`/`max` call at all, so
-# `type_of_expr` of the CALL ITSELF is `Unknown` regardless of this card's
-# fix — printing it directly falls to raw `{}` Display, which doesn't
-# compile against a tuple. An explicit annotation (`: tuple[int, str] =`)
-# sources the variable's type from the ANNOTATION, not that oracle gap
-# (see `Stmt::Assign`'s `Some(t)` arm), so it prints correctly via
-# `.py_repr()`. That oracle gap is separate/pre-existing/out of scope here
-# (it also affects plain `min`/`max` with no `key=` at all) — noted for a
-# follow-up card rather than fixed in this one, since patching it changes
-# float-formatting behavior for unrelated existing goldens. Each variable
-# gets its OWN fresh list literal (not shared with `pairs`) because
-# codegen's min/max `key=` lowering MOVES its source instead of cloning it
-# (unlike `sorted`'s, which clones) — a separate, pre-existing, also
-# out-of-scope gap. Every expected line below is python3-verified.
+# `min`/`max` results were originally captured into an EXPLICITLY typed
+# variable rather than printed directly, because AT THE TIME `infer_expr_ty`
+# (the pure oracle, distinct from `check_expr`) had no arm for a bare
+# `min`/`max` call at all, and each variable used its OWN fresh list literal
+# (not shared with `pairs`) because min/max's `key=` codegen MOVED its
+# source instead of cloning it. Both gaps were carded here as follow-ups and
+# have since been FIXED by CARD bd2bd472: the oracle now types a bare
+# `min`/`max` call as its source's element type (so `print(min(xs))`
+# formats correctly, e.g. a whole-number float prints "2.0" not "2"), and
+# the `key=` lowering now routes its source through `emit_consuming` (clones
+# a reusable place, same convention as `sorted`), so the source stays usable
+# afterward. The explicit annotations and per-call fresh lists below are
+# harmless now but no longer load-bearing — kept as-is here since this
+# file's job is CARD 55343eaa's original tuple-indexing fix; see
+# `min_max_float_key_reuse.pyrs` for a direct golden of the bd2bd472 fixes
+# (bare min/max float formatting + key= reuse-after-call). Every expected
+# line below is python3-verified.
 def main() -> None:
     pairs: list[tuple[int, str]] = [(3, "c"), (1, "a"), (1, "b"), (2, "z")]
 

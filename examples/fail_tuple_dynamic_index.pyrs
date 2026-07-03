@@ -1,0 +1,10 @@
+# CARD a40d603e: a tuple compiles to a fixed-size, heterogeneous Rust tuple,
+# so only a LITERAL integer index has a single well-defined field type.
+# Python allows a dynamic `t[i]` at runtime (raising IndexError if `i` is
+# out of range); pyrst cannot represent it, and previously left this to a
+# raw rustc build error (E0308: `&[_]` expected, found `&(i64, String)`)
+# instead of rejecting it honestly at `check`. Must be rejected here.
+def main() -> None:
+    t: tuple[int, str] = (1, "a")
+    i: int = 0
+    print(t[i])

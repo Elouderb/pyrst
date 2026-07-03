@@ -9,6 +9,27 @@
 #
 # Exit code: 0 only when all sections pass.
 # No set -e: failures are counted and reported at the end.
+#
+# ── Parity convention (docs/design/stdlib-full.md §G, card a758c958) ────────
+# Any examples/parity_*.pyrs is a DUAL-RUN parity test: the same source is
+# built+run under the pyrst binary AND executed, unmodified, under python3 —
+# CPython becomes the golden oracle instead of a hand-written expected/*.txt.
+#   - The python3 side execs the SAME .pyrs file with the literal line
+#     `from __future__ import annotations` (PEP 563) prepended, which
+#     stringizes every annotation (Mut[T], Iterator[T], PEP 695 `def f[T]`,
+#     ...) so pyrst-only syntax is never evaluated by the Python parser; then
+#     `main()` is invoked explicitly (no `if __name__` guard is used/needed).
+#   - Byte-for-byte stdout mismatch between the two runs FAILS the suite.
+#   - A parity_*.pyrs file that cannot run under real python3 (uses
+#     `@extern`/`@crate`, which have no Python meaning) opts OUT of the
+#     dual-run with an explicit `# parity: pyrst-only` comment anywhere in
+#     the file. It still gets an ordinary pyrst golden via Section 1; the
+#     parity section COUNTS and LISTS it as SKIPPED — never silently dropped.
+#   - Convention: a parity_*.pyrs SHOULD also ship an examples/expected/*.txt
+#     so Section 1 exercises it too, as a normal positive golden — double
+#     coverage (once vs. a pinned file, once vs. live python3).
+#   - python3 is a HARD REQUIREMENT for this section; if absent, the section
+#     fails loudly (see below) rather than silently skipping parity coverage.
 
 BIN="$(cd "$(dirname "$0")" && pwd)/target/release/pyrst"
 EXAMPLES="$(cd "$(dirname "$0")" && pwd)/examples"
@@ -247,6 +268,88 @@ else
     fi
 fi
 
+# ── 4c. PARITY (dual-run pyrst vs. python3, docs/design/stdlib-full.md §G) ───
+# See the "Parity convention" comment block at the top of this file.
+
+parity_count=0
+parity_passed=0
+parity_skipped=0
+parity_skipped_names=()
+parity_failures=()
+parity_fatal=0
+
+if ! command -v python3 >/dev/null 2>&1; then
+    echo ""
+    echo "PARITY: FATAL — python3 not found on PATH. The parity harness"
+    echo "requires python3 to act as the CPython golden oracle (§G); this is"
+    echo "a hard failure, not a silent skip. Install python3 and re-run."
+    parity_fatal=1
+    for f in "$EXAMPLES"/parity_*.pyrs; do
+        [[ -e "$f" ]] || continue
+        parity_count=$((parity_count + 1))
+        parity_failures+=("$(basename "$f" .pyrs):python3-missing")
+    done
+else
+    for f in "$EXAMPLES"/parity_*.pyrs; do
+        [[ -e "$f" ]] || continue
+        base=$(basename "$f" .pyrs)
+        parity_count=$((parity_count + 1))
+
+        if grep -q '# parity: pyrst-only' "$f"; then
+            echo "SKIPPED [parity: pyrst-only]: $base"
+            parity_skipped=$((parity_skipped + 1))
+            parity_skipped_names+=("$base")
+            continue
+        fi
+
+        # pyrst side: build + run (mirrors Section 1's build/run handling).
+        stderr_out=$(timeout 30 "$BIN" build "$f" 2>&1 >/dev/null)
+        build_exit=$?
+        if [[ $build_exit -ne 0 ]]; then
+            echo "FAIL [parity build exit $build_exit]: $base"
+            parity_failures+=("$base")
+            rm -f "$base" "$base.rs"
+            continue
+        fi
+
+        pyrst_out=$(timeout 5 ./"$base" 2>/dev/null)
+        run_exit=$?
+        rm -f "$base" "$base.rs"
+        if [[ $run_exit -ne 0 ]]; then
+            echo "FAIL [parity run exit $run_exit]: $base"
+            parity_failures+=("$base")
+            continue
+        fi
+
+        # python3 side: the SAME source, `from __future__ import annotations`
+        # prepended, exec'd, then main() called explicitly — replicates the
+        # proven scratchpad/probes2 prototype invocation exactly, just with
+        # the literal filename swapped for $f.
+        py_out=$(timeout 10 python3 -c "src='from __future__ import annotations\n'+open('$f').read(); g={}; exec(compile(src,'$f','exec'),g); g['main']()" 2>&1)
+        py_exit=$?
+        if [[ $py_exit -ne 0 ]]; then
+            echo "FAIL [parity python3 exit $py_exit]: $base"
+            printf '%s\n' "$py_out" | head -20
+            parity_failures+=("$base")
+            continue
+        fi
+
+        if [[ "$pyrst_out" == "$py_out" ]]; then
+            parity_passed=$((parity_passed + 1))
+        else
+            echo "FAIL [parity mismatch pyrst vs python3]: $base"
+            diff <(printf '%s\n' "$pyrst_out") <(printf '%s\n' "$py_out") | head -20
+            parity_failures+=("$base")
+        fi
+    done
+fi
+
+echo ""
+if [[ ${#parity_skipped_names[@]} -gt 0 ]]; then
+    echo "PARITY SKIPPED (pyrst-only, ${#parity_skipped_names[@]}): ${parity_skipped_names[*]}"
+fi
+echo "PARITY: $parity_passed / $parity_count"
+
 # ── SUMMARY ──────────────────────────────────────────────────────────────────
 
 echo ""
@@ -256,9 +359,10 @@ echo "NEGATIVES (build):      $neg_ok / $neg_count"
 echo "NEGATIVES (typeck):     $typeck_ok / $typeck_count"
 echo "MULTI_FILE_DEMO:        $multi_ok / 1"
 echo "MULTI_FILE_NEGATIVE:    $multi_neg_ok / 1"
+echo "PARITY:                 $parity_passed / $parity_count (skipped: $parity_skipped)"
 echo "══════════════════════════════════════════════"
 
-total_failures=$(( ${#pos_failures[@]} + ${#neg_build_failures[@]} + ${#typeck_failures[@]} + ${#multi_failures[@]} + ${#multi_neg_failures[@]} ))
+total_failures=$(( ${#pos_failures[@]} + ${#neg_build_failures[@]} + ${#typeck_failures[@]} + ${#multi_failures[@]} + ${#multi_neg_failures[@]} + ${#parity_failures[@]} ))
 
 if [[ $total_failures -gt 0 ]]; then
     echo ""
@@ -268,6 +372,7 @@ if [[ $total_failures -gt 0 ]]; then
     for name in "${typeck_failures[@]}"; do echo "  [typeck-leak] $name"; done
     for name in "${multi_failures[@]}"; do echo "  [multi-file] $name"; done
     for name in "${multi_neg_failures[@]}"; do echo "  [multi-file-negative] $name"; done
+    for name in "${parity_failures[@]}"; do echo "  [parity] $name"; done
     echo ""
     exit 1
 fi

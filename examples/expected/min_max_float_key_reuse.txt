@@ -21,3 +21,9 @@ apple
 banana
 banana
 apple
+caught: min() iterable argument is empty
+caught: max() iterable argument is empty
+caught: min() iterable argument is empty
+caught: max() iterable argument is empty
+caught: min() iterable argument is empty
+0

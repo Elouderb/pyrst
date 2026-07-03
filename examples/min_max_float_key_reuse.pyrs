@@ -57,9 +57,30 @@
 # non-Copy arg (str/object). Fixed by routing both args through
 # `emit_consuming` (a Copy arg is unaffected).
 #
+# SECOND REVIEW FOLLOW-UP (release-gating: the re-review of the first
+# follow-up found the `.unwrap_or_default()`/`.unwrap_or(0)` pattern —
+# pre-existing in every min/max lowering site, but newly REACHABLE for
+# strings once (4) made `list[str]` min/max build at all — silently
+# returns the element type's default (`0`, `""`, `f64::INFINITY`/
+# `NEG_INFINITY` for the float loop) for an EMPTY source, where Python
+# raises `ValueError("min()/max() iterable argument is empty")`. Fixed
+# EVERY min/max emission site (key= fold, no-key list/generator, both
+# Int/Str/Bool `.min()`/`.max()` and the Float manual loop) to instead
+# `panic!("ValueError\0min()/max() iterable argument is empty")` — the
+# same NUL-delimited "Type\0msg" convention every other builtin runtime
+# error already uses, so it is a catchable `except ValueError` like the
+# others (uncaught: a clean "ValueError <msg>" panic line + nonzero exit,
+# verified manually, not in this golden since a positive golden must exit
+# 0). `sum([])` is intentionally UNCHANGED — Python's `sum()` of an empty
+# iterable returns `0`, not an error, confirmed against python3.
+#
 # Every line below is python3-verified.
 def word_len(s: str) -> int:
     return len(s)
+
+def gen_range(n: int) -> Iterator[int]:
+    for i in range(n):
+        yield i
 
 def main() -> None:
     # (1) Whole-number float results must still print with a trailing
@@ -132,5 +153,44 @@ def main() -> None:
     print(hi)
     print(a)
     print(b)
+
+    # (7) min([])/max([]) raise a catchable ValueError instead of silently
+    # returning a type default — plain, key=, and a generator source (both
+    # a FRESH empty generator call and an already-DRAINED generator
+    # variable are "empty" the same way sum()/... treat it).
+    empty_ints: list[int] = []
+    empty_strs: list[str] = []
+    try:
+        print(min(empty_ints))
+    except ValueError as e:
+        # python3: min() iterable argument is empty
+        print(f"caught: {e}")
+    try:
+        print(max(empty_ints))
+    except ValueError as e:
+        # python3: max() iterable argument is empty
+        print(f"caught: {e}")
+    try:
+        print(min(empty_strs, key=lambda w: len(w)))
+    except ValueError as e:
+        # python3: min() iterable argument is empty
+        print(f"caught: {e}")
+    try:
+        print(max(gen_range(0)))
+    except ValueError as e:
+        # python3: max() iterable argument is empty (fresh empty generator)
+        print(f"caught: {e}")
+    drained = gen_range(3)
+    for _ in drained:
+        pass
+    try:
+        print(min(drained))
+    except ValueError as e:
+        # python3: min() iterable argument is empty (drained generator)
+        print(f"caught: {e}")
+
+    # sum([]) is NOT an error — Python returns 0, unchanged here.
+    # python3: 0
+    print(sum(empty_ints))
 
 main()

@@ -1009,8 +1009,18 @@ impl<'a> Codegen<'a> {
                                 // A side benefit: `<`/`>` need only `PartialOrd`
                                 // (not the `Ord` `min_by_key`/`max_by_key`
                                 // require), so a FLOAT-valued key now compiles too.
+                                // (REVIEW FOLLOW-UP on 88e91b4) `min([])`/an empty
+                                // key= source must be a CATCHABLE `ValueError`
+                                // ("min() iterable argument is empty", matching
+                                // CPython verbatim), not a silent type default —
+                                // `unwrap_or_default()` returned `""`/`0` for an
+                                // empty source instead. `unwrap_or_else(|| panic!(
+                                // "ValueError\0..."))` matches the NUL-delimited
+                                // "Type\0msg" convention the try/except dispatcher
+                                // and every other builtin runtime error already use
+                                // (see `__py_int_from_str` etc.).
                                 return Ok(Some(format!(
-                                    "{{ let __list = {}; let mut __best: Option<(_, _)> = None; for __ref in __list.iter() {{ let __x = __ref.clone(); let __k = {}; let __take = match &__best {{ None => true, Some((__bk, _)) => __k < *__bk }}; if __take {{ __best = Some((__k, __x)); }} }} __best.map(|(_, __v)| __v).unwrap_or_default() }}",
+                                    "{{ let __list = {}; let mut __best: Option<(_, _)> = None; for __ref in __list.iter() {{ let __x = __ref.clone(); let __k = {}; let __take = match &__best {{ None => true, Some((__bk, _)) => __k < *__bk }}; if __take {{ __best = Some((__k, __x)); }} }} __best.map(|(_, __v)| __v).unwrap_or_else(|| panic!(\"ValueError\\0min() iterable argument is empty\")) }}",
                                     a, key_code
                                 )));
                             } else if args.len() == 1 {
@@ -1023,24 +1033,26 @@ impl<'a> Codegen<'a> {
                                 // (LAZY-GEN V1-c) A generator source (`Gen<T>`)
                                 // yields OWNED elements directly — no `.iter()`
                                 // (`Gen` has none) and no `&`/deref on `__x`.
+                                // (REVIEW FOLLOW-UP on 88e91b4) Both the Float loop
+                                // and the non-Float `.min()` must raise the same
+                                // catchable ValueError on an empty source instead
+                                // of silently returning `f64::INFINITY`/`0` — see
+                                // the note on the key= fold above.
                                 if matches!(arg_ty, Ty::Iterator(_)) {
                                     let src = Self::iter_arg_source(&args[0], &a);
                                     return Ok(Some(match elem_ty {
-                                        Ty::Float => format!("{{ let mut __min = f64::INFINITY; for __x in {} {{ if __x < __min {{ __min = __x; }} }} __min }}", src),
-                                        _ => format!("{}.min().unwrap_or(0)", src),
+                                        Ty::Float => format!("{{ let mut __min = f64::INFINITY; let mut __seen = false; for __x in {} {{ __seen = true; if __x < __min {{ __min = __x; }} }} if !__seen {{ panic!(\"ValueError\\0min() iterable argument is empty\"); }} __min }}", src),
+                                        _ => format!("{}.min().unwrap_or_else(|| panic!(\"ValueError\\0min() iterable argument is empty\"))", src),
                                     }));
                                 }
                                 // (REVIEW FOLLOW-UP on 577b04f, item 2) `.copied()`
                                 // requires `Copy`, which a non-Copy element type
                                 // (e.g. `str`) does not implement — `.cloned()`
                                 // requires only `Clone` and covers both Copy and
-                                // non-Copy element types uniformly. `.unwrap_or(0)`
-                                // likewise only typechecks for an Int element;
-                                // `.unwrap_or_default()` works for Int (0), Str
-                                // (""), and Bool (false) alike.
+                                // non-Copy element types uniformly.
                                 return Ok(Some(match elem_ty {
-                                    Ty::Float => format!("{{ let mut __min = f64::INFINITY; for __x in {}.iter() {{ if __x < &__min {{ __min = *__x; }} }} __min }}", a),
-                                    _ => format!("{}.iter().cloned().min().unwrap_or_default()", a),
+                                    Ty::Float => format!("{{ let mut __min = f64::INFINITY; let mut __seen = false; for __x in {}.iter() {{ __seen = true; if __x < &__min {{ __min = *__x; }} }} if !__seen {{ panic!(\"ValueError\\0min() iterable argument is empty\"); }} __min }}", a),
+                                    _ => format!("{}.iter().cloned().min().unwrap_or_else(|| panic!(\"ValueError\\0min() iterable argument is empty\"))", a),
                                 }));
                             } else {
                                 // (REVIEW FOLLOW-UP on 577b04f, item 4) The 2-arg
@@ -1115,8 +1127,12 @@ impl<'a> Codegen<'a> {
                                 // helper-function-in-key-body E0308, and needs
                                 // only `PartialOrd` (not `Ord`), so a float key
                                 // now compiles too.
+                                // (REVIEW FOLLOW-UP on 88e91b4) See the `min` key=
+                                // arm above: an empty source must raise a catchable
+                                // ValueError ("max() iterable argument is empty",
+                                // matching CPython), not silently default.
                                 return Ok(Some(format!(
-                                    "{{ let __list = {}; let mut __best: Option<(_, _)> = None; for __ref in __list.iter() {{ let __x = __ref.clone(); let __k = {}; let __take = match &__best {{ None => true, Some((__bk, _)) => __k > *__bk }}; if __take {{ __best = Some((__k, __x)); }} }} __best.map(|(_, __v)| __v).unwrap_or_default() }}",
+                                    "{{ let __list = {}; let mut __best: Option<(_, _)> = None; for __ref in __list.iter() {{ let __x = __ref.clone(); let __k = {}; let __take = match &__best {{ None => true, Some((__bk, _)) => __k > *__bk }}; if __take {{ __best = Some((__k, __x)); }} }} __best.map(|(_, __v)| __v).unwrap_or_else(|| panic!(\"ValueError\\0max() iterable argument is empty\")) }}",
                                     a, key_code
                                 )));
                             } else if args.len() == 1 {
@@ -1129,19 +1145,23 @@ impl<'a> Codegen<'a> {
                                 // (LAZY-GEN V1-c) See the `min` arm above: a
                                 // generator source yields OWNED elements — no
                                 // `.iter()`/deref.
+                                // (REVIEW FOLLOW-UP on 88e91b4) See the `min` arm
+                                // above: raise a catchable ValueError on an empty
+                                // source instead of silently returning
+                                // `f64::NEG_INFINITY`/`0`.
                                 if matches!(arg_ty, Ty::Iterator(_)) {
                                     let src = Self::iter_arg_source(&args[0], &a);
                                     return Ok(Some(match elem_ty {
-                                        Ty::Float => format!("{{ let mut __max = f64::NEG_INFINITY; for __x in {} {{ if __x > __max {{ __max = __x; }} }} __max }}", src),
-                                        _ => format!("{}.max().unwrap_or(0)", src),
+                                        Ty::Float => format!("{{ let mut __max = f64::NEG_INFINITY; let mut __seen = false; for __x in {} {{ __seen = true; if __x > __max {{ __max = __x; }} }} if !__seen {{ panic!(\"ValueError\\0max() iterable argument is empty\"); }} __max }}", src),
+                                        _ => format!("{}.max().unwrap_or_else(|| panic!(\"ValueError\\0max() iterable argument is empty\"))", src),
                                     }));
                                 }
                                 // (REVIEW FOLLOW-UP on 577b04f, item 2) See the
-                                // `min` arm above: `.cloned()`/`.unwrap_or_default()`
-                                // work for both Copy and non-Copy element types.
+                                // `min` arm above: `.cloned()` works for both Copy
+                                // and non-Copy element types.
                                 return Ok(Some(match elem_ty {
-                                    Ty::Float => format!("{{ let mut __max = f64::NEG_INFINITY; for __x in {}.iter() {{ if __x > &__max {{ __max = *__x; }} }} __max }}", a),
-                                    _ => format!("{}.iter().cloned().max().unwrap_or_default()", a),
+                                    Ty::Float => format!("{{ let mut __max = f64::NEG_INFINITY; let mut __seen = false; for __x in {}.iter() {{ __seen = true; if __x > &__max {{ __max = *__x; }} }} if !__seen {{ panic!(\"ValueError\\0max() iterable argument is empty\"); }} __max }}", a),
+                                    _ => format!("{}.iter().cloned().max().unwrap_or_else(|| panic!(\"ValueError\\0max() iterable argument is empty\"))", a),
                                 }));
                             } else {
                                 // (REVIEW FOLLOW-UP on 577b04f, item 4) See the

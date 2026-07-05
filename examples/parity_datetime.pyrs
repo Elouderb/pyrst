@@ -1,0 +1,421 @@
+# Parity test for lib/datetime.pyrs (card 672deb3b, docs/design/w2-dossiers/
+# datetime.md PARITY PLAN). Dual-run under both the pyrst binary and
+# python3's REAL `datetime` module — `from datetime import ...` resolves to
+# lib/datetime.pyrs under pyrst and to CPython's own `datetime` under
+# python3.
+#
+# Every line below is chosen to be BYTE-IDENTICAL under both runtimes. See
+# lib/datetime.pyrs's module header for the full divergence list; the
+# specific adaptations made to keep THIS file dual-run-safe are:
+#   - `date.min()`/`.max()`/`.resolution()` (and the `time`/`timedelta`/
+#     `datetime` equivalents) are pyrst-only (parenthesised) — EXCLUDED here,
+#     spot-verified separately.
+#   - `datetime`'s "classmethod" factory API (`datetime.fromisoformat`,
+#     `datetime.combine`, `datetime.strptime`, ...) is NOT importable/callable
+#     here at all: pyrst ships it as free top-level functions
+#     (`datetime_fromisoformat`, `datetime_combine`, `datetime_strptime` —
+#     see lib/datetime.pyrs divergence #12), which are names that DO NOT
+#     EXIST in CPython's real `datetime` module — importing them would make
+#     `from datetime import (...)` itself raise `ImportError` under python3,
+#     killing dual-run for the ENTIRE file, not just those call sites. They
+#     are therefore OMITTED from this file entirely (no import, no call) and
+#     spot-verified separately by running the SAME values through pyrst's
+#     free-function spelling vs. CPython's real `datetime.fromisoformat(...)`
+#     / `.combine(...)` / `.strptime(...)` classmethod spelling in two
+#     side-by-side scripts (see the card history for the transcript — outputs and
+#     `ValueError` messages match byte-for-byte, only the call syntax
+#     differs).
+#   - `date - timedelta` / `datetime - timedelta` use the documented
+#     `x + (-delta)` workaround (divergence #4) instead of `-` directly —
+#     this IS valid, identical CPython too, so it dual-runs unmodified.
+#   - `2 * timedelta(...)` (reflected multiply) is unsupported — reordered
+#     to `timedelta(...) * 2` (divergence #4); same value both ways.
+#   - `timedelta(...) / n` / `// n` are unsupported at all (divergence #5) —
+#     omitted entirely, not reproduced by another spelling.
+#   - Cross-type `==` (`date(...) == time(...)`) does not compile
+#     (divergence #7) — omitted entirely.
+#   - `bool(timedelta())` / truthiness (`__bool__` unsupported) — omitted.
+#   - `timedelta(999999999999999999999 days)` overflows pyrst's i64 at the
+#     LITERAL itself — replaced with the i64-safe `timedelta(days=1000000000)`
+#     (one past the real 999999999 bound), which raises the SAME
+#     `OverflowError` message under both runtimes.
+#   - `today()`/`now()`/`fromtimestamp()`/`ctime()`/locale directives
+#     (`%A`/`%B`/`%p`) are time- or locale-dependent — omitted (same
+#     precedent as lib/time.pyrs's own parity file).
+#   - A constructor call must supply every parameter (positionally or by
+#     keyword) — pyrst's positional-trailing-default omission is broken for
+#     class constructors (a confirmed, separate compiler bug, documented in
+#     lib/datetime.pyrs) — so `time(0, 0, 0, 0)` / `timedelta(0, 0, 0, 0, 0,
+#     0, 0)` spell out every field instead of CPython's bare `time()` /
+#     `timedelta()`; both are equally valid, identical-result CPython syntax
+#     too, so this adaptation stays dual-run-safe.
+#   - Local variables are never named `datetime` (shadowing the imported
+#     class) or reused across scopes in a way that would trip pyrst's
+#     block-scoped-reassignment restriction; `dt`/`dt2`/etc. are used
+#     instead throughout.
+
+from datetime import (
+    date,
+    time,
+    datetime,
+    timedelta
+)
+
+
+def main() -> None:
+    # date construction and attributes
+    d: date = date(2025, 1, 15)
+    print(d.year)
+    print(d.month)
+    print(d.day)
+
+    # date weekday / isocalendar (numeric; no locale dependence)
+    print(d.weekday())
+    print(d.isoweekday())
+    d_iso = d.isocalendar()
+    print(d_iso.year)
+    print(d_iso.week)
+    print(d_iso.weekday)
+
+    # date ordinal (numeric; no locale/platform dependence)
+    print(d.toordinal())
+    print(date.fromordinal(739266))
+
+    # date isocalendar round trip
+    print(date.fromisocalendar(2025, 3, 3))
+
+    # date formatting (ISO and numeric strftime directives)
+    print(d.isoformat())
+    print(date.fromisoformat("2025-01-15"))
+    print(d.strftime("%Y-%m-%d"))
+    print(d.strftime("%Y/%m/%d"))
+    print(d.strftime("%d %m %y"))
+    print(d.strftime("%j"))
+
+    # time construction and attributes
+    t: time = time(14, 30, 45, 123456)
+    print(t.hour)
+    print(t.minute)
+    print(t.second)
+    print(t.microsecond)
+    t_empty: time = time(0, 0, 0, 0)
+    print(t_empty.hour)
+    print(t_empty.minute)
+
+    # time formatting (ISO and numeric strftime directives)
+    print(t.isoformat())
+    print(time.fromisoformat("14:30:45.123456"))
+    t2: time = time(14, 30, 45, 0)
+    print(t2.isoformat())
+    print(time.fromisoformat("14:30:45"))
+    # fromisoformat: CPython-3.12-permissive matrix (date + time, dual-run).
+    # date: extended + basic (compact) forms
+    print(date.fromisoformat("20250115"))
+    print(date.fromisoformat("0001-01-01"))
+    # time: basic (compact), partial (HH / HH:MM / HHMM / HH), fractional after
+    # '.'/',' on ANY component, 1..6 significant digits, >6 truncated, leading T
+    print(time.fromisoformat("123045"))
+    print(time.fromisoformat("12:30"))
+    print(time.fromisoformat("1230"))
+    print(time.fromisoformat("12"))
+    print(time.fromisoformat("000000"))
+    print(time.fromisoformat("12:30:45.123"))
+    print(time.fromisoformat("12:30:45.1"))
+    print(time.fromisoformat("123045.123456"))
+    print(time.fromisoformat("12:30:45,123"))
+    print(time.fromisoformat("T12:30:45"))
+    print(time.fromisoformat("12:30:45.1234567"))
+    print(time.fromisoformat("12:30:45.123456789"))
+    print(time.fromisoformat("12,5"))
+    print(time.fromisoformat("12:00.5"))
+    print(time.fromisoformat("12:30,5"))
+    print(t.strftime("%H:%M:%S"))
+    print(t.strftime("%H:%M:%S.%f"))
+    t3: time = time(9, 5, 3, 0)
+    print(t3.strftime("%H:%M:%S"))
+
+    # datetime construction and attributes
+    dt: datetime = datetime(2025, 1, 15, 14, 30, 45, 123456)
+    print(dt.year)
+    print(dt.month)
+    print(dt.day)
+    print(dt.hour)
+    print(dt.minute)
+    print(dt.second)
+    print(dt.microsecond)
+    dt_date_only: datetime = datetime(2025, 1, 15, 0, 0, 0, 0)
+    print(dt_date_only.hour)
+    print(dt_date_only.minute)
+    print(dt_date_only.second)
+
+    # datetime formatting (ISO and numeric strftime directives)
+    print(dt.isoformat())
+    print(dt_date_only.isoformat())
+    print(dt.strftime("%Y-%m-%d %H:%M:%S"))
+    print(dt.strftime("%Y-%m-%d %H:%M:%S.%f"))
+
+    # datetime component extraction
+    print(dt.date())
+    print(dt.time())
+
+    # datetime weekday (numeric; no locale dependence)
+    print(dt.weekday())
+    print(dt.isoweekday())
+
+    # datetime ordinal and isocalendar (numeric; no locale/platform dependence)
+    print(dt.toordinal())
+
+    # timedelta construction and normalization (numeric; no locale/platform dependence)
+    td: timedelta = timedelta(5, 30, 100, 0, 0, 0, 0)
+    print(td.days)
+    print(td.seconds)
+    print(td.microseconds)
+    td_hours: timedelta = timedelta(0, 0, 0, 0, 0, 25, 0)
+    print(td_hours.days)
+    print(td_hours.seconds)
+    td_micro: timedelta = timedelta(0, 0, 1000000, 0, 0, 0, 0)
+    print(td_micro.days)
+    print(td_micro.seconds)
+    print(td_micro.microseconds)
+    td_empty: timedelta = timedelta(0, 0, 0, 0, 0, 0, 0)
+    print(td_empty.days)
+    print(td_empty.seconds)
+    print(td_empty.microseconds)
+    td_neg: timedelta = timedelta(-5, 0, 0, 0, 0, 2, 0)
+    print(td_neg.days)
+    print(td_neg.seconds)
+
+    # timedelta total_seconds (float output; exact microsecond values)
+    print(timedelta(0, 0, 0, 1500, 0, 0, 0).total_seconds())
+    td_complex: timedelta = timedelta(1, 4, 5, 0, 3, 2, 0)
+    print(td_complex.total_seconds())
+
+    # timedelta arithmetic (numeric; no locale/platform dependence)
+    print(timedelta(5, 0, 0, 0, 0, 0, 0) + timedelta(3, 0, 0, 0, 0, 0, 0))
+    print(timedelta(5, 0, 0, 0, 0, 0, 0) - timedelta(3, 0, 0, 0, 0, 0, 0))
+    print(timedelta(5, 0, 0, 0, 0, 0, 0) * 2)
+    print(-timedelta(5, 0, 0, 0, 0, 0, 0))
+
+    # timedelta comparisons (numeric; no locale/platform dependence)
+    print(timedelta(5, 0, 0, 0, 0, 0, 0) == timedelta(5, 0, 0, 0, 0, 0, 0))
+    print(timedelta(5, 0, 0, 0, 0, 0, 0) < timedelta(10, 0, 0, 0, 0, 0, 0))
+    print(timedelta(5, 0, 0, 0, 0, 0, 0) < timedelta(3, 0, 0, 0, 0, 0, 0))
+
+    # date +/- timedelta (numeric; no locale/platform dependence).
+    # `date - timedelta` uses the documented `+ (-delta)` workaround
+    # (divergence #4) since pyrst's `date.__sub__` is `date - date`.
+    print(date(2025, 1, 15) + timedelta(5, 0, 0, 0, 0, 0, 0))
+    print(date(2025, 1, 15) + (-timedelta(5, 0, 0, 0, 0, 0, 0)))
+
+    # date - date (numeric; no locale/platform dependence)
+    print(date(2025, 1, 20) - date(2025, 1, 15))
+
+    # datetime +/- timedelta (same `+ (-delta)` workaround as date)
+    print(datetime(2025, 1, 15, 10, 30, 0, 0) + timedelta(5, 0, 0, 0, 30, 2, 0))
+    print(datetime(2025, 1, 15, 10, 30, 0, 0) + (-timedelta(5, 0, 0, 0, 30, 2, 0)))
+
+    # datetime - datetime (numeric; no locale/platform dependence)
+    print(datetime(2025, 1, 20, 10, 30, 0, 0) - datetime(2025, 1, 15, 10, 30, 0, 0))
+
+    # date/datetime comparisons (numeric; no locale/platform dependence)
+    print(date(2025, 1, 1) == date(2025, 1, 1))
+    print(date(2025, 1, 1) < date(2025, 1, 2))
+    print(date(2025, 1, 2) > date(2025, 1, 1))
+    print(datetime(2025, 1, 1, 10, 30, 0, 0) == datetime(2025, 1, 1, 10, 30, 0, 0))
+    print(datetime(2025, 1, 1, 10, 30, 0, 0) < datetime(2025, 1, 1, 10, 31, 0, 0))
+
+    # date/time/datetime replace (numeric; no locale/platform dependence)
+    print(date(2025, 1, 15).replace(month=2, day=20))
+    print(time(14, 30, 45, 0).replace(hour=16, minute=45))
+    print(datetime(2025, 1, 15, 14, 30, 45, 0).replace(year=2026, hour=16))
+
+    # Boundary: leap year (no locale/platform dependence)
+    print(date(2024, 2, 29) == date(2024, 2, 29))
+    try:
+        date(2025, 2, 29)
+    except ValueError as e:
+        print(str(e))
+
+    # Construction error messages (re-verified against a live python3 during
+    # authoring)
+    try:
+        date(2025, 13, 1)
+    except ValueError as e:
+        print(str(e))
+    try:
+        date(2025, 0, 1)
+    except ValueError as e:
+        print(str(e))
+    try:
+        date(2025, 1, 0)
+    except ValueError as e:
+        print(str(e))
+    try:
+        date(0, 1, 1)
+    except ValueError as e:
+        print(str(e))
+    try:
+        date(10000, 1, 1)
+    except ValueError as e:
+        print(str(e))
+    try:
+        time(24, 0, 0, 0)
+    except ValueError as e:
+        print(str(e))
+    try:
+        time(0, 60, 0, 0)
+    except ValueError as e:
+        print(str(e))
+    try:
+        time(0, 0, 60, 0)
+    except ValueError as e:
+        print(str(e))
+    try:
+        time(0, 0, 0, 1000000)
+    except ValueError as e:
+        print(str(e))
+    try:
+        datetime(2025, 13, 1, 0, 0, 0, 0)
+    except ValueError as e:
+        print(str(e))
+    try:
+        datetime(2025, 1, 1, 24, 0, 0, 0)
+    except ValueError as e:
+        print(str(e))
+    try:
+        datetime(2025, 1, 1, 0, 0, 60, 0)
+    except ValueError as e:
+        print(str(e))
+    try:
+        datetime(2025, 2, 29, 0, 0, 0, 0)
+    except ValueError as e:
+        print(str(e))
+
+    # fromisoformat / fromisocalendar error messages
+    try:
+        date.fromisoformat("invalid")
+    except ValueError as e:
+        print(str(e))
+    try:
+        date.fromisocalendar(2025, 0, 1)
+    except ValueError as e:
+        print(str(e))
+    try:
+        date.fromisocalendar(2025, 54, 1)
+    except ValueError as e:
+        print(str(e))
+    try:
+        date.fromisocalendar(2025, 1, 0)
+    except ValueError as e:
+        print(str(e))
+    try:
+        date.fromisocalendar(2025, 1, 8)
+    except ValueError as e:
+        print(str(e))
+
+    # fromisoformat: permissive-parser REJECTIONS (format + range), dual-run —
+    # each must raise CPython's exact message on both sides.
+    try:
+        date.fromisoformat("2025-1-1")
+    except ValueError as e:
+        print(str(e))
+    try:
+        date.fromisoformat("2025/01/15")
+    except ValueError as e:
+        print(str(e))
+    try:
+        date.fromisoformat("2025-001")
+    except ValueError as e:
+        print(str(e))
+    try:
+        date.fromisoformat("202501")
+    except ValueError as e:
+        print(str(e))
+    try:
+        date.fromisoformat("2025-13-01")
+    except ValueError as e:
+        print(str(e))
+    try:
+        date.fromisoformat("2025-01-32")
+    except ValueError as e:
+        print(str(e))
+    try:
+        time.fromisoformat("12:30:45.")
+    except ValueError as e:
+        print(str(e))
+    try:
+        time.fromisoformat("12:")
+    except ValueError as e:
+        print(str(e))
+    try:
+        time.fromisoformat("12:30:45.123abc")
+    except ValueError as e:
+        print(str(e))
+    try:
+        time.fromisoformat("25:00:00")
+    except ValueError as e:
+        print(str(e))
+
+    # timedelta overflow (i64-safe input reordering to 1000000000 days;
+    # see header note — same OverflowError message under both runtimes)
+    try:
+        timedelta(1000000000, 0, 0, 0, 0, 0, 0)
+    except OverflowError as e:
+        print(str(e))
+
+    # Arithmetic boundary OverflowError (date.min - 1 day / date.max + 1 day)
+    try:
+        date(9999, 12, 31) + timedelta(1, 0, 0, 0, 0, 0, 0)
+    except OverflowError as e:
+        print(str(e))
+    try:
+        date(1, 1, 1) + (-timedelta(1, 0, 0, 0, 0, 0, 0))
+    except OverflowError as e:
+        print(str(e))
+
+    # ── HARDENING (w2-hardener pass, card 672deb3b) ─────────────────────────
+    # Edge cases probed live against python3 3.12.9 beyond the dossier's own
+    # PARITY PLAN / ERRORS sections; all confirmed byte-identical.
+
+    # timedelta str/repr for a NEGATIVE, sub-day delta (CPython normalizes
+    # `hours=-1` to `days=-1, seconds=82800` -- exercises the day/seconds
+    # split at a small negative magnitude, distinct from the day-only
+    # negative case already covered above).
+    print(timedelta(0, 0, 0, 0, 0, -1, 0))
+    print(repr(timedelta(0, 0, 0, 0, 0, -1, 0)))
+
+    # date.weekday() at the proleptic-Gregorian MINIMUM (year 1, month 1,
+    # day 1) -- CPython's real answer is 0 (Monday); a boundary sanity check
+    # distinct from the ordinary-date weekday case above.
+    print(date(1, 1, 1).weekday())
+
+    # isocalendar() at TWO week-boundary edges the dossier's own PARITY PLAN
+    # does not probe: a January 1st that belongs to the PRIOR ISO year
+    # (2023-01-01 -> ISO week 52 of 2022), and a December 31st that belongs
+    # to ISO week 53 of its OWN year (2020-12-31, a 53-ISO-week year).
+    iso_a = date(2023, 1, 1).isocalendar()
+    print(iso_a.year)
+    print(iso_a.week)
+    print(iso_a.weekday)
+    iso_b = date(2020, 12, 31).isocalendar()
+    print(iso_b.year)
+    print(iso_b.week)
+    print(iso_b.weekday)
+
+    # fromisoformat on an EMPTY string (both date and time) -- the shortest
+    # possible malformed input, not covered by the dossier's "invalid"
+    # (non-empty) case above.
+    try:
+        date.fromisoformat("")
+    except ValueError as e:
+        print(str(e))
+    try:
+        time.fromisoformat("")
+    except ValueError as e:
+        print(str(e))
+
+    # Equality TIES at the finest-grained field (microsecond) for both
+    # `time` and `datetime` -- confirms the full field-by-field `__eq__`
+    # chain, not just whole-object identity, agrees at the boundary.
+    print(time(1, 2, 3, 999) == time(1, 2, 3, 999))
+    print(datetime(2025, 1, 1, 0, 0, 0, 500) == datetime(2025, 1, 1, 0, 0, 0, 500))

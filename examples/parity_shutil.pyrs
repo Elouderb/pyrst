@@ -1,0 +1,253 @@
+# parity: pyrst-only
+# Parity test for lib/shutil.pyrs (card 39bf959a, docs/design/w2-dossiers/
+# fs-trio.md). Seeded from the dossier's §6 PARITY PLAN (python3-verified),
+# with one correction: the dossier's Test 15 claim (move onto an existing
+# plain-file destination raises OSError) was RE-PROBED against live CPython
+# 3.12.9 and found to be wrong — `shutil.move` only pre-checks for a
+# colliding destination when `dst` is a DIRECTORY; onto a plain file it goes
+# straight to `os.rename`, which silently overwrites on POSIX (see
+# lib/shutil.pyrs's header for the verification transcript summary, and
+# the card history for the live-python3 session). This golden asserts the VERIFIED
+# behavior in both directions: overwrite-succeeds for a plain-file
+# destination, and raise-on-collision for a directory destination.
+#
+# `shutil` is `@extern`/`@crate`-backed over `std::fs`/`std::process` with
+# real filesystem side effects, and every helper here is pyrst's flat `os`-
+# style spelling (`os.join`, not `os.path.join`) — neither shape is real
+# Python syntax/namespace, so this is out of literal same-source dual-run
+# scope (same convention as `examples/parity_os.pyrs`). Every assertion below
+# is a DETERMINISTIC fact: file CONTENT after each operation, tree shape
+# after copytree/rmtree, exact CPython-verified error messages, and
+# derived/shape facts for disk_usage (never the machine-specific byte
+# counts). The test creates all scratch state under a fresh `mkdtemp()`
+# directory and removes it before exiting (no leftover state).
+
+from os import mkdir, write_file, read_file, join, path_exists
+from shutil import copyfile, copy, copytree, rmtree, move, disk_usage
+from tempfile import mkdtemp
+
+
+def main() -> None:
+    base: str = mkdtemp(prefix="parity_shutil_")
+
+    # --- copyfile: basic + overwrite ------------------------------------------
+    src: str = join(base, "src.txt")
+    dst: str = join(base, "dst.txt")
+    write_file(src, "hello")
+    copyfile(src, dst)
+    print(read_file(dst))
+    write_file(dst, "old")
+    copyfile(src, dst)
+    print(read_file(dst))
+
+    # --- copy: preserves content, returns dst path ----------------------------
+    dst2: str = join(base, "dst2.txt")
+    ret: str = copy(src, dst2)
+    print(ret == dst2)
+    print(read_file(dst2))
+
+    # --- copy into an existing directory: real_dst = dir/basename(src) -------
+    into_dir: str = join(base, "into_dir")
+    mkdir(into_dir)
+    ret2: str = copy(src, into_dir)
+    print(ret2 == join(into_dir, "src.txt"))
+
+    # --- copytree: basic recursion --------------------------------------------
+    src_tree: str = join(base, "src_tree")
+    mkdir(src_tree)
+    write_file(join(src_tree, "f1.txt"), "f1")
+    mkdir(join(src_tree, "subdir"))
+    write_file(join(join(src_tree, "subdir"), "f2.txt"), "f2")
+    dst_tree: str = join(base, "dst_tree")
+    ret3: str = copytree(src_tree, dst_tree)
+    print(ret3 == dst_tree)
+    print(read_file(join(dst_tree, "f1.txt")))
+    print(read_file(join(join(dst_tree, "subdir"), "f2.txt")))
+
+    # --- copytree: dirs_exist_ok=False on an existing dst -> FileExistsError -
+    existing_dst: str = join(base, "existing_dst")
+    mkdir(existing_dst)
+    try:
+        copytree(src_tree, existing_dst, dirs_exist_ok=False)
+        print("no error")
+    except FileExistsError as e:
+        print(e.replace(base, "<base>"))
+
+    # --- copytree: dirs_exist_ok=True on an existing dst -> succeeds ----------
+    copytree(src_tree, existing_dst, dirs_exist_ok=True)
+    print(read_file(join(existing_dst, "f1.txt")))
+
+    # --- copytree: empty subdirectories are preserved -------------------------
+    empty_tree: str = join(base, "empty_tree")
+    mkdir(empty_tree)
+    mkdir(join(empty_tree, "empty_subdir"))
+    empty_dst: str = join(base, "empty_tree_dst")
+    copytree(empty_tree, empty_dst)
+    print(join(empty_dst, "empty_subdir").replace(base, "<base>"))
+
+    # --- rmtree: removes a populated tree --------------------------------------
+    rm_tree: str = join(base, "rm_tree")
+    mkdir(rm_tree)
+    write_file(join(rm_tree, "file.txt"), "x")
+    mkdir(join(rm_tree, "subdir"))
+    rmtree(rm_tree)
+    print(path_exists(rm_tree))
+
+    # --- rmtree: ignore_errors=True on a missing path -> no error -------------
+    rmtree(join(base, "never_existed"), True)
+    print("rmtree ignore ok")
+
+    # --- rmtree: ignore_errors=False (default) on a missing path -> raises ----
+    try:
+        rmtree(join(base, "never_existed2"))
+        print("no error")
+    except FileNotFoundError as e:
+        print(e.replace(base, "<base>"))
+
+    # --- move: file rename ------------------------------------------------------
+    to_move: str = join(base, "to_move.txt")
+    write_file(to_move, "move me")
+    moved_result: str = move(to_move, join(base, "moved.txt"))
+    print(moved_result.endswith("moved.txt"))
+    print(path_exists(to_move))
+    print(read_file(join(base, "moved.txt")))
+
+    # --- move: file into a directory --------------------------------------------
+    move_into: str = join(base, "move_into_dir.txt")
+    write_file(move_into, "content")
+    dst_dir: str = join(base, "dst_dir")
+    mkdir(dst_dir)
+    moved_result2: str = move(move_into, dst_dir)
+    print(moved_result2.endswith("move_into_dir.txt"))
+    print(read_file(join(dst_dir, "move_into_dir.txt")))
+
+    # --- move: directory rename --------------------------------------------------
+    src_dir_move: str = join(base, "src_dir_move")
+    mkdir(src_dir_move)
+    write_file(join(src_dir_move, "file.txt"), "x")
+    moved_result3: str = move(src_dir_move, join(base, "dst_dir_move"))
+    print(moved_result3.endswith("dst_dir_move"))
+    print(path_exists(src_dir_move))
+    print(read_file(join(join(base, "dst_dir_move"), "file.txt")))
+
+    # --- move: onto an EXISTING PLAIN FILE destination overwrites (verified) --
+    mv_src: str = join(base, "mv_src.txt")
+    mv_dst: str = join(base, "mv_dst.txt")
+    write_file(mv_src, "src-content")
+    write_file(mv_dst, "dst-content")
+    move(mv_src, mv_dst)
+    print(read_file(mv_dst))
+
+    # --- move: onto an existing directory whose real_dst collides -> raises --
+    mv_dir_dst: str = join(base, "mv_dir_dst")
+    mkdir(mv_dir_dst)
+    write_file(join(mv_dir_dst, "collide.txt"), "old")
+    write_file(join(base, "collide.txt"), "new")
+    try:
+        move(join(base, "collide.txt"), mv_dir_dst)
+        print("no error")
+    except OSError as e:
+        print(e.replace(base, "<base>"))
+
+    # --- disk_usage: shape facts only (platform/filesystem-dependent values) --
+    du = disk_usage(base)
+    print(du.total > 0)
+    print(du.used >= 0)
+    print(du.free >= 0)
+    print(du.total >= du.free)
+
+    # --- disk_usage: missing path -> FileNotFoundError ------------------------
+    try:
+        disk_usage(join(base, "does_not_exist"))
+        print("no error")
+    except FileNotFoundError as e:
+        print(e.replace(base, "<base>"))
+
+    # === HARDENING PASS (w2-hardener): edges re-oracled against live CPython 3.12,
+    # beyond the dossier's probed set. Each fixed a real, verified divergence in
+    # lib/shutil.pyrs (see that file's header for the full verification detail). ===
+
+    # --- copyfile: src and dst are the SAME file -> SameFileError (verified) --
+    same_path: str = join(base, "same.txt")
+    write_file(same_path, "unchanged")
+    try:
+        copyfile(same_path, same_path)
+        print("no error")
+    except SameFileError as e:
+        print(e.replace(base, "<base>"))
+    print(read_file(same_path))
+
+    # --- copy: src and dst are the SAME file -> SameFileError (verified) ------
+    try:
+        copy(same_path, same_path)
+        print("no error")
+    except SameFileError as e:
+        print(e.replace(base, "<base>"))
+
+    # --- copyfile: src is a DIRECTORY -> IsADirectoryError (verified) ---------
+    src_is_dir: str = join(base, "src_is_dir")
+    mkdir(src_is_dir)
+    try:
+        copyfile(src_is_dir, join(base, "wont_exist.txt"))
+        print("no error")
+    except IsADirectoryError as e:
+        print(e.replace(base, "<base>"))
+
+    # --- copy: src is a DIRECTORY -> IsADirectoryError (verified) -------------
+    try:
+        copy(src_is_dir, join(base, "wont_exist2.txt"))
+        print("no error")
+    except IsADirectoryError as e:
+        print(e.replace(base, "<base>"))
+
+    # --- copytree: dst exists as a plain FILE -> FileExistsError REGARDLESS of
+    # dirs_exist_ok (verified: os.makedirs(dst, exist_ok=True) still raises when
+    # dst exists as a non-directory; dirs_exist_ok only suppresses the error when
+    # dst is ALREADY a directory) -----------------------------------------------
+    dst_is_file: str = join(base, "dst_is_file.txt")
+    write_file(dst_is_file, "x")
+    try:
+        copytree(src_tree, dst_is_file, dirs_exist_ok=False)
+        print("no error")
+    except FileExistsError as e:
+        print(e.replace(base, "<base>"))
+    try:
+        copytree(src_tree, dst_is_file, dirs_exist_ok=True)
+        print("no error")
+    except FileExistsError as e:
+        print(e.replace(base, "<base>"))
+    print(read_file(dst_is_file))
+
+    # --- copytree: src is a plain FILE, not a directory -> NotADirectoryError -
+    try:
+        copytree(dst_is_file, join(base, "wont_exist3"))
+        print("no error")
+    except NotADirectoryError as e:
+        print(e.replace(base, "<base>"))
+
+    # --- rmtree: path exists but is a plain FILE -> NotADirectoryError --------
+    rm_plain_file: str = join(base, "rm_plain_file.txt")
+    write_file(rm_plain_file, "x")
+    try:
+        rmtree(rm_plain_file)
+        print("no error")
+    except NotADirectoryError as e:
+        print(e.replace(base, "<base>"))
+    print(path_exists(rm_plain_file))
+
+    # --- rmtree: ignore_errors=True on a plain FILE -> silently untouched -----
+    rmtree(rm_plain_file, True)
+    print(path_exists(rm_plain_file))
+
+    # NOTE: rmtree's symlink-safety fix (a path that is ITSELF a symlink to a
+    # directory must be REFUSED, not followed-and-emptied) cannot be exercised
+    # from this parity file — pyrst's `os`/`shutil` surface exposes no
+    # symlink-creation primitive to a pyrst program (only `copytree`'s internal
+    # `_shutil_make_symlink` @extern helper does, and it is private). That fix
+    # was instead verified with an isolated standalone `rustc` repro (see
+    # lib/shutil.pyrs's header and the card history) rather than silently left
+    # unexercised without comment.
+
+    # --- cleanup ----------------------------------------------------------------
+    rmtree(base)
+    print("done")

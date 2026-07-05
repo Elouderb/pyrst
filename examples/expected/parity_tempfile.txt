@@ -1,0 +1,25 @@
+True
+True
+True
+True
+True
+True
+True
+True
+False
+True
+[Errno 2] No such file or directory: '<arena>/no_such_subdir'
+True
+True
+True
+True
+True
+True
+True
+True
+True
+True
+[Errno 2] No such file or directory: '<arena>/no_such_subdir'
+[Errno 20] Not a directory: '<arena>/hard_dir_is_file.txt'
+[Errno 20] Not a directory: '<arena>/hard_dir_is_file.txt'
+done

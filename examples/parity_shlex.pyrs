@@ -1,0 +1,241 @@
+# parity: dual-run
+#
+# W2 stdlib writer (card a4e079bb) — `lib/shlex.pyrs` (`split`/`join`/`quote`,
+# docs/design/w2-dossiers/shlex.md, target 5/5). Every case below is drawn
+# from the dossier's BEHAVIOR MATRIX / PARITY PLAN plus a handful of extra
+# oracle-verified edge cases the dossier didn't spell out explicitly (POSIX-
+# mode quote-anywhere-in-token, non-POSIX quote-only-at-token-start, and the
+# posix=False + comments=True interaction) — see `lib/shlex.pyrs`'s header
+# for the CPython `shlex.py` source facts each case is exercising. All
+# outputs are byte-identical to real `python3` (verified independently of
+# this golden).
+
+
+from shlex import split, join, quote
+
+
+def main() -> None:
+    # ── split() — basic tokenization ───────────────────────────────────────
+    print(split(""))
+    print(split("hello"))
+    print(split("hello world"))
+    print(split("hello    world"))
+    print(split("   hello"))
+    print(split("hello\tworld"))
+    print(split("hello\nworld"))
+
+    # ── split() — single-quote escaping (POSIX) ─────────────────────────────
+    print(split("'hello world'"))
+    print(split("'hello'world"))
+    print(split("hello'world'"))
+    print(split("a'b'c"))
+    print(split("'\\n'"))          # backslash NOT special inside single quotes
+    print(split("''"))
+
+    # ── split() — double-quote escaping (POSIX) ─────────────────────────────
+    print(split("\"hello world\""))
+    print(split("\"hello\"world"))
+    print(split("a\"b\"c"))
+    print(split("\"\\n\""))        # only \" and \\ are special inside "..."
+    print(split("\"\""))
+
+    # ── split() — backslash escaping (POSIX, outside quotes) ────────────────
+    print(split("hello\\ world"))
+    print(split("hello\\nworld"))
+    print(split("hello\\tworld"))
+    print(split("hello\\\\world"))
+
+    # ── split() — mixed quoting / pure whitespace ───────────────────────────
+    print(split("'hello' \"world\""))
+    print(split("   "))
+    print(split("\t\n"))
+
+    # ── split() — comments=False (default): '#' is a plain token ───────────
+    print(split("hello # comment"))
+
+    # ── split() — comments=True ──────────────────────────────────────────────
+    print(split("hello # comment", comments=True))
+    print(split("hello #comment", comments=True))
+    print(split("# comment only", comments=True))
+    print(split("hello # comment with 'quotes'", comments=True))
+    print(split("hello\\# not a comment", comments=True))  # escaped '#' is literal
+
+    # ── split() — posix=False ───────────────────────────────────────────────
+    print(split("hello world", posix=False))
+    print(split("'hello world'", posix=False))
+    print(split("\"hello world\"", posix=False))
+    print(split("hello\\ world", posix=False))
+    print(split("hello\\nworld", posix=False))
+
+    # ── quote() — safe strings (returned unchanged) ─────────────────────────
+    print(quote("hello"))
+    print(quote("hello123"))
+    print(quote("hello_world"))
+    print(quote("hello-world"))
+    print(quote("hello.world"))
+    print(quote("/path/to/file"))
+    print(quote("@"))
+    print(quote("="))
+    print(quote("+"))
+    print(quote(":"))
+
+    # ── quote() — unsafe strings (single-quoted) ────────────────────────────
+    print(quote(""))
+    print(quote("hello world"))
+    print(quote("hello\nworld"))
+    print(quote("hello\tworld"))
+    print(quote("~"))
+    print(quote("$"))
+    print(quote("`"))
+    print(quote(";"))
+    print(quote("&"))
+    print(quote("|"))
+    print(quote(">"))
+    print(quote("<"))
+    print(quote("("))
+    print(quote(")"))
+    print(quote("{"))
+    print(quote("}"))
+    print(quote("*"))
+    print(quote("?"))
+
+    # ── quote() — embedded quotes ────────────────────────────────────────────
+    print(quote("'hello'"))
+    print(quote("\"hello\""))
+    print(quote("hello'world"))
+    print(quote("hello\"world"))
+    print(quote("'"))
+    print(quote("\""))
+
+    # ── join() — empty and simple ───────────────────────────────────────────
+    print(join([]))
+    print(join(["hello"]))
+    print(join(["hello", "world"]))
+    print(join(["a", "b", "c"]))
+    print(join([""]))
+    print(join(["", "", ""]))
+
+    # ── join() — spaces / special chars requiring quoting ───────────────────
+    print(join(["hello world"]))
+    print(join(["hello", "", "world"]))
+    print(join(["a b", "c d"]))
+    print(join(["'hello'"]))
+    print(join(["\"hello\""]))
+    print(join(["hello'world"]))
+    print(join(["hello\nworld"]))
+    print(join(["hello\tworld"]))
+    print(join(["hello\\world"]))
+    print(join(["$hello"]))
+    print(join(["hello;world"]))
+
+    # ── round-trip: split -> join -> split identity ─────────────────────────
+    original: str = "hello 'world with spaces' foo"
+    r1: list[str] = split(original)
+    print(r1)
+    j1: str = join(r1)
+    print(j1)
+    r2: list[str] = split(j1)
+    print(r2)
+    print(r1 == r2)
+
+    # ── errors: ValueError, exact CPython message text ──────────────────────
+    try:
+        split("'")
+    except ValueError as e:
+        print("caught:", str(e))
+    try:
+        split("\"")
+    except ValueError as e:
+        print("caught:", str(e))
+    try:
+        split("'''")
+    except ValueError as e:
+        print("caught:", str(e))
+    try:
+        split("\"\"\"")
+    except ValueError as e:
+        print("caught:", str(e))
+    try:
+        split("\\")
+    except ValueError as e:
+        print("caught:", str(e))
+    try:
+        split("\"\\")
+    except ValueError as e:
+        print("caught:", str(e))
+
+    # ── extra oracle-verified edge cases (not in the dossier matrix, but
+    #    required for full state-machine fidelity — see lib/shlex.pyrs header)
+    print(split("a'b'c", posix=False))           # mid-token quote: literal
+    print(split("foo'bar", posix=False))          # unterminated mid-token quote: literal, no error
+    print(split("'foo'bar", posix=False))         # quote-at-start: raw span ends token immediately
+    print(split("foo\"bar\"baz", posix=False))
+    print(split("foo#bar baz\nqux", posix=False, comments=True))  # comment mid-token, non-posix: doesn't end token
+    print(split("#bar baz\nqux", posix=False, comments=True))
+    print(split("foo #bar\nqux", posix=False, comments=True))
+
+    # ── HARDENING (w2-hardener pass): edge cases beyond the dossier + writer's
+    #    own edge set, adversarially oracle-verified against a live python3.
+    # Unicode / non-ASCII tokenization and quoting (café/wörld beyond ASCII,
+    # an astral-plane emoji beyond the BMP — confirms char-wise, not
+    # byte-wise or UTF-16-wise, iteration).
+    print(split("café monde"))
+    print(quote("café"))
+    print(split("'héllo wörld'"))
+    print(split("a😀b"))
+    print(quote("😀"))
+
+    # CR and CRLF count as whitespace (CPython's shlex.whitespace = ' \t\r\n');
+    # form feed (\f) does NOT (only space/tab/CR/LF split tokens).
+    print(split("a\rb"))
+    print(split("a\r\nb"))
+    print(split("a\fb"))
+
+    # Adjacent/back-to-back quoted spans within one token (POSIX): closing a
+    # quote resumes the same token rather than ending it.
+    print(split("'a''b'"))
+    print(split("\"a\"\"b\""))
+
+    # Backslash-newline: POSIX escapes the newline itself into the token
+    # (line continuation, literal newline kept); non-POSIX treats `\` as a
+    # plain literal char and the following newline as an ordinary whitespace
+    # token boundary.
+    print(split("a\\\nb"))
+    print(split("a\\\nb", posix=False))
+
+    # Trailing backslash INSIDE single quotes never escapes (single quotes do
+    # no escape processing at all) — so it can only ever end unterminated.
+    try:
+        split("'\\")
+    except ValueError as e:
+        print("caught:", str(e))
+
+    # Double quotes with an even run of backslashes ending exactly at EOF:
+    # the last backslash still has nothing to escape -> "No escaped character".
+    try:
+        split("\"" + "\\" * 3)
+    except ValueError as e:
+        print("caught:", str(e))
+
+    # kwargs-only / out-of-declaration-order keyword calls (CPython evaluation
+    # order; same-name kwarg `s` as CPython's own `shlex.split` signature).
+    print(split(s="a#b", comments=True, posix=False))
+    print(split(comments=True, s="a#b"))
+
+    # quote() — additional CPython-safe-vs-unsafe punctuation coverage beyond
+    # the dossier's explicit list (`!`/`#` are unsafe -> quoted; `,`/`:` inside
+    # a token are part of the extra safe set -> unquoted).
+    print(quote("!"))
+    print(quote("#"))
+    print(quote("a,b"))
+    print(quote("a:b"))
+
+    # Unicode round-trip: split -> join -> split identity holds beyond ASCII.
+    original_u: str = "héllo 'wörld with spaces' foo日本"
+    ru1: list[str] = split(original_u)
+    print(ru1)
+    ju1: str = join(ru1)
+    print(ju1)
+    ru2: list[str] = split(ju1)
+    print(ru2)
+    print(ru1 == ru2)

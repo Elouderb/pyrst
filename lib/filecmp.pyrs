@@ -1,0 +1,242 @@
+# pyrst standard library — filecmp
+#
+# fs-trio dossier: docs/design/w2-dossiers/fs-trio.md (card 39bf959a).
+# FIDELITY SCORE: 3.5 / 5 (dossier §7 TARGET, this module's share of it).
+# `cmp`, `cmpfiles`, and the `dircmp` class core attributes are all
+# implemented and CPython-message-exact for the probed error cases.
+# Self-contained: no cross-module imports (see lib/shutil.pyrs header).
+#
+# SURFACE: cmp(f1, f2, shallow=True), cmpfiles(a, b, common, shallow=True),
+# class dircmp(a, b, ignore=None) with same_files/diff_files/funny_files/
+# left_only/right_only/common/left_list/right_list/subdirs.
+#
+# BEHAVIOR NOTE (verified, not just assumed): real CPython's `cmp` only takes
+# a fast path when `shallow=True` AND the two files' (size, mtime) stat
+# signature matches exactly (skipping the byte read entirely in that case);
+# the moment sizes match but mtimes differ — or `shallow=False` — it falls
+# through to a REAL byte-by-byte comparison either way. So the *observable*
+# True/False OUTPUT of `cmp` is identical for shallow=True and shallow=False
+# in every case except "same content written at literally the same stat
+# signature" (where both return True immediately). This module always does a
+# real content comparison (`shallow` is accepted for signature parity but
+# does not skip the read) — functionally IDENTICAL outputs, just without
+# CPython's stat-cache fast-path optimization. A file vs. a directory (same
+# name in `common`, differing type) returns False, not an error, matching the
+# dossier's probed behavior.
+#
+# GATED / DEFERRED:
+#   - `dircmp`'s `hide` parameter (legacy `[os.curdir, os.pardir]` filter) is
+#     dropped — `_filecmp_listdir`'s Rust `read_dir` backing never yields "."
+#     or ".." in the first place, so `hide`'s only practical CPython effect is
+#     already a no-op here.
+#   - `dircmp.report()` / `report_full_closure()` (stdout-formatting methods)
+#     are NOT implemented — no parity test in this pass calls them and their
+#     exact CPython print format was not oracle-verified; a documented gap,
+#     not a silent one.
+#   - content comparison reads files as pyrst `str` (UTF-8 `String`), so (like
+#     the rest of pyrst) true non-UTF8 binary content cannot be constructed
+#     from pyrst source — the ASCII/UTF-8 text case this module DOES compare
+#     is fully exercised in the parity golden.
+#
+# HARDENING PASS (w2-hardener, card 39bf959a):
+#   - **FIXED**: `cmpfiles` used to bucket a common name that is a DIRECTORY
+#     on either side straight into `errors`. Verified against live CPython:
+#     `cmpfiles` delegates each comparison to `cmp()`, whose type-mismatch
+#     check just returns `False`, which `cmpfiles` buckets into `mismatch`,
+#     NOT `errors` (`errors` is reserved for an actually-missing path, which
+#     raises `OSError` inside real CPython's internal `_cmp` helper). Fixed to
+#     match — the isdir special case was removed so it now falls through to
+#     the same `cmp()` call the regular-file case already used.
+#   - **FIXED**: `dircmp(<a plain file>, <a real dir>)` used to have no
+#     explicit type check at all: `_filecmp_listdir`'s raw
+#     `std::fs::read_dir(..).unwrap()` would panic on a non-directory `a`/`b`
+#     with a generic Rust message, an UNHANDLED panic no `except` clause
+#     could catch (not even `except Exception:`). Verified against live
+#     CPython: this raises a catchable `NotADirectoryError`. Fixed with an
+#     explicit `isdir` check on both `a` and `b` before any listing is
+#     attempted.
+#   - **Documented, NOT fixed — a real semantic gap, not just a message
+#     difference**: real CPython's `dircmp` is LAZY (`same_files`/
+#     `left_list`/etc. are `cached_property`-style attributes computed on
+#     FIRST ACCESS, not in `__init__`); verified empirically —
+#     `filecmp.dircmp(<not-a-dir>, <real-dir>)` CONSTRUCTS successfully every
+#     time, and only raises `NotADirectoryError` on the first attribute
+#     read (e.g. `d.left_list`). This module's `dircmp` is EAGER (all
+#     comparisons run inside `__init__`, since pyrst has no
+#     `cached_property`/lazy-attribute mechanism to express CPython's real
+#     shape), so a bad `dircmp(...)` call here raises immediately at
+#     CONSTRUCTION time instead of at first attribute access. The eventual
+#     exception TYPE and MESSAGE are identical either way (verified); only
+#     the timing differs, and only for a constructed-but-never-read
+#     `dircmp` (every real use — including every call in this unit's own
+#     parity file — constructs and immediately reads attributes, where the
+#     two behaviors are indistinguishable).
+
+
+@extern
+def _filecmp_path_exists(p: str) -> bool:
+    "std::path::Path::new(&{p}).exists()"
+
+
+@extern
+def _filecmp_isdir(p: str) -> bool:
+    "std::path::Path::new(&{p}).is_dir()"
+
+
+@extern
+def _filecmp_isfile(p: str) -> bool:
+    "std::path::Path::new(&{p}).is_file()"
+
+
+@extern
+def _filecmp_listdir(p: str) -> list[str]:
+    "std::fs::read_dir(&{p}).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).collect::<Vec<String>>()"
+
+
+@extern
+def _filecmp_join(a: str, b: str) -> str:
+    "std::path::Path::new(&{a}).join(&{b}).to_string_lossy().into_owned()"
+
+
+@extern
+def _filecmp_read_file(p: str) -> str:
+    "std::fs::read_to_string(&{p}).unwrap_or_else(|e| panic!(\"OSError\\0{}\", e))"
+
+
+def _filecmp_resolve_ignore(ignore: Optional[list[str]]) -> list[str]:
+    if ignore is not None:
+        return ignore
+    return _filecmp_default_ignores()
+
+
+def _filecmp_default_ignores() -> list[str]:
+    # CPython's filecmp.DEFAULT_IGNORES (python3-verified: ['RCS', 'CVS',
+    # 'tags', '.git', '.hg', '.bzr', '_darcs', '__pycache__']).
+    return ["RCS", "CVS", "tags", ".git", ".hg", ".bzr", "_darcs", "__pycache__"]
+
+
+def _filecmp_filtered_sorted(names: list[str], ignore: list[str]) -> list[str]:
+    kept: list[str] = []
+    for n in names:
+        if n not in ignore:
+            kept.append(n)
+    return sorted(kept)
+
+
+def cmp(f1: str, f2: str, shallow: bool = True) -> bool:
+    if not _filecmp_path_exists(f1):
+        raise FileNotFoundError("[Errno 2] No such file or directory: '" + f1 + "'")
+    if not _filecmp_path_exists(f2):
+        raise FileNotFoundError("[Errno 2] No such file or directory: '" + f2 + "'")
+    if _filecmp_isdir(f1) or _filecmp_isdir(f2):
+        # Type mismatch (or both directories): CPython's S_IFREG check fails
+        # and it returns False without erroring — matches the dossier's
+        # probed "compares as regular path" note.
+        return False
+    return _filecmp_read_file(f1) == _filecmp_read_file(f2)
+
+
+def cmpfiles(a: str, b: str, common: list[str], shallow: bool = True) -> tuple[list[str], list[str], list[str]]:
+    matched: list[str] = []
+    mismatch: list[str] = []
+    errors: list[str] = []
+    for name in common:
+        p1: str = _filecmp_join(a, name)
+        p2: str = _filecmp_join(b, name)
+        if not _filecmp_path_exists(p1) or not _filecmp_path_exists(p2):
+            errors.append(name)
+        else:
+            # HARDENING FIX: verified against live CPython — a common name
+            # that is a DIRECTORY on either side (dir-vs-dir OR dir-vs-file)
+            # is NOT an error; CPython's `cmpfiles` delegates to `cmp()`,
+            # whose `S_IFREG` type-mismatch check just returns `False`
+            # ("not equal"), which `cmpfiles` then buckets into MISMATCH, not
+            # errors (`errors` is reserved for a `cmp()` call that raises
+            # `OSError`, i.e. a genuinely missing path, already handled
+            # above). The prior version special-cased `isdir` straight to
+            # `errors`, which diverged from CPython's real classification.
+            if cmp(p1, p2, shallow):
+                matched.append(name)
+            else:
+                mismatch.append(name)
+    return (matched, mismatch, errors)
+
+
+class dircmp:
+    # Compare two directories. Attributes mirror CPython's filecmp.dircmp:
+    # left/right (the two dir paths), left_list/right_list (sorted, filtered
+    # entry names), common (names in both), left_only/right_only,
+    # same_files/diff_files/funny_files (common names split by comparison
+    # outcome), subdirs (dict of common-subdirectory name -> nested dircmp).
+    left: str
+    right: str
+    left_list: list[str]
+    right_list: list[str]
+    common: list[str]
+    left_only: list[str]
+    right_only: list[str]
+    same_files: list[str]
+    diff_files: list[str]
+    funny_files: list[str]
+    subdirs: dict[str, dircmp]
+
+    def __init__(self, a: str, b: str, ignore: Optional[list[str]] = None) -> None:
+        if not _filecmp_path_exists(a):
+            raise FileNotFoundError("[Errno 2] No such file or directory: '" + a + "'")
+        if not _filecmp_path_exists(b):
+            raise FileNotFoundError("[Errno 2] No such file or directory: '" + b + "'")
+        # HARDENING FIX: verified against live CPython — `dircmp(<a plain
+        # file>, <a dir>)` raises `NotADirectoryError` (CPython gets this for
+        # free from `os.listdir()` on a non-directory path). The prior
+        # version had no such check, so `_filecmp_listdir`'s raw
+        # `std::fs::read_dir(..).unwrap()` would panic with a non-CPython,
+        # non-catchable Rust message instead of a typed exception.
+        if not _filecmp_isdir(a):
+            raise NotADirectoryError("[Errno 20] Not a directory: '" + a + "'")
+        if not _filecmp_isdir(b):
+            raise NotADirectoryError("[Errno 20] Not a directory: '" + b + "'")
+        self.left = a
+        self.right = b
+
+        ignore_list: list[str] = _filecmp_resolve_ignore(ignore)
+
+        left_entries: list[str] = _filecmp_filtered_sorted(_filecmp_listdir(a), ignore_list)
+        right_entries: list[str] = _filecmp_filtered_sorted(_filecmp_listdir(b), ignore_list)
+        self.left_list = left_entries
+        self.right_list = right_entries
+
+        common_names: list[str] = []
+        left_only: list[str] = []
+        for name in left_entries:
+            if name in right_entries:
+                common_names.append(name)
+            else:
+                left_only.append(name)
+        right_only: list[str] = []
+        for name in right_entries:
+            if name not in left_entries:
+                right_only.append(name)
+        self.common = common_names
+        self.left_only = left_only
+        self.right_only = right_only
+
+        same_files: list[str] = []
+        diff_files: list[str] = []
+        funny_files: list[str] = []
+        subdirs: dict[str, dircmp] = {}
+        for name in common_names:
+            p1: str = _filecmp_join(a, name)
+            p2: str = _filecmp_join(b, name)
+            if _filecmp_isdir(p1) and _filecmp_isdir(p2):
+                subdirs[name] = dircmp(p1, p2, ignore)
+            elif _filecmp_isfile(p1) and _filecmp_isfile(p2):
+                if cmp(p1, p2, True):
+                    same_files.append(name)
+                else:
+                    diff_files.append(name)
+            else:
+                funny_files.append(name)
+        self.same_files = same_files
+        self.diff_files = diff_files
+        self.funny_files = funny_files
+        self.subdirs = subdirs

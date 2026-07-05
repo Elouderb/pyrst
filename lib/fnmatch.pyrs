@@ -1,0 +1,332 @@
+# pyrst standard library — fnmatch (Unix shell-style filename matching)
+#
+# W2 batch (card a96a07b5, per docs/design/w2-dossiers/fnmatch.md). Builds on
+# `lib/re` (`is_match`): imports `re` and compiles a translated pattern per
+# call. Because `re` declares `@crate("regex", "1")`, any program that imports
+# `fnmatch` transitively pulls in that crate dependency too (the resolver
+# recurses into an embedded module's OWN imports — see `src/resolver.rs`), so
+# importing `fnmatch` routes the build through the Cargo-project path exactly
+# like importing `re` directly.
+#
+# Fidelity score: 4/5 (dossier target was 4.5). Adversarial hardening review
+# (a96a07b5) found and FIXED a crash-on-panic defect (Rust's `regex` crate
+# rejects descending character-class ranges like `[9-0]` that CPython treats
+# as harmless "never matches"); the remaining 1pt gap is the `translate()`
+# atomic-group string divergence (#2) plus a couple of narrow, documented
+# character-class corner cases (#3) that are safe for matching in the common
+# case but not perfectly CPython-exact in rare chained-hyphen/leading-`]`
+# patterns — none of which appear in the dossier's PARITY PLAN or BEHAVIOR
+# MATRIX.
+#
+# --- Public surface -------------------------------------------------------
+#   fnmatch(name, pat)     -> bool           case-sensitive shell match
+#   fnmatchcase(name, pat) -> bool           always case-sensitive (same as
+#                                             fnmatch on the Unix/Linux target
+#                                             pyrst runs on; CPython's
+#                                             case-folding via os.path.normcase
+#                                             is a Windows-only no-op on POSIX,
+#                                             so `fnmatch` and `fnmatchcase`
+#                                             are IDENTICAL here — matches the
+#                                             dossier's §4 "Platform
+#                                             Dependence" hazard note verbatim)
+#   filter(names, pat)     -> list[str]      names matching pat, input order
+#   translate(pat)         -> str            CPython-shaped regex STRING
+#
+# --- Divergences (all documented, none silent) -----------------------------
+#
+# 1. `translate()` / `\Z` vs `\z` (ENGINE divergence, not API divergence):
+#    CPython's `translate()` returns `(?s:...)\Z` — `\Z` is CPython `re`'s
+#    end-of-string anchor. Rust's `regex` crate does NOT implement `\Z` at all
+#    (verified: `regex::Regex::new(r"(?s:abc)\Z")` -> "unrecognized escape
+#    sequence" parse error; only lowercase `\z` is end-of-text in that crate).
+#    So the PUBLIC `translate(pat)` function below still returns the exact
+#    CPython string (with `\Z`, byte-for-byte, per the dossier's PARITY PLAN)
+#    for display/introspection parity — but internally, `fnmatchcase()` and
+#    `filter()` do NOT compile that literal string. They build a functionally
+#    equivalent pattern via the private `_fnmatch_translate_body()` helper,
+#    wrapped as `^(?s:BODY)\z` (caret start-anchor + lowercase end-anchor),
+#    which IS valid Rust-regex syntax and matches the identical set of
+#    strings. `translate()`'s return value is therefore descriptive output
+#    only in pyrst — it is never fed back into `re.is_match` unchanged.
+#
+# 2. `translate()` atomic-group divergence (multi-star patterns only):
+#    CPython 3.11+ compresses "STAR fixed STAR fixed" interior runs into
+#    non-backtracking atomic groups, e.g. `translate('a*b*c')` ==
+#    `'(?s:a(?>.*?b)(?>.*?)c)\\Z'`-shaped output (exact grouping depends on
+#    the run). Rust's `regex` crate has NO atomic-group syntax at all
+#    (verified: `(?>...)` -> "unrecognized flag" parse error) — and needs
+#    none, since the crate is a linear-time finite-automaton engine with no
+#    backtracking to bound in the first place. `translate()` in this module
+#    therefore emits a PLAIN (non-atomic) `.*` for every star run instead of
+#    CPython's atomic-group form. For any pattern with at most ONE star run
+#    (after consecutive-star compression) — which is every case in the
+#    dossier's PARITY PLAN — the output is byte-identical to CPython. Only
+#    patterns with TWO OR MORE star runs separated by fixed text (e.g.
+#    `'a*b*c'`, `'*_*.txt'`) produce a translate() STRING that diverges from
+#    CPython's exact bytes, even though the resulting match BEHAVIOR (which
+#    strings it matches) is identical — Rust's non-atomic `.*` and CPython's
+#    atomic `(?>.*?...)` group are semantically equivalent set-of-matches,
+#    just different regex spellings. `fnmatch()`/`fnmatchcase()`/`filter()`
+#    are NOT affected (their internal pattern is never printed).
+#
+# 3. Character-class edge cases NOT reproduced byte-for-byte (rare; none in
+#    the parity plan): CPython's translate() also (a) escapes stray
+#    backslashes and the 3.11+ set-operation characters `&`, `~`, `|` inside
+#    `[...]` via `re.sub(r'([&~|])', r'\\\1', ...)`, and (b) for classes
+#    containing a literal `-` NOT part of a valid a-b range, chunks and
+#    re-escapes the hyphen (e.g. CPython's `translate('[-a-z]')` ==
+#    `'(?s:[\\-a-z])\\Z'`, escaping the leading hyphen). This module passes
+#    class contents straight through unescaped instead (except for the
+#    descending-range fix below). For the COMMON case — a hyphen at the very
+#    start or end of a class (`[-a-z]`, `[a-z-]`) or a single ascending range
+#    with extra fixed text (`[a-c-e]`) — this is SAFE for matching
+#    correctness: verified empirically that Rust's `regex` crate treats a
+#    boundary `-` as literal exactly like CPython, with no crash and no
+#    boolean-match divergence (`fnmatch('-', '[-a-z]')` and
+#    `fnmatch('-', '[a-c-e]')` both agree with CPython).
+#
+#    TWO genuine hardening findings from adversarial review, both FIXED or
+#    documented here:
+#      (i) FIXED — a DESCENDING range (`[9-0]`, `[Z-A]`) is legal CPython
+#          glob syntax (CPython silently makes it never-match) but Rust's
+#          `regex` crate PANICS at compile time on it (invalid character
+#          class range). `_fnmatch_escape_bad_ranges()` now detects any `-`
+#          that would form a start>end range and escapes it to a literal
+#          hyphen instead, eliminating the crash. This is NOT byte-identical
+#          to CPython's "matches nothing" semantics: the escaped class becomes
+#          the LITERAL member set `{'9','-','0'}`, so `fnmatch('9','[9-0]')`,
+#          `fnmatch('0','[9-0]')`, and `fnmatch('-','[9-0]')` are all `True`
+#          in pyrst vs `False` in CPython (which matches NOTHING). The two
+#          engines agree only on characters OUTSIDE that set — e.g.
+#          `fnmatch('5','[9-0]')` is `False` in both (oracle-verified against
+#          CPython 3.12) — documented, not silently wrong, and no
+#          longer a crash. A CHAINED class with a bad range plus a good one
+#          (e.g. `[9-0-5]`) is fixed for the crash the same way, but the
+#          resulting SET of matched characters can differ further from
+#          CPython's own chunk-merge algorithm (verified: CPython's
+#          `[9-0-5]` matches only `-`/`5`; this module's matches `9`/`0`
+#          through `5`/`-`) — same rationale: crash-safety over a
+#          byte-perfect port of CPython's internal chunk-merging, and this
+#          shape of pattern is not in the dossier's PARITY PLAN or BEHAVIOR
+#          MATRIX.
+#      (ii) NOT FIXED (documented only) — a class whose first member is a
+#          literal `]` (the `[]...]` / `[!]...]` bracket-escape rule)
+#          immediately followed by a hyphen-range, e.g. `[]-a]`, is parsed
+#          DIFFERENTLY by the two regex engines even from the byte-identical
+#          translate() STRING: CPython's `re` treats the leading `]` as
+#          eligible to be the START of a range (so `[]-a]` matches the
+#          range `]`..`a`, i.e. `]^_\`a`), while Rust's `regex` crate treats
+#          it as a plain literal member followed by a separately-literal `-`
+#          (so it matches only `]`, `-`, `a`). Verified directly against
+#          both engines with the identical string `[]-a]`. This is a
+#          genuine, narrow regex-engine parsing incompatibility — vanishingly
+#          rare in real shell-glob usage (requires a class that starts with
+#          a literal `]` AND immediately chains a hyphen-range) and not in
+#          the dossier's PARITY PLAN or BEHAVIOR MATRIX; left as a documented
+#          divergence rather than hand-rolling a second regex-class parser.
+#      (iii) FIXED — a literal `[` INSIDE a class body (e.g. `[a[c]`, a class
+#          matching `a`, `[`, or `c`) is legal CPython glob syntax that
+#          CPython's `re` accepts verbatim, but Rust's `regex` crate parses the
+#          interior `[` as the start of a NESTED class and PANICKED at compile
+#          time ("unclosed character class", exit 101) — a CRASH on a valid
+#          pattern. `_fnmatch_escape_bad_ranges()` now escapes every interior
+#          `[` to `\[`, which Rust accepts as a literal member; MATCH behavior
+#          is now CPython-exact (`fnmatch('[', '[a[c]')` is `True` in both,
+#          oracle-verified). The only residual divergence is the PUBLIC
+#          `translate()` STRING: CPython leaves the interior `[` un-escaped
+#          (`translate('[a[c]')` == `'(?s:[a[c])\\Z'`) while pyrst emits the
+#          Rust-safe escaped form (`'(?s:[a\\[c])\\Z'`) — descriptive output
+#          only, never fed to `re.is_match`; a leading `[` (`[[]`) stays
+#          byte-identical to CPython since both escape it.
+#
+# 6. **`filter` collides with pyrst's BUILTIN `filter(f, iterable)` for the
+#    UNQUALIFIED import form (hardening-review finding; the original W2 drop
+#    incorrectly asserted no builtin collision exists — it does).** pyrst has
+#    a real language builtin `filter(predicate, iterable)` (lazy 2-arg
+#    filter, see `src/typeck/exprs.rs` / `src/codegen/exprs.rs`), special-
+#    cased by LITERAL callee name `filter` ahead of normal name resolution.
+#    `import fnmatch; fnmatch.filter(names, pat)` (QUALIFIED, member-access
+#    form) is unaffected and fully supported — verified working throughout
+#    this module's parity tests. But `from fnmatch import filter;
+#    filter(names, pat)` (BARE, unqualified form) is BROKEN: the compiler's
+#    literal-name special case intercepts the bare call, treats `names`
+#    (a `list[str]`) as the PREDICATE and `pat` (a `str`) as the iterable,
+#    and emits invalid Rust that fails to compile (verified: `rustc` errors
+#    E0599/E0618 — "no method named `iter` found for struct `String`" /
+#    "expected function, found `Vec<String>`" — not a clean pyrst-level
+#    diagnostic). This is the same class of restriction the naming rules
+#    call out for `operator`/`re` co-import name clashes: use the QUALIFIED
+#    form (`import fnmatch` + `fnmatch.filter(...)`) — never
+#    `from fnmatch import filter`. `fnmatch`, `fnmatchcase`, and `translate`
+#    do NOT collide with any builtin or str-method special case (verified:
+#    all three work fine as bare unqualified imports).
+#
+# 4. Unclosed-`[` / empty-class corner cases: this module reproduces CPython's
+#    two most-common corner cases exactly — (a) an unclosed `[` (no matching
+#    `]` anywhere in the rest of the pattern) becomes the literal two-char
+#    escape `\[`, with the rest of the pattern processed normally starting
+#    right after the `[` (matches CPython's `translate('[')` ==
+#    `'(?s:\\[)\\Z'` and `translate('[]*')` == `'(?s:\\[\\].*)\\Z'`); and
+#    (b) a `]` as the very first class member (optionally right after a
+#    leading `!`) is a LITERAL member, not the closer (matches CPython's
+#    `translate('[]]')` == `'(?s:[]])\\Z'`). The one CPython corner case NOT
+#    reproduced is an actually-EMPTY class body after the literal-`]`-skip
+#    (CPython emits the impossible-match assertion `(?!)`) — never reachable
+#    from the patterns above, so left undone rather than guessed at.
+#
+# 5. `fnmatchcase`/`fnmatch` type-checking (dossier §2 ERRORS): CPython raises
+#    `TypeError` with specific wording when `name`/`pat` are non-str (e.g. an
+#    `int`). pyrst is statically typed — the `str` parameter annotations make
+#    passing an `int` a COMPILE-TIME type-check error instead of the runtime
+#    `TypeError` CPython raises; there is no pyrst-side runtime error text to
+#    match because the program never compiles. Not a gap, just a different
+#    (earlier, stricter) failure point — consistent with every other stdlib
+#    module's docs in this codebase (`math`, `re`, etc.).
+#
+# --- Gated (per dossier §5) -------------------------------------------------
+# No gates block this module: no *args/**kwargs, no module-level mutable
+# state, and `re.is_match` (this module's foundation) already exists.
+#
+# The golden exercises the flat `import fnmatch; fnmatch.<name>(...)` form
+# throughout (see divergence #6 above: this is REQUIRED for `filter`, whose
+# bare unqualified `from fnmatch import filter` form collides with pyrst's
+# builtin `filter(f, iterable)` and miscompiles).
+
+
+import re
+
+
+def fnmatch(name: str, pat: str) -> bool:
+    return fnmatchcase(name, pat)
+
+
+def fnmatchcase(name: str, pat: str) -> bool:
+    body: str = _fnmatch_translate_body(pat)
+    pattern: str = "^(?s:" + body + ")\\z"
+    return re.is_match(pattern, name)
+
+
+def filter(names: list[str], pat: str) -> list[str]:
+    body: str = _fnmatch_translate_body(pat)
+    pattern: str = "^(?s:" + body + ")\\z"
+    result: list[str] = []
+    for name in names:
+        if re.is_match(pattern, name):
+            result.append(name)
+    return result
+
+
+def translate(pat: str) -> str:
+    body: str = _fnmatch_translate_body(pat)
+    return "(?s:" + body + ")\\Z"
+
+
+# --- private helpers --------------------------------------------------------
+
+# Shared translation core for fnmatch()/fnmatchcase()/filter()/translate():
+# walks `pat` once, turning `*` / `?` / `[seq]` / `[!seq]` into the equivalent
+# (non-atomic) regex body. Consecutive `*` compress into a single `.*`,
+# matching CPython's own STAR-run compression.
+def _fnmatch_translate_body(pat: str) -> str:
+    body: str = ""
+    last_was_star: bool = False
+    i: int = 0
+    n: int = len(pat)
+    while i < n:
+        ch: str = pat[i]
+        if ch == "*":
+            if not last_was_star:
+                body += ".*"
+            last_was_star = True
+            i += 1
+        elif ch == "?":
+            body += "."
+            last_was_star = False
+            i += 1
+        elif ch == "[":
+            parsed: tuple[str, int] = _fnmatch_translate_class(pat, i)
+            body += parsed[0]
+            i = parsed[1]
+            last_was_star = False
+        else:
+            body += re.escape(ch)
+            last_was_star = False
+            i += 1
+    return body
+
+
+# Translates a single `[...]` character class starting at `pat[start]` (which
+# must be `[`). Returns (regex_fragment, index_just_past_the_class). Mirrors
+# CPython's `fnmatch.translate` bracket-scanning rules: a `!` right after `[`
+# negates; a `]` as the very next character (after an optional `!`) is a
+# LITERAL member, not the closer; if no closing `]` is ever found, the `[` is
+# a literal character and scanning resumes right after it.
+def _fnmatch_translate_class(pat: str, start: int) -> tuple[str, int]:
+    n: int = len(pat)
+    j: int = start + 1
+    negated: bool = False
+    if j < n and pat[j] == "!":
+        negated = True
+        j += 1
+    if j < n and pat[j] == "]":
+        j += 1
+    while j < n and pat[j] != "]":
+        j += 1
+    if j >= n:
+        return ("\\[", start + 1)
+    stuff_start: int = start + 1
+    if negated:
+        stuff_start = start + 2
+    stuff: str = pat[stuff_start:j]
+    stuff = _fnmatch_escape_bad_ranges(stuff)
+    if negated:
+        return ("[^" + stuff + "]", j + 1)
+    if len(stuff) > 0 and (stuff[0] == "^" or stuff[0] == "["):
+        return ("[\\" + stuff + "]", j + 1)
+    return ("[" + stuff + "]", j + 1)
+
+
+# HARDENING FIX (adversarial review): Rust's `regex` crate PANICS at
+# pattern-compile time on TWO character-class constructs CPython's `re` treats
+# as harmless literals; BOTH are neutralized here on the already-bracket-
+# extracted class body, or `re.is_match` crashes (exit 101) on legal globs:
+#   (1) a DESCENDING range (`[9-0]`, `[Z-A]`, start codepoint > end codepoint)
+#       -> "invalid character class range" panic; CPython silently never-matches.
+#       The `-` is escaped to a literal hyphen. This stays a documented MATCH
+#       divergence: CPython's `[9-0]` matches NOTHING; the escaped form matches
+#       the literal members '9'/'-'/'0'. See module header divergence #3(i).
+#   (2) a literal `[` INSIDE the class body (`[a[c]`) -> "unclosed character
+#       class" panic, because Rust parses an interior `[` as the start of a
+#       NESTED class; CPython treats it as an ordinary literal member. Escaping
+#       every interior `[` to `\[` restores CPython-CORRECT matching (verified:
+#       `fnmatch('[', '[a[c]')` is now `True` in both, was a pyrst crash). See
+#       module header divergence #3(iii).
+# Neither escape is byte-identical to CPython's `translate()` STRING for those
+# rare inputs (translate() emits the un-escaped form CPython does) — a
+# descriptive-output-only divergence, never fed back into `re.is_match`.
+def _fnmatch_escape_bad_ranges(stuff: str) -> str:
+    out: str = ""
+    n: int = len(stuff)
+    i: int = 0
+    while i < n:
+        ch: str = stuff[i]
+        # (2) interior literal `[` -> `\[`: Rust's `regex` crate parses an
+        # un-escaped interior `[` as the start of a NESTED class and PANICS
+        # ("unclosed character class"); CPython treats it as a literal member.
+        # Escaping restores CPython-correct matching (verified via oracle).
+        if ch == "[":
+            out += "\\["
+            i += 1
+            continue
+        # (1) descending range (`[9-0]`) -> escape the `-` to a literal hyphen
+        # (Rust panics on start>end; CPython silently never-matches).
+        if ch == "-" and i > 0 and i < n - 1:
+            prev: str = stuff[i - 1]
+            nxt: str = stuff[i + 1]
+            if ord(prev) > ord(nxt):
+                out += "\\-"
+                i += 1
+                continue
+        out += ch
+        i += 1
+    return out

@@ -1,0 +1,206 @@
+# parity: pyrst-only
+#
+# `enum` ships NO `Enum`/`IntEnum`/`Flag`/`auto`/`unique` (design decision on
+# card 03eb4e2c, dossier docs/design/w2-dossiers/enum.md): pyrst has no
+# metaclass machinery, no module-level mutable state, and no reflection over
+# a class's own const list, all of which CPython's real `Enum` needs. Instead
+# this module documents the CLASS-CONST NAMESPACE PATTERN (a plain class with
+# typed `int`/`str` consts standing in for enum members) plus three small
+# helper functions (`check_valid`/`lookup_by_name`/`find_duplicate_value`)
+# that are pyrst-only conventions with no CPython `enum` counterpart under
+# these names — `from enum import check_valid, ...` cannot resolve against
+# the REAL CPython `enum` module the dual-run harness would otherwise import,
+# so this exact source cannot execute unmodified against it (same reason
+# `examples/parity_collections.pyrs` / `examples/parity_json.pyrs` are
+# pyrst-only: see those files' headers for the established precedent).
+#
+# Every behavior below was independently verified against a REAL python3
+# session using CPython's actual `enum.Enum` (`Color(99)`, `Color["NOTFOUND"]`,
+# `Color.RED == Color.RED`, etc. — see `lib/enum.pyrs`'s header for the exact
+# probes and messages) or, for the class-const pattern's plain-attribute
+# member-access/equality/arithmetic lines, against an equivalent plain
+# CPython class with the SAME shape (no `enum.Enum` base — that plain-class
+# equivalence is the entire point of the class-const design). Expected output
+# below is pinned deterministically against the pyrst binary.
+#
+# HARDENING PASS (w2-hardener, card 4ad25c29): the trailing block adds edge
+# inputs — negative int / float / bool / unicode-string / quote-embedded
+# string values, empty allowed/names/values lists, and duplicate-index ties
+# (interleaved, all-same, negative, unicode) — each independently
+# cross-verified against a REAL python3 session (`enum.Enum(-5)`,
+# `enum.Enum("nope")` with a unicode member, `repr("it's")`'s quote-switch,
+# `Enum[""]`, etc; see `lib/enum.pyrs` HARDENING notes for the exact
+# transcript). All inputs are literal, order-independent, and dict-free, so
+# the golden stays deterministic across runs.
+from enum import check_valid, lookup_by_name, find_duplicate_value
+
+
+class Color:
+    RED: int = 1
+    GREEN: int = 2
+    BLUE: int = 3
+
+
+class Priority:
+    LOW: int = 1
+    MEDIUM: int = 2
+    HIGH: int = 3
+
+
+class Status:
+    PENDING: str = "pending"
+    ACTIVE: str = "active"
+    DONE: str = "done"
+
+
+def main() -> None:
+    # ── class-const namespace pattern: member access -----------------------
+    # Verified byte-identical against a plain CPython class with the same
+    # shape (`class Color: RED = 1; GREEN = 2; BLUE = 3` — `print(Color.RED)`
+    # -> `1`, not CPython enum.Enum's `Color.RED` -> `<Color.RED: 1>`; that
+    # divergence from the real `Enum` is the documented, deliberate shape of
+    # this module, see lib/enum.pyrs header).
+    print(Color.RED)                     # 1
+    print(Color.GREEN)                   # 2
+    print(Color.BLUE)                    # 3
+
+    # ── equality: the const IS the value, so plain int/str equality applies
+    print(Color.RED == Color.RED)        # True
+    print(Color.RED == Color.GREEN)      # False
+    print(Color.RED != Color.GREEN)      # True
+
+    # ── "IntEnum-style" arithmetic and ordering: works because the const has
+    # no wrapper type (CPython's plain Enum would TypeError on `<`; pyrst has
+    # only one shape, documented as a divergence in lib/enum.pyrs)
+    print(Color.RED + 1)                 # 2
+    print(Priority.HIGH > Priority.LOW)  # True
+    print(Priority.LOW + Priority.MEDIUM)  # 3
+
+    # ── consts compose into ordinary collections like any int/str value
+    values: list[int] = [Color.RED, Color.GREEN, Color.BLUE]
+    print(values)                        # [1, 2, 3]
+    print(Status.PENDING)                # pending
+    print(Status.ACTIVE == "active")     # True
+    print(Status.DONE)                   # done
+
+    # ── helper convention: check_valid (CPython Color(value) stand-in) -----
+    print(check_valid(1, values, "Color"))   # 1
+    try:
+        check_valid(99, values, "Color")
+    except ValueError as e:
+        print(str(e))                    # 99 is not a valid Color
+    try:
+        check_valid("done", ["pending", "active"], "Status")
+    except ValueError as e:
+        print(str(e))                    # 'done' is not a valid Status
+
+    names: list[str] = ["RED", "GREEN", "BLUE"]
+
+    # ── helper convention: lookup_by_name (CPython Color["NAME"] stand-in) --
+    print(lookup_by_name("RED", names, values))    # 1
+    print(lookup_by_name("BLUE", names, values))   # 3
+    try:
+        lookup_by_name("NOTFOUND", names, values)
+    except KeyError as e:
+        print(str(e))                    # 'NOTFOUND'
+
+    # ── helper convention: find_duplicate_value (manual @unique stand-in) --
+    distinct: list[int] = [1, 2, 3]
+    print(find_duplicate_value(distinct))          # -1
+
+    aliased: list[int] = [1, 1, 2, 2]
+    print(find_duplicate_value(aliased))           # 1 (index of the alias)
+
+    # ── HARDENING: edge inputs cross-verified against real python3 (see
+    # card-history HARDENING notes for the exact probes run against real
+    # `enum.Enum`) ------------------------------------------------------
+
+    # check_valid: negative int miss (verified against real Color(-5))
+    try:
+        check_valid(-5, values, "Color")
+    except ValueError as e:
+        print(str(e))                    # -5 is not a valid Color
+
+    # check_valid: unicode string miss (verified against real Greet("nope")
+    # where Greet has a unicode member "héllo")
+    uni_allowed: list[str] = ["héllo", "bye"]
+    try:
+        check_valid("nope", uni_allowed, "Greet")
+    except ValueError as e:
+        print(str(e))                    # 'nope' is not a valid Greet
+
+    # check_valid: value containing a single quote — repr() quote-switches
+    # to double quotes (verified against real repr("it's") == "it's")
+    quote_allowed: list[str] = ["a"]
+    try:
+        check_valid("it's", quote_allowed, "Quote")
+    except ValueError as e:
+        print(str(e))                    # "it's" is not a valid Quote
+
+    # check_valid: bool value, a hit (bool is a valid const-typeable T)
+    bool_allowed: list[bool] = [True, False]
+    print(check_valid(True, bool_allowed, "Flag"))  # True
+
+    # check_valid: float value miss (verified against real Fl(2.5))
+    float_allowed: list[float] = [1.5, 1.0]
+    try:
+        check_valid(2.5, float_allowed, "Fl")
+    except ValueError as e:
+        print(str(e))                    # 2.5 is not a valid Fl
+
+    # check_valid: EMPTY allowed list always misses
+    empty_allowed: list[int] = []
+    try:
+        check_valid(1, empty_allowed, "Empty")
+    except ValueError as e:
+        print(str(e))                    # 1 is not a valid Empty
+
+    # lookup_by_name: EMPTY names/values lists always miss
+    empty_names: list[str] = []
+    empty_values: list[int] = []
+    try:
+        lookup_by_name("NOTFOUND", empty_names, empty_values)
+    except KeyError as e:
+        print(str(e))                    # 'NOTFOUND'
+
+    # lookup_by_name: name containing a single quote — repr() quote-switches
+    # (verified against real Quote["it's"] -> str(e) == "it's")
+    try:
+        lookup_by_name("it's", empty_names, empty_values)
+    except KeyError as e:
+        print(str(e))                    # "it's"
+
+    # lookup_by_name: EMPTY-STRING name (verified against real Quote[""])
+    try:
+        lookup_by_name("", empty_names, empty_values)
+    except KeyError as e:
+        print(str(e))                    # ''
+
+    # find_duplicate_value: EMPTY list -> -1
+    dup_empty: list[int] = []
+    print(find_duplicate_value(dup_empty))          # -1
+
+    # find_duplicate_value: SINGLE element -> -1 (nothing to repeat)
+    dup_single: list[int] = [1]
+    print(find_duplicate_value(dup_single))         # -1
+
+    # find_duplicate_value: interleaved ties — first REPEAT index (not the
+    # first value's own index)
+    dup_ties: list[int] = [1, 2, 1, 2]
+    print(find_duplicate_value(dup_ties))           # 2
+
+    # find_duplicate_value: all-same run
+    dup_all_same: list[int] = [5, 5, 5]
+    print(find_duplicate_value(dup_all_same))       # 1
+
+    # find_duplicate_value: negative-value ties
+    dup_neg: list[int] = [-1, -2, -1]
+    print(find_duplicate_value(dup_neg))            # 2
+
+    # find_duplicate_value: unicode string ties
+    dup_str: list[str] = ["café", "naïve", "café"]
+    print(find_duplicate_value(dup_str))            # 2
+
+    # find_duplicate_value: distinct strings -> -1
+    dup_str2: list[str] = ["a", "b", "c"]
+    print(find_duplicate_value(dup_str2))           # -1

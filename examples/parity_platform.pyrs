@@ -1,0 +1,78 @@
+from platform import system, machine, release, version, python_version, platform, node
+
+# parity: pyrst-only
+# `platform` is now registered under its REAL CPython name (renamed from the
+# earlier `plat` stand-in), so `import platform` works. This file STAYS
+# pyrst-only, though, because pyrst's `platform` is a MINIMAL SUBSET whose
+# `platform(aliased=, terse=)` kwargs are accepted-but-ignored (G4): the
+# assertions below require every kwarg permutation to return the SAME string
+# (lines 55-61), which is TRUE for pyrst but FALSE for CPython's real
+# `platform.platform(terse=True)` (a genuinely shorter string) — so a dual-run
+# would diverge by construction. Section 1 still exercises this file against
+# examples/expected/parity_platform.txt (values verified against the live
+# CPython `platform` module ON THIS HOST during the unit's hardening pass).
+
+# NOTE: environment-coupled by nature (real system/machine/hostname values),
+# same as CPython's own `platform` module — the dual-run harness runs both
+# sides on the SAME host, so these are stable, real assertions here, not a
+# weakened smoke test. HARDENING (card 4b6d4c36): `system()` was fixed from
+# `std::env::consts::OS` (lowercase "linux") to shelling out to `uname -s`
+# ("Linux") — the writer's original returned the WRONG case, an undocumented
+# divergence from CPython's real `platform.system()` (verified live).
+def main() -> None:
+    # platform.system()
+    sys: str = system()
+    assert len(sys) > 0
+    assert sys == "Linux"
+
+    # platform.machine()
+    mach: str = machine()
+    assert len(mach) > 0
+    assert mach == "x86_64"
+
+    # platform.release()
+    rel: str = release()
+    assert len(rel) > 0
+    # Has version separators (. or -)
+    assert "." in rel or "-" in rel
+
+    # platform.version()
+    ver: str = version()
+    assert len(ver) > 0
+
+    # platform.python_version()
+    pyver: str = python_version()
+    assert "." in pyver
+    parts: list[str] = pyver.split(".")
+    assert len(parts) >= 2
+    assert pyver == "3.12.9"
+
+    # platform.platform()
+    plat_str: str = platform()
+    assert len(plat_str) > 0
+    # Should contain hyphens
+    assert "-" in plat_str
+    # Should start with the same OS name as system()
+    assert plat_str.split("-")[0] == sys
+
+    # platform.platform with explicit kwargs (accepted-but-ignored, G4 —
+    # every permutation must still return the SAME string).
+    base: str = platform()
+    assert base == platform(aliased=False)
+    assert base == platform(terse=False)
+    assert base == platform(aliased=True)
+    assert base == platform(terse=True)
+    assert base == platform(aliased=True, terse=True)
+
+    # platform.node()
+    node_name: str = node()
+    assert len(node_name) > 0
+
+    # Consistency across calls
+    assert system() == system()
+    assert machine() == machine()
+    assert release() == release()
+    assert python_version() == python_version()
+    assert node() == node()
+
+    print("PASS")

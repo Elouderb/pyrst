@@ -1,0 +1,59 @@
+['test']
+value
+True
+True
+['key']
+[('key', 'value')]
+42
+3.14
+True
+False
+[('def', 'val')]
+val
+True
+True
+v
+dv
+/home/user
+%(base)s/user
+/opt/conf
+/var/conf
+
+a=b
+DONE
+def
+99
+2.71
+False
+v
+line1
+line2
+line3
+['myopt']
+val
+True
+False
+True
+False
+True
+False
+True
+False
+True
+False
+False
+False
+val % here
+val %% here
+0
+-99
+9223372036854775807
+0.0
+1e-10
+/home/alice
+['local_key', 'global_key']
+[('global_key', 'global_val'), ('local_key', 'local_val')]
+['z', 'a', 'm']
+['z', 'a', 'm']
+[('d1', 'v1'), ('d2', 'v2')]
+你好

@@ -1,0 +1,245 @@
+# pyrst standard library — colorsys
+#
+# Color system conversion module. Provides six conversion functions between RGB,
+# YIQ, HLS, and HSV color spaces, plus three mathematical constants.
+#
+# FIDELITY: 4.5/5 — every function's output was diffed against a real
+# CPython 3.12 oracle across ~80 (value, edge-case) combinations (zero,
+# one, ties, negatives, >1, large/negative hue, unicode N/A here) and is now
+# byte-identical. HARDENING PASS found and fixed two real bugs that were NOT
+# float-precision artifacts (see the `HARDENING FIX` comments at each site):
+#   1. `yiq_to_rgb` had WRONG hardcoded coefficients (confirmed against
+#      CPython's actual `colorsys.py` source via `inspect.getsource`): the
+#      `g` channel's Q-coefficient was off by ~3.6e-5 (0.6356547546139638 vs
+#      the real 0.6356910791873801), and the `r` channel's Q-coefficient and
+#      `b` channel's I-coefficient were each wrong at the 10th significant
+#      digit. This was NOT caught by the original parity suite because it
+#      never round-tripped `rgb_to_yiq` through `yiq_to_rgb` (only HLS/HSV
+#      had roundtrip tests) — now added, see examples/parity_colorsys.pyrs.
+#   2. `rgb_to_yiq` used a pre-expanded (algebraically equivalent, but
+#      differently-rounding) form of the I/Q formulas instead of CPython's
+#      actual 3-step Y-then-I/Q computation; switched to match CPython's
+#      exact operation order.
+#   3. `hls_to_rgb` pre-normalized `h` ONCE via manual truncation instead of
+#      applying CPython's `% 1.0` fresh to each of the three hue offsets;
+#      diverged from CPython in the last few bits for large `|h|` (e.g.
+#      h=10.5). Switched to match CPython's exact structure.
+#
+# Divergences from CPython (documented):
+#   - OUTPUT TYPE HOMOGENIZATION: `rgb_to_hsv` and `hsv_to_rgb` return V as
+#     int when all inputs/outputs are in {0, 1}; pyrst homogenizes all returns
+#     to (float, float, float) for simplicity. Tests using integer V must use
+#     equality with float (e.g., `== 1.0` not `== 1`).
+#   - PRECISION: Nearly-zero YIQ I/Q components for grayscale (e.g., 5.2e-17)
+#     emerge from IEEE 754 rounding. Parity tests use `round(value, n)` or
+#     epsilon comparisons for these edges.
+#   - NO INPUT VALIDATION: Negative, >1, NaN, and ∞ values pass through
+#     silently, matching CPython's permissive semantics — including
+#     `hsv_to_rgb` with a raw/negative/large hue, which now mirrors CPython's
+#     `int(h*6.0)` truncation + `i % 6` sector wrap exactly (it formerly
+#     pre-normalized `h` into [0, 1) and diverged; see the HARDENING FIX at
+#     `hsv_to_rgb`). The SOLE remaining divergence from CPython's permissive
+#     pass-through is `rgb_to_hls(1.5, 0.5, 0.5)` (and other
+#     out-of-[0,1]-range inputs that make `2.0 - maxc - minc == 0.0`) makes
+#     CPython itself RAISE `ZeroDivisionError: float division by zero`
+#     (verified against CPython 3.12), while pyrst's `/` operator on floats
+#     does not trap divide-by-zero and silently returns `inf`. This is a
+#     pyrst-WIDE float-division divergence (plain `1.0 / 0.0` already returns
+#     `inf` in pyrst instead of raising), not specific to this module or
+#     fixable here — flagged for a follow-up card rather than patched with a
+#     local zero-check that the rest of the language wouldn't honor anyway.
+
+# Module-level constants (exact values from CPython)
+ONE_SIXTH: float = 0.16666666666666666
+ONE_THIRD: float = 0.3333333333333333
+TWO_THIRD: float = 0.6666666666666666
+
+def rgb_to_yiq(r: float, g: float, b: float) -> tuple[float, float, float]:
+    """Convert RGB [0,1]³ to YIQ luma-chroma; Y ∈ [0,1], I,Q unbounded."""
+    # HARDENING FIX: the ORIGINAL delivered version pre-expanded this into
+    # `i = 0.599*r - 0.2773*g - 0.3217*b` / `q = 0.213...*r - 0.525...*g +
+    # 0.3121*b` — algebraically equivalent to CPython's own formula in exact
+    # math, but IEEE-754 arithmetic is not associative/distributive, so the
+    # pre-expanded form rounds differently in the last few bits than
+    # CPython's actual 3-step computation for MANY non-trivial (r,g,b)
+    # triples (confirmed by diffing ~50 (r,g,b) triples against a real
+    # CPython 3.12 oracle — mismatches went well beyond the already-documented
+    # near-zero-exponent grayscale case, e.g. i/q differed at the 12th–14th
+    # significant digit for (0.5, 0.3, 0.7) and other ordinary colors). This
+    # computes Y first and re-uses it for I/Q exactly like CPython's actual
+    # `colorsys.py` source, which reproduces its rounding bit-for-bit.
+    y: float = 0.30 * r + 0.59 * g + 0.11 * b
+    i: float = 0.74 * (r - y) - 0.27 * (b - y)
+    q: float = 0.48 * (r - y) + 0.41 * (b - y)
+    return (y, i, q)
+
+def yiq_to_rgb(y: float, i: float, q: float) -> tuple[float, float, float]:
+    """Convert YIQ to RGB; clamps RGB to [0,1]."""
+    # HARDENING FIX: the ORIGINAL delivered coefficients for the Q terms (and
+    # the I term of `b`) were WRONG — not float-precision noise, actual wrong
+    # constants (confirmed against CPython 3.12's real `colorsys.py` source
+    # via `inspect.getsource`): `g`'s Q-coefficient was 0.6356547546139638
+    # instead of the real 0.6356910791873801 (off by ~3.6e-5, easily outside
+    # any float-tolerance band), `r`'s Q-coefficient and `b`'s I-coefficient
+    # were each wrong at the 10th significant digit. None of this was caught
+    # by the original parity suite because it never round-tripped
+    # `rgb_to_yiq` through `yiq_to_rgb` (only HLS and HSV had roundtrip
+    # tests). Restored CPython's exact literal coefficients below.
+    r: float = y + 0.9468822170900693 * i + 0.6235565819861433 * q
+    g: float = y - 0.27478764629897834 * i - 0.6356910791873801 * q
+    b: float = y - 1.1085450346420322 * i + 1.7090069284064666 * q
+
+    # Clamp to [0, 1]
+    r = 0.0 if r < 0.0 else (1.0 if r > 1.0 else r)
+    g = 0.0 if g < 0.0 else (1.0 if g > 1.0 else g)
+    b = 0.0 if b < 0.0 else (1.0 if b > 1.0 else b)
+
+    return (r, g, b)
+
+def rgb_to_hls(r: float, g: float, b: float) -> tuple[float, float, float]:
+    """Convert RGB to HLS (Hue, Lightness, Saturation); all ∈ [0,1]."""
+    maxc: float = r if r >= g else g
+    maxc = maxc if maxc >= b else b
+    minc: float = r if r <= g else g
+    minc = minc if minc <= b else b
+
+    l: float = (minc + maxc) / 2.0
+
+    if minc == maxc:
+        return (0.0, l, 0.0)
+
+    # Calculate saturation
+    if l <= 0.5:
+        s: float = (maxc - minc) / (maxc + minc)
+    else:
+        s = (maxc - minc) / (2.0 - maxc - minc)
+
+    # Calculate hue
+    rc: float = (maxc - r) / (maxc - minc)
+    gc: float = (maxc - g) / (maxc - minc)
+    bc: float = (maxc - b) / (maxc - minc)
+
+    if maxc == r:
+        h: float = bc - gc
+    elif maxc == g:
+        h = 2.0 + rc - bc
+    else:
+        h = 4.0 + gc - rc
+
+    h = h / 6.0
+    if h < 0.0:
+        h = h + 1.0
+
+    return (h, l, s)
+
+def hls_to_rgb(h: float, l: float, s: float) -> tuple[float, float, float]:
+    """Convert HLS to RGB; H wraps cyclically, L,S clamped to [0,1]."""
+    if s == 0.0:
+        return (l, l, l)
+
+    if l <= 0.5:
+        m2: float = l * (1.0 + s)
+    else:
+        m2 = l + s - (l * s)
+
+    m1: float = 2.0 * l - m2
+
+    # HARDENING FIX: the ORIGINAL delivered version pre-normalized `h` ONCE
+    # via manual truncation (`h - int(h)`, then add/subtract 1.0 to force
+    # into [0, 1)) and reused that single normalized value +/- an offset for
+    # all three channels. CPython's actual `colorsys.py` instead applies `%
+    # 1.0` (Python float modulo) FRESH to each of `h+1/3`, `h`, `h-1/3`
+    # independently inside its `_v` helper. Both are mathematically the same
+    # wrapped angle, but IEEE-754 float subtraction/modulo is not
+    # associative, so for large `|h|` (e.g. h=10.5) the two computation
+    # orders round differently in the last few bits — confirmed by diffing
+    # against a real CPython 3.12 oracle (b channel differed at the 15th
+    # significant digit for h=10.5, l=s=0.5). Mirrors CPython's structure
+    # exactly (fresh `% 1.0` per channel) to reproduce its rounding
+    # bit-for-bit.
+    def _hls_value_at(hue_in: float) -> float:
+        hue: float = hue_in % 1.0
+        if hue < ONE_SIXTH:
+            return m1 + (m2 - m1) * hue * 6.0
+        if hue < 0.5:
+            return m2
+        if hue < TWO_THIRD:
+            return m1 + (m2 - m1) * (TWO_THIRD - hue) * 6.0
+        return m1
+
+    r: float = _hls_value_at(h + ONE_THIRD)
+    g: float = _hls_value_at(h)
+    b: float = _hls_value_at(h - ONE_THIRD)
+
+    return (r, g, b)
+
+def rgb_to_hsv(r: float, g: float, b: float) -> tuple[float, float, float]:
+    """Convert RGB to HSV (Hue, Saturation, Value); H,S ∈ [0,1], V ∈ [0,1]."""
+    maxc: float = r if r >= g else g
+    maxc = maxc if maxc >= b else b
+    minc: float = r if r <= g else g
+    minc = minc if minc <= b else b
+
+    v: float = maxc
+
+    if minc == maxc:
+        return (0.0, 0.0, v)
+
+    s: float = (maxc - minc) / maxc
+
+    # Calculate hue
+    rc: float = (maxc - r) / (maxc - minc)
+    gc: float = (maxc - g) / (maxc - minc)
+    bc: float = (maxc - b) / (maxc - minc)
+
+    if maxc == r:
+        h: float = bc - gc
+    elif maxc == g:
+        h = 2.0 + rc - bc
+    else:
+        h = 4.0 + gc - rc
+
+    h = h / 6.0
+    if h < 0.0:
+        h = h + 1.0
+
+    return (h, s, v)
+
+def hsv_to_rgb(h: float, s: float, v: float) -> tuple[float, float, float]:
+    """Convert HSV to RGB; H wraps cyclically."""
+    # HARDENING FIX: the ORIGINAL delivered version pre-normalized `h` into
+    # [0, 1) (truncate-then-add/sub-1.0) BEFORE computing the sector index.
+    # CPython's actual `colorsys.hsv_to_rgb` does NOT: it computes
+    # `i = int(h*6.0)` on the RAW hue (int() truncates toward zero) and wraps
+    # ONLY the integer sector via `i % 6`; `f` keeps the raw fractional part
+    # (which is NEGATIVE for negative hues). The two agree for many hues but
+    # diverge whenever the truncated sector differs from the normalized one —
+    # confirmed against a real CPython 3.12 oracle: `hsv_to_rgb(-0.25,0.5,0.5)`
+    # -> (0.5, 0.25, 0.625) (pre-normalize gave the wrong sector), and
+    # `hsv_to_rgb(-0.1,0.8,0.9)` -> (0.9, -0.252, 0.18) — CPython lets the
+    # negative green channel through, so pyrst now does too. Mirrors CPython's
+    # structure exactly (raw int truncation, `i %= 6`) to match bit-for-bit.
+    if s == 0.0:
+        return (v, v, v)
+
+    h_i: int = int(h * 6.0)
+    f: float = (h * 6.0) - h_i
+
+    p: float = v * (1.0 - s)
+    q: float = v * (1.0 - s * f)
+    t: float = v * (1.0 - s * (1.0 - f))
+
+    h_i = h_i % 6
+
+    if h_i == 0:
+        return (v, t, p)
+    elif h_i == 1:
+        return (q, v, p)
+    elif h_i == 2:
+        return (p, v, t)
+    elif h_i == 3:
+        return (p, q, v)
+    elif h_i == 4:
+        return (t, p, v)
+    else:
+        return (v, p, q)

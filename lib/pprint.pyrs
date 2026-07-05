@@ -1,0 +1,695 @@
+# pyrst standard library — pprint
+#
+# FIDELITY: 4/5 (matches the W2 dossier's own target estimate).
+#
+# HARDENING PASS (w2-hardener, card 26b362d3): re-oracled every public
+# function against fresh CPython 3.12 with unicode/negative/boundary/tie
+# inputs beyond the original dossier plan. Two genuine defects found and
+# FIXED (both string-scanning gaps in the "wrap repr()" strategy, not core-
+# repr issues):
+#   (a) `_pprint_underscore` grouped EVERY bare digit run unconditionally,
+#       incorrectly underscore-grouping a float's mantissa/fractional/
+#       exponent digits (`underscore_numbers` only affects `int` values in
+#       CPython, never `float` — verified live). Fixed by detecting the
+#       full float-token span (`.`+digit and/or `[eE][+-]?`+digit lookahead)
+#       and passing it through untouched.
+#   (b) `_pprint_depth_limit` treated every `(` uniformly as a depth-
+#       counted bracket, so it wrongly truncated INSIDE a dataclass's own
+#       repr (e.g. `Outer(items=[...], inner=Inner(...))` at `depth=1`)
+#       where CPython treats a dataclass repr as an OPAQUE leaf for depth-
+#       limiting purposes, however deep its own fields nest (verified
+#       live). Fixed via `_pprint_is_dataclass_paren`: a `(` immediately
+#       preceded by an identifier character is a dataclass-repr call paren,
+#       copied through verbatim with no depth counting.
+# See `examples/parity_pprint.pyrs`'s HARDENING section for the regression
+# cases, and the card history for the full verification trail. Two additional
+# apparent "divergences" found during re-oracling
+# (mixed-width int dict-key ordering; multi-string-element set ordering)
+# were traced to PRE-EXISTING core `repr()` properties (not introduced by
+# this module) and are documented, not fixed here — see G11/G12/G13 below.
+#
+# Surface implemented (exact CPython names): `pformat`, `pprint`, `pp`,
+# `isreadable`, `isrecursive`, `saferepr`, `PrettyPrinter` (class, with
+# `pformat`/`pprint`/`isreadable`/`isrecursive` methods).
+#
+# STRATEGY — "wrap repr()", not re-derive it: `pformat` computes
+# `flat: str = repr(object)` (the CPython-EXACT repr from the new PyRepr
+# machinery — see src/codegen/mod.rs REPR_PRELUDE) and then does everything
+# else — depth truncation, width-driven line wrapping, underscore-grouping —
+# as GENERIC, TYPE-AGNOSTIC string scanning over that text (bracket/quote
+# aware, so it never splits inside a quoted string). This is what lets
+# `pformat[T]` be a single truly generic entry point that works for
+# `object: T` bound only by `T: PyRepr` (inferred from the `repr(object)`
+# call) — literally any scalar, list/dict/set/tuple, or user dataclass —
+# instead of needing a family of overloads per container shape (pyrst does
+# not support function overloading or generic methods; see GATE 2 below).
+#
+# ── DICT KEY SORTING (the card's headline claim) ──────────────────────────
+# `sort_dicts=True` (CPython's default) "just works": pyrst's own `repr()` of
+# a `dict[K, V]` already renders entries in a stable sorted order (see
+# REPR_PRELUDE's `HashMap` impl), so `pformat({3:'c',1:'a',2:'b'})` naturally
+# comes out key-ascending, matching CPython's `sort_dicts=True` default with
+# NO extra work in this module. This is the "aligns with pyrst dicts" win the
+# card called out.
+#
+# GATES / DIVERGENCES (every one that survived to this file):
+#
+#   G1 (bytes — DEFERRED): pyrst has no `bytes` type/literal at all, so
+#      `pformat(b'...')`/`saferepr(b'...')` cannot even be called; the
+#      CPython probes using `b'hello'` in the dossier are inapplicable, not
+#      silently wrong. No stub needed since no caller can construct the arg.
+#
+#   G2 (`PrettyPrinter` must be A GENERIC CLASS, not a plain one — REQUIRED
+#      ADAPTATION): pyrst's parser explicitly REJECTS generic methods
+#      ("generic methods are not supported... a generic helper can always be
+#      written", src/parser.rs `reject_generic_method`). CPython's
+#      `PrettyPrinter.pformat(self, object)` needs `object` to be of ANY
+#      type per call, which a non-generic class's method cannot express. The
+#      only way to give `PrettyPrinter` an `object: T` parameter at all is to
+#      make the CLASS itself generic: `class PrettyPrinter[T]`. Per the
+#      established `deque[T]`/`Cache[K,V]` precedent (see `examples/
+#      stdlib_deque.pyrs`), the type argument is driven by the binding's
+#      annotation, not an explicit `PrettyPrinter[int](...)` call expression:
+#          p: PrettyPrinter[int] = PrettyPrinter(indent=1, width=80)
+#      matches CPython's `pp = PrettyPrinter(indent=1, width=80)` in every
+#      respect except that pyrst callers must annotate the concrete element
+#      type on the left-hand side. A `PrettyPrinter[T]` instance can only be
+#      used to format ONE element type per binding (not arbitrary mixed
+#      objects across calls, as CPython's untyped instance can) — documented,
+#      unavoidable given pyrst's static generics.
+#      (Implementation note: `PrettyPrinter[T]` has NO field of type `T` in
+#      CPython's own field set (indent/width/depth/compact/sort_dicts/
+#      underscore_numbers are the true state) — but Rust requires every
+#      struct type parameter to appear in some field ("parameter T is never
+#      used", E0392). A private `_pprint_marker: Optional[T]` field (always
+#      `None`) exists purely to satisfy that constraint; it carries no
+#      runtime meaning.)
+#
+#   G3 (`pp(object, *args, sort_dicts=False, **kwargs)` — NO VARIADICS):
+#      pyrst has no `*args`/`**kwargs` (G4 in the dossier). Per the dossier's
+#      own migration guidance, `pp` is implemented as a plain passthrough
+#      with the SAME explicit keyword parameters as `pprint`/`pformat`
+#      (`stream` aside, see G5), just with `sort_dicts` defaulting to
+#      `False` instead of `True` — the one behavioral difference CPython's
+#      `pp` actually adds over `pprint`.
+#
+#   G4 (`sort_dicts=False` cannot reproduce CPython insertion order —
+#      DIVERGENCE, same shape as `json.dumps`'s documented `sort_keys`
+#      divergence): pyrst's `dict` has no insertion-order tracking at all
+#      (verified empirically in `lib/json.pyrs`'s own hardening note: raw
+#      `.keys()` iteration is UNSORTED/per-process-randomized, and there is
+#      no channel to insertion order). `pformat`'s dict content is exactly
+#      `repr(dict)`'s content, which is ALWAYS rendered in sorted order
+#      regardless of `sort_dicts`. So `sort_dicts=False` is accepted (for
+#      signature parity and to flow through `PrettyPrinter`/`pp`) but is
+#      CURRENTLY A NO-OP: pyrst always prints dict entries sorted by key,
+#      whether `sort_dicts` is `True` or `False`. This is flagged, not
+#      hidden — see the parity file's explicit `# parity: pyrst-only` case.
+#
+#   G5 (`stream=` param — DROPPED, not merely defaulted): CPython's
+#      `pprint`/`pp`/`PrettyPrinter.__init__` accept an arbitrary writable
+#      `stream` object. pyrst's only I/O handle type is the `File` produced
+#      by `open(...)` (`Ty::File`), which has NO nameable spelling as a
+#      parameter annotation anywhere in the grammar (`open`'s return type is
+#      synthesized, not a user-referenceable type name) — there is no
+#      generic "writable" abstraction to accept a duck-typed stream. `pprint`
+#      / `pp` therefore ALWAYS print to stdout (via the builtin `print`);
+#      the `stream=` parameter is omitted from the signature entirely rather
+#      than faked. This is a real, load-bearing signature reduction, called
+#      out here rather than silently dropped.
+#
+#   G6 (`compact=True` — accepted, NOT IMPLEMENTED; documented divergence):
+#      the parameter is accepted for signature/plumbing parity through
+#      `PrettyPrinter`/`pp`, but it does NOT change wrapping. This is a REAL
+#      divergence, not a no-op that happens to agree: when a container's items
+#      would overflow `width`, CPython's `compact=True` PACKS as many items as
+#      fit per line, e.g. `pformat(list(range(1,16)), width=20, compact=True)`
+#      -> `'[1, 2, 3, 4, 5, 6,\n 7, 8, 9, 10, 11,\n 12, 13, 14, 15]'`, whereas
+#      this module emits the same output as `compact=False` (one item per line
+#      once it wraps: `'[1,\n 2,\n ... 15]'`). CPython's compact packing tracks
+#      the exact running column across the recursive structure; pyrst's flat-
+#      text single-level wrapper (see STRATEGY / G7) cannot reproduce it byte-
+#      for-byte, and a partial port would silently diverge on untested shapes
+#      (worse than an honest gap), so it is documented rather than approximated.
+#      Output for compact=True is still valid, readable, one-item-per-line.
+#
+#   G6b (long STRING atoms are NOT wrapped; documented divergence): when a
+#      plain string's repr exceeds `width`, CPython splits it on whitespace and
+#      emits a parenthesized implicit-concatenation block, e.g.
+#      `pformat("a rather long single string value here", width=10)` ->
+#      `"('a '\n 'rather '\n 'long '\n 'single '\n 'string '\n 'value '\n 'here')"`.
+#      This module returns the flat one-line repr instead. Same rationale as
+#      G6: CPython's per-line whitespace chunking + width/allowance tracking
+#      (its `_pprint_str`, incl. `splitlines`/`re.findall(r'\S*\s*', ...)`)
+#      does not port byte-exactly onto the flat-text single-level strategy for
+#      a gate-hold round, and a partial port would be a silent miscompile — so
+#      it is documented, not approximated. See the NOTE at `_pprint_wrap`.
+#
+#   G7 (wrapping is SINGLE-LEVEL, not fully recursive): CPython's real
+#      pprint algorithm recursively re-wraps EVERY nested container that
+#      doesn't fit on its own line, tracking the exact column position where
+#      each nested value starts. Because pyrst's generics cannot branch on
+#      "is T a list/dict/scalar" from inside one generic function body (each
+#      instantiation must type-check uniformly), `pformat` cannot recurse
+#      through the actual typed structure — it operates on the FLAT repr
+#      TEXT instead (see STRATEGY above). It therefore only reflows the
+#      OUTERMOST bracketed container's top-level comma-separated elements
+#      across multiple lines when the whole thing exceeds `width`; a nested
+#      container that is ITSELF long keeps its flat (unwrapped) repr inline
+#      on whatever line it lands on, rather than being recursively
+#      re-wrapped with its own indent. This is exact for every case in the
+#      dossier's verified BEHAVIOR MATRIX and PARITY PLAN (all single-level
+#      wraps), and documented here as a known simplification for deeper
+#      structures.
+#
+#   G8 (`isrecursive` is ALWAYS `False`, `saferepr` is ALWAYS `repr(object)`
+#      — CORRECT BY CONSTRUCTION, not a stub): pyrst has NO aliasing —
+#      assignment and argument passing deep-copy — so there is structurally
+#      NO way to construct a true reference cycle reachable from a value
+#      passed into `repr()`. (Even a recursive `Optional[Self]`-linked
+#      structure is a finite tree built tail-first with value-semantics
+#      copies, never a cycle.) `isrecursive` returning `False` and
+#      `saferepr` reducing to plain `repr` are therefore exact, not
+#      approximations, for every value pyrst can construct.
+#
+#   G9 (`isreadable` is ALWAYS `True` — CORRECT BY CONSTRUCTION): CPython's
+#      `isreadable` is `False` exactly when `saferepr` embeds a non-literal
+#      marker (a lambda's `<function ...>`, a bare `object()`'s
+#      `<object object at 0x...>`, or a recursion marker). pyrst's `repr()`
+#      is only callable on types with a real `PyRepr` impl — ints/floats/
+#      strs/bools/`None`/containers/dataclasses with `__repr__` — all of
+#      which produce literal, syntactically valid text (a class without
+#      `__repr__` is rejected at CHECK time, so it can never reach here in
+#      the first place). There is no pyrst value whose `repr()` produces a
+#      `<...>`-style marker, so `isreadable` returning `True` unconditionally
+#      is exact, not a stub. The dossier's own `isreadable(lambda: None) ==
+#      False` / `isreadable(object()) == False` probes are INAPPLICABLE:
+#      pyrst has no way to pass a lambda or a bare object into a
+#      `repr`-bound generic parameter in the first place (the call wouldn't
+#      compile), so those two specific CPython probes are dropped from the
+#      parity file rather than faked.
+#
+#   G10 (dynamic-typing error probes — INAPPLICABLE): CPython's
+#      `pformat(..., width='invalid')` (raises `ValueError`) and
+#      `pformat(..., width=1.5)` (silently `int()`-coerces) both rely on
+#      Python's duck-typed `int(width)` coercion of the `width` PARAMETER
+#      itself. pyrst's `width: int` is statically typed — a caller can no
+#      more pass a `str` or `float` there than to any other `int` parameter
+#      in the language; the call is a compile error, not a runtime
+#      `ValueError`. Both probes are dropped from the parity file as
+#      inapplicable to a statically typed target, not as an oversight.
+#
+#   G11 (mixed-width int dict keys — LATENT, INHERITED divergence, not
+#      introduced here): `pformat`'s dict content is exactly `repr(dict)`'s
+#      content, and `repr()`'s `HashMap` impl (REPR_PRELUDE) sorts entries by
+#      the rendered `"key: value"` STRING, not by the key's own `<`
+#      ordering. This coincides with true numeric order for single-digit int
+#      keys (as in every dict test in the dossier's PARITY PLAN) and for all
+#      string keys, but could diverge for a dict with MIXED-WIDTH int keys
+#      (e.g. `{1: 'a', 10: 'b', 2: 'c'}`, where `"10: 'b'"` sorts before
+#      `"1: 'a'"` lexically). This is a property of pyrst's core `repr()`,
+#      not something introduced or fixable in this module; flagged here for
+#      visibility rather than silently inherited. Verified directly (w2-
+#      hardener): `repr({1: 'a', 10: 'b', 2: 'c'})` alone, with NO pprint
+#      involved at all, already gives `{10: 'b', 1: 'a', 2: 'c'}` vs
+#      CPython's `{1: 'a', 2: 'c', 10: 'b'}` — confirming the root cause is
+#      core `repr()`, not this module's string-scanning logic.
+#
+#   G12 (multi-string-element `set` ordering — LATENT, INHERITED
+#      divergence, discovered during hardening, same root cause as G11):
+#      pyrst's `repr(set)` (REPR_PRELUDE) renders elements in a fixed
+#      sorted order; CPython's `set` iteration order depends on (randomized
+#      -by-default) string hashing, so e.g. `repr({'z', 'a', 'm'})` in
+#      CPython is `{'z', 'a', 'm'}` on one interpreter run and can differ
+#      on another (`PYTHONHASHSEED`-dependent) — not even a stable target
+#      for pyrst to match. Verified directly with a bare `repr({'z', 'a',
+#      'm'})` (no pprint involved): pyrst gives the sorted `{'a', 'm',
+#      'z'}`. A property of core `repr()`, not this module; excluded from
+#      the dual-run golden accordingly (small-int sets are unaffected,
+#      since CPython's small-int hash equals its own value, so pyrst's
+#      sorted-by-value order and CPython's hash-bucket order coincide).
+#
+# Error surface implemented (matches the dossier's ERRORS table exactly for
+# every statically-typeable case):
+#   - `width == 0`   -> `ValueError("width must be != 0")`
+#   - `indent < 0`   -> `ValueError("indent must be >= 0")`
+#   - `depth <= 0` (when not `None`) -> `ValueError("depth must be > 0")`
+#   - negative `width` (other than 0): no error, forces one-item-per-line
+#     wrapping (matches CPython: "treated as tiny width").
+#
+# RE-ORACLE NOTE (dossier erratum, found during re-verification): the
+# dossier's own PARITY PLAN asserts
+# `pformat([1, 2, 3, 4, 5], width=20).count('\n') >= 1  # multiline`, but
+# re-running that EXACT call against live CPython 3.12 gives
+# `pformat([1, 2, 3, 4, 5], width=20) == '[1, 2, 3, 4, 5]'` (16 chars, fits
+# comfortably inside width=20 — count is 0, not >= 1). This module and its
+# parity golden follow the VERIFIED live-CPython behavior (no wrap), not the
+# dossier's pseudocode, which appears to have a stale/incorrect example
+# here (it likely meant the 8-element list used in the BEHAVIOR MATRIX
+# section instead, which genuinely does wrap at width=20).
+
+
+def _pprint_validate(indent: int, width: int, depth: Optional[int]) -> None:
+    # Shared validation for `pformat`/`pprint`/`pp`/`PrettyPrinter.__init__` —
+    # exact CPython messages (dossier ERRORS table).
+    if width == 0:
+        raise ValueError("width must be != 0")
+    if indent < 0:
+        raise ValueError("indent must be >= 0")
+    if depth is not None:
+        if depth <= 0:
+            raise ValueError("depth must be > 0")
+
+
+def _pprint_group_digits(digits: str) -> str:
+    # Group an ALL-DIGIT run into underscore-separated triples from the
+    # right (CPython `f'{n:_}'` grouping): "1000000" -> "1_000_000". Runs of
+    # length <= 3 are returned unchanged (no separator needed).
+    n: int = len(digits)
+    if n <= 3:
+        return digits
+    first_len: int = n % 3
+    if first_len == 0:
+        first_len = 3
+    out: str = digits[0:first_len]
+    i: int = first_len
+    while i < n:
+        out += "_" + digits[i:i + 3]
+        i = i + 3
+    return out
+
+
+def _pprint_underscore(s: str) -> str:
+    # Scan `s` (a `repr()` result) and underscore-group every maximal
+    # ALL-DIGIT run that appears OUTSIDE a quoted string (so a digit run
+    # inside a str literal, e.g. `'1000000'`, is left untouched — only bare
+    # numeric text is grouped) AND that belongs to an `int` token, not a
+    # `float` token. CPython's `underscore_numbers` ONLY affects values
+    # where `type(x) is int` (`pprint._safe_repr`'s
+    # `issubclass(typ, int) and r is object.__repr__` guard, which floats
+    # never satisfy) — a float's repr is passed through completely
+    # unchanged, digits and all (verified live: `pformat(1234567.891,
+    # underscore_numbers=True) == '1234567.891'`, not `'1_234_567.891'`;
+    # HARDENING fix — the original implementation grouped every bare digit
+    # run unconditionally, incorrectly underscoring a float's mantissa/
+    # fractional/exponent digits too).
+    #
+    # A digit run starting at `i` is the INTEGER-PART of a float token
+    # (rather than a plain `int`) iff, looking ahead past the run, the text
+    # continues with `.` + digit (a fractional part) and/or `[eE][+-]?`
+    # + digit (an exponent) — the CPython float-repr grammar. When that is
+    # detected, the ENTIRE float token (mantissa + fraction + exponent) is
+    # copied through verbatim with no grouping at all; otherwise the run is
+    # a plain int and is grouped as before.
+    out: str = ""
+    in_quote: str = ""
+    i: int = 0
+    n: int = len(s)
+    while i < n:
+        c: str = s[i]
+        if in_quote != "":
+            out += c
+            if c == "\\" and i + 1 < n:
+                out += s[i + 1]
+                i = i + 2
+                continue
+            if c == in_quote:
+                in_quote = ""
+            i = i + 1
+            continue
+        if c == "'" or c == "\"":
+            in_quote = c
+            out += c
+            i = i + 1
+            continue
+        if c.isdigit():
+            j: int = i
+            while j < n and s[j].isdigit():
+                j = j + 1
+            k: int = j
+            is_float: bool = False
+            if k < n and s[k] == "." and k + 1 < n and s[k + 1].isdigit():
+                is_float = True
+                k = k + 1
+                while k < n and s[k].isdigit():
+                    k = k + 1
+            if k < n and (s[k] == "e" or s[k] == "E"):
+                m: int = k + 1
+                if m < n and (s[m] == "+" or s[m] == "-"):
+                    m = m + 1
+                if m < n and s[m].isdigit():
+                    is_float = True
+                    k = m
+                    while k < n and s[k].isdigit():
+                        k = k + 1
+            if is_float:
+                out += s[i:k]
+                i = k
+                continue
+            out += _pprint_group_digits(s[i:j])
+            i = j
+            continue
+        out += c
+        i = i + 1
+    return out
+
+
+def _pprint_match_close(c: str) -> str:
+    if c == "[":
+        return "]"
+    if c == "{":
+        return "}"
+    return ")"
+
+
+def _pprint_find_match(s: str, open_idx: int) -> int:
+    # Return the index of the bracket that closes the OPEN bracket at
+    # `open_idx`, skipping over quoted-string spans and nested brackets.
+    n: int = len(s)
+    depth: int = 0
+    in_quote: str = ""
+    i: int = open_idx
+    while i < n:
+        c: str = s[i]
+        if in_quote != "":
+            if c == "\\" and i + 1 < n:
+                i = i + 2
+                continue
+            if c == in_quote:
+                in_quote = ""
+            i = i + 1
+            continue
+        if c == "'" or c == "\"":
+            in_quote = c
+            i = i + 1
+            continue
+        if c == "[" or c == "{" or c == "(":
+            depth = depth + 1
+            i = i + 1
+            continue
+        if c == "]" or c == "}" or c == ")":
+            depth = depth - 1
+            if depth == 0:
+                return i
+            i = i + 1
+            continue
+        i = i + 1
+    return n - 1
+
+
+def _pprint_is_dataclass_paren(s: str, open_idx: int) -> bool:
+    # True iff the `(` at `open_idx` is a DATACLASS-REPR call paren
+    # (`Name(field=..., ...)`) rather than a genuine tuple-literal `(`.
+    # CPython's real pprint only ever depth-walks the four STRUCTURAL
+    # container types (list/dict/set/tuple) via its own object-graph
+    # recursion; a dataclass (or any object using its default/derived
+    # `__repr__`) is an OPAQUE leaf for depth-limiting purposes no matter
+    # how deeply ITS OWN fields nest (verified live: `pformat(Outer(...),
+    # depth=1)` reproduces the FULL untouched repr, including nested
+    # `Inner(...)` and list fields — CPython never truncates inside a
+    # dataclass repr at any depth). Since this module's `_pprint_depth_
+    # limit` walks the FLAT text and can't see real types, it distinguishes
+    # the two cases the same way Python's own grammar does: a tuple's `(`
+    # is never immediately preceded by an identifier character, while a
+    # dataclass repr's `(` always is (`Outer(`, `Inner(`).
+    if open_idx == 0:
+        return False
+    prev: str = s[open_idx - 1]
+    return prev.isalnum() or prev == "_"
+
+
+def _pprint_depth_limit(s: str, max_depth: int) -> str:
+    # Collapse every bracketed span whose nesting level EXCEEDS `max_depth`
+    # to `<open>...<close>` (CPython's `{...}` / `[...]` truncation marker),
+    # tracking nesting depth over the flat repr text (quote-aware, so a
+    # literal bracket char inside a quoted string never perturbs the count).
+    # A dataclass-repr paren (see `_pprint_is_dataclass_paren`) is copied
+    # through ENTIRELY VERBATIM and does not participate in depth counting
+    # at all — HARDENING fix: the original implementation treated every
+    # `(` uniformly as a depth-counted bracket, so `PrettyPrinter`/`pformat`
+    # depth-truncated INSIDE dataclass reprs (e.g. `Outer(items=[1, 2, 3],
+    # inner=Inner(v=5))` at `depth=1` wrongly became `Outer(items=[...],
+    # inner=Inner(...))`) where CPython leaves the whole dataclass repr
+    # untouched.
+    out: str = ""
+    in_quote: str = ""
+    depth: int = 0
+    i: int = 0
+    n: int = len(s)
+    while i < n:
+        c: str = s[i]
+        if in_quote != "":
+            out += c
+            if c == "\\" and i + 1 < n:
+                out += s[i + 1]
+                i = i + 2
+                continue
+            if c == in_quote:
+                in_quote = ""
+            i = i + 1
+            continue
+        if c == "'" or c == "\"":
+            in_quote = c
+            out += c
+            i = i + 1
+            continue
+        if c == "(" and _pprint_is_dataclass_paren(s, i):
+            j: int = _pprint_find_match(s, i)
+            out += s[i:j + 1]
+            i = j + 1
+            continue
+        if c == "[" or c == "{" or c == "(":
+            if depth + 1 > max_depth:
+                close_char: str = _pprint_match_close(c)
+                j: int = _pprint_find_match(s, i)
+                out += c + "..." + close_char
+                i = j + 1
+                continue
+            depth = depth + 1
+            out += c
+            i = i + 1
+            continue
+        if c == "]" or c == "}" or c == ")":
+            depth = depth - 1
+            out += c
+            i = i + 1
+            continue
+        out += c
+        i = i + 1
+    return out
+
+
+def _pprint_top_level_split(interior: str) -> list[str]:
+    # Split `interior` (a container repr with its outer brackets already
+    # stripped) on TOP-LEVEL ", " separators only — i.e. skip separators
+    # nested inside a bracket or a quoted string. Mirrors exactly how
+    # REPR_PRELUDE joins container elements (`xs.join(", ")`).
+    parts: list[str] = []
+    cur: str = ""
+    in_quote: str = ""
+    depth: int = 0
+    i: int = 0
+    n: int = len(interior)
+    while i < n:
+        c: str = interior[i]
+        if in_quote != "":
+            cur += c
+            if c == "\\" and i + 1 < n:
+                cur += interior[i + 1]
+                i = i + 2
+                continue
+            if c == in_quote:
+                in_quote = ""
+            i = i + 1
+            continue
+        if c == "'" or c == "\"":
+            in_quote = c
+            cur += c
+            i = i + 1
+            continue
+        if c == "[" or c == "{" or c == "(":
+            depth = depth + 1
+            cur += c
+            i = i + 1
+            continue
+        if c == "]" or c == "}" or c == ")":
+            depth = depth - 1
+            cur += c
+            i = i + 1
+            continue
+        if c == "," and depth == 0 and i + 1 < n and interior[i + 1] == " ":
+            parts.append(cur)
+            cur = ""
+            i = i + 2
+            continue
+        cur += c
+        i = i + 1
+    parts.append(cur)
+    return parts
+
+
+def _pprint_wrap(flat: str, width: int, indent: int) -> str:
+    # Reflow the OUTERMOST bracketed container's top-level elements across
+    # multiple lines (see module header G7 for the single-level scope of
+    # this). `indent` columns of leading space precede every continuation
+    # line; the first element sits `indent - 1` spaces after the opening
+    # bracket (so it lines up under where a second element would start).
+    n: int = len(flat)
+    if n == 0:
+        return flat
+    open_char: str = flat[0]
+    if open_char != "[" and open_char != "{" and open_char != "(":
+        # Non-container atoms (int/float/bool/None) are never split — matches
+        # CPython. NOTE: a long STRING atom is a DOCUMENTED DIVERGENCE (G6b):
+        # CPython wraps an over-width string into a parenthesized implicit-
+        # concatenation block split on whitespace, e.g.
+        # `pformat("a rather long single string value here", width=10)` ->
+        # `"('a '\n 'rather '\n 'long '\n 'single '\n 'string '\n 'value '\n 'here')"`,
+        # while pyrst returns the flat one-line repr. Reproducing CPython's
+        # whitespace-chunking/width-tracking byte-for-byte on the flat-text
+        # strategy (no typed recursion) does not land cleanly for a gate-hold
+        # round; a partial port would silently diverge, so it is documented,
+        # not approximated. The flat repr stays valid and readable.
+        return flat
+    if n <= width:
+        return flat
+    close_char: str = flat[n - 1]
+    interior: str = flat[1:n - 1]
+    if interior == "":
+        return flat
+    parts: list[str] = _pprint_top_level_split(interior)
+    if len(parts) <= 1:
+        return flat
+    ind: int = indent
+    if ind < 0:
+        ind = 0
+    first_pad: int = ind - 1
+    if first_pad < 0:
+        first_pad = 0
+    out: str = open_char + (" " * first_pad) + parts[0] + ","
+    i: int = 1
+    last: int = len(parts) - 1
+    while i < last:
+        out += "\n" + (" " * ind) + parts[i] + ","
+        i = i + 1
+    out += "\n" + (" " * ind) + parts[last] + close_char
+    return out
+
+
+def pformat[T](object: T, indent: int = 1, width: int = 80, depth: Optional[int] = None, compact: bool = False, sort_dicts: bool = True, underscore_numbers: bool = False) -> str:
+    # `pformat(object, indent=1, width=80, depth=None, *, compact=False,
+    # sort_dicts=True, underscore_numbers=False) -> str` — CPython-exact
+    # surface (pyrst additionally accepts everything positionally, the
+    # standard kwargs-v1 documented superset). See module header for the
+    # `compact` (G6, accepted-but-not-implemented packing), long-string-wrap
+    # (G6b), and `sort_dicts=False` (G4) documented divergences.
+    _pprint_validate(indent, width, depth)
+    flat: str = repr(object)
+    if underscore_numbers:
+        flat = _pprint_underscore(flat)
+    if depth is not None:
+        flat = _pprint_depth_limit(flat, depth)
+    if len(flat) > width:
+        flat = _pprint_wrap(flat, width, indent)
+    return flat
+
+
+def pprint[T](object: T, indent: int = 1, width: int = 80, depth: Optional[int] = None, compact: bool = False, sort_dicts: bool = True, underscore_numbers: bool = False) -> None:
+    # `pprint(object, stream=None, indent=1, width=80, depth=None, *,
+    # compact=False, sort_dicts=True, underscore_numbers=False) -> None` —
+    # `stream` is DROPPED (G5): always prints to stdout via the builtin
+    # `print`, with the trailing newline `print` already supplies (matching
+    # CPython's `pformat(...) + "\n"` write).
+    print(pformat(object, indent=indent, width=width, depth=depth, compact=compact, sort_dicts=sort_dicts, underscore_numbers=underscore_numbers))
+
+
+def pp[T](object: T, indent: int = 1, width: int = 80, depth: Optional[int] = None, compact: bool = False, sort_dicts: bool = False, underscore_numbers: bool = False) -> None:
+    # `pp(object, *args, sort_dicts=False, **kwargs) -> None` in CPython —
+    # a `pprint` shorthand with `sort_dicts` defaulting `False`. The
+    # `*args`/`**kwargs` passthrough is replaced by the SAME explicit
+    # keyword parameters as `pprint` (G3 — no variadics in pyrst); `stream`
+    # is dropped for the same reason as `pprint` (G5).
+    pprint(object, indent=indent, width=width, depth=depth, compact=compact, sort_dicts=sort_dicts, underscore_numbers=underscore_numbers)
+
+
+def isreadable[T](object: T) -> bool:
+    # `isreadable(object) -> bool`. ALWAYS `True` in pyrst — correct by
+    # construction, not a stub (see module header G9): every `T` that
+    # type-checks against the `repr(object)` call below already has a
+    # literal, re-parseable `PyRepr` rendering (no `<...>`-style marker is
+    # producible in pyrst), and a `T` that could only repr as a non-literal
+    # marker (a lambda, a bare untyped object) cannot reach this generic
+    # parameter in the first place — the call would not compile.
+    _ignored: str = repr(object)
+    return True
+
+
+def isrecursive[T](object: T) -> bool:
+    # `isrecursive(object) -> bool`. ALWAYS `False` in pyrst — correct by
+    # construction (module header G8): pyrst has no aliasing (assignment
+    # and argument passing deep-copy), so no value reachable here can ever
+    # contain a true reference cycle.
+    _ignored: str = repr(object)
+    return False
+
+
+def saferepr[T](object: T) -> str:
+    # `saferepr(object) -> str`. Reduces to plain `repr(object)` — correct
+    # by construction (module header G8): since `isrecursive` is always
+    # `False`, there is never a cycle for `saferepr`'s recursion-guard to
+    # catch, so its output is always identical to `repr()`.
+    return repr(object)
+
+
+class PrettyPrinter[T]:
+    # `PrettyPrinter(indent=1, width=80, depth=None, stream=None, *,
+    # compact=False, sort_dicts=True, underscore_numbers=False)` — see
+    # module header G2 for why this class must be GENERIC (`PrettyPrinter
+    # [T]`, LHS-annotation-driven, one element type per instance) and G5 for
+    # why `stream` is dropped.
+    indent: int
+    width: int
+    depth: Optional[int]
+    compact: bool
+    sort_dicts: bool
+    underscore_numbers: bool
+    # Compiler-required phantom field (module header G2): `T` must appear in
+    # at least one field or Rust rejects the generated struct ("parameter T
+    # is never used", E0392). Always `None`; carries no runtime meaning.
+    _pprint_marker: Optional[T]
+
+    def __init__(self, indent: int = 1, width: int = 80, depth: Optional[int] = None, compact: bool = False, sort_dicts: bool = True, underscore_numbers: bool = False) -> None:
+        _pprint_validate(indent, width, depth)
+        self.indent = indent
+        self.width = width
+        self.depth = depth
+        self.compact = compact
+        self.sort_dicts = sort_dicts
+        self.underscore_numbers = underscore_numbers
+        self._pprint_marker = None
+
+    def pformat(self, object: T) -> str:
+        # `repr(object)` here is NOT dead code: bound inference for a
+        # generic CLASS type param only recognizes the literal `repr`/
+        # `print`/`str`/`ascii` call shapes written directly in the class's
+        # OWN method body (src/typeck/generics.rs `infer_bounds_expr`) — it
+        # does not look through a call to another generic function (like
+        # the module-level `pformat` below) to inherit ITS bound
+        # requirements. Without this line, the generated `impl<T: Clone>
+        # PrettyPrinter<T>` is missing `T: PyRepr`, and `pformat(object,
+        # ...)` fails to compile (E0277). This forces the bound onto `T`.
+        _pprint_force_bound: str = repr(object)
+        return pformat(object, indent=self.indent, width=self.width, depth=self.depth, compact=self.compact, sort_dicts=self.sort_dicts, underscore_numbers=self.underscore_numbers)
+
+    def pprint(self, object: T) -> None:
+        print(self.pformat(object))
+
+    def isreadable(self, object: T) -> bool:
+        # See the bound-inference note in `pformat` above — same reason.
+        _pprint_force_bound: str = repr(object)
+        return isreadable(object)
+
+    def isrecursive(self, object: T) -> bool:
+        # See the bound-inference note in `pformat` above — same reason.
+        _pprint_force_bound: str = repr(object)
+        return isrecursive(object)

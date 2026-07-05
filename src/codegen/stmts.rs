@@ -152,8 +152,30 @@ impl<'a> Codegen<'a> {
                 }
             }
             Stmt::Expr(e) => {
-                let s = self.emit_expr(e)?;
-                self.line(&format!("{};", s));
+                // A bare *plain* string-literal statement is a Python no-op — most
+                // often a function/class/module docstring (`"""..."""`), but a bare
+                // string ANYWHERE just evaluates-and-discards. It lowered to
+                // `String::from("...");`, which rustc flags as `unused_must_use`
+                // (`From::from` is `#[must_use]`); it has no runtime effect, so drop
+                // it. Only a plain `Str` is skipped — an f-string (`FStr`) can call
+                // functions in its interpolations, so that is still emitted below.
+                if matches!(e, Expr::Str(..)) {
+                    // bare string literal: emit nothing (Python no-op / docstring).
+                } else {
+                    let s = self.emit_expr(e)?;
+                    // A discarded arithmetic/unary expression-statement (e.g. a bare
+                    // `date(...) + timedelta(...)` whose only purpose is to raise
+                    // OverflowError, as parity goldens do) lowers to `a + b;` / `-x;`,
+                    // which rustc flags as "unused arithmetic operation that must be
+                    // used". The value is deliberately discarded — the side effect is
+                    // the panic during evaluation — so bind it to `_`: evaluation (and
+                    // any panic) still happens, the warning does not.
+                    if matches!(e, Expr::BinOp { .. } | Expr::UnOp { .. }) {
+                        self.line(&format!("let _ = {};", s));
+                    } else {
+                        self.line(&format!("{};", s));
+                    }
+                }
             }
             Stmt::Assign { target, ty, value, span, .. } => {
                 // Uniform clone-on-use: assigning from a non-Copy place (`y = x`,

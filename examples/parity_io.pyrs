@@ -1,0 +1,454 @@
+# DUAL-RUN parity golden for `io.StringIO` (card 066173c4; dossier
+# docs/design/w2-dossiers/stringio.md). Seeded from the dossier's PARITY PLAN
+# (32 cases), corrected against a live CPython 3 re-oracle where the dossier's
+# own claims were imprecise or wrong (see lib/io.pyrs's "RE-ORACLE
+# CORRECTIONS" for the full account):
+#   - truncate() never moves the position (dossier HAZARDS section wrongly
+#     said it resets to 0 — every dossier probe just happened to start at
+#     pos 0 already).
+#   - the two-readline() position on `StringIO("line1\nline2")` is 11, not
+#     the dossier's impossible "12" (len of the buffer IS 11).
+#   - `seek(pos, whence=2)` with a nonzero `pos` raises the same
+#     "Can't do nonzero cur-relative seeks" OSError as whence=1 (the dossier
+#     only demonstrated this for whence=1).
+#   - the closed-file ValueError text is NOT one uniform string:
+#     readlines()/isatty() carry a trailing period the other methods don't.
+#   - flush() and the closed/encoding/errors properties never raise, even
+#     when closed.
+#
+# `StringIO("")` is used everywhere in place of CPython's no-arg `StringIO()`
+# — behaviorally identical (both build an empty buffer) — because this
+# module's `initial_value` parameter is REQUIRED, not defaulted (see
+# lib/io.pyrs's "COMPILER GAPS" #1: constructor calls do not fill an omitted
+# default-valued parameter in this compiler build). Since `StringIO("")` is
+# ALSO valid, unmodified CPython, this keeps the source identical for both
+# runners with no pyrst-only carve-out needed.
+from io import StringIO
+
+
+def main() -> None:
+    # --- initialization ---
+    print(StringIO("").getvalue())
+    print(StringIO("hello").getvalue())
+    print(StringIO("").getvalue())
+    s0: StringIO = StringIO("hello")
+    print(s0.tell())
+
+    # --- write() return values ---
+    print(StringIO("").write("abc"))
+    print(StringIO("").write(""))
+    print(StringIO("").write("\n"))
+    print(StringIO("").write("a" * 1000))
+
+    s1: StringIO = StringIO("")
+    s1.write("hi")
+    print(s1.getvalue())
+
+    # --- read() basic (cumulative reads advance the cursor) ---
+    s2: StringIO = StringIO("hello")
+    print(s2.read(2))
+    print(s2.read(3))
+
+    print(StringIO("hello").read())
+    print(StringIO("abc").read(-1))
+    print(StringIO("hi").read(-2))
+    print(StringIO("hello").read(0))
+    print(StringIO("hello").read(100))
+    print(StringIO("").read())
+
+    # --- read() from a specific position ---
+    s3: StringIO = StringIO("hello world")
+    s3.seek(6)
+    print(s3.read(5))
+
+    s4: StringIO = StringIO("hello")
+    s4.seek(2)
+    print(s4.read(2))
+
+    # --- read() at / beyond EOF ---
+    s5: StringIO = StringIO("hello")
+    s5.seek(5)
+    print(s5.read())
+
+    s6: StringIO = StringIO("hello")
+    s6.seek(100)
+    print(s6.read())
+    print(s6.tell())
+
+    s7: StringIO = StringIO("x")
+    s7.read()
+    print(s7.read())
+
+    # --- readline() ---
+    s8: StringIO = StringIO("line1\nline2\n")
+    print(s8.readline())
+    print(s8.tell())
+
+    s9: StringIO = StringIO("line1\nline2")
+    print(s9.readline())
+    print(s9.readline())
+    print(s9.tell())
+
+    print(StringIO("hello").readline())
+    print(StringIO("hello\nworld").readline(3))
+    print(StringIO("").readline())
+
+    s10: StringIO = StringIO("x\ny")
+    print(s10.readline())
+    print(s10.readline())
+    print(s10.readline())
+    print(s10.tell())
+
+    # readline() size limit continuing mid-line
+    s11: StringIO = StringIO("hello\nworld")
+    print(s11.readline(3))
+    print(s11.readline())
+
+    # --- readlines() ---
+    print(StringIO("a\nb\nc").readlines())
+    print(StringIO("").readlines())
+    print(StringIO("a\nb\nc").readlines(-1))
+    print(StringIO("a\nb\nc").readlines(0))
+    print(StringIO("a\nb\nc").readlines(-100))
+    print(StringIO("a\nb\nc").readlines(2))
+
+    # --- getvalue() ignores position ---
+    s12: StringIO = StringIO("test")
+    s12.seek(2)
+    print(s12.getvalue())
+
+    # --- tell() ---
+    s13: StringIO = StringIO("12345")
+    print(s13.tell())
+    s13.seek(3)
+    print(s13.tell())
+
+    # --- seek() and read ---
+    s14: StringIO = StringIO("abcde")
+    s14.seek(2)
+    print(s14.read())
+
+    s15: StringIO = StringIO("hi")
+    s15.seek(100)
+    print(s15.tell())
+
+    s16: StringIO = StringIO("hello")
+    print(s16.seek(0, 2))
+    print(s16.tell())
+
+    # whence=1 with offset 0 is a no-op
+    s17: StringIO = StringIO("hello")
+    s17.seek(3)
+    print(s17.seek(0, 1))
+
+    # --- truncate() (position is UNCHANGED — re-oracled) ---
+    s18: StringIO = StringIO("hello world")
+    print(s18.truncate(5))
+    print(s18.getvalue())
+    print(s18.tell())
+
+    s19: StringIO = StringIO("abcdef")
+    s19.seek(3)
+    print(s19.truncate())
+    print(s19.getvalue())
+    print(s19.tell())
+
+    s20: StringIO = StringIO("hi")
+    print(s20.truncate(10))
+    print(s20.getvalue())
+    print(s20.tell())
+
+    s21: StringIO = StringIO("hello world")
+    s21.seek(8)
+    print(s21.truncate(3))
+    print(s21.getvalue())
+    print(s21.tell())
+
+    # --- write after seek (overwrite) ---
+    s22: StringIO = StringIO("hello")
+    s22.seek(1)
+    s22.write("X")
+    print(s22.getvalue())
+
+    s23: StringIO = StringIO("hello")
+    s23.seek(0)
+    s23.write("HI")
+    print(s23.getvalue())
+
+    s24: StringIO = StringIO("hello")
+    s24.seek(10)
+    s24.write("x")
+    # getvalue() here is "hello\0\0\0\0\0x" — seek-beyond-EOF pads the gap with NUL.
+    # The dual-run compares stdout through bash `$(...)`, which STRIPS NUL bytes
+    # (see the test_all.sh header note), so a raw `print(getvalue())` would compare
+    # VACUOUSLY (both sides stripped to "hellox"). Assert the length and per-char
+    # ordinals instead: NUL-free text that genuinely verifies the NUL padding
+    # position-by-position against python3.
+    v24: str = s24.getvalue()
+    print(len(v24))
+    print([ord(c) for c in v24])
+    print(s24.tell())
+
+    # --- writelines() ---
+    s25: StringIO = StringIO("")
+    s25.writelines(["a", "b", "c"])
+    print(s25.getvalue())
+
+    s26: StringIO = StringIO("")
+    s26.writelines(["x\n", "y\n"])
+    print(s26.getvalue())
+
+    # --- close() / closed property ---
+    # NOTE: `print(s27.closed)` directly (a bare `@property` access piped
+    # straight into `print`) is a fourth compiler gap found while building
+    # this module (lib/io.pyrs "COMPILER GAPS" #4): a `bool`-typed
+    # `@property` prints in Rust's native lowercase `true`/`false` when
+    # printed DIRECTLY, instead of pyrst's Python-style `True`/`False` (every
+    # other bool-producing expression, including an IDENTICAL plain method,
+    # uses the correct casing). Assigning to a local `bool` first prints
+    # correctly, so that's the pattern used here and is exactly how real
+    # callers should use it meanwhile.
+    s27: StringIO = StringIO("")
+    c27a: bool = s27.closed
+    print(c27a)
+    s27.close()
+    c27b: bool = s27.closed
+    print(c27b)
+    s27.close()
+    c27c: bool = s27.closed
+    print(c27c)
+
+    # --- closed-file errors (message text; note the trailing-period pair) ---
+    s28: StringIO = StringIO("")
+    s28.close()
+    try:
+        s28.read()
+    except ValueError as e:
+        print(str(e))
+    try:
+        s28.readline()
+    except ValueError as e:
+        print(str(e))
+    try:
+        s28.readlines()
+    except ValueError as e:
+        print(str(e))
+    try:
+        s28.write("x")
+    except ValueError as e:
+        print(str(e))
+    try:
+        s28.seek(0)
+    except ValueError as e:
+        print(str(e))
+    try:
+        s28.truncate()
+    except ValueError as e:
+        print(str(e))
+    try:
+        s28.getvalue()
+    except ValueError as e:
+        print(str(e))
+    try:
+        print(s28.readable())
+    except ValueError as e:
+        print(str(e))
+    try:
+        print(s28.writable())
+    except ValueError as e:
+        print(str(e))
+    try:
+        print(s28.seekable())
+    except ValueError as e:
+        print(str(e))
+    try:
+        s28.tell()
+    except ValueError as e:
+        print(str(e))
+    try:
+        print(s28.isatty())
+    except ValueError as e:
+        print(str(e))
+    try:
+        print(s28.line_buffering)
+    except ValueError as e:
+        print(str(e))
+    try:
+        print(s28.newlines())
+    except ValueError as e:
+        print(str(e))
+    # flush() never raises, even when closed. NOTE: `encoding()`/`errors()`/
+    # `newlines()` (which never raise EITHER, open or closed) are excluded
+    # from THIS dual-run point on: real CPython's `s.encoding` is a bare
+    # property returning `None`, so `s.encoding()` there evaluates the
+    # property (`None`), then tries to CALL it — `TypeError: 'NoneType'
+    # object is not callable`. pyrst's `encoding()` (a real method — see
+    # lib/io.pyrs "COMPILER GAP 3") returns `None` successfully instead. The
+    # two languages only happen to agree on this call shape while the
+    # property access itself still RAISES (the closed-file probes above,
+    # where CPython's property getter raises before the `()` is ever
+    # attempted) — never on the non-raising path. Their non-raising
+    # behavior (always `None`) is covered non-dual-run in
+    # examples/stdlib_io.pyrs instead (a pyrst-only golden).
+    s28.flush()
+    c28: bool = s28.closed
+    print(c28)
+
+    # --- readable/writable/seekable/isatty (open) ---
+    s29: StringIO = StringIO("")
+    print(s29.readable())
+    print(s29.writable())
+    print(s29.seekable())
+    print(s29.isatty())
+    lb29: bool = s29.line_buffering
+    print(lb29)
+
+    # --- unicode ---
+    s30: StringIO = StringIO("")
+    print(s30.write("hello 世界 🌍"))
+    print(s30.write("世"))
+
+    s31: StringIO = StringIO("こんにちは\nworld")
+    print(s31.readline())
+
+    # --- null padding on seek-beyond + write ---
+    s32: StringIO = StringIO("a")
+    s32.seek(3)
+    s32.write("x")
+    # getvalue() is "a\0\0x"; asserted via length + ordinals rather than a raw
+    # print because the dual-run's `$(...)` capture strips NUL bytes (see the s24
+    # note above and the test_all.sh header) — a raw print would be vacuous.
+    v32: str = s32.getvalue()
+    print(len(v32))
+    print([ord(c) for c in v32])
+
+    # --- mixed write and read ---
+    s33: StringIO = StringIO("")
+    s33.write("ab")
+    s33.seek(0)
+    print(s33.read())
+
+    s34: StringIO = StringIO("abc")
+    s34.write("xy")
+    print(s34.getvalue())
+
+    # --- seek() / truncate() errors ---
+    try:
+        StringIO("").seek(-1)
+    except ValueError as e:
+        print(str(e))
+    try:
+        StringIO("").seek(0, 3)
+    except ValueError as e:
+        print(str(e))
+    try:
+        StringIO("hi").seek(1, 1)
+    except OSError as e:
+        print(str(e))
+    try:
+        StringIO("hello").seek(1, 2)
+    except OSError as e:
+        print(str(e))
+    try:
+        StringIO("").truncate(-1)
+    except ValueError as e:
+        print(str(e))
+
+    # --- HARDENING (w2-hardener adversarial pass): additional edge cases
+    # re-verified against live CPython 3.12, none previously covered by the
+    # writer's golden. All confirmed byte-identical; no defects found. ---
+
+    # seek() with an out-of-range whence beyond the dossier's single probed
+    # value (3): negative and larger-positive whence both hit the same
+    # "Invalid whence" branch.
+    try:
+        StringIO("x").seek(0, -1)
+    except ValueError as e:
+        print(str(e))
+    try:
+        StringIO("x").seek(0, 5)
+    except ValueError as e:
+        print(str(e))
+
+    # seek(whence=1/2) with a NEGATIVE nonzero offset (the dossier and the
+    # original golden only probed a positive nonzero offset) — same
+    # "Can't do nonzero cur-relative seeks" OSError either sign.
+    try:
+        StringIO("hi").seek(-1, 1)
+    except OSError as e:
+        print(str(e))
+    try:
+        StringIO("hi").seek(-1, 2)
+    except OSError as e:
+        print(str(e))
+
+    # truncate(): seek-beyond-end, then default (position-based) truncate.
+    # Since pos (10) > len(buf) (2), no truncation AND no null-padding to
+    # reach the target size — this is CPython's real behavior, not an
+    # implementation shortcut; re-oracled directly.
+    s35: StringIO = StringIO("hi")
+    s35.seek(10)
+    print(s35.truncate())
+    print(s35.getvalue())
+    print(s35.tell())
+
+    # readlines(hint) sweep across a 5-line buffer's every boundary
+    # (previously only hint=2 on a 3-line buffer was covered) — confirms the
+    # strict-`>` cumulative-length rule holds across repeated ties.
+    buf5: str = "a\nb\nc\nd\ne\n"
+    print(StringIO(buf5).readlines(4))
+    print(StringIO(buf5).readlines(5))
+    print(StringIO(buf5).readlines(6))
+    print(StringIO(buf5).readlines(7))
+    print(StringIO(buf5).readlines(8))
+    print(StringIO(buf5).readlines(9))
+    print(StringIO(buf5).readlines(10))
+    print(StringIO(buf5).readlines(11))
+
+    # readlines(hint) is CHARACTER-counted, not byte-counted, even for
+    # non-ASCII content — confirms the hint arithmetic (which uses `len()`,
+    # already char-based in pyrst) doesn't silently regress to byte counting.
+    bufu: str = "世\n界\n人\n"
+    print(StringIO(bufu).readlines(1))
+    print(StringIO(bufu).readlines(2))
+    print(StringIO(bufu).readlines(3))
+
+    # read(0) / readline(0): zero-size reads return empty without advancing.
+    print(StringIO("hello").read(0))
+    print(StringIO("hello\nworld").readline(0))
+
+    # readline() with a negative size OTHER than the canonical -1 (the
+    # dossier's normalization language is "size<0 means unlimited", not
+    # "size==-1"; -5 must behave identically to -1 and to no argument).
+    print(StringIO("hello\nworld").readline(-5))
+
+    # write() overwrite spanning a multi-byte (non-ASCII) boundary: confirms
+    # slicing on both sides of the overwrite stays CHAR-indexed (not
+    # byte-indexed) even when the untouched tail contains multi-byte chars.
+    s36: StringIO = StringIO("hello 世界")
+    s36.seek(3)
+    print(s36.write("XY"))
+    print(s36.getvalue())
+
+    # Default newline handling: StringIO's default `newline='\n'` mode splits
+    # ONLY on a bare "\n" — bare "\r" and "\r\n" are ordinary content
+    # characters, not line boundaries. Confirms `_io_find_newline`'s
+    # deliberately-narrow "\n"-only scan is correct, not an oversight.
+    s37: StringIO = StringIO("a\r\nb\rc\nd")
+    print(s37.readline())
+    print(s37.readline())
+    print(s37.readline())
+    print(s37.readline())
+    print(StringIO("a\r\nb\rc\nd").readlines())
+
+    # --- detach()/fileno() (unsupported; OSError substitutes for CPython's
+    # io.UnsupportedOperation, which pyrst has no custom-class equivalent
+    # for) ---
+    try:
+        StringIO("").detach()
+    except OSError as e:
+        print(str(e))
+    try:
+        StringIO("").fileno()
+    except OSError as e:
+        print(str(e))

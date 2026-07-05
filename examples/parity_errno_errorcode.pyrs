@@ -1,0 +1,66 @@
+# parity: pyrst-only — `errorcode` is a real dict in CPython (`errno.errorcode
+# = {1: "EPERM", ...}`); pyrst has no module-level dict state (G2 — see
+# lib/errno.pyrs header), so `errorcode` is exposed as a FUNCTION here,
+# `errorcode(code: int) -> str`. That is a real syntax divergence from
+# CPython's `errorcode[code]` subscript, so this file cannot execute
+# unmodified under real CPython (`errorcode(1)` there raises `TypeError:
+# 'dict' object is not callable`) — it is pyrst-only by construction, not by
+# laziness. Every value below was cross-checked against a live CPython 3.12
+# `errno.errorcode` dict (see lib/errno.pyrs's HARDENING note for the one
+# real value bug this caught: key 35 is 'EDEADLOCK', not 'EDEADLK').
+from errno import errorcode
+
+def main() -> None:
+    # Known codes, incl. the three symbolic-alias collisions where CPython's
+    # errorcode dict prefers ONE spelling over the other (verified live).
+    assert errorcode(1) == "EPERM"
+    assert errorcode(2) == "ENOENT"
+    assert errorcode(11) == "EAGAIN"       # not "EWOULDBLOCK"
+    assert errorcode(35) == "EDEADLOCK"    # not "EDEADLK"
+    assert errorcode(95) == "ENOTSUP"      # not "EOPNOTSUPP"
+    assert errorcode(132) == "ERFKILL"     # highest valid key
+
+    # The two documented gaps in the 1..132 range (41 and 58 are unassigned
+    # in real CPython's errorcode dict — verified live) raise KeyError, same
+    # as an out-of-range code.
+    caught: bool = False
+    try:
+        errorcode(41)
+    except KeyError as e:
+        caught = True
+        assert str(e) == "41"
+    assert caught == True
+
+    caught = False
+    try:
+        errorcode(58)
+    except KeyError as e:
+        caught = True
+        assert str(e) == "58"
+    assert caught == True
+
+    caught = False
+    try:
+        errorcode(999)
+    except KeyError as e:
+        caught = True
+        assert str(e) == "999"
+    assert caught == True
+
+    caught = False
+    try:
+        errorcode(0)
+    except KeyError as e:
+        caught = True
+        assert str(e) == "0"
+    assert caught == True
+
+    caught = False
+    try:
+        errorcode(-1)
+    except KeyError as e:
+        caught = True
+        assert str(e) == "-1"
+    assert caught == True
+
+    print("PASS")

@@ -1,0 +1,172 @@
+# parity: pyrst-only
+# Parity test for lib/filecmp.pyrs (card 39bf959a, docs/design/w2-dossiers/
+# fs-trio.md). `filecmp` reads real files via `@extern`/std::fs, and uses
+# pyrst's flat `os`-style helpers internally — out of literal same-source
+# dual-run scope, same convention as `examples/parity_os.pyrs`. Every
+# assertion below is a DETERMINISTIC fact (booleans, sorted name lists, exact
+# CPython-verified error messages). All scratch state is created under a
+# fresh `mkdtemp()` directory and removed before exiting.
+#
+# NOTE: `dircmp(a, b)` — the CPython 2-positional-argument call shape — hits
+# a compiler gap independent of this stdlib pass: a class constructor call
+# with ZERO keyword arguments does not fill a trailing `__init__` default
+# (only a free-function call or an explicit keyword/full-positional
+# constructor call goes through the default-filling path — verified against
+# `lib/bisect.pyrs`'s free-function defaults, which DO work 1-arg-short; see
+# the card history for the isolated repro). Every `dircmp(...)` call below passes
+# `ignore` explicitly (`None` or a list) to stay on the working path; this is
+# flagged for the integrator rather than worked around silently in a way that
+# would mask the gap.
+
+from os import mkdir, write_file, join
+from filecmp import cmp, cmpfiles, dircmp
+from shutil import rmtree
+from tempfile import mkdtemp
+
+
+def main() -> None:
+    base: str = mkdtemp(prefix="parity_filecmp_")
+
+    # --- cmp: identical files --------------------------------------------------
+    f1: str = join(base, "cmp1.txt")
+    f2: str = join(base, "cmp2.txt")
+    write_file(f1, "same")
+    write_file(f2, "same")
+    print(cmp(f1, f2))
+
+    # --- cmp: different files ----------------------------------------------------
+    f3: str = join(base, "cmp3.txt")
+    write_file(f3, "different")
+    print(cmp(f1, f3))
+
+    # --- cmp: shallow=True / shallow=False give the same result for identical
+    # large content (functionally equivalent to CPython's stat-cache fast path
+    # for THIS input; see lib/filecmp.pyrs's header for the verified nuance) --
+    large1: str = join(base, "large1.bin")
+    large2: str = join(base, "large2.bin")
+    write_file(large1, "x" * 10000)
+    write_file(large2, "x" * 10000)
+    print(cmp(large1, large2, shallow=True))
+    print(cmp(large1, large2, shallow=False))
+
+    # --- cmp: missing files -> FileNotFoundError --------------------------------
+    try:
+        cmp(join(base, "nope1.txt"), join(base, "nope2.txt"))
+        print("no error")
+    except FileNotFoundError as e:
+        print(e.replace(base, "<base>"))
+
+    # --- cmp: file vs directory -> False, no error ------------------------------
+    a_dir: str = join(base, "a_dir")
+    mkdir(a_dir)
+    print(cmp(f1, a_dir))
+
+    # --- cmpfiles: match / mismatch / errors ------------------------------------
+    dir_a: str = join(base, "cmp_dir_a")
+    dir_b: str = join(base, "cmp_dir_b")
+    mkdir(dir_a)
+    mkdir(dir_b)
+    write_file(join(dir_a, "same.txt"), "same")
+    write_file(join(dir_b, "same.txt"), "same")
+    write_file(join(dir_a, "diff.txt"), "a")
+    write_file(join(dir_b, "diff.txt"), "b")
+    matched, mismatch, errors = cmpfiles(dir_a, dir_b, ["same.txt", "diff.txt"])
+    print(sorted(matched))
+    print(sorted(mismatch))
+    print(sorted(errors))
+
+    # --- cmpfiles: a missing file goes to errors, not a crash -------------------
+    matched2, mismatch2, errors2 = cmpfiles(dir_a, dir_b, ["same.txt", "missing.txt"])
+    print(sorted(matched2))
+    print(sorted(mismatch2))
+    print(sorted(errors2))
+
+    # --- cmpfiles: missing directories -> empty results, no error --------------
+    matched3, mismatch3, errors3 = cmpfiles(join(base, "no_a"), join(base, "no_b"), ["x.txt"])
+    print(matched3)
+    print(mismatch3)
+    print(errors3)
+
+    # --- dircmp: basic attributes ------------------------------------------------
+    dcmp: dircmp = dircmp(dir_a, dir_b, None)
+    print(sorted(dcmp.same_files))
+    print(sorted(dcmp.diff_files))
+    print(sorted(dcmp.left_only))
+    print(sorted(dcmp.right_only))
+    print(sorted(dcmp.common))
+    print(sorted(dcmp.left_list))
+    print(sorted(dcmp.right_list))
+
+    # --- dircmp: left_only / right_only ------------------------------------------
+    write_file(join(dir_a, "only_left.txt"), "l")
+    write_file(join(dir_b, "only_right.txt"), "r")
+    dcmp2: dircmp = dircmp(dir_a, dir_b, None)
+    print(sorted(dcmp2.left_only))
+    print(sorted(dcmp2.right_only))
+
+    # --- dircmp: ignore parameter -------------------------------------------------
+    write_file(join(dir_a, "ignore_me.txt"), "x")
+    write_file(join(dir_b, "ignore_me.txt"), "x")
+    dcmp3: dircmp = dircmp(dir_a, dir_b, ["ignore_me.txt"])
+    in_left_list: bool = "ignore_me.txt" in dcmp3.left_list
+    print(in_left_list)
+
+    # --- dircmp: missing directory -> FileNotFoundError --------------------------
+    try:
+        dircmp(dir_a, join(base, "no_such_dir"), None)
+        print("no error")
+    except FileNotFoundError as e:
+        print(e.replace(base, "<base>"))
+
+    # --- dircmp: subdirectories are recursively compared (nested dircmp) --------
+    mkdir(join(dir_a, "subdir"))
+    mkdir(join(dir_b, "subdir"))
+    write_file(join(join(dir_a, "subdir"), "file.txt"), "sub")
+    write_file(join(join(dir_b, "subdir"), "file.txt"), "sub")
+    dcmp4: dircmp = dircmp(dir_a, dir_b, None)
+    print(sorted(dcmp4.subdirs.keys()))
+    nested: dircmp = dcmp4.subdirs["subdir"]
+    print(sorted(nested.same_files))
+
+    # === HARDENING PASS (w2-hardener): edges re-oracled against live CPython 3.12,
+    # beyond the dossier's probed set. Each fixed a real, verified divergence in
+    # lib/filecmp.pyrs (see that file's header for the full verification detail). ===
+
+    # --- cmpfiles: a common name that is a DIRECTORY on both sides goes to
+    # MISMATCH, not errors (verified: cmp()'s type-mismatch check just returns
+    # False, which cmpfiles buckets as a mismatch; errors is reserved for an
+    # actually-missing path) -----------------------------------------------------
+    dir_x: str = join(base, "hard_dir_x")
+    dir_y: str = join(base, "hard_dir_y")
+    mkdir(dir_x)
+    mkdir(dir_y)
+    mkdir(join(dir_x, "bothdirs"))
+    mkdir(join(dir_y, "bothdirs"))
+    matched4, mismatch4, errors4 = cmpfiles(dir_x, dir_y, ["bothdirs"])
+    print(sorted(matched4))
+    print(sorted(mismatch4))
+    print(sorted(errors4))
+
+    # --- cmpfiles: a common name that is a DIRECTORY on one side and a plain
+    # FILE on the other ALSO goes to mismatch, not errors (verified) -----------
+    mkdir(join(dir_x, "mixedtype"))
+    write_file(join(dir_y, "mixedtype"), "x")
+    matched5, mismatch5, errors5 = cmpfiles(dir_x, dir_y, ["mixedtype"])
+    print(sorted(matched5))
+    print(sorted(mismatch5))
+    print(sorted(errors5))
+
+    # --- dircmp: `a` is a plain FILE, not a directory -> NotADirectoryError
+    # (verified; previously this hit an unhandled Rust panic no `except` could
+    # catch, since `_filecmp_listdir` had no directory-type guard) -------------
+    not_a_dir: str = join(base, "hard_not_a_dir.txt")
+    write_file(not_a_dir, "x")
+    try:
+        dircmp(not_a_dir, dir_x, None)
+        print("no error")
+    except NotADirectoryError as e:
+        print(e.replace(base, "<base>"))
+
+    # --- cleanup ----------------------------------------------------------------
+    rmtree(base)
+    print("done")

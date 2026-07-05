@@ -1,0 +1,175 @@
+# pyrst standard library — sys (PARTIAL scope, card cd3aa7b7)
+#
+# Fidelity score: ~2.5/5 against the dossier's own 4/5 target
+# (docs/design/w2-dossiers/sys-partial.md) — see "WHY BELOW THE DOSSIER
+# ESTIMATE" below. Surface: `maxsize`, `platform`, `version`, `version_info`,
+# `exit`. `argv`/`stdin`/`stdout`/`stderr` are G2-deferred per the dossier
+# (module-level mutable state — not implemented; use no workaround).
+#
+# WHY BELOW THE DOSSIER ESTIMATE — two load-bearing pyrst constraints the
+# dossier's 4/5 assumed away, discovered during THIS implementation pass by
+# reading src/typeck/checks.rs and docs/design/exception-lowering.md (not
+# re-litigated by the dossier's CPython-side probes, which were about
+# behavior, not pyrst's own compiler capabilities):
+#
+#   1. **No SystemExit / BaseException class exists in pyrst at all.**
+#      docs/design/exception-lowering.md confirms `raise`/`try`/`except`
+#      lowers to `panic!`/`catch_unwind` over a HARDCODED two-level builtin
+#      hierarchy (ArithmeticError/LookupError/RuntimeError/NameError/OSError
+#      families only — see `exc_descendants`, codegen.rs:6824-6838). There is
+#      no BaseException-vs-Exception split and no SystemExit type to raise,
+#      catch, or attach a `.code` to. Building that is real exception-
+#      hierarchy infrastructure, explicitly out of scope for a stdlib-writer
+#      card (it would touch codegen/typeck core, not a lib/*.pyrs file).
+#      CONSEQUENCE: pyrst's `exit()` cannot be a catchable, `.code`-bearing
+#      exception. It is implemented as an UNCATCHABLE, IMMEDIATE process
+#      termination (`std::process::exit`, via `@extern`) — honestly matching
+#      only the CPython behavior of an *unhandled* `sys.exit()` reaching the
+#      interpreter's top level (interpreter prints nothing extra for an int
+#      code, exits with that status; `None`/no-arg exits 0). Every
+#      `try: sys.exit(...); except SystemExit as e: ...`-shaped case in the
+#      dossier's own PARITY PLAN §6 is therefore NOT reproducible in pyrst —
+#      not because the dossier's CPython research was wrong, but because
+#      pyrst has no exception class to catch. Documented, not silently
+#      dropped — see `exit()`'s docstring and examples/parity_sys.pyrs.
+#
+#   2. **No general Union type, only `Optional[T]` (a 2-arm `T | None`).**
+#      `Ty::from_type_expr`'s `("Union", args)` arm (src/typeck/types.rs:182)
+#      collapses a 2-arm `Optional[T]`-shaped union to `Ty::Option(T)` but
+#      falls through to `Ty::Unknown` for anything else — a THREE-arm union
+#      like the dossier's own signature `code: int | str | None` DOES NOT
+#      TYPECHECK (an `@extern` param/return of `Ty::Unknown` is explicitly
+#      rejected — src/typeck/checks.rs:170-190, "requires fully-typed params
+#      and return"). pyrst has no way to express "int OR str OR None" as one
+#      parameter type. CONSEQUENCE: `exit()` takes a single concrete type,
+#      `code: int = 0` — the overwhelmingly common real-world call shape
+#      (`sys.exit()`, `sys.exit(0)`, `sys.exit(1)`, `sys.exit(N)`). The
+#      string-message form (`sys.exit("fatal error")`) is NOT supported;
+#      there is no sound way to add it without a real union type. This is a
+#      NEW divergence beyond the dossier's own GATED table (§5), which only
+#      anticipated G2 (mutable state) — flagging it explicitly rather than
+#      silently narrowing the signature.
+#
+# `version`/`version_info` — HONEST PYRST IDENTITY (per card cd3aa7b7's
+# explicit instruction), not a spoofed CPython version:
+#   - pyrst is not CPython and has no interpreter version to "be" 3.12.9 —
+#     reporting a fake CPython version would be a lie a user's version-gated
+#     code could act on. `version`/`version_info` report PYRST's own release
+#     (0.1.3, this worktree's Cargo.toml / CHANGELOG.md at authoring time),
+#     not any CPython release.
+#   - `version_info` is a `@dataclass` (`VersionInfo`), exposed as a NILADIC
+#     FUNCTION `version_info()` — not a bare module constant — because pyrst
+#     module-level constants must be a bare int/float/str/bool LITERAL
+#     (src/typeck/checks.rs `is_const_literal`/`is_module_const_decl`); a
+#     class-instance initializer is not eligible. This is the exact,
+#     precedented technique `math.inf()`/`math.nan()` already use for the
+#     same reason (see lib/math.pyrs). Call it: `sys.version_info().major`.
+#   - CPython's `version_info` is a hybrid tuple/namedtuple: both `[0]`
+#     indexing AND iteration AND `>=`-comparison against a raw tuple literal
+#     work (dossier §3.3/§3.4). pyrst has no first-class named-tuple type, no
+#     `__getitem__`, and dataclasses don't support cross-type comparison to a
+#     `tuple` literal — so `VersionInfo` supports ONLY named-attribute access
+#     (`.major`/`.minor`/`.micro`/`.releaselevel`/`.serial`). Indexing,
+#     iteration, `len()`, `tuple()`/`list()` conversion, and `>=` comparison
+#     against a tuple literal are NOT supported. Documented divergence, not a
+#     bug.
+#   - `version` is a plain honest-identity string: `"pyrst 0.1.3 (compiles to
+#     Rust; not CPython-compatible)"`.
+#
+# `platform` — HARDCODED to `"linux"` (a bare module-level literal constant,
+# matching the existing `os.sep`/`os.linesep` precedent of hardcoding
+# POSIX-only values rather than runtime-introspecting the host). pyrst
+# targets POSIX/Linux only today (see lib/os.pyrs's own `sep: str = "/"`
+# rationale) — there is no Windows/macOS pyrst target to honestly report, so
+# hardcoding avoids a runtime dependency for a value that cannot vary in
+# practice. On an actual Linux x86_64 host this happens to be
+# byte-for-byte the same value CPython reports there.
+#
+# `maxsize` — a genuine, no-divergence CPython match: pyrst `int` is `i64`,
+# so `maxsize = 2**63 - 1 = 9223372036854775807` is EXACTLY CPython's value
+# on any 64-bit CPython build. No hardware/identity caveat needed here.
+#
+# G2-DEFERRED (per dossier §5, unchanged): `argv`, `stdin`, `stdout`,
+# `stderr` are NOT exposed — each is module-level MUTABLE state, which pyrst
+# prohibits outright (no workaround exists; do not attempt one).
+#
+# HARDENING PASS additions (w2-hardener, card cd3aa7b7) — two NEW divergences
+# found by adversarial CPython-diffing beyond the writer's own list, neither
+# fixable inside this module (both are language/cross-unit level; documented
+# rather than silently dropped):
+#
+#   9. `exit(code=N)` ACCEPTS A KEYWORD ARGUMENT; real CPython's `sys.exit()`
+#      is a C function that is positional-ONLY and raises
+#      `TypeError: sys.exit() takes no keyword arguments` for `sys.exit(code=N)`
+#      (verified against CPython 3.12.9). pyrst has no positional-only
+#      parameter marker, so every pyrst function (including this one)
+#      uniformly accepts its parameters by keyword too — a documented
+#      SUPERSET-of-CPython calling convention, the same direction already
+#      precedented for other stdlib functions (see `lib/textwrap.pyrs`'s
+#      header: "pyrst additionally accepts them positionally in declared
+#      order"), just the mirror case (keyword where CPython requires
+#      positional, instead of positional where CPython requires keyword).
+#      Not fixable without a pyrst positional-only-parameter feature, which
+#      is a compiler-level capability outside a stdlib-module card's scope.
+#
+#   10. CROSS-UNIT NAME COLLISION (found by sweeping the OTHER in-flight W2
+#       drop directories' hardening notes, not just the already-merged
+#       lib/*.pyrs): the sibling unit `sep-quad`'s `platform` module (its stand-in for
+#       CPython's `platform` module) defines top-level `def version() -> str`
+#       and `def platform(...) -> str`, which collide with this module's
+#       `version: str` and `platform: str` module consts under pyrst's FLAT
+#       stdlib namespace (confirmed live: registering a throwaway stub module
+#       with `version`/`platform` top-level names alongside this one produces
+#       `type error: name 'version' is provided by both 'sys' and
+#       '<other>'; pyrst's module namespace is flat ... a program cannot
+#       import both`). This is the SAME class of unavoidable CPython-name
+#       collision the project already accepts for `datetime.time` vs. the
+#       `time` module (operator/re precedent) — `sys.version`/`sys.platform`
+#       are kept under their canonical CPython names here (this module is
+#       the more natural home for both), and a program that also needs
+#       `plat`'s `version()`/`platform()` functions cannot co-import `sys`
+#       and `plat` until real per-module namespacing (G3 epic) lands. Flagged
+#       to the integrator for cross-unit resolution — not something either
+#       individual module can unilaterally fix.
+#
+# REGISTRATION: this module was ALSO removed from `resolver.rs`'s stdlib
+# skip-list (it previously silently no-op'd `import sys` as a "not yet a
+# real module" stub, alongside `dataclasses`) — see src/resolver.rs, the
+# `matches!(mod_name.as_str(), "dataclasses" | "sys")` arm is now just
+# `"dataclasses"`. Without that change `from sys import maxsize` etc. would
+# resolve to nothing at all (a silent no-op import), never reaching this
+# file. `dataclasses` itself stays skipped (it is a decorator-only synthetic
+# import, not a real module with codegen).
+#
+# PUBLIC-NAME COLLISION SWEEP (against every other lib/*.pyrs's top-level
+# `def`/`class`/const names, via `grep -n '^def |^class |^[A-Za-z_]*:.*='`):
+# `maxsize`, `version`, `version_info`, `platform`, `exit`, and the class
+# name `VersionInfo` do not collide with any existing stdlib module's public
+# surface. No co-import restriction needed for this module.
+
+from dataclasses import dataclass
+
+
+maxsize: int = 9223372036854775807
+
+platform: str = "linux"
+
+version: str = "pyrst 0.1.3 (compiles to Rust; not CPython-compatible)"
+
+
+@dataclass
+class VersionInfo:
+    major: int
+    minor: int
+    micro: int
+    releaselevel: str
+    serial: int
+
+
+def version_info() -> VersionInfo:
+    return VersionInfo(0, 1, 3, "final", 0)
+
+
+@extern
+def exit(code: int = 0) -> None:
+    "std::process::exit({code} as i32)"

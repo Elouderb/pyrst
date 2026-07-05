@@ -1,0 +1,187 @@
+from stat import S_ISREG, S_ISDIR, S_ISLNK, S_ISFIFO, S_ISSOCK, S_ISCHR, S_ISBLK
+from stat import S_ISDOOR, S_ISPORT, S_ISWHT
+from stat import S_IFREG, S_IFDIR, S_IFLNK, S_IFIFO, S_IFSOCK, S_IFCHR, S_IFBLK
+from stat import S_IFMT, S_IMODE
+from stat import ST_MODE, ST_INO, ST_DEV, ST_NLINK, ST_UID, ST_GID, ST_SIZE, ST_ATIME, ST_MTIME, ST_CTIME
+from stat import S_ISUID, S_ISGID, S_ISVTX, S_IRUSR, S_IWUSR, S_IXUSR, S_IRWXU
+from stat import S_IRGRP, S_IWGRP, S_IXGRP, S_IRWXG
+from stat import S_IROTH, S_IWOTH, S_IXOTH, S_IRWXO
+from stat import S_IREAD, S_IWRITE, S_IEXEC, S_ENFMT
+
+# NOTE (HARDENING, card 4b6d4c36): every predicate call below is bound to a
+# local variable BEFORE the `assert` — never `assert S_ISxxx(...) == ...`
+# directly. This works around a real pyrst compiler bug (independent of this
+# unit): `collect_calls_from_stmt` in `src/typeck/checks.rs` has no match arm
+# for `Stmt::Assert`, so a function called ONLY inside `assert` conditions is
+# invisible to dead-code elimination and gets pruned — codegen then emits a
+# call to a function that was never output, and `rustc` fails with "cannot
+# find function" (a check-passes/build-fails bug). Verified live: the
+# writer's ORIGINAL parity_stat.pyrs (pure `assert S_ISxxx(...) == ...`
+# throughout, no intermediate assignment) fails `pyrst build` with 18
+# `E0425` errors — it never actually ran under pyrst despite the unit report
+# claiming full dual-run validation. Binding every call result to a variable
+# routes it through the (correctly-handled) `Stmt::Assign` traversal instead.
+def main() -> None:
+    b: bool = S_ISREG(S_IFREG)
+    assert b == True
+    b = S_ISDIR(S_IFDIR)
+    assert b == True
+    b = S_ISLNK(S_IFLNK)
+    assert b == True
+    b = S_ISFIFO(S_IFIFO)
+    assert b == True
+    b = S_ISSOCK(S_IFSOCK)
+    assert b == True
+    b = S_ISCHR(S_IFCHR)
+    assert b == True
+    b = S_ISBLK(S_IFBLK)
+    assert b == True
+    b = S_ISREG(S_IFDIR)
+    assert b == False
+    b = S_ISDIR(S_IFREG)
+    assert b == False
+    b = S_ISLNK(S_IFREG)
+    assert b == False
+    b = S_ISFIFO(S_IFREG)
+    assert b == False
+    b = S_ISSOCK(S_IFREG)
+    assert b == False
+    b = S_ISCHR(S_IFREG)
+    assert b == False
+    b = S_ISBLK(S_IFREG)
+    assert b == False
+
+    # S_IFSOCK == S_IFREG | S_IFDIR (a real CPython gotcha, see Lib/stat.py's
+    # _filemode_table comment) — a mode with ONLY the sock bits set must match
+    # S_ISSOCK and NEITHER S_ISREG nor S_ISDIR (S_IFMT/S_ISxxx compare against
+    # the WHOLE type field, not a bit-subset, so there is no ambiguity —
+    # verified against real CPython).
+    b = S_ISSOCK(S_IFSOCK)
+    assert b == True
+    b = S_ISREG(S_IFSOCK)
+    assert b == False
+    b = S_ISDIR(S_IFSOCK)
+    assert b == False
+
+    # Solaris/BSD-only predicates: always False on Linux, regardless of mode
+    # bits (verified live against real CPython on this host).
+    b = S_ISDOOR(0)
+    assert b == False
+    b = S_ISDOOR(S_IFREG)
+    assert b == False
+    b = S_ISPORT(0)
+    assert b == False
+    b = S_ISPORT(S_IFDIR)
+    assert b == False
+    b = S_ISWHT(0)
+    assert b == False
+    b = S_ISWHT(S_IFREG)
+    assert b == False
+
+    # Boundary: mode == 0 (no type bits at all) matches none of the S_IS*
+    # predicates, and both mode-analysis functions return 0.
+    b = S_ISREG(0)
+    assert b == False
+    b = S_ISDIR(0)
+    assert b == False
+    b = S_ISLNK(0)
+    assert b == False
+    n: int = S_IFMT(0)
+    assert n == 0
+    n = S_IMODE(0)
+    assert n == 0
+
+    # ST_* Index Constants (10 cases)
+    assert ST_MODE == 0
+    assert ST_INO == 1
+    assert ST_DEV == 2
+    assert ST_NLINK == 3
+    assert ST_UID == 4
+    assert ST_GID == 5
+    assert ST_SIZE == 6
+    assert ST_ATIME == 7
+    assert ST_MTIME == 8
+    assert ST_CTIME == 9
+
+    # S_I* File Type Constants (7 cases)
+    assert S_IFREG == 0o100000
+    assert S_IFDIR == 0o40000
+    assert S_IFLNK == 0o120000
+    assert S_IFIFO == 0o10000
+    assert S_IFSOCK == 0o140000
+    assert S_IFCHR == 0o20000
+    assert S_IFBLK == 0o60000
+
+    # S_I* Permission Bits (15 cases)
+    assert S_ISUID == 0o4000
+    assert S_ISGID == 0o2000
+    assert S_ISVTX == 0o1000
+    assert S_IRUSR == 0o400
+    assert S_IWUSR == 0o200
+    assert S_IXUSR == 0o100
+    assert S_IRWXU == 0o700
+    assert S_IRGRP == 0o40
+    assert S_IWGRP == 0o20
+    assert S_IXGRP == 0o10
+    assert S_IRWXG == 0o70
+    assert S_IROTH == 0o4
+    assert S_IWOTH == 0o2
+    assert S_IXOTH == 0o1
+    assert S_IRWXO == 0o7
+
+    # Mode Functions (6 cases, incl. an all-bits-set mode as an upper boundary)
+    n = S_IFMT(S_IFREG | 0o644)
+    assert n == S_IFREG
+    n = S_IFMT(S_IFDIR | 0o755)
+    assert n == S_IFDIR
+    n = S_IMODE(S_IFREG | 0o644)
+    assert n == 0o644
+    n = S_IMODE(S_IFDIR | 0o755)
+    assert n == 0o755
+    n = S_IFMT(0o177777)
+    assert n == 0o170000
+    n = S_IMODE(0o177777)
+    assert n == 0o7777
+
+    # Deprecated Aliases (4 cases)
+    assert S_IREAD == 0o400
+    assert S_IWRITE == 0o200
+    assert S_IEXEC == 0o100
+    assert S_ENFMT == 0o2000
+
+    # Negative mode: real CPython's C `_stat` extension raises OverflowError
+    # (verified live: `stat.S_ISREG(-1)` on CPython 3.12), not just an honest
+    # pyrst-only restriction — exercised across several predicates.
+    caught: bool = False
+    try:
+        S_ISREG(-1)
+    except OverflowError as e:
+        caught = True
+        assert str(e) == "can't convert negative value to unsigned int"
+    assert caught == True
+
+    caught = False
+    try:
+        S_ISDOOR(-5)
+    except OverflowError as e:
+        caught = True
+        assert str(e) == "can't convert negative value to unsigned int"
+    assert caught == True
+
+    caught = False
+    try:
+        S_IFMT(-1)
+    except OverflowError as e:
+        caught = True
+        assert str(e) == "can't convert negative value to unsigned int"
+    assert caught == True
+
+    caught = False
+    try:
+        S_IMODE(-1)
+    except OverflowError as e:
+        caught = True
+        assert str(e) == "can't convert negative value to unsigned int"
+    assert caught == True
+
+    print("PASS")

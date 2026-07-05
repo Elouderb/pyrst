@@ -1,0 +1,259 @@
+# parity: pyrst-only
+#
+# Card cc0ff8fe — `lib/pathlib.pyrs` (`PurePosixPath`), per
+# docs/design/w2-dossiers/purepath.md's PARITY PLAN section.
+#
+# WHY PYRST-ONLY (not a literal dual-run under python3 like most stdlib
+# parity goldens): this file calls `.match_(...)` (see `lib/pathlib.pyrs`
+# header divergence #5 — `match` is a pyrst STATEMENT keyword, so the method
+# is spelled `match_`; CPython's real `pathlib.PurePosixPath` has no
+# `match_` attribute, so running this exact source under python3 would raise
+# AttributeError on the first `match_` call). `parts`/`suffixes` also print
+# as a pyrst `list` (`['/', 'usr', ...]`) rather than CPython's `tuple`
+# (`('/', 'usr', ...)`) — divergence #6/#7 in the module header (pyrst has
+# no variable-length tuple type). Every OTHER printed line uses the exact
+# same call shape CPython's `pathlib.PurePosixPath` accepts.
+#
+# Each printed value below was independently verified against real CPython
+# (`python3 -c "import pathlib; ..."`, substituting `.match(...)` for
+# `.match_(...)`) — see the card history "Validation evidence" for the full
+# side-by-side transcript. This file's own EXPECTED output
+# (`expected/parity_pathlib.txt`) is the pyrst binary's deterministic output,
+# byte-diffed against that CPython transcript line-by-line (adjusting only
+# for the tuple/list bracket divergence).
+
+from pathlib import PurePosixPath
+
+
+def main() -> None:
+    # ── initialization + basic properties ──────────────────────────────────
+    pp: PurePosixPath = PurePosixPath("/usr/local/bin/python3.12")
+    parts_val: list[str] = pp.parts
+    print(parts_val)                      # ['/', 'usr', 'local', 'bin', 'python3.12']
+    print(pp.name)                        # python3.12
+    print(pp.stem)                        # python3
+    print(pp.suffix)                      # .12
+    suffixes_val: list[str] = pp.suffixes
+    print(suffixes_val)                   # ['.12']
+
+    tgz: PurePosixPath = PurePosixPath("file.tar.gz")
+    tgz_suffixes: list[str] = tgz.suffixes
+    print(tgz_suffixes)                   # ['.tar', '.gz']
+
+    hidden: PurePosixPath = PurePosixPath(".hidden")
+    print(hidden.suffix)                  # (empty)
+    hidden_txt: PurePosixPath = PurePosixPath(".hidden.txt")
+    print(hidden_txt.stem)                # .hidden
+
+    empty_path: PurePosixPath = PurePosixPath("")
+    print(str(empty_path))                # .
+    print(empty_path.is_absolute())       # False
+
+    dotdot: PurePosixPath = PurePosixPath("..")
+    print(dotdot.name)                    # ..
+    wsfx: PurePosixPath = dotdot.with_suffix(".txt")
+    print(str(wsfx))                      # ...txt
+
+    # ── parents access ──────────────────────────────────────────────────────
+    pp2: PurePosixPath = PurePosixPath("/a/b/c/d")
+    parents: list[PurePosixPath] = pp2.parents
+    p0: PurePosixPath = parents[0]
+    p1: PurePosixPath = parents[1]
+    plast: PurePosixPath = parents[-1]
+    print(str(p0))                        # /a/b/c
+    print(str(p1))                        # /a/b
+    print(str(plast))                     # /
+    print(len(parents))                   # 4
+
+    root: PurePosixPath = PurePosixPath("/")
+    root_parents: list[PurePosixPath] = root.parents
+    print(len(root_parents))              # 0
+
+    # ── joinpath (single-segment; chained calls == CPython's multi-arg form) ─
+    j1: PurePosixPath = PurePosixPath("/usr/local").joinpath("bin")
+    print(str(j1))                        # /usr/local/bin
+    j2: PurePosixPath = PurePosixPath("relative").joinpath("path")
+    print(str(j2))                        # relative/path
+    j3: PurePosixPath = PurePosixPath("/usr").joinpath("/override")
+    print(str(j3))                        # /override
+    j4: PurePosixPath = PurePosixPath("/usr/local").joinpath("bin").joinpath("/etc/passwd")
+    print(str(j4))                        # /etc/passwd
+    j5: PurePosixPath = PurePosixPath("/usr").joinpath("")
+    print(str(j5))                        # /usr
+
+    # ── with_name / with_suffix / with_stem ────────────────────────────────
+    wn: PurePosixPath = PurePosixPath("/usr/local/bin/python3.12").with_name("python3.11")
+    print(str(wn))                        # /usr/local/bin/python3.11
+    wn2: PurePosixPath = PurePosixPath("file.txt").with_name("newfile.txt")
+    print(str(wn2))                       # newfile.txt
+
+    ws1: PurePosixPath = PurePosixPath("/usr/local/bin/python3.12").with_suffix(".11")
+    print(str(ws1))                       # /usr/local/bin/python3.11
+    ws2: PurePosixPath = PurePosixPath("/usr/local/bin/python3.12").with_suffix("")
+    print(str(ws2))                       # /usr/local/bin/python3
+    ws3: PurePosixPath = PurePosixPath("file.tar.gz").with_suffix(".zip")
+    print(str(ws3))                       # file.tar.zip
+
+    wst1: PurePosixPath = PurePosixPath("file.tar.gz").with_stem("archive")
+    print(str(wst1))                      # archive.gz
+    wst2: PurePosixPath = PurePosixPath("/usr/local/bin/python3.12").with_stem("python")
+    print(str(wst2))                      # /usr/local/bin/python.12
+
+    # ── as_posix / is_absolute ──────────────────────────────────────────────
+    print(PurePosixPath("/usr/local").as_posix())     # /usr/local
+    print(PurePosixPath("/usr/local").is_absolute())  # True
+    print(PurePosixPath("relative/path").is_absolute())  # False
+    print(PurePosixPath("/").is_absolute())           # True
+
+    # ── relative_to (with and without walk_up) ──────────────────────────────
+    r1: PurePosixPath = PurePosixPath("/usr/local/bin/python").relative_to("/usr/local")
+    print(str(r1))                        # bin/python
+    r2: PurePosixPath = PurePosixPath("/a/b/c").relative_to("/a/b/c")
+    print(str(r2))                        # .
+    r3: PurePosixPath = PurePosixPath("a/b/c").relative_to("a")
+    print(str(r3))                        # b/c
+    r4: PurePosixPath = PurePosixPath("/a/b/c").relative_to("/a/x/y", walk_up=True)
+    print(str(r4))                        # ../../b/c
+    r5: PurePosixPath = PurePosixPath("/a/b/c").relative_to("/a", walk_up=True)
+    print(str(r5))                        # b/c
+
+    # ── match_ (glob-style; see header for the `match` -> `match_` rename) ──
+    print(PurePosixPath("/usr/local/bin/python3.12").match_("*.12"))          # True
+    print(PurePosixPath("/usr/local/bin/python3.12").match_("python*"))       # True
+    print(PurePosixPath("/usr/local/bin/python3.12").match_("bin/python*"))   # True
+    print(PurePosixPath("/usr/local/bin/python3.12").match_("/usr/local/bin/python*"))  # True
+    print(PurePosixPath("/usr/local/bin/python3.12").match_("nonmatch"))      # False
+    print(PurePosixPath("/home/file.TXT").match_("*.txt"))                    # False
+    print(PurePosixPath("/home/file.TXT").match_("*.txt", case_sensitive=False))  # True
+    print(PurePosixPath("/home/file.TXT").match_("*.TXT", case_sensitive=True))   # True
+    print(PurePosixPath("/home/user/file.txt").match_("user/*"))             # True
+    print(PurePosixPath("/home/user/file.txt").match_("*/file.txt"))         # True
+    print(PurePosixPath("/a/b/c/d/file.txt").match_("**/file.txt"))          # True
+
+    # ── is_relative_to ───────────────────────────────────────────────────────
+    print(PurePosixPath("/usr/local/bin").is_relative_to("/usr/local"))  # True
+    print(PurePosixPath("/usr/local/bin").is_relative_to("/home"))      # False
+    print(PurePosixPath("/a/b/c").is_relative_to("/a/b"))               # True
+
+    # ── equality (trailing-slash normalization) ─────────────────────────────
+    print(PurePosixPath("/usr/local") == PurePosixPath("/usr/local"))   # True
+    print(PurePosixPath("/usr/local") == PurePosixPath("/usr/local/"))  # True
+
+    # ── str/repr ─────────────────────────────────────────────────────────────
+    print(str(pp))                        # /usr/local/bin/python3.12
+    print(repr(pp))                       # PurePosixPath('/usr/local/bin/python3.12')
+
+    # ── edge cases ───────────────────────────────────────────────────────────
+    root_parent: PurePosixPath = root.parent
+    print(str(root_parent))               # /
+    ft: PurePosixPath = PurePosixPath("file.txt")
+    ft_parent: PurePosixPath = ft.parent
+    print(str(ft_parent))                 # .
+    dot: PurePosixPath = PurePosixPath(".")
+    dot_parent: PurePosixPath = dot.parent
+    print(str(dot_parent))                # .
+
+    # ── ERRORS section (dossier §2) ─────────────────────────────────────────
+    try:
+        PurePosixPath("/usr/local").match_("")
+    except ValueError as e:
+        print(e)                     # empty pattern
+
+    try:
+        PurePosixPath("/usr/local/file.txt").with_name("")
+    except ValueError as e:
+        print(e)                     # Invalid name ''
+
+    try:
+        PurePosixPath("/usr/local/file.txt").with_name("new/file.txt")
+    except ValueError as e:
+        print(e)                     # Invalid name 'new/file.txt'
+
+    try:
+        PurePosixPath("/").with_suffix(".txt")
+    except ValueError as e:
+        print(e)                     # PurePosixPath('/') has an empty name
+
+    try:
+        PurePosixPath(".").with_suffix(".txt")
+    except ValueError as e:
+        print(e)                     # PurePosixPath('.') has an empty name
+
+    try:
+        PurePosixPath("/").with_name("newname")
+    except ValueError as e:
+        print(e)                     # PurePosixPath('/') has an empty name
+
+    try:
+        PurePosixPath("/usr/local/bin").relative_to("/home/user")
+    except ValueError as e:
+        print(e)                     # '/usr/local/bin' is not in the subpath of '/home/user'
+
+    try:
+        PurePosixPath("/a/b").relative_to("/a/b/c")
+    except ValueError as e:
+        print(e)                     # '/a/b' is not in the subpath of '/a/b/c'
+
+    # ── HARDENING (w2-hardener, card cc0ff8fe) ──────────────────────────────
+    # unicode names — regression test for the `str.rfind` byte-vs-char-offset
+    # bug in `suffix` (fixed by `_pathlib_rfind_dot`; see module header)
+    cafe: PurePosixPath = PurePosixPath("café.txt")
+    print(cafe.stem)                      # café
+    print(cafe.suffix)                    # .txt
+    cafe_suffixes: list[str] = cafe.suffixes
+    print(cafe_suffixes)                  # ['.txt']
+    jp: PurePosixPath = PurePosixPath("日本語.txt")
+    print(jp.stem)                        # 日本語
+    print(jp.suffix)                      # .txt
+
+    # multi-leading-dot names (rfind-adjacent boundary, ASCII)
+    bashrc: PurePosixPath = PurePosixPath("..bashrc")
+    print(bashrc.stem)                    # .
+    print(bashrc.suffix)                  # .bashrc
+    manydots: PurePosixPath = PurePosixPath("....txt")
+    print(manydots.stem)                  # ...
+    print(manydots.suffix)                # .txt
+
+    # POSIX network-path root ("//" exactly two leading slashes; 1 or 3+
+    # collapse to a single "/")
+    netroot: PurePosixPath = PurePosixPath("//")
+    netroot_parts: list[str] = netroot.parts
+    print(netroot_parts)                  # ['//']
+    print(netroot.name)                   # (empty)
+    print(netroot.is_absolute())          # True
+    print(str(netroot.parent))            # //
+    print(str(PurePosixPath("///a/b")))   # /a/b
+
+    # with_suffix validation (hardening fix — the pre-hardening module
+    # silently accepted any string, including ones that inject a stray "/"
+    # and restructure the path)
+    try:
+        PurePosixPath("/a/b.txt").with_suffix("txt")
+    except ValueError as e:
+        print(e)                     # Invalid suffix 'txt'
+    try:
+        PurePosixPath("/a/b.txt").with_suffix(".")
+    except ValueError as e:
+        print(e)                     # Invalid suffix '.'
+    try:
+        PurePosixPath("/a/b.txt").with_suffix(".a/b")
+    except ValueError as e:
+        print(e)                     # Invalid suffix '.a/b'
+
+    # match_ leading-`**` off-by-one (hardening fix — `**` must consume at
+    # least one path part, root or segment, before the trailing pattern)
+    print(PurePosixPath("file.txt").match_("**/file.txt"))   # False
+    print(PurePosixPath("/file.txt").match_("**/file.txt"))  # True
+
+    # relative_to: absolute self vs. relative other (mismatched roots)
+    try:
+        PurePosixPath("/a/b").relative_to("a")
+    except ValueError as e:
+        print(e)                     # '/a/b' is not in the subpath of 'a'
+
+    # parents of a single relative segment; is_relative_to against ""
+    a_path: PurePosixPath = PurePosixPath("a")
+    a_parents: list[PurePosixPath] = a_path.parents
+    print(len(a_parents))                 # 1
+    print(str(a_parents[0]))              # .
+    print(PurePosixPath("a/b/c").is_relative_to(""))  # True

@@ -1,0 +1,230 @@
+# Dual-run parity for difflib, seeded from docs/design/w2-dossiers/difflib.md
+# PARITY PLAN. Every case below is a DUAL-RUN case (byte-identical under
+# python3 with `from __future__ import annotations` prepended and `main()`
+# called, per the harness convention) EXCEPT the ones explicitly noted.
+#
+# Two adaptations from the dossier's literal snippets (both preserve
+# byte-identical dual-run parity — see lib/difflib.pyrs module header
+# Divergences #6 and #2 for the full rationale):
+#   - `SequenceMatcher(...)` is always called with all FOUR positional args
+#     (`None, a, b, True`) instead of the dossier's 3-arg omitted-`autojunk`
+#     spelling — a pyrst codegen gap (class-constructor trailing-default
+#     positional omission), not a semantic difference; `True` is
+#     `autojunk`'s own default, so real CPython behavior is unchanged and an
+#     explicit `True` is equally valid Python.
+#   - The THREE list/tuple/mixed-type `SequenceMatcher` rows from the
+#     dossier's "Core SequenceMatcher behavior" block
+#     (`[1,2,3]`/`[1,2,3,4]` vs `[1,'x',3,4]`/`(1,2,3)` vs `(1,2,4)`) are
+#     OMITTED: this port's `SequenceMatcher` is `str`-only (see divergence
+#     #2 in the module header) since pyrst has no dynamic `Any` element type
+#     to duck-type across `str`/`list[int]`/heterogeneous-`list` the way
+#     CPython does. Not reachable in a statically-typed port; not a parity
+#     gap in the tested surface.
+#
+# HARDENING PASS (card fb63e9dc, reviewer w2-hardener): the block below
+# `# --- HARDENING` adds adversarial-edge coverage found by re-oracling
+# beyond the dossier's own PARITY PLAN — see lib/difflib.pyrs's "HARDENING
+# FIX" header notes for the two real defects this uncovered and fixed
+# (get_close_matches's ratio-tie tiebreak, and a get_grouped_opcodes
+# eager/lazy documentation correction). A THIRD finding — passing a custom
+# `isjunk`/`linejunk` callable directly (by name, or as a bare lambda
+# literal) into `SequenceMatcher(...)`/`ndiff(...)`'s constructor-adjacent
+# call path does not compile (a general pyrst codegen gap: class
+# constructors do not `Some(Rc::new(...))`-wrap a lambda/fn-item argument
+# for an `Optional[Callable]`-typed parameter, confirmed to affect ANY
+# class, not just this module) — is a COMPILER gap, not a difflib bug;
+# flagged for a follow-up compiler card. The WORKAROUND (verified to
+# compile and produce byte-identical dual-run results below): bind the
+# lambda to a plain (non-`Optional`) `Callable[...]`-typed local first, then
+# assign THAT local to an `Optional[Callable[...]]`-typed local, and pass
+# the second local to the constructor.
+from difflib import SequenceMatcher, Match, get_close_matches, unified_diff, ndiff, IS_LINE_JUNK, IS_CHARACTER_JUNK
+
+
+def _parity_difflib_is_vowel(ch: str) -> bool:
+    return ch == "a" or ch == "e" or ch == "i" or ch == "o" or ch == "u"
+
+
+def main() -> None:
+    # --- Core SequenceMatcher ratio (13 of the dossier's 16 cases; the
+    # other 3 are list/tuple-typed, see file header) ---
+    print(SequenceMatcher(None, "", "", True).ratio() == 1.0)
+    print(SequenceMatcher(None, "abc", "abc", True).ratio() == 1.0)
+    print(SequenceMatcher(None, "abc", "xyz", True).ratio() == 0.0)
+    print(SequenceMatcher(None, "abcd", "aXcd", True).ratio() == 0.75)
+    # NOTE (re-oracled correction): the dossier's BEHAVIOR MATRIX lists
+    # 0.6667 for this pair, but that contradicts its OWN
+    # `get_matching_blocks` column for the same row (sizes 1+1, T=2+3=5 ->
+    # 2*2/5 = 0.8) — verified live against `python3`: real CPython returns
+    # 0.8. Using the re-oracled, correct value here.
+    print(SequenceMatcher(None, "ab", "aXb", True).ratio() == 0.8)
+    print(SequenceMatcher(None, "abc", "", True).ratio() == 0.0)
+    print(SequenceMatcher(None, "", "abc", True).ratio() == 0.0)
+    print(SequenceMatcher(None, "aaa", "aab", True).ratio() == 2.0 / 3.0)
+    print(SequenceMatcher(None, "abab", "baba", True).ratio() == 0.75)
+    print(SequenceMatcher(None, "abc", "abc", True).get_matching_blocks()[0] == Match(0, 0, 3))
+    print(SequenceMatcher(None, "abc", "xyz", True).get_matching_blocks()[0].size == 0)
+    print(len(SequenceMatcher(None, "abc", "def", True).get_matching_blocks()) == 1)
+    print(SequenceMatcher(None, "ABRACADABRA", "YABBADABBADOO", True).get_matching_blocks()[-1] == Match(11, 13, 0))
+
+    # --- Opcodes (9 cases) ---
+    print(SequenceMatcher(None, "abc", "abc", True).get_opcodes() == [("equal", 0, 3, 0, 3)])
+    print(SequenceMatcher(None, "abc", "xyz", True).get_opcodes()[0][0] == "replace")
+    # NOTE (re-oracled correction): `get_opcodes()` for these pairs has only
+    # 2 elements (`[('equal', ...), ('insert'/'delete', ...)]`), so the
+    # dossier's `[-2]` (the FIRST/`equal` element) is an off-by-one; `[-1]`
+    # (the actual insert/delete tag) is the correct index — verified live
+    # against `python3`.
+    print(SequenceMatcher(None, "abc", "abcX", True).get_opcodes()[-1][0] == "insert")
+    print(SequenceMatcher(None, "abcX", "abc", True).get_opcodes()[-1][0] == "delete")
+    print(SequenceMatcher(None, "ab", "aXb", True).get_opcodes()[1][0] == "insert")
+    print(SequenceMatcher(None, "abcd", "acd", True).get_opcodes()[1][0] == "delete")
+    print(len(SequenceMatcher(None, "abc", "abc", True).get_opcodes()) == 1)
+    print(len(SequenceMatcher(None, "abcdef", "aXcXef", True).get_opcodes()) == 5)
+    # NOTE (adaptation): the dossier's literal snippet is
+    # `list(...)[0][1:] == (0, 3, 0, 3)` — pyrst has no tuple-slicing
+    # codegen, so this is the same check spelled out element-wise (still
+    # plain, dual-run-valid Python).
+    op0: tuple[str, int, int, int, int] = SequenceMatcher(None, "abc", "abc", True).get_opcodes()[0]
+    print((op0[1], op0[2], op0[3], op0[4]) == (0, 3, 0, 3))
+
+    # --- find_longest_match (4 cases; `ahi=`/`bhi=` passed as KEYWORD args —
+    # see module header divergence #6: the same class-constructor-style
+    # positional/Optional codegen gap also affects positional calls to a
+    # method with an `Optional[int]` parameter, worked around here the same
+    # way, with no change in dual-run semantics) ---
+    print(SequenceMatcher(None, "abcdef", "facbde", True).find_longest_match(alo=0, ahi=6, blo=0, bhi=6).size >= 1)
+    print(SequenceMatcher(None, "abc", "xyz", True).find_longest_match(alo=0, ahi=3, blo=0, bhi=3).size == 0)
+    print(SequenceMatcher(None, "abcdefgh", "cdefijkl", True).find_longest_match(alo=0, ahi=8, blo=0, bhi=8).a == 2)
+    print(SequenceMatcher(None, "abcdefgh", "cdefijkl", True).find_longest_match(alo=0, ahi=8, blo=0, bhi=8).size == 4)
+
+    # --- Ratio formulae (6 cases) ---
+    blocks_ac: list[Match] = SequenceMatcher(None, "abcd", "aXcY", True).get_matching_blocks()
+    print(2 * sum([m.size for m in blocks_ac]) / (4 + 4) == SequenceMatcher(None, "abcd", "aXcY", True).ratio())
+    print(SequenceMatcher(None, "", "", True).quick_ratio() == 1.0)
+    print(SequenceMatcher(None, "a", "b", True).quick_ratio() == 0.0)
+    print(SequenceMatcher(None, "a", "b", True).real_quick_ratio() == 1.0)
+    print(SequenceMatcher(None, "abcdef", "abcdefgh", True).quick_ratio() >= SequenceMatcher(None, "abcdef", "abcdefgh", True).ratio())
+    print(SequenceMatcher(None, "abc", "xyz", True).real_quick_ratio() >= SequenceMatcher(None, "abc", "xyz", True).ratio())
+
+    # --- get_close_matches (12 cases) ---
+    empty_strs: list[str] = []
+    print(get_close_matches("apple", ["apple", "apples", "apply", "banana"]) == ["apple", "apples", "apply"])
+    print(get_close_matches("apple", ["apple", "apples", "apply", "banana"], n=2) == ["apple", "apples"])
+    print(get_close_matches("apple", ["apple", "apples", "apply", "banana"], n=1) == ["apple"])
+    print(get_close_matches("zzz", ["apple", "apples", "apply"]) == empty_strs)
+    print(get_close_matches("apple", empty_strs) == empty_strs)
+    print(get_close_matches("apple", ["apple"], cutoff=1.0) == ["apple"])
+    print(get_close_matches("abc", ["abcd"], cutoff=0.74) == ["abcd"])
+    print(get_close_matches("abc", ["xyz", "aaa"], n=10, cutoff=0.0) == ["aaa", "xyz"])
+    print(len(get_close_matches("apple", ["apple", "apples", "apply"], n=1000)) == 3)
+    print(get_close_matches("apple", ["apply", "apples", "apple"], n=1)[0] == "apple")
+    print(len(get_close_matches("a", ["b"], cutoff=0.6)) == 0)
+    print(get_close_matches("abc", ["abcd"], cutoff=0.8571) == ["abcd"])
+
+    # --- unified_diff basics (10 cases) ---
+    print(list(unified_diff(["a\n"], ["b\n"])) != empty_strs)
+    print(list(unified_diff(["a\n", "b\n", "c\n"], ["a\n", "b\n", "c\n"])) == empty_strs)
+    print(list(unified_diff(["a\n"], ["b\n"], fromfile="f1", tofile="f2"))[0] == "--- f1\n")
+    print(list(unified_diff(["a\n"], ["b\n"], fromfile="f1", tofile="f2"))[1] == "+++ f2\n")
+    print(list(unified_diff(empty_strs, ["a\n"]))[2][0:2] == "@@")
+    print(list(unified_diff(["a\n"], empty_strs))[2][0:2] == "@@")
+    # NOTE (re-oracled correction): the dossier's PARITY PLAN claims
+    # `.count(",") == 2` here, but with single-line `a`/`b` both hunk
+    # ranges are length-1 (`@@ -1 +1 @@`, no `,count` suffix at all) — 0
+    # commas, verified live against `python3`.
+    print(list(unified_diff(["a\n"], ["b\n"], n=0))[2].count(",") == 0)
+    print(all([line.endswith("\n") for line in unified_diff(["a\n", "b\n"], ["a\n", "c\n"])]) == True)
+    print(list(unified_diff(["a", "b"], ["a", "c"]))[3] == " a")
+    print(list(unified_diff(["a\n", "b\n"], ["a\n", "c\n"], lineterm=""))[0] == "--- ")
+
+    # --- ndiff basics (8 cases) ---
+    print(list(ndiff(["a\n"], ["b\n"]))[0][0] == "-")
+    print(list(ndiff(["a\n"], ["b\n"]))[1][0] == "+")
+    print(list(ndiff(["a\n", "b\n"], ["a\n", "b\n"]))[0][0] == " ")
+    print(list(ndiff(empty_strs, empty_strs)) == empty_strs)
+    print(list(ndiff(empty_strs, ["a\n"]))[0][0] == "+")
+    print(list(ndiff(["a\n"], empty_strs))[0][0] == "-")
+    print(all([len(line) > 0 for line in ndiff(["abc\n"], ["aXc\n"])]) == True)
+    print(list(ndiff(["abc\n"], ["aXc\n"]))[1][0] == "?")
+
+    # --- HARDENING: get_close_matches ratio-tie tiebreak (REGRESSION test
+    # for the defect found+fixed this pass — see file header). Real CPython
+    # breaks a tie on `ratio` by the LEXICOGRAPHICALLY GREATER possibility
+    # string (heapq.nlargest compares the full `(ratio, x)` tuple), NOT by
+    # earliest input position. ---
+    print(get_close_matches("aaa", ["aab", "aac"], n=5, cutoff=0.0) == ["aac", "aab"])
+    print(get_close_matches("aaa", ["aad", "aac", "aab"], n=5, cutoff=0.0) == ["aad", "aac", "aab"])
+    print(get_close_matches("aaa", ["aab", "aab", "aac"], n=5, cutoff=0.0) == ["aac", "aab", "aab"])
+    print(get_close_matches("zzz", ["zzz", "yyy", "xxx"], n=1, cutoff=0.0) == ["zzz"])
+
+    # --- HARDENING: get_close_matches cutoff exact-equality boundary
+    # (`ratio >= cutoff`, not `>`) ---
+    print(get_close_matches("aXb", ["ab"], n=5, cutoff=0.8) == ["ab"])
+    print(get_close_matches("aXb", ["ab"], n=5, cutoff=0.80001) == empty_strs)
+
+    # --- HARDENING: unicode SequenceMatcher (multi-byte / CJK) ---
+    print(SequenceMatcher(None, "héllo", "héllo", True).ratio() == 1.0)
+    print(SequenceMatcher(None, "日本語abc", "日本xyz", True).get_opcodes() == [("equal", 0, 2, 0, 2), ("replace", 2, 6, 2, 5)])
+
+    # --- HARDENING: autojunk >=200-element "popular" filtering (repeated
+    # element that crosses the `ntest = n//100 + 1` popularity threshold is
+    # excluded from `b2j`, changing the matched block) ---
+    big_a: str = "a" * 200 + "bcdef"
+    big_b: str = "a" * 200 + "bXdef"
+    print(SequenceMatcher(None, big_a, big_b, True).ratio() == SequenceMatcher(None, big_a, big_b, False).ratio())
+
+    # --- HARDENING: IS_LINE_JUNK / IS_CHARACTER_JUNK additional edges ---
+    print(IS_LINE_JUNK("") == True)
+    print(IS_LINE_JUNK("   \n") == True)
+    print(IS_LINE_JUNK("## \n") == False)
+    print(IS_LINE_JUNK("  # x\n") == False)
+    print(IS_CHARACTER_JUNK("\n") == False)
+
+    # --- HARDENING: ndiff multi-line replace block (best-i/best-j pairing
+    # across several fuzzy candidates in one replace run — the dossier's own
+    # coverage was a single-line replace only) ---
+    a_multi: list[str] = ["one\n", "twx\n", "thrxe\n"]
+    b_multi: list[str] = ["one\n", "two\n", "three\n"]
+    print(list(ndiff(a_multi, b_multi)) == ["  one\n", "- twx\n", "?   ^\n", "+ two\n", "?   ^\n", "- thrxe\n", "?    ^\n", "+ three\n", "?    ^\n"])
+
+    # --- HARDENING: ndiff replace block with NO close-enough candidate
+    # (falls back to `_plain_replace`, not the fancy `?`-marker path) ---
+    print(list(ndiff(["zzzzzzzzzz\n"], ["qqqqqqqqqq\n"])) == ["- zzzzzzzzzz\n", "+ qqqqqqqqqq\n"])
+
+    # --- HARDENING: unified_diff with n larger than the whole file (single
+    # merged group, no splitting) ---
+    a5: list[str] = ["1\n", "2\n"]
+    b5: list[str] = ["1\n", "X\n"]
+    print(len(list(unified_diff(a5, b5, n=100))) == 6)
+
+    # --- HARDENING: custom isjunk on SequenceMatcher via the verified
+    # 2-step lambda-to-Optional[Callable] workaround (see file header) ---
+    ij_base: Callable[[str], bool] = lambda ch: _parity_difflib_is_vowel(ch)
+    ij: Optional[Callable[[str], bool]] = ij_base
+    print(SequenceMatcher(ij, "aabbcc", "bbcc", True).ratio() == 0.8)
+
+    # --- Error boundary (4 cases; the two dynamic-TypeError probes from the
+    # dossier are omitted here — see module header: pyrst rejects those at
+    # COMPILE TIME via its static parameter types, so they cannot appear as
+    # a runtime try/except in a dual-run source file at all) ---
+    try:
+        get_close_matches("apple", ["apple"], n=0)
+        print("no error")
+    except ValueError as e:
+        print(e)
+    try:
+        get_close_matches("apple", ["apple"], cutoff=1.5)
+        print("no error")
+    except ValueError as e:
+        print(e)
+    try:
+        get_close_matches("apple", ["apple"], n=-1)
+        print("no error")
+    except ValueError as e:
+        print(e)
+    try:
+        get_close_matches("apple", ["apple"], cutoff=-0.5)
+        print("no error")
+    except ValueError as e:
+        print(e)

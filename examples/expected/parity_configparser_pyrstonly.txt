@@ -1,0 +1,46 @@
+[test]
+key = value
+
+
+value
+[s]
+k=v
+
+
+[s]
+k = v
+
+
+
+value2
+No section: 'missing_section'
+No option 'missing_key' in section: 's'
+Section 's' already exists
+No section: 'missing'
+invalid literal for int() with base 10: 'notint'
+could not convert string to float: 'notfloat'
+Not a boolean: maybe
+Bad value substitution: option 'k' in section 's' contains an interpolation key 'undefined' which is not a valid option name. Raw value: '%(undefined)s'
+Recursion limit exceeded in value substitution: option 'a' in section 's' contains an interpolation key which cannot be substituted in 10 steps. Raw value: '%(a)s'
+Source contains parsing errors: '<string>'
+	[line  2]: 'key3 value3'
+While reading from '<string>' [line  3]: option 'key' in section 's' already exists
+False
+No section: 'DEFAULT'
+False
+Section "it's" already exists
+No section: "it's_missing"
+File contains no section headers.
+file: '<string>', line: 1
+'no header here at all'
+File contains no section headers.
+file: '<string>', line: 1
+'[s\n'
+Source contains parsing errors: '<string>'
+	[line  3]: '[bad\n'
+Source contains parsing errors: '<string>'
+	[line  2]: 'key3 value3'
+bad interpolation variable reference '%(unterminated'
+Bad value substitution: option 'k' in section 's' contains an interpolation key 'undefined' which is not a valid option name. Raw value: '%(Undefined)s'
+invalid literal for int() with base 10: '%(undefined)s'
+42

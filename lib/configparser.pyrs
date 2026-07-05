@@ -1,0 +1,731 @@
+# pyrst standard library — configparser
+#
+# A PURE-PYRST re-implementation of CPython's `configparser.ConfigParser`
+# (INI-style section/option config files) as ONE class, `ConfigParser`, with
+# `BasicInterpolation`-style `%(name)s` substitution. No external crate — the
+# whole module is pyrst source, embedded via `include_str!` (see
+# `src/stdlib.rs`). Usable as `from configparser import ConfigParser` or
+# `import configparser; configparser.ConfigParser()`.
+#
+# FIDELITY SCORE: 4 / 5 (docs/design/w2-dossiers/configparser.md TARGET row
+# estimated 3.5/5 assuming a plain sorted-dict backing; this implementation
+# does BETTER than that baseline by tracking insertion order EXPLICITLY with
+# parallel `list[str]` fields alongside the value dicts — see "ORDERING" below
+# — so `sections()`/`options()`/`items()`/`write()` reproduce CPython's real
+# insertion-order behavior instead of falling back to pyrst's sorted/
+# unordered `dict` iteration. What still caps the score below 4.5: no custom
+# exception TYPES (G2: mapped to `ValueError`, losing `isinstance()`
+# discrimination), no keyword-only enforcement (G4: params are
+# positional-or-keyword, a documented superset), and `write()`'s signature
+# diverges to return a `str` instead of accepting a file object (G7: pyrst
+# has no spellable file-typed parameter yet — see the `write()` docstring).
+#
+# HARDENING PASS (w2-hardener, card eae7fa52): an adversarial edge-case sweep
+# against live CPython 3.12.9 found and fixed several REAL, previously
+# undocumented behavior bugs (not just fidelity gaps) — see
+# `examples/parity_configparser_pyrstonly.pyrs`'s "HARDENING" section for the
+# full before/after list with re-oracled evidence: `has_option()` on an
+# unrecognized section now returns `False` instead of raising;
+# `options("DEFAULT")` now raises `NoSectionError`-equivalent instead of
+# silently returning `[]`; `remove_section("DEFAULT")` now returns `False`
+# instead of raising; every constructed error message now uses `repr()`
+# instead of manual single-quote wrapping (matches CPython's `%r` formatting
+# exactly, including switching to double quotes for names containing an
+# apostrophe); `read_string`'s bad-line handling now distinguishes CPython's
+# two DIFFERENT exception shapes (`MissingSectionHeaderError`-equivalent
+# before any section is open vs `ParsingError`-equivalent once one is) and
+# stopped unconditionally appending a trailing `\n` to the quoted line when
+# the source's actual last line has none; `_configparser_interpolate`'s
+# "unterminated `%(`" case now uses CPython's real "bad interpolation
+# variable reference" message (was wrongly reusing the "'%' must be followed
+# by...' " text) and reports the interpolation key in its OPTIONXFORM'd
+# (lowercased) form, matching CPython; `getint`/`getfloat`/`getboolean` now
+# accept a `raw=` parameter (previously omitted entirely, narrowing their
+# signature versus real CPython's).
+#
+# ORDERING (the key design decision): pyrst's `dict` does NOT preserve
+# insertion order on iteration (`.keys()` is sorted/hash-order, NOT the
+# CPython 3.7+ insertion-order guarantee — see other stdlib modules' HAZARD
+# notes). Naively backing sections/options with plain dicts and iterating
+# `.keys()` for `sections()`/`options()`/`items()`/`write()` would silently
+# REORDER every one of those outputs relative to CPython. Instead, this
+# module tracks order EXPLICITLY:
+#   - `section_order: list[str]`               — section names, insertion order
+#   - `section_option_order: dict[str, list[str]]` — per-section option names,
+#     insertion order (values are LISTS, so mutation always goes through the
+#     safe "read the list out, mutate the local copy, write it back to the
+#     dict key" pattern — pyrst's value semantics deep-copy a dict's VALUE on
+#     read, so `self.section_option_order[s].append(x)` chained directly would
+#     mutate a throwaway copy, not the stored field)
+#   - `default_order: list[str]`                — DEFAULT-section option names,
+#     insertion order
+# Actual option VALUES live in a separate FLAT `dict[str, str]` (`values`),
+# keyed by a composite `section + chr(1) + option` string (a control byte that
+# can't appear in a parsed section/option name), so no NESTED dict/list
+# mutation is ever needed on `values` itself — only scalar `str` values, which
+# assign cleanly through a single index (`self.values[key] = v`).
+#
+# `options()` and `items()` deliberately use TWO DIFFERENT merge orders,
+# matching CPython's own source (`configparser.py`) exactly:
+#   - `options(section)`: LOCAL option order first, then any DEFAULT-only
+#     option names appended at the end (CPython: `opts = section.copy();
+#     opts.update(defaults)` — `dict.update` only APPENDS keys not already
+#     present, preserving `opts`'s existing order).
+#   - `items(section)` / `get(...)`'s interpolation map: DEFAULT order first,
+#     then any section-only names appended (CPython: `d = defaults.copy();
+#     d.update(section)`).
+# This asymmetry is real CPython behavior (verified against 3.12.9 semantics
+# in the dossier's "Default Section" example: `options()` orders local-then-
+# default while `items()` orders default-then-local for the SAME state) — not
+# a pyrst bug.
+#
+# INTERPOLATION (`BasicInterpolation`): `%(name)s` is looked up (case-
+# insensitively, via `optionxform`) against a merged map of DEFAULT + section
+# + `vars` (in that override priority); `%%` is a literal `%`. Recursion is
+# capped at CPython's hardcoded `MAX_INTERPOLATION_DEPTH = 10`, raising the
+# same message text as CPython's `InterpolationDepthError` on overflow (a
+# self-referential `%(a)s` inside key `a` always trips it). Depth accounting
+# MIRRORS CPython exactly: recursion (and the depth increment) happens ONLY
+# when the substituted value itself contains another `%` — a `%`-free value is
+# appended directly. This is NOT a simplification: incrementing depth on every
+# substitution would overcount by one per link and wrongly reject a legal
+# 10-deep chain of plain values that CPython resolves, while a genuine deep
+# `%`-chain still hits the cap with CPython's error.
+#
+# GATED / DEFERRED (documented, not silently dropped):
+#   - Custom exception classes (`NoSectionError`, `NoOptionError`,
+#     `DuplicateSectionError`, `DuplicateOptionError`,
+#     `InterpolationMissingOptionError`, `InterpolationDepthError`,
+#     `ParsingError`) — pyrst has no custom exception types (G2). All map to
+#     `ValueError`, with CPython's exact message text preserved (verified
+#     against the dossier's ERRORS table). `isinstance(e, NoSectionError)`-
+#     style discrimination is not reproducible.
+#   - Keyword-only constructor/method args (`*, raw=`, `vars=`, `fallback=`,
+#     `space_around_delimiters=`, etc, G4) — pyrst has no `*` keyword-only
+#     marker; every parameter here is positional-or-keyword, a documented
+#     superset (both `cp.get('s','k',fallback='x')` and the equivalent
+#     positional call work).
+#   - `read_file(fp)` / `write(fp)` (G7: no bytes type, no spellable
+#     file-typed parameter) — `read_file` is NOT provided at all; `write()`'s
+#     SIGNATURE diverges to `write(space_around_delimiters=True) -> str`
+#     (returns the composed text instead of writing to a file object). Callers
+#     round-trip via `os.write_file(path, cp.write())` / `os.read_file(path)`
+#     + `read_string(...)`.
+#   - `optionxform` override — pyrst has no instance-method-override
+#     mechanism for a caller to customize this post-construction; the method
+#     exists and returns CPython's default (lowercase), but subclassing to
+#     change it is not supported.
+#   - Constructor kwargs `dict_type`, `delimiters`, `comment_prefixes`,
+#     `inline_comment_prefixes`, `strict`, `empty_lines_in_values`,
+#     `default_section`, `converters` are NOT exposed — this module hardcodes
+#     CPython's own defaults for each (delimiters `=`/`:`, comment prefixes
+#     `#`/`;` at line-start only, no inline comments, section name literally
+#     `"DEFAULT"`). Only `defaults` and `allow_no_value` are constructor
+#     parameters here.
+#   - `vars=` dict keys are matched case-SENSITIVELY against the already-
+#     lowercased lookup (CPython additionally applies `optionxform` to each
+#     `vars` key before use) — pass already-lowercase keys in a `vars` dict
+#     for exact parity. Low-risk: every dossier example already does this.
+#   - `allow_no_value=True` valueless keys (`key` with no `=`/`:`) parse
+#     without raising, but are stored as an EMPTY STRING (`""`), not `None`
+#     (`get()`'s return type here is plain `str`, not `Optional[str] | Any`
+#     like CPython's, so there is no channel for a `None` payload). This is a
+#     real, permanent divergence for the (rare) valueless-key feature.
+#   - `read_string`'s bad-line `ParsingError` (no delimiter found, `strict`
+#     mode) raises IMMEDIATELY on the FIRST offending line — message text
+#     matches CPython's exactly for that one line (`"Source contains parsing
+#     errors: '<source>'\n\t[line  N]: '<raw line>'"`, repr()-quoted and
+#     re-oracled against 3.12.9, including its `{0:2d}`-padded line number,
+#     and correctly OMITTING a trailing `\n` when the offending line is the
+#     source's last line with no trailing newline) — rather than CPython's
+#     behavior of scanning the WHOLE input first and raising ONE
+#     `ParsingError` that lists every bad line found.
+#   - `get(...)`/`getint`/`getfloat`/`getboolean`'s `fallback=` parameter
+#     cannot distinguish "no fallback provided" from "fallback explicitly
+#     passed as None" (pyrst has one `Optional[T]` channel doing both jobs) —
+#     every dossier/PARITY-PLAN fallback example uses a real (non-None)
+#     fallback value, so this is not exercised, but a caller wanting a
+#     None-returning fallback should check `has_option()` first instead.
+#   - `set(section, option, value)` does NOT eagerly validate `%`-
+#     interpolation SYNTAX the way CPython's real `set()` does (a
+#     `BasicInterpolation.before_set` hook there raises a plain
+#     `ValueError("invalid interpolation syntax in %r at position %d", ...)`
+#     immediately for a value like `"val %(unterminated"`). This module
+#     defers ALL interpolation-syntax checking to `get()`-time instead (same
+#     timing regardless of whether the value came from `set()` or
+#     `read_string()`) — a malformed value is still eventually rejected with
+#     a real, CPython-message-matching `ValueError`, just later and with
+#     different message text than CPython's `set()`-time check would give
+#     for that same call. Re-oracled during hardening (card eae7fa52); low
+#     risk since `read_string()` — the far more common ingestion path — never
+#     runs CPython's eager check either, so both engines already agree there.
+#   - `getint`'s range is `i64` (pyrst has no arbitrary-precision int type):
+#     a numeric string that overflows `i64` raises pyrst's own `int()`
+#     builtin's "invalid literal for int() with base 10: '<text>'" message,
+#     whereas real CPython's arbitrary-precision `int()` parses it
+#     successfully. Re-confirmed during hardening (card eae7fa52) with a
+#     25-digit value.
+#   - A handful of narrower CPython quirks/inconsistencies are NOT
+#     reproduced (re-oracled during hardening, card eae7fa52, all verified
+#     low-impact/rare): (1) CPython treats an empty-string OR `None` section
+#     argument as an alias for `"DEFAULT"` in `has_option`/`set`/
+#     `remove_option` specifically (but NOT in `has_section`/`options`); this
+#     module requires the exact literal `"DEFAULT"` everywhere. (2) CPython's
+#     section-header regex (`SECTCRE`) only requires a `[...]` PREFIX match,
+#     silently ignoring trailing garbage after the closing bracket (e.g.
+#     `"[s]x"` parses as section `"s"`); this module requires the WHOLE
+#     stripped line to end in `]`, and raises a parsing error for that same
+#     input instead.
+
+
+class ConfigParser:
+    # See the module header for the ORDERING design (why option/section names
+    # are tracked via explicit `list[str]` fields alongside the value dicts,
+    # rather than relying on `dict` iteration order).
+    allow_no_value: bool
+    default_values: dict[str, str]
+    default_order: list[str]
+    section_order: list[str]
+    section_option_order: dict[str, list[str]]
+    values: dict[str, str]
+
+    def __init__(self, defaults: Optional[dict[str, str]] = None, allow_no_value: bool = False) -> None:
+        self.allow_no_value = allow_no_value
+        self.default_values = {}
+        self.default_order = []
+        self.section_order = []
+        self.section_option_order = {}
+        self.values = {}
+        if defaults is not None:
+            d: dict[str, str] = defaults
+            # DIVERGENCE: a caller-supplied `dict` literal has no reliable
+            # insertion order under pyrst (see module header), so the
+            # DEFAULT section's initial order is `sorted(d.keys())` rather
+            # than the source's textual order. Order-neutral for every
+            # single-key `defaults={...}` example in the dossier.
+            for k in sorted(d.keys()):
+                kl: str = self.optionxform(k)
+                self.default_values[kl] = d[k]
+                self.default_order.append(kl)
+
+    def optionxform(self, optionstr: str) -> str:
+        # Option-name normalization applied before every lookup/store.
+        # CPython default: lowercase. Overriding via subclassing is not
+        # supported by pyrst (see module header).
+        return optionstr.lower()
+
+    def _configparser_lineno(self, n: int) -> str:
+        # CPython's error messages format the line number with `{0:2d}`
+        # (space-padded to width 2, e.g. line 3 -> " 3"), verified against
+        # real CPython 3.12.9 output (re-oracled: the dossier's own literal
+        # text omitted this padding, but the actual exception message has
+        # it).
+        if n < 10:
+            return " " + str(n)
+        return str(n)
+
+    def _configparser_key(self, section: str, option_lc: str) -> str:
+        # The flat composite key into `self.values` for (section, option).
+        # `chr(1)` is a control byte that cannot appear in a parsed section
+        # or option name, so it safely separates the two parts.
+        return section + chr(1) + option_lc
+
+    def _configparser_line_repr(self, raw_line: str, idx: int, total: int) -> str:
+        # CPython's parser reads lines off a real file object, so every
+        # line it sees carries its trailing "\n" EXCEPT possibly the very
+        # last line of the source (only if the source text itself doesn't
+        # end with a newline). `read_string` splits on "\n" up front,
+        # losing that trailing character, so it must be reconstructed here
+        # before calling `repr()` (CPython's `MissingSectionHeaderError`/
+        # `ParsingError` messages both embed `repr(line)`, escape-newline
+        # and all — re-oracled against live CPython 3.12.9, including the
+        # case where the offending line IS the last line of the source and
+        # has no trailing newline, where CPython's message has none either
+        # — a prior version of this module unconditionally appended a
+        # trailing "\n" and diverged for that case).
+        if idx < total - 1:
+            return repr(raw_line + "\n")
+        return repr(raw_line)
+
+    # ── section / option existence ───────────────────────────────────────────
+
+    def has_section(self, section: str) -> bool:
+        if section == "DEFAULT":
+            return False
+        return section in self.section_option_order
+
+    def has_option(self, section: str, option: str) -> bool:
+        # HARDENING FIX: real CPython's `has_option` returns False for an
+        # unrecognized SECTION (it does not raise) — re-oracled against
+        # live CPython 3.12.9. A prior version of this module incorrectly
+        # raised `ValueError` here, conflating "no section" with "no
+        # option".
+        ol: str = self.optionxform(option)
+        if section == "DEFAULT":
+            return ol in self.default_values
+        if section not in self.section_option_order:
+            return False
+        ck: str = self._configparser_key(section, ol)
+        if ck in self.values:
+            return True
+        return ol in self.default_values
+
+    def add_section(self, section: str) -> None:
+        if section == "DEFAULT":
+            raise ValueError("Invalid section name: " + repr(section))
+        if section in self.section_option_order:
+            raise ValueError("Section " + repr(section) + " already exists")
+        self.section_option_order[section] = []
+        self.section_order.append(section)
+
+    def sections(self) -> list[str]:
+        return self.section_order
+
+    def options(self, section: str) -> list[str]:
+        # LOCAL order first, then any DEFAULT-only names appended (see
+        # module header: this is CPython's `options()` merge order, distinct
+        # from `items()`'s).
+        #
+        # HARDENING FIX: `section == "DEFAULT"` is NEVER a key of
+        # `section_option_order` (DEFAULT is tracked via separate fields),
+        # so `options("DEFAULT")` now always falls into the "no section"
+        # raise below — matching real CPython, which raises
+        # `NoSectionError` for `options("DEFAULT")` too (re-oracled against
+        # 3.12.9). A prior version of this module special-cased DEFAULT
+        # here and silently returned `[]` instead of raising.
+        if section not in self.section_option_order:
+            raise ValueError("No section: " + repr(section))
+        result: list[str] = []
+        local: list[str] = self.section_option_order[section]
+        for k in local:
+            result.append(k)
+        for k in self.default_order:
+            if k not in result:
+                result.append(k)
+        return result
+
+    def defaults(self) -> dict[str, str]:
+        d: dict[str, str] = {}
+        for k in self.default_order:
+            d[k] = self.default_values[k]
+        return d
+
+    def remove_option(self, section: str, option: str) -> bool:
+        ol: str = self.optionxform(option)
+        if section == "DEFAULT":
+            if ol in self.default_values:
+                self.default_values.pop(ol)
+                self.default_order.remove(ol)
+                return True
+            return False
+        if section not in self.section_option_order:
+            raise ValueError("No section: " + repr(section))
+        ck: str = self._configparser_key(section, ol)
+        if ck in self.values:
+            self.values.pop(ck)
+            local: list[str] = self.section_option_order[section]
+            local.remove(ol)
+            self.section_option_order[section] = local
+            return True
+        return False
+
+    def remove_section(self, section: str) -> bool:
+        # HARDENING FIX: real CPython's `remove_section("DEFAULT")` does
+        # NOT raise — DEFAULT is never a key of its internal `_sections`
+        # dict, so the membership check just falls through and returns
+        # False (re-oracled against live CPython 3.12.9). A prior version
+        # of this module incorrectly special-cased DEFAULT here and always
+        # raised `ValueError`.
+        if section not in self.section_option_order:
+            return False
+        local: list[str] = self.section_option_order[section]
+        for k in local:
+            ck: str = self._configparser_key(section, k)
+            if ck in self.values:
+                self.values.pop(ck)
+        self.section_option_order.pop(section)
+        self.section_order.remove(section)
+        return True
+
+    def set(self, section: str, option: str, value: str) -> None:
+        ol: str = self.optionxform(option)
+        if section == "DEFAULT":
+            if ol not in self.default_values:
+                self.default_order.append(ol)
+            self.default_values[ol] = value
+            return
+        if section not in self.section_option_order:
+            raise ValueError("No section: " + repr(section))
+        ck: str = self._configparser_key(section, ol)
+        if ck not in self.values:
+            local: list[str] = self.section_option_order[section]
+            local.append(ol)
+            self.section_option_order[section] = local
+        self.values[ck] = value
+
+    # ── reading values (with interpolation) ──────────────────────────────────
+
+    def _configparser_raw_or_none(self, section: str, option_lc: str, vars: Optional[dict[str, str]]) -> Optional[str]:
+        # Layered lookup: `vars` overrides section, which overrides DEFAULT.
+        if vars is not None:
+            v: dict[str, str] = vars
+            if option_lc in v:
+                return v[option_lc]
+        if section != "DEFAULT" and section in self.section_option_order:
+            ck: str = self._configparser_key(section, option_lc)
+            if ck in self.values:
+                return self.values[ck]
+        if option_lc in self.default_values:
+            return self.default_values[option_lc]
+        return None
+
+    def _configparser_interp_map(self, section: str, vars: Optional[dict[str, str]]) -> dict[str, str]:
+        # The merged map `%(name)s` references resolve against: DEFAULT,
+        # overridden by the section, overridden by `vars`.
+        m: dict[str, str] = {}
+        for k in self.default_order:
+            m[k] = self.default_values[k]
+        if section != "DEFAULT" and section in self.section_option_order:
+            local: list[str] = self.section_option_order[section]
+            for k in local:
+                m[k] = self.values[self._configparser_key(section, k)]
+        if vars is not None:
+            v2: dict[str, str] = vars
+            for k in v2.keys():
+                m[k] = v2[k]
+        return m
+
+    def _configparser_interpolate(self, value: str, section: str, option: str, lookup: dict[str, str], top_raw: str, depth: int) -> str:
+        # BasicInterpolation over `value`: `%%` -> `%`, `%(name)s` -> a
+        # (recursively-interpolated) lookup, capped at CPython's hardcoded
+        # MAX_INTERPOLATION_DEPTH = 10 (see module header for the depth
+        # simplification note).
+        if depth > 10:
+            raise ValueError("Recursion limit exceeded in value substitution: option " + repr(option) + " in section " + repr(section) + " contains an interpolation key which cannot be substituted in 10 steps. Raw value: " + repr(top_raw))
+        out: str = ""
+        i: int = 0
+        n: int = len(value)
+        while i < n:
+            c: str = value[i]
+            if c == "%":
+                if i + 1 < n and value[i + 1] == "%":
+                    out += "%"
+                    i = i + 2
+                    continue
+                if i + 1 < n and value[i + 1] == "(":
+                    rest: str = value[i + 2:]
+                    j_rel: int = rest.find(")")
+                    j: int = i + 2 + j_rel
+                    if j_rel == -1 or j + 1 >= n or value[j + 1] != "s":
+                        # HARDENING FIX: real CPython's message here is
+                        # "bad interpolation variable reference " + repr(the
+                        # whole remainder from '%' to end of string), NOT
+                        # the "'%' must be followed by...' " text (that text
+                        # is reserved for the OTHER branch below, where '%'
+                        # is followed by neither '%' nor '(' at all) —
+                        # re-oracled against live CPython 3.12.9 for both an
+                        # unterminated `%(name` and a `%(name)x` (wrong
+                        # trailing char) input.
+                        raise ValueError("bad interpolation variable reference " + repr(value[i:]))
+                    key: str = value[i + 2:j]
+                    keyl: str = key.lower()
+                    if keyl not in lookup:
+                        # HARDENING FIX: real CPython reports the
+                        # OPTIONXFORM'd (lowercased) key name here, not the
+                        # raw-case text as typed in the source value —
+                        # re-oracled against live CPython 3.12.9 with a
+                        # mixed-case `%(Undefined)s` reference.
+                        raise ValueError("Bad value substitution: option " + repr(option) + " in section " + repr(section) + " contains an interpolation key " + repr(keyl) + " which is not a valid option name. Raw value: " + repr(top_raw))
+                    sub: str = lookup[keyl]
+                    # CPython's BasicInterpolation only RECURSES (and so only
+                    # advances the depth counter toward MAX_INTERPOLATION_DEPTH
+                    # = 10) when the substituted value itself contains another
+                    # `%`; a `%`-free value is appended directly. Recursing
+                    # unconditionally overcounts depth by one per link, wrongly
+                    # rejecting a legal 10-deep chain of plain values that
+                    # CPython resolves. Mirror CPython's accounting exactly so a
+                    # 10-deep plain chain resolves while a genuine deep `%`-chain
+                    # still hits the limit with the same error.
+                    if sub.find("%") != -1:
+                        out += self._configparser_interpolate(sub, section, option, lookup, top_raw, depth + 1)
+                    else:
+                        out += sub
+                    i = j + 2
+                    continue
+                raise ValueError("'%' must be followed by '%' or '(', found: " + repr(value[i:]))
+            out += c
+            i = i + 1
+        return out
+
+    def get(self, section: str, option: str, raw: bool = False, vars: Optional[dict[str, str]] = None, fallback: Optional[str] = None) -> str:
+        if section != "DEFAULT" and section not in self.section_option_order:
+            if fallback is not None:
+                return fallback
+            raise ValueError("No section: " + repr(section))
+        ol: str = self.optionxform(option)
+        rawval: Optional[str] = self._configparser_raw_or_none(section, ol, vars)
+        if rawval is not None:
+            rv: str = rawval
+            if raw:
+                return rv
+            lookup: dict[str, str] = self._configparser_interp_map(section, vars)
+            return self._configparser_interpolate(rv, section, option, lookup, rv, 1)
+        if fallback is not None:
+            return fallback
+        raise ValueError("No option " + repr(option) + " in section: " + repr(section))
+
+    def getint(self, section: str, option: str, raw: bool = False, vars: Optional[dict[str, str]] = None, fallback: Optional[int] = None) -> int:
+        if section != "DEFAULT" and section not in self.section_option_order:
+            if fallback is not None:
+                return fallback
+            raise ValueError("No section: " + repr(section))
+        ol: str = self.optionxform(option)
+        rawval: Optional[str] = self._configparser_raw_or_none(section, ol, vars)
+        if rawval is not None:
+            rv: str = rawval
+            val: str = rv
+            if not raw:
+                lookup: dict[str, str] = self._configparser_interp_map(section, vars)
+                val = self._configparser_interpolate(rv, section, option, lookup, rv, 1)
+            return int(val)
+        if fallback is not None:
+            return fallback
+        raise ValueError("No option " + repr(option) + " in section: " + repr(section))
+
+    def getfloat(self, section: str, option: str, raw: bool = False, vars: Optional[dict[str, str]] = None, fallback: Optional[float] = None) -> float:
+        if section != "DEFAULT" and section not in self.section_option_order:
+            if fallback is not None:
+                return fallback
+            raise ValueError("No section: " + repr(section))
+        ol: str = self.optionxform(option)
+        rawval: Optional[str] = self._configparser_raw_or_none(section, ol, vars)
+        if rawval is not None:
+            rv: str = rawval
+            val: str = rv
+            if not raw:
+                lookup: dict[str, str] = self._configparser_interp_map(section, vars)
+                val = self._configparser_interpolate(rv, section, option, lookup, rv, 1)
+            return float(val)
+        if fallback is not None:
+            return fallback
+        raise ValueError("No option " + repr(option) + " in section: " + repr(section))
+
+    def getboolean(self, section: str, option: str, raw: bool = False, vars: Optional[dict[str, str]] = None, fallback: Optional[bool] = None) -> bool:
+        if section != "DEFAULT" and section not in self.section_option_order:
+            if fallback is not None:
+                return fallback
+            raise ValueError("No section: " + repr(section))
+        ol: str = self.optionxform(option)
+        rawval: Optional[str] = self._configparser_raw_or_none(section, ol, vars)
+        if rawval is not None:
+            rv: str = rawval
+            val: str = rv
+            if not raw:
+                lookup: dict[str, str] = self._configparser_interp_map(section, vars)
+                val = self._configparser_interpolate(rv, section, option, lookup, rv, 1)
+            lc: str = val.lower()
+            if lc == "1" or lc == "yes" or lc == "true" or lc == "on":
+                return True
+            if lc == "0" or lc == "no" or lc == "false" or lc == "off":
+                return False
+            raise ValueError("Not a boolean: " + val)
+        if fallback is not None:
+            return fallback
+        raise ValueError("No option " + repr(option) + " in section: " + repr(section))
+
+    def items(self, section: str, raw: bool = False, vars: Optional[dict[str, str]] = None) -> list[tuple[str, str]]:
+        # DEFAULT order first, then any section-only names appended (see
+        # module header: CPython's `items()` merge order, distinct from
+        # `options()`'s).
+        if section != "DEFAULT" and section not in self.section_option_order:
+            raise ValueError("No section: " + repr(section))
+        order: list[str] = []
+        values_map: dict[str, str] = {}
+        for k in self.default_order:
+            order.append(k)
+            values_map[k] = self.default_values[k]
+        if section != "DEFAULT":
+            local: list[str] = self.section_option_order[section]
+            for k in local:
+                if k not in values_map:
+                    order.append(k)
+                values_map[k] = self.values[self._configparser_key(section, k)]
+        if vars is not None:
+            v2: dict[str, str] = vars
+            for k in v2.keys():
+                if k not in values_map:
+                    order.append(k)
+                values_map[k] = v2[k]
+        result: list[tuple[str, str]] = []
+        for k in order:
+            val: str = values_map[k]
+            if not raw:
+                val = self._configparser_interpolate(val, section, k, values_map, val, 1)
+            result.append((k, val))
+        return result
+
+    # ── parsing ───────────────────────────────────────────────────────────────
+
+    def read_string(self, string: str, source: str = "<string>") -> None:
+        # A simplified recursive-descent-free line scanner over CPython's INI
+        # grammar: `[section]` headers, `key=value`/`key:value` pairs (first
+        # of `=`/`:` wins), `#`/`;` full-line comments, blank lines, and
+        # leading-whitespace CONTINUATION lines (appended to the previous
+        # option's value with a `\n` join). See the module header for the
+        # documented deviations (allow_no_value payload, single-line
+        # ParsingError message).
+        # `cursect`/`optname` use `""` as the "unset" sentinel rather than
+        # `Optional[str]` + `None`: both are REASSIGNED across branches of
+        # this `while` loop, and pyrst's flow-narrowing does not track an
+        # `Optional` local through reassignment inside a loop body (see
+        # pyrst authoring notes: "while-loop narrowing with reassignment" is
+        # unsupported) — a plain `str` sentinel sidesteps the issue entirely
+        # since no `Optional` narrowing is ever needed. A real section name
+        # is never empty in valid INI text, so `""` is an unambiguous marker.
+        lines: list[str] = string.split("\n")
+        cursect: str = ""
+        optname: str = ""
+        idx: int = 0
+        total: int = len(lines)
+        while idx < total:
+            raw_line: str = lines[idx]
+            lineno: int = idx + 1
+            stripped: str = raw_line.strip()
+            is_indented: bool = raw_line.startswith(" ") or raw_line.startswith("\t")
+            if stripped == "":
+                optname = ""
+                idx = idx + 1
+                continue
+            if stripped.startswith("#") or stripped.startswith(";"):
+                idx = idx + 1
+                continue
+            handled: bool = False
+            if is_indented:
+                if optname != "":
+                    if cursect != "":
+                        on: str = optname
+                        cs: str = cursect
+                        contval: str = stripped
+                        if cs == "DEFAULT":
+                            self.default_values[on] = self.default_values[on] + "\n" + contval
+                        else:
+                            ck: str = self._configparser_key(cs, on)
+                            self.values[ck] = self.values[ck] + "\n" + contval
+                        handled = True
+            if handled:
+                idx = idx + 1
+                continue
+            if stripped.startswith("["):
+                if not stripped.endswith("]"):
+                    # HARDENING FIX: real CPython raises a DIFFERENT
+                    # exception (`MissingSectionHeaderError`, distinct
+                    # message format) for a malformed header line
+                    # encountered BEFORE any section has been opened yet
+                    # (`cursect == ""` here); it only raises the generic
+                    # `ParsingError` text for a malformed line seen AFTER a
+                    # section is already open — re-oracled against live
+                    # CPython 3.12.9 for both cases. A prior version of
+                    # this module always raised the `ParsingError` text
+                    # regardless of section state.
+                    line_repr: str = self._configparser_line_repr(raw_line, idx, total)
+                    if cursect == "":
+                        raise ValueError("File contains no section headers.\nfile: " + repr(source) + ", line: " + str(lineno) + "\n" + line_repr)
+                    raise ValueError("Source contains parsing errors: " + repr(source) + "\n\t[line " + self._configparser_lineno(lineno) + "]: " + line_repr)
+                secname: str = stripped[1:len(stripped) - 1]
+                if secname == "DEFAULT":
+                    cursect = "DEFAULT"
+                else:
+                    if secname in self.section_option_order:
+                        raise ValueError("While reading from " + repr(source) + " [line " + self._configparser_lineno(lineno) + "]: section " + repr(secname) + " already exists")
+                    self.section_option_order[secname] = []
+                    self.section_order.append(secname)
+                    cursect = secname
+                optname = ""
+                idx = idx + 1
+                continue
+            if cursect != "":
+                cs2: str = cursect
+                eq_idx: int = stripped.find("=")
+                colon_idx: int = stripped.find(":")
+                delim_idx: int = -1
+                if eq_idx == -1:
+                    delim_idx = colon_idx
+                else:
+                    if colon_idx == -1:
+                        delim_idx = eq_idx
+                    else:
+                        if eq_idx < colon_idx:
+                            delim_idx = eq_idx
+                        else:
+                            delim_idx = colon_idx
+                if delim_idx == -1:
+                    if self.allow_no_value:
+                        key_lc: str = self.optionxform(stripped)
+                        if cs2 == "DEFAULT":
+                            if key_lc not in self.default_values:
+                                self.default_order.append(key_lc)
+                            self.default_values[key_lc] = ""
+                        else:
+                            ck2: str = self._configparser_key(cs2, key_lc)
+                            if ck2 not in self.values:
+                                local2: list[str] = self.section_option_order[cs2]
+                                local2.append(key_lc)
+                                self.section_option_order[cs2] = local2
+                            self.values[ck2] = ""
+                        optname = key_lc
+                    else:
+                        raise ValueError("Source contains parsing errors: " + repr(source) + "\n\t[line " + self._configparser_lineno(lineno) + "]: " + self._configparser_line_repr(raw_line, idx, total))
+                else:
+                    key_part: str = stripped[0:delim_idx].strip()
+                    val_part: str = stripped[delim_idx + 1:].strip()
+                    key_lc2: str = self.optionxform(key_part)
+                    if cs2 == "DEFAULT":
+                        if key_lc2 in self.default_values:
+                            raise ValueError("While reading from " + repr(source) + " [line " + self._configparser_lineno(lineno) + "]: option " + repr(key_lc2) + " in section " + repr(cs2) + " already exists")
+                        self.default_values[key_lc2] = val_part
+                        self.default_order.append(key_lc2)
+                    else:
+                        ck3: str = self._configparser_key(cs2, key_lc2)
+                        if ck3 in self.values:
+                            raise ValueError("While reading from " + repr(source) + " [line " + self._configparser_lineno(lineno) + "]: option " + repr(key_lc2) + " in section " + repr(cs2) + " already exists")
+                        self.values[ck3] = val_part
+                        local3: list[str] = self.section_option_order[cs2]
+                        local3.append(key_lc2)
+                        self.section_option_order[cs2] = local3
+                    optname = key_lc2
+            else:
+                # This branch only fires when `cursect == ""` (no section
+                # opened yet) — always CPython's `MissingSectionHeaderError`
+                # shape, not `ParsingError`'s (re-oracled against live
+                # CPython 3.12.9; see `_configparser_line_repr` and the
+                # header-parsing branch above for the same distinction). A
+                # prior version of this module raised the `ParsingError`
+                # text here unconditionally.
+                raise ValueError("File contains no section headers.\nfile: " + repr(source) + ", line: " + str(lineno) + "\n" + self._configparser_line_repr(raw_line, idx, total))
+            idx = idx + 1
+
+    # ── writing ───────────────────────────────────────────────────────────────
+
+    def write(self, space_around_delimiters: bool = True) -> str:
+        # DIVERGENCE (G7 — see module header): CPython's `write(fp,
+        # space_around_delimiters=True)` writes to a file object and returns
+        # `None`. pyrst has no spellable file-typed parameter, so this
+        # returns the composed text as a `str` instead; round-trip via
+        # `os.write_file(path, cp.write())`. Ordering is TRUE insertion order
+        # (see module header's ORDERING section), matching CPython, not a
+        # sorted-dict fallback.
+        delim: str = " = " if space_around_delimiters else "="
+        out: str = ""
+        if len(self.default_order) > 0:
+            out += "[DEFAULT]\n"
+            for k in self.default_order:
+                out += k + delim + self.default_values[k] + "\n"
+            out += "\n"
+        for sec in self.section_order:
+            out += "[" + sec + "]\n"
+            local: list[str] = self.section_option_order[sec]
+            for k in local:
+                ck: str = self._configparser_key(sec, k)
+                out += k + delim + self.values[ck] + "\n"
+            out += "\n"
+        return out

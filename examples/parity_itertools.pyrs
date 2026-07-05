@@ -20,7 +20,7 @@
 # Every OTHER call in this file (`count`, `cycle`, `repeat`, `chain`,
 # `islice`, `takewhile`, `dropwhile`, `starmap`, `accumulate`, `product`,
 # `combinations`, `combinations_with_replacement`, `permutations`) IS
-# independently CPython-parity-verified (see notes.md). Expected output below
+# independently CPython-parity-verified. Expected output below
 # was captured from the pyrst binary and is fully deterministic (no
 # randomness, no timing).
 from itertools import count, cycle, repeat, chain, islice, takewhile, dropwhile

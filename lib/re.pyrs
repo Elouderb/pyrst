@@ -150,6 +150,14 @@ def split(pattern: str, text: str, maxsplit: int = 0) -> list[str]:
 # CPython's `re.escape` does (Python 3.7+ semantics — only the characters in
 # `()[]{}?*+-|^$\.&~#` plus whitespace are escaped; e.g. `!`, `_`, letters,
 # and digits are left alone). See the module-header divergence note re `\v`.
+#
+# NAME COLLISION (card d9182d50): `lib/html.pyrs` ALSO defines a top-level
+# `escape` (HTML entity escaping). pyrst's module namespace is FLAT, so a
+# single program cannot `import re` and `import html` together (nor
+# `from re import escape` + `from html import escape`) — the resolver's
+# cross-module-collision detector (card 6c8b4a39) raises a compile-time
+# error rather than letting one shadow the other. Both modules keep their
+# exact CPython name; see `lib/html.pyrs`'s header for the full writeup.
 def escape(pattern: str) -> str:
     specials: str = "()[]{}?*+-|^$\\.&~# \t\n\r\f"
     out: str = ""

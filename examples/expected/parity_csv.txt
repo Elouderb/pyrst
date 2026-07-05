@@ -1,0 +1,99 @@
+['a', 'b', 'c']
+['1', '2', '3']
+['x']
+['']
+['a', 'b', '']
+['', '', '', '']
+['a', 'b\nc', 'd']
+['a"b', 'c"']
+['a', 'b', 'c']
+['a', 'b', 'c']
+['a', 'b', 'c']
+['a\tb\tc']
+['a', 'b', 'c']
+[]
+[]
+[]
+['a']
+['1']
+['2']
+['a', ' b ', 'c']
+['a', 'b', 'c', 'de']
+[' "a" ', ' "b" ', ' "c" ']
+['café', '日本語', 'Ñoño']
+'a,b,c\r\n'
+'a,"b,c",d\r\n'
+'"a""b",c\r\n'
+'"a\nb",c\r\n'
+'"a","b"\r\n'
+'a\\,b,c\r\n'
+'a,b\n'
+'a,b\r\n1,2\r\n'
+'a\\"b,c\r\n'
+"a;'b;c';'d''e'\r\n"
+'"a","","b"\r\n'
+'""\r\n'
+'a,b'
+'café,日本語,Ñoño\r\n'
+[('age', '30'), ('name', 'Alice')]
+[('age', '25'), ('name', 'Bob')]
+[('age', '30'), ('name', 'Alice')]
+[('age', '25'), ('name', 'Bob')]
+[('a', '1'), ('b', '2')]
+[('a', '1'), ('b', '2')] ['3']
+'name,age\r\n'
+'Alice,30\r\n'
+'1,X\r\n'
+'1,2\r\n'
+dict contains fields not in fieldnames: 'c'
+,
+|
+	
+:
+True
+False
+['excel', 'excel-tab', 'unix']
+,
+	
+True
+unknown dialect
+131072
+field larger than field limit (10)
+"quotechar" must be a 1-character string
+"delimiter" must be a 1-character string
+"delimiter" must be a 1-character string
+"escapechar" must be a 1-character string
+['a', 'b']
+['c', 'd']
+['e', 'f']
+['g', 'h']
+['a']
+['b']
+['c']
+['a\rb', 'c']
+['ab"cd', 'e']
+[' "ab"', 'c']
+['ab', 'c']
+['a"']
+['"']
+['""']
+['abc']
+['abc,def']
+['']
+[' ']
+',a,,b,,c\r\n'
+'a""b,c\r\n'
+'"a","1","2.5"\r\n'
+'"a","1"\r\n'
+need to escape, but no escapechar set
+need to escape, but no escapechar set
+need to escape, but no escapechar set
+bad "quoting" value
+extrasaction (bogus) must be 'raise' or 'ignore'
+[('a', '1'), ('b', '2'), ('c', 'MISSING')]
+[('a', '1'), ('b', '2')] ['3', '4']
+'café,"has,comma"\r\n'
+,
+Could not determine delimiter
+False
+done

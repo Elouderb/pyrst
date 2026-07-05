@@ -1,0 +1,23 @@
+P1(x=1, y=2)
+True
+True
+True
+1
+2
+10
+2
+20
+1
+2
+Derived(x=1, y=2)
+True
+Empty()
+Outer(inner=Inner(a=5))
+5
+True
+Named(name='café', note="o'reilly")
+Named(name='x', note='line1\nline2')
+Bounds(lo=-9223372036854775807, hi=9223372036854775807)
+Bounds(lo=0, hi=0)
+GrandChild(x=1, y=2, z=3)
+1 2 3

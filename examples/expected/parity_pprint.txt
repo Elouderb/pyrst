@@ -1,0 +1,68 @@
+42
+3.14
+'hello'
+True
+False
+None
+[]
+{}
+set()
+[1, 2, 3]
+(1, 2, 3)
+(1,)
+'hello\\nworld'
+'hello\\tworld'
+'hello\nworld'
+'hello\tworld'
+0.1
+1.0
+inf
+-inf
+1_000_000
+1000000
+False
+[1]
+True
+False
+False
+[1, 2]
+{'a': 1}
+{1: 'a', 2: 'b', 3: 'c'}
+[1, 2, 3]
+True
+False
+'héllo wörld ünïcödé 日本語'
+['日本語', 'emoji😀', 'café']
+[-1, -2, -3]
+-1_000_000
+-5
+{-1: 'a', 1: 'b'}
+1234567.891
+12345678.9
+[1_234_567]
+{1_234_567: 7654321.5}
+15
+[1, 2, 3, 4, 5]
+[1,
+ 2,
+ 3,
+ 4,
+ 5]
+[1]
+[1,
+ 2,
+ 3]
+[1,
+2,
+3,
+4,
+5,
+6,
+7,
+8]
+_ParityOuter(items=[1, 2, 3], inner=_ParityInner(v=5))
+_ParityOuter(items=[1, 2, 3], inner=_ParityInner(v=5))
+[_ParityOuter(items=[1, 2, 3], inner=_ParityInner(v=5))]
+True
+True
+True

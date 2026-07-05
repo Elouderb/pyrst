@@ -1,0 +1,152 @@
+# dataclasses — companion module for the `@dataclass` decorator.
+#
+# FIDELITY: ~1/5 of the CPython surface (docs/design/w2-dossiers/dataclasses.md).
+# `@dataclass` itself is NOT implemented here: it is a COMPILER-SYNTHESIZED
+# class decorator (card 6f69d4a3, see `src/typeck/checks.rs::check_class_prelude`
+# and `src/codegen/items.rs`), recognized purely by the literal decorator name
+# `dataclass` regardless of which module (if any) it was imported from. That is
+# why `from dataclasses import dataclass` has ALWAYS been a no-op import in
+# pyrst (`src/resolver.rs` hard-skips the module name `dataclasses`, same as
+# `sys`) — the decorator works whether or not this file is ever consulted.
+#
+# This card (855fe2e5) was scoped to add the dataclasses COMPANIONS —
+# `field()`, `asdict()`, `astuple()`, `fields()`, `is_dataclass()`,
+# `FrozenInstanceError`, `MISSING`, `Field` — as honestly-expressible pyrst
+# library code. Every one of them was probed against the actual pyrst compiler
+# (reproduced during the hardening pass; transcripts in the card history) and turned
+# out to be UNREACHABLE with library-only code, for two independent reasons:
+#
+# 1. NO GENERIC FIELD REFLECTION. `asdict()`/`astuple()`/`fields()` need to
+#    enumerate the fields of an ARBITRARY dataclass type generically. pyrst's
+#    generics (v2) only infer bounds for comparison/equality/arithmetic/
+#    Display/Hash — attribute access on a bare type parameter is a hard type
+#    error:
+#        def getx[T](obj: T) -> int:
+#            return obj.x
+#     courtesy of the compiler:
+#        "cannot access an attribute of a value of generic type `T` (this
+#         operation on a type parameter is not supported — generics v2 infers
+#         bounds only for comparison, equality, arithmetic, Display, and Hash)"
+#    There is no reflection/`__dict__`/structural-field protocol to fall back
+#    on, so a genuinely generic `asdict`/`astuple`/`fields` cannot be written
+#    as pyrst source. `is_dataclass()` has the identical problem in reverse
+#    (no runtime type tag to test "is T a `@dataclass`" against) — `type()`/
+#    `isinstance()` exist, but only as CODEGEN BUILTINS special-cased on a
+#    literal type name at compile time (`src/codegen/exprs.rs`), not as
+#    something a library function can hook into for a caller-supplied type
+#    parameter.
+#
+# 2. NO GENERIC CLASS-FIELD DEFAULTS. `field()` would need to be a normal
+#    function whose call result becomes a class field's default value
+#    (`x: int = field(default=1)`). Probing this directly (not even
+#    generically — a plain `int -> int` helper) shows pyrst's codegen for a
+#    dataclass field's default expression does not resolve calls to
+#    user-defined top-level functions at all:
+#        def ident(x: int) -> int:
+#            return x
+#        @dataclass
+#        class P:
+#            x: int
+#            y: int = ident(5)
+#    fails to compile the generated Rust with `cannot find function 'ident' in
+#    this scope` — the default-expression call site is emitted somewhere that
+#    does not see sibling top-level `fn`s. Only bare literals and calls to
+#    BUILTIN functions (constructors like `list()`/`dict()`/`set()`, but also
+#    plain builtins like `len([1, 2, 3])`/`abs(-1)`, or literals `0`/`""`, …)
+#    survive as dataclass field defaults today — re-verified during w2-hardener
+#    review (`y: int = len([1, 2, 3])` compiles and runs; the earlier "BUILTIN
+#    constructor calls" phrasing undersold this — it's any compiler-recognized
+#    builtin, not just constructors). This is a pre-existing compiler gap
+#    unrelated to this card's scope (a library file cannot work around it),
+#    so `field()` cannot be defined in a way that is actually usable from a
+#    `@dataclass` field position — a hypothetical user-defined `field()`
+#    would need the SAME special-cased codegen recognition real builtins get,
+#    which only a compiler change (not a `.pyrs` file) can provide.
+#
+# A useful pyrst-side consequence of (2), and worth calling out because it
+# removes the MOST COMMON reason anyone reaches for `field()` in the first
+# place: pyrst's value semantics (deep-copy on construction, no aliasing)
+# mean a bare mutable-looking default already behaves like CPython's
+# `field(default_factory=...)` — each instance gets its own independent list:
+#     @dataclass
+#     class WithFactory:
+#         items: list[int] = []      # or `= list()`
+#     WithFactory().items is WithFactory().items   # pyrst: separate objects
+# CPython instead REJECTS this exact class body at decoration time
+# (`ValueError: mutable default <class 'list'> for field items is not
+# allowed: use default_factory`) and requires spelling it with
+# `field(default_factory=list)`. This is a DOCUMENTED, tested divergence
+# (pyrst silently allows and correctly handles the plain-literal form CPython
+# forbids) — not something dual-run parity code can exercise (the CPython
+# side of that specific snippet does not even reach line 1 of `main()`), so
+# it is demonstrated only in this header and in the card history, never in
+# `examples/parity_dataclasses.pyrs`.
+#
+# Also confirmed UNREACHABLE / not synthesized by the compiler today
+# (independent of this module, so no library workaround applies):
+#   - `ClassVar[...]` annotations are not recognized at all: a `ClassVar[int]`
+#     field is treated as an ordinary field of an unknown/unreprable type and
+#     fails the dataclass repr check. There is no ClassVar exclusion.
+#   - `__post_init__` is not invoked by the synthesized `__init__`. A class
+#     may define a method literally named `__post_init__`, but it is dead
+#     code — nothing calls it. (Silent divergence, not a compile error —
+#     documented here since it is easy to assume CPython semantics.)
+#   - `@dataclass(...)` with ANY keyword argument (`order=`, `frozen=`,
+#     `eq=`, `repr=`, `init=`, `unsafe_hash=`, `slots=`, `match_args=`,
+#     `kw_only=`) is an honest compiler CHECK ERROR today — only the bare
+#     `@dataclass` is supported. That rules out `FrozenInstanceError`
+#     entirely: nothing can ever produce a frozen instance to raise it
+#     against, so it is not defined here (a stray exception class with no
+#     way to trigger it would be a decoy, not a companion).
+#   - `MISSING`/`Field` exist in CPython purely to make `field()`/`fields()`
+#     introspection meaningful (`Field.default is MISSING`, etc.). With
+#     `field()` and `fields()` both unreachable (see above), a `MISSING`
+#     sentinel or `Field` shape here would have nothing to attach to —
+#     defining them would be exactly the "fake it" failure mode this module
+#     is meant to avoid, so they are also left undefined.
+#
+# DISCOVERED DURING w2-hardener REVIEW (adversarial edge pass, not previously
+# documented — flagged as a compiler-side follow-up, no library workaround
+# exists):
+#   - 3-LEVEL (OR DEEPER) `@dataclass` INHERITANCE CHAINS MISCOMPILE WHEN
+#     CONSTRUCTED WITH POSITIONAL ARGUMENTS. A 2-level chain (one base class)
+#     works correctly with positional args (see `examples/parity_dataclasses.pyrs`'s
+#     `Derived(Base)` test). A 3rd level breaks:
+#         @dataclass
+#         class Base:
+#             x: int
+#         @dataclass
+#         class Mid(Base):
+#             y: int
+#         @dataclass
+#         class Leaf(Mid):
+#             z: int
+#         Leaf(1, 2, 3)   # positional
+#     fails — depending on the exact positional arg count this surfaces as
+#     either `codegen error: class 'Leaf' has 2 fields but 3 positional
+#     arguments given`, a `missing a required argument: 'z'` type error, or
+#     (with one positional + two keyword args) a generated-Rust `E0062: field
+#     'y' specified more than once` — i.e. positional args silently get
+#     mapped to the WRONG field name once the chain is 3 levels deep. The
+#     checker's own field registry is NOT confused (`Leaf(x=1, y=2, z=3)` —
+#     ALL-KEYWORD construction — typechecks, compiles, and runs correctly,
+#     producing `Leaf(x=1, y=2, z=3)` exactly as CPython does), so this is
+#     narrowly a positional-argument codegen bug for chains of inheritance
+#     depth ≥ 3, not a field-tracking bug. WORKAROUND: construct 3+-level
+#     dataclass inheritance chains with all-keyword arguments only. This is
+#     compiler-side (the synthesized `__init__`'s positional-arg-to-field
+#     mapping, `@dataclass` itself is card 6f69d4a3's territory, not this
+#     library-only card's), so it cannot be fixed from `lib/dataclasses.pyrs`
+#     — documented here and demonstrated (via the safe all-keyword spelling)
+#     in `examples/parity_dataclasses.pyrs`'s `GrandChild` test.
+#
+# NET RESULT: this file intentionally defines NO runtime names. `@dataclass`
+# continues to work exactly as it does today (compiler-side, independent of
+# import), and `from dataclasses import dataclass, field, asdict, astuple,
+# fields, is_dataclass` remains a no-op import — the same behavior the
+# resolver's existing `dataclasses` skip-list has always provided. This file
+# is registered as a real (but presently unreachable — the resolver still
+# intercepts `dataclasses` before the embedded-module lookup) stdlib entry so
+# the dossier's findings live next to the other lib/*.pyrs modules, and so a
+# future card that adds compiler-side field reflection or class-field-default
+# function calls has a natural home to land real companions in.

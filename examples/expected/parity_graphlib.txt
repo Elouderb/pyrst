@@ -1,0 +1,47 @@
+[]
+[]
+['X']
+['Z', 'A', 'M']
+['C', 'B', 'A']
+['A', 'B', 'C', 'D', 'E']
+['base', 'left', 'right', 'apex']
+['B', 'Y', 'A', 'X']
+['B', 'A']
+['B', 'C', 'A']
+['B', 'C', 'D', 'A']
+[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+[(3, 4), (1, 2)]
+['A', 'B', 'C']
+['B']
+['A']
+[]
+[]
+['D', 'E']
+['A', 'B', 'C']
+[]
+True
+('nodes are in a cycle', ['A', 'A'])
+True
+('nodes are in a cycle', ['A', 'B', 'A'])
+True
+('nodes are in a cycle', ['A', 'C', 'B', 'A'])
+True
+True
+True
+True
+True
+True
+True
+True
+['free1', 'free2']
+True
+True
+False
+True
+['naïve', '日本語', 'café']
+[-10, 0, -5]
+['A']
+('nodes are in a cycle', ['C1', 'C0', 'C1'])
+['V0']
+True
+True

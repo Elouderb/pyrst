@@ -1,0 +1,42 @@
+hello
+hello
+True
+hello
+True
+True
+f1
+f2
+[Errno 17] File exists: '<base>/existing_dst'
+f1
+<base>/empty_tree_dst/empty_subdir
+False
+rmtree ignore ok
+[Errno 2] No such file or directory: '<base>/never_existed2'
+True
+False
+move me
+True
+content
+True
+False
+x
+src-content
+Destination path '<base>/mv_dir_dst/collide.txt' already exists
+True
+True
+True
+True
+[Errno 2] No such file or directory: '<base>/does_not_exist'
+'<base>/same.txt' and '<base>/same.txt' are the same file
+unchanged
+'<base>/same.txt' and '<base>/same.txt' are the same file
+[Errno 21] Is a directory: '<base>/src_is_dir'
+[Errno 21] Is a directory: '<base>/src_is_dir'
+[Errno 17] File exists: '<base>/dst_is_file.txt'
+[Errno 17] File exists: '<base>/dst_is_file.txt'
+x
+[Errno 20] Not a directory: '<base>/dst_is_file.txt'
+[Errno 20] Not a directory: '<base>/rm_plain_file.txt'
+True
+True
+done

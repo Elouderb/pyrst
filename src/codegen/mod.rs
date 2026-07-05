@@ -771,7 +771,14 @@ pub fn emit_program(modules: &[(Module, String)], ctx: &TyCtx) -> Result<String>
     // and those keep `let mut x: T = <default>; x = <init>;`. The dead default is a
     // generated-code artifact (never a user bug), suppressed here uniformly for all
     // hoist orderings — see the note on `try_fold_hoisted_init`.
-    cg.line("#![allow(unused_parens, unused_variables, unused_mut, dead_code, unused_imports, non_upper_case_globals, non_camel_case_types, unreachable_code, unused_assignments)]");
+    // `non_snake_case` (W2 stdlib): CPython-exact public names are kept verbatim
+    // (`stat.S_ISREG`, `difflib.IS_LINE_JUNK`, ...) — matching the reference API is
+    // the contract, so their non-snake spelling is intentional, not a user mistake.
+    // `unused_braces` (sibling of the already-suppressed `unused_parens`): a
+    // single-expression `@extern` template body (`plat.uname_release`'s `{ Command
+    // ::new(...)...}`) lowers as a braced block return — structurally redundant
+    // generated code, never a hand-maintained style choice, same as extra parens.
+    cg.line("#![allow(unused_parens, unused_braces, unused_variables, unused_mut, dead_code, unused_imports, non_upper_case_globals, non_camel_case_types, non_snake_case, unreachable_code, unused_assignments)]");
     cg.line("use std::io::Write;");
     cg.line("");
     // CPython-parity float formatting (str==repr for floats in Python 3). Uses

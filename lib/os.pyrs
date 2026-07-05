@@ -206,20 +206,26 @@ def urandom(n: int) -> list[int]:
 class stat_result:
     st_size: int
     st_mtime: float
+    # Full mode word (file-type bits | permission bits), matching CPython's
+    # os.stat().st_mode; decode it with the `stat` module (S_IMODE/S_IFMT/...).
+    # Exposed so the tempfile owner-only permission contract (0o700 dir / 0o600
+    # file) can be asserted in-language rather than only out of band.
+    st_mode: int
 
-    def __init__(self, st_size: int, st_mtime: float) -> None:
+    def __init__(self, st_size: int, st_mtime: float, st_mode: int) -> None:
         self.st_size = st_size
         self.st_mtime = st_mtime
+        self.st_mode = st_mode
 
 
 @extern
-def _os_stat_raw(p: str) -> tuple[int, float]:
-    "{ let m = std::fs::metadata(&{p}).unwrap(); let sz = m.len() as i64; let mt = m.modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64(); (sz, mt) }"
+def _os_stat_raw(p: str) -> tuple[int, float, int]:
+    "{ use std::os::unix::fs::MetadataExt; let m = std::fs::metadata(&{p}).unwrap(); let sz = m.len() as i64; let mt = m.modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64(); let md = m.mode() as i64; (sz, mt, md) }"
 
 
 def stat(p: str) -> stat_result:
-    sz, mt = _os_stat_raw(p)
-    return stat_result(sz, mt)
+    sz, mt, md = _os_stat_raw(p)
+    return stat_result(sz, mt, md)
 
 
 def walk(top: str) -> Iterator[tuple[str, list[str], list[str]]]:

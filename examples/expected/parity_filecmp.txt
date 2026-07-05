@@ -1,0 +1,36 @@
+True
+False
+True
+True
+[Errno 2] No such file or directory: '<base>/nope1.txt'
+False
+['same.txt']
+['diff.txt']
+[]
+['same.txt']
+[]
+['missing.txt']
+[]
+[]
+['x.txt']
+['same.txt']
+['diff.txt']
+[]
+[]
+['diff.txt', 'same.txt']
+['diff.txt', 'same.txt']
+['diff.txt', 'same.txt']
+['only_left.txt']
+['only_right.txt']
+False
+[Errno 2] No such file or directory: '<base>/no_such_dir'
+['subdir']
+['file.txt']
+[]
+['bothdirs']
+[]
+[]
+['mixedtype']
+[]
+[Errno 20] Not a directory: '<base>/hard_not_a_dir.txt'
+done

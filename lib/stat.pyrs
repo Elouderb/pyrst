@@ -1,0 +1,156 @@
+# pyrst standard library — stat
+#
+# FIDELITY: 4/5
+#
+# File mode constants and predicates for os.stat() result interpretation.
+# All S_IS* predicates take unsigned int mode values and return bool.
+# Constants use octal notation matching POSIX/CPython.
+#
+# SURFACE:
+#   - 10 S_IS* predicates: S_ISREG, S_ISDIR, S_ISLNK, S_ISFIFO, S_ISSOCK, S_ISCHR, S_ISBLK, S_ISDOOR, S_ISPORT, S_ISWHT
+#   - 2 mode analysis functions: S_IFMT (extract file type), S_IMODE (extract permissions)
+#   - 10 ST_* index constants for stat() result tuple fields
+#   - 10 S_I* file type constants (S_IFREG, S_IFDIR, S_IFLNK, S_IFIFO, S_IFSOCK, S_IFCHR, S_IFBLK, S_IFDOOR, S_IFPORT, S_IFWHT)
+#   - 12 S_I* permission bit constants
+#   - 3 S_I* permission mask constants (S_IRWXU, S_IRWXG, S_IRWXO)
+#   - 4 deprecated aliases (S_IREAD, S_IWRITE, S_IEXEC, S_ENFMT)
+#
+# ERRORS:
+#   - S_IS*/S_IFMT/S_IMODE require an unsigned-int-range mode (raises
+#     OverflowError for a negative mode, matching CPython's real `_stat` C
+#     extension exactly — verified live: `stat.S_ISREG(-1)` really does raise
+#     `OverflowError: can't convert negative value to unsigned int` in
+#     CPython 3.12, it is NOT just an honest pyrst-only restriction).
+#
+# DIVERGENCES:
+#   - S_ISDOOR, S_ISPORT, S_ISWHT and related constants are always 0/False on
+#     Linux (Solaris-only; verified against real CPython on this host too).
+#   - NOT IMPLEMENTED (out of this unit's mechanical-bundle scope, absent
+#     from CPython's stat module surface here): `filemode(mode) -> str`
+#     (`-rwxrwxrwx`-style rendering — a separate table-driven algorithm, not
+#     a simple constant), the BSD `UF_*`/`SF_*` file-flag constants (14
+#     items), and the Windows-only `FILE_ATTRIBUTE_*` constants (17 items).
+#     None of the 47 surfaced items above depend on them. A caller doing
+#     `from stat import filemode` gets pyrst's real "unknown name" resolver
+#     error, not a silent no-op.
+
+# ST_* Tuple Index Constants (10 items)
+ST_MODE: int = 0
+ST_INO: int = 1
+ST_DEV: int = 2
+ST_NLINK: int = 3
+ST_UID: int = 4
+ST_GID: int = 5
+ST_SIZE: int = 6
+ST_ATIME: int = 7
+ST_MTIME: int = 8
+ST_CTIME: int = 9
+
+# S_I* File Type Constants (octal values)
+S_IFREG: int = 0o100000
+S_IFDIR: int = 0o40000
+S_IFLNK: int = 0o120000
+S_IFIFO: int = 0o10000
+S_IFSOCK: int = 0o140000
+S_IFCHR: int = 0o20000
+S_IFBLK: int = 0o60000
+S_IFDOOR: int = 0o0
+S_IFPORT: int = 0o0
+S_IFWHT: int = 0o0
+
+# S_I* Permission Bit Constants (octal values)
+S_ISUID: int = 0o4000
+S_ISGID: int = 0o2000
+S_ISVTX: int = 0o1000
+S_IRUSR: int = 0o400
+S_IWUSR: int = 0o200
+S_IXUSR: int = 0o100
+S_IRGRP: int = 0o40
+S_IWGRP: int = 0o20
+S_IXGRP: int = 0o10
+S_IROTH: int = 0o4
+S_IWOTH: int = 0o2
+S_IXOTH: int = 0o1
+
+# S_I* Permission Masks (octal values, convenience combinations)
+S_IRWXU: int = 0o700
+S_IRWXG: int = 0o70
+S_IRWXO: int = 0o7
+
+# Deprecated Aliases
+S_IREAD: int = 0o400
+S_IWRITE: int = 0o200
+S_IEXEC: int = 0o100
+S_ENFMT: int = 0o2000
+
+def S_ISREG(mode: int) -> bool:
+    """True if mode is a regular file."""
+    if mode < 0:
+        raise OverflowError("can't convert negative value to unsigned int")
+    return (mode & 0o170000) == S_IFREG
+
+def S_ISDIR(mode: int) -> bool:
+    """True if mode is a directory."""
+    if mode < 0:
+        raise OverflowError("can't convert negative value to unsigned int")
+    return (mode & 0o170000) == S_IFDIR
+
+def S_ISLNK(mode: int) -> bool:
+    """True if mode is a symbolic link."""
+    if mode < 0:
+        raise OverflowError("can't convert negative value to unsigned int")
+    return (mode & 0o170000) == S_IFLNK
+
+def S_ISFIFO(mode: int) -> bool:
+    """True if mode is a FIFO (named pipe)."""
+    if mode < 0:
+        raise OverflowError("can't convert negative value to unsigned int")
+    return (mode & 0o170000) == S_IFIFO
+
+def S_ISSOCK(mode: int) -> bool:
+    """True if mode is a socket."""
+    if mode < 0:
+        raise OverflowError("can't convert negative value to unsigned int")
+    return (mode & 0o170000) == S_IFSOCK
+
+def S_ISCHR(mode: int) -> bool:
+    """True if mode is a character device."""
+    if mode < 0:
+        raise OverflowError("can't convert negative value to unsigned int")
+    return (mode & 0o170000) == S_IFCHR
+
+def S_ISBLK(mode: int) -> bool:
+    """True if mode is a block device."""
+    if mode < 0:
+        raise OverflowError("can't convert negative value to unsigned int")
+    return (mode & 0o170000) == S_IFBLK
+
+def S_ISDOOR(mode: int) -> bool:
+    """True if mode is a door (Solaris only; always False on Linux)."""
+    if mode < 0:
+        raise OverflowError("can't convert negative value to unsigned int")
+    return False
+
+def S_ISPORT(mode: int) -> bool:
+    """True if mode is an event port (Solaris only; always False on Linux)."""
+    if mode < 0:
+        raise OverflowError("can't convert negative value to unsigned int")
+    return False
+
+def S_ISWHT(mode: int) -> bool:
+    """True if mode is a whiteout (BSD only; always False on Linux)."""
+    if mode < 0:
+        raise OverflowError("can't convert negative value to unsigned int")
+    return False
+
+def S_IFMT(mode: int) -> int:
+    """Extract file type bits from mode (mask 0o170000)."""
+    if mode < 0:
+        raise OverflowError("can't convert negative value to unsigned int")
+    return mode & 0o170000
+
+def S_IMODE(mode: int) -> int:
+    """Extract permission bits from mode (mask 0o7777)."""
+    if mode < 0:
+        raise OverflowError("can't convert negative value to unsigned int")
+    return mode & 0o7777

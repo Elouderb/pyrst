@@ -735,6 +735,19 @@ the trailing `else` is `{ None }` and `__reraise_msg` is bound without `mut`.
 4. **Code generator** walks AST → Rust source code
 5. **rustc** compiles Rust source → native binary
 
+**Two backend paths.** A program with no `@crate` dependency takes the
+single-file path (`rustc <src> --edition 2021`); a program that imports an
+`@crate`-backed module (`re` → `regex`, `tempfile` → `getrandom`, …) is built as
+a small Cargo project so the crates are fetched and linked. Both paths are
+configured to **panic honestly on i64 overflow**: the single-file path is a debug
+build (overflow-checks / debug-assertions ON by rustc default), and the Cargo
+project pins `overflow-checks = true` + `debug-assertions = true` in
+`[profile.release]` so it does not silently *wrap* where the single-file path
+panics (they must agree — honest error over silent miscompile). These checks add
+a per-arithmetic-op branch (in generated code and in dependency crates), but the
+Cargo build is still `opt-level = 3`, so it stays far faster than the opt-level-0
+single-file path.
+
 ### Ownership and Cloning
 
 **Current strategy:** Aggressive cloning to avoid ownership complexity.

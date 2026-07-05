@@ -1,0 +1,184 @@
+# pyrst standard library — enum
+#
+# Design decision (recorded on card 03eb4e2c, dossier
+# docs/design/w2-dossiers/enum.md): pyrst has NO `enum.Enum`/`IntEnum`/`Flag`
+# class, NO `auto()`, and NO `@unique` decorator. CPython's `Enum` members are
+# distinct singleton OBJECTS carrying a `.name` and a `.value`; pyrst has no
+# metaclass machinery, no module-level mutable state (needed for `auto()`'s
+# running counter and for `@unique`'s duplicate scan), and no reflection over
+# a class's own attribute list (needed for `.__members__` / iteration / `len`).
+# Building any of that honestly needs a DEDICATED COMPILER ENUM TYPE, which is
+# out of scope for this card. Faking it with a pyrst class that merely PRINTS
+# like an Enum member would be dishonest (see the "no fake .name/.value" note
+# on card 4ad25c29) — so this module does not attempt it.
+#
+# THE HONEST SHAPE: pyrst's class-const substrate (card 03eb4e2c) shipped
+# associated consts — a class-body line `NAME: T = <int|str|bool|float
+# literal>` becomes `ClassName::NAME` in the generated Rust, reachable as
+# `ClassName.NAME` from pyrst. That is real, checked, and generic over any
+# const-typeable literal. The pattern this module documents and supports is:
+# write your "enum" as a class whose members are typed class-level consts.
+# `Color.RED` then IS the value 1 (an `int`), not a wrapper object.
+#
+#     class Color:
+#         RED: int = 1
+#         GREEN: int = 2
+#         BLUE: int = 3
+#
+#     def paint(c: int) -> None:
+#         if c == Color.RED:
+#             print("red")
+#
+# This pattern gives you, for free and type-checked:
+#   - member access:            Color.RED
+#   - use in expressions:       Color.RED + 1, [Color.RED, Color.GREEN]
+#   - equality/comparison:      x == Color.RED   (the const IS the value, so
+#                                this is real `int`/`str` equality — no fake
+#                                identity semantics needed to make it work)
+#   - "IntEnum-style" arithmetic: since the const has no separate wrapper
+#     type, `Color.RED + 1` just works as plain `int` arithmetic (CPython's
+#     `IntEnum` supports this too; CPython's plain `Enum` would TypeError —
+#     pyrst does not distinguish the two, which is itself a divergence, see
+#     below).
+#
+# WHAT THIS PATTERN DOES NOT GIVE YOU (compared to CPython's real `Enum`),
+# and why each is out of scope without a dedicated compiler enum type:
+#   - `.name`            — the const has no runtime tag recording which
+#                           attribute name produced it; `Color.RED` is just
+#                           the `int` `1`, indistinguishable at runtime from
+#                           any other `1`.
+#   - `.value`           — there is nothing but the value; `.value` would be
+#                           a no-op accessor, which is exactly the kind of
+#                           fake surface this module avoids shipping.
+#   - `EnumClass(value)` reverse lookup — see `check_valid` below for the
+#     closest honest substitute (caller supplies the list of legal values).
+#   - `EnumClass[name]` bracket lookup — see `lookup_by_name` below (caller
+#     supplies parallel name/value lists).
+#   - iteration (`for m in EnumClass`) / `len(EnumClass)` / `__members__` —
+#     needs reflection over a class's own const list; not available.
+#   - singleton identity (`Color(1) is Color.RED`) — consts are values, not
+#     objects; `is`-identity on an `int`/`str` is not a meaningful question
+#     pyrst needs to answer the same way CPython does.
+#   - `auto()` — needs a running per-class counter tracked across class-body
+#     evaluation, i.e. module/class-level MUTABLE state; not available.
+#     Design-around: write the sequential ints out by hand (`RED: int = 1`,
+#     `GREEN: int = 2`, ...). This is more typing but fully honest.
+#   - `@unique` — needs to enumerate a class's own consts to scan for
+#     duplicate values; not available as an automatic, attach-and-forget
+#     decorator. Design-around: call `find_duplicate_value` yourself (e.g.
+#     from a test) against the literal list of values you wrote.
+#   - `repr(Color.RED)` printing as `<Color.RED: 1>` — the const has no
+#     enclosing-class tag to print; `repr(Color.RED)` prints the plain `int`
+#     repr (`1`), which is an honest, documented divergence, not a bug.
+#   - regular-`Enum`-vs-`IntEnum` distinction — pyrst has one shape (a typed
+#     const), so every "enum" is usable in arithmetic the way only CPython's
+#     `IntEnum` is. A pyrst "enum" modeled on CPython's plain `Enum` (where
+#     `Color.RED < Color.GREEN` should TypeError) will NOT raise — arithmetic
+#     and ordering on the underlying value type always work. Document this
+#     if the CPython twin you are porting relied on plain-`Enum`'s stricter
+#     behavior.
+#
+# HELPER CONVENTIONS (this module's actual runtime contents): three small,
+# generic, honestly-named functions for the lookup/validation patterns above.
+# These are pyrst-only conventions — they have no CPython `enum` counterpart
+# under these names (CPython's `Enum` does this via metaclass machinery this
+# module deliberately does not fake) — call them yourself with the literal
+# list of values/names your class declares; nothing here is automatic or
+# reflects over your class:
+#
+#   - `check_valid(value, allowed, class_name)` — the closest honest stand-in
+#     for `EnumClass(value)` reverse lookup: returns `value` unchanged if it
+#     is present in `allowed`, else raises `ValueError` with CPython's exact
+#     message shape (`f"{repr(value)} is not a valid {class_name}"`, verified
+#     against the dossier's ERRORS table: `Color(99)` -> "99 is not a valid
+#     Color", `Color("RED")` -> "'RED' is not a valid Color").
+#   - `lookup_by_name(name, names, values)` — the closest honest stand-in for
+#     `EnumClass[name]` bracket lookup over caller-supplied PARALLEL
+#     name/value lists (same order as your class's const declarations —
+#     keeping them in sync is the caller's job; there is no reflection to
+#     derive `names` from your class automatically). Raises
+#     `KeyError(repr(name))` on a miss, matching CPython's exact `str(e)`
+#     shape (`Color["NOTFOUND"]` -> `str(e) == "'NOTFOUND'"`, single-quoted).
+#     NOTE this is deliberately NOT the same as a bare `raise KeyError(name)`:
+#     pyrst's user-raised `KeyError` does not itself add quoting (unlike
+#     CPython's, which reprs its single arg in `__str__`), and a SEPARATE,
+#     pre-existing pyrst divergence exists for the AUTOMATIC `KeyError` a
+#     bare dict-subscript miss raises (`d["missing"]` -> double-quoted
+#     `"missing"`, see `examples/catch_key_error.pyrs`) — that automatic path
+#     is untouched by this module; wrapping the argument in `repr(...)` here
+#     is what makes THIS function's `KeyError` message CPython-exact.
+#   - `find_duplicate_value(values)` — the closest honest stand-in for a
+#     manual `@unique` check: returns the index of the first value in
+#     `values` that repeats an earlier one (an "alias"), or `-1` if all
+#     values are distinct. Unlike `@unique`, this is not automatic — call it
+#     yourself (e.g. in a test) against the literal list of values you wrote.
+#
+# Fidelity score: 2 / 5. The class-const namespace pattern (member access,
+# equality, "IntEnum-style" arithmetic) is fully honest and type-checked, and
+# the three helper conventions faithfully reproduce CPython's `ValueError`/
+# `KeyError` message text for the lookup patterns they stand in for. The
+# score is low, not because the shipped surface is unreliable, but because
+# most of the dossier's 14-item SURFACE (`.name`, `.value`, `__members__`,
+# iteration, `len`, singleton identity, `auto()`, `@unique`, `Flag`
+# bitwise composition, and the `Enum`-vs-`IntEnum` arithmetic distinction) is
+# DEFERRED to a dedicated compiler enum type, not present here in any form —
+# faked or otherwise. See "WHAT THIS PATTERN DOES NOT GIVE YOU" above for the
+# full, itemized list.
+#
+# Divergences (beyond the deferrals above):
+#   - No CPython-name collisions: `check_valid`/`lookup_by_name`/
+#     `find_duplicate_value` are pyrst-only names (grepped clean against
+#     every other `lib/*.pyrs` public name before landing).
+#   - `check_valid`/`lookup_by_name` are GENERIC over `T` (int, str, or any
+#     type supporting `==`), matching how class-const values may be typed;
+#     `find_duplicate_value` is likewise generic.
+
+
+def check_valid[T](value: T, allowed: list[T], class_name: str) -> T:
+    # Honest stand-in for CPython's `EnumClass(value)` reverse-lookup
+    # constructor. Returns `value` if it appears in `allowed`; otherwise
+    # raises `ValueError` with CPython's exact message shape, verified
+    # against the dossier's ERRORS table (`Color(99)` -> "99 is not a valid
+    # Color"; `Color("RED")` -> "'RED' is not a valid Color") via `repr(value)`
+    # (BYTE-EXACT for int/str/bool/float — see `lib/collections.pyrs`'s
+    # `repr(x)` precedent, same underlying `PyRepr` machinery).
+    for v in allowed:
+        if v == value:
+            return value
+    raise ValueError(f"{repr(value)} is not a valid {class_name}")
+
+
+def lookup_by_name[T](name: str, names: list[str], values: list[T]) -> T:
+    # Honest stand-in for CPython's `EnumClass[name]` bracket lookup over
+    # caller-supplied PARALLEL `names`/`values` lists (same order as the
+    # class's const declarations — the caller keeps them in sync; there is
+    # no reflection to derive `names` automatically). Raises `KeyError` on a
+    # miss, matching the dossier's `Color["NOTFOUND"]` case in SHAPE (see the
+    # module header for the documented double-quote-vs-single-quote
+    # `KeyError` formatting divergence, pre-existing and not specific to this
+    # module).
+    i: int = 0
+    while i < len(names):
+        if names[i] == name:
+            return values[i]
+        i = i + 1
+    raise KeyError(repr(name))
+
+
+def find_duplicate_value[T](values: list[T]) -> int:
+    # Honest stand-in for a manual `@unique` check: returns the index of the
+    # first value that repeats an earlier one in `values` (an "alias" in
+    # CPython enum terms), or -1 if every value is distinct. Not automatic —
+    # CPython's `@unique` decorator scans a class's own consts for you at
+    # class-definition time; pyrst has no reflection to do that, so call
+    # this yourself (e.g. from a test) against the literal list of values
+    # your class declares.
+    i: int = 0
+    while i < len(values):
+        j: int = 0
+        while j < i:
+            if values[j] == values[i]:
+                return i
+            j = j + 1
+        i = i + 1
+    return -1

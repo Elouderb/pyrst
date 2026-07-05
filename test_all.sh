@@ -20,10 +20,18 @@
 #     ...) so pyrst-only syntax is never evaluated by the Python parser; then
 #     `main()` is invoked explicitly (no `if __name__` guard is used/needed).
 #   - Byte-for-byte stdout mismatch between the two runs FAILS the suite.
+#     CAVEAT: both sides are captured with bash command substitution `$(...)`,
+#     which STRIPS NUL bytes (and trailing newlines) from the captured text. A
+#     divergence that is ONLY in NUL bytes therefore compares vacuously "equal"
+#     here — so a golden exercising NUL output (io.StringIO seek-beyond padding)
+#     must assert it in a NUL-free form (length + per-char ord(), not a raw
+#     print of the NUL-bearing string); see examples/parity_io.pyrs.
 #   - A parity_*.pyrs file that cannot run under real python3 (uses
-#     `@extern`/`@crate`, which have no Python meaning) opts OUT of the
-#     dual-run with an explicit `# parity: pyrst-only` comment anywhere in
-#     the file. It still gets an ordinary pyrst golden via Section 1; the
+#     `@extern`/`@crate`, which have no Python meaning) opts OUT of the dual-run
+#     with the directive  # parity: pyrst-only  as a STANDALONE line-START comment
+#     (anchored `^` — see the grep below; a prose/backtick mention of the marker
+#     inside a sentence does NOT count, so files can freely describe the
+#     convention). It still gets an ordinary pyrst golden via Section 1; the
 #     parity section COUNTS and LISTS it as SKIPPED — never silently dropped.
 #   - Convention: a parity_*.pyrs SHOULD also ship an examples/expected/*.txt
 #     so Section 1 exercises it too, as a normal positive golden — double
@@ -295,9 +303,14 @@ else
         base=$(basename "$f" .pyrs)
         parity_count=$((parity_count + 1))
 
-        # -a: treat the file as text even if a stray binary byte sneaks in;
-        # a NUL once made grep skip the marker and force a bogus dual-run.
-        if grep -aq '# parity: pyrst-only' "$f"; then
+        # The opt-out marker must be a STANDALONE directive at the START of a line
+        # (`^# parity: pyrst-only`) — anchoring it (`-E` + `^`) is what keeps a PROSE
+        # mention of the marker (in a sentence, in backticks, or in an indented
+        # comment explaining the convention) from being mistaken for the directive
+        # and silently skipping a file authored for full dual-run. `-a` treats the
+        # file as text even if a stray binary byte sneaks in (a NUL once made grep
+        # skip the marker and force a bogus dual-run).
+        if grep -aqE '^# parity: pyrst-only' "$f"; then
             echo "SKIPPED [parity: pyrst-only]: $base"
             parity_skipped=$((parity_skipped + 1))
             parity_skipped_names+=("$base")

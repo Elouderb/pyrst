@@ -1,0 +1,421 @@
+# pyrst standard library — shutil
+#
+# fs-trio dossier: docs/design/w2-dossiers/fs-trio.md (card 39bf959a).
+# FIDELITY SCORE: 3.5 / 5 (dossier §7 TARGET). Core file/tree operations are
+# real, deterministic, and CPython-message-exact for the probed error cases;
+# every callback-shaped parameter (ignore/copy_function/onerror/onexc) is
+# DROPPED (pyrst has no *args/**kwargs, so a Callable-typed keyword default
+# cannot be spelled today — G4). Self-contained: no cross-module imports (a
+# handful of small path/fs primitives are re-declared here as
+# `_shutil_`-prefixed private @extern helpers, mirroring the pattern in
+# `lib/os.pyrs` rather than importing it — cross-embedded-module imports are
+# untested territory in this compiler and every other embedded lib file is
+# self-contained the same way).
+#
+# SURFACE: copyfile, copy, copytree, rmtree, move, disk_usage.
+#
+# CROSS-UNIT NAME COLLISION (found by w2-hardener, card 39bf959a, cross-
+# checking this pass's public names against every other in-flight W2 unit's
+# drop-dir notes): the separately-authored `ccr-trio` unit's `copy.pyrs`
+# module (CPython's `copy` module) also declares a top-level `copy(x)` —
+# an EXACT bare-name collision with `shutil.copy(src, dst)` here (different
+# arity, same name; the resolver's cross-module duplicate-name check is by
+# name only). Real CPython has the identical ambiguity (`shutil.copy` vs
+# `copy.copy` are two distinct, correctly-named functions) and resolves it
+# via `import shutil` / `import copy` qualified access — a pattern this
+# compiler cannot express (no `import X as Y` aliasing: see
+# `src/parser.rs`'s explicit "import aliases (`as`) are not yet supported"
+# rejection). Per the existing `operator`/`re` and `datetime.time`/`time`
+# precedent, this is KEPT (both names are CPython-exact and correct) and
+# documented as a co-import restriction: a pyrst program may `from shutil
+# import copy` OR `from copy import copy`, never both in the same program.
+# ORACLE RE-VERIFICATION (this pass re-probed live CPython 3.12 rather than
+# trusting the dossier verbatim — the instructions call this out explicitly):
+#   - `copyfile` does NOT preserve the source file's permission bits (dst gets
+#     the umask default); `copy` DOES preserve them. Rust's `std::fs::copy`
+#     itself copies permission bits on Unix (confirmed empirically: a 0o741
+#     source produced a 0o741 destination through `std::fs::copy`), so
+#     `copyfile` here is deliberately implemented via `std::fs::read` +
+#     `std::fs::write` (content bytes only, no permission copy) to stay
+#     CPython-faithful, while `copy` uses `std::fs::copy` directly (content +
+#     mode). This is a real behavioral split the dossier's SURFACE table only
+#     hinted at ("no metadata" vs "file+mode metadata") — verified, not
+#     assumed.
+#   - **Dossier ERRORS/PARITY PLAN correction**: the dossier's Test 15 claims
+#     `move(existing_file_src, existing_file_dst)` (dst is a plain FILE, not a
+#     directory) raises `OSError`. Re-probed against live CPython 3.12.9: it
+#     does **not** raise — `shutil.move` only pre-checks for an existing
+#     destination when `dst` is a DIRECTORY (`real_dst = join(dst, basename
+#     (src))`); when `dst` is a plain file, it goes straight to
+#     `os.rename(src, dst)`, which silently overwrites on POSIX. Verified with
+#     a live interpreter (live-interpreter transcript in the card history). This module
+#     implements the CORRECT (verified) semantics — `move` onto an existing
+#     plain-file destination overwrites — and `examples/parity_shutil.pyrs`
+#     asserts the verified behavior, not the dossier's erroneous claim. `move`
+#     DOES still raise when `dst` is a directory and `dst/basename(src)`
+#     already exists (verified: message is exactly `Destination path 'X'
+#     already exists`, raised as `OSError` — real CPython's `shutil.Error` is
+#     an `OSError` subclass, so this module raises the builtin `OSError`
+#     directly with that exact message rather than inventing a custom
+#     exception class pyrst cannot express).
+#
+# GATED / DEFERRED (per dossier §5 + §7 design recommendation):
+#   - `copyfile`/`copy` drop `follow_symlinks` (always follows — no raw
+#     symlink-preserving byte copy primitive without extra Rust plumbing).
+#   - `copytree` drops `ignore`, `copy_function`, `ignore_dangling_symlinks`
+#     (G4: callables not spellable; dangling-symlink detection deferred).
+#     `symlinks: bool = False` IS implemented: when True, a symlink entry is
+#     recreated as a symlink (via `std::fs::read_link` + `std::os::unix::
+#     fs::symlink`); when False (default), Rust's own symlink-following
+#     `is_dir`/`fs::copy`/`fs::read` transparently dereferences it, so the
+#     "False" branch needs no special-casing.
+#   - `rmtree` drops `onerror`/`onexc` (G4); only `ignore_errors` is
+#     implemented — matching the dossier's recommended all-or-nothing
+#     fallback.
+#   - `move` drops `copy_function` (G4); the cross-device-rename fallback
+#     (copy+remove when `os.rename` fails with EXDEV) is NOT implemented —
+#     pyrst's own tempdir-based tests always stay on one filesystem, so this
+#     is a documented, untested gap for cross-mount moves.
+#   - `disk_usage(path)` shells out to `df -Pk <path>` (parses the POSIX
+#     `-P` output format: `Filesystem 1024-blocks Used Available Capacity
+#     Mounted-on`) rather than binding `statvfs` — Rust's std has no
+#     stable disk-usage API, and adding an FFI/libc dependency or a new crate
+#     was avoided this wave per the unit's constraints. This is a
+#     **documented, deliberate implementation choice**: functionally correct
+#     on any POSIX system with `df` on PATH, at the cost of one process spawn
+#     per call. `disk_usage(None)` (CPython raises `TypeError`) has no pyrst
+#     equivalent — `path` is statically typed `str`, so passing `None` is a
+#     compile-time type error, not a runtime one; not applicable.
+#
+# HARDENING PASS (w2-hardener, card 39bf959a) — re-oracled every public
+# function against live CPython 3.12 with edge inputs beyond the dossier's
+# probed set; fixed real divergences, documented the rest honestly:
+#   - **FIXED (data-loss bug, CRITICAL)**: `rmtree` on a path that is ITSELF a
+#     symlink to a directory used to silently follow the link via
+#     `std::fs::remove_dir_all` and delete the TARGET directory's contents
+#     (confirmed with a standalone `rustc` repro before the fix). Real
+#     CPython refuses to `rmtree` any symlink at all. Fixed with an explicit
+#     `is_symlink` guard before any removal call (see `rmtree`'s own comment
+#     for the exact, oddly-formatted CPython error text this reproduces).
+#   - **FIXED**: `rmtree` on a path that exists but is a plain FILE (not a
+#     directory) now raises `NotADirectoryError` (CPython-exact message)
+#     instead of a raw, non-CPython-shaped Rust error string.
+#   - **FIXED**: `copyfile`/`copy` did not check for "source and destination
+#     are the same file" (CPython raises `SameFileError`, an `OSError`
+#     subclass) or "source is a directory" (CPython raises
+#     `IsADirectoryError`) — both now checked explicitly with CPython-exact
+#     messages, verified against a live interpreter.
+#   - **FIXED**: `copytree` onto an existing `dst` that is a plain FILE (not a
+#     directory) used to raise `FileExistsError` only when `dirs_exist_ok`
+#     was False, and otherwise fell through to constructing an invalid
+#     `dst/entryname` path under a FILE, which the OS itself would reject
+#     with a confusing `NotADirectoryError`. Verified against live CPython:
+#     `os.makedirs(dst, exist_ok=True)` still raises `FileExistsError` when
+#     `dst` exists as a non-directory — `dirs_exist_ok` only suppresses the
+#     error when `dst` is ALREADY a directory. Fixed to match.
+#   - **FIXED**: `copytree` to a `dst` whose intermediate PARENTS do not yet
+#     exist (e.g. `copytree(src, "a/b/c/dst")` with "a/b/c" absent). CPython
+#     creates them all via `os.makedirs`; pyrst used `std::fs::create_dir`
+#     (single level), which panicked UNCATCHABLY on a missing parent. Now uses
+#     `std::fs::create_dir_all` (`_shutil_makedirs`) to create the full chain,
+#     matching CPython. `dirs_exist_ok=False` onto an existing `dst` still
+#     raises `FileExistsError` (guarded before the create).
+#   - **Documented, NOT fixed** (message-only divergence, no data-loss risk —
+#     `std::fs::rename` already safely refuses the operation, it just panics
+#     with Rust's generic io-error text): `move`'s "directory into its own
+#     subdirectory" case. Real CPython's `os.rename` also fails at the OS
+#     level here (`EINVAL`), then a `move`-internal fallback re-checks and
+#     raises a cleaner `Error("Cannot move a directory '%s' into itself
+#     '%s'.")`; that fallback path is the SAME one already documented above
+#     as dropped for the (also-untested) cross-filesystem EXDEV case, so this
+#     is the same gap, not a new one.
+#   - **Documented, NOT fixed** (rare edge, no dossier/parity coverage):
+#     `copytree` with `symlinks=False` (the default) on a source tree
+#     containing a DANGLING symlink. Real CPython aggregates every per-entry
+#     failure into a single `shutil.Error` whose `.args[0]` is a list of
+#     `(src, dst, error_str)` tuples (a shape pyrst's exception model cannot
+#     express — no custom exception payload types); this module instead
+#     panics with a generic OSError on the FIRST such entry. Functionally
+#     both refuse to produce a silently-broken copy; only the aggregation
+#     shape and message text differ.
+#   - **Compiler gap found (not a stdlib bug), same family as the dircmp
+#     constructor-defaults gap already flagged by the original pass**: this
+#     compiler's `except OSError:` handler only widens to catch the THREE
+#     hardcoded `OSError` subclasses in `src/codegen/mod.rs`'s
+#     `exc_descendants("OSError")` list (`FileNotFoundError`,
+#     `PermissionError`, `IsADirectoryError`). `FileExistsError` (already used
+#     by the original pass), and this hardening pass's new `SameFileError`
+#     and `NotADirectoryError`, are real CPython `OSError` subclasses that a
+#     bare `except OSError:` in real Python WOULD catch but this compiler's
+#     `except OSError:` currently does NOT (verified with an isolated
+#     `raise NotADirectoryError(...)` / `except OSError:` repro — it falls
+#     through as an unhandled panic). Every `except` in this unit's own
+#     parity file names the EXACT raised type (never a widening `OSError`
+#     catch-all for these), so this gap does not affect this module's own
+#     tests, but is flagged here for the integrator since it is a real,
+#     user-facing correctness gap in the shared exception-dispatch codegen,
+#     not something a stdlib-file-only pass can fix in scope.
+
+
+class usage:
+    # disk_usage's return "shape" (CPython: a namedtuple). pyrst has no
+    # namedtuple, so this is a plain class with the same three fields in the
+    # same order; `du.total` / `.used` / `.free` attribute access matches.
+    total: int
+    used: int
+    free: int
+
+    def __init__(self, total: int, used: int, free: int) -> None:
+        self.total = total
+        self.used = used
+        self.free = free
+
+
+@extern
+def _shutil_path_exists(p: str) -> bool:
+    "std::path::Path::new(&{p}).exists()"
+
+
+@extern
+def _shutil_isdir(p: str) -> bool:
+    "std::path::Path::new(&{p}).is_dir()"
+
+
+@extern
+def _shutil_isfile(p: str) -> bool:
+    "std::path::Path::new(&{p}).is_file()"
+
+
+@extern
+def _shutil_listdir(p: str) -> list[str]:
+    "std::fs::read_dir(&{p}).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).collect::<Vec<String>>()"
+
+
+@extern
+def _shutil_join(a: str, b: str) -> str:
+    "std::path::Path::new(&{a}).join(&{b}).to_string_lossy().into_owned()"
+
+
+def _shutil_basename(p: str) -> str:
+    # Same pure-string posixpath.basename logic as os.pyrs (duplicated here to
+    # keep this module self-contained; see lib/os.pyrs for the fuller
+    # commentary on the edge cases this matches).
+    parts: list[str] = p.split("/")
+    return parts[len(parts) - 1]
+
+
+@extern
+def _shutil_makedirs(p: str) -> None:
+    # CPython's `copytree` creates `dst` via `os.makedirs(dst, ...)`, which
+    # creates every MISSING INTERMEDIATE PARENT too — so `create_dir_all`, not
+    # `create_dir` (the latter panicked, uncatchably, whenever a parent of
+    # `dst` did not already exist). Existence of `dst` itself is guarded by the
+    # caller before this runs, so the "already exists" no-op of create_dir_all
+    # is never reached with a stale `dst`.
+    "std::fs::create_dir_all(&{p}).unwrap_or_else(|e| panic!(\"OSError\\0{}\", e))"
+
+
+@extern
+def _shutil_rename(src: str, dst: str) -> None:
+    "std::fs::rename(&{src}, &{dst}).unwrap_or_else(|e| panic!(\"OSError\\0{}\", e))"
+
+
+@extern
+def _shutil_remove_dir_all(p: str) -> None:
+    "std::fs::remove_dir_all(&{p}).unwrap_or_else(|e| panic!(\"OSError\\0{}\", e))"
+
+
+@extern
+def _shutil_remove_dir_all_ignore(p: str) -> None:
+    "{ let _ = std::fs::remove_dir_all(&{p}); }"
+
+
+@extern
+def _shutil_is_symlink(p: str) -> bool:
+    "std::fs::symlink_metadata(&{p}).map(|m| m.file_type().is_symlink()).unwrap_or(false)"
+
+
+@extern
+def _shutil_same_file(a: str, b: str) -> bool:
+    # HARDENING FIX: CPython's `shutil._samefile` compares (st_dev, st_ino)
+    # via `os.stat` (follows symlinks), treating any stat failure as "not the
+    # same file". `std::fs::metadata` also follows symlinks, so this matches.
+    # Backs the `copyfile`/`copy` SameFileError check below (verified against
+    # live CPython: `copyfile(x, x)` raises `SameFileError`, an `OSError`
+    # subclass, message `"'<src>' and '<dst>' are the same file"` — note the
+    # repr-style quoting, reproduced literally since pyrst has no repr(str)
+    # call here).
+    "{ use std::os::unix::fs::MetadataExt; match (std::fs::metadata(&{a}), std::fs::metadata(&{b})) { (Ok(ma), Ok(mb)) => ma.dev() == mb.dev() && ma.ino() == mb.ino(), _ => false } }"
+
+
+@extern
+def _shutil_read_link(p: str) -> str:
+    "std::fs::read_link(&{p}).unwrap_or_else(|e| panic!(\"OSError\\0{}\", e)).to_string_lossy().into_owned()"
+
+
+@extern
+def _shutil_make_symlink(target: str, linkpath: str) -> None:
+    "std::os::unix::fs::symlink(&{target}, &{linkpath}).unwrap_or_else(|e| panic!(\"OSError\\0{}\", e))"
+
+
+@extern
+def _shutil_copy_bytes_no_mode(src: str, dst: str) -> None:
+    # copyfile: content ONLY, no metadata — read raw bytes (binary-safe, so
+    # this stays byte-for-byte faithful even though pyrst's own `str` cannot
+    # itself hold non-UTF8 content) and write them back with a fresh dst file
+    # (default umask mode, NOT the source's permission bits).
+    "{ let __data = std::fs::read(&{src}).unwrap_or_else(|e| panic!(\"OSError\\0{}\", e)); std::fs::write(&{dst}, &__data).unwrap_or_else(|e| panic!(\"OSError\\0{}\", e)); }"
+
+
+@extern
+def _shutil_copy_with_mode(src: str, dst: str) -> None:
+    # copy / copytree's default copy_function (CPython's copy2-ish): content +
+    # permission bits. `std::fs::copy` preserves Unix permission bits
+    # (verified empirically), which is exactly copy()'s CPython semantics.
+    "{ std::fs::copy(&{src}, &{dst}).unwrap_or_else(|e| panic!(\"OSError\\0{}\", e)); }"
+
+
+def copyfile(src: str, dst: str) -> str:
+    if not _shutil_path_exists(src):
+        raise FileNotFoundError("[Errno 2] No such file or directory: '" + src + "'")
+    # HARDENING FIX: verified against live CPython — `copyfile(x, x)` (or two
+    # paths/hardlinks resolving to the same inode) raises `SameFileError`
+    # (an `OSError` subclass) BEFORE touching either file, rather than
+    # silently reading-then-writing identical bytes back onto the source.
+    if _shutil_same_file(src, dst):
+        raise SameFileError("'" + src + "' and '" + dst + "' are the same file")
+    # HARDENING FIX: verified against live CPython — copying a DIRECTORY as
+    # `src` raises `IsADirectoryError` (real CPython gets this for free from
+    # `open(src, 'rb')`; this module makes the same check explicit since its
+    # `std::fs::read` would otherwise panic with a non-CPython-shaped message).
+    if _shutil_isdir(src):
+        raise IsADirectoryError("[Errno 21] Is a directory: '" + src + "'")
+    _shutil_copy_bytes_no_mode(src, dst)
+    return dst
+
+
+def copy(src: str, dst: str) -> str:
+    if not _shutil_path_exists(src):
+        raise FileNotFoundError("[Errno 2] No such file or directory: '" + src + "'")
+    real_dst: str = dst
+    if _shutil_isdir(dst):
+        real_dst = _shutil_join(dst, _shutil_basename(src))
+    # HARDENING FIX: same two checks as `copyfile` (CPython's `copy` delegates
+    # to `copyfile` internally against the resolved `real_dst`, so both checks
+    # apply post-resolution here too).
+    if _shutil_same_file(src, real_dst):
+        raise SameFileError("'" + src + "' and '" + real_dst + "' are the same file")
+    if _shutil_isdir(src):
+        raise IsADirectoryError("[Errno 21] Is a directory: '" + src + "'")
+    _shutil_copy_with_mode(src, real_dst)
+    return real_dst
+
+
+def copytree(src: str, dst: str, symlinks: bool = False, dirs_exist_ok: bool = False) -> str:
+    if not _shutil_path_exists(src):
+        raise FileNotFoundError("[Errno 2] No such file or directory: '" + src + "'")
+    # HARDENING FIX: verified against live CPython — `copytree(<a plain
+    # file>, dst)` raises `NotADirectoryError` (CPython's `os.scandir(src)`
+    # does this for free). Without this check, `_shutil_listdir`'s raw
+    # `std::fs::read_dir(..).unwrap()` would panic with a non-CPython,
+    # UNCATCHABLE Rust message instead (same class of bug fixed in
+    # `filecmp.dircmp` this same pass).
+    if not _shutil_isdir(src):
+        raise NotADirectoryError("[Errno 20] Not a directory: '" + src + "'")
+    # HARDENING FIX: verified against live CPython — `copytree` calls
+    # `os.makedirs(dst, exist_ok=dirs_exist_ok)`, and `exist_ok=True` only
+    # suppresses the error when `dst` ALREADY IS a directory; if `dst` exists
+    # as a non-directory (a plain file), `FileExistsError` is raised
+    # UNCONDITIONALLY, `dirs_exist_ok` notwithstanding. The prior version only
+    # checked `dirs_exist_ok` and, when True, fell through to join a filename
+    # onto `dst` as if it were a directory — an `existing_file.txt/f.txt`
+    # path that the OS itself would reject with a confusing
+    # `NotADirectoryError` instead of CPython's clean `FileExistsError`.
+    if _shutil_path_exists(dst):
+        if _shutil_isdir(dst):
+            if not dirs_exist_ok:
+                raise FileExistsError("[Errno 17] File exists: '" + dst + "'")
+        else:
+            raise FileExistsError("[Errno 17] File exists: '" + dst + "'")
+    else:
+        # os.makedirs semantics: create `dst` AND any missing intermediate
+        # parents (e.g. copytree(src, "a/b/c/dst") with "a/b/c" absent).
+        _shutil_makedirs(dst)
+    entries: list[str] = _shutil_listdir(src)
+    for name in entries:
+        s: str = _shutil_join(src, name)
+        d: str = _shutil_join(dst, name)
+        if symlinks and _shutil_is_symlink(s):
+            target: str = _shutil_read_link(s)
+            _shutil_make_symlink(target, d)
+        elif _shutil_isdir(s):
+            copytree(s, d, symlinks, dirs_exist_ok)
+        else:
+            _shutil_copy_with_mode(s, d)
+    return dst
+
+
+def rmtree(path: str, ignore_errors: bool = False) -> None:
+    if not _shutil_path_exists(path):
+        if ignore_errors:
+            return
+        raise FileNotFoundError("[Errno 2] No such file or directory: '" + path + "'")
+    # HARDENING FIX (data-loss bug, CRITICAL): `std::fs::remove_dir_all` on a
+    # path that is ITSELF a symlink to a directory FOLLOWS the symlink and
+    # deletes the TARGET directory's *contents* (confirmed empirically with a
+    # standalone `rustc` repro: a `linkdir -> realdir` symlink, once
+    # `remove_dir_all("linkdir")`'d, left `realdir` an empty directory —
+    # its files were gone). Real CPython's `rmtree` explicitly refuses to
+    # operate on a symlink at all (verified: `rmtree(<symlink-to-dir>)`
+    # raises `OSError` and leaves BOTH the symlink and its target fully
+    # intact); this check must run before any removal call. Verified
+    # `str(e)` for this exact CPython `OSError` is the unusual
+    # `"[Errno None] None: '<path>'"` (the exception is constructed with a
+    # plain message and only `.filename` set, so `OSError.__str__`'s
+    # errno/strerror fields print literally as `None`) — reproduced exactly,
+    # not "cleaned up", to stay CPython-message-exact. `ignore_errors=True`
+    # suppresses this the same way it suppresses every other case here
+    # (verified: CPython leaves the symlink AND target untouched under
+    # `ignore_errors=True` too, it does not fall through to deleting anything).
+    if _shutil_is_symlink(path):
+        if ignore_errors:
+            return
+        raise OSError("[Errno None] None: '" + path + "'")
+    # HARDENING FIX: verified against live CPython — `rmtree` on a path that
+    # exists but is a plain FILE (not a directory, not a symlink) raises
+    # `NotADirectoryError` with the OS's real errno text, rather than the
+    # generic non-CPython-shaped message `std::fs::remove_dir_all` itself
+    # would panic with (its own error text on a file target is platform-
+    # dependent and not "[Errno 20] Not a directory: '...'").
+    if not _shutil_isdir(path):
+        if ignore_errors:
+            return
+        raise NotADirectoryError("[Errno 20] Not a directory: '" + path + "'")
+    if ignore_errors:
+        _shutil_remove_dir_all_ignore(path)
+    else:
+        _shutil_remove_dir_all(path)
+
+
+def move(src: str, dst: str) -> str:
+    if not _shutil_path_exists(src):
+        raise FileNotFoundError("[Errno 2] No such file or directory: '" + src + "'")
+    real_dst: str = dst
+    if _shutil_isdir(dst):
+        real_dst = _shutil_join(dst, _shutil_basename(src))
+        if _shutil_path_exists(real_dst):
+            raise OSError("Destination path '" + real_dst + "' already exists")
+    _shutil_rename(src, real_dst)
+    return real_dst
+
+
+@extern
+def _shutil_disk_usage_raw(path: str) -> tuple[int, int, int]:
+    "{ let __out = std::process::Command::new(\"df\").arg(\"-Pk\").arg(&{path}).output().unwrap_or_else(|e| panic!(\"OSError\\0{}\", e)); let __text = String::from_utf8_lossy(&__out.stdout); let __line = __text.lines().nth(1).unwrap_or(\"\"); let __cols: Vec<&str> = __line.split_whitespace().collect(); let __total: i64 = __cols.get(1).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0); let __used: i64 = __cols.get(2).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0); let __free: i64 = __cols.get(3).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0); (__total * 1024, __used * 1024, __free * 1024) }"
+
+
+def disk_usage(path: str) -> usage:
+    if not _shutil_path_exists(path):
+        raise FileNotFoundError("[Errno 2] No such file or directory: '" + path + "'")
+    total, used, free = _shutil_disk_usage_raw(path)
+    return usage(total, used, free)

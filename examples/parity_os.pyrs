@@ -5,8 +5,9 @@
 # so it is out of literal same-source dual-run scope (`@extern`/`@crate` are
 # not real Python syntax; see stdlib-full.md's dual-run-scope note). Every
 # function's *semantics* was instead cross-checked against python3's real
-# `os` module one-by-one while writing lib/os.pyrs (see notes.md for the
-# transcript). This golden asserts DETERMINISTIC facts only:
+# `os` module one-by-one while writing lib/os.pyrs (verified against a live
+# interpreter; transcript in the card history). This golden asserts
+# DETERMINISTIC facts only:
 #   - constants (`os.sep`, `len(os.linesep)`) — fixed POSIX values
 #   - booleans/derived values for path predicates, stat, rename, walk, cleanup
 #   - `getpid() > 0` and `getcwd() != ""` (never the raw, machine-dependent

@@ -1,0 +1,282 @@
+# parity: pyrst-only
+#
+# Card eae7fa52 — supplementary golden for `lib/configparser.pyrs`, covering
+# the surface that CANNOT dual-run byte-identically against real CPython's
+# `configparser` module (see `examples/parity_configparser.pyrs`'s header for
+# the main dual-run golden):
+#
+#   - `write()` — pyrst's signature is `write(space_around_delimiters=True)
+#     -> str` (returns the composed text) instead of CPython's
+#     `write(fp, space_around_delimiters=True) -> None` (writes to a file
+#     object). pyrst has no spellable file-typed parameter yet (G7). Real
+#     CPython behavior was cross-checked SEPARATELY (not via this file) with:
+#       import io, configparser
+#       cp = configparser.ConfigParser()
+#       cp.add_section('test'); cp.set('test', 'key', 'value')
+#       out = io.StringIO(); cp.write(out)
+#       out.getvalue() == '[test]\nkey = value\n\n'   # True
+#     — matches this file's `cp1.write()` output exactly.
+#
+#   - Every ERRORS-table exception check — CPython raises its OWN
+#     `NoSectionError` / `NoOptionError` / `DuplicateSectionError` /
+#     `DuplicateOptionError` / `InterpolationMissingOptionError` /
+#     `InterpolationDepthError` (all subclasses of `configparser.Error`, NOT
+#     `ValueError`); pyrst has no custom exception types (G2) and maps all of
+#     them to `ValueError` with CPython's message text preserved. A literal
+#     `except ValueError:` around these calls would silently NOT catch the
+#     real CPython exception, so this file (which relies on catching
+#     `ValueError`) only runs correctly under pyrst. The exact message TEXT
+#     was cross-checked against real CPython 3.12.9 (see the dossier's
+#     ERRORS table, which was itself pre-verified) and independently
+#     re-confirmed via a throwaway `except Exception as e: print(str(e))`
+#     script for each case.
+#
+#   - `allow_no_value` — pyrst stores a valueless key's value as `""`
+#     (documented divergence: `get()`'s return type is plain `str`, no
+#     `Optional[str]`/`None` payload channel like CPython's).
+from configparser import ConfigParser
+
+
+def main() -> None:
+    # write() + round-trip (pyrst-only signature: returns str)
+    cp1: ConfigParser = ConfigParser(defaults=None, allow_no_value=False)
+    cp1.add_section('test')
+    cp1.set('test', 'key', 'value')
+    written: str = cp1.write()
+    print(written)                                  # [test]\nkey = value\n\n
+    cp2: ConfigParser = ConfigParser(defaults=None, allow_no_value=False)
+    cp2.read_string(written)
+    print(cp2.get('test', 'key'))                    # value
+
+    # write with space_around_delimiters=False
+    cp3: ConfigParser = ConfigParser(defaults=None, allow_no_value=False)
+    cp3.add_section('s')
+    cp3.set('s', 'k', 'v')
+    print(cp3.write(space_around_delimiters=False))  # [s]\nk=v\n\n
+    print(cp3.write(space_around_delimiters=True))   # [s]\nk = v\n\n
+
+    # allow_no_value
+    cp4: ConfigParser = ConfigParser(defaults=None, allow_no_value=True)
+    cp4.read_string('[s]\nkey1\nkey2=value2')
+    print(cp4.get('s', 'key1'))                      # "" (pyrst divergence: CPython returns None here)
+    print(cp4.get('s', 'key2'))                      # value2
+
+    # ERRORS table: NoSectionError -> ValueError
+    cp5: ConfigParser = ConfigParser(defaults=None, allow_no_value=False)
+    try:
+        cp5.get('missing_section', 'key')
+    except ValueError as e:
+        print(str(e))                                # No section: 'missing_section'
+
+    # NoOptionError -> ValueError
+    cp6: ConfigParser = ConfigParser(defaults=None, allow_no_value=False)
+    cp6.add_section('s')
+    try:
+        cp6.get('s', 'missing_key')
+    except ValueError as e:
+        print(str(e))                                # No option 'missing_key' in section: 's'
+
+    # DuplicateSectionError -> ValueError
+    cp7: ConfigParser = ConfigParser(defaults=None, allow_no_value=False)
+    cp7.add_section('s')
+    try:
+        cp7.add_section('s')
+    except ValueError as e:
+        print(str(e))                                # Section 's' already exists
+
+    # set on missing section -> NoSectionError -> ValueError
+    cp8: ConfigParser = ConfigParser(defaults=None, allow_no_value=False)
+    try:
+        cp8.set('missing', 'k', 'v')
+    except ValueError as e:
+        print(str(e))                                # No section: 'missing'
+
+    # getint invalid literal -> ValueError (pyrst int() builtin's own message)
+    cp9: ConfigParser = ConfigParser(defaults=None, allow_no_value=False)
+    cp9.add_section('s')
+    cp9.set('s', 'k', 'notint')
+    try:
+        cp9.getint('s', 'k')
+    except ValueError as e:
+        print(str(e))                                # invalid literal for int() with base 10: 'notint'
+
+    # getfloat invalid literal -> ValueError
+    cp9.set('s', 'k', 'notfloat')
+    try:
+        cp9.getfloat('s', 'k')
+    except ValueError as e:
+        print(str(e))                                # could not convert string to float: 'notfloat'
+
+    # getboolean invalid -> ValueError
+    cp9.set('s', 'k', 'maybe')
+    try:
+        cp9.getboolean('s', 'k')
+    except ValueError as e:
+        print(str(e))                                # Not a boolean: maybe
+
+    # InterpolationMissingOptionError -> ValueError
+    cp9.set('s', 'k', '%(undefined)s')
+    try:
+        cp9.get('s', 'k')
+    except ValueError as e:
+        print(str(e))
+        # Bad value substitution: option 'k' in section 's' contains an
+        # interpolation key 'undefined' which is not a valid option name.
+        # Raw value: '%(undefined)s'
+
+    # InterpolationDepthError -> ValueError (self-referential key)
+    cp9.set('s', 'a', '%(a)s')
+    try:
+        cp9.get('s', 'a')
+    except ValueError as e:
+        print(str(e))
+        # Recursion limit exceeded in value substitution: option 'a' in
+        # section 's' contains an interpolation key which cannot be
+        # substituted in 10 steps. Raw value: '%(a)s'
+
+    # read_string: no-delimiter line -> ParsingError -> ValueError
+    cp10: ConfigParser = ConfigParser(defaults=None, allow_no_value=False)
+    try:
+        cp10.read_string('[s]\nkey3 value3')
+    except ValueError as e:
+        print(str(e))                                # Source contains parsing errors: '<string>'
+
+    # read_string: duplicate option -> DuplicateOptionError -> ValueError
+    cp11: ConfigParser = ConfigParser(defaults=None, allow_no_value=False)
+    try:
+        cp11.read_string('[s]\nkey=v1\nkey=v2')
+    except ValueError as e:
+        print(str(e))
+        # While reading from '<string>' [line 3]: option 'key' in section 's' already exists
+
+    # HARDENING (w2-hardener pass, card eae7fa52): edge cases re-oracled
+    # against live CPython 3.12.9 that surfaced real (previously
+    # undocumented) divergences, now fixed in the module.
+
+    # has_option on a NONEXISTENT section returns False, does NOT raise
+    # (re-oracled: a prior version of this module raised ValueError here).
+    cp12: ConfigParser = ConfigParser(defaults=None, allow_no_value=False)
+    print(cp12.has_option('nope', 'x'))              # False
+
+    # options("DEFAULT") raises (DEFAULT is never a real "section" key),
+    # matching CPython's NoSectionError -- a prior version of this module
+    # silently returned [] instead.
+    try:
+        cp12.options('DEFAULT')
+    except ValueError as e:
+        print(str(e))                                # No section: 'DEFAULT'
+
+    # remove_section("DEFAULT") returns False and does NOT raise (DEFAULT
+    # is never a key of the section table) -- a prior version of this
+    # module raised ValueError here.
+    cp12.add_section('s')
+    print(cp12.remove_section('DEFAULT'))            # False
+
+    # Error messages use repr()-style quoting (matches CPython's `%r`
+    # formatting exactly, incl. switching to double quotes for a name
+    # containing an apostrophe) -- a prior version of this module always
+    # manually wrapped names in single quotes.
+    cp13: ConfigParser = ConfigParser(defaults=None, allow_no_value=False)
+    try:
+        cp13.add_section("it's")
+        cp13.add_section("it's")
+    except ValueError as e:
+        print(str(e))                                # Section "it's" already exists
+    try:
+        cp13.get("it's_missing", 'x')
+    except ValueError as e:
+        print(str(e))                                # No section: "it's_missing"
+
+    # read_string: a bad line before ANY section header exists is a
+    # DIFFERENT exception shape (CPython's MissingSectionHeaderError) from
+    # a bad line found once a section IS already open (ParsingError) -- a
+    # prior version of this module used the ParsingError text for both.
+    cp14: ConfigParser = ConfigParser(defaults=None, allow_no_value=False)
+    try:
+        cp14.read_string('no header here at all')
+    except ValueError as e:
+        print(str(e))
+        # File contains no section headers.
+        # file: '<string>', line: 1
+        # 'no header here at all'
+    cp15: ConfigParser = ConfigParser(defaults=None, allow_no_value=False)
+    try:
+        cp15.read_string('[s\nk=v')
+    except ValueError as e:
+        print(str(e))
+        # File contains no section headers.
+        # file: '<string>', line: 1
+        # '[s\n'
+    # ...but a malformed header line AFTER a section is already open stays
+    # ParsingError-shaped.
+    cp16: ConfigParser = ConfigParser(defaults=None, allow_no_value=False)
+    try:
+        cp16.read_string('[s]\nk=v\n[bad\nk2=v2')
+    except ValueError as e:
+        print(str(e))
+        # Source contains parsing errors: '<string>'
+        # 	[line  3]: '[bad\n'
+
+    # read_string: the LAST line of the source (with no trailing newline in
+    # the source text) does NOT get an escaped "\n" appended to its repr in
+    # the ParsingError message -- a prior version of this module always
+    # appended one regardless of whether the source actually had a trailing
+    # newline there.
+    cp17: ConfigParser = ConfigParser(defaults=None, allow_no_value=False)
+    try:
+        cp17.read_string('[s]\nkey3 value3')
+    except ValueError as e:
+        print(str(e))
+        # Source contains parsing errors: '<string>'
+        # 	[line  2]: 'key3 value3'   (no trailing \n -- last line, no newline in source)
+
+    # Bad interpolation variable reference (unterminated "%(") uses a
+    # DIFFERENT message ("bad interpolation variable reference ...") than
+    # the "'%' must be followed by..." text (that one is reserved for a
+    # bare "%" followed by neither "%" nor "(") -- a prior version of this
+    # module used the wrong message for the unterminated-"%(" case.
+    #
+    # NOTE: entered via `read_string`, not `set()` -- CPython's real
+    # `set()` validates `%`-interpolation SYNTAX eagerly (a `before_set`
+    # hook raising a plain `ValueError("invalid interpolation syntax in
+    # %r at position %d", ...)` immediately), which this module does not
+    # replicate (documented divergence in the module header); `read_string`
+    # does not run that eager check in EITHER engine, so both defer to
+    # get()-time validation and agree here.
+    cp18: ConfigParser = ConfigParser(defaults=None, allow_no_value=False)
+    cp18.read_string('[s]\nk = val %(unterminated')
+    try:
+        cp18.get('s', 'k')
+    except ValueError as e:
+        print(str(e))                                # bad interpolation variable reference '%(unterminated'
+
+    # Interpolation key report is OPTIONXFORM'd (lowercased), not the raw
+    # mixed-case text as typed in the source value -- a prior version of
+    # this module reported the raw case.
+    cp19: ConfigParser = ConfigParser(defaults=None, allow_no_value=False)
+    cp19.add_section('s')
+    cp19.set('s', 'k', '%(Undefined)s')
+    try:
+        cp19.get('s', 'k')
+    except ValueError as e:
+        print(str(e))
+        # Bad value substitution: option 'k' in section 's' contains an
+        # interpolation key 'undefined' which is not a valid option name.
+        # Raw value: '%(Undefined)s'
+
+    # getint/getfloat/getboolean now accept `raw=` (matches CPython's real
+    # signature) -- a prior version of this module omitted the parameter
+    # entirely. Demonstrated by a value that WOULD interpolate-error if
+    # `raw` were ignored, but instead fails inside `int()` on the literal
+    # text -- proving interpolation was genuinely skipped, not just a no-op.
+    cp20: ConfigParser = ConfigParser(defaults=None, allow_no_value=False)
+    cp20.add_section('s')
+    cp20.set('s', 'k', '%(undefined)s')
+    try:
+        cp20.getint('s', 'k', raw=True)
+    except ValueError as e:
+        print(str(e))                                # invalid literal for int() with base 10: '%(undefined)s'
+    cp21: ConfigParser = ConfigParser(defaults=None, allow_no_value=False)
+    cp21.add_section('s')
+    cp21.set('s', 'k', '42')
+    print(cp21.getint('s', 'k', raw=True))           # 42

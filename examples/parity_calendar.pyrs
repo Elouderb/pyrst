@@ -1,0 +1,253 @@
+# Dual-run parity golden for lib/calendar.pyrs, seeded from the PARITY PLAN
+# in docs/design/w2-dossiers/calendar.md (re-oracled against a live python3.12
+# for this pass). Runs byte-identical under pyrst and
+# python3's REAL `calendar` module (`import calendar` resolves to CPython's
+# own module in the python3 twin and to lib/calendar.pyrs under pyrst — same
+# pattern as parity_math.pyrs/parity_time.pyrs for an @extern/pure-pyrst
+# stdlib reimplementation, not a same-source module golden).
+#
+# `weekday()`/`monthrange()` print their raw int directly (no `int(...)`
+# wrapper needed): CPython 3.11+'s `Day` IntEnum prints as its bare int value
+# (`str(Day.MONDAY) == '0'`), so `print(calendar.weekday(...))` already
+# matches pyrst's plain-`int` return byte-for-byte.
+#
+# HARDENED (w2-hardener pass, card eed0bb70): added negative/zero-year
+# isleap/leapdays/weekday/monthrange cases, extreme years (-500 / 99999),
+# a 4-week month (Feb 2021) and a 6-week month (Mar 2015) for
+# monthcalendar/calendar row-height edges, additional error-message cases
+# (weekday day=0/32, monthrange/monthcalendar/month month=0), negative
+# w/l clamping in month(), negative c clamping + non-default m in
+# calendar(). All re-verified against a live python3.12 before being
+# trusted (the card history).
+#
+# Excluded from this dual-run file, with reasons (see lib/calendar.pyrs
+# header "DIVERGENCE 2" / "DIVERGENCE 4a"), spot-verified separately via
+# `pyrst build`+run only against a live python3:
+#   - `day_name`/`day_abbr`/`month_name`/`month_abbr`/`mdays`: CPython
+#     exposes these as SUBSCRIPTABLE ATTRIBUTES (`calendar.day_name[0]`);
+#     pyrst's module-constant relaxation only legalizes a scalar-literal
+#     const, so pyrst exposes them as niladic FUNCTIONS
+#     (`calendar.day_name()[0]`) — calling `calendar.day_name()` under real
+#     CPython raises `TypeError: '_localized_day' object is not callable`.
+#     Same shape as `math.inf()`/`math.nan()` in parity_math.pyrs.
+#   - `monthcalendar`/`month`/`calendar`'s `firstweekday=` keyword parameter:
+#     a pyrst-only addition (see lib/calendar.pyrs header "DIVERGENCE 2")
+#     standing in for CPython's global `setfirstweekday()` state, which
+#     pyrst cannot express (module-level mutable state, G2). CPython's own
+#     `monthcalendar(year, month)` takes no such parameter — passing
+#     `firstweekday=` there is a `TypeError` under real CPython.
+#   - `firstweekday()`/`setfirstweekday()`: kept as STATELESS STUBS (see
+#     lib/calendar.pyrs header) — their return values happen to line up with
+#     CPython's own DEFAULTS for the cases exercised, but they do not
+#     round-trip a persisted change, so they are excluded from the
+#     byte-identical golden on principle (not because a specific call here
+#     would print differently) and are spot-verified separately instead.
+from calendar import (
+    isleap,
+    leapdays,
+    weekday,
+    monthrange,
+    monthcalendar,
+    month,
+    calendar,
+    MONDAY,
+    TUESDAY,
+    WEDNESDAY,
+    THURSDAY,
+    FRIDAY,
+    SATURDAY,
+    SUNDAY,
+    JANUARY,
+    FEBRUARY,
+    MARCH,
+    APRIL,
+    MAY,
+    JUNE,
+    JULY,
+    AUGUST,
+    SEPTEMBER,
+    OCTOBER,
+    NOVEMBER,
+    DECEMBER,
+    EPOCH
+)
+
+
+def main() -> None:
+    # isleap
+    print(isleap(2024))
+    print(isleap(2023))
+    print(isleap(2000))
+    print(isleap(1900))
+    print(isleap(1904))
+    print(isleap(1))
+    print(isleap(400))
+    # HARDENED: negative / zero years
+    print(isleap(0))
+    print(isleap(-4))
+    print(isleap(-100))
+    print(isleap(-400))
+
+    # leapdays
+    print(leapdays(2000, 2004))
+    print(leapdays(2000, 2000))
+    print(leapdays(2001, 2000))
+    print(leapdays(1900, 1904))
+    print(leapdays(2100, 2104))
+    print(leapdays(1, 5))
+    # HARDENED: reversed args (negative result), equal args (0), spanning 0
+    print(leapdays(2000, 1900))
+    print(leapdays(2024, 2024))
+    print(leapdays(-100, 100))
+
+    # weekday
+    print(weekday(2024, 1, 1))
+    print(weekday(2024, 1, 2))
+    print(weekday(2024, 1, 7))
+    print(weekday(2000, 1, 1))
+    print(weekday(2024, 2, 29))
+    print(weekday(1970, 1, 1))
+    print(weekday(2024, 12, 31))
+    print(weekday(1, 1, 1))
+    # HARDENED: extreme / boundary years
+    print(weekday(-500, 1, 1))
+    print(weekday(99999, 1, 1))
+    print(weekday(0, 1, 1))
+
+    # monthrange (tuple unpack)
+    fd1, nd1 = monthrange(2024, 1)
+    print(fd1)
+    print(nd1)
+    fd2, nd2 = monthrange(2024, 2)
+    print(fd2)
+    print(nd2)
+    fd3, nd3 = monthrange(2023, 2)
+    print(fd3)
+    print(nd3)
+    fd4, nd4 = monthrange(2024, 12)
+    print(fd4)
+    print(nd4)
+    fd5, nd5 = monthrange(2000, 2)
+    print(fd5)
+    print(nd5)
+    # HARDENED: year 0 and negative year
+    fd6, nd6 = monthrange(0, 2)
+    print(fd6)
+    print(nd6)
+    fd7, nd7 = monthrange(-4, 2)
+    print(fd7)
+    print(nd7)
+
+    # monthcalendar (default firstweekday=Monday, CPython-compatible 2-arg form)
+    jan2024 = monthcalendar(2024, 1)
+    print(len(jan2024))
+    print(len(jan2024[0]))
+    print(jan2024[0])
+    print(jan2024[len(jan2024) - 1][6])
+    feb2024 = monthcalendar(2024, 2)
+    print(feb2024[len(feb2024) - 1][6])
+    feb2023 = monthcalendar(2023, 2)
+    print(feb2023[0][0])
+    # HARDENED: 4-week month (Feb 2021, 28 days starting Monday) and
+    # 6-week month (Mar 2015, starts Sunday) row-count edges
+    feb2021 = monthcalendar(2021, 2)
+    print(len(feb2021))
+    print(feb2021)
+    mar2015 = monthcalendar(2015, 3)
+    print(len(mar2015))
+    print(mar2015[0])
+    print(mar2015[len(mar2015) - 1])
+    # December of a year (year-boundary content, not a row-count edge)
+    dec2024 = monthcalendar(2024, 12)
+    print(len(dec2024))
+    print(dec2024[0])
+    print(dec2024[len(dec2024) - 1])
+
+    # error cases (message text)
+    try:
+        monthrange(2024, 0)
+        print("no-raise")
+    except ValueError as e:
+        print(str(e))
+    try:
+        monthrange(2024, 13)
+        print("no-raise")
+    except ValueError as e:
+        print(str(e))
+    try:
+        weekday(2024, 0, 1)
+        print("no-raise")
+    except ValueError as e:
+        print(str(e))
+    try:
+        weekday(2024, 1, 32)
+        print("no-raise")
+    except ValueError as e:
+        print(str(e))
+    try:
+        weekday(2024, 1, 0)
+        print("no-raise")
+    except ValueError as e:
+        print(str(e))
+    try:
+        monthcalendar(2024, 13)
+        print("no-raise")
+    except ValueError as e:
+        print(str(e))
+    # HARDENED: month=0 (lower boundary) on monthrange/monthcalendar/month,
+    # and the Feb-30 (day out of range for month, not "day out of range for
+    # year") case
+    try:
+        monthrange(2024, 0)
+        print("no-raise")
+    except ValueError as e:
+        print(str(e))
+    try:
+        monthcalendar(2024, 0)
+        print("no-raise")
+    except ValueError as e:
+        print(str(e))
+    try:
+        month(2024, 0)
+        print("no-raise")
+    except ValueError as e:
+        print(str(e))
+    try:
+        weekday(2024, 2, 30)
+        print("no-raise")
+    except ValueError as e:
+        print(str(e))
+
+    # text layouts (byte-exact)
+    print(month(2024, 1, w=0, l=0))
+    print(month(2024, 1, w=3, l=0))
+    print(month(2024, 1, w=3, l=2))
+    print(month(2024, 2, w=2, l=1))
+    print(calendar(2024, w=2, l=1, c=6, m=3))
+    # HARDENED: negative w/l clamp to CPython's max(2,w)/max(1,l), negative c
+    # clamp to max(2,c), and a non-default m (rows-per-year layout)
+    print(month(2024, 2, w=-5, l=-3))
+    print(calendar(2024, c=-5))
+    print(calendar(2021, w=2, l=1, c=6, m=4))
+
+    # int constants
+    print(MONDAY)
+    print(TUESDAY)
+    print(WEDNESDAY)
+    print(THURSDAY)
+    print(FRIDAY)
+    print(SATURDAY)
+    print(SUNDAY)
+    print(JANUARY)
+    print(FEBRUARY)
+    print(MARCH)
+    print(APRIL)
+    print(MAY)
+    print(JUNE)
+    print(JULY)
+    print(AUGUST)
+    print(SEPTEMBER)
+    print(OCTOBER)
+    print(NOVEMBER)
+    print(DECEMBER)
+    print(EPOCH)

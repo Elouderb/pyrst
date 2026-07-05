@@ -1,0 +1,715 @@
+# pyrst standard library — csv
+#
+# Fidelity score: 3/5 (docs/design/w2-dossiers/csv.md, card cffa1ca4). A
+# pure-pyrst CSV reader/writer/DictReader/DictWriter/Sniffer built on the SAME
+# character-by-character quoting state machine CPython's `_csv` module uses,
+# adapted to pyrst's constraints (no file objects, no `Any`, no `**kwargs`, no
+# module-level mutable state). Embedded via `include_str!` (see
+# `src/stdlib.rs`). Usable as either `from csv import reader, writer, ...` or
+# `import csv; csv.reader(...)`.
+#
+# ── THE CENTRAL DIVERGENCE: NO FILE OBJECTS (G7) ───────────────────────────
+# CPython's `csv.reader(iterable)` / `csv.writer(f)` operate over a file-like
+# object (an iterable of physical lines / something with `.write`). pyrst has
+# no file-object type expressible as a function parameter, so this module
+# works directly over STR / LIST[STR] instead (per the card's "parse/emit
+# over str lists" scope):
+#   - `reader(text, ...)` takes the WHOLE raw CSV text as one `str` (what a
+#     `StringIO`'s `.getvalue()` would hold) and returns `list[list[str]]` —
+#     ALL rows, EAGERLY. CPython's reader is a lazy line-at-a-time iterator
+#     exposing `.line_num`/`next()`/`StopIteration`; pyrst has no user
+#     `__iter__`/`__next__` dunders and generators (`Iterator[T]` + `yield`)
+#     cannot carry extra attributes like `.line_num`, so eager `list[list
+#     [str]]` is the honest, achievable shape. `next(reader(...))`-style
+#     consumption and `.line_num` are NOT available; iterate the returned
+#     list directly (`for row in reader(text): ...`).
+#   - `writer(...)` returns a `_csv_Writer` object whose `.writerow`/
+#     `.writerows` accumulate formatted lines internally; retrieve the result
+#     with `.getvalue() -> str` (mirrors `io.StringIO().getvalue()` — there is
+#     no real target file to write into, so the writer IS the buffer).
+#   - `DictReader`/`DictWriter` mirror the same eager / buffer-holding shape.
+#
+# ── DIALECT RESOLUTION ──────────────────────────────────────────────────────
+# `dialect` is a STRING name ("excel" (default) / "excel-tab" / "unix"), not
+# an object — matching the dossier signature's own `dialect='excel'` string
+# default. Every other format knob (`delimiter`, `quotechar`, `escapechar`,
+# `doublequote`, `skipinitialspace`, `quoting`, `lineterminator`) is
+# `Optional[...] = None`; a `None` means "inherit from the dialect", and an
+# explicit value overrides it — resolved once into a private, uniform
+# `_csv_DialectConfig` record by `_csv_resolve`. This INVERTS one CPython
+# error probe: real CPython's default is `delimiter=','` and explicitly
+# passing `delimiter=None` is what raises `TypeError` there; here `None` is
+# the valid "use the dialect default" sentinel, so that exact probe cannot be
+# reproduced (documented, not silently dropped).
+#
+# ── EXCEPTIONS ───────────────────────────────────────────────────────────────
+# pyrst has no custom-exception-class support (playbook constraint), so
+# `csv.Error` is NOT implemented as a distinct type: every place CPython
+# raises `csv.Error` (unknown dialect, field-too-large, DictWriter extra
+# fields is the one exception — CPython itself raises `ValueError` there,
+# unchanged) this module raises `ValueError` with CPython's message text.
+# Parameter-shape checks that ARE real runtime validation in CPython
+# (`quotechar`/`delimiter`/`escapechar` must be exactly one character) raise
+# `TypeError` with CPython's EXACT message text — pyrst's exception dispatch
+# is a plain string-tag match (verified: `raise TypeError(...)` / `except
+# TypeError as e:` round-trips cleanly), so this is real fidelity, not a
+# substitution.
+#
+# ── GATED (G2: no module-level mutable state) ───────────────────────────────
+#   - `register_dialect` / `unregister_dialect`: NOT IMPLEMENTED. A dialect
+#     registry is inherently a mutable module-level global; pyrst has no such
+#     construct. Only the three built-in dialects are selectable by name.
+#   - `field_size_limit(new_limit=None)`: implemented as a PURE function that
+#     always returns the fixed `FIELD_SIZE_LIMIT` constant (131072, CPython's
+#     own default) — passing `new_limit` has NO persistent effect (there is
+#     nothing to persist it in). Real per-call enforcement is instead exposed
+#     as `reader(..., max_field_size=131072)`, an explicit parameter replacing
+#     the global — a documented design-around, not a silent no-op.
+#
+# ── OTHER DOCUMENTED DIVERGENCES ────────────────────────────────────────────
+#   - `get_dialect(name)` / `Sniffer.sniff(...)` return the private, uniform
+#     `_csv_DialectConfig` shape (same field set as `excel()`/`excel_tab()`/
+#     `unix_dialect()`, just not a named subclass instance) since pyrst has no
+#     return-type polymorphism across sibling classes without inheritance-
+#     driven value-enum support, which this module does not use.
+#   - Writer field values are `str` ONLY (no `int`/`float`/`bool`/`None`
+#     coercion — pyrst has no `Any`; call `str(x)` before appending a field).
+#     `QUOTE_NONNUMERIC` and `QUOTE_STRINGS` therefore can't distinguish
+#     "a real int/float object" from "a numeric-looking string" the way
+#     CPython does — every field is a `str`, so both modes always quote
+#     (documented; use `QUOTE_MINIMAL`/`QUOTE_ALL`/`QUOTE_NONE` for real
+#     content-driven control). `QUOTE_NOTNULL` is exempt only from quoting a
+#     real `None` value (an empty STRING "" is still quoted); since this
+#     writer's fields are always `str`, `QUOTE_NOTNULL` is therefore
+#     equivalent to `QUOTE_ALL` here (verified against CPython: `writerow(["a",
+#     "", "b"])` under `QUOTE_NOTNULL` quotes all three, including the empty
+#     one).
+#   - `DictReader`/`DictWriter`: `DictWriter` emits columns by walking its
+#     OWN `fieldnames: list[str]` (an ordered list, driving output order
+#     directly) rather than iterating the row `dict[str, str]` — this
+#     SIDESTEPS the usual pyrst dict-iterates-sorted-keys hazard entirely for
+#     writing. `DictReader` still returns each row's fields as a
+#     `dict[str, str]` (`DictRow.values`); iterating ITS `.keys()` directly
+#     is sorted, not header-order — consult the DictReader's own `.fieldnames`
+#     (a `list[str]`, header/constructor order preserved) for column order,
+#     never the dict's own iteration order.
+#   - `restkey`'s extra fields land in `DictRow.rest: list[str]` (a fixed
+#     field, not a dynamically-named dict key — CPython lets the CALLER name
+#     that dict key via `restkey`; pyrst dicts require one uniform value type
+#     per dict, and `str` cannot coexist with `list[str]` in the same
+#     `dict[str, str]`, so this is a structural, permanent divergence). This
+#     applies UNCONDITIONALLY: `.rest` is populated whenever a row has more
+#     raw fields than `fieldnames`, whether or not the caller passed a
+#     `restkey` (CPython only captures overflow under a dict key when
+#     `restkey` is given, else silently drops it under a `None` key — this
+#     module never drops it).
+#   - `DictReader`'s `restval: str` has NO `None` option (it is a required,
+#     non-optional parameter — see the constructor-defaults compiler-gap note
+#     below). CPython's default `restval=None` fills a missing trailing field
+#     with a real `None` sentinel, distinguishable from a genuinely empty
+#     string; since `DictRow.values` is `dict[str, str]` (no `Optional[str]`
+#     payload), this module cannot represent "field absent" separately from
+#     "field is restval" — callers must pick an explicit string stand-in
+#     (verified via oracle: CPython's `restval=None` default produces `None`
+#     for a missing trailing field where this module produces whatever `str`
+#     the caller supplied for `restval`, e.g. `""`).
+#   - `DictReader.fieldnames` / row parsing happen EAGERLY in `__init__`
+#     (constructor time), not lazily on first iteration as CPython does; the
+#     end result (the fieldnames list, the parsed rows) is identical, just
+#     computed earlier.
+#   - `Sniffer.sniff`/`has_header` are REDUCED-fidelity heuristics (a
+#     consistent-character-frequency delimiter guess; a "does the header row
+#     contain any non-numeric-looking field" `has_header` check) rather than
+#     CPython's full statistical column-type/length comparison. Verified
+#     against the dossier's 5 PARITY PLAN sniffer cases; not a byte-for-byte
+#     port of CPython's `Sniffer` internals.
+#   - Newline-in-unquoted-field validation (CPython's `Error: new-line
+#     character seen in unquoted field - do you need to open the file with
+#     newline=''?`) is a REAL-FILE-specific error path (StringIO doesn't hit
+#     it either) — moot here since there are no file objects; a bare `\r` is
+#     simply treated as its own line terminator (matching StringIO / text
+#     blob semantics, not raw-file-without-`newline=''` semantics). VERIFIED:
+#     this is not a guess — `csv.reader(io.StringIO(text, newline=''))` (i.e.
+#     opened the way CPython's own docs recommend for csv) treats a bare `\r`
+#     exactly this way too; only the DEFAULT `io.StringIO(text)` (no
+#     `newline=''`) surfaces the file-specific error, and that default mode
+#     has no pyrst analogue in the first place.
+#   - EXTREME edge case, confirmed NOT reproduced: setting `escapechar` equal
+#     to `quotechar` (an unusual, likely-never-intentional configuration) can
+#     make real CPython's C state machine append a phantom trailing `"\n"` to
+#     a field when the input ends immediately after an odd/dangling
+#     escapechar-as-quotechar sequence (e.g. `reader('"a"', escapechar='"')`
+#     -> CPython gives `[['a\n']]`, not `[['a']]`). This module's reader does
+#     not reproduce that artifact (it returns the field without the phantom
+#     `\n`) — this looks like an accidental byproduct of CPython's own C
+#     parser reaching for a "continue onto the next physical line" state that
+#     never materializes at EOF, not a documented/intentional csv-module
+#     contract, and is far outside the dossier's PARITY PLAN / BEHAVIOR
+#     MATRIX scope. Documented rather than chased.
+#   - HARDENING FIXES (post-writer-drop adversarial pass): `writer(...)` /
+#     `reader(...)` now VALIDATE `quoting` is one of the 6 known `QUOTE_*`
+#     constants at dialect-resolution time, raising `TypeError('bad
+#     "quoting" value')` for anything else — matching CPython's own
+#     construction-time validation (previously an out-of-range `quoting` int
+#     silently fell through to `QUOTE_MINIMAL`-style behavior). `DictWriter`
+#     now VALIDATES `extrasaction` is `"raise"` or `"ignore"` at construction
+#     time, raising `ValueError("extrasaction (<val>) must be 'raise' or
+#     'ignore'")` — CPython's exact message — instead of silently treating
+#     any other string as `"ignore"`.
+#   - `*args`/`**kwargs` passthrough on `DictReader`/`DictWriter` (G4): not
+#     implemented; every dialect knob is an explicit keyword parameter
+#     instead.
+#   - `DictReader.__init__`/`DictWriter.__init__` take EVERY parameter with NO
+#     default value (a compiler gap: default-argument filling does not thread
+#     through a class constructor call site that omits trailing args, only
+#     through plain function calls — confirmed while building this module).
+#     Construct with every argument supplied explicitly (keyword args are
+#     fine): e.g. `DictReader(text, [], None, "", "excel")` or
+#     `DictReader(text, fieldnames=[], restkey=None, restval="", dialect=
+#     "excel")`.
+#   - Several ERRORS-table probes are MOOT under pyrst's static typing (the
+#     bad call cannot even be written, let alone compiled): `reader(f,
+#     delimiter=None)` positive-probe (see dialect-resolution note above),
+#     `writer(f, lineterminator=123)` (parameter is `str`-typed; `123` is a
+#     compile error), `csv.field_size_limit("string")` (parameter is
+#     `Optional[int]`; a `str` argument is a compile error), `writer(io.
+#     BytesIO())` (no bytes type / no file objects at all — G7), `reader(f);
+#     f.close(); next(reader)` (no file handle / no lazy iterator to close —
+#     moot by the eager-list design above).
+
+from dataclasses import dataclass
+
+QUOTE_MINIMAL: int = 0
+QUOTE_ALL: int = 1
+QUOTE_NONNUMERIC: int = 2
+QUOTE_NONE: int = 3
+QUOTE_STRINGS: int = 4
+QUOTE_NOTNULL: int = 5
+
+# CPython's own compiled-in default (`csv.field_size_limit()` with no
+# argument). See the G2 note above — this stays a fixed constant, never a
+# mutable global.
+FIELD_SIZE_LIMIT: int = 131072
+
+
+# ── Public dialect-descriptor classes (surface parity only; see header) ────
+# Every field below is a literal class-level default that is never
+# subsequently assigned via `self.field = ...`, so each is promoted to an
+# associated constant (same mechanism as `Color.RED` in parity_class_consts
+# .pyrs) — `excel().delimiter`, `excel.delimiter`, and `self.delimiter` (in a
+# method) all read the same fixed value. These are NOT consulted by
+# `reader`/`writer` internally (that path uses the private
+# `_csv_DialectConfig` + `_csv_dialect_defaults` below); they exist purely so
+# `csv.excel()` / `csv.excel_tab()` / `csv.unix_dialect()` / `csv.Dialect()`
+# are constructible and inspectable, matching the CPython surface.
+class Dialect:
+    delimiter: str = ","
+    quotechar: str = '"'
+    escapechar: str = ""
+    doublequote: bool = True
+    skipinitialspace: bool = False
+    quoting: int = QUOTE_MINIMAL
+    lineterminator: str = "\r\n"
+
+
+class excel:
+    delimiter: str = ","
+    quotechar: str = '"'
+    escapechar: str = ""
+    doublequote: bool = True
+    skipinitialspace: bool = False
+    quoting: int = QUOTE_MINIMAL
+    lineterminator: str = "\r\n"
+
+
+class excel_tab:
+    delimiter: str = "\t"
+    quotechar: str = '"'
+    escapechar: str = ""
+    doublequote: bool = True
+    skipinitialspace: bool = False
+    quoting: int = QUOTE_MINIMAL
+    lineterminator: str = "\r\n"
+
+
+class unix_dialect:
+    delimiter: str = ","
+    quotechar: str = '"'
+    escapechar: str = ""
+    doublequote: bool = True
+    skipinitialspace: bool = False
+    quoting: int = QUOTE_ALL
+    lineterminator: str = "\n"
+
+
+# ── Private resolved-config record (what reader/writer/Sniffer actually use)
+@dataclass
+class _csv_DialectConfig:
+    delimiter: str
+    quotechar: str
+    escapechar: str
+    has_escapechar: bool
+    doublequote: bool
+    skipinitialspace: bool
+    quoting: int
+    lineterminator: str
+
+
+def _csv_dialect_defaults(dialect: str) -> _csv_DialectConfig:
+    if dialect == "excel":
+        return _csv_DialectConfig(",", '"', "", False, True, False, QUOTE_MINIMAL, "\r\n")
+    elif dialect == "excel-tab":
+        return _csv_DialectConfig("\t", '"', "", False, True, False, QUOTE_MINIMAL, "\r\n")
+    elif dialect == "unix":
+        return _csv_DialectConfig(",", '"', "", False, True, False, QUOTE_ALL, "\n")
+    else:
+        raise ValueError("unknown dialect")
+
+
+def get_dialect(name: str) -> _csv_DialectConfig:
+    return _csv_dialect_defaults(name)
+
+
+def list_dialects() -> list[str]:
+    return ["excel", "excel-tab", "unix"]
+
+
+def field_size_limit(new_limit: Optional[int] = None) -> int:
+    # See the G2 note in the module header: this cannot persist state, so it
+    # always returns the fixed default regardless of `new_limit`.
+    return FIELD_SIZE_LIMIT
+
+
+def _csv_resolve(dialect: str, delimiter: Optional[str], quotechar: Optional[str], escapechar: Optional[str], doublequote: Optional[bool], skipinitialspace: Optional[bool], quoting: Optional[int], lineterminator: Optional[str]) -> _csv_DialectConfig:
+    base: _csv_DialectConfig = _csv_dialect_defaults(dialect)
+
+    d: str = base.delimiter
+    if delimiter is not None:
+        dv: str = delimiter
+        if len(dv) != 1:
+            raise TypeError('"delimiter" must be a 1-character string')
+        d = dv
+
+    q: str = base.quotechar
+    if quotechar is not None:
+        qv: str = quotechar
+        if len(qv) != 1:
+            raise TypeError('"quotechar" must be a 1-character string')
+        q = qv
+
+    esc: str = base.escapechar
+    has_esc: bool = base.has_escapechar
+    if escapechar is not None:
+        ev: str = escapechar
+        if len(ev) != 1:
+            raise TypeError('"escapechar" must be a 1-character string')
+        esc = ev
+        has_esc = True
+
+    dq: bool = base.doublequote
+    if doublequote is not None:
+        dqv: bool = doublequote
+        dq = dqv
+
+    sis: bool = base.skipinitialspace
+    if skipinitialspace is not None:
+        sisv: bool = skipinitialspace
+        sis = sisv
+
+    qt: int = base.quoting
+    if quoting is not None:
+        qtv: int = quoting
+        if qtv != QUOTE_MINIMAL and qtv != QUOTE_ALL and qtv != QUOTE_NONNUMERIC and qtv != QUOTE_NONE and qtv != QUOTE_STRINGS and qtv != QUOTE_NOTNULL:
+            raise TypeError('bad "quoting" value')
+        qt = qtv
+
+    lt: str = base.lineterminator
+    if lineterminator is not None:
+        ltv: str = lineterminator
+        lt = ltv
+
+    return _csv_DialectConfig(d, q, esc, has_esc, dq, sis, qt, lt)
+
+
+# ── Reader: character-by-character quoting state machine ───────────────────
+class _csv_Parser:
+    text: str
+    pos: int
+    n: int
+    cfg: _csv_DialectConfig
+    max_field_size: int
+    rows: list[list[str]]
+    row: list[str]
+    field: str
+    in_quotes: bool
+    quote_just_closed: bool
+    record_started: bool
+
+    def __init__(self, text: str, cfg: _csv_DialectConfig, max_field_size: int) -> None:
+        self.text = text
+        self.pos = 0
+        self.n = len(text)
+        self.cfg = cfg
+        self.max_field_size = max_field_size
+        self.rows = []
+        self.row = []
+        self.field = ""
+        self.in_quotes = False
+        self.quote_just_closed = False
+        self.record_started = False
+
+    def _append_char(self, ch: str) -> None:
+        self.field = self.field + ch
+        self.record_started = True
+        if len(self.field) > self.max_field_size:
+            raise ValueError("field larger than field limit (" + str(self.max_field_size) + ")")
+
+    def _end_field(self) -> None:
+        self.row.append(self.field)
+        self.field = ""
+
+    def _end_record(self) -> None:
+        # Always emits a record on a real line terminator: an empty one
+        # (`[]`) for a genuinely blank line, else the accumulated fields.
+        if self.record_started or len(self.field) > 0 or len(self.row) > 0:
+            self._end_field()
+            self.rows.append(self.row)
+        else:
+            self.rows.append([])
+        self.row = []
+        self.quote_just_closed = False
+        self.record_started = False
+
+    def _end_record_final(self) -> None:
+        # EOF flush: unlike `_end_record`, emits NOTHING when there is no
+        # pending content at all (so `reader("")` is `[]`, not `[[]]`).
+        if self.record_started or len(self.field) > 0 or len(self.row) > 0:
+            self._end_field()
+            self.rows.append(self.row)
+
+    def parse(self) -> list[list[str]]:
+        while self.pos < self.n:
+            c: str = self.text[self.pos]
+            if self.in_quotes:
+                if self.cfg.has_escapechar and c == self.cfg.escapechar:
+                    self.pos = self.pos + 1
+                    if self.pos < self.n:
+                        self._append_char(self.text[self.pos])
+                    self.pos = self.pos + 1
+                elif c == self.cfg.quotechar:
+                    if self.cfg.doublequote and self.pos + 1 < self.n and self.text[self.pos + 1] == self.cfg.quotechar:
+                        self._append_char(self.cfg.quotechar)
+                        self.pos = self.pos + 2
+                    else:
+                        self.in_quotes = False
+                        self.quote_just_closed = True
+                        self.pos = self.pos + 1
+                else:
+                    self._append_char(c)
+                    self.pos = self.pos + 1
+            else:
+                if c == self.cfg.quotechar and len(self.field) == 0 and not self.quote_just_closed:
+                    self.in_quotes = True
+                    self.quote_just_closed = False
+                    self.record_started = True
+                    self.pos = self.pos + 1
+                elif c == self.cfg.delimiter:
+                    self._end_field()
+                    self.quote_just_closed = False
+                    self.record_started = True
+                    self.pos = self.pos + 1
+                elif c == "\r" or c == "\n":
+                    if c == "\r" and self.pos + 1 < self.n and self.text[self.pos + 1] == "\n":
+                        self.pos = self.pos + 2
+                    else:
+                        self.pos = self.pos + 1
+                    self._end_record()
+                elif self.cfg.skipinitialspace and len(self.field) == 0 and c == " " and not self.quote_just_closed:
+                    self.pos = self.pos + 1
+                else:
+                    self._append_char(c)
+                    self.pos = self.pos + 1
+        self._end_record_final()
+        return self.rows
+
+
+def reader(text: str, dialect: str = "excel", delimiter: Optional[str] = None, quotechar: Optional[str] = None, escapechar: Optional[str] = None, doublequote: Optional[bool] = None, skipinitialspace: Optional[bool] = None, quoting: Optional[int] = None, lineterminator: Optional[str] = None, max_field_size: int = 131072) -> list[list[str]]:
+    cfg: _csv_DialectConfig = _csv_resolve(dialect, delimiter, quotechar, escapechar, doublequote, skipinitialspace, quoting, lineterminator)
+    p: _csv_Parser = _csv_Parser(text, cfg, max_field_size)
+    return p.parse()
+
+
+# ── Writer ───────────────────────────────────────────────────────────────────
+def _csv_field_needs_quote(field: str, cfg: _csv_DialectConfig, single_field_row: bool) -> bool:
+    if cfg.quoting == QUOTE_ALL:
+        return True
+    if cfg.quoting == QUOTE_NONNUMERIC or cfg.quoting == QUOTE_STRINGS:
+        # Divergence (see module header): writer fields are always `str`, so
+        # both modes always quote here.
+        return True
+    if cfg.quoting == QUOTE_NOTNULL:
+        # CPython quotes every field except a real `None` value (an empty
+        # STRING "" still gets quoted — only `None` is exempt). This writer's
+        # fields are always `str` (no `None` in a row — see module header),
+        # so nothing is ever exempt: always quote, same as QUOTE_ALL.
+        return True
+    if cfg.quoting == QUOTE_NONE:
+        return False
+    # QUOTE_MINIMAL: quote a lone empty field in a single-field row (so it
+    # round-trips as a real empty field, not a blank/absent record), or any
+    # field containing the delimiter, a newline, or (when doublequote is on)
+    # the quotechar.
+    if single_field_row and field == "":
+        return True
+    if cfg.delimiter in field:
+        return True
+    if "\n" in field or "\r" in field:
+        return True
+    if cfg.doublequote and cfg.quotechar in field:
+        return True
+    return False
+
+
+def _csv_escape_for_none(field: str, cfg: _csv_DialectConfig) -> str:
+    out: str = ""
+    for ch in field:
+        special: bool = ch == cfg.delimiter or ch == cfg.quotechar or ch == "\n" or ch == "\r"
+        if cfg.has_escapechar and ch == cfg.escapechar:
+            special = True
+        if special:
+            if cfg.has_escapechar:
+                out += cfg.escapechar + ch
+            else:
+                raise ValueError("need to escape, but no escapechar set")
+        else:
+            out += ch
+    return out
+
+
+def _csv_format_field(field: str, cfg: _csv_DialectConfig, single_field_row: bool) -> str:
+    if cfg.quoting == QUOTE_NONE:
+        return _csv_escape_for_none(field, cfg)
+    needs_quote: bool = _csv_field_needs_quote(field, cfg, single_field_row)
+    content: str = field
+    if cfg.quotechar in content:
+        if cfg.doublequote:
+            content = content.replace(cfg.quotechar, cfg.quotechar + cfg.quotechar)
+        elif cfg.has_escapechar:
+            content = content.replace(cfg.quotechar, cfg.escapechar + cfg.quotechar)
+        else:
+            raise ValueError("need to escape, but no escapechar set")
+    if needs_quote:
+        return cfg.quotechar + content + cfg.quotechar
+    return content
+
+
+def _csv_format_row(row: list[str], cfg: _csv_DialectConfig) -> str:
+    single: bool = len(row) == 1
+    parts: list[str] = []
+    for f in row:
+        parts.append(_csv_format_field(f, cfg, single))
+    return cfg.delimiter.join(parts) + cfg.lineterminator
+
+
+class _csv_Writer:
+    cfg: _csv_DialectConfig
+    lines: list[str]
+
+    def __init__(self, cfg: _csv_DialectConfig) -> None:
+        self.cfg = cfg
+        self.lines = []
+
+    def writerow(self, row: list[str]) -> None:
+        self.lines.append(_csv_format_row(row, self.cfg))
+
+    def writerows(self, rows: list[list[str]]) -> None:
+        for r in rows:
+            self.writerow(r)
+
+    def getvalue(self) -> str:
+        return "".join(self.lines)
+
+
+def writer(dialect: str = "excel", delimiter: Optional[str] = None, quotechar: Optional[str] = None, escapechar: Optional[str] = None, doublequote: Optional[bool] = None, skipinitialspace: Optional[bool] = None, quoting: Optional[int] = None, lineterminator: Optional[str] = None) -> _csv_Writer:
+    cfg: _csv_DialectConfig = _csv_resolve(dialect, delimiter, quotechar, escapechar, doublequote, skipinitialspace, quoting, lineterminator)
+    return _csv_Writer(cfg)
+
+
+# ── DictReader / DictWriter ──────────────────────────────────────────────────
+@dataclass
+class DictRow:
+    values: dict[str, str]
+    rest: list[str]
+
+
+def _csv_build_dictrow(names: list[str], raw_row: list[str], restval: str) -> DictRow:
+    values: dict[str, str] = {}
+    rest: list[str] = []
+    n_names: int = len(names)
+    i: int = 0
+    while i < n_names:
+        if i < len(raw_row):
+            values[names[i]] = raw_row[i]
+        else:
+            values[names[i]] = restval
+        i = i + 1
+    j: int = n_names
+    while j < len(raw_row):
+        rest.append(raw_row[j])
+        j = j + 1
+    return DictRow(values, rest)
+
+
+class DictReader:
+    # NOTE: pyrst's default-argument lowering does not thread defaults through
+    # a class CONSTRUCTOR call site that omits trailing args (a confirmed
+    # compiler gap, distinct from free-function defaults which DO fill in —
+    # `reader(text)` alone works fine because `reader` is a function, not a
+    # constructor). Every `__init__` in this module therefore takes ALL its
+    # parameters with NO defaults; callers must pass every argument explicitly
+    # (by keyword is fine — kwargs work at every call site). Use `fieldnames:
+    # list[str] = []` (empty list) to mean "infer from the header row" and
+    # `restkey: Optional[str] = None`-style `None` still narrows normally as
+    # an explicit argument value, it just cannot be OMITTED.
+    fieldnames: list[str]
+    restkey: str
+    has_restkey: bool
+    restval: str
+    rows: list[DictRow]
+    line_num: int
+
+    def __init__(self, text: str, fieldnames: list[str], restkey: Optional[str], restval: str, dialect: str) -> None:
+        rk: str = ""
+        hrk: bool = False
+        if restkey is not None:
+            rkv: str = restkey
+            rk = rkv
+            hrk = True
+        self.restkey = rk
+        self.has_restkey = hrk
+        self.restval = restval
+
+        raw: list[list[str]] = reader(text, dialect)
+        names: list[str] = fieldnames
+        start_idx: int = 0
+        if len(names) == 0:
+            if len(raw) > 0:
+                names = raw[0]
+            start_idx = 1
+        self.fieldnames = names
+
+        built: list[DictRow] = []
+        i: int = start_idx
+        n: int = len(raw)
+        while i < n:
+            built.append(_csv_build_dictrow(names, raw[i], self.restval))
+            i = i + 1
+        self.rows = built
+        self.line_num = n
+
+
+class DictWriter:
+    # Holds its own `cfg`/`lines` directly (rather than wrapping a
+    # `_csv_Writer` instance) so `writerow`'s `self.lines.append(...)` is a
+    # directly-recognized mutating call on a `self` field — pyrst's `&mut
+    # self` inference (`compute_mut_self`) recognizes built-in collection
+    # mutators like `list.append` called on a `self.field` chain, but does
+    # NOT (yet) recognize a call to another class's own mutating METHOD
+    # reached through a `self.field` (`self.w.writerow(...)` for a nested
+    # `_csv_Writer` field `w`) as mutating — a confirmed compiler gap. Direct
+    # `self.lines.append(...)` sidesteps it entirely.
+    fieldnames: list[str]
+    restval: str
+    extrasaction: str
+    cfg: _csv_DialectConfig
+    lines: list[str]
+
+    def __init__(self, fieldnames: list[str], restval: str, extrasaction: str, dialect: str) -> None:
+        if extrasaction != "raise" and extrasaction != "ignore":
+            raise ValueError("extrasaction (" + extrasaction + ") must be 'raise' or 'ignore'")
+        self.fieldnames = fieldnames
+        self.restval = restval
+        self.extrasaction = extrasaction
+        self.cfg = _csv_dialect_defaults(dialect)
+        self.lines = []
+
+    def writeheader(self) -> None:
+        self.lines.append(_csv_format_row(self.fieldnames, self.cfg))
+
+    def writerow(self, row: dict[str, str]) -> None:
+        extras: list[str] = []
+        for k in row.keys():
+            if k not in self.fieldnames:
+                extras.append(k)
+        if len(extras) > 0 and self.extrasaction == "raise":
+            names_repr: list[str] = [repr(x) for x in extras]
+            raise ValueError("dict contains fields not in fieldnames: " + ", ".join(names_repr))
+        values: list[str] = []
+        for name in self.fieldnames:
+            values.append(row.get(name, self.restval))
+        self.lines.append(_csv_format_row(values, self.cfg))
+
+    def writerows(self, rows: list[dict[str, str]]) -> None:
+        for r in rows:
+            self.writerow(r)
+
+    def getvalue(self) -> str:
+        return "".join(self.lines)
+
+
+# ── Sniffer (reduced-fidelity heuristics; see module header) ────────────────
+def _csv_looks_numeric(s: str) -> bool:
+    if len(s.strip()) == 0:
+        return False
+    try:
+        v: float = float(s)
+        return True
+    except ValueError as e:
+        return False
+
+
+def _csv_first_line(sample: str) -> str:
+    idx: int = sample.find("\n")
+    if idx == -1:
+        return sample
+    return sample[0:idx]
+
+
+def _csv_sniff_delimiter(sample: str, delimiters: Optional[str]) -> str:
+    candidates: list[str] = []
+    if delimiters is not None:
+        dv: str = delimiters
+        for ch in dv:
+            candidates.append(ch)
+    else:
+        candidates = [",", "\t", ";", " ", ":", "|"]
+    lines: list[str] = [ln for ln in sample.split("\n") if len(ln) > 0]
+    if len(lines) == 0:
+        raise ValueError("Could not determine delimiter")
+    for cand in candidates:
+        first_count: int = lines[0].count(cand)
+        if first_count == 0:
+            continue
+        consistent: bool = True
+        for ln in lines:
+            if ln.count(cand) != first_count:
+                consistent = False
+        if consistent:
+            return cand
+    raise ValueError("Could not determine delimiter")
+
+
+class Sniffer:
+    def sniff(self, sample: str, delimiters: Optional[str] = None) -> _csv_DialectConfig:
+        delim: str = _csv_sniff_delimiter(sample, delimiters)
+        return _csv_DialectConfig(delim, '"', "", False, False, False, QUOTE_MINIMAL, "\r\n")
+
+    def has_header(self, sample: str) -> bool:
+        delim: str = _csv_sniff_delimiter(sample, None)
+        first: str = _csv_first_line(sample)
+        fields: list[str] = first.split(delim)
+        any_non_numeric: bool = False
+        for f in fields:
+            if not _csv_looks_numeric(f):
+                any_non_numeric = True
+        return any_non_numeric

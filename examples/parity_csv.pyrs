@@ -1,0 +1,331 @@
+# parity: pyrst-only
+#
+# Card cffa1ca4 — `lib/csv.pyrs` (docs/design/w2-dossiers/csv.md). PYRST-ONLY
+# for the same structural reason as `parity_os.pyrs`/`parity_json.pyrs`: the
+# csv module's real CPython surface is built around FILE OBJECTS
+# (`csv.reader(some_file_or_StringIO)` / `csv.writer(f)`); pyrst has no file-
+# object parameter type (G7), so `lib/csv.pyrs`'s `reader`/`writer` work
+# directly over `str`/`list[str]` instead (see the module header in
+# `lib/csv.pyrs` for the full divergence list). The SAME source calling
+# `reader(text)` / `w.getvalue()` cannot run under python3's real `csv`
+# module (that API takes a file-like object, not a bare `str`), so a
+# byte-identical same-file dual run is not achievable for this module's API
+# SHAPE — only for the underlying quoting/parsing BEHAVIOR, which was
+# instead cross-checked line-by-line against a real CPython oracle script
+# (`csv.reader/writer/DictReader/DictWriter/Sniffer` wrapped in
+# `io.StringIO`) with byte-identical output; see the card history for that
+# transcript and the exact oracle script used.
+#
+# Every case below is seeded from the dossier's PARITY PLAN (38 cases) plus
+# extra edge-case rows from its BEHAVIOR MATRIX (quote-escaping edges,
+# skipinitialspace + quotes, doublequote=False + escapechar, custom
+# delimiter/quotechar dialects, QUOTE_NOTNULL, a lone-empty-field row,
+# empty lineterminator, unicode round-trip). Expected values are CPython-
+# oracle-verified (not asserted from memory).
+#
+# HARDENING PASS additions (w2-hardener, card cffa1ca4): a further adversarial
+# round against a real-CPython oracle (`csv.reader(io.StringIO(text,
+# newline=''))` — CPython's own recommended way to open a csv source,
+# matching this module's str-based semantics) surfaced more edge cases below:
+# bare-`\r` as a line terminator, quote-not-at-field-start literal handling,
+# quote-after-closed-value literal handling, multi-quote sequences,
+# unterminated quotes at EOF, a writer delimiter==quotechar collision, a
+# doublequote=False+escapechar==quotechar writer collision,
+# QUOTE_NONNUMERIC/QUOTE_STRINGS on plain str fields (confirmed this always
+# quotes under real CPython too, since the fields are literal `str` objects
+# there as well — not actually a behavioral divergence), QUOTE_NONE /
+# doublequote=False raising without an escapechar (CPython's exact message),
+# a bad `quoting` int (now raises `TypeError` — a fix, see module header),
+# a bad `extrasaction` string (now raises `ValueError` at construction — a
+# fix, see module header), DictReader missing-field defaulting and
+# extra-field capture in `.rest`, DictWriter unicode + embedded-delimiter
+# round-trip, and Sniffer against quoted samples / an inconsistent sample /
+# a numeric-looking header row.
+
+from csv import reader, writer, DictReader, DictWriter, Sniffer
+from csv import QUOTE_ALL, QUOTE_NONE, QUOTE_NOTNULL, QUOTE_NONNUMERIC, QUOTE_STRINGS, list_dialects, get_dialect, field_size_limit
+
+
+def show(rows: list[list[str]]) -> None:
+    for r in rows:
+        print(r)
+
+
+def main() -> None:
+    # ── reader: basic shapes (dossier cases 1-6) ────────────────────────────
+    show(reader("a,b,c\n1,2,3\n"))          # [['a','b','c'], ['1','2','3']]
+    show(reader(""))                         # [] (empty input)
+    show(reader("x"))                        # [['x']] (single field, no newline)
+    show(reader('""'))                       # [['']] (quoted empty field)
+    show(reader("a,b,"))                     # [['a','b','']] (trailing empty field)
+    show(reader(",,,"))                      # [['','','','']] (only delimiters)
+
+    # ── reader: embedded newlines / quote escaping (cases 7-8) ──────────────
+    show(reader('"a","b\nc","d"'))           # [['a','b\nc','d']]
+    show(reader('"a""b","c"""'))             # [['a"b','c"']]
+
+    # ── reader: delimiter variants (cases 9-13) ──────────────────────────────
+    show(reader("a b c", delimiter=" "))                    # [['a','b','c']]
+    show(reader("a|b|c", delimiter="|"))                    # [['a','b','c']]
+    show(reader("a, b, c", skipinitialspace=True))          # [['a','b','c']]
+    show(reader("a\tb\tc"))                                 # [['a\tb\tc']] (tab NOT a delimiter by default)
+    show(reader("a\tb\tc", delimiter="\t"))                 # [['a','b','c']]
+
+    # ── reader: only-newlines / single-column (BEHAVIOR MATRIX "Empty and
+    # Edge Cases") ────────────────────────────────────────────────────────────
+    show(reader("\n\n\n"))                   # [[], [], []] (blank lines)
+    show(reader("a\n1\n2"))                  # [['a'], ['1'], ['2']]
+
+    # ── reader: skipinitialspace + quoted field, quote-after-field-value,
+    # space-outside-quotes, unicode (BEHAVIOR MATRIX edge cases) ────────────
+    show(reader('a, " b ", c', skipinitialspace=True))      # [['a',' b ','c']]
+    show(reader('a,"b",c,"d"e'))                            # [['a','b','c','de']]
+    show(reader(' "a" , "b" , "c" '))                       # [[' "a" ', ' "b" ', ' "c" ']]
+    show(reader("café,日本語,Ñoño"))                          # [['café','日本語','Ñoño']]
+
+    # ── writer: quoting / escaping / type-of-content (cases 14-25) ──────────
+    w1 = writer()
+    w1.writerow(["a", "b", "c"])
+    print(repr(w1.getvalue()))                              # 'a,b,c\r\n'
+
+    w2 = writer()
+    w2.writerow(["a", "b,c", "d"])
+    print(repr(w2.getvalue()))                              # 'a,"b,c",d\r\n'
+
+    w3 = writer()
+    w3.writerow(['a"b', "c"])
+    print(repr(w3.getvalue()))                              # '"a""b",c\r\n'
+
+    w4 = writer()
+    w4.writerow(["a\nb", "c"])
+    print(repr(w4.getvalue()))                              # '"a\nb",c\r\n'
+
+    w5 = writer(quoting=QUOTE_ALL)
+    w5.writerow(["a", "b"])
+    print(repr(w5.getvalue()))                              # '"a","b"\r\n'
+
+    w6 = writer(quoting=QUOTE_NONE, escapechar="\\")
+    w6.writerow(["a,b", "c"])
+    print(repr(w6.getvalue()))                              # 'a\\,b,c\r\n'
+
+    w7 = writer(lineterminator="\n")
+    w7.writerow(["a", "b"])
+    print(repr(w7.getvalue()))                              # 'a,b\n'
+
+    w8 = writer()
+    w8.writerows([["a", "b"], ["1", "2"]])
+    print(repr(w8.getvalue()))                              # 'a,b\r\n1,2\r\n'
+
+    # ── writer: doublequote=False + escapechar, custom delimiter/quotechar,
+    # QUOTE_NOTNULL, lone empty field, empty lineterminator, unicode ────────
+    w9 = writer(doublequote=False, escapechar="\\")
+    w9.writerow(['a"b', "c"])
+    print(repr(w9.getvalue()))                              # 'a\\"b,c\r\n'
+
+    w10 = writer(delimiter=";", quotechar="'")
+    w10.writerow(["a", "b;c", "d'e"])
+    print(repr(w10.getvalue()))                             # "a;'b;c';'d''e'\r\n"
+
+    w11 = writer(quoting=QUOTE_NOTNULL)
+    w11.writerow(["a", "", "b"])
+    print(repr(w11.getvalue()))                             # '"a","","b"\r\n'
+
+    w12 = writer()
+    w12.writerow([""])
+    print(repr(w12.getvalue()))                             # '""\r\n' (lone empty field still quoted)
+
+    w13 = writer(lineterminator="")
+    w13.writerow(["a", "b"])
+    print(repr(w13.getvalue()))                             # 'a,b' (no terminator)
+
+    w14 = writer()
+    w14.writerow(["café", "日本語", "Ñoño"])
+    print(repr(w14.getvalue()))                             # 'café,日本語,Ñoño\r\n'
+
+    # ── DictReader (cases 26-29) ──────────────────────────────────────────────
+    dr = DictReader("name,age\nAlice,30\nBob,25\n", [], None, "", "excel")
+    for row in dr.rows:
+        print(sorted(row.values.items()))                  # [('age','30'),('name','Alice')] / [('age','25'),('name','Bob')]
+
+    dr2 = DictReader("30,Alice\n25,Bob\n", ["age", "name"], None, "", "excel")
+    for row in dr2.rows:
+        print(sorted(row.values.items()))                  # same shape, custom fieldnames
+
+    dr3 = DictReader("a,b\n1,2,3\n", [], None, "X", "excel")
+    for row in dr3.rows:
+        print(sorted(row.values.items()))                  # [('a','1'),('b','2')] (restval unused: no missing field)
+
+    dr4 = DictReader("a,b\n1,2,3\n", [], "_extra", "", "excel")
+    for row in dr4.rows:
+        print(sorted(row.values.items()), row.rest)         # [('a','1'),('b','2')] ['3']
+
+    # ── DictWriter (cases 30-33) ────────────────────────────────────────────
+    dw = DictWriter(["name", "age"], "", "raise", "excel")
+    dw.writeheader()
+    print(repr(dw.getvalue()))                              # 'name,age\r\n'
+
+    dw2 = DictWriter(["name", "age"], "", "raise", "excel")
+    dw2.writerow({"name": "Alice", "age": "30"})
+    print(repr(dw2.getvalue()))                             # 'Alice,30\r\n'
+
+    dw3 = DictWriter(["a", "b"], "X", "raise", "excel")
+    dw3.writerow({"a": "1"})
+    print(repr(dw3.getvalue()))                             # '1,X\r\n'
+
+    dw4 = DictWriter(["a", "b"], "", "ignore", "excel")
+    dw4.writerow({"a": "1", "b": "2", "c": "3"})
+    print(repr(dw4.getvalue()))                             # '1,2\r\n'
+
+    try:
+        dw5 = DictWriter(["a", "b"], "", "raise", "excel")
+        dw5.writerow({"a": "1", "b": "2", "c": "3"})
+        print("no error")
+    except ValueError as e:
+        print(str(e))                                       # dict contains fields not in fieldnames: 'c'
+
+    # ── Sniffer (cases 34-38) ─────────────────────────────────────────────────
+    s = Sniffer()
+    print(s.sniff("a,b,c\n1,2,3\n").delimiter)              # ,
+    print(s.sniff("a|b|c\n1|2|3\n").delimiter)              # |
+    print(s.sniff("a\tb\tc\n1\t2\t3\n").delimiter)          # \t
+    print(s.sniff("a:b:c\n1:2:3\n", delimiters=":;").delimiter)  # :
+    print(s.has_header("name,age\nAlice,30\n"))             # True
+    print(s.has_header("1,2,3\n4,5,6\n"))                   # False
+
+    # ── Dialects / registry surface ──────────────────────────────────────────
+    print(list_dialects())                                  # ['excel', 'excel-tab', 'unix']
+    print(get_dialect("excel").delimiter)                   # ,
+    print(get_dialect("excel-tab").delimiter)                # \t
+    print(get_dialect("unix").lineterminator == "\n")        # True
+    try:
+        get_dialect("nope")
+        print("no error")
+    except ValueError as e:
+        print(str(e))                                        # unknown dialect
+    print(field_size_limit())                                # 131072
+
+    # ── Field-size-limit enforcement (design-around: explicit reader param,
+    # not the (deferred) global — see module header) ────────────────────────
+    try:
+        reader("x" * 20, max_field_size=10)
+        print("no error")
+    except ValueError as e:
+        print(str(e))                                        # field larger than field limit (10)
+
+    # ── TypeError validation (delimiter/quotechar/escapechar length) ─────────
+    try:
+        writer(quotechar="")
+        print("no error")
+    except TypeError as e:
+        print(str(e))                                        # "quotechar" must be a 1-character string
+    try:
+        writer(delimiter="::")
+        print("no error")
+    except TypeError as e:
+        print(str(e))                                        # "delimiter" must be a 1-character string
+    try:
+        writer(delimiter="")
+        print("no error")
+    except TypeError as e:
+        print(str(e))                                        # "delimiter" must be a 1-character string (dossier ERRORS case, 0-length)
+    try:
+        writer(escapechar="")
+        print("no error")
+    except TypeError as e:
+        print(str(e))                                        # "escapechar" must be a 1-character string
+
+    # ── HARDENING PASS: bare-\r as line terminator, quote-position edges ────
+    show(reader("a,b\rc,d\r\ne,f\ng,h"))      # [['a','b'],['c','d'],['e','f'],['g','h']]
+    show(reader("a\rb\rc"))                   # [['a'],['b'],['c']]
+    show(reader('"a\rb",c'))                  # [['a\rb','c']] (embedded \r inside quotes, literal)
+    show(reader('ab"cd,e'))                   # [['ab"cd','e']] (quote not at field start: literal)
+    show(reader(' "ab",c'))                   # [[' "ab"','c']] (leading space consumes field-start slot)
+    show(reader('"a"b,c'))                    # [['ab','c']] (quote-after-value: trailing chars appended literally)
+    show(reader('"a"""'))                     # [['a"']]
+    show(reader('""""'))                      # [['"']]
+    show(reader('"""""'))                     # [['""']]
+    show(reader('"abc'))                      # [['abc']] (unterminated quote at EOF: no error)
+    show(reader('"abc,def'))                  # [['abc,def']] (delimiter literal inside unterminated quote)
+    show(reader('"'))                         # [['']] (lone quotechar)
+    show(reader(" "))                         # [[' ']] (lone space field)
+
+    # ── HARDENING PASS: writer collision edges ──────────────────────────────
+    w15 = writer(delimiter=",", quotechar=",")
+    w15.writerow(["a,b", "c"])
+    print(repr(w15.getvalue()))                             # ',a,,b,,c\r\n'
+
+    w16 = writer(doublequote=False, escapechar='"')
+    w16.writerow(['a"b', "c"])
+    print(repr(w16.getvalue()))                             # 'a""b,c\r\n'
+
+    w17 = writer(quoting=QUOTE_NONNUMERIC)
+    w17.writerow(["a", "1", "2.5"])
+    print(repr(w17.getvalue()))                             # '"a","1","2.5"\r\n' (str fields always quote)
+
+    w18 = writer(quoting=QUOTE_STRINGS)
+    w18.writerow(["a", "1"])
+    print(repr(w18.getvalue()))                             # '"a","1"\r\n'
+
+    try:
+        w19 = writer(quoting=QUOTE_NONE)
+        w19.writerow(["a,b", "c"])
+        print("no error")
+    except ValueError as e:
+        print(str(e))                                       # need to escape, but no escapechar set
+
+    try:
+        w20 = writer(quoting=QUOTE_NONE)
+        w20.writerow(['a"b', "c"])
+        print("no error")
+    except ValueError as e:
+        print(str(e))                                       # need to escape, but no escapechar set
+
+    try:
+        w21 = writer(doublequote=False)
+        w21.writerow(['a"b', "c"])
+        print("no error")
+    except ValueError as e:
+        print(str(e))                                       # need to escape, but no escapechar set
+
+    # ── HARDENING PASS: bad `quoting` int now raises TypeError (a fix) ──────
+    try:
+        w22 = writer(quoting=999)
+        w22.writerow(["a", "b"])
+        print("no error")
+    except TypeError as e:
+        print(str(e))                                       # bad "quoting" value
+
+    # ── HARDENING PASS: bad `extrasaction` now raises ValueError at
+    # construction time (a fix) ─────────────────────────────────────────────
+    try:
+        DictWriter(["a", "b"], "", "bogus", "excel")
+        print("no error")
+    except ValueError as e:
+        print(str(e))                                       # extrasaction (bogus) must be 'raise' or 'ignore'
+
+    # ── HARDENING PASS: DictReader missing-field default + extras-in-.rest ──
+    dr5 = DictReader("a,b,c\n1,2\n", [], None, "MISSING", "excel")
+    for row in dr5.rows:
+        print(sorted(row.values.items()))                   # [('a','1'),('b','2'),('c','MISSING')]
+
+    dr6 = DictReader("a,b\n1,2,3,4\n", [], None, "", "excel")
+    for row in dr6.rows:
+        print(sorted(row.values.items()), row.rest)         # [('a','1'),('b','2')] ['3','4']
+
+    # ── HARDENING PASS: DictWriter unicode + embedded delimiter ─────────────
+    dw6 = DictWriter(["name", "note"], "", "raise", "excel")
+    dw6.writerow({"name": "café", "note": "has,comma"})
+    print(repr(dw6.getvalue()))                             # 'café,"has,comma"\r\n'
+
+    # ── HARDENING PASS: Sniffer against quoted / inconsistent / numeric-
+    # header samples ────────────────────────────────────────────────────────
+    s2 = Sniffer()
+    print(s2.sniff('"a","b","c"\n"1","2","3"\n').delimiter) # ,
+    try:
+        s2.sniff("a,b\nc;d\n")
+        print("no error")
+    except ValueError as e:
+        print(str(e))                                       # Could not determine delimiter
+    print(s2.has_header("1,2,3\na,b,c\n"))                  # False (numeric-looking header)
+
+    print("done")

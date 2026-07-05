@@ -1,0 +1,142 @@
+# Dual-run parity test for `fnmatch` (card a96a07b5, docs/design/w2-dossiers/
+# fnmatch.md §6 PARITY PLAN). Unlike `re` (whose public surface is partly
+# pyrst-only), `fnmatch`'s public names (`fnmatch`, `fnmatchcase`, `filter`,
+# `translate`) are EXACT CPython names/signatures with EXACT CPython
+# behavior, so `import fnmatch` resolves to the REAL Python stdlib module
+# under the python3 side of this harness — a true whole-file dual run, no
+# parity opt-out marker needed.
+#
+# Kept deliberately LEAN (per card instructions: `fnmatch` transitively pulls
+# in `re`'s `@crate("regex", "1")` dependency, so this golden takes the
+# Cargo build path — every extra line here is extra Cargo-build wall time for
+# the whole suite). This is the dossier's 40-case PARITY PLAN, seeded
+# verbatim, printed instead of asserted so a mismatch shows as a stdout diff.
+import fnmatch
+
+
+def main() -> None:
+    # --- basic wildcards ---
+    print(fnmatch.fnmatch("test.txt", "*.txt"))
+    print(fnmatch.fnmatch("test.py", "*.txt"))
+    print(fnmatch.fnmatch("test", "test"))
+    print(fnmatch.fnmatch("", ""))
+    print(fnmatch.fnmatch("", "*"))
+    print(fnmatch.fnmatch("", "?"))
+
+    # --- single-char wildcard ---
+    print(fnmatch.fnmatch("a", "?"))
+    print(fnmatch.fnmatch("ab", "?"))
+    print(fnmatch.fnmatch("test", "t?st"))
+    print(fnmatch.fnmatch("test", "t??t"))
+
+    # --- zero-or-more wildcard ---
+    print(fnmatch.fnmatch("a", "*"))
+    print(fnmatch.fnmatch("abc", "a*c"))
+    print(fnmatch.fnmatch("ac", "a*c"))
+    print(fnmatch.fnmatch("test.txt", "*.*"))
+
+    # --- case sensitivity (fnmatch is case-sensitive on this platform) ---
+    print(fnmatch.fnmatch("TEST", "test"))
+    print(fnmatch.fnmatch("test", "test"))
+    print(fnmatch.fnmatch("Test", "test"))
+
+    # --- character classes ---
+    print(fnmatch.fnmatch("a", "[abc]"))
+    print(fnmatch.fnmatch("d", "[abc]"))
+    print(fnmatch.fnmatch("1", "[0-9]"))
+    print(fnmatch.fnmatch("a", "[a-z]"))
+    print(fnmatch.fnmatch("A", "[a-z]"))
+    print(fnmatch.fnmatch("5", "[a-zA-Z0-9]"))
+
+    # --- negated character classes ---
+    print(fnmatch.fnmatch("a", "[!b]"))
+    print(fnmatch.fnmatch("b", "[!b]"))
+    print(fnmatch.fnmatch("1", "[!a-z]"))
+    print(fnmatch.fnmatch("a", "[!0-9]"))
+
+    # --- complex patterns ---
+    print(fnmatch.fnmatch("file_2024.txt", "*_*.txt"))
+    print(fnmatch.fnmatch("file_2024.txt", "file_[0-9]*.txt"))
+    print(fnmatch.fnmatch("file_abc.txt", "file_[0-9]*.txt"))
+
+    # --- special patterns ---
+    print(fnmatch.fnmatch(".hidden", ".*"))
+    print(fnmatch.fnmatch("bashrc", ".*"))
+
+    # --- fnmatchcase (always case-sensitive) ---
+    print(fnmatch.fnmatchcase("hello.txt", "*.txt"))
+    print(fnmatch.fnmatchcase("HELLO.TXT", "*.txt"))
+
+    # --- filter() ---
+    print(fnmatch.filter(["a.txt", "b.py", "c.txt"], "*.txt"))
+    print(fnmatch.filter(["hello", "HELLO", "world"], "h*"))
+    empty: list[str] = []
+    print(fnmatch.filter(empty, "*.txt"))
+    print(fnmatch.filter([""], "*"))
+
+    # --- translate() — exact regex strings ---
+    print(fnmatch.translate("*.txt"))
+    print(fnmatch.translate("h?llo"))
+    print(fnmatch.translate("[abc]"))
+    print(fnmatch.translate("[!abc]"))
+    print(fnmatch.translate("[a-z]"))
+    print(fnmatch.translate(""))
+    print(fnmatch.translate("*"))
+    print(fnmatch.translate("?"))
+
+    # --- HARDENING: edge cases added by adversarial review (card a96a07b5) ---
+    # boundary hyphens (dossier BEHAVIOR MATRIX, not in the original 40)
+    print(fnmatch.fnmatch("-", "[-a-z]"))
+    print(fnmatch.fnmatch("-", "[a-z-]"))
+    print(fnmatch.fnmatch("-", "[a-z]"))
+    # malformed / never-crash bracket forms
+    print(fnmatch.fnmatch("[1]", "[[]1[]].txt"))
+    print(fnmatch.fnmatch("file1.txt", "file[1].txt"))
+    print(fnmatch.fnmatch("", "[]*"))
+    print(fnmatch.fnmatch("[]", "[]*"))
+    print(fnmatch.translate("["))
+    print(fnmatch.translate("]"))
+    print(fnmatch.translate("[[]"))
+    print(fnmatch.translate("[]]"))
+    # regression guard for the crash FIX below: a descending char-class range
+    # is legal CPython glob syntax (silently matches nothing); Rust's regex
+    # crate panics on it unless escaped — this must never crash pyrst. (Chars
+    # chosen so both engines agree False; the divergent chars for THIS
+    # pattern shape are a documented, out-of-parity-plan corner case — see
+    # the module header.)
+    print(fnmatch.fnmatch("5", "[9-0]"))
+    print(fnmatch.fnmatch("b", "[z-a]"))
+    # interior literal `[` inside a class body: legal CPython glob (a literal
+    # member), PANICKED pyrst before the escape fix (Rust's regex crate read it
+    # as a nested class). Now dual-run byte-identical. `[a[c]` == class {a,[,c}.
+    print(fnmatch.fnmatch("a", "[a[c]"))
+    print(fnmatch.fnmatch("[", "[a[c]"))
+    print(fnmatch.fnmatch("c", "[a[c]"))
+    print(fnmatch.fnmatch("b", "[a[c]"))
+    # leading-`]` classes with more members must also not crash and must match
+    # CPython (`]` right after `[`/`[!` is a literal member, not the closer).
+    print(fnmatch.fnmatch("]", "[]abc]"))
+    print(fnmatch.fnmatch("a", "[]a]"))
+    print(fnmatch.fnmatch("]", "[!]]"))
+    print(fnmatch.fnmatch("a", "[!]]"))
+    # ties / duplicates / empty-name edge cases in filter()
+    print(fnmatch.filter(["a", "a", "b"], "a"))
+    print(fnmatch.filter(["", "a", ""], ""))
+    print(fnmatch.filter([".", ".."], "*"))
+    # unicode (BEHAVIOR MATRIX §Unicode Support)
+    print(fnmatch.fnmatch("café", "café"))
+    print(fnmatch.fnmatch("café", "caf*"))
+    print(fnmatch.fnmatch("café", "caf?"))
+    print(fnmatch.fnmatch("🎉", "*"))
+    print(fnmatch.fnmatch("🎉test", "🎉*"))
+    print(fnmatch.fnmatch("αβγ", "α*"))
+    # regex-metacharacter literals in name/pattern (must be escaped, not
+    # interpreted, since translate() feeds through a real regex engine)
+    print(fnmatch.fnmatch("a.b", "a.b"))
+    print(fnmatch.fnmatch("axb", "a.b"))
+    print(fnmatch.fnmatch("a(b)c", "a(b)c"))
+    print(fnmatch.fnmatch("a+b", "a+b"))
+    print(fnmatch.fnmatch("a$b", "a$b"))
+    # embedded newline: fnmatch is DOTALL, so `*`/`?` must cross it
+    print(fnmatch.fnmatch("a\nb", "a*b"))
+    print(fnmatch.fnmatch("a\nb", "a?b"))

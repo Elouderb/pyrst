@@ -1,0 +1,113 @@
+# DUAL-RUN parity (W2 card cd3aa7b7): `sys` PARTIAL scope — `maxsize`,
+# `platform`, `version`, `version_info`, `exit`. Seeded from
+# docs/design/w2-dossiers/sys-partial.md §6 PARITY PLAN, adapted to what is
+# ACTUALLY dual-run-safe given pyrst's real constraints (see lib/sys.pyrs's
+# header for the full rationale), then HARDENED (w2-hardener pass, card
+# cd3aa7b7) with additional edge assertions that are still true under BOTH
+# pyrst's real values AND real CPython's real values on this host — every
+# assertion below was re-diffed against real CPython 3.12.9 before landing:
+#
+#   - `sys.maxsize` assertions skip the dossier's `== 2**63 - 1` / `< 2**64`
+#     forms: pyrst's `**` operator types as `Ty::Float` UNCONDITIONALLY
+#     (src/typeck/exprs.rs:370/962/2664 — a pre-existing, project-wide
+#     divergence with no connection to `sys`), so `2**63 - 1` cannot be
+#     compared to an `int` without a cast. The equivalent literal-form
+#     assertion (`maxsize == 9223372036854775807`) is kept — it exercises the
+#     identical claim. HARDENED: added an oddness check (`maxsize % 2 == 1`)
+#     and a negation check (`-maxsize == -9223372036854775807`, computed by
+#     negating the identifier rather than writing a `-9223372036854775808`
+#     literal — pyrst's lexer parses a leading `-` as unary minus over a
+#     POSITIVE literal, so the i64::MIN literal itself cannot be written at
+#     all in pyrst source; a pre-existing, sys-unrelated lexer limitation,
+#     not exercised here since `maxsize` itself is `i64::MAX`, not `MIN`).
+#     These are still EXACT numeric matches on any real 64-bit CPython build,
+#     not just structural ones (pyrst's `maxsize` literal is byte-identical
+#     to CPython's real `sys.maxsize` there).
+#   - `sys.platform` sticks to the dossier's own recommended-safe form
+#     (isinstance / len / membership-in-common-platforms), never the
+#     hazard-flagged exact `== 'linux'` (dossier §4.1) — pyrst hardcodes
+#     `'linux'` (POSIX-only target, see lib/sys.pyrs) which happens to match
+#     this sandbox's real CPython host, but an exact-equality assertion would
+#     be a portability trap on a non-Linux CPython host, exactly as the
+#     dossier warns. HARDENED: added two structural properties true of EVERY
+#     real CPython `sys.platform` value (`'linux'`/`'darwin'`/`'win32'`/
+#     `'cygwin'`/`'aix'`/...): it is already lowercase, and it contains no
+#     whitespace. Both hold for pyrst's hardcoded `'linux'` too.
+#   - `sys.version` assertions are restricted to claims TRUE under BOTH
+#     CPython's real version string and pyrst's honest pyrst-identity string
+#     (never a literal CPython version NUMBER — pyrst reports its OWN
+#     version, not CPython's; see lib/sys.pyrs). HARDENED: added a
+#     no-leading/trailing-whitespace check (`version.strip() == version`) and
+#     a non-empty check — both true of CPython's real one-line `sys.version`
+#     string and of pyrst's own.
+#   - `sys.version_info` is EXCLUDED from this dual-run file entirely, for the
+#     same structural reason `math.pyrs`'s `parity_math.pyrs` excludes
+#     `math.inf()`/`math.nan()`: pyrst exposes it as a niladic FUNCTION
+#     (`version_info()`, module consts must be annotated literals — see
+#     lib/sys.pyrs), but CPython's `sys.version_info` is a plain namedtuple
+#     ATTRIBUTE, not callable — `sys.version_info()` is a `TypeError` under
+#     real CPython (confirmed: swapping this file to call it fails dual-run
+#     with exactly that error). Spot-verified separately via `pyrst build`+run
+#     only — see the card history and scratchpad `smoke.pyrs`.
+#   - `sys.exit()` is exercised as the FINAL statement, called with NO
+#     ARGUMENTS (default `code=0`). This is the one exit-related case that
+#     stays dual-run-safe: an unhandled `SystemExit(None)` reaching CPython's
+#     top level exits status 0 (verified: `python3 -c "import sys; sys.exit()"`
+#     → `$?` is `0`), and pyrst's `exit()` calls `std::process::exit(0)` for
+#     the same default — so BOTH sides print identical stdout and BOTH exit
+#     0, which is what `test_all.sh`'s dual-run harness requires (it treats
+#     any non-zero run as a hard FAIL regardless of whether both sides agree,
+#     since it does not diff exit codes — only stdout). Every OTHER
+#     exit-related case (`exit(42)`, `exit(-1)`, `exit(256)` wraparound,
+#     `exit(code=N)` keyword form, catching `SystemExit`, reading `.code`)
+#     was verified MANUALLY instead (see the card history's HARDENING section) —
+#     pyrst's `exit()` is an immediate, UNCATCHABLE process termination (no
+#     `SystemExit`/`BaseException` class exists in pyrst yet, see
+#     lib/sys.pyrs), so those cases cannot be reached from inside a single
+#     dual-run stdout comparison at all: on the CPython side an unhandled
+#     `SystemExit` still lets the *rest* of a `try/except SystemExit` handler
+#     run and print more output, while on the pyrst side the process is
+#     simply gone at that exact point — a real, documented divergence, not a
+#     gap in this test.
+
+from sys import maxsize, platform, version, exit
+
+
+def main() -> None:
+    # maxsize — exact CPython parity (pyrst int is i64; no divergence)
+    print(maxsize)
+    print(maxsize == 9223372036854775807)
+    print(maxsize > 0)
+    print(isinstance(maxsize, int))
+    print(maxsize % 2 == 1)
+    print(-maxsize == -9223372036854775807)
+
+    # platform — structural checks only (dossier §4.1 hazard-safe form)
+    print(isinstance(platform, str))
+    print(len(platform) > 0)
+    print(platform in ["linux", "darwin", "win32", "cygwin"])
+    print(platform == platform.lower())
+    print(" " not in platform)
+
+    # version — structural checks only (pyrst-identity string, not CPython's)
+    print(isinstance(version, str))
+    print(len(version) > 20)
+    print("." in version)
+    print(version.strip() == version)
+    print(version != "")
+
+    # version_info is EXCLUDED from this dual-run file — see header comment
+    # ("pyrst niladic function vs. CPython callable-not attribute").
+    # Spot-verified separately (card history / scratchpad smoke.pyrs):
+    #   pyrst: version_info().major == 0, .minor == 1, .micro == 3,
+    #          .releaselevel == "final", .serial == 0
+    #   CPython 3.12.9: version_info.major == 3, .minor == 12, .micro == 9,
+    #          .releaselevel == "final", .serial == 0
+    #   (releaselevel happens to match — both are stable "final" releases —
+    #   every numeric field intentionally differs: pyrst-identity, not a
+    #   spoofed CPython version.)
+
+    # exit — default (code=0) is the one dual-run-safe termination case
+    print("before exit")
+    exit()
+    print("unreachable")

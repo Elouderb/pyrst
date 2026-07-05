@@ -34,7 +34,7 @@ def main() -> None:
     # (TypeError if passed positionally on CPython), so this coverage can't
     # be dual-run against real python3 — hand-verified against
     # `python3 -c "textwrap.wrap(..., initial_indent=..., ...)"` instead
-    # (see notes.md). All calls below use pure positional args (this
+    #. All calls below use pure positional args (this
     # build's keyword-call codegen gap, see module header).
     print(textwrap.wrap("the quick brown fox jumps", 10, ">>> ", ".. "))
     print(textwrap.wrap("supercalifragilisticexpialidocious", 10, "", "", False))

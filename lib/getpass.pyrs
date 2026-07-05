@@ -1,0 +1,79 @@
+# pyrst standard library — getpass
+#
+# FIDELITY: 3.5/5 (interactive getpass() is deferred)
+#
+# User identification and password input functions.
+#
+# SURFACE:
+#   - getuser() -> str: login name from environment or pwd fallback
+#   - getpass(prompt='Password: ') -> str: read password from terminal
+#
+# LIMITATIONS & DEFERRALS:
+#   - getpass() is INTERACTIVE and cannot be implemented in pure pyrst without
+#     terminal control (echo off/on). Marked as @extern with a docstring noting
+#     the limitation. In batch/non-TTY contexts, this function may block or fail.
+#   - getuser() implements the CPython fallback chain: LOGNAME → USER → LNAME →
+#     USERNAME environment variables. Falls back to pwd module lookup on Unix
+#     (not implemented; would require pwd module). On systems without these env
+#     vars, returns a default value.
+#   - HARDENING (card 4b6d4c36) — this module DID NOT COMPILE as delivered
+#     (three independent bugs):
+#     1. `getpass()`'s @extern body used `"{{ \` backslash-then-newline
+#        continuation inside a single-quoted string — pyrst's lexer has no
+#        such escape (`unknown escape '\x0a'`; see the identical bug in
+#        `plat.pyrs`'s HARDENING note). Flattened to one line.
+#     2. `getuser()` had `import os` INSIDE the function body. pyrst's
+#        qualified-call lowering (`os.getenv(...)` -> flat `getenv(...)`)
+#        only registers the alias for a TOP-LEVEL `import os`; a nested
+#        import compiles but the qualified call then fails at the Rust
+#        layer with `cannot find value 'os' in this scope` (verified with a
+#        minimal repro). Moved `import os` to module top level.
+#     3. `getuser()` called `os.getenv("LOGNAME", None)` expecting `str |
+#        None`, but this pyrst worktree's real `os.getenv(key: str, default:
+#        str) -> str` (`lib/os.pyrs`) takes a `str` default and returns
+#        plain `str` — a type error, not `Optional[str]`. Rewritten to pass
+#        `""` as the default and truthy-check length (matches CPython's own
+#        `if user:` truthy check on `os.environ.get(name)` exactly).
+#     4. The original signature was `getpass(prompt: str = "Password: ",
+#        stream: object | None = None)` — `object` IS NOT A PYRST TYPE
+#        (no `Any`/top type exists; `cannot find type 'object' in this
+#        scope` at the Rust layer). Rather than fake a typed no-op param,
+#        `stream` is DROPPED entirely: pyrst has no file-like-object type to
+#        accept it honestly, so a caller passing `stream=...` now gets a
+#        real "unknown keyword argument" check error instead of a
+#        silently-ignored accepted param. CPython call sites that only pass
+#        `prompt` (the overwhelming common case) are unaffected.
+
+import os
+
+def getuser() -> str:
+    """Return login name from environment variables or pwd fallback.
+
+    Tries LOGNAME, USER, LNAME, USERNAME in order (CPython's exact chain,
+    truthy-checked so an EMPTY env var is skipped like real `os.environ.get`
+    + `if user:`). Falls back to 'unknown' if none are set (pwd module not
+    available in pyrst — see module header LIMITATIONS).
+    """
+    logname: str = os.getenv("LOGNAME", "")
+    if len(logname) > 0:
+        return logname
+
+    user: str = os.getenv("USER", "")
+    if len(user) > 0:
+        return user
+
+    lname: str = os.getenv("LNAME", "")
+    if len(lname) > 0:
+        return lname
+
+    username: str = os.getenv("USERNAME", "")
+    if len(username) > 0:
+        return username
+
+    # Fallback: pwd module not available in pyrst, so return a default
+    return "unknown"
+
+
+@extern
+def getpass(prompt: str = "Password: ") -> str:
+    "{ use std::io::Write; eprint!(\"{}\", {prompt}); let _ = std::io::stderr().flush(); let mut password = String::new(); std::io::stdin().read_line(&mut password).ok(); password.trim_end().to_string() }"

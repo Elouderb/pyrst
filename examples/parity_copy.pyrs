@@ -1,0 +1,94 @@
+# parity: dual-run
+# NOTE on structure: every `copy.copy(...)`/`copy.deepcopy(...)` call below is
+# assigned to a TYPED LOCAL first, then asserted on the local — never
+# `assert copy.copy(x) == y` directly. This works around a confirmed pyrst
+# codegen bug (out of scope to fix here, reported upstream via a minimal
+# repro): a call to a GENERIC free function written directly inside an
+# `assert` statement's test expression is never monomorphized, so the
+# generated Rust hits "cannot find function `copy`/`deepcopy` in this scope"
+# even though the exact same call assigned to a variable first compiles fine.
+# This matches the established convention already used elsewhere in this repo
+# (see examples/parity_bisect.pyrs) for the same reason.
+#
+# Also NOTE: `copy.deepcopy(None)` (a BARE `None` literal, no other argument)
+# is intentionally not tested — pyrst cannot infer the generic type parameter
+# `T` from a bare `None` literal (confirmed: it type-checks as `Option<_>`
+# with no concrete inner type, producing a doubly-wrapped `Option<Option<_>>`
+# mismatch). Passing a `None`-valued but concretely-TYPED variable (e.g.
+# `n: Optional[int] = None`) infers `T = Optional[int]` correctly and is
+# tested below instead.
+import copy
+from copy import Error
+
+def main() -> None:
+    # Immutables: int / str / float, including negative/zero/unicode edges.
+    a: int = copy.copy(42)
+    assert a == 42
+    a_neg: int = copy.copy(-1)
+    assert a_neg == -1
+    a_zero: int = copy.copy(0)
+    assert a_zero == 0
+
+    b: str = copy.copy("hello")
+    assert b == "hello"
+    b_empty: str = copy.copy("")
+    assert b_empty == ""
+    b_unicode: str = copy.copy("héllo Ω 日本語")
+    assert b_unicode == "héllo Ω 日本語"
+
+    c: float = copy.copy(3.14)
+    assert c == 3.14
+    c_neg: float = copy.copy(-0.0)
+    assert c_neg == -0.0
+
+    d: int = copy.deepcopy(42)
+    assert d == 42
+    e: str = copy.deepcopy("")
+    assert e == ""
+
+    # None via a concretely-typed variable (see NOTE above for why a bare
+    # `None` literal argument is not used directly).
+    n: Optional[int] = None
+    n_copy: Optional[int] = copy.copy(n)
+    assert n_copy is None
+    n_deep: Optional[int] = copy.deepcopy(n)
+    assert n_deep is None
+
+    # Containers: copy.copy/deepcopy on a list. In CPython, copy.copy(list)
+    # makes a NEW outer list (so appending to the original afterward does not
+    # affect the copy) — pyrst's value semantics give the identical outcome
+    # for a top-level container of immutable elements, so this is safe,
+    # genuine dual-run parity (not just a pyrst-only coincidence).
+    original: list[int] = [1, 2, 3]
+    shallow: list[int] = copy.copy(original)
+    assert shallow == [1, 2, 3]
+    original.append(4)
+    assert shallow == [1, 2, 3], "copy.copy(list) must not alias the original"
+    assert original == [1, 2, 3, 4]
+
+    original2: list[int] = [5, 6]
+    deep: list[int] = copy.deepcopy(original2)
+    assert deep == [5, 6]
+    original2.append(7)
+    assert deep == [5, 6], "copy.deepcopy(list) must not alias the original"
+
+    # Empty list edge case.
+    empty_list: list[int] = []
+    empty_copy: list[int] = copy.copy(empty_list)
+    assert empty_copy == []
+
+    # copy.Error is a real, usable exception type (raise/except by type,
+    # not just by name) even though copy()/deepcopy() never raise it
+    # themselves in this simplified module (no cycles, no unpicklable types
+    # to fail on in pyrst).
+    caught: bool = False
+    msg: str = ""
+    try:
+        raise Error("boom")
+    except Error as err:
+        caught = True
+        msg = str(err)
+    assert caught
+    assert msg == "boom"
+
+    print("parity_copy: all assertions passed")

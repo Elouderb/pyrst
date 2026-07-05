@@ -1,0 +1,50 @@
+from errno import EPERM, ENOENT, ESRCH, EINTR, EIO, EAGAIN, ENOMEM, EACCES, EBADF, EBUSY
+from errno import EEXIST, EISDIR, EINVAL, ENFILE, EMFILE, EROFS, EPIPE, ERANGE, ENOSYS, EWOULDBLOCK
+from errno import EDEADLK, EDEADLOCK, ENOTSUP, EOPNOTSUPP, ERFKILL
+
+# NOTE (HARDENING, card 4b6d4c36): the writer's original `errorcode` was a
+# module-level `dict[int, str]` literal — pyrst has NO module-level dict
+# state at all (only scalar int/float/str/bool literal consts are legal top
+# level; see `src/typeck/checks.rs::is_const_literal`), so it never compiled
+# ("top-level statements other than function/class/import ... are not
+# supported"). `errno.pyrs` now exposes `errorcode` as a FUNCTION,
+# `errorcode(code: int) -> str`, which cannot dual-run against CPython's real
+# dict (`errorcode(1)` raises `TypeError: 'dict' object is not callable`
+# under real Python). Its behavior is instead covered by the separate
+# separate pyrst-only file `parity_errno_errorcode.pyrs`. This file stays
+# fully dual-run, covering the 133 scalar error constants only.
+def main() -> None:
+    # errno Constants (Common Subset, 10 cases)
+    assert EPERM == 1
+    assert ENOENT == 2
+    assert ESRCH == 3
+    assert EINTR == 4
+    assert EIO == 5
+    assert EAGAIN == 11
+    assert ENOMEM == 12
+    assert EACCES == 13
+    assert EBADF == 9
+    assert EBUSY == 16
+
+    # Additional constants (10 more)
+    assert EEXIST == 17
+    assert EISDIR == 21
+    assert EINVAL == 22
+    assert ENFILE == 23
+    assert EMFILE == 24
+    assert EROFS == 30
+    assert EPIPE == 32
+    assert ERANGE == 34
+    assert ENOSYS == 38
+    assert EWOULDBLOCK == 11
+
+    # Alias-collision ties (same int value, two symbolic names — verified
+    # live against real CPython 3.12; each pair must be numerically equal).
+    assert EAGAIN == EWOULDBLOCK
+    assert EDEADLK == EDEADLOCK
+    assert ENOTSUP == EOPNOTSUPP
+
+    # Boundary: highest-numbered constant in the table.
+    assert ERFKILL == 132
+
+    print("PASS")

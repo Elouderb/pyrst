@@ -1,0 +1,960 @@
+# pyrst standard library — difflib (W2, core sequence comparison)
+#
+# Fidelity score: 3/5 (see Divergences below — this is the hardest W2 unit;
+# the CORE engine (SequenceMatcher's greedy longest-match recursion, exact
+# `Match`/opcode tuples, both ratio families, `get_close_matches`, and
+# `unified_diff`'s exact hunk formatting) is a faithful, line-for-line port
+# of CPython's `Lib/difflib.py` reference algorithm. `ndiff`'s character-level
+# "fancy replace" ('?' marker lines) is also ported, but is the LEAST
+# battle-tested corner — see Divergences #4).
+#
+# Public API implemented (CPython names/shapes, all embedded via
+# `include_str!`, see `src/stdlib.rs`; usable as either
+# `from difflib import SequenceMatcher` or `import difflib;
+# difflib.SequenceMatcher(...)`):
+#   - `Match`                              dataclass(a: int, b: int, size: int)
+#     — CPython's `Match` is a namedtuple; pyrst has no namedtuple, so this
+#       is a `@dataclass` instead. `@dataclass` synthesizes `__init__` in
+#       FIELD order (so positional `Match(11, 13, 0)` and keyword
+#       `Match(a=11, b=13, size=0)` both work) plus `__repr__`
+#       (`"Match(a=11, b=13, size=0)"`, matching CPython's namedtuple repr
+#       EXACTLY) and `__eq__`/`__lt__`-free structural equality — see
+#       Divergences #1 for the one thing a dataclass can't give us
+#       (tuple-style `m[0]` indexing) and Implementation Notes for how
+#       `sorted()`/`get_matching_blocks` still gets ordering.
+#   - `SequenceMatcher(isjunk=None, a="", b="", autojunk=True)`  class, over
+#     `str` sequences only (see Divergences #2 for the list/tuple gap):
+#       - `set_seqs(a, b)` / `set_seq1(a)` / `set_seq2(b)`
+#       - `find_longest_match(alo=0, ahi=None, blo=0, bhi=None) -> Match`
+#       - `get_matching_blocks() -> list[Match]` (sentinel `Match(len(a),
+#         len(b), 0)` always last, exactly like CPython)
+#       - `get_opcodes() -> list[tuple[str, int, int, int, int]]` — PLAIN
+#         tuples (`tag`, `i1`, `i2`, `j1`, `j2`), matching CPython (opcodes
+#         are NOT namedtuples in CPython either).
+#       - `get_grouped_opcodes(n=3) -> list[list[tuple[str,int,int,int,int]]]`
+#         — **CORRECTED CLAIM** (an earlier version of this header
+#         incorrectly asserted CPython types this eager): CPython's actual
+#         `get_grouped_opcodes` is a GENERATOR function (`yield`s each
+#         group lazily). This port returns an eager `list` of `list`s
+#         instead — a real, honest laziness divergence (`for group in
+#         sm.get_grouped_opcodes(n):` and `list(sm.get_grouped_opcodes(n))`
+#         both work identically either way and produce byte-identical
+#         grouped-tuple VALUES against live CPython, verified; only
+#         infinite-consumption-order tricks a lazy caller could rely on,
+#         e.g. mutating `codes` between yields, would differ, and no such
+#         usage exists anywhere in this port or its parity file).
+#       - `ratio() -> float`, `quick_ratio() -> float`,
+#         `real_quick_ratio() -> float` — CPython's exact three-tier formula
+#         family (`2.0*M/T`; `quick_ratio`/`real_quick_ratio` are increasingly
+#         cheap over-estimates, per CPython's own documented contract
+#         `real_quick_ratio() >= quick_ratio() >= ratio()`).
+#   - `get_close_matches(word, possibilities, n=3, cutoff=0.6) -> list[str]`
+#     — exact CPython selection semantics (ratio >= cutoff, top `n` by
+#     ratio, ties broken by EARLIEST position in `possibilities`) and exact
+#     `ValueError` text for bad `n`/`cutoff` (see ERRORS below).
+#   - `unified_diff(a, b, fromfile="", tofile="", fromfiledate="",
+#     tofiledate="", n=3, lineterm="\n") -> Iterator[str]` — exact hunk
+#     headers (`@@ -l,s +l,s @@`, count-of-1 range omits the `,count`,
+#     empty-range special case `beginning -= 1`), exact ` `/`-`/`+`
+#     line-prefixing, empty-diff-produces-empty-output.
+#   - `ndiff(a, b, linejunk=None, charjunk=None) -> Iterator[str]` — line-level
+#     diff (`  `/`- `/`+ ` prefixed lines) PLUS the character-level `? `
+#     marker lines for a close single-line replace (CPython's
+#     `Differ._fancy_replace`); see Divergences #3 (`charjunk` signature
+#     shape) and #4 (fidelity caveat).
+#   - `IS_CHARACTER_JUNK(ch) -> bool` — `ch == " " or ch == "\t"`, CPython's
+#     exact default whitespace set.
+#   - `IS_LINE_JUNK(line) -> bool` — CPython-equivalent approximation: True
+#     iff `line` (with at most one trailing `\n` stripped) is blank, or is
+#     exactly a single `#` after stripping surrounding whitespace. CPython's
+#     real default is a regex `\s*#?\s*$`; this pyrst port is NOT a full
+#     regex port (no capture-group-free single-`#`-anywhere-inside-whitespace
+#     generality beyond "the entire non-whitespace content is one `#`") —
+#     see Divergences #5. Not exercised by the PARITY PLAN (callers there
+#     use a dedicated inline `is_blank` of their own).
+#
+# DEFERRED (documented, not implemented — none are in the card's punch list
+# or the dossier's PARITY PLAN, so cutting them keeps the tested core solid):
+#   - `diff_bytes`: needs a `bytes` type (G1). Dossier explicitly flags this
+#     as out of initial scope.
+#   - `HtmlDiff`, `Differ` (the class): dossier's own deferral suggestion
+#     ("Skip diff_bytes, HtmlDiff, Differ initially"). `ndiff` (the FUNCTION,
+#     which is `Differ(...).compare(...)` in CPython) is fully implemented
+#     directly against the same shared engine — only the public class
+#     WRAPPER around it is skipped.
+#   - `context_diff`: zero coverage in the dossier's PARITY PLAN; shares
+#     `get_grouped_opcodes` with `unified_diff` so is mechanically easy to
+#     add later, just not built this pass to keep effort on tested surface.
+#   - `restore(delta, which)`: same reasoning — zero PARITY PLAN coverage.
+#
+# ERRORS (matches the dossier's ERRORS table):
+#   - `get_close_matches(..., n=0)` / `n=-1` -> `ValueError("n must be > 0: "
+#     + str(n))` — exact CPython message text.
+#   - `get_close_matches(..., cutoff=1.5)` / `cutoff=-0.5` ->
+#     `ValueError("cutoff must be in [0.0, 1.0]: " + str(cutoff))` — exact
+#     CPython message text.
+#   - CPython's dynamic `TypeError`s (`get_close_matches(123, ...)`,
+#     `cutoff="0.5"`, `n="3"`, `unified_diff([[1],[2]], ...)`,
+#     `ndiff([["a"]], ...)`) have NO pyrst equivalent: `word: str`,
+#     `n: int`, `cutoff: float`, `a: list[str]` are enforced by pyrst's
+#     static type system, so passing a list/int/str where a str/int/float
+#     is declared is rejected at COMPILE TIME (a check error), not raised
+#     as a catchable runtime `TypeError`. This is the same "dynamic-type
+#     TypeError becomes a static check error" divergence class documented
+#     across every other stdlib unit in this project — not new here.
+#
+# Divergences (documented, not silent):
+#   1. **`Match` is a `@dataclass`, not a namedtuple**: CPython callers can
+#      do `m[0]`/`m[1]`/`m[2]` (tuple-style) OR `m.a`/`m.b`/`m.size`
+#      (attribute-style) on a `Match`. pyrst's `Match` supports ONLY
+#      attribute access (`m.a`, `m.b`, `m.size`) — no `__getitem__` (not a
+#      supported dunder). `repr(Match(11,13,0))` still prints EXACTLY
+#      `"Match(a=11, b=13, size=0)"` (verified against CPython — dataclass
+#      repr shape and namedtuple repr shape happen to coincide).
+#   2. **`SequenceMatcher` is `str`-only, not duck-typed over any sequence**:
+#      CPython's `SequenceMatcher` works over strings, lists, or tuples of
+#      ANY hashable element (including heterogeneous element types, e.g.
+#      `[1, 2, 3, 4]` vs `[1, 'x', 3, 4]`). pyrst has no `Any`/dynamic type,
+#      so a single concrete class cannot duck-type over `str` AND
+#      `list[int]` AND heterogeneous lists simultaneously — and the
+#      dossier's OWN literal constructor signature
+#      (`SequenceMatcher(isjunk=None, a='', b='', autojunk=True)`) already
+#      commits to `str` defaults, confirming text comparison as the primary,
+#      intended use case. The `list[int]`/`tuple[int,...]`/mixed-type rows
+#      in the dossier's BEHAVIOR MATRIX and PARITY PLAN
+#      (`SequenceMatcher(None, [1,2,3], [1,2,3])`, `(1,2,3)` vs `(1,2,4)`,
+#      the mixed `[1,'x',3,4]` row) are NOT reachable — that generality is
+#      deferred; ONLY `str` sequences are supported. This is why the parity
+#      file below marks that block `# parity: pyrst-only (str-only
+#      SequenceMatcher)` and substitutes same-type-representable analogues
+#      where the underlying algorithmic behavior is still worth covering.
+#   3. **`ndiff`'s `charjunk` default is `None`, not `IS_CHARACTER_JUNK`**:
+#      the dossier's own GATED table calls this out (G4: pyrst's keyword
+#      defaults can't carry a bare top-level FUNCTION NAME as a literal
+#      default value reliably through every call shape here, and even where
+#      they can — see `parity_functools.pyrs`'s `Callable[[int],int] =
+#      square` precedent — binding it inside a DEFAULT PARAMETER expression
+#      in a function signature, rather than a local-variable initializer,
+#      is untested/unsupported terrain this pass). The WORKAROUND: both
+#      `linejunk` and `charjunk` are `Optional[Callable[[str], bool]] =
+#      None`; when `charjunk` is omitted (`None`), `ndiff` substitutes
+#      `IS_CHARACTER_JUNK` internally. Net observable behavior for every
+#      omitted-or-explicit-function call site is IDENTICAL to CPython;
+#      only an explicit `ndiff(a, b, charjunk=None)` (deliberately passing
+#      `None`) diverges — CPython would then get a `None` stored as
+#      `self.charjunk` (never called with the exact opcode shapes in this
+#      port's char-level path, so this rarely surfaces) whereas pyrst
+#      substitutes `IS_CHARACTER_JUNK`. Not in the PARITY PLAN.
+#   4. **`ndiff`'s "fancy replace" (`?` marker lines) is the least hardened
+#      corner of this port.** It is a faithful transcription of CPython's
+#      `Differ._fancy_replace`/`_fancy_helper`/`_qformat` (best-candidate
+#      line search via `real_quick_ratio`/`quick_ratio`/`ratio` short-circuit
+#      cascade, then a char-level `SequenceMatcher` over the two winning
+#      lines to build the `^`/`-`/`+`/` ` tag strings, then
+#      `_difflib_keep_original_ws` to fold whitespace-preserving positions
+#      back in before `.rstrip()`), verified against the dossier's own
+#      single-line-replace PARITY PLAN case
+#      (`["abc\n"]`/`["aXc\n"]` -> `? ` lines with `^` under the changed
+#      column) but NOT independently stress-tested beyond that one shape
+#      (e.g. multi-line replace blocks picking a best-i/best-j pair have
+#      only been reasoned through against the CPython source, not
+#      dual-run-verified against a battery of multi-line cases).
+#   5. **`IS_LINE_JUNK` is an approximation, not a regex port**: see the
+#      Public API note above. No `re` dependency was pulled in for one
+#      predicate; the common "blank line" and "bare `#` line" cases (the
+#      only shapes CPython's own docstring examples exercise) are exact.
+#   6. **`SequenceMatcher(...)` positional calls must supply all FOUR
+#      constructor args (or use keyword args for the omitted trailing
+#      ones)**: a pyrst CODEGEN GAP (not a stdlib design choice) means a
+#      class `__init__`'s trailing DEFAULT arguments are not filled in for a
+#      plain positional call that omits them (`SequenceMatcher(None, "a",
+#      "b")` — 3 positional args, relying on `autojunk`'s default — fails
+#      to build with a Rust `E0061` arg-count mismatch). The SAME
+#      trailing-default omission works FINE for ordinary free functions
+#      (e.g. `get_close_matches("x", ["y"])`, omitting `n`/`cutoff`,
+#      compiles and runs correctly) and also works fine via an explicit
+#      KEYWORD call on the constructor itself
+#      (`SequenceMatcher(isjunk=None, a="a", b="b")` builds and runs
+#      correctly) — so the gap is specific to POSITIONAL-with-omission on a
+#      class constructor. WORKAROUND used throughout this module and its
+#      parity file: always pass all four constructor positionals
+#      explicitly (`SequenceMatcher(None, a, b, True)`), which is equally
+#      valid CPython syntax (an explicit `True` for the already-default
+#      `autojunk` changes nothing observable) so dual-run byte-identical
+#      parity is unaffected — only the LITERAL 3-arg spelling from the
+#      dossier's own PARITY PLAN snippets had to be expanded to 4 args.
+#      The SAME family of gap also showed up on `find_longest_match`'s
+#      `Optional[int]` params: a positional literal int
+#      (`find_longest_match(0, 6, 0, 6)`) fails to coerce to `Some(6)` for
+#      a class METHOD (whereas a plain free FUNCTION with an
+#      `Optional[int]` parameter, e.g. `bisect_left(a, 3, 1, 5)`, coerces
+#      the positional literal fine) — worked around the same way, with
+#      keyword args (`find_longest_match(alo=0, ahi=6, blo=0, bhi=6)`).
+#   7a. **HARDENING (card fb63e9dc, reviewer w2-hardener): a real pyrst
+#      COMPILER gap, not a difflib bug — passing a custom `isjunk`/
+#      `linejunk`/`charjunk` callable (a bare top-level function name, OR a
+#      lambda literal) DIRECTLY into `SequenceMatcher(...)`'s constructor
+#      call (positional OR keyword, tested both) fails to build
+#      (`E0308`/`E0282`: the codegen never `Some(Rc::new(...))`-wraps a
+#      fn-item/closure argument for a class constructor's
+#      `Optional[Callable]`-typed parameter). Confirmed with a minimal
+#      isolated repro that this affects ANY class (not specific to
+#      `SequenceMatcher`) — a plain free FUNCTION with the identical
+#      `Optional[Callable]` parameter shape handles the same call correctly,
+#      so the gap is constructor-call-path-specific (a sibling of
+#      Divergence #6's class-constructor codegen gaps, but a distinct
+#      symptom: value-wrapping, not default-filling). WORKAROUND (verified
+#      to compile and produce byte-identical dual-run results — see
+#      `examples/parity_difflib.pyrs`'s HARDENING block): bind the
+#      lambda/function reference to a plain (non-`Optional`)
+#      `Callable[...]`-typed local FIRST, then assign that local to an
+#      `Optional[Callable[...]]`-typed local, and pass the SECOND local to
+#      the constructor. Flagged for the same compiler follow-up card as
+#      Divergence #6.
+#   7. **No memoized `matching_blocks`/`opcodes`/`fullbcount` caching**:
+#      CPython's `SequenceMatcher` caches `get_matching_blocks()`/
+#      `get_opcodes()`/`quick_ratio()`'s `fullbcount` on the instance until
+#      `set_seq1`/`set_seq2` invalidates them. pyrst has no ergonomic
+#      `Optional[T]`-field-narrowing story for this pattern (see
+#      `docs/design` narrowing notes — narrowing a `self.slot` directly,
+#      rather than a local copy, is unsupported), so every call
+#      RECOMPUTES from scratch. Purely a performance divergence — every
+#      returned VALUE is identical to CPython's cached version, just
+#      recomputed each call. Not observable in any test in this port.
+#
+# Implementation notes:
+#   - The real engine is a set of `_difflib_`-prefixed MODULE-LEVEL helper
+#     functions operating uniformly over `list[str]` ("tokens"): for
+#     char-level comparison (the `SequenceMatcher` class, and `ndiff`'s
+#     inner char-level pass) a token is one character
+#     (`_difflib_str_to_tokens` splits a `str` into `list[str]` of
+#     single-char strings); for line-level comparison (`unified_diff`,
+#     `ndiff`'s outer pass) a token is already a whole line (`list[str]` is
+#     the natural CPython shape for line-oriented diffing). Sharing ONE
+#     `list[str]`-based engine for both granularities means the exact same
+#     `_difflib_find_longest_match`/`_difflib_get_matching_blocks`/
+#     `_difflib_get_opcodes`/`_difflib_build_b2j` code paths back both use
+#     cases, with `SequenceMatcher` and `unified_diff`/`ndiff` as thin
+#     callers over the shared engine (`SequenceMatcher` additionally
+#     converts its `str` inputs to char-tokens first).
+#   - `_difflib_B2J` (a small `@dataclass`) bundles the `b2j: dict[str,
+#     list[int]]` bucket map together with the `bjunk: set[str]` set of
+#     junked elements — `_difflib_build_b2j` builds both in one pass
+#     (an element is added to `b2j` iff it is not junk; `autojunk`'s
+#     "popular element" filtering is a SECOND pass over a `raw` dict,
+#     producing a fresh filtered `b2j`, rather than `del`-ing keys in place
+#     — pyrst has no precedent anywhere in this codebase for a dict `del`
+#     statement, so this port follows `collections.pyrs`'s established
+#     "build a filtered copy" idiom instead of risking an unsupported
+#     construct).
+#   - `find_longest_match`'s inner index-buckets loop (`for j in
+#     b2j[a[i]]: ... if j >= bhi: break`) is a direct transcription of
+#     CPython's own loop, using `break`/`continue` (both used elsewhere in
+#     this stdlib, e.g. `itertools.pyrs`/`textwrap.pyrs`) rather than the
+#     card's suggested pure index-loop style — `break`/`continue` inside a
+#     `for` ARE index-loop-safe (no while-narrowing-with-reassignment
+#     hazard: nothing here narrows an `Optional` across a mutating while
+#     loop).
+#   - `get_matching_blocks` reproduces CPython's iterative queue-based
+#     recursion (a `list[tuple[int,int,int,int]]` used as an explicit
+#     stack via `.append`/`.pop()`, exactly mirroring CPython's own
+#     `queue.pop()`-based iterative rewrite of the conceptually-recursive
+#     algorithm) followed by the adjacent-block-merge pass and the
+#     `Match(len(a), len(b), 0)` sentinel append.
+#   - Sorting `list[Match]` (`sorted(blocks)`) needed `Match.__lt__`
+#     (tuple-style `(a, b, size)` lexicographic ordering) since pyrst's
+#     `sorted()`/`min()`/`max()` over a user class REQUIRE an explicit
+#     `__lt__` — a `@dataclass` alone does not synthesize one.
+#   - `get_close_matches`'s ranking (`_difflib_gcm_top_n`) is a selection-
+#     sort scan (same shape as `collections.pyrs`'s `_collections_top_n`):
+#     repeatedly pick the highest-`(ratio, str)`-tuple NOT-YET-TAKEN
+#     candidate. **HARDENING FIX**: an earlier version of this port broke
+#     ties (two DISTINCT possibilities with an identical ratio) by input
+#     order; live re-oracling found that's WRONG —
+#     `get_close_matches("aaa", ["aab", "aac"], cutoff=0.0)` returns
+#     `["aac", "aab"]` in real CPython, not `["aab", "aac"]`. CPython's
+#     `heapq.nlargest(n, [(ratio, x) for x in possibilities])` compares the
+#     FULL `(ratio, x)` tuple, so a tie on `ratio` falls through to comparing
+#     the possibility strings themselves — the LEXICOGRAPHICALLY GREATER
+#     string wins the tie, not the earliest input position. `_difflib_score_
+#     greater` now reproduces this exactly (`(ratio, str)` tuple comparison);
+#     only truly-identical `(ratio, str)` pairs (duplicate strings) remain
+#     input-order-stable, matching CPython's stable-sort behavior for actual
+#     duplicates. See `examples/parity_difflib.pyrs`'s tie-break cases.
+#   - `unified_diff`/`context_diff`-style range formatting
+#     (`_difflib_format_range_unified`) reproduces CPython's `beginning -=
+#     1` empty-range special case and the `length == 1` -> no `,count`
+#     shortcut exactly (verified against the dossier's `@@ -1 +0,0 @@`
+#     deletion-hunk example).
+#   - `isjunk`/`linejunk`/`charjunk` narrowing: every place this port needs
+#     to call a `self.isjunk`/parameter-supplied `Optional[Callable]`, the
+#     `Optional` value is first bound to a plain local (`ij: Optional[...] =
+#     self.isjunk`) and narrowed there — narrowing directly on an attribute
+#     chain (`if self.isjunk is not None:`) is documented elsewhere in this
+#     project as unsupported.
+
+from dataclasses import dataclass
+
+
+@dataclass
+class Match:
+    a: int
+    b: int
+    size: int
+
+    def __lt__(self, other: Match) -> bool:
+        if self.a != other.a:
+            return self.a < other.a
+        if self.b != other.b:
+            return self.b < other.b
+        return self.size < other.size
+
+
+@dataclass
+class _difflib_B2J:
+    b2j: dict[str, list[int]]
+    bjunk: set[str]
+
+
+def IS_CHARACTER_JUNK(ch: str) -> bool:
+    return ch == " " or ch == "\t"
+
+
+def IS_LINE_JUNK(line: str) -> bool:
+    s: str = line
+    n: int = len(s)
+    if n > 0 and s[n - 1] == "\n":
+        s = s[0:n - 1]
+    t: str = s.strip()
+    if t == "":
+        return True
+    if t == "#":
+        return True
+    return False
+
+
+def _difflib_resolve_hi(v: Optional[int], default_val: int) -> int:
+    if v is not None:
+        return v
+    return default_val
+
+
+def _difflib_str_to_tokens(s: str) -> list[str]:
+    out: list[str] = []
+    i: int = 0
+    n: int = len(s)
+    while i < n:
+        out.append(s[i])
+        i = i + 1
+    return out
+
+
+def _difflib_build_b2j(b: list[str], isjunk: Optional[Callable[[str], bool]], autojunk: bool) -> _difflib_B2J:
+    raw: dict[str, list[int]] = {}
+    bjunk: set[str] = set()
+    n: int = len(b)
+    i: int = 0
+    while i < n:
+        elt: str = b[i]
+        if elt not in bjunk:
+            if isjunk is not None:
+                fn: Callable[[str], bool] = isjunk
+                if fn(elt):
+                    bjunk.add(elt)
+        if elt not in bjunk:
+            if elt in raw:
+                raw[elt].append(i)
+            else:
+                raw[elt] = [i]
+        i = i + 1
+    bpopular: set[str] = set()
+    if autojunk and n >= 200:
+        ntest: int = n // 100 + 1
+        for elt in raw:
+            idxs: list[int] = raw[elt]
+            if len(idxs) > ntest:
+                bpopular.add(elt)
+    b2j: dict[str, list[int]] = {}
+    for elt in raw:
+        if elt not in bpopular:
+            b2j[elt] = raw[elt]
+    return _difflib_B2J(b2j, bjunk)
+
+
+def _difflib_find_longest_match(a: list[str], b: list[str], b2j: dict[str, list[int]], bjunk: set[str], alo: int, ahi: int, blo: int, bhi: int) -> Match:
+    besti: int = alo
+    bestj: int = blo
+    bestsize: int = 0
+    j2len: dict[int, int] = {}
+    i: int = alo
+    while i < ahi:
+        ai: str = a[i]
+        newj2len: dict[int, int] = {}
+        if ai in b2j:
+            idxs: list[int] = b2j[ai]
+            for j in idxs:
+                if j < blo:
+                    continue
+                if j >= bhi:
+                    break
+                prev: int = 0
+                if (j - 1) in j2len:
+                    prev = j2len[j - 1]
+                k: int = prev + 1
+                newj2len[j] = k
+                if k > bestsize:
+                    besti = i - k + 1
+                    bestj = j - k + 1
+                    bestsize = k
+        j2len = newj2len
+        i = i + 1
+    while besti > alo and bestj > blo and (b[bestj - 1] not in bjunk) and a[besti - 1] == b[bestj - 1]:
+        besti = besti - 1
+        bestj = bestj - 1
+        bestsize = bestsize + 1
+    while (besti + bestsize) < ahi and (bestj + bestsize) < bhi and (b[bestj + bestsize] not in bjunk) and a[besti + bestsize] == b[bestj + bestsize]:
+        bestsize = bestsize + 1
+    while besti > alo and bestj > blo and (b[bestj - 1] in bjunk) and a[besti - 1] == b[bestj - 1]:
+        besti = besti - 1
+        bestj = bestj - 1
+        bestsize = bestsize + 1
+    while (besti + bestsize) < ahi and (bestj + bestsize) < bhi and (b[bestj + bestsize] in bjunk) and a[besti + bestsize] == b[bestj + bestsize]:
+        bestsize = bestsize + 1
+    return Match(besti, bestj, bestsize)
+
+
+def _difflib_get_matching_blocks(a: list[str], b: list[str], b2j: dict[str, list[int]], bjunk: set[str]) -> list[Match]:
+    la: int = len(a)
+    lb: int = len(b)
+    queue: list[tuple[int, int, int, int]] = [(0, la, 0, lb)]
+    blocks: list[Match] = []
+    while len(queue) > 0:
+        item: tuple[int, int, int, int] = queue.pop()
+        alo: int = item[0]
+        ahi: int = item[1]
+        blo: int = item[2]
+        bhi: int = item[3]
+        m: Match = _difflib_find_longest_match(a, b, b2j, bjunk, alo, ahi, blo, bhi)
+        if m.size > 0:
+            blocks.append(m)
+            if alo < m.a and blo < m.b:
+                queue.append((alo, m.a, blo, m.b))
+            if (m.a + m.size) < ahi and (m.b + m.size) < bhi:
+                queue.append((m.a + m.size, ahi, m.b + m.size, bhi))
+    sorted_blocks: list[Match] = sorted(blocks)
+    result: list[Match] = []
+    i1: int = 0
+    j1: int = 0
+    k1: int = 0
+    for blk in sorted_blocks:
+        if (i1 + k1) == blk.a and (j1 + k1) == blk.b:
+            k1 = k1 + blk.size
+        else:
+            if k1 > 0:
+                result.append(Match(i1, j1, k1))
+            i1 = blk.a
+            j1 = blk.b
+            k1 = blk.size
+    if k1 > 0:
+        result.append(Match(i1, j1, k1))
+    result.append(Match(la, lb, 0))
+    return result
+
+
+def _difflib_get_opcodes(a: list[str], b: list[str], blocks: list[Match]) -> list[tuple[str, int, int, int, int]]:
+    i: int = 0
+    j: int = 0
+    result: list[tuple[str, int, int, int, int]] = []
+    for blk in blocks:
+        ai: int = blk.a
+        bj: int = blk.b
+        size: int = blk.size
+        tag: str = ""
+        if i < ai and j < bj:
+            tag = "replace"
+        elif i < ai:
+            tag = "delete"
+        elif j < bj:
+            tag = "insert"
+        if tag != "":
+            result.append((tag, i, ai, j, bj))
+        i = ai + size
+        j = bj + size
+        if size > 0:
+            result.append(("equal", ai, i, bj, j))
+    return result
+
+
+def _difflib_get_grouped_opcodes(codes_in: list[tuple[str, int, int, int, int]], n: int) -> list[list[tuple[str, int, int, int, int]]]:
+    codes: list[tuple[str, int, int, int, int]] = []
+    for c in codes_in:
+        codes.append(c)
+    if len(codes) == 0:
+        codes.append(("equal", 0, 1, 0, 1))
+    first_tag: str = codes[0][0]
+    if first_tag == "equal":
+        c0: tuple[str, int, int, int, int] = codes[0]
+        i1: int = c0[1]
+        i2: int = c0[2]
+        j1: int = c0[3]
+        j2: int = c0[4]
+        new_i1: int = i1
+        if (i2 - n) > new_i1:
+            new_i1 = i2 - n
+        new_j1: int = j1
+        if (j2 - n) > new_j1:
+            new_j1 = j2 - n
+        codes[0] = ("equal", new_i1, i2, new_j1, j2)
+    last_idx: int = len(codes) - 1
+    last_tag: str = codes[last_idx][0]
+    if last_tag == "equal":
+        cl: tuple[str, int, int, int, int] = codes[last_idx]
+        li1: int = cl[1]
+        li2: int = cl[2]
+        lj1: int = cl[3]
+        lj2: int = cl[4]
+        new_i2: int = li2
+        if (li1 + n) < new_i2:
+            new_i2 = li1 + n
+        new_j2: int = lj2
+        if (lj1 + n) < new_j2:
+            new_j2 = lj1 + n
+        codes[last_idx] = ("equal", li1, new_i2, lj1, new_j2)
+    nn: int = n + n
+    groups: list[list[tuple[str, int, int, int, int]]] = []
+    group: list[tuple[str, int, int, int, int]] = []
+    for c in codes:
+        tag: str = c[0]
+        gi1: int = c[1]
+        gi2: int = c[2]
+        gj1: int = c[3]
+        gj2: int = c[4]
+        if tag == "equal" and (gi2 - gi1) > nn:
+            e_i2: int = gi1 + n
+            if gi2 < e_i2:
+                e_i2 = gi2
+            e_j2: int = gj1 + n
+            if gj2 < e_j2:
+                e_j2 = gj2
+            group.append(("equal", gi1, e_i2, gj1, e_j2))
+            groups.append(group)
+            s_i1: int = gi2 - n
+            if gi1 > s_i1:
+                s_i1 = gi1
+            s_j1: int = gj2 - n
+            if gj1 > s_j1:
+                s_j1 = gj1
+            group = [("equal", s_i1, gi2, s_j1, gj2)]
+        else:
+            group.append((tag, gi1, gi2, gj1, gj2))
+    keep: bool = len(group) > 0
+    if len(group) == 1:
+        only_tag: str = group[0][0]
+        if only_tag == "equal":
+            keep = False
+    if keep:
+        groups.append(group)
+    return groups
+
+
+def _difflib_calculate_ratio(matches: int, length: int) -> float:
+    if length > 0:
+        return 2.0 * float(matches) / float(length)
+    return 1.0
+
+
+def _difflib_ratio(a: list[str], b: list[str], blocks: list[Match]) -> float:
+    matches: int = 0
+    for blk in blocks:
+        matches = matches + blk.size
+    return _difflib_calculate_ratio(matches, len(a) + len(b))
+
+
+def _difflib_quick_ratio(a: list[str], b: list[str]) -> float:
+    fullbcount: dict[str, int] = {}
+    for elt in b:
+        fullbcount[elt] = fullbcount.get(elt, 0) + 1
+    avail: dict[str, int] = {}
+    matches: int = 0
+    for elt in a:
+        numb: int = 0
+        if elt in avail:
+            numb = avail[elt]
+        else:
+            numb = fullbcount.get(elt, 0)
+        avail[elt] = numb - 1
+        if numb > 0:
+            matches = matches + 1
+    return _difflib_calculate_ratio(matches, len(a) + len(b))
+
+
+def _difflib_real_quick_ratio(a: list[str], b: list[str]) -> float:
+    la: int = len(a)
+    lb: int = len(b)
+    lo: int = la
+    if lb < lo:
+        lo = lb
+    return _difflib_calculate_ratio(lo, la + lb)
+
+
+class SequenceMatcher:
+    isjunk: Optional[Callable[[str], bool]]
+    autojunk: bool
+    a: list[str]
+    b: list[str]
+    b2j: dict[str, list[int]]
+    bjunk: set[str]
+
+    def __init__(self, isjunk: Optional[Callable[[str], bool]] = None, a: str = "", b: str = "", autojunk: bool = True) -> None:
+        self.isjunk = isjunk
+        self.autojunk = autojunk
+        self.a = []
+        self.b = []
+        self.b2j = {}
+        self.bjunk = set()
+        self.set_seqs(a, b)
+
+    def set_seqs(self, a: str, b: str) -> None:
+        self.set_seq1(a)
+        self.set_seq2(b)
+
+    def set_seq1(self, a: str) -> None:
+        self.a = _difflib_str_to_tokens(a)
+
+    def set_seq2(self, b: str) -> None:
+        self.b = _difflib_str_to_tokens(b)
+        pair: _difflib_B2J = _difflib_build_b2j(self.b, self.isjunk, self.autojunk)
+        self.b2j = pair.b2j
+        self.bjunk = pair.bjunk
+
+    def find_longest_match(self, alo: int = 0, ahi: Optional[int] = None, blo: int = 0, bhi: Optional[int] = None) -> Match:
+        ahi_v: int = _difflib_resolve_hi(ahi, len(self.a))
+        bhi_v: int = _difflib_resolve_hi(bhi, len(self.b))
+        return _difflib_find_longest_match(self.a, self.b, self.b2j, self.bjunk, alo, ahi_v, blo, bhi_v)
+
+    def get_matching_blocks(self) -> list[Match]:
+        return _difflib_get_matching_blocks(self.a, self.b, self.b2j, self.bjunk)
+
+    def get_opcodes(self) -> list[tuple[str, int, int, int, int]]:
+        return _difflib_get_opcodes(self.a, self.b, self.get_matching_blocks())
+
+    def get_grouped_opcodes(self, n: int = 3) -> list[list[tuple[str, int, int, int, int]]]:
+        return _difflib_get_grouped_opcodes(self.get_opcodes(), n)
+
+    def ratio(self) -> float:
+        return _difflib_ratio(self.a, self.b, self.get_matching_blocks())
+
+    def quick_ratio(self) -> float:
+        return _difflib_quick_ratio(self.a, self.b)
+
+    def real_quick_ratio(self) -> float:
+        return _difflib_real_quick_ratio(self.a, self.b)
+
+
+def _difflib_score_greater(cand: tuple[float, str], best: tuple[float, str]) -> bool:
+    # Mirrors CPython's `heapq.nlargest(n, [(ratio, x) for x in ...])`: the
+    # comparison key is the FULL `(ratio, x)` tuple, so two DISTINCT
+    # possibilities tied on ratio are NOT broken by input order — the
+    # LEXICOGRAPHICALLY GREATER string sorts first (tuple comparison falls
+    # through to the second element). Only truly identical `(ratio, x)`
+    # pairs (duplicate strings) are order-stable, which this strict `>`
+    # preserves (first occurrence keeps its earlier "best" slot).
+    if cand[0] != best[0]:
+        return cand[0] > best[0]
+    return cand[1] > best[1]
+
+
+def _difflib_gcm_top_n(scored: list[tuple[float, str]], limit: int) -> list[str]:
+    total: int = len(scored)
+    used: list[bool] = []
+    i: int = 0
+    while i < total:
+        used.append(False)
+        i = i + 1
+    result: list[str] = []
+    taken: int = 0
+    while taken < limit and taken < total:
+        best: int = -1
+        scan: int = 0
+        while scan < total:
+            if not used[scan]:
+                if best < 0:
+                    best = scan
+                elif _difflib_score_greater(scored[scan], scored[best]):
+                    best = scan
+            scan = scan + 1
+        used[best] = True
+        result.append(scored[best][1])
+        taken = taken + 1
+    return result
+
+
+def get_close_matches(word: str, possibilities: list[str], n: int = 3, cutoff: float = 0.6) -> list[str]:
+    if n <= 0:
+        raise ValueError("n must be > 0: " + str(n))
+    if cutoff < 0.0 or cutoff > 1.0:
+        raise ValueError("cutoff must be in [0.0, 1.0]: " + str(cutoff))
+    scored: list[tuple[float, str]] = []
+    # Mirror CPython: build ONE SequenceMatcher, set seq2 (the target `word`)
+    # a SINGLE time so its b2j index is computed once, then per candidate set
+    # seq1 and run the real_quick_ratio -> quick_ratio -> ratio cutoff cascade.
+    # real_quick_ratio() >= quick_ratio() >= ratio(), so a candidate passes all
+    # three iff ratio() >= cutoff — RESULT-IDENTICAL to a bare ratio() test —
+    # but the two cheap upper-bound ratios short-circuit the expensive ratio()
+    # for obvious non-matches, and b2j(word) is no longer rebuilt per candidate
+    # (the prior version constructed a fresh SequenceMatcher, and thus a fresh
+    # b2j, on every iteration). Order + ties preserved (_difflib_gcm_top_n
+    # unchanged), oracle-verified byte-identical against CPython 3.12.
+    sm: SequenceMatcher = SequenceMatcher(None, "", word, True)
+    for p in possibilities:
+        sm.set_seq1(p)
+        if sm.real_quick_ratio() >= cutoff and sm.quick_ratio() >= cutoff:
+            r: float = sm.ratio()
+            if r >= cutoff:
+                scored.append((r, p))
+    return _difflib_gcm_top_n(scored, n)
+
+
+def _difflib_format_range_unified(start: int, stop: int) -> str:
+    beginning: int = start + 1
+    length: int = stop - start
+    if length == 1:
+        return str(beginning)
+    b2: int = beginning
+    if length == 0:
+        b2 = beginning - 1
+    return str(b2) + "," + str(length)
+
+
+def unified_diff(a: list[str], b: list[str], fromfile: str = "", tofile: str = "", fromfiledate: str = "", tofiledate: str = "", n: int = 3, lineterm: str = "\n") -> Iterator[str]:
+    b2jp: _difflib_B2J = _difflib_build_b2j(b, None, True)
+    blocks: list[Match] = _difflib_get_matching_blocks(a, b, b2jp.b2j, b2jp.bjunk)
+    opcodes: list[tuple[str, int, int, int, int]] = _difflib_get_opcodes(a, b, blocks)
+    groups: list[list[tuple[str, int, int, int, int]]] = _difflib_get_grouped_opcodes(opcodes, n)
+    started: bool = False
+    for group in groups:
+        if not started:
+            started = True
+            fromdate: str = ""
+            if fromfiledate != "":
+                fromdate = "\t" + fromfiledate
+            todate: str = ""
+            if tofiledate != "":
+                todate = "\t" + tofiledate
+            yield "--- " + fromfile + fromdate + lineterm
+            yield "+++ " + tofile + todate + lineterm
+        first: tuple[str, int, int, int, int] = group[0]
+        last: tuple[str, int, int, int, int] = group[len(group) - 1]
+        file1_range: str = _difflib_format_range_unified(first[1], last[2])
+        file2_range: str = _difflib_format_range_unified(first[3], last[4])
+        yield "@@ -" + file1_range + " +" + file2_range + " @@" + lineterm
+        for c in group:
+            tag: str = c[0]
+            i1: int = c[1]
+            i2: int = c[2]
+            j1: int = c[3]
+            j2: int = c[4]
+            if tag == "equal":
+                k: int = i1
+                while k < i2:
+                    yield " " + a[k]
+                    k = k + 1
+            else:
+                if tag == "replace" or tag == "delete":
+                    k2: int = i1
+                    while k2 < i2:
+                        yield "-" + a[k2]
+                        k2 = k2 + 1
+                if tag == "replace" or tag == "insert":
+                    k3: int = j1
+                    while k3 < j2:
+                        yield "+" + b[k3]
+                        k3 = k3 + 1
+
+
+def _difflib_dump(tag: str, x: list[str], lo: int, hi: int) -> list[str]:
+    out: list[str] = []
+    i: int = lo
+    while i < hi:
+        out.append(tag + " " + x[i])
+        i = i + 1
+    return out
+
+
+def _difflib_plain_replace(a: list[str], alo: int, ahi: int, b: list[str], blo: int, bhi: int) -> list[str]:
+    out: list[str] = []
+    if (bhi - blo) < (ahi - alo):
+        for line in _difflib_dump("+", b, blo, bhi):
+            out.append(line)
+        for line in _difflib_dump("-", a, alo, ahi):
+            out.append(line)
+    else:
+        for line in _difflib_dump("-", a, alo, ahi):
+            out.append(line)
+        for line in _difflib_dump("+", b, blo, bhi):
+            out.append(line)
+    return out
+
+
+def _difflib_repeat_char(ch: str, n: int) -> str:
+    # `ch * n` (str repetition) instead of a per-char `out = out + ch` loop:
+    # the old loop was O(n^2) (each `+` rebuilt the whole string). Byte-
+    # identical: `ch * n` repeats `ch` n times, "" for n <= 0 (Python
+    # semantics), same as the loop.
+    return ch * n
+
+
+def _difflib_keep_original_ws(s: str, tags: str) -> str:
+    out: str = ""
+    i: int = 0
+    n: int = len(s)
+    while i < n:
+        c: str = s[i]
+        tc: str = tags[i]
+        if tc == " " and (c == " " or c == "\t" or c == "\n" or c == "\r" or c == "\f"):
+            out += c
+        else:
+            out += tc
+        i = i + 1
+    return out
+
+
+def _difflib_qformat(aline: str, bline: str, atags: str, btags: str) -> list[str]:
+    at: str = _difflib_keep_original_ws(aline, atags).rstrip()
+    bt: str = _difflib_keep_original_ws(bline, btags).rstrip()
+    out: list[str] = []
+    out.append("- " + aline)
+    if at != "":
+        out.append("? " + at + "\n")
+    out.append("+ " + bline)
+    if bt != "":
+        out.append("? " + bt + "\n")
+    return out
+
+
+def _difflib_fancy_helper(a: list[str], alo: int, ahi: int, b: list[str], blo: int, bhi: int, charjunk: Callable[[str], bool]) -> list[str]:
+    if alo < ahi:
+        if blo < bhi:
+            return _difflib_fancy_replace(a, alo, ahi, b, blo, bhi, charjunk)
+        else:
+            return _difflib_dump("-", a, alo, ahi)
+    elif blo < bhi:
+        return _difflib_dump("+", b, blo, bhi)
+    empty: list[str] = []
+    return empty
+
+
+def _difflib_fancy_replace(a: list[str], alo: int, ahi: int, b: list[str], blo: int, bhi: int, charjunk: Callable[[str], bool]) -> list[str]:
+    best_ratio: float = 0.74
+    cutoff: float = 0.75
+    eqi: int = -1
+    eqj: int = -1
+    best_i: int = -1
+    best_j: int = -1
+    j: int = blo
+    while j < bhi:
+        bj: str = b[j]
+        bj_tokens: list[str] = _difflib_str_to_tokens(bj)
+        i: int = alo
+        while i < ahi:
+            ai: str = a[i]
+            if ai == bj:
+                if eqi < 0:
+                    eqi = i
+                    eqj = j
+                i = i + 1
+                continue
+            ai_tokens: list[str] = _difflib_str_to_tokens(ai)
+            rq: float = _difflib_real_quick_ratio(ai_tokens, bj_tokens)
+            if rq > best_ratio:
+                qq: float = _difflib_quick_ratio(ai_tokens, bj_tokens)
+                if qq > best_ratio:
+                    b2jp2: _difflib_B2J = _difflib_build_b2j(bj_tokens, charjunk, True)
+                    blocks2: list[Match] = _difflib_get_matching_blocks(ai_tokens, bj_tokens, b2jp2.b2j, b2jp2.bjunk)
+                    rr: float = _difflib_ratio(ai_tokens, bj_tokens, blocks2)
+                    if rr > best_ratio:
+                        best_ratio = rr
+                        best_i = i
+                        best_j = j
+            i = i + 1
+        j = j + 1
+    use_eq: bool = False
+    if best_ratio < cutoff:
+        if eqi < 0:
+            return _difflib_plain_replace(a, alo, ahi, b, blo, bhi)
+        best_i = eqi
+        best_j = eqj
+        use_eq = True
+    result: list[str] = []
+    for line in _difflib_fancy_helper(a, alo, best_i, b, blo, best_j, charjunk):
+        result.append(line)
+    aelt: str = a[best_i]
+    belt: str = b[best_j]
+    if not use_eq:
+        atags: str = ""
+        btags: str = ""
+        ai_tok: list[str] = _difflib_str_to_tokens(aelt)
+        bi_tok: list[str] = _difflib_str_to_tokens(belt)
+        b2jp3: _difflib_B2J = _difflib_build_b2j(bi_tok, charjunk, True)
+        blocks3: list[Match] = _difflib_get_matching_blocks(ai_tok, bi_tok, b2jp3.b2j, b2jp3.bjunk)
+        ops3: list[tuple[str, int, int, int, int]] = _difflib_get_opcodes(ai_tok, bi_tok, blocks3)
+        for op in ops3:
+            tag: str = op[0]
+            ai1: int = op[1]
+            ai2: int = op[2]
+            bj1: int = op[3]
+            bj2: int = op[4]
+            la: int = ai2 - ai1
+            lb: int = bj2 - bj1
+            if tag == "replace":
+                atags += _difflib_repeat_char("^", la)
+                btags += _difflib_repeat_char("^", lb)
+            elif tag == "delete":
+                atags += _difflib_repeat_char("-", la)
+            elif tag == "insert":
+                btags += _difflib_repeat_char("+", lb)
+            else:
+                atags += _difflib_repeat_char(" ", la)
+                btags += _difflib_repeat_char(" ", lb)
+        for line in _difflib_qformat(aelt, belt, atags, btags):
+            result.append(line)
+    else:
+        result.append("  " + aelt)
+    for line in _difflib_fancy_helper(a, best_i + 1, ahi, b, best_j + 1, bhi, charjunk):
+        result.append(line)
+    return result
+
+
+def ndiff(a: list[str], b: list[str], linejunk: Optional[Callable[[str], bool]] = None, charjunk: Optional[Callable[[str], bool]] = None) -> Iterator[str]:
+    cj: Callable[[str], bool] = IS_CHARACTER_JUNK
+    if charjunk is not None:
+        cjv: Callable[[str], bool] = charjunk
+        cj = cjv
+    b2jp: _difflib_B2J = _difflib_build_b2j(b, linejunk, True)
+    blocks: list[Match] = _difflib_get_matching_blocks(a, b, b2jp.b2j, b2jp.bjunk)
+    opcodes: list[tuple[str, int, int, int, int]] = _difflib_get_opcodes(a, b, blocks)
+    for op in opcodes:
+        tag: str = op[0]
+        i1: int = op[1]
+        i2: int = op[2]
+        j1: int = op[3]
+        j2: int = op[4]
+        if tag == "replace":
+            lines: list[str] = _difflib_fancy_replace(a, i1, i2, b, j1, j2, cj)
+            for line in lines:
+                yield line
+        elif tag == "delete":
+            k: int = i1
+            while k < i2:
+                yield "- " + a[k]
+                k = k + 1
+        elif tag == "insert":
+            k2: int = j1
+            while k2 < j2:
+                yield "+ " + b[k2]
+                k2 = k2 + 1
+        else:
+            k3: int = i1
+            while k3 < i2:
+                yield "  " + a[k3]
+                k3 = k3 + 1

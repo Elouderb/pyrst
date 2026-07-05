@@ -16,7 +16,7 @@
 #     FUNCTIONS (module consts must be annotated literals; there is no
 #     inf/nan literal), but CPython's `math.inf`/`math.nan` are plain float
 #     ATTRIBUTES, not callables — `math.inf()` is a TypeError under CPython.
-#     Spot-verified separately via `pyrst build`+run only (see notes.md).
+#     Spot-verified separately via `pyrst build`+run only.
 #   - `floor`/`ceil`/`trunc` are wrapped in `int(...)` below specifically so
 #     the dual-run comparison lines up: CPython's `math.floor/ceil/trunc`
 #     already return `int`, while pyrst's return `float` (the gated **G6**
@@ -86,7 +86,7 @@ def main() -> None:
     # has no scientific-notation exponent syntax, and any op large enough to
     # overflow to inf raises OverflowError under CPython's math.pow/**/exp
     # instead of returning inf — so the modf(+-inf) fix is spot-verified
-    # pyrst-only below instead of in this dual-run section; see notes.md.)
+    # pyrst-only below instead of in this dual-run section; see the card history.)
     print(math.modf(0.0))
     print(math.modf(-0.0))
     print(math.fmod(7.0, -3.0))

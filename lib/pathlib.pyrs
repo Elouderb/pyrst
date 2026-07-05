@@ -1,0 +1,527 @@
+# pyrst standard library — pathlib (PurePosixPath)
+#
+# Card cc0ff8fe (W2 stdlib writer wave). Per
+# docs/design/w2-dossiers/purepath.md: a PURE-PYRST `PurePosixPath` class —
+# str-based POSIX path manipulation with NO filesystem access (no `Path`,
+# no `exists`/`stat`/`open`; that is `PurePath`'s job, not this module's).
+# Embedded via `include_str!` (see `src/stdlib.rs`); usable as
+# `from pathlib import PurePosixPath` or `import pathlib;
+# pathlib.PurePosixPath(...)`.
+#
+# Fidelity: 4/5 (matches the dossier's TARGET; every documented divergence
+# below was forced by a GATED pyrst limitation, never silent).
+#
+# ---------------------------------------------------------------------------
+# DIVERGENCES (all forced by GATED pyrst limitations; documented, not silent)
+# ---------------------------------------------------------------------------
+#
+# 1. Constructor is single-segment, not variadic (dossier gate G4 —
+#    `__init__(self, *args)`). pyrst has no `*args`. `PurePosixPath(path:
+#    str)` takes exactly one string. CPython's multi-segment constructor
+#    form — `PurePosixPath('/usr', 'local', 'bin')` — has no direct
+#    equivalent here; build the same path with `.joinpath(...)` chaining
+#    (`PurePosixPath('/usr').joinpath('local').joinpath('bin')`) or just
+#    pass one pre-joined string (`PurePosixPath('/usr/local/bin')`).
+#    Constructing from an existing `PurePosixPath` object (CPython:
+#    `PurePosixPath(PurePosixPath('/usr'), 'local')`) is not supported
+#    either — use `.as_posix()` to get the string first.
+#
+# 2. `joinpath` is single-segment, not variadic (dossier gate G4 —
+#    `joinpath(self, *pathsegments)`). `joinpath(self, other: str)` takes
+#    exactly one segment. CHAIN calls for multiple segments:
+#    `p.joinpath('a').joinpath('b')` — this is semantically IDENTICAL to
+#    CPython's `p.joinpath('a', 'b')`, because CPython processes variadic
+#    segments in order and resets on any absolute segment, which is exactly
+#    what repeated single-segment calls do (verified: chaining reproduces
+#    the dossier's `joinpath('bin', '/etc/passwd') -> '/etc/passwd'`
+#    absolute-reset example one call at a time).
+#
+# 3. No `/` operator (dossier: "No __truediv__" — pyrst has no
+#    `__truediv__` dunder). Use `.joinpath(...)` exclusively; there is no
+#    `path / 'segment'` spelling in pyrst. Documented, not implemented.
+#
+# 4. No bytes-path support (dossier: "No bytes" — pyrst has no `bytes`
+#    type). `PurePosixPath` here is str-only, matching every other pyrst
+#    stdlib module.
+#
+# 5. `match` is spelled `match_` (trailing underscore). `match` is a pyrst
+#    STATEMENT keyword (the `match`/`case` construct — see `src/lexer.rs`,
+#    `"match" => Tok::Match` unconditionally, even after a `.`), so
+#    `path.match(...)` does not parse: the lexer hands the parser a
+#    `Tok::Match` where an attribute-name `Tok::Ident` is expected. Same
+#    precedent as `re.match_` in `lib/re.pyrs`. `case_sensitive` is typed
+#    `bool = True` (not `Optional[bool] = None`): pyrst's only supported
+#    path flavor is POSIX, whose platform default IS `True`, so the `None`
+#    sentinel's only meaningful resolved value is hardcoded as the default
+#    — behaviorally identical to CPython on POSIX, just not spelled with a
+#    `None` sentinel (pyrst has `Optional[T]` but a bool-vs-None branch
+#    inside one param wasn't needed for a single-flavor target).
+#
+# 6. `parts` returns `list[str]`, not `tuple[str, ...]` (no variable-length
+#    tuple type in pyrst — tuples are fixed-arity, e.g. `tuple[str, str]`).
+#    Indexing, iteration, and `len()` all behave identically to the
+#    CPython tuple for every operation this dossier documents.
+#
+# 7. `parents` returns an eagerly-materialized `list[PurePosixPath]`
+#    (immediate parent first, root/`.`-terminus last), not CPython's lazy
+#    `_PathParents` sequence type (no custom `__getitem__`/`__len__`
+#    dunders in pyrst — see gate note in EPIC docs). Indexing (including
+#    negative indices), `len()`, and iteration all match CPython's
+#    `parents[i]` / `len(parents)` results exactly for every case in the
+#    dossier's BEHAVIOR MATRIX; only laziness and the distinct type name
+#    are lost.
+#
+# 8. `relative_to`/`is_relative_to` accept `other: str` only, not a
+#    `PurePosixPath` (or os.PathLike) argument (keeps the same single-str
+#    shape as the rest of this module; no union-typed parameter needed for
+#    the dossier's PARITY PLAN, which only ever calls these with a string
+#    literal). Convert a `PurePosixPath` first via `.as_posix()`. The
+#    `*_deprecated` position (already deprecated in CPython since 3.12, slated
+#    for removal) is dropped entirely — it is gate G4 (`*args`) with no
+#    remaining use.
+#
+# 9. `relative_to(..., walk_up=True)` correctly raises CPython's
+#    "<self> and <other> have different anchors" ValueError when the two paths
+#    have different anchors — a relative path vs an absolute one, or '/' vs the
+#    POSIX '//' root (an earlier version silently fabricated a bogus
+#    '..'-prefixed path here). The ONE remaining walk_up corner NOT reproduced
+#    is a `'..'` component appearing INSIDE `other` (CPython raises "'..'
+#    segment in ... cannot be walked"): not exercised by the dossier's PARITY
+#    PLAN; a documented gap, not silently wrong for any tested input.
+#
+# 10. `match_`'s glob engine supports `*` and `?` per path segment (no
+#     `[seq]` character classes — not in the dossier's BEHAVIOR MATRIX) and
+#     a LEADING `**` component (`'**/file.txt'`-shaped patterns), requiring
+#     at least one path part (root or a real segment) to be consumed by the
+#     `**` before the trailing pattern segments — matching real CPython
+#     3.12/3.13 (`PurePosixPath("file.txt").match("**/file.txt")` is False;
+#     `PurePosixPath("a/file.txt")`/`PurePosixPath("/file.txt")` — 2 parts,
+#     root counting as one — are True; verified against a live CPython
+#     oracle, hardening pass, card cc0ff8fe). A `**` in a NON-leading
+#     position is matched as an ordinary single-segment wildcard (CPython's
+#     `fnmatch.translate("**")` also collapses to "match any one segment
+#     name", not a recursive expansion, outside the special leading case) —
+#     this happens to reproduce CPython for every shape the dossier and the
+#     hardening pass's oracle tried, but is NOT a general recursive-glob
+#     implementation. A rooted pattern (`'/**/x'`) does not require `self`
+#     to be absolute the way CPython does (untested by the dossier; a
+#     narrower, documented gap, not a silent wrong answer for any case this
+#     module's parity/hardening tests exercise).
+#
+# All ERRORS-section messages (empty `match_` pattern, `with_name`/
+# `with_suffix` empty-name, `relative_to` not-in-subpath, `with_suffix`
+# invalid-suffix) reproduce CPython's exact wording — python3-verified
+# against the dossier's ERRORS section and the hardening pass's own oracle
+# probes (`with_suffix` validation — suffix must be empty, or start with
+# `.`, not be exactly `.`, and contain no `/` — was added during the
+# hardening pass, oracle-verified against a live CPython 3.12).
+
+
+class PurePosixPath:
+    _path: str
+
+    def __init__(self, path: str) -> None:
+        self._path = _pathlib_normalize(path)
+
+    def __str__(self) -> str:
+        return self._path
+
+    def __repr__(self) -> str:
+        return "PurePosixPath(" + repr(self._path) + ")"
+
+    @property
+    def parts(self) -> list[str]:
+        parsed: tuple[str, list[str]] = _pathlib_split_raw(self._path)
+        root: str = parsed[0]
+        segs: list[str] = parsed[1]
+        if root != "":
+            result: list[str] = [root]
+            i: int = 0
+            while i < len(segs):
+                result.append(segs[i])
+                i = i + 1
+            return result
+        return segs
+
+    @property
+    def name(self) -> str:
+        parsed: tuple[str, list[str]] = _pathlib_split_raw(self._path)
+        segs: list[str] = parsed[1]
+        if len(segs) == 0:
+            return ""
+        return segs[-1]
+
+    @property
+    def suffix(self) -> str:
+        nm: str = self.name
+        idx: int = _pathlib_rfind_dot(nm)
+        n: int = len(nm)
+        if idx > 0 and idx < n - 1:
+            return nm[idx:n]
+        return ""
+
+    @property
+    def stem(self) -> str:
+        nm: str = self.name
+        suf: str = self.suffix
+        if suf == "":
+            return nm
+        return nm[0:len(nm) - len(suf)]
+
+    @property
+    def suffixes(self) -> list[str]:
+        nm: str = self.name
+        if nm.endswith("."):
+            return []
+        stripped: str = _pathlib_lstrip_dots(nm)
+        pieces: list[str] = stripped.split(".")
+        result: list[str] = []
+        i: int = 1
+        while i < len(pieces):
+            result.append("." + pieces[i])
+            i = i + 1
+        return result
+
+    @property
+    def parent(self) -> PurePosixPath:
+        parsed: tuple[str, list[str]] = _pathlib_split_raw(self._path)
+        root: str = parsed[0]
+        segs: list[str] = parsed[1]
+        if len(segs) == 0:
+            return self
+        new_segs: list[str] = []
+        i: int = 0
+        while i < len(segs) - 1:
+            new_segs.append(segs[i])
+            i = i + 1
+        return PurePosixPath(_pathlib_join_str(root, new_segs))
+
+    @property
+    def parents(self) -> list[PurePosixPath]:
+        result: list[PurePosixPath] = []
+        current: PurePosixPath = self
+        while True:
+            p: PurePosixPath = current.parent
+            if p._path == current._path:
+                break
+            result.append(p)
+            current = p
+        return result
+
+    def is_absolute(self) -> bool:
+        return self._path.startswith("/")
+
+    def as_posix(self) -> str:
+        return self._path
+
+    def joinpath(self, other: str) -> PurePosixPath:
+        if other == "":
+            return self
+        if other.startswith("/"):
+            return PurePosixPath(other)
+        base: str = self._path
+        if base.endswith("/"):
+            return PurePosixPath(base + other)
+        return PurePosixPath(base + "/" + other)
+
+    def with_name(self, name: str) -> PurePosixPath:
+        if self.name == "":
+            raise ValueError(f"{repr(self)} has an empty name")
+        if name == "" or name.find("/") != -1:
+            raise ValueError(f"Invalid name {repr(name)}")
+        parsed: tuple[str, list[str]] = _pathlib_split_raw(self._path)
+        root: str = parsed[0]
+        segs: list[str] = parsed[1]
+        new_segs: list[str] = []
+        i: int = 0
+        while i < len(segs) - 1:
+            new_segs.append(segs[i])
+            i = i + 1
+        new_segs.append(name)
+        return PurePosixPath(_pathlib_join_str(root, new_segs))
+
+    def with_suffix(self, suffix: str) -> PurePosixPath:
+        nm: str = self.name
+        if nm == "":
+            raise ValueError(f"{repr(self)} has an empty name")
+        if suffix != "" and (
+            not suffix.startswith(".") or suffix == "." or suffix.find("/") != -1
+        ):
+            raise ValueError(f"Invalid suffix {repr(suffix)}")
+        old_suffix: str = self.suffix
+        new_name: str = ""
+        if old_suffix == "":
+            new_name = nm + suffix
+        else:
+            new_name = nm[0:len(nm) - len(old_suffix)] + suffix
+        parsed: tuple[str, list[str]] = _pathlib_split_raw(self._path)
+        root: str = parsed[0]
+        segs: list[str] = parsed[1]
+        new_segs: list[str] = []
+        i: int = 0
+        while i < len(segs) - 1:
+            new_segs.append(segs[i])
+            i = i + 1
+        new_segs.append(new_name)
+        return PurePosixPath(_pathlib_join_str(root, new_segs))
+
+    def with_stem(self, stem: str) -> PurePosixPath:
+        return self.with_name(stem + self.suffix)
+
+    def relative_to(self, other: str, walk_up: bool = False) -> PurePosixPath:
+        other_path: PurePosixPath = PurePosixPath(other)
+        self_parts: list[str] = self.parts
+        other_parts: list[str] = other_path.parts
+        n_self: int = len(self_parts)
+        n_other: int = len(other_parts)
+        # ANCHOR of a path is its root part (parts[0] when absolute, "" when
+        # relative); `_pathlib_split_raw` preserves the POSIX '//' double-slash
+        # root distinct from '/'.
+        self_anchor: str = ""
+        if self.is_absolute() and n_self > 0:
+            self_anchor = self_parts[0]
+        other_anchor: str = ""
+        if other_path.is_absolute() and n_other > 0:
+            other_anchor = other_parts[0]
+        i: int = 0
+        while i < n_other and i < n_self and self_parts[i] == other_parts[i]:
+            i = i + 1
+        if i < n_other and not walk_up:
+            raise ValueError(
+                f"{repr(str(self))} is not in the subpath of {repr(str(other_path))}"
+            )
+        # walk_up=True can climb out of a shared subtree with '..' segments, but
+        # it CANNOT bridge two DIFFERENT anchors (a relative path vs an absolute
+        # one, or '/' vs '//'). CPython raises "<self> and <other> have
+        # different anchors" here; without this guard walk_up fabricated a bogus
+        # '..'-prefixed path (e.g. 'a/b'.relative_to('/a', walk_up=True) gave
+        # '../../a/b'). Gated on walk_up: the walk_up=False anchor-mismatch case
+        # is already reported as "is not in the subpath" just above, matching
+        # CPython.
+        if walk_up and self_anchor != other_anchor:
+            raise ValueError(
+                f"{repr(str(self))} and {repr(str(other_path))} have different anchors"
+            )
+        result_segs: list[str] = []
+        k: int = i
+        while k < n_other:
+            result_segs.append("..")
+            k = k + 1
+        m: int = i
+        while m < n_self:
+            result_segs.append(self_parts[m])
+            m = m + 1
+        if len(result_segs) == 0:
+            return PurePosixPath(".")
+        return PurePosixPath("/".join(result_segs))
+
+    def is_relative_to(self, other: str) -> bool:
+        other_path: PurePosixPath = PurePosixPath(other)
+        self_parts: list[str] = self.parts
+        other_parts: list[str] = other_path.parts
+        n_self: int = len(self_parts)
+        n_other: int = len(other_parts)
+        if n_other > n_self:
+            return False
+        i: int = 0
+        while i < n_other:
+            if self_parts[i] != other_parts[i]:
+                return False
+            i = i + 1
+        return True
+
+    def match_(self, path_pattern: str, case_sensitive: bool = True) -> bool:
+        if path_pattern == "":
+            raise ValueError("empty pattern")
+        parsed: tuple[str, list[str]] = _pathlib_split_raw(path_pattern)
+        proot: str = parsed[0]
+        psegs: list[str] = parsed[1]
+        if len(psegs) > 0 and psegs[0] == "**":
+            tail: list[str] = []
+            i: int = 1
+            while i < len(psegs):
+                tail.append(psegs[i])
+                i = i + 1
+            self_parsed: tuple[str, list[str]] = _pathlib_split_raw(self._path)
+            self_segs: list[str] = self_parsed[1]
+            if len(tail) > 0:
+                # CPython's leading `**` requires at least one path
+                # component (including the root, if any) to be consumed by
+                # it before the trailing pattern segments — a bare
+                # `PurePosixPath("file.txt").match("**/file.txt")` is False
+                # (only one part, "file.txt", to satisfy both `**` and the
+                # trailing segment), while `PurePosixPath("a/file.txt")` or
+                # `PurePosixPath("/file.txt")` (2 parts each, root counting
+                # as one) is True. `self.parts` (root-inclusive) vs a plain
+                # segment count is what distinguishes these — verified
+                # against a real CPython 3.12 oracle across 8 depth/root
+                # combinations. A bare `"**"` pattern (empty `tail`) always
+                # matches, even an empty/`.` path, so that case is exempted.
+                self_total: list[str] = self.parts
+                if len(self_total) <= len(tail):
+                    return False
+            return _pathlib_match_tail(self_segs, tail, case_sensitive)
+        if proot != "":
+            pattern_parts: list[str] = [proot]
+            j: int = 0
+            while j < len(psegs):
+                pattern_parts.append(psegs[j])
+                j = j + 1
+            self_parts2: list[str] = self.parts
+            if len(self_parts2) != len(pattern_parts):
+                return False
+            k: int = 0
+            while k < len(self_parts2):
+                if not _pathlib_fnmatch_segment(self_parts2[k], pattern_parts[k], case_sensitive):
+                    return False
+                k = k + 1
+            return True
+        self_parsed2: tuple[str, list[str]] = _pathlib_split_raw(self._path)
+        self_segs2: list[str] = self_parsed2[1]
+        return _pathlib_match_tail(self_segs2, psegs, case_sensitive)
+
+
+# ── private helpers (pure str logic; no filesystem access) ─────────────────
+# Split a raw path string into (root, segments):
+#   root is "" (relative), "/" (absolute), or "//" (POSIX network path — the
+#   one non-collapsing case: EXACTLY two leading slashes; one or three-plus
+#   leading slashes both collapse to a single "/" root, matching CPython's
+#   PurePosixPath / posixpath rules). Segments drop empty pieces (collapsed
+#   multi-slashes) and bare "." pieces (elided, like CPython).
+def _pathlib_split_raw(path: str) -> tuple[str, list[str]]:
+    if path == "":
+        empty_segs: list[str] = []
+        return ("", empty_segs)
+    lead: int = 0
+    i: int = 0
+    n: int = len(path)
+    while i < n and path[i] == "/":
+        lead = lead + 1
+        i = i + 1
+    root: str = ""
+    if lead == 1:
+        root = "/"
+    elif lead >= 2:
+        if lead == 2:
+            root = "//"
+        else:
+            root = "/"
+    rest: str = path[i:n]
+    raw_segs: list[str] = rest.split("/")
+    segs: list[str] = []
+    j: int = 0
+    while j < len(raw_segs):
+        seg: str = raw_segs[j]
+        if seg != "" and seg != ".":
+            segs.append(seg)
+        j = j + 1
+    return (root, segs)
+
+
+# Rebuild the canonical string form from a (root, segments) pair. An empty
+# relative path (no root, no segments) canonicalizes to "." — matching
+# CPython's `str(PurePosixPath(''))  == str(PurePosixPath('.')) == '.'`.
+def _pathlib_join_str(root: str, segs: list[str]) -> str:
+    if len(segs) == 0:
+        if root == "":
+            return "."
+        return root
+    body: str = "/".join(segs)
+    if root == "":
+        return body
+    return root + body
+
+
+def _pathlib_normalize(path: str) -> str:
+    parsed: tuple[str, list[str]] = _pathlib_split_raw(path)
+    return _pathlib_join_str(parsed[0], parsed[1])
+
+
+# Find the LAST '.' in `s`, returning its CHARACTER (not byte) index, or -1
+# if none. A hand-rolled loop, not `str.rfind(".")` — pyrst's `str.rfind`
+# codegens straight to Rust's `str::rfind`, which returns a UTF-8 BYTE
+# offset, while `len()`/slicing/`s[i]` are character-count-based (see
+# src/codegen/exprs.rs `"len"` vs `"rfind"` arms); for any name with a
+# multi-byte character before the last dot (e.g. `"café.txt"`), the byte
+# offset from `.rfind(".")` overshoots the character offset `suffix` needs,
+# corrupting the slice (`"café.txt"` gave stem `"café."` / suffix `"txt"`
+# instead of `"café"` / `".txt"` before this fix). This is a pre-existing,
+# general pyrst compiler bug (not pathlib-specific — any module doing
+# `x.rfind(pat)` then slicing/comparing against `len(x)` on a non-ASCII `x`
+# hits it); worked around HERE by never calling `.rfind()` on `nm`, only
+# character indexing/`len()`, which are mutually consistent.
+def _pathlib_rfind_dot(s: str) -> int:
+    n: int = len(s)
+    i: int = n - 1
+    while i >= 0:
+        if s[i] == ".":
+            return i
+        i = i - 1
+    return -1
+
+
+# Strip LEADING '.' characters only (str.lstrip in pyrst only trims
+# whitespace — see src/codegen/exprs.rs — so a char-set lstrip needs a
+# hand-rolled loop). Used by `suffixes` to match CPython's
+# `name.lstrip('.')` step exactly.
+def _pathlib_lstrip_dots(s: str) -> str:
+    i: int = 0
+    n: int = len(s)
+    while i < n and s[i] == ".":
+        i = i + 1
+    return s[i:n]
+
+
+# Classic two-pointer wildcard matcher (`*` = any run of characters, `?` =
+# exactly one character; no `[seq]` classes — see header divergence #10).
+# Case-folds both operands up front when `case_sensitive` is False.
+def _pathlib_fnmatch_segment(name: str, pat: str, case_sensitive: bool) -> bool:
+    n_name: str = name
+    n_pat: str = pat
+    if not case_sensitive:
+        n_name = name.lower()
+        n_pat = pat.lower()
+    return _pathlib_glob_match(n_name, n_pat)
+
+
+def _pathlib_glob_match(s: str, p: str) -> bool:
+    si: int = 0
+    pi: int = 0
+    star_idx: int = -1
+    star_si: int = 0
+    ns: int = len(s)
+    np: int = len(p)
+    while si < ns:
+        if pi < np and (p[pi] == "?" or p[pi] == s[si]):
+            si = si + 1
+            pi = pi + 1
+        elif pi < np and p[pi] == "*":
+            star_idx = pi
+            star_si = si
+            pi = pi + 1
+        elif star_idx != -1:
+            pi = star_idx + 1
+            star_si = star_si + 1
+            si = star_si
+        else:
+            return False
+    while pi < np and p[pi] == "*":
+        pi = pi + 1
+    return pi == np
+
+
+# Match the TRAILING `len(psegs)` elements of `self_segs` against `psegs`,
+# segment-by-segment (used for a non-anchored `match_` pattern, and for the
+# suffix after a leading `**`).
+def _pathlib_match_tail(self_segs: list[str], psegs: list[str], case_sensitive: bool) -> bool:
+    n_self: int = len(self_segs)
+    n_pat: int = len(psegs)
+    if n_pat > n_self:
+        return False
+    offset: int = n_self - n_pat
+    i: int = 0
+    while i < n_pat:
+        if not _pathlib_fnmatch_segment(self_segs[offset + i], psegs[i], case_sensitive):
+            return False
+        i = i + 1
+    return True

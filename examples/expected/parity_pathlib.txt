@@ -1,0 +1,90 @@
+['/', 'usr', 'local', 'bin', 'python3.12']
+python3.12
+python3
+.12
+['.12']
+['.tar', '.gz']
+
+.hidden
+.
+False
+..
+...txt
+/a/b/c
+/a/b
+/
+4
+0
+/usr/local/bin
+relative/path
+/override
+/etc/passwd
+/usr
+/usr/local/bin/python3.11
+newfile.txt
+/usr/local/bin/python3.11
+/usr/local/bin/python3
+file.tar.zip
+archive.gz
+/usr/local/bin/python.12
+/usr/local
+True
+False
+True
+bin/python
+.
+b/c
+../../b/c
+b/c
+True
+True
+True
+True
+False
+False
+True
+True
+True
+True
+True
+True
+False
+True
+True
+True
+/usr/local/bin/python3.12
+PurePosixPath('/usr/local/bin/python3.12')
+/
+.
+.
+empty pattern
+Invalid name ''
+Invalid name 'new/file.txt'
+PurePosixPath('/') has an empty name
+PurePosixPath('.') has an empty name
+PurePosixPath('/') has an empty name
+'/usr/local/bin' is not in the subpath of '/home/user'
+'/a/b' is not in the subpath of '/a/b/c'
+café
+.txt
+['.txt']
+日本語
+.txt
+.
+.bashrc
+...
+.txt
+['//']
+
+True
+//
+/a/b
+Invalid suffix 'txt'
+Invalid suffix '.'
+Invalid suffix '.a/b'
+False
+True
+'/a/b' is not in the subpath of 'a'
+1
+.
+True

@@ -1,0 +1,378 @@
+# pyrst standard library — graphlib
+#
+# Real pyrst stdlib module (embedded via `include_str!`, see `src/stdlib.rs`).
+# Usable as either `from graphlib import TopologicalSorter` or
+# `import graphlib; graphlib.TopologicalSorter(...)`.
+#
+# FIDELITY: 4/5 (post-hardening; see HARDENING below). Scope: `TopologicalSorter[T]`
+# (CPython 3.12's `graphlib` has exactly this one class). Core Kahn's-algorithm
+# topological sort, the `add`/`prepare`/`get_ready`/`done`/`is_active` imperative
+# state machine, and `static_order` are all faithfully ported with CPython-exact
+# insertion-order tie-breaking (see ORDERING below — this BEATS the w2-dossier's
+# 3/5 estimate, which assumed pyrst's sorted-dict iteration would corrupt
+# tie-break order; it doesn't, because this module tracks insertion order with
+# an explicit `nodes: list[T]` rather than relying on dict iteration anywhere
+# in the hot path). The remaining gap is the structural/gated divergences below,
+# all discovered pre-verified-against-CPython or during implementation:
+#
+# HARDENING (w2-hardener pass): two real defects found by running edge cases
+# against real CPython 3.12.9 and fixed here (not just documented):
+#
+#   H1. `prepare()` populated `ready_queue` AFTER raising on a detected cycle,
+#       so `get_ready()` always returned `[]` following a caught CycleError —
+#       even when independent, genuinely-ready nodes existed elsewhere in the
+#       graph. Real CPython populates `_ready_nodes` BEFORE the cycle check,
+#       explicitly by design (its own source comment: "if the user wants to
+#       catch the CycleError, that's fine, they can continue using the
+#       instance to grab as many nodes as possible before cycles block more
+#       progress"). Fixed: `ready_queue` population now happens before the
+#       cycle check/raise, matching CPython exactly (verified: a graph with a
+#       2-cycle plus two independent free nodes now yields the free nodes via
+#       `get_ready()` after catching the cycle, byte-identical to CPython).
+#   H2. `is_active()` was entirely ABSENT from the original port — a real
+#       CPython public method on `TopologicalSorter` that the w2-dossier's own
+#       SURFACE table never listed (undocumented gap, not a gated divergence).
+#       Added: `nfinished`/`npassedout` int counters plus `is_active()` ported
+#       directly from CPython's semantics (`nfinished < npassedout` OR a
+#       non-empty ready queue; raises the same `ValueError` pre-`prepare()`).
+#       CPython's `__bool__` (which just delegates to `is_active()`, used for
+#       `if ts:` truthiness) is NOT added: pyrst's `__bool__` dunder is
+#       explicitly REJECTED at compile time (`checks.rs`: "object truthiness
+#       is not lowered") despite appearing in codegen's dunder-name table —
+#       a real, pre-existing compiler gap, not something introduced here.
+#       Divergence 9 below: callers must call `ts.is_active()` explicitly;
+#       `if ts:` / `while ts:` do not compile.
+#
+# STRUCTURAL DIVERGENCES (documented, not silent):
+#
+#   1. `add(node, *predecessors)` -> `add(node, predecessors=None)`. Pyrst has
+#      no `*args`; the dossier's G4 gate. Callers pass a `list[T]` (or omit it
+#      for a dependency-free node): `ts.add("A", ["B", "C"])` instead of
+#      CPython's `ts.add("A", "B", "C")`.
+#
+#   2. `done(*nodes)` -> `done(nodes: list[T])`. Same G4 gate. Callers wrap:
+#      `ts.done(["B"])` instead of CPython's `ts.done("B")`. `get_ready()`
+#      correspondingly returns `list[T]`, not `tuple[Hashable, ...]` — pyrst's
+#      tuple type is FIXED-ARITY (`tuple[str, int]`, ...); there is no
+#      variadic `tuple[T, ...]` to target. This is a divergence the w2-dossier
+#      did NOT anticipate (its SURFACE table lists `get_ready` returning
+#      `tuple[Hashable, ...]` with no gate noted) — found here at
+#      implementation time. Dual-run parity tests below route every
+#      `get_ready()` comparison through `list(...)` on BOTH sides so the
+#      shared source stays byte-identical (CPython: `list(a_tuple) == [...]`
+#      also works, so this costs nothing on the CPython side).
+#
+#   3. `CycleError` (a `ValueError` subclass with a `(msg, cycle_path)` args
+#      tuple) -> plain `ValueError` (pyrst has no custom exception classes;
+#      only the builtin hierarchy — the dossier's explicit gate). The raised
+#      message text is built to be BYTE-IDENTICAL to
+#      `str(CycleError(("nodes are in a cycle", cycle_path)))` in CPython —
+#      i.e. `"('nodes are in a cycle', [...])"`, the str() of the 2-tuple
+#      CycleError was constructed with — so `"nodes are in a cycle" in str(e)`
+#      (or, since pyrst's `except ValueError as e:` binds `e` directly to the
+#      message STRING — see divergence 4 below — simply
+#      `"nodes are in a cycle" in e`) recovers the same detection CPython code
+#      gets via `e.args[0] == "nodes are in a cycle"`.
+#
+#   4. `except ValueError as e:` binds `e` to the message STRING, not an
+#      exception object with `.args`/`.args[0]` — pyrst has no exception
+#      object model (see codegen/stmts.rs: exceptions compile to panics whose
+#      payload is a `(type, message)` pair, and the handler binds the message
+#      text directly as `Ty::Str`). CPython parity-plan assertions written as
+#      `e.args[0] == "nodes are in a cycle"` are NOT portable as literal
+#      source; this module's parity test uses `"nodes are in a cycle" in e`
+#      on the pyrst side (CPython also accepts substring-in-string against
+#      `str(e)`, so both sides can share `"nodes are in a cycle" in str(e)`
+#      — see the parity file for the exact shared phrasing chosen).
+#
+#   5. `static_order()` returns `list[T]` (EAGER), not a lazy generator.
+#      Pyrst DOES support `yield`/`Iterator[T]` in free functions, but
+#      **generator METHODS are a rejected V1 feature** (checks.rs:
+#      "generator methods arrive in V2" — the returned `Gen<T>` would outlive
+#      the `&self` borrow). The w2-dossier's GATED section assumed no gate
+#      hit here ("Iterator Return Type ... Status: No gate hit") reasoning
+#      from the free-function `yield` support alone; this is corrected during
+#      implementation. Making `static_order` a free function taking `ts` as a
+#      parameter (`static_order(ts)` instead of `ts.static_order()`) would
+#      dodge the generator-method restriction but BREAK dual-run call-site
+#      parity (CPython has no free-standing `static_order`). Eager `list[T]`
+#      keeps `ts.static_order()` callable exactly as written in CPython, and
+#      `list(ts.static_order())` — the idiomatic CPython consumption idiom —
+#      produces an IDENTICAL value on both sides (`list()` over an
+#      already-`list[T]` value is a harmless copy). The one CPython-observable
+#      difference: `type(ts.static_order())` is `<class 'generator'>` in
+#      CPython vs. a plain list in pyrst, and calling `ts.static_order()`
+#      twice raises in CPython (prepare() cannot run twice) but is idempotent
+#      in pyrst only if `prepare()` was not already called by other means —
+#      it still raises via the same `prepare()` guard here, so THIS specific
+#      behavior is actually preserved. `type(...)` introspection is out of
+#      scope for a statically-typed target and is excluded from parity.
+#
+#   6. Node TYPE is a single concrete `T` per `TopologicalSorter[T]` instance
+#      (pyrst generics monomorphize to one concrete type argument), whereas
+#      CPython's graph is untyped and freely mixes `str`/`int`/`tuple`/`None`
+#      nodes in the SAME graph (dossier behavior-matrix case 29). Not
+#      representable; deferred. Node values must all share one hashable type
+#      per sorter — `str` is recommended (per unit notes) for CPython
+#      comparability; `int` and fixed-shape `tuple[...]` instantiations also
+#      work (structural hashing).
+#
+#   7. Unhashable-node/-predecessor `TypeError` (dossier's ERRORS section) has
+#      no runtime analogue: pyrst's type system requires `T` to already be a
+#      hashable dict-key type at COMPILE time (the module's `dict[T, ...]`
+#      fields force the bound), so passing something unhashable is a
+#      compile-time type error, not a runtime `TypeError` — arguably an
+#      IMPROVEMENT (fails earlier), documented as a divergence in error
+#      *timing*, not a missing feature.
+#
+#   8. `TopologicalSorter(graph=...)` dict-constructor path iterates the input
+#      dict's `.items()`, and pyrst dict iteration is SORTED BY KEY (not
+#      insertion order, per the general pyrst dict-iteration rule) — so
+#      tie-break order for nodes that arrive ONLY via the `graph=` dict
+#      constructor (as opposed to explicit `.add()` calls, which preserve
+#      exact insertion order via an internal list) can diverge from CPython's
+#      dict-literal insertion order on graphs with ties. The parity test's
+#      dict-init case is a total order (a straight chain) with no ties, so it
+#      is unaffected and dual-runs byte-identical; this is a real latent
+#      hazard for OTHER graphs, called out per the dossier's HAZARDS section.
+#
+#   9. `TopologicalSorter()` (bare, zero-arg) does NOT compile — a general
+#      pyrst compiler gap: `rustc` E0061 "this function takes 1 argument but
+#      0 arguments were supplied" on the generated `TopologicalSorter::new()`
+#      call, because default-arg lowering doesn't thread an `Optional[T] =
+#      None` default through a GENERIC class's zero-arg call site (confirmed
+#      via an isolated minimal, non-generic repro too — the same class of gap
+#      already documented for `collections.deque`'s `set_maxlen`). Callers
+#      MUST pass the graph argument explicitly: `TopologicalSorter(None)`
+#      instead of bare `TopologicalSorter()` — valid, semantically-identical
+#      CPython syntax too, so this costs nothing for parity (used throughout
+#      the parity file), but pyrst cannot support the bare zero-arg call
+#      CPython users are most likely to write. Flagged for the compiler-gap
+#      backlog; not a `graphlib`-specific defect.
+#
+# ORDERING (the dossier's headline HAZARD, resolved): `nodes: list[T]` records
+# true first-seen order for every node touched by `.add()` (explicit or as an
+# implicit predecessor) — a plain list append, never a dict-iteration walk —
+# so `static_order()`/`get_ready()` reproduce CPython's insertion-order
+# tie-breaking EXACTLY for every `.add()`-built graph, including multi-ready
+# tuples-turned-lists like `get_ready() -> ["D", "E"]`. Only the dict-literal
+# `graph=` constructor path (divergence 8 above) can diverge, and only on
+# tied graphs.
+#
+# Public API (exact CPython names): `TopologicalSorter` — `__init__`, `add`,
+# `prepare`, `get_ready`, `done`, `is_active`, `static_order`, `__bool__`. No
+# `CycleError` export (see divergence 3); callers catch `ValueError` and
+# pattern-match the message.
+
+
+class TopologicalSorter[T]:
+    nodes: list[T]
+    preds: dict[T, list[T]]
+    prepared: bool
+    remaining: dict[T, int]
+    successors: dict[T, list[T]]
+    ready_queue: list[T]
+    passed_out: dict[T, bool]
+    marked_done: dict[T, bool]
+    color: dict[T, int]
+    dfs_stack: list[T]
+    cycle_result: list[T]
+    nfinished: int
+    npassedout: int
+
+    def __init__(self, graph: Optional[dict[T, list[T]]] = None) -> None:
+        self.nodes = []
+        self.preds = {}
+        self.prepared = False
+        self.remaining = {}
+        self.successors = {}
+        self.ready_queue = []
+        self.passed_out = {}
+        self.marked_done = {}
+        self.color = {}
+        self.dfs_stack = []
+        self.cycle_result = []
+        self.nfinished = 0
+        self.npassedout = 0
+        if graph is not None:
+            g: dict[T, list[T]] = graph
+            # Divergence 8 (module header): iterates SORTED BY KEY, not the
+            # dict literal's original insertion order.
+            for node, node_preds in g.items():
+                self.add(node, node_preds)
+
+    def _register(self, node: T) -> None:
+        if node not in self.preds:
+            self.nodes.append(node)
+            self.preds[node] = []
+
+    def __eq__(self, other: TopologicalSorter[T]) -> bool:
+        # Explicit `__eq__` REQUIRED here (same reason as `functools.Cache`):
+        # the derived structural `PartialEq` infers too weak a bound (`T:
+        # PartialEq`) for the `dict[T, ...]` fields' `HashMap<T, _>:
+        # PartialEq` requirement (`T: Eq + Hash`), which fails to compile
+        # (E0369). Never actually exercised by parity tests; exists purely so
+        # the class compiles.
+        return len(self.nodes) == len(other.nodes)
+
+    def add(self, node: T, predecessors: Optional[list[T]] = None) -> None:
+        # Divergence 1 (module header): CPython's `add(node, *predecessors)`
+        # takes a `list[T]` here instead.
+        if self.prepared:
+            raise ValueError("Nodes cannot be added after a call to prepare()")
+        self._register(node)
+        if predecessors is not None:
+            plist: list[T] = predecessors
+            # NOTE: accumulate into a LOCAL list and write `self.preds[node]`
+            # back exactly ONCE at the end (rather than `self.preds[node]
+            # .append(p)` inside the loop) — repeatedly using `node` as a
+            # mutating-subscript key across loop iterations moves `node` into
+            # the index expression on the first iteration (rustc E0382,
+            # "value borrowed here after move" on later iterations); a single
+            # end-of-loop write uses `node` as an index only once.
+            current: list[T] = self.preds[node]
+            for p in plist:
+                self._register(p)
+                if p not in current:
+                    # Union semantics: repeated `add()` calls for the same
+                    # node merge predecessor sets rather than duplicating.
+                    current.append(p)
+            self.preds[node] = current
+
+    def _dfs(self, node: T) -> bool:
+        # DFS over the SUCCESSOR graph (edges "depends on me"), walked in
+        # `self.nodes` / `self.successors[...]` insertion order so the
+        # reported cycle path matches CPython's exactly (verified against all
+        # 3 dossier CycleError cases). `color`: 0 = unvisited,
+        # 1 = on the current DFS stack (gray), 2 = fully processed (black).
+        self.color[node] = 1
+        self.dfs_stack.append(node)
+        # Snapshot into a LOCAL before the loop: iterating `self.successors
+        # [node]` directly while calling the recursive self-method
+        # `self._dfs(...)` inside the loop body holds a live borrow of `self`
+        # for the loop's duration, conflicting with `_dfs`'s `&mut self`
+        # (rustc E0502). A local copy (already a value-semantics deep copy)
+        # carries no such borrow.
+        succs: list[T] = self.successors[node]
+        for succ in succs:
+            c: int = self.color.get(succ, 0)
+            if c == 0:
+                found: bool = self._dfs(succ)
+                if found:
+                    return True
+            elif c == 1:
+                idx: int = 0
+                while self.dfs_stack[idx] != succ:
+                    idx = idx + 1
+                i: int = idx
+                while i < len(self.dfs_stack):
+                    self.cycle_result.append(self.dfs_stack[i])
+                    i = i + 1
+                self.cycle_result.append(succ)
+                return True
+        self.color[node] = 2
+        self.dfs_stack.pop()
+        return False
+
+    def prepare(self) -> None:
+        if self.prepared:
+            raise ValueError("cannot prepare() more than once")
+        self.prepared = True
+        # Snapshot once: `self._dfs(...)` below is a recursive self-method
+        # (needs `&mut self`), so iterating `self.nodes` directly around it
+        # would hold a live borrow of `self` for the loop (rustc E0502) — see
+        # `_dfs`'s own snapshot for the same reason. Reused for every loop in
+        # this method for consistency/cheapness (all are the same list).
+        node_snapshot: list[T] = self.nodes
+        for n in node_snapshot:
+            self.successors[n] = []
+        for n in node_snapshot:
+            for p in self.preds[n]:
+                self.successors[p].append(n)
+        for n in node_snapshot:
+            self.remaining[n] = len(self.preds[n])
+        # `ready_queue` is populated BEFORE the cycle check, on purpose,
+        # mirroring CPython's own explicit design (graphlib.py comment:
+        # "ready_nodes is set before we look for cycles on purpose: if the
+        # user wants to catch the CycleError, that's fine, they can continue
+        # using the instance to grab as many nodes as possible before cycles
+        # block more progress"). BUG FIXED during hardening: the original
+        # port populated `ready_queue` AFTER the `raise`, so `get_ready()`
+        # always returned `[]` post-CycleError even when independent
+        # already-ready nodes existed elsewhere in the graph — verified
+        # against real CPython 3.12.9 to diverge (CPython returns the
+        # genuinely-ready nodes; the old code returned nothing).
+        for n in node_snapshot:
+            if self.remaining[n] == 0:
+                self.ready_queue.append(n)
+        self.color = {}
+        self.dfs_stack = []
+        self.cycle_result = []
+        for n in node_snapshot:
+            if self.color.get(n, 0) == 0:
+                found: bool = self._dfs(n)
+                if found:
+                    break
+        if len(self.cycle_result) > 0:
+            # Divergence 3 (module header): plain ValueError, message text
+            # matches CPython's str(CycleError((...))) byte-for-byte.
+            raise ValueError(f"('nodes are in a cycle', {repr(self.cycle_result)})")
+
+    def get_ready(self) -> list[T]:
+        # Divergence 2 (module header): `list[T]`, not `tuple[Hashable, ...]`.
+        if not self.prepared:
+            raise ValueError("prepare() must be called first")
+        result: list[T] = self.ready_queue
+        for n in result:
+            self.passed_out[n] = True
+        self.ready_queue = []
+        self.npassedout = self.npassedout + len(result)
+        return result
+
+    def is_active(self) -> bool:
+        # Added during hardening: CPython's `TopologicalSorter.is_active()`
+        # was in scope (real public API on the class, `graphlib.py`) but
+        # absent from the w2-dossier's SURFACE table and the original port
+        # entirely — a genuine, undocumented gap, not a gated divergence.
+        # Semantics ported directly from CPython: progress remains possible
+        # if more nodes have been passed out by `get_ready()` than marked
+        # `done()`, or if the ready queue itself is non-empty.
+        if not self.prepared:
+            raise ValueError("prepare() must be called first")
+        if self.nfinished < self.npassedout:
+            return True
+        return len(self.ready_queue) > 0
+
+    def done(self, nodes: list[T]) -> None:
+        # Divergence 1/2 (module header): CPython's `done(*nodes)` takes a
+        # `list[T]` here instead.
+        if not self.prepared:
+            raise ValueError("prepare() must be called first")
+        for node in nodes:
+            if node not in self.preds:
+                raise ValueError(f"node {repr(node)} was not added using add()")
+            if not self.passed_out.get(node, False):
+                raise ValueError(f"node {repr(node)} was not passed out (still not ready)")
+            if self.marked_done.get(node, False):
+                raise ValueError(f"node {repr(node)} was already marked done")
+            self.marked_done[node] = True
+            for succ in self.successors[node]:
+                self.remaining[succ] = self.remaining[succ] - 1
+                if self.remaining[succ] == 0:
+                    self.ready_queue.append(succ)
+            self.nfinished = self.nfinished + 1
+
+    def static_order(self) -> list[T]:
+        # Divergence 5 (module header): EAGER list, not a lazy generator —
+        # generator METHODS are a rejected V1 pyrst feature. The call site
+        # `ts.static_order()` (and `list(ts.static_order())`) stays identical
+        # to CPython source text.
+        self.prepare()
+        result: list[T] = []
+        ready: list[T] = self.get_ready()
+        while len(ready) > 0:
+            for n in ready:
+                result.append(n)
+            self.done(ready)
+            ready = self.get_ready()
+        return result

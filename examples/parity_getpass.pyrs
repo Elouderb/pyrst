@@ -1,0 +1,22 @@
+from getpass import getuser, getpass
+
+# NOTE: `getpass()` is deliberately NOT called here — it is interactive
+# (reads from a controlling terminal / stdin) and CPython additionally
+# writes a `GetPassWarning` to stderr when stdin is not a real TTY (verified
+# live: `getpass.getpass()` under a piped, non-tty stdin prints a warning
+# line before the prompt). The dual-run harness captures python3's stdout
+# AND stderr combined but pyrst's stdout ONLY (see `test_all.sh`), so ANY
+# stderr-writing interactive function is asymmetric under this harness by
+# construction — not specific to this module. `getpass` is imported (so a
+# missing/renamed symbol is still caught as a resolver error) but only
+# `getuser()`, which is pure and non-interactive, is exercised for real
+# dual-run coverage.
+def main() -> None:
+    # getpass.getuser()
+    user: str = getuser()
+    assert len(user) > 0
+
+    # getpass.getuser consistency
+    assert getuser() == getuser()
+
+    print("PASS")

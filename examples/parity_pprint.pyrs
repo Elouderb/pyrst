@@ -1,0 +1,242 @@
+# parity: dual-run
+#
+# Card 26b362d3 — dual-run parity golden for `lib/pprint.pyrs`, seeded from
+# the W2 dossier's PARITY PLAN (docs/design/w2-dossiers/pprint.md §6), every
+# case pre-verified against real CPython 3.12 there, and HARDENED (w2-
+# hardener pass) with additional edge cases discovered by re-oracling every
+# public function against fresh CPython 3.12: unicode, negative numbers,
+# exact width-boundary ties, `underscore_numbers` on floats (a genuine bug
+# found and fixed — see `lib/pprint.pyrs`'s `_pprint_underscore` header),
+# and depth-limiting across a dataclass field (a second genuine bug found
+# and fixed — see `_pprint_depth_limit`/`_pprint_is_dataclass_paren`).
+#
+# EXCLUDED BY DESIGN (not merely omitted — see `lib/pprint.pyrs`'s module
+# header for the full reasoning of each):
+#   - `pformat(())` (empty tuple): a discovered PRE-EXISTING core-compiler
+#     gap independent of pprint — `repr(())` does not compile at all
+#     (`PyRepr` is not implemented for Rust's unit type, which pyrst's empty
+#     -tuple literal lowers to). Not a pprint bug; flagged in the card history for
+#     the integrator.
+#   - `isreadable(lambda: None)` / `isreadable(object())`: pyrst has no way
+#     to pass a lambda or a bare untyped object into a `repr`-bound generic
+#     parameter — the call would not compile in the first place, so the
+#     probe is inapplicable rather than faked (module header G9).
+#   - `pformat({'z': 1, 'a': 2}, sort_dicts=False)` (insertion-order
+#     preservation): pyrst's `dict` has NO insertion-order tracking at all
+#     (see `lib/json.pyrs`'s own hardening note), so `sort_dicts=False`
+#     cannot reproduce CPython's insertion order — it is a documented NO-OP
+#     in pyrst (module header G4), always sorting like `sort_dicts=True`.
+#     Including this case here would make the dual-run byte-diff fail
+#     against python3 even though pyrst's divergence is fully understood
+#     and intentional (same exclusion pattern as `examples/
+#     parity_bisect.pyrs`'s `hi=-1` case). Verified directly (not part of
+#     this golden) that pyrst prints `{'a': 2, 'z': 1}` here where CPython
+#     prints `{'z': 1, 'a': 2}`.
+#   - bare `pformat([])` / `pformat({})` / `pformat(None)` / `saferepr([1,2])`
+#     literal-argument forms: `pformat`/`saferepr` are ORDINARY generic
+#     pyrst functions (not compiler intrinsics like `repr()`, which
+#     special-cases a bare `None` literal) — mandatory typing means the
+#     element type must be inferable from a concrete binding. Every case
+#     below uses an explicitly typed local instead; the OUTPUT is identical
+#     either way, only the call-site spelling differs (this is a pyrst
+#     calling-convention fact, not a behavior divergence).
+#   - HARDENING (G12, new): `pformat` on a `dict` with MIXED-WIDTH int keys
+#     (e.g. `{1: 'a', 10: 'b', 2: 'c'}`) — confirmed live to be a PRE-
+#     EXISTING core-`repr()` property (module header G11), not introduced
+#     by this module: `repr({1: 'a', 10: 'b', 2: 'c'})` alone (no pprint
+#     involved) already sorts entries by the rendered `"key: value"` STRING
+#     ("10: 'b'" < "1: 'a'" < "2: 'c'" lexically) rather than by numeric key
+#     value, giving `{10: 'b', 1: 'a', 2: 'c'}` where CPython gives
+#     `{1: 'a', 2: 'c', 10: 'b'}`. Excluded from this golden for the same
+#     reason as G4/G11; every dict literal below uses single-digit or all-
+#     same-width keys so real key order coincides with core `repr()`'s
+#     string order.
+#   - HARDENING (G13, new): `pformat` on a `set` of MULTIPLE STRING
+#     elements (e.g. `{'z', 'a', 'm'}`) — confirmed live to be a PRE-
+#     EXISTING core-`repr()` property, not introduced here: pyrst's `repr
+#     (set)` renders elements in a fixed sorted order, while CPython's set
+#     iteration order depends on (randomized-by-default) string hashing —
+#     `PYTHONHASHSEED` varies the CPython order run-to-run, so this is not
+#     even a stable target to diff against, let alone one pprint could
+#     reproduce. Every set literal below uses `int` elements only (whose
+#     small-int hash IS its value in CPython, so pyrst's sorted-by-value
+#     order and CPython's hash-bucket order coincide) or a single string
+#     element (no ordering question).
+#
+# Value-semantics note: every dict/list literal below is written fresh at
+# its use site (or via a freshly-typed local) rather than aliased, since
+# pyrst assignment deep-copies while CPython aliases — not otherwise
+# observable here since nothing is mutated after construction.
+
+from pprint import pformat, pprint, isreadable, isrecursive, saferepr, PrettyPrinter
+# Integration fix (W2): the python3 oracle side needs `dataclass` as a real
+# name; under pyrst this import is a resolver-skip-list no-op (`@dataclass`
+# is compiler-synthesized), so adding it is dual-run-neutral for pyrst.
+from dataclasses import dataclass
+
+
+@dataclass
+class _ParityInner:
+    v: int
+
+
+@dataclass
+class _ParityOuter:
+    items: list[int]
+    inner: _ParityInner
+
+
+def main() -> None:
+    # ── basic scalar types ──────────────────────────────────────────────
+    print(pformat(42))
+    print(pformat(3.14))
+    print(pformat("hello"))
+    print(pformat(True))
+    print(pformat(False))
+    none_val: Optional[int] = None
+    print(pformat(none_val))
+
+    # ── empty collections ───────────────────────────────────────────────
+    empty_list: list[int] = []
+    print(pformat(empty_list))
+    empty_dict: dict[str, int] = {}
+    print(pformat(empty_dict))
+    empty_set: set[int] = set()
+    print(pformat(empty_set))
+
+    # ── simple lists ─────────────────────────────────────────────────────
+    print(pformat([1, 2, 3]))
+
+    # ── tuples ───────────────────────────────────────────────────────────
+    triple: tuple[int, int, int] = (1, 2, 3)
+    print(pformat(triple))
+    single: tuple[int] = (1,)
+    print(pformat(single))
+
+    # ── strings with escapes ────────────────────────────────────────────
+    # A literal backslash-n (two chars: '\' 'n'), NOT a newline — repr()
+    # must double-escape the backslash.
+    lit_backslash_n: str = "hello\\nworld"
+    print(pformat(lit_backslash_n))
+    lit_backslash_t: str = "hello\\tworld"
+    print(pformat(lit_backslash_t))
+    # A REAL newline / tab char (BEHAVIOR MATRIX section, not just the
+    # PARITY PLAN's literal-backslash variant above).
+    real_newline: str = "hello\nworld"
+    print(pformat(real_newline))
+    real_tab: str = "hello\tworld"
+    print(pformat(real_tab))
+
+    # ── floats ───────────────────────────────────────────────────────────
+    print(pformat(0.1))
+    print(pformat(1.0))
+    print(pformat(float("inf")))
+    print(pformat(float("-inf")))
+
+    # ── underscore_numbers ──────────────────────────────────────────────
+    print(pformat(1000000, underscore_numbers=True))
+    print(pformat(1000000, underscore_numbers=False))
+
+    # ── width-induced wrapping (deterministic) ──────────────────────────
+    to_wrap: list[int] = [1, 2, 3, 4, 5]
+    wrapped: str = pformat(to_wrap, width=20)
+    print(str(wrapped.count("\n") >= 1))       # multiline
+    one_elem: list[int] = [1]
+    print(pformat(one_elem, width=80))         # single line
+
+    # ── depth limiting (deterministic, via isreadable) ──────────────────
+    shallow: dict[str, dict[str, int]] = {"a": {"b": 1}}
+    print(isreadable(shallow))
+
+    # ── recursion detection (deterministic on non-cyclic) ───────────────
+    non_cyclic: list[int] = [1, 2, 3]
+    print(isrecursive(non_cyclic))
+    one_key: dict[str, int] = {"a": 1}
+    print(isrecursive(one_key))
+
+    # ── saferepr on non-cyclic objects ──────────────────────────────────
+    pair: list[int] = [1, 2]
+    print(saferepr(pair))
+    print(saferepr(one_key))
+
+    # ── dict sorting (deterministic with sort_dicts=True) ───────────────
+    mixed_order: dict[int, str] = {3: "c", 1: "a", 2: "b"}
+    print(pformat(mixed_order, sort_dicts=True))
+
+    # ── PrettyPrinter instance ───────────────────────────────────────────
+    printer: PrettyPrinter[list[int]] = PrettyPrinter(indent=1, width=80)
+    three: list[int] = [1, 2, 3]
+    print(printer.pformat(three))
+    two: list[int] = [1, 2]
+    print(printer.isreadable(two))
+    print(printer.isrecursive(two))
+
+    # ── HARDENING: unicode scalars and containers ───────────────────────
+    unicode_str: str = "héllo wörld ünïcödé 日本語"
+    print(pformat(unicode_str))
+    unicode_list: list[str] = ["日本語", "emoji😀", "café"]
+    print(pformat(unicode_list))
+
+    # ── HARDENING: negative numbers ─────────────────────────────────────
+    neg_list: list[int] = [-1, -2, -3]
+    print(pformat(neg_list))
+    print(pformat(-1000000, underscore_numbers=True))
+    print(pformat(-5))
+    neg_dict: dict[int, str] = {-1: "a", 1: "b"}
+    print(pformat(neg_dict))
+
+    # ── HARDENING: underscore_numbers must NOT touch floats (bug found &
+    #    fixed in `_pprint_underscore` — verified live against CPython:
+    #    `pformat(1234567.891, underscore_numbers=True) == '1234567.891'`,
+    #    NOT `'1_234_567.891'`) ───────────────────────────────────────────
+    print(pformat(1234567.891, underscore_numbers=True))
+    print(pformat(12345678.9, underscore_numbers=True))
+    mixed_nums: list[int] = [1234567]
+    print(pformat(mixed_nums, underscore_numbers=True))
+    float_dict: dict[int, float] = {1234567: 7654321.5}
+    print(pformat(float_dict, underscore_numbers=True))
+
+    # ── HARDENING: exact width-boundary ties (n == width, n == width+1) ──
+    five: list[int] = [1, 2, 3, 4, 5]
+    exact15: str = pformat(five)                # flat len is exactly 15
+    print(len(exact15))
+    print(pformat(five, width=15))              # 15 <= 15: no wrap
+    print(pformat(five, width=14))              # 15 > 14: wraps
+    print(pformat([1], width=1))                # scalar-like single elem
+
+    # ── HARDENING: negative / zero-ish width and indent boundaries ──────
+    print(pformat([1, 2, 3], width=-5))         # negative width forces wrap
+    eight: list[int] = [1, 2, 3, 4, 5, 6, 7, 8]
+    print(pformat(eight, width=5, indent=0))    # indent=0: no leading pad
+
+    # ── HARDENING: depth-limiting THROUGH a dataclass field (bug found &
+    #    fixed in `_pprint_depth_limit`/`_pprint_is_dataclass_paren` — a
+    #    dataclass repr's `(...)` is OPAQUE to depth-limiting in CPython,
+    #    verified live: `pformat(Outer(...), depth=1)` reproduces the FULL
+    #    untouched repr) ───────────────────────────────────────────────────
+    dc: _ParityOuter = _ParityOuter([1, 2, 3], _ParityInner(5))
+    print(pformat(dc))
+    print(pformat(dc, depth=1))
+    dc_list: list[_ParityOuter] = [dc]
+    print(pformat(dc_list, depth=1))
+
+    # ── edge: width=0 raises ValueError ─────────────────────────────────
+    try:
+        pformat(empty_list, width=0)
+        print(False)
+    except ValueError:
+        print(True)
+
+    # ── edge: negative indent raises ValueError ─────────────────────────
+    try:
+        pformat(empty_list, indent=-1)
+        print(False)
+    except ValueError:
+        print(True)
+
+    # ── edge: depth must be > 0 ──────────────────────────────────────────
+    try:
+        pformat(empty_list, depth=0)
+        print(False)
+    except ValueError:
+        print(True)

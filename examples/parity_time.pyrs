@@ -6,7 +6,7 @@
 # harness (per docs/design/stdlib-full.md: "@extern/@crate modules ... use a
 # python3-reference golden ... or a tiny shim"). This example is therefore
 # marked pyrst-only; the deterministic calendar-math portions were additionally
-# hand-verified against CPython's real `time` module (see notes.md for the
+# hand-verified against CPython's real `time` module (transcript in the card history)
 # `python3 -c` transcript) so the fixed-epoch outputs below are true CPython
 # parity, not just self-consistency.
 from time import ctime, gmtime, monotonic, perf_counter, process_time, sleep, strftime, struct_time, time, time_ns

@@ -1,0 +1,106 @@
+# parity: pyrst-only
+# Parity test for lib/tempfile.pyrs (card 39bf959a, docs/design/w2-dossiers/
+# fs-trio.md). `tempfile` is `@extern`/`@crate`-backed over `std::env`/
+# `std::fs`/raw fds with real filesystem side effects, and uses pyrst's flat
+# `os`-style helpers internally — out of literal same-source dual-run scope,
+# same convention as `examples/parity_os.pyrs`. `mkdtemp`/`mkstemp` generate a
+# random suffix by design (matching CPython's own `tempfile`), so this golden
+# asserts DETERMINISTIC SHAPE facts only — parent directory, prefix/suffix
+# placement, uniqueness across calls, and exact CPython-verified error
+# messages — never the random middle text. All scratch state is created
+# under a fresh `mkdtemp()` "arena" directory and removed before exiting.
+
+from os import isdir, path_exists, mkdir, write_file, stat
+from tempfile import gettempdir, mkdtemp, mkstemp
+from shutil import rmtree
+from stat import S_IMODE
+
+
+def main() -> None:
+    # --- gettempdir: a real, existing directory -------------------------------
+    tmp: str = gettempdir()
+    print(len(tmp) > 0)
+    print(isdir(tmp))
+
+    arena: str = mkdtemp(prefix="parity_tempfile_")
+
+    # --- mkdtemp: default (no suffix/prefix/dir) — created under gettempdir --
+    d1: str = mkdtemp()
+    print(d1.startswith(gettempdir()))
+    print(isdir(d1))
+    # SECURITY (round-1 fix): mkdtemp must create an OWNER-ONLY 0o700 directory,
+    # matching CPython — never world-accessible (was 0o775 under a default umask,
+    # silently leaking private temp data on a multi-user host). 0o700 survives any
+    # umask that masks only group/other bits, so this is deterministic.
+    print(S_IMODE(stat(d1).st_mode) == 0o700)
+    rmtree(d1)
+
+    # --- mkdtemp: prefix + suffix + explicit dir ------------------------------
+    d2: str = mkdtemp(suffix="_suf", prefix="pre_", dir=arena)
+    base_name: str = d2[len(arena) + 1:len(d2)]
+    print(base_name.startswith("pre_"))
+    print(base_name.endswith("_suf"))
+    print(isdir(d2))
+
+    # --- mkdtemp: two calls never collide -------------------------------------
+    d3: str = mkdtemp(prefix="pre_", suffix="_suf", dir=arena)
+    print(d2 == d3)
+    print(isdir(d3))
+
+    # --- mkdtemp: dir=<nonexistent> -> FileNotFoundError ----------------------
+    try:
+        mkdtemp(dir=arena + "/no_such_subdir")
+        print("no error")
+    except FileNotFoundError as e:
+        print(e.replace(arena, "<arena>"))
+
+    # --- mkstemp: default — (fd, path) with fd usable and path under tempdir --
+    fd1, p1 = mkstemp()
+    print(fd1 >= 0)
+    print(p1.startswith(gettempdir()))
+    print(path_exists(p1))
+    # SECURITY (round-1 fix): mkstemp must create an OWNER-ONLY 0o600 file,
+    # matching CPython (was 0o664 under a default umask — world-readable).
+    print(S_IMODE(stat(p1).st_mode) == 0o600)
+
+    # --- mkstemp: prefix + suffix + explicit dir + text=True/False no-op -----
+    fd2, p2 = mkstemp(suffix=".tmp", prefix="mk_", dir=arena, text=False)
+    p2_base: str = p2[len(arena) + 1:len(p2)]
+    print(p2_base.startswith("mk_"))
+    print(p2_base.endswith(".tmp"))
+    print(fd2 >= 0)
+    print(fd2 != fd1)
+
+    fd3, p3 = mkstemp(dir=arena, text=True)
+    print(fd3 >= 0)
+    print(p3 != p2)
+
+    # --- mkstemp: dir=<nonexistent> -> FileNotFoundError ----------------------
+    try:
+        mkstemp(dir=arena + "/no_such_subdir")
+        print("no error")
+    except FileNotFoundError as e:
+        print(e.replace(arena, "<arena>"))
+
+    # === HARDENING PASS (w2-hardener): edges re-oracled against live CPython 3.12,
+    # beyond the dossier's probed set. Fixed a real, verified divergence in
+    # lib/tempfile.pyrs (see that file's header for the full verification detail). ===
+
+    # --- mkdtemp/mkstemp: dir=<a path that EXISTS but is a plain FILE, not a
+    # directory> -> NotADirectoryError, NOT FileNotFoundError (verified) -------
+    dir_is_file: str = arena + "/hard_dir_is_file.txt"
+    write_file(dir_is_file, "x")
+    try:
+        mkdtemp(dir=dir_is_file)
+        print("no error")
+    except NotADirectoryError as e:
+        print(e.replace(arena, "<arena>"))
+    try:
+        mkstemp(dir=dir_is_file)
+        print("no error")
+    except NotADirectoryError as e:
+        print(e.replace(arena, "<arena>"))
+
+    # --- cleanup ----------------------------------------------------------------
+    rmtree(arena)
+    print("done")

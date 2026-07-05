@@ -1,0 +1,53 @@
+# pyrst standard library — copy
+#
+# Shallow and deep copy implementation.
+# FIDELITY: 2/5 (value semantics make the module mostly decorative).
+#
+# HARDENING FIX: the ORIGINAL delivered `copy(x)`/`deepcopy(x, memo=None)`
+# had UNTYPED parameters (`def copy(x):` / `def deepcopy(x, memo=None):`) —
+# pyrst mandates type annotations on every parameter, so the module did not
+# even PARSE ("expected ':' (parameter — type annotation required)"). Fixed
+# by making both functions generic (`copy[T](x: T) -> T`, `deepcopy[T](x: T,
+# memo: Optional[dict[int, T]] = None) -> T`), matching the established
+# pattern used elsewhere in this stdlib (e.g. `bisect.bisect_left[T]`,
+# `functools.reduce[T]`).
+#
+# Divergences from CPython:
+#   - ALIASING IMPOSSIBLE: pyrst's value semantics forbid aliasing.
+#   - NO CUSTOM COPY PROTOCOL: __copy__/__deepcopy__ dunders unsupported.
+#   - NO CIRCULAR REFERENCES: value semantics forbid cycles.
+#   - NO BYTES/BYTEARRAY: pyrst has no bytes type.
+#   - `copy(None)`/`deepcopy(None)` with a BARE `None` literal argument (no
+#     other call in scope to pin the type) cannot be called: pyrst cannot
+#     infer the generic type parameter `T` from a bare `None` (it type-checks
+#     as `Option<_>` with no concrete inner type). A `None`-valued but
+#     concretely-TYPED variable (e.g. `n: Optional[int] = None; copy.copy(n)`)
+#     works fine — see examples/parity_copy.pyrs.
+#
+# CROSS-UNIT NAME COLLISION (co-import restriction, confirmed empirically):
+# this module's `copy(x)` is an EXACT bare-name collision with the separately
+# -authored `fs-trio` unit's `lib/shutil.pyrs`, which declares its own
+# top-level `copy(src, dst)` (CPython's `shutil.copy`). Real CPython has the
+# identical name ambiguity and resolves it via real per-module namespacing
+# (`copy.copy` vs `shutil.copy` are two distinct functions); pyrst's module
+# namespace is FLAT (confirmed: `import copy; import shutilstub` where
+# `shutilstub` also declares `def copy(...)` fails with "name `copy` is
+# provided by both `copy` and `shutilstub`; pyrst's module namespace is flat
+# ... a program cannot import both"). A pyrst program therefore CANNOT
+# `import copy` and `import shutil` (or `from copy import copy` and `from
+# shutil import copy`) together — the same operator/re precedent this
+# codebase already uses for other unavoidable CPython-name collisions.
+# Neither module renames its function (that would itself be a CPython-name
+# divergence); this is kept and documented on both sides (see `shutil.pyrs`'s
+# own header for its matching note) rather than silently worked around.
+# For new pyrst code: assignment already provides deep copy semantics.
+# This module exists for CPython compatibility only.
+
+class Error(Exception):
+    pass
+
+def copy[T](x: T) -> T:
+    return x
+
+def deepcopy[T](x: T, memo: Optional[dict[int, T]] = None) -> T:
+    return x

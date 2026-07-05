@@ -15,7 +15,7 @@
 # run under python3's real `json` module (`JsonValue`/`.get`/`.as_str` don't
 # exist there) — so a byte-identical dual run is not achievable for this
 # module's *API shape*, only for underlying SERIALIZED-STRING behavior, which
-# is validated separately (see notes.md) by round-tripping equivalent
+# is validated separately by round-tripping equivalent
 # documents through both `lib/json.pyrs`'s `dumps`/`loads` and CPython's
 # `json.dumps`/`json.loads` with matching `indent=`/`sort_keys=` args and
 # byte-diffing the two serialized strings directly (not the API surface).

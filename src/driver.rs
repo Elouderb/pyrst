@@ -226,8 +226,22 @@ fn build_cargo_project(
     for (name, version) in crates {
         deps_block.push_str(&format!("{} = \"{}\"\n", name, version));
     }
+    // The single-file rustc path builds with `rustc <src> --edition 2021` and NO
+    // optimization flags — i.e. a DEBUG build, where `debug-assertions` AND
+    // `overflow-checks` are ON, so i64 overflow PANICS honestly (see `build`).
+    // `cargo build --release`, by contrast, defaults BOTH OFF, so the very same
+    // overflowing arithmetic silently WRAPS on this Cargo path — reached by any
+    // program importing an `@crate`-backed module (`re`, `os.urandom`, ...). Two
+    // build paths that disagree on whether overflow panics is a silent miscompile;
+    // the project's iron rule is honest errors over silent wrap. Pin both checks ON
+    // in the release profile so the Cargo path matches the single-file path exactly.
+    //
+    // Perf note: `overflow-checks`/`debug-assertions` add a per-arithmetic-op branch
+    // (in generated code AND dependency crates like `regex`), but this build is still
+    // `opt-level = 3` — far faster than the opt-level-0 single-file path — and
+    // correctness/honesty outranks the marginal arithmetic cost here.
     let cargo_toml = format!(
-        "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n{}",
+        "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[profile.release]\noverflow-checks = true\ndebug-assertions = true\n\n[dependencies]\n{}",
         pkg_name, deps_block
     );
     std::fs::write(proj_dir.join("Cargo.toml"), cargo_toml)?;

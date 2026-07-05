@@ -1589,11 +1589,19 @@ pub(crate) fn collect_calls_from_stmt(stmt: &Stmt, called: &mut std::collections
             collect_calls_from_expr(idx, called);
             collect_calls_from_expr(value, called);
         }
-        // A function called ONLY inside a `raise`/`yield` expression must still be
-        // kept alive through dead-code elimination, or codegen emits a call to a
-        // pruned function -> rustc "cannot find function" (a check-passes/build-fails).
+        // A function called ONLY inside a `raise`/`yield`/`assert` expression must
+        // still be kept alive through dead-code elimination, or codegen emits a call
+        // to a pruned function -> rustc "cannot find function" (a check-passes/
+        // build-fails). Same bug class as the earlier Raise/Yield fix.
         Stmt::Raise { exc: Some(e), .. } => collect_calls_from_expr(e, called),
         Stmt::Yield(e, _) => collect_calls_from_expr(e, called),
+        // `assert cond` / `assert cond, msg` — walk BOTH the condition and the
+        // optional message: a helper referenced only in `assert check(x)` or in
+        // `assert ok, describe(x)` would otherwise be pruned then re-emitted.
+        Stmt::Assert { cond, msg, .. } => {
+            collect_calls_from_expr(cond, called);
+            if let Some(m) = msg { collect_calls_from_expr(m, called); }
+        }
         _ => {}
     }
 }

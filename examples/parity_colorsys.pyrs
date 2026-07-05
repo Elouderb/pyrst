@@ -1,0 +1,137 @@
+from colorsys import rgb_to_yiq, yiq_to_rgb, rgb_to_hls, hls_to_rgb, rgb_to_hsv, hsv_to_rgb
+from colorsys import ONE_SIXTH, ONE_THIRD, TWO_THIRD
+
+def main() -> None:
+    # Test constants
+    assert abs(ONE_SIXTH - 0.16666666666666666) < 1e-15
+    assert abs(ONE_THIRD - 0.3333333333333333) < 1e-15
+    assert abs(TWO_THIRD - 0.6666666666666666) < 1e-15
+
+    # Test rgb_to_yiq — black
+    y, i, q = rgb_to_yiq(0.0, 0.0, 0.0)
+    assert y == 0.0 and i == 0.0 and q == 0.0, f"Expected (0.0, 0.0, 0.0), got ({y}, {i}, {q})"
+
+    # Test rgb_to_yiq — white (with tolerance for tiny exponents)
+    y, i, q = rgb_to_yiq(1.0, 1.0, 1.0)
+    assert abs(y - 1.0) < 1e-10, f"White Y should be ~1.0, got {y}"
+
+    # Test rgb_to_yiq — red
+    y, i, q = rgb_to_yiq(1.0, 0.0, 0.0)
+    assert y == 0.3, f"Expected Y=0.3 for red, got {y}"
+    assert i == 0.599, f"Expected I=0.599 for red, got {i}"
+
+    # Test rgb_to_yiq — green
+    y, i, q = rgb_to_yiq(0.0, 1.0, 0.0)
+    assert y == 0.59, f"Expected Y=0.59 for green, got {y}"
+
+    # Test rgb_to_yiq — blue
+    y, i, q = rgb_to_yiq(0.0, 0.0, 1.0)
+    assert y == 0.11, f"Expected Y=0.11 for blue, got {y}"
+
+    # Test rgb_to_hls — black
+    h, l, s = rgb_to_hls(0.0, 0.0, 0.0)
+    assert (h, l, s) == (0.0, 0.0, 0.0), f"Expected (0.0, 0.0, 0.0) for black HLS, got ({h}, {l}, {s})"
+
+    # Test rgb_to_hls — white
+    h, l, s = rgb_to_hls(1.0, 1.0, 1.0)
+    assert (h, l, s) == (0.0, 1.0, 0.0), f"Expected (0.0, 1.0, 0.0) for white HLS, got ({h}, {l}, {s})"
+
+    # Test rgb_to_hls — red
+    h, l, s = rgb_to_hls(1.0, 0.0, 0.0)
+    assert (h, l, s) == (0.0, 0.5, 1.0), f"Expected (0.0, 0.5, 1.0) for red HLS, got ({h}, {l}, {s})"
+
+    # Test rgb_to_hls — green (1/3)
+    h, l, s = rgb_to_hls(0.0, 1.0, 0.0)
+    assert h == ONE_THIRD and l == 0.5 and s == 1.0, f"Expected (1/3, 0.5, 1.0) for green HLS, got ({h}, {l}, {s})"
+
+    # Test rgb_to_hsv — black
+    h, s, v = rgb_to_hsv(0.0, 0.0, 0.0)
+    assert (h, s, v) == (0.0, 0.0, 0.0), f"Expected (0.0, 0.0, 0.0) for black HSV, got ({h}, {s}, {v})"
+
+    # Test rgb_to_hsv — white
+    h, s, v = rgb_to_hsv(1.0, 1.0, 1.0)
+    assert (h, s, v) == (0.0, 0.0, 1.0), f"Expected (0.0, 0.0, 1.0) for white HSV, got ({h}, {s}, {v})"
+
+    # Test rgb_to_hsv — red
+    h, s, v = rgb_to_hsv(1.0, 0.0, 0.0)
+    assert (h, s, v) == (0.0, 1.0, 1.0), f"Expected (0.0, 1.0, 1.0) for red HSV, got ({h}, {s}, {v})"
+
+    # Test rgb_to_hsv — gray
+    h, s, v = rgb_to_hsv(0.5, 0.5, 0.5)
+    assert (h, s, v) == (0.0, 0.0, 0.5), f"Expected (0.0, 0.0, 0.5) for gray HSV, got ({h}, {s}, {v})"
+
+    # Test roundtrip: HLS (with tolerance for precision)
+    h_orig, l_orig, s_orig = rgb_to_hls(0.5, 0.3, 0.7)
+    r, g, b = hls_to_rgb(h_orig, l_orig, s_orig)
+    assert abs(r - 0.5) < 1e-10 and abs(g - 0.3) < 1e-10 and abs(b - 0.7) < 1e-10, f"HLS roundtrip failed: ({r}, {g}, {b})"
+
+    # Test roundtrip: HSV
+    h_orig, s_orig, v_orig = rgb_to_hsv(0.5, 0.3, 0.7)
+    r, g, b = hsv_to_rgb(h_orig, s_orig, v_orig)
+    assert abs(r - 0.5) < 1e-10 and abs(g - 0.3) < 1e-10 and abs(b - 0.7) < 1e-10, f"HSV roundtrip failed: ({r}, {g}, {b})"
+
+    # Test yiq_to_rgb clamping (just check that clamping happens)
+    r, g, b = yiq_to_rgb(0.0, 1.0, 0.0)
+    # The exact value before clamping is ~(0.946, 0, 0), clamped to (1.0, 0, 0)
+    # Due to coefficient precision, we check that r is close to 1.0 when clamped
+    assert 0.9 <= r <= 1.0 and g == 0.0 and b == 0.0, f"yiq_to_rgb should clamp, got ({r}, {g}, {b})"
+
+    # Test hue wrapping in hls_to_rgb (negative hue)
+    r1, g1, b1 = hls_to_rgb(-0.5, 0.5, 0.5)
+    r2, g2, b2 = hls_to_rgb(0.5, 0.5, 0.5)
+    assert abs(r1 - r2) < 1e-10 and abs(g1 - g2) < 1e-10 and abs(b1 - b2) < 1e-10, "Hue wrapping failed for HLS"
+
+    # Test hue wrapping in hsv_to_rgb (negative hue)
+    r1, g1, b1 = hsv_to_rgb(-0.5, 0.5, 0.5)
+    r2, g2, b2 = hsv_to_rgb(0.5, 0.5, 0.5)
+    assert abs(r1 - r2) < 1e-10 and abs(g1 - g2) < 1e-10 and abs(b1 - b2) < 1e-10, "Hue wrapping failed for HSV"
+
+    # HARDENING (regression coverage): the original suite never round-tripped
+    # rgb_to_yiq -> yiq_to_rgb, which let WRONG yiq_to_rgb coefficients slip
+    # through undetected (g's Q-coefficient was off by ~3.6e-5 — not a
+    # float-precision artifact, an actual wrong constant; see the FIX note in
+    # lib/colorsys.pyrs). Every value below was verified byte-identical
+    # against a real CPython 3.12 oracle.
+    y2, i2, q2 = rgb_to_yiq(0.5, 0.3, 0.7)
+    assert y2 == 0.40399999999999997, f"rgb_to_yiq Y regression: {y2}"
+    assert i2 == -0.008879999999999985, f"rgb_to_yiq I regression: {i2}"
+    assert q2 == 0.16743999999999998, f"rgb_to_yiq Q regression: {q2}"
+    r3, g3, b3 = yiq_to_rgb(y2, i2, q2)
+    assert abs(r3 - 0.5) < 1e-9 and abs(g3 - 0.3) < 1e-9 and abs(b3 - 0.7) < 1e-9, \
+        f"rgb_to_yiq/yiq_to_rgb roundtrip failed: ({r3}, {g3}, {b3})"
+
+    # Exact regression for the specific coefficient that was wrong: a pure
+    # -Q input isolates g's Q-coefficient (the one most badly off before the
+    # fix — 0.6356547546139638 vs the real 0.6356910791873801).
+    ry, gy, by = yiq_to_rgb(0.0, 0.0, -1.0)
+    assert ry == 0.0 and by == 0.0
+    assert gy == 0.6356910791873801, f"yiq_to_rgb Q-coefficient regression: {gy}"
+
+    # HARDENING (large-hue edge case): hls_to_rgb/hsv_to_rgb must wrap hues
+    # far outside [0, 1) — not just a single reflection like -0.5 vs 0.5 — by
+    # matching CPython's `% 1.0` wrapping bit-for-bit (a prior pre-normalize-
+    # once-then-add/sub-1.0 implementation rounded differently for large |h|;
+    # see the FIX note in lib/colorsys.pyrs). h=10.5 wraps to the same angle
+    # as h=0.5 seven full turns later.
+    rl, gl, bl = hls_to_rgb(10.5, 0.5, 0.5)
+    assert rl == 0.25 and gl == 0.7499999999999999 and bl == 0.7499999999999982, \
+        f"hls_to_rgb large-hue regression: ({rl}, {gl}, {bl})"
+
+    # Empty-gamut / degenerate edges: s == 0.0 short-circuits before any
+    # division (both hls_to_rgb and hsv_to_rgb), so it is safe at any l/v.
+    assert hls_to_rgb(0.37, 0.8, 0.0) == (0.8, 0.8, 0.8)
+    assert hsv_to_rgb(0.61, 0.0, 0.42) == (0.42, 0.42, 0.42)
+
+    # HARDENING (out-of-range / negative hue): CPython's hsv_to_rgb computes
+    # i=int(h*6.0) on the RAW hue and wraps only i%6 — it does NOT normalize h
+    # into [0,1) first, so negative and >1 hues (and even a negative resulting
+    # channel) pass through exactly. Printed (not asserted) so the dual-run
+    # compares the FULL float tuples against live python3 byte-for-byte.
+    print(hsv_to_rgb(-0.25, 0.5, 0.5))
+    print(hsv_to_rgb(1.5, 0.5, 0.5))
+    print(hsv_to_rgb(7.0, 0.5, 0.5))
+    print(hsv_to_rgb(-0.1, 0.8, 0.9))
+    print(hsv_to_rgb(-1.25, 0.5, 0.5))
+    print(hsv_to_rgb(2.5, 0.3, 0.7))
+
+    print("parity_colorsys: all assertions passed")

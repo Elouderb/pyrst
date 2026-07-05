@@ -1,0 +1,1513 @@
+# pyrst standard library — datetime
+#
+# Fidelity score: 3.5/5 (docs/design/w2-dossiers/datetime.md target was 4/5;
+# FOUR real compiler-limitation gaps discovered during authoring, beyond the
+# dossier's own TZINFO_GATE/CLASSMETHOD_GATE/STRUCT_TIME_GATE estimate — see
+# "Divergences" below).
+#
+# Surface: `date`, `time`, `datetime`, `timedelta` classes + a small
+# `IsoCalendarDate` value class for `isocalendar()`. Construction + full
+# range validation, `replace()` (kwargs), `isoformat`/`fromisoformat`,
+# `strftime`/`strptime` (core numeric directives), `weekday`/`isoweekday`/
+# `isocalendar`, ordinal round-trip, `+`/`-` arithmetic where the compiler's
+# dunder model allows it (see below), same-type comparisons, exact CPython
+# `ValueError`/`OverflowError` messages for every validated edge in the
+# dossier's ERRORS section. NO timezone support anywhere (see TZINFO_GATE).
+#
+# ── NAME COLLISION (documented, permanent — matches the card's warning) ────
+# `class time` (this module) collides with the TOP-LEVEL `def time()` in
+# `lib/time.pyrs` — pyrst's module namespace is FLAT (resolver
+# `detect_cross_module_collisions`, same class of restriction as an
+# operator/re-style name clash). A program that does `import time` AND
+# `import datetime` (or `from datetime import time` alongside `import time`)
+# gets a compile-time error: "name `time` is provided by both `time` and
+# `datetime`". Workaround: import only one of the two in a given program, or
+# alias at the call site is not available (pyrst has no `import x as y`) —
+# use qualified `datetime.time(...)` and avoid importing the `time` module in
+# the same file, or vice versa. Not a bug: an unavoidable flat-namespace
+# consequence, same shape as the pre-existing operator/re precedent.
+#
+# ── DIVERGENCES (all honest, none silent) ───────────────────────────────────
+#
+# 1. NO TZINFO/FOLD (TZINFO_GATE, as gated by the dossier). `tzinfo`/`fold`
+#    are not fields, not constructor params, not method params anywhere.
+#    `time`/`datetime` constructors take exactly `(hour=0, minute=0,
+#    second=0, microsecond=0)` / `(year, month, day, hour=0, minute=0,
+#    second=0, microsecond=0)` — no trailing `fold`/`tzinfo` kwargs (passing
+#    them is a compile-time "unknown keyword argument" error, which is
+#    honest — not a silently-ignored no-op). `tzname()`/`utcoffset()`/
+#    `dst()`/`astimezone()` are not implemented at all. `datetime.now()`
+#    takes no `tz` parameter (CPython's `now(tz=None)` — the only value we
+#    could ever honor is the default, so the param is simply absent).
+#    Consequently `fromisoformat` REJECTS any tz-bearing ISO string (a `+`/`-`
+#    offset or trailing `Z`) with CPython's "Invalid isoformat string: '...'"
+#    message rather than returning the tz-aware value CPython would — the same
+#    TZINFO gate, applied at the parser. Otherwise `fromisoformat` is now
+#    CPython-3.12-permissive (extended AND basic forms, any single date/time
+#    separator, 1..6 fractional digits after `.`/`,` on any component); the
+#    only NON-tz forms still rejected are ISO-week (`YYYY-Www-D`) and ordinal
+#    (`YYYY-DDD`) dates (deferred; see the `_dt_parse_iso_date` helper note).
+#
+# 2. STRUCT_TIME_GATE: `timetuple()`/`utctimetuple()` are NOT implemented on
+#    `date`/`datetime` (dossier-gated). Implementing them would need
+#    `time.struct_time`, and importing `lib/time.pyrs` from this module would
+#    make the `class time` / `def time()` collision fire INSIDE this module's
+#    own compile, not just at a downstream co-import — so it is skipped
+#    entirely rather than partially faked.
+#
+# 3. CLASSMETHOD_GATE — mostly a non-issue for `date`/`time`/`timedelta`:
+#    pyrst has no `@classmethod`, but every dossier "classmethod" on THOSE
+#    three classes (`today`, `fromordinal`, `fromisoformat`,
+#    `fromisocalendar`, `fromtimestamp`) is a `@staticmethod`, called with
+#    the IDENTICAL `ClassName.method(...)` syntax as a real classmethod — so
+#    these dual-run byte-identically against CPython. The gate DOES bite in
+#    two ways:
+#      - CPython's `.min`/`.max`/`.resolution` are plain (parenthesis-less)
+#        class ATTRIBUTES, e.g. `date.min`. A class-level constant field in
+#        pyrst must be an int/float/str/bool LITERAL
+#        (`codegen::class_const_decl`) — a `date`/`time`/`timedelta`/
+#        `datetime` INSTANCE cannot be a class constant. So these ship as
+#        niladic `@staticmethod`s instead: `date.min()`, `date.max()`,
+#        `date.resolution()` (same shape `math.pyrs` already established for
+#        `math.inf()`/`math.nan()`). `date.min()` is a `TypeError` under
+#        CPython (calling a non-callable `date` instance) — these three
+#        accessors per class (12 total) are EXCLUDED from the dual-run
+#        parity file and spot-verified pyrst-only.
+#      - See divergence #12 below for the SEPARATE, much bigger issue that
+#        forced ALL of `class datetime`'s factory methods off the class
+#        entirely.
+#
+# 4. NO REAL OPERATOR OVERLOADING BY ARGUMENT TYPE (a genuine, newly-found
+#    compiler limitation — empirically confirmed, not assumed from the
+#    dossier, which did not anticipate it). pyrst resolves a dunder's
+#    STATIC return type via `TyCtx::get_method`, which returns the FIRST
+#    method in the class body named e.g. `__sub__` — it does not dispatch on
+#    the actual argument type the way CPython's real `date.__sub__`
+#    (isinstance-branching between `date` and `timedelta`) does. Defining
+#    `__sub__` twice with different `other:`/return types type-checks the
+#    SECOND occurrence's expressions using the FIRST occurrence's declared
+#    return type (confirmed with a standalone repro: `Pt.__sub__(Pt)->Delta`
+#    then `Pt.__sub__(Delta)->Pt` mistyped `a - Delta(4)` as `Delta`). Since
+#    CPython's `date`/`datetime` genuinely need TWO different `-` shapes
+#    (`X - X -> timedelta` AND `X - timedelta -> X`), only ONE can be the
+#    real dunder per class:
+#      - `date.__sub__`/`datetime.__sub__` implement `X - X -> timedelta`
+#        (chosen deliberately: this is the CROSS-TYPE-RETURN case — self and
+#        return type differ — that this pass's card calls out as the thing
+#        to validate).
+#      - `X - timedelta -> X` (`date - timedelta`, `datetime - timedelta`)
+#        is NOT available via `-` at all. The documented, CPython-valid
+#        workaround is `x + (-delta)` (using the WORKING `__add__` plus
+#        `timedelta.__neg__`) — identical result, and it happens to be
+#        valid, identical Python too, so the parity file exercises this
+#        exact substitute rather than skipping the case.
+#    Also GATED for the same first-match reason: `timedelta.__mul__` ships
+#    ONLY the `timedelta * int -> timedelta` order (param literally named
+#    `other`, required by the `__add__`/`__sub__`/`__mul__` codegen path in
+#    `codegen::items::emit_class`, which looks up the parameter named
+#    `other` specifically). The REFLECTED order `2 * timedelta(...)` is not
+#    just gated by the overload rule — Rust has no `impl Mul<timedelta> for
+#    i64` emitted anywhere (no `__rmul__`/reflected-dunder concept in pyrst
+#    at all), so `int * ClassInstance` is a hard compile error independent
+#    of the overload issue. `timedelta(days=5) * 2` (right order) works;
+#    `2 * timedelta(days=5)` does not — divergence, documented, excluded
+#    from parity (the dossier's own case is reordered to the supported
+#    shape). `timedelta * float` (`timedelta(days=10) * 1.5`) is out of
+#    scope for the same first-match-overload reason and is not in the
+#    dossier's PARITY PLAN — omitted, not implemented.
+#
+# 5. NO `/` OR `//` ON `timedelta` AT ALL (a second genuine compiler
+#    limitation, distinct from #4): pyrst's `/` and `//` operators are
+#    HARDCODED to float/int division in both `typeck` (`BinOp::Div` always
+#    infers `Ty::Float`; `BinOp::FloorDiv` is excluded from the class-dunder
+#    dispatch list alongside `Add`/`Sub`/`Mul`) and `codegen` (no
+#    `__truediv__`/`__floordiv__` lowering exists — confirmed against the
+#    project's own "STILL UNSUPPORTED" list). `timedelta(days=5) / 2` and
+#    `timedelta(days=5) // 2` are therefore not expressible via the
+#    operator at all; there is no non-operator substitute that would also
+#    run under CPython's real `timedelta.__truediv__`/`__floordiv__`
+#    (any pyrst-only method name we added would be an `AttributeError`
+#    under the python3 twin). Divergence, documented; EXCLUDED from the
+#    dual-run parity file (the dossier's `timedelta(days=5) / 2` /
+#    `timedelta(days=5) // 2` cases are omitted, not faked).
+#
+# 6. NO `__bool__` (confirmed rejected outright by `typeck::checks` —
+#    "`__bool__` is not yet supported"). `bool(timedelta())` /
+#    `not timedelta(...)` / `if some_timedelta:` cannot be implemented.
+#    Divergence, documented; omitted from parity (the dossier's
+#    `assert not td_empty` / `assert timedelta(days=1)` truthiness cases are
+#    not reproducible and are skipped).
+#
+# 7. NO CROSS-CLASS `==` (a third genuine compiler limitation): `__eq__`
+#    lowers to `impl PartialEq for X` (`fn eq(&self, other: &X)`) — a fixed
+#    Rust type on both sides. `date(...) == time(...)` would need `date` and
+#    `time` (DIFFERENT Rust structs) to satisfy the SAME `==`, which does
+#    not compile (confirmed: rustc E0308 in a standalone repro). CPython's
+#    "cross-type equality quietly returns False" behavior (dossier BEHAVIOR
+#    MATRIX: `date(...) == time(...)` -> `False`, no error) is therefore
+#    UNREPRODUCIBLE as written — pyrst requires both `==` operands to share
+#    a declared class. Divergence, documented; the three cross-type-`==`
+#    dossier lines are excluded from the dual-run parity file (not faked as
+#    a hardcoded `False`, which would silently misrepresent same-type
+#    equality too).
+#
+# 8. `fromtimestamp`/`utcfromtimestamp`/`timestamp()` are UTC-ONLY (no local
+#    tz database, same reasoning as `lib/time.pyrs`'s `gmtime`/`ctime`).
+#    `utcfromtimestamp` is therefore identical to `fromtimestamp` here (both
+#    already UTC) — CPython distinguishes them only by tz interpretation,
+#    which we don't have. Time- and locale-dependent (`today()`, `now()`,
+#    any `fromtimestamp`/`timestamp()` against the real wall clock,
+#    `ctime()`/`strftime('%A'/'%a'/'%B'/'%b'/'%p')`) are all excluded from
+#    the dual-run file for the same reasons `lib/time.pyrs` excludes them —
+#    only numeric/locale-independent directives and fixed epoch inputs are
+#    dual-run tested.
+#
+# 9. `strptime` supports the CORE numeric directives only: `%Y %m %d %H %M
+#    %S` plus literal characters (matches the dossier's one PARITY PLAN
+#    case, `'%Y-%m-%d %H:%M:%S'`). `%f` and any locale directive are NOT
+#    implemented (raises `ValueError` on an unrecognized `%` code) — a
+#    smaller directive set than CPython's, documented, not silently ignored.
+#    `%Y` requires EXACTLY 4 digits (matches CPython's real `_strptime`
+#    regex, `\d\d\d\d`, verified live: `strptime('999-01-05', '%Y-%m-%d')`
+#    raises rather than silently parsing `year=999`); `%m`/`%d`/`%H`/`%M`/
+#    `%S` accept 1 or 2 digits, matching CPython. Trailing characters left
+#    over after every directive matched raise `"unconverted data remains:
+#    <rest>"`, matching CPython's distinct message for that case (verified
+#    live) rather than the generic "does not match format" message.
+#    REMAINING HONEST GAP (found during hardening, not worth a full rewrite):
+#    CPython's real per-directive widths come from hand-built regexes with
+#    backtracking (e.g. `%S` structurally accepts "60"/"61" for leap
+#    seconds, then raises `ValueError: second must be in 0..59` from
+#    construction — a DIFFERENT message than ours) and `%d`/`%m` reject
+#    certain two-digit combinations at the regex level before falling back
+#    to a single digit (producing "unconverted data remains" in cases where
+#    this module's greedy-then-range-check approach produces the generic
+#    "does not match format" instead). This module's greedy-consume +
+#    combined-range-check approach matches CPython exactly for every case
+#    the dossier's own ERRORS section tests (`'invalid'`, `'2025-13-01'`)
+#    and for every common well-formed/malformed input probed during
+#    hardening, but does not replicate CPython's per-directive regex
+#    corpus byte-for-byte in every deep leap-second/backtracking corner.
+#
+
+# 10. `IsoCalendarDate` (the `isocalendar()` return value) is a plain class
+#     with `year`/`week`/`weekday` int fields and CPython-matching
+#     `str`/`repr`, NOT a real named tuple — no integer indexing
+#     (`iso[0]`), no `len()`, no tuple unpacking (`y, w, d = d.isocalendar()`)
+#     since pyrst has no tuple-subclass / `__getitem__` mechanism. Attribute
+#     access (`.year`/`.week`/`.weekday`) matches CPython exactly.
+#
+# 11. `replace()` takes plain default-args (positional-OR-keyword), not
+#     CPython's keyword-ONLY shape — an ADDITIVE divergence (more permissive
+#     calling convention), not a removed capability.
+#
+# 12. `class datetime`'s "classmethod" factory API (`today`, `now`,
+#     `fromordinal`, `fromisoformat`, `fromisocalendar`, `fromtimestamp`,
+#     `utcfromtimestamp`, `combine`, `strptime`, `min`, `max`, `resolution`)
+#     is NOT on the class at all — it ships as free top-level functions
+#     `datetime_today()`, `datetime_now()`, `datetime_fromordinal(...)`, etc.
+#     (see the block right after `class datetime`'s definition for the full
+#     rationale). Root cause, confirmed empirically (both from a caller
+#     OUTSIDE this file and from a self-reference INSIDE it): `class
+#     datetime` shares its exact name with this ITS OWN module,
+#     `datetime.pyrs`. pyrst's qualified-call resolver
+#     (`typeck::exprs::check_expr`, the `Expr::Attr{Ident(modname), name}`
+#     callee arm) always checks "is `modname` a tracked MODULE name" first;
+#     `datetime` unavoidably IS one (this module), so `datetime.fromordinal(
+#     ...)` is routed to "find a top-level FUNCTION named `fromordinal` in
+#     module `datetime`" — finds none (it's a class staticmethod) — and
+#     rejects with "module `datetime` has no function `fromordinal`" INSTEAD
+#     OF resolving the class's static method, unconditionally, for every
+#     caller. `date`/`time`/`timedelta` do not have this problem (no module
+#     shares their name) and keep the exact CPython `ClassName.method(...)`
+#     call shape (divergence #3 above). This is a real, and rather
+#     surprising, compiler gap: a class is not first-class enough relative
+#     to a same-named module for its OWN qualified static calls to resolve.
+#
+# ── COMPILER BUG WORKAROUNDS (internal only — no user-visible effect) ──────
+#
+# Two more genuine, previously-unknown `pyrst` codegen bugs were found and
+# worked around WITHIN this module (neither changes any documented behavior
+# above — both are purely about making the generated Rust compile):
+#
+#   - A constructor call supplying FEWER positional arguments than the
+#     class's full `__init__` param count (relying on trailing defaults, the
+#     way a plain function call correctly does — confirmed working for
+#     ordinary `def`s) does NOT get the omitted defaults filled in at
+#     codegen for a CLASS CONSTRUCTOR specifically: `SomeClass(a, b)` against
+#     an `__init__(self, a, b, c=0)` emits `SomeClass::new(a, b)` verbatim,
+#     which fails to compile (`rustc` E0061, missing argument) — confirmed
+#     with a standalone repro. Every internal constructor call in this
+#     module therefore supplies ALL parameters explicitly (positionally) —
+#     never relies on a trailing default when constructing `date`/`time`/
+#     `datetime` from inside this file. (Keyword-form construction, e.g.
+#     `timedelta(days=5)`, is unaffected — confirmed working — since it goes
+#     through a different, kwarg-aware call-site lowering.)
+#   - A dunder method that is CODEGEN-SPECIAL-CASED (`__add__`/`__sub__`/
+#     `__mul__`/`__neg__`/`__str__`/`__repr__` — lowered directly to a Rust
+#     trait impl by `codegen::items::emit_class`, NOT through the shared
+#     `emit_func` that ordinary methods and free functions use) leaks its
+#     locally-declared variable NAMES into the compiler's "already declared"
+#     tracking for whatever is emitted next, when a later name+type pair
+#     happens to match: the later declaration silently loses its `let` and
+#     becomes a bare (undeclared-variable) reassignment, failing to compile
+#     (confirmed with a standalone repro: a class `__add__` declaring
+#     `n`/`h`/`mi`/`s`/`us` as `int` locals, followed by an unrelated
+#     free function declaring the SAME names, breaks the free function).
+#     `emit_func`-routed code (`__init__`, `__eq__`/`__lt__` — which declare
+#     no new locals here anyway —, plain methods, and free functions) clears
+#     this tracking correctly at the end of every one of ITS OWN calls; only
+#     the special-cased arithmetic/string dunders skip that reset. Every
+#     local variable declared inside one of THIS module's `__add__`/
+#     `__sub__`/`__str__`/`__repr__` bodies is therefore given a
+#     method-unique prefix (`_tds_`, `_tdr_`, `_dadd_`, `_dsub_`, `_timr_`,
+#     `_dtadd_`, `_dtsub_`, `_dtr_`) so no name anywhere else in this file
+#     (or, in principle, in any file compiled after it) can ever collide
+#     with a leaked one — a conservative, file-scoped fix for a
+#     compiler-wide latent hazard, not something a stdlib module can fix at
+#     its root.
+#
+# All ERROR MESSAGES (ValueError/OverflowError text) in the dossier's
+# ERRORS section were re-verified against a live `python3` (3.12.9) during
+# authoring, not copied blind from the dossier. A few dossier probe inputs don't fit pyrst's i64
+# (`timedelta(days=999999999999999999999)` overflows i64 at the LITERAL
+# itself, before any timedelta logic runs) — the parity file substitutes an
+# i64-safe input that hits the SAME `OverflowError` message
+# (`timedelta(days=1000000000)`, one past the real 999999999 bound).
+
+
+@extern
+def _dt_now_unix_seconds() -> float:
+    "std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64()"
+
+
+# ── calendar math (ports CPython's Lib/datetime.py pure-python algorithms) ──
+
+
+def _dt_is_leap(y: int) -> bool:
+    return (y % 4 == 0 and y % 100 != 0) or (y % 400 == 0)
+
+
+def _dt_days_in_month(y: int, m: int) -> int:
+    table: list[int] = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    if m == 2 and _dt_is_leap(y):
+        return 29
+    return table[m]
+
+
+def _dt_days_before_month(y: int, m: int) -> int:
+    table: list[int] = [0, 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]
+    n: int = table[m]
+    if m > 2 and _dt_is_leap(y):
+        n = n + 1
+    return n
+
+
+def _dt_days_before_year(y: int) -> int:
+    yy: int = y - 1
+    return yy * 365 + yy // 4 - yy // 100 + yy // 400
+
+
+def _dt_ymd2ord(y: int, m: int, d: int) -> int:
+    return _dt_days_before_year(y) + _dt_days_before_month(y, m) + d
+
+
+def _dt_ord2ymd(n: int) -> tuple[int, int, int]:
+    # Howard-Hinnant-free port of CPython's own `_ord2ymd`: locate the
+    # 400/100/4/1-year block the ordinal falls in, then the month via a
+    # fast estimate corrected by one table lookup.
+    nn: int = n - 1
+    n400: int = nn // 146097
+    nn = nn % 146097
+    year: int = n400 * 400 + 1
+    n100: int = nn // 36524
+    nn = nn % 36524
+    n4: int = nn // 1461
+    nn = nn % 1461
+    n1: int = nn // 365
+    nn = nn % 365
+    year = year + n100 * 100 + n4 * 4 + n1
+    if n1 == 4 or n100 == 4:
+        return (year - 1, 12, 31)
+    month: int = (nn + 50) >> 5
+    preceding: int = _dt_days_before_month(year, month)
+    if preceding > nn:
+        month = month - 1
+        preceding = preceding - _dt_days_in_month(year, month)
+    day: int = nn - preceding + 1
+    return (year, month, day)
+
+
+def _dt_weekday(y: int, m: int, d: int) -> int:
+    # 0=Monday .. 6=Sunday, matching CPython's `date.weekday()`.
+    return (_dt_ymd2ord(y, m, d) + 6) % 7
+
+
+def _dt_day_of_year(y: int, m: int, d: int) -> int:
+    return _dt_days_before_month(y, m) + d
+
+
+def _dt_isoweek1monday(year: int) -> int:
+    firstday: int = _dt_ymd2ord(year, 1, 1)
+    firstweekday: int = (firstday + 6) % 7
+    week1monday: int = firstday - firstweekday
+    if firstweekday > 3:
+        week1monday = week1monday + 7
+    return week1monday
+
+
+def _dt_isocalendar(y: int, m: int, d: int) -> tuple[int, int, int]:
+    today: int = _dt_ymd2ord(y, m, d)
+    yr: int = y
+    week1monday: int = _dt_isoweek1monday(yr)
+    week: int = (today - week1monday) // 7
+    dow: int = (today - week1monday) % 7
+    if week < 0:
+        yr = yr - 1
+        week1monday = _dt_isoweek1monday(yr)
+        week = (today - week1monday) // 7
+        dow = (today - week1monday) % 7
+    elif week >= 52:
+        if today >= _dt_isoweek1monday(yr + 1):
+            yr = yr + 1
+            week = 0
+    return (yr, week + 1, dow + 1)
+
+
+def _dt_weekday_name(w: int) -> str:
+    names: list[str] = [
+        "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"
+    ]
+    return names[w]
+
+
+def _dt_month_name(m: int) -> str:
+    names: list[str] = [
+        "January", "February", "March", "April", "May", "June",
+        "July", "August", "September", "October", "November", "December"
+    ]
+    return names[m - 1]
+
+
+# ── string formatting shared by date / time / datetime ──────────────────────
+
+
+def _dt_date_str(y: int, m: int, d: int) -> str:
+    return str(y).zfill(4) + "-" + str(m).zfill(2) + "-" + str(d).zfill(2)
+
+
+def _dt_time_str(h: int, mi: int, s: int, us: int) -> str:
+    base: str = str(h).zfill(2) + ":" + str(mi).zfill(2) + ":" + str(s).zfill(2)
+    if us != 0:
+        base = base + "." + str(us).zfill(6)
+    return base
+
+
+def _dt_ctime(y: int, m: int, d: int, h: int, mi: int, s: int) -> str:
+    wday: int = _dt_weekday(y, m, d)
+    wname: str = _dt_weekday_name(wday)[0:3]
+    mname: str = _dt_month_name(m)[0:3]
+    day_field: str = str(d).rjust(2)
+    return (
+        wname + " " + mname + " " + day_field + " "
+        + str(h).zfill(2) + ":" + str(mi).zfill(2) + ":" + str(s).zfill(2)
+        + " " + str(y)
+    )
+
+
+def _dt_strftime_code(
+    code: str, y: int, m: int, d: int, h: int, mi: int, s: int, us: int
+) -> str:
+    wday: int = _dt_weekday(y, m, d)
+    if code == "Y":
+        return str(y)
+    if code == "y":
+        return str(y % 100).zfill(2)
+    if code == "m":
+        return str(m).zfill(2)
+    if code == "d":
+        return str(d).zfill(2)
+    if code == "H":
+        return str(h).zfill(2)
+    if code == "M":
+        return str(mi).zfill(2)
+    if code == "S":
+        return str(s).zfill(2)
+    if code == "f":
+        return str(us).zfill(6)
+    if code == "j":
+        return str(_dt_day_of_year(y, m, d)).zfill(3)
+    if code == "A":
+        return _dt_weekday_name(wday)
+    if code == "a":
+        return _dt_weekday_name(wday)[0:3]
+    if code == "B":
+        return _dt_month_name(m)
+    if code == "b":
+        return _dt_month_name(m)[0:3]
+    if code == "p":
+        if h < 12:
+            return "AM"
+        return "PM"
+    if code == "w":
+        return str((wday + 1) % 7)
+    if code == "%":
+        return "%"
+    raise ValueError("strftime: unsupported directive %" + code)
+
+
+def _dt_strftime(fmt: str, y: int, m: int, d: int, h: int, mi: int, s: int, us: int) -> str:
+    out: str = ""
+    i: int = 0
+    n: int = len(fmt)
+    while i < n:
+        c: str = fmt[i]
+        if c == "%" and i + 1 < n:
+            out += _dt_strftime_code(fmt[i + 1], y, m, d, h, mi, s, us)
+            i = i + 2
+        else:
+            out += c
+            i = i + 1
+    return out
+
+
+# ── small parsing helpers (fromisoformat / strptime) ────────────────────────
+
+
+def _dt_all_digits(s: str) -> bool:
+    if len(s) == 0:
+        return False
+    i: int = 0
+    while i < len(s):
+        if not s[i].isdigit():
+            return False
+        i = i + 1
+    return True
+
+
+def _dt_parse_uint(s: str) -> int:
+    n: int = 0
+    i: int = 0
+    while i < len(s):
+        n = n * 10 + (ord(s[i]) - ord("0"))
+        i = i + 1
+    return n
+
+
+def _dt_consume_digits(s: str, start: int, maxw: int) -> tuple[int, int]:
+    # Greedily consumes 1..maxw digits from `s` starting at `start`. Returns
+    # (value, new_index) on success, or (0, -1) if no digit was available.
+    n: int = len(s)
+    i: int = start
+    count: int = 0
+    val: int = 0
+    while i < n and count < maxw and s[i].isdigit():
+        val = val * 10 + (ord(s[i]) - ord("0"))
+        i = i + 1
+        count = count + 1
+    if count == 0:
+        return (0, -1)
+    return (val, i)
+
+
+def _dt_consume_digits_exact(s: str, start: int, width: int) -> tuple[int, int]:
+    # Consumes EXACTLY `width` digits (used for `%Y`, which CPython's real
+    # `_strptime` regex hardcodes to `\d\d\d\d` -- unlike `%m`/`%d`/`%H`/`%M`/
+    # `%S`, which accept 1 or 2 digits). Returns (0, -1) if fewer than
+    # `width` digits are available at `start`.
+    n: int = len(s)
+    i: int = start
+    count: int = 0
+    val: int = 0
+    while i < n and count < width and s[i].isdigit():
+        val = val * 10 + (ord(s[i]) - ord("0"))
+        i = i + 1
+        count = count + 1
+    if count != width:
+        return (0, -1)
+    return (val, i)
+
+
+# ── ISO-8601 fromisoformat parsing (CPython 3.12-permissive) ────────────────
+# Ported from CPython 3.12's C `parse_isoformat_date` / `parse_hh_mm_ss_ff`.
+# Handles the extended (`YYYY-MM-DD`, `HH:MM:SS`) AND basic (`YYYYMMDD`,
+# `HHMMSS`) forms, partial times (`HH`, `HH:MM`, basic `HHMM`), a `.`/`,`
+# fractional-seconds component of 1..6 SIGNIFICANT digits (extra digits must
+# still be digits but are truncated) appearing after ANY time component, and —
+# for datetime — ANY single character as the date/time separator. DEFERRED,
+# rejected with CPython's exact "Invalid isoformat string: '...'" message
+# (documented divergence, NOT a silent accept): tz offsets / trailing `Z`
+# (TZINFO gate — CPython would return a tz-aware value), and the ISO-week
+# (`YYYY-Www-D`) / ordinal (`YYYY-DDD`) date forms. Range errors (month/day/
+# hour/...) are NOT checked here: the date()/time()/datetime() constructor
+# raises them with CPython's exact wording, exactly as CPython's own
+# fromisoformat lets the constructor error propagate (e.g. "2025-13-01" ->
+# "month must be in 1..12", "25:00:00" -> "hour must be in 0..23").
+
+
+# True if s[start:end] contains a tz designator ('+'/'-'/'Z'). pyrst has no
+# tzinfo, so any otherwise-valid tz form is rejected by the caller. A bare
+# HH:MM:SS[.ffffff] time never contains one, so this only fires on real tz.
+def _dt_iso_time_has_tz(s: str, start: int, end: int) -> bool:
+    i: int = start
+    while i < end:
+        c: str = s[i]
+        if c == "+" or c == "-" or c == "Z":
+            return True
+        i = i + 1
+    return False
+
+
+# Parse YYYY-MM-DD (date_len == 10) or YYYYMMDD (date_len == 8) at s[start].
+# Returns (year, month, day, ok). NO range validation (constructor does that).
+def _dt_parse_iso_date(s: str, start: int, date_len: int) -> tuple[int, int, int, bool]:
+    ys: str = ""
+    ms: str = ""
+    ds: str = ""
+    if date_len == 10:
+        if s[start + 4] != "-" or s[start + 7] != "-":
+            return (0, 0, 0, False)
+        ys = s[start:start + 4]
+        ms = s[start + 5:start + 7]
+        ds = s[start + 8:start + 10]
+    elif date_len == 8:
+        ys = s[start:start + 4]
+        ms = s[start + 4:start + 6]
+        ds = s[start + 6:start + 8]
+    else:
+        return (0, 0, 0, False)
+    if not (_dt_all_digits(ys) and _dt_all_digits(ms) and _dt_all_digits(ds)):
+        return (0, 0, 0, False)
+    return (_dt_parse_uint(ys), _dt_parse_uint(ms), _dt_parse_uint(ds), True)
+
+
+# Parse [HH[:MM[:SS]]][{.,}ffffff] (basic or extended) from s[start:end].
+# Returns (hour, minute, second, microsecond, ok). Mirrors CPython 3.12's
+# `parse_hh_mm_ss_ff`: HH/MM/SS are EXACTLY 2 digits each; a '.'/',' after any
+# component switches to the fractional part (1..6 significant digits; any
+# trailing chars must still be digits, and beyond 6 are truncated). Caller has
+# already rejected tz. NO range validation (constructor does that).
+def _dt_parse_iso_time(s: str, start: int, end: int) -> tuple[int, int, int, int, bool]:
+    vals: list[int] = [0, 0, 0]
+    pos: int = start
+    comp: int = 0
+    frac_pos: int = -1
+    # sep_mode: 0 undetermined, 3 = colon-SEPARATED (HH:MM:SS), 2 = BASIC
+    # (HHMMSS, no separators). Decided by the character right after HH, exactly
+    # like CPython's C `parse_hh_mm_ss_ff` char_offset. In basic mode the next
+    # component's first digit follows immediately, so a non-':'/'.'/',' char is
+    # "backed up" and re-read as the start of the next component.
+    sep_mode: int = 0
+    while comp < 3:
+        if end - pos < 2:
+            return (0, 0, 0, 0, False)
+        seg: str = s[pos:pos + 2]
+        if not _dt_all_digits(seg):
+            return (0, 0, 0, 0, False)
+        vals[comp] = _dt_parse_uint(seg)
+        pos = pos + 2
+        if pos >= end:
+            # Consumed all input; this component was the last, no fraction.
+            return (vals[0], vals[1], vals[2], 0, True)
+        c: str = s[pos]
+        pos = pos + 1
+        if comp == 0:
+            if c == ":":
+                sep_mode = 3
+            else:
+                sep_mode = 2
+        if c == ":" and sep_mode == 3:
+            comp = comp + 1
+            continue
+        elif c == "." or c == ",":
+            frac_pos = pos
+            comp = 3
+        elif sep_mode == 2:
+            # Basic mode: `c` is the first digit of the next component. Back up
+            # one and re-read it as the start of that component.
+            pos = pos - 1
+            comp = comp + 1
+            continue
+        else:
+            return (0, 0, 0, 0, False)  # malformed separator in colon mode
+    # Post-loop: a '.'/',' set frac_pos, OR SS was followed by ':' (comp hit 3
+    # via ':' — CPython then also treats what follows as the fraction).
+    if frac_pos < 0:
+        frac_pos = pos
+    remainder: int = end - frac_pos
+    if remainder <= 0:
+        return (0, 0, 0, 0, False)  # trailing '.'/','/':' with no digits
+    to_parse: int = remainder
+    if to_parse > 6:
+        to_parse = 6
+    frac_seg: str = s[frac_pos:frac_pos + to_parse]
+    if not _dt_all_digits(frac_seg):
+        return (0, 0, 0, 0, False)
+    us: int = _dt_parse_uint(frac_seg)
+    k: int = to_parse
+    while k < 6:
+        us = us * 10
+        k = k + 1
+    if remainder > to_parse:
+        extra: str = s[frac_pos + to_parse:end]
+        if not _dt_all_digits(extra):
+            return (0, 0, 0, 0, False)
+    return (vals[0], vals[1], vals[2], us, True)
+
+
+# ── module-wide bounds (proleptic Gregorian ordinal range + Unix epoch) ─────
+
+_DT_MIN_ORD: int = 1
+_DT_MAX_ORD: int = 3652059
+_DT_EPOCH_ORD: int = 719163
+
+
+class timedelta:
+    days: int
+    seconds: int
+    microseconds: int
+
+    def __init__(
+        self,
+        days: int = 0,
+        seconds: int = 0,
+        microseconds: int = 0,
+        milliseconds: int = 0,
+        minutes: int = 0,
+        hours: int = 0,
+        weeks: int = 0
+    ) -> None:
+        # Normalize incrementally (days kept as a PLAIN int accumulator,
+        # never multiplied out into a total-microseconds count) rather than
+        # CPython's own "collapse everything into one flat unit" style
+        # gloss — `days` can legitimately be up to 999999999, and
+        # `999999999 * 86400000000` overflows i64 by roughly 10x (i64 tops
+        # out at ~9.22e18; that product is ~8.64e19). Found via a direct
+        # `timedelta.min()`/`timedelta.max()` boundary test (a Rust integer
+        # overflow panic), fixed by normalizing seconds/microseconds
+        # contributions in their OWN small-magnitude units first and only
+        # ever adding (never multiplying) day-sized carries into `d`.
+        d: int = days + weeks * 7
+        total_seconds: int = seconds + minutes * 60 + hours * 3600
+        d = d + total_seconds // 86400
+        s: int = total_seconds % 86400
+        total_micros: int = microseconds + milliseconds * 1000
+        s = s + total_micros // 1000000
+        us: int = total_micros % 1000000
+        d = d + s // 86400
+        s = s % 86400
+        if d < -999999999 or d > 999999999:
+            raise OverflowError("days=" + str(d) + "; must have magnitude <= 999999999")
+        self.days = d
+        self.seconds = s
+        self.microseconds = us
+
+    @staticmethod
+    def min() -> timedelta:
+        return timedelta(days=-999999999)
+
+    @staticmethod
+    def max() -> timedelta:
+        return timedelta(days=999999999, seconds=86399, microseconds=999999)
+
+    @staticmethod
+    def resolution() -> timedelta:
+        return timedelta(microseconds=1)
+
+    def total_seconds(self) -> float:
+        # Computed in float space (not `days*86400 + seconds` as one i64
+        # product) to avoid overflowing i64 for `days` near +-999999999 —
+        # 999999999 * 86400 alone is ~8.6e13, safe, but CPython's own
+        # computation multiplies by 10**6 first; doing that in i64 here
+        # would overflow (~8.6e19 > i64::MAX). Float composition matches
+        # CPython's returned float value to its own double precision.
+        return float(self.days) * 86400.0 + float(self.seconds) + float(self.microseconds) / 1000000.0
+
+    def __add__(self, other: timedelta) -> timedelta:
+        return timedelta(
+            days=self.days + other.days,
+            seconds=self.seconds + other.seconds,
+            microseconds=self.microseconds + other.microseconds
+        )
+
+    def __sub__(self, other: timedelta) -> timedelta:
+        return timedelta(
+            days=self.days - other.days,
+            seconds=self.seconds - other.seconds,
+            microseconds=self.microseconds - other.microseconds
+        )
+
+    def __neg__(self) -> timedelta:
+        return timedelta(days=-self.days, seconds=-self.seconds, microseconds=-self.microseconds)
+
+    def __mul__(self, other: int) -> timedelta:
+        # (divergence #4) `timedelta * int` only — the reflected `int *
+        # timedelta` order has no lowering in pyrst (no reflected-dunder
+        # concept); see module header.
+        return timedelta(
+            days=self.days * other,
+            seconds=self.seconds * other,
+            microseconds=self.microseconds * other
+        )
+
+    def __eq__(self, other: timedelta) -> bool:
+        return (
+            self.days == other.days
+            and self.seconds == other.seconds
+            and self.microseconds == other.microseconds
+        )
+
+    def __lt__(self, other: timedelta) -> bool:
+        if self.days != other.days:
+            return self.days < other.days
+        if self.seconds != other.seconds:
+            return self.seconds < other.seconds
+        return self.microseconds < other.microseconds
+
+    def __str__(self) -> str:
+        # (compiler-limitation workaround — see NOTE below the module header
+        # divergence list) local names here are prefixed `_tds_` so they
+        # cannot collide with ANY other function/method's locals: a
+        # confirmed compiler bug leaks a dunder method's local variable
+        # names into whatever is emitted next when the names AND types
+        # match, silently discarding a real `let` declaration.
+        _tds_total_secs: int = self.seconds
+        _tds_h: int = _tds_total_secs // 3600
+        _tds_rem: int = _tds_total_secs % 3600
+        _tds_mi: int = _tds_rem // 60
+        _tds_s: int = _tds_rem % 60
+        _tds_time_part: str = str(_tds_h) + ":" + str(_tds_mi).zfill(2) + ":" + str(_tds_s).zfill(2)
+        if self.microseconds != 0:
+            _tds_time_part = _tds_time_part + "." + str(self.microseconds).zfill(6)
+        _tds_result: str = _tds_time_part
+        if self.days != 0:
+            _tds_day_word: str = "days"
+            if self.days == 1 or self.days == -1:
+                _tds_day_word = "day"
+            _tds_result = str(self.days) + " " + _tds_day_word + ", " + _tds_time_part
+        return _tds_result
+
+    def __repr__(self) -> str:
+        _tdr_parts: list[str] = []
+        if self.days != 0:
+            _tdr_parts.append("days=" + str(self.days))
+        if self.seconds != 0:
+            _tdr_parts.append("seconds=" + str(self.seconds))
+        if self.microseconds != 0:
+            _tdr_parts.append("microseconds=" + str(self.microseconds))
+        if len(_tdr_parts) == 0:
+            return "datetime.timedelta(0)"
+        _tdr_out: str = "datetime.timedelta("
+        _tdr_i: int = 0
+        while _tdr_i < len(_tdr_parts):
+            if _tdr_i > 0:
+                _tdr_out += ", "
+            _tdr_out += _tdr_parts[_tdr_i]
+            _tdr_i = _tdr_i + 1
+        _tdr_out += ")"
+        return _tdr_out
+
+
+class IsoCalendarDate:
+    year: int
+    week: int
+    weekday: int
+
+    def __init__(self, year: int, week: int, weekday: int) -> None:
+        self.year = year
+        self.week = week
+        self.weekday = weekday
+
+    def __str__(self) -> str:
+        return (
+            "datetime.IsoCalendarDate(year=" + str(self.year)
+            + ", week=" + str(self.week)
+            + ", weekday=" + str(self.weekday)
+            + ")"
+        )
+
+    def __repr__(self) -> str:
+        return self.__str__()
+
+
+class date:
+    year: int
+    month: int
+    day: int
+
+    def __init__(self, year: int, month: int, day: int) -> None:
+        if year < 1 or year > 9999:
+            raise ValueError("year " + str(year) + " is out of range")
+        if month < 1 or month > 12:
+            raise ValueError("month must be in 1..12")
+        if day < 1 or day > _dt_days_in_month(year, month):
+            raise ValueError("day is out of range for month")
+        self.year = year
+        self.month = month
+        self.day = day
+
+    @staticmethod
+    def today() -> date:
+        return date.fromtimestamp(_dt_now_unix_seconds())
+
+    @staticmethod
+    def fromordinal(ordinal: int) -> date:
+        if ordinal < 1:
+            raise ValueError("ordinal must be >= 1")
+        ymd: tuple[int, int, int] = _dt_ord2ymd(ordinal)
+        return date(ymd[0], ymd[1], ymd[2])
+
+    @staticmethod
+    def fromisoformat(date_string: str) -> date:
+        # CPython 3.12-permissive: extended `YYYY-MM-DD` OR basic `YYYYMMDD`.
+        # The date length is decided by char 4 ('-' => extended/10, else
+        # basic/8); the whole string must be exactly that length (a partial
+        # `2025-01`, a single-digit `2025-1-1`, or an ISO-week/ordinal form is
+        # rejected — see the _dt_parse_iso_date helper's DEFERRED note).
+        n: int = len(date_string)
+        date_len: int = -1
+        if n >= 5 and date_string[4] == "-":
+            date_len = 10
+        elif n >= 4:
+            date_len = 8
+        if date_len == -1 or n != date_len:
+            raise ValueError("Invalid isoformat string: '" + date_string + "'")
+        parsed: tuple[int, int, int, bool] = _dt_parse_iso_date(date_string, 0, date_len)
+        if not parsed[3]:
+            raise ValueError("Invalid isoformat string: '" + date_string + "'")
+        return date(parsed[0], parsed[1], parsed[2])
+
+    @staticmethod
+    def fromisocalendar(year: int, week: int, day: int) -> date:
+        if week < 1 or week > 53:
+            raise ValueError("Invalid week: " + str(week))
+        if day < 1 or day > 7:
+            raise ValueError("Invalid day: " + str(day) + " (range is [1, 7])")
+        week1monday: int = _dt_isoweek1monday(year)
+        ordv: int = week1monday + (week - 1) * 7 + (day - 1)
+        ymd: tuple[int, int, int] = _dt_ord2ymd(ordv)
+        return date(ymd[0], ymd[1], ymd[2])
+
+    @staticmethod
+    def fromtimestamp(timestamp: float) -> date:
+        # (divergence #8) UTC-based, not local-tz — see module header.
+        days: int = int(timestamp // 86400.0)
+        ordv: int = _DT_EPOCH_ORD + days
+        ymd: tuple[int, int, int] = _dt_ord2ymd(ordv)
+        return date(ymd[0], ymd[1], ymd[2])
+
+    @staticmethod
+    def min() -> date:
+        return date(1, 1, 1)
+
+    @staticmethod
+    def max() -> date:
+        return date(9999, 12, 31)
+
+    @staticmethod
+    def resolution() -> timedelta:
+        return timedelta(days=1)
+
+    def replace(
+        self, year: Optional[int] = None, month: Optional[int] = None, day: Optional[int] = None
+    ) -> date:
+        y: int = self.year
+        if year is not None:
+            y: int = year
+        m: int = self.month
+        if month is not None:
+            m: int = month
+        d: int = self.day
+        if day is not None:
+            d: int = day
+        return date(y, m, d)
+
+    def toordinal(self) -> int:
+        return _dt_ymd2ord(self.year, self.month, self.day)
+
+    def isoformat(self) -> str:
+        return _dt_date_str(self.year, self.month, self.day)
+
+    def ctime(self) -> str:
+        return _dt_ctime(self.year, self.month, self.day, 0, 0, 0)
+
+    def strftime(self, fmt: str) -> str:
+        return _dt_strftime(fmt, self.year, self.month, self.day, 0, 0, 0, 0)
+
+    def weekday(self) -> int:
+        return _dt_weekday(self.year, self.month, self.day)
+
+    def isoweekday(self) -> int:
+        return _dt_weekday(self.year, self.month, self.day) + 1
+
+    def isocalendar(self) -> IsoCalendarDate:
+        t: tuple[int, int, int] = _dt_isocalendar(self.year, self.month, self.day)
+        return IsoCalendarDate(t[0], t[1], t[2])
+
+    def __eq__(self, other: date) -> bool:
+        return self.year == other.year and self.month == other.month and self.day == other.day
+
+    def __lt__(self, other: date) -> bool:
+        if self.year != other.year:
+            return self.year < other.year
+        if self.month != other.month:
+            return self.month < other.month
+        return self.day < other.day
+
+    def __add__(self, other: timedelta) -> date:
+        # CPython's real `date.__add__` only ever consults `other.days`
+        # (a timedelta's seconds/microseconds can never carry into a whole
+        # day after normalization) — ported faithfully, not approximated.
+        # (compiler-limitation workaround: `_dadd_`-prefixed locals — see the
+        # NOTE below the module header divergence list.)
+        _dadd_n: int = _dt_ymd2ord(self.year, self.month, self.day) + other.days
+        if _dadd_n < _DT_MIN_ORD or _dadd_n > _DT_MAX_ORD:
+            raise OverflowError("date value out of range")
+        _dadd_ymd: tuple[int, int, int] = _dt_ord2ymd(_dadd_n)
+        return date(_dadd_ymd[0], _dadd_ymd[1], _dadd_ymd[2])
+
+    def __sub__(self, other: date) -> timedelta:
+        # (divergence #4) `date - date -> timedelta` is the real dunder;
+        # `date - timedelta -> date` is not available via `-` — write
+        # `d + (-delta)` instead. See module header.
+        _dsub_days: int = (
+            _dt_ymd2ord(self.year, self.month, self.day)
+            - _dt_ymd2ord(other.year, other.month, other.day)
+        )
+        return timedelta(days=_dsub_days)
+
+    def __str__(self) -> str:
+        return self.isoformat()
+
+    def __repr__(self) -> str:
+        return "datetime.date(" + str(self.year) + ", " + str(self.month) + ", " + str(self.day) + ")"
+
+
+class time:
+    # (NAME COLLISION — see module header) This class shares the name
+    # `time` with the top-level `def time()` in `lib/time.pyrs`; co-importing
+    # both modules is a compile-time error. Kept as the exact CPython name
+    # per the card's instruction (documented, not a bug).
+    hour: int
+    minute: int
+    second: int
+    microsecond: int
+
+    def __init__(
+        self, hour: int = 0, minute: int = 0, second: int = 0, microsecond: int = 0
+    ) -> None:
+        if hour < 0 or hour > 23:
+            raise ValueError("hour must be in 0..23")
+        if minute < 0 or minute > 59:
+            raise ValueError("minute must be in 0..59")
+        if second < 0 or second > 59:
+            raise ValueError("second must be in 0..59")
+        if microsecond < 0 or microsecond > 999999:
+            raise ValueError("microsecond must be in 0..999999")
+        self.hour = hour
+        self.minute = minute
+        self.second = second
+        self.microsecond = microsecond
+
+    @staticmethod
+    def fromisoformat(time_string: str) -> time:
+        # CPython 3.12-permissive: [T]HH[:MM[:SS]][{.,}ffffff] in extended or
+        # basic form (see _dt_parse_iso_time). A single leading 'T' is stripped
+        # for parsing, but the error message keeps the ORIGINAL string (matching
+        # CPython: `time.fromisoformat('Tbad')` -> "...: 'Tbad'"). tz forms
+        # ('+'/'-'/'Z') are rejected (TZINFO gate); range errors propagate from
+        # the time() constructor with CPython's exact wording.
+        ts: str = time_string
+        if len(ts) > 0 and ts[0] == "T":
+            ts = ts[1:]
+        n: int = len(ts)
+        if n < 2 or _dt_iso_time_has_tz(ts, 0, n):
+            raise ValueError("Invalid isoformat string: '" + time_string + "'")
+        parsed: tuple[int, int, int, int, bool] = _dt_parse_iso_time(ts, 0, n)
+        if not parsed[4]:
+            raise ValueError("Invalid isoformat string: '" + time_string + "'")
+        return time(parsed[0], parsed[1], parsed[2], parsed[3])
+
+    @staticmethod
+    def min() -> time:
+        return time(0, 0, 0, 0)
+
+    @staticmethod
+    def max() -> time:
+        return time(23, 59, 59, 999999)
+
+    @staticmethod
+    def resolution() -> timedelta:
+        return timedelta(microseconds=1)
+
+    def replace(
+        self,
+        hour: Optional[int] = None,
+        minute: Optional[int] = None,
+        second: Optional[int] = None,
+        microsecond: Optional[int] = None
+    ) -> time:
+        h: int = self.hour
+        if hour is not None:
+            h: int = hour
+        mi: int = self.minute
+        if minute is not None:
+            mi: int = minute
+        s: int = self.second
+        if second is not None:
+            s: int = second
+        us: int = self.microsecond
+        if microsecond is not None:
+            us: int = microsecond
+        return time(h, mi, s, us)
+
+    def isoformat(self) -> str:
+        return _dt_time_str(self.hour, self.minute, self.second, self.microsecond)
+
+    def strftime(self, fmt: str) -> str:
+        return _dt_strftime(fmt, 1900, 1, 1, self.hour, self.minute, self.second, self.microsecond)
+
+    def __eq__(self, other: time) -> bool:
+        return (
+            self.hour == other.hour
+            and self.minute == other.minute
+            and self.second == other.second
+            and self.microsecond == other.microsecond
+        )
+
+    def __lt__(self, other: time) -> bool:
+        if self.hour != other.hour:
+            return self.hour < other.hour
+        if self.minute != other.minute:
+            return self.minute < other.minute
+        if self.second != other.second:
+            return self.second < other.second
+        return self.microsecond < other.microsecond
+
+    def __str__(self) -> str:
+        return self.isoformat()
+
+    def __repr__(self) -> str:
+        _timr_parts: str = str(self.hour) + ", " + str(self.minute)
+        if self.microsecond != 0:
+            _timr_parts = _timr_parts + ", " + str(self.second) + ", " + str(self.microsecond)
+        elif self.second != 0:
+            _timr_parts = _timr_parts + ", " + str(self.second)
+        return "datetime.time(" + _timr_parts + ")"
+
+
+# Private helper shared by the free `datetime_fromtimestamp` /
+# `datetime_utcfromtimestamp` / `datetime_today` / `datetime_now` functions
+# below (see divergence #12 in the module header for why these are free
+# functions rather than `@staticmethod`s on `class datetime`).
+def _dt_datetime_from_timestamp(timestamp: float) -> datetime:
+    total_days: int = int(timestamp // 86400.0)
+    secs_of_day: float = timestamp - float(total_days) * 86400.0
+    isec: int = int(secs_of_day)
+    frac: float = secs_of_day - float(isec)
+    us: int = int(frac * 1000000.0 + 0.5)
+    if us >= 1000000:
+        us = us - 1000000
+        isec = isec + 1
+    ordv: int = _DT_EPOCH_ORD + total_days
+    ymd: tuple[int, int, int] = _dt_ord2ymd(ordv)
+    h: int = isec // 3600
+    rem: int = isec % 3600
+    mi: int = rem // 60
+    s: int = rem % 60
+    return datetime(ymd[0], ymd[1], ymd[2], h, mi, s, us)
+
+
+class datetime:
+    year: int
+    month: int
+    day: int
+    hour: int
+    minute: int
+    second: int
+    microsecond: int
+
+    def __init__(
+        self,
+        year: int,
+        month: int,
+        day: int,
+        hour: int = 0,
+        minute: int = 0,
+        second: int = 0,
+        microsecond: int = 0
+    ) -> None:
+        if year < 1 or year > 9999:
+            raise ValueError("year " + str(year) + " is out of range")
+        if month < 1 or month > 12:
+            raise ValueError("month must be in 1..12")
+        if day < 1 or day > _dt_days_in_month(year, month):
+            raise ValueError("day is out of range for month")
+        if hour < 0 or hour > 23:
+            raise ValueError("hour must be in 0..23")
+        if minute < 0 or minute > 59:
+            raise ValueError("minute must be in 0..59")
+        if second < 0 or second > 59:
+            raise ValueError("second must be in 0..59")
+        if microsecond < 0 or microsecond > 999999:
+            raise ValueError("microsecond must be in 0..999999")
+        self.year = year
+        self.month = month
+        self.day = day
+        self.hour = hour
+        self.minute = minute
+        self.second = second
+        self.microsecond = microsecond
+
+    def replace(
+        self,
+        year: Optional[int] = None,
+        month: Optional[int] = None,
+        day: Optional[int] = None,
+        hour: Optional[int] = None,
+        minute: Optional[int] = None,
+        second: Optional[int] = None,
+        microsecond: Optional[int] = None
+    ) -> datetime:
+        y: int = self.year
+        if year is not None:
+            y: int = year
+        m: int = self.month
+        if month is not None:
+            m: int = month
+        d: int = self.day
+        if day is not None:
+            d: int = day
+        h: int = self.hour
+        if hour is not None:
+            h: int = hour
+        mi: int = self.minute
+        if minute is not None:
+            mi: int = minute
+        s: int = self.second
+        if second is not None:
+            s: int = second
+        us: int = self.microsecond
+        if microsecond is not None:
+            us: int = microsecond
+        return datetime(y, m, d, h, mi, s, us)
+
+    def toordinal(self) -> int:
+        return _dt_ymd2ord(self.year, self.month, self.day)
+
+    def isoformat(self) -> str:
+        return _dt_date_str(self.year, self.month, self.day) + "T" + _dt_time_str(
+            self.hour, self.minute, self.second, self.microsecond
+        )
+
+    def ctime(self) -> str:
+        return _dt_ctime(self.year, self.month, self.day, self.hour, self.minute, self.second)
+
+    def strftime(self, fmt: str) -> str:
+        return _dt_strftime(
+            fmt, self.year, self.month, self.day, self.hour, self.minute, self.second, self.microsecond
+        )
+
+    def weekday(self) -> int:
+        return _dt_weekday(self.year, self.month, self.day)
+
+    def isoweekday(self) -> int:
+        return _dt_weekday(self.year, self.month, self.day) + 1
+
+    def isocalendar(self) -> IsoCalendarDate:
+        t: tuple[int, int, int] = _dt_isocalendar(self.year, self.month, self.day)
+        return IsoCalendarDate(t[0], t[1], t[2])
+
+    def date(self) -> date:
+        return date(self.year, self.month, self.day)
+
+    def time(self) -> time:
+        return time(self.hour, self.minute, self.second, self.microsecond)
+
+    def timestamp(self) -> float:
+        # (divergence #8) UTC-based — CPython's naive `.timestamp()`
+        # assumes LOCAL time; pyrst has no local tz database.
+        ordv: int = _dt_ymd2ord(self.year, self.month, self.day)
+        days: int = ordv - _DT_EPOCH_ORD
+        secs: int = (self.hour * 60 + self.minute) * 60 + self.second
+        return float(days) * 86400.0 + float(secs) + float(self.microsecond) / 1000000.0
+
+    def __eq__(self, other: datetime) -> bool:
+        return (
+            self.year == other.year
+            and self.month == other.month
+            and self.day == other.day
+            and self.hour == other.hour
+            and self.minute == other.minute
+            and self.second == other.second
+            and self.microsecond == other.microsecond
+        )
+
+    def __lt__(self, other: datetime) -> bool:
+        if self.year != other.year:
+            return self.year < other.year
+        if self.month != other.month:
+            return self.month < other.month
+        if self.day != other.day:
+            return self.day < other.day
+        if self.hour != other.hour:
+            return self.hour < other.hour
+        if self.minute != other.minute:
+            return self.minute < other.minute
+        if self.second != other.second:
+            return self.second < other.second
+        return self.microsecond < other.microsecond
+
+    def __add__(self, other: timedelta) -> datetime:
+        # (compiler-limitation workaround: `_dtadd_`-prefixed locals — see
+        # the NOTE below the module header divergence list.)
+        _dtadd_ord_self: int = _dt_ymd2ord(self.year, self.month, self.day)
+        _dtadd_micros_self: int = (
+            (self.hour * 60 + self.minute) * 60 + self.second
+        ) * 1000000 + self.microsecond
+        _dtadd_total_micros: int = _dtadd_micros_self + other.seconds * 1000000 + other.microseconds
+        _dtadd_carry_days: int = _dtadd_total_micros // 86400000000
+        _dtadd_micros_of_day: int = _dtadd_total_micros % 86400000000
+        _dtadd_n: int = _dtadd_ord_self + other.days + _dtadd_carry_days
+        if _dtadd_n < _DT_MIN_ORD or _dtadd_n > _DT_MAX_ORD:
+            raise OverflowError("date value out of range")
+        _dtadd_ymd: tuple[int, int, int] = _dt_ord2ymd(_dtadd_n)
+        _dtadd_h: int = _dtadd_micros_of_day // 3600000000
+        _dtadd_rem1: int = _dtadd_micros_of_day % 3600000000
+        _dtadd_mi: int = _dtadd_rem1 // 60000000
+        _dtadd_rem2: int = _dtadd_rem1 % 60000000
+        _dtadd_s: int = _dtadd_rem2 // 1000000
+        _dtadd_us: int = _dtadd_rem2 % 1000000
+        return datetime(
+            _dtadd_ymd[0], _dtadd_ymd[1], _dtadd_ymd[2],
+            _dtadd_h, _dtadd_mi, _dtadd_s, _dtadd_us
+        )
+
+    def __sub__(self, other: datetime) -> timedelta:
+        # (divergence #4) `datetime - datetime -> timedelta` is the real
+        # dunder (the "cross-type return" case this pass validates);
+        # `datetime - timedelta -> datetime` is not available via `-` —
+        # write `dt + (-delta)` instead. See module header.
+        _dtsub_ord_a: int = _dt_ymd2ord(self.year, self.month, self.day)
+        _dtsub_ord_b: int = _dt_ymd2ord(other.year, other.month, other.day)
+        _dtsub_micros_a: int = (
+            (self.hour * 60 + self.minute) * 60 + self.second
+        ) * 1000000 + self.microsecond
+        _dtsub_micros_b: int = (
+            (other.hour * 60 + other.minute) * 60 + other.second
+        ) * 1000000 + other.microsecond
+        _dtsub_diff_days: int = _dtsub_ord_a - _dtsub_ord_b
+        _dtsub_diff_micros: int = _dtsub_micros_a - _dtsub_micros_b
+        return timedelta(days=_dtsub_diff_days, microseconds=_dtsub_diff_micros)
+
+    def __str__(self) -> str:
+        return _dt_date_str(self.year, self.month, self.day) + " " + _dt_time_str(
+            self.hour, self.minute, self.second, self.microsecond
+        )
+
+    def __repr__(self) -> str:
+        _dtr_parts: str = (
+            str(self.year) + ", " + str(self.month) + ", " + str(self.day)
+            + ", " + str(self.hour) + ", " + str(self.minute)
+        )
+        if self.microsecond != 0:
+            _dtr_parts = _dtr_parts + ", " + str(self.second) + ", " + str(self.microsecond)
+        elif self.second != 0:
+            _dtr_parts = _dtr_parts + ", " + str(self.second)
+        return "datetime.datetime(" + _dtr_parts + ")"
+
+
+# ── `datetime` factory "classmethods" as FREE FUNCTIONS (forced divergence) ─
+#
+# CPython names these `datetime.today()`, `datetime.now()`,
+# `datetime.fromordinal(...)`, `datetime.fromisoformat(...)`,
+# `datetime.fromisocalendar(...)`, `datetime.fromtimestamp(...)`,
+# `datetime.utcfromtimestamp(...)`, `datetime.combine(...)`,
+# `datetime.strptime(...)`, `datetime.min`, `datetime.max`,
+# `datetime.resolution` — i.e. ALL called through the CLASS. They cannot be
+# `@staticmethod`s on `class datetime` here: unlike `date`/`time`/`timedelta`
+# (whose names don't collide with any module), the class is named EXACTLY
+# `datetime`, the SAME as its own enclosing module. pyrst's qualified-call
+# resolver checks "is this identifier a tracked MODULE name" before "is it a
+# class", and `datetime` unavoidably names this module too — so ANY
+# `datetime.foo(...)` (from ANY caller, internal or external — confirmed
+# both ways) gets routed to "look up a top-level FUNCTION named `foo` in the
+# `datetime` module", fails to find one (it's a class method), and rejects
+# with "module `datetime` has no function `foo`", even though `foo` is a
+# perfectly good static method on the class. This is DISTINCT from the
+# `class time` / `def time()` name COLLISION documented at the top of this
+# file (that one is a hard resolver error only on co-import of two files
+# sharing a top-level name); this one fires unconditionally, every time,
+# for THIS class alone, because it IS its own module.
+#
+# Workaround (this is the one place in this module where the public surface
+# genuinely cannot keep CPython's call shape): every `datetime` "classmethod"
+# ships as a free top-level function named `datetime_<name>` instead.
+# Callable either unqualified after `from datetime import datetime_now` (a
+# bare call never goes through the qualified-call special case) or via
+# `import datetime; datetime.datetime_now()` (a genuine qualified MODULE
+# call, which — unlike the class-static form — resolves correctly, since
+# `datetime_now` really is one of the module's flat top-level functions).
+# `date`/`time`/`timedelta` are UNAFFECTED — their classmethod-style
+# `@staticmethod`s keep the exact `ClassName.method(...)` CPython shape (see
+# divergence #3 in the module header).
+
+
+def datetime_today() -> datetime:
+    return _dt_datetime_from_timestamp(_dt_now_unix_seconds())
+
+
+def datetime_now() -> datetime:
+    # (divergence #1) CPython's `now(tz=None)` — no `tz` param here at all,
+    # since the only value we could ever honor is the default.
+    return _dt_datetime_from_timestamp(_dt_now_unix_seconds())
+
+
+def datetime_fromordinal(ordinal: int) -> datetime:
+    if ordinal < 1:
+        raise ValueError("ordinal must be >= 1")
+    ymd: tuple[int, int, int] = _dt_ord2ymd(ordinal)
+    return datetime(ymd[0], ymd[1], ymd[2], 0, 0, 0, 0)
+
+
+def datetime_fromisoformat(datetime_string: str) -> datetime:
+    # CPython 3.12-permissive: <date>[<sep><time>], where <date> is extended
+    # `YYYY-MM-DD` or basic `YYYYMMDD` (length decided by char 4), <sep> is ANY
+    # single character (CPython allows an arbitrary separator, not just 'T'/' '),
+    # and <time> is parsed by _dt_parse_iso_time (partial/basic/fractional all
+    # supported). A date-only string yields midnight. tz forms are rejected
+    # (TZINFO gate); range errors propagate from the datetime() constructor.
+    n: int = len(datetime_string)
+    date_len: int = -1
+    if n >= 5 and datetime_string[4] == "-":
+        date_len = 10
+    elif n >= 4:
+        date_len = 8
+    if date_len == -1 or n < date_len:
+        raise ValueError("Invalid isoformat string: '" + datetime_string + "'")
+    dparsed: tuple[int, int, int, bool] = _dt_parse_iso_date(datetime_string, 0, date_len)
+    if not dparsed[3]:
+        raise ValueError("Invalid isoformat string: '" + datetime_string + "'")
+    h: int = 0
+    mi: int = 0
+    s: int = 0
+    us: int = 0
+    if n > date_len:
+        # One separator char at index date_len, then the time portion.
+        time_start: int = date_len + 1
+        if _dt_iso_time_has_tz(datetime_string, time_start, n):
+            raise ValueError("Invalid isoformat string: '" + datetime_string + "'")
+        tparsed: tuple[int, int, int, int, bool] = _dt_parse_iso_time(datetime_string, time_start, n)
+        if not tparsed[4]:
+            raise ValueError("Invalid isoformat string: '" + datetime_string + "'")
+        h = tparsed[0]
+        mi = tparsed[1]
+        s = tparsed[2]
+        us = tparsed[3]
+    return datetime(dparsed[0], dparsed[1], dparsed[2], h, mi, s, us)
+
+
+def datetime_fromisocalendar(year: int, week: int, day: int) -> datetime:
+    d: date = date.fromisocalendar(year, week, day)
+    return datetime(d.year, d.month, d.day, 0, 0, 0, 0)
+
+
+def datetime_fromtimestamp(timestamp: float) -> datetime:
+    # (divergence #8) UTC-based, not local-tz.
+    return _dt_datetime_from_timestamp(timestamp)
+
+
+def datetime_utcfromtimestamp(timestamp: float) -> datetime:
+    # (divergence #8) Identical to `datetime_fromtimestamp` here — both are
+    # already UTC-only; CPython distinguishes them only by tz
+    # interpretation, which pyrst has no concept of.
+    return _dt_datetime_from_timestamp(timestamp)
+
+
+def datetime_combine(d: date, t: time) -> datetime:
+    return datetime(d.year, d.month, d.day, t.hour, t.minute, t.second, t.microsecond)
+
+
+def datetime_strptime(date_string: str, format: str) -> datetime:
+    year: int = 1900
+    month: int = 1
+    day: int = 1
+    hour: int = 0
+    minute: int = 0
+    second: int = 0
+    si: int = 0
+    fi: int = 0
+    slen: int = len(date_string)
+    flen: int = len(format)
+    failed: bool = False
+    while fi < flen and not failed:
+        fc: str = format[fi]
+        if fc == "%" and fi + 1 < flen:
+            code: str = format[fi + 1]
+            fi = fi + 2
+            if code == "Y":
+                # CPython's `%Y` regex is exactly `\d\d\d\d` -- fewer (or
+                # more, before a non-digit) digits do not match, matching
+                # verified against a live `python3` (`strptime('999-01-05',
+                # '%Y-%m-%d')` raises, it does NOT parse year=999).
+                parsed: tuple[int, int] = _dt_consume_digits_exact(date_string, si, 4)
+                year = parsed[0]
+                si = parsed[1]
+            elif code == "m":
+                parsed = _dt_consume_digits(date_string, si, 2)
+                month = parsed[0]
+                si = parsed[1]
+            elif code == "d":
+                parsed = _dt_consume_digits(date_string, si, 2)
+                day = parsed[0]
+                si = parsed[1]
+            elif code == "H":
+                parsed = _dt_consume_digits(date_string, si, 2)
+                hour = parsed[0]
+                si = parsed[1]
+            elif code == "M":
+                parsed = _dt_consume_digits(date_string, si, 2)
+                minute = parsed[0]
+                si = parsed[1]
+            elif code == "S":
+                parsed = _dt_consume_digits(date_string, si, 2)
+                second = parsed[0]
+                si = parsed[1]
+            else:
+                raise ValueError("strptime: unsupported directive %" + code)
+            if si < 0:
+                failed = True
+        else:
+            if si >= slen or date_string[si] != fc:
+                failed = True
+            else:
+                si = si + 1
+                fi = fi + 1
+    if not failed and si != slen:
+        # CPython distinguishes this from a structural format mismatch: if
+        # every directive in `format` matched a PREFIX of `date_string`
+        # successfully, but characters remain afterward, the real
+        # `datetime.strptime` raises "unconverted data remains: <rest>",
+        # not the generic "does not match format" message (verified live:
+        # `strptime('2021-01-05extra', '%Y-%m-%d')` ->
+        # `ValueError: unconverted data remains: extra`).
+        raise ValueError("unconverted data remains: " + date_string[si:])
+    if not failed and (month < 1 or month > 12 or day < 1 or day > 31 or hour > 23 or minute > 59 or second > 59):
+        failed = True
+    if failed:
+        raise ValueError(
+            "time data '" + date_string + "' does not match format '" + format + "'"
+        )
+    return datetime(year, month, day, hour, minute, second, 0)
+
+
+def datetime_min() -> datetime:
+    return datetime(1, 1, 1, 0, 0, 0, 0)
+
+
+def datetime_max() -> datetime:
+    return datetime(9999, 12, 31, 23, 59, 59, 999999)
+
+
+def datetime_resolution() -> timedelta:
+    return timedelta(microseconds=1)

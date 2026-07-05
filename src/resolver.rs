@@ -140,8 +140,13 @@ impl Resolver {
                 // resolution path. `itertools` is NO LONGER skipped: it is now a
                 // real embedded module (`lib/itertools.pyrs`, an eager subset), so
                 // it must reach the resolution path. (`textwrap`/`random` were
-                // never skipped and resolve as embedded modules too.)
-                if matches!(mod_name.as_str(), "dataclasses" | "sys") {
+                // never skipped and resolve as embedded modules too.) `sys` is
+                // NO LONGER skipped (W2 card cd3aa7b7): it is now a real
+                // embedded module (`lib/sys.pyrs`, partial scope: `maxsize`/
+                // `platform`/`version`/`version_info`/`exit`), so it must
+                // reach the resolution path. `dataclasses` stays: it has no
+                // real module body, only decorator handling.
+                if matches!(mod_name.as_str(), "dataclasses") {
                     continue;
                 }
 

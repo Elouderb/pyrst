@@ -1,0 +1,334 @@
+# pyrst standard library — errno
+#
+# FIDELITY: 3.5/5 (see HARDENING note below — the original `errorcode` design
+# did not compile; fixed to a function, which is a real syntax divergence)
+#
+# POSIX and Linux error codes as module-level integer constants, plus
+# `errorcode(code)` — a function returning the symbolic name for a code
+# (CPython's `errorcode` is a real dict; pyrst has no module-level dict
+# state, see GATE HIT below).
+#
+# SURFACE:
+#   - 133 symbolic error constants (EPERM, ENOENT, etc.)
+#   - errorcode(code: int) -> str: symbolic-name lookup (130 valid codes,
+#     keys 1..132 with two documented gaps at 41/58)
+#
+# GATE HIT (G2): CPython's `errorcode` is a module-level dict. pyrst has NO
+# module-level mutable OR immutable dict/list/container state at all — the
+# only legal top-level statement forms are `def`, `class`, `import`, and a
+# bare-scalar-literal `NAME: T = <literal>` (`int`/`float`/`str`/`bool` only;
+# see `src/typeck/checks.rs::is_const_literal`). A dict literal at module
+# scope is a hard compile error ("top-level statements other than
+# function/class/import ... are not supported"), so an "immutable const
+# dict" is not an available design — it does not exist as a pyrst construct.
+# RESOLUTION: `errorcode` is a FUNCTION, `errorcode(code: int) -> str`, that
+# builds the table locally per call and indexes it — reusing the compiler's
+# real dict-subscript KeyError codegen so a missing code still raises
+# KeyError with the offending int, matching CPython's failure mode.
+#
+# DIVERGENCES:
+#   - errorcode is a FUNCTION `errorcode(code)`, not a subscriptable dict
+#     `errorcode[code]` (G2, see above). `.get()`, `len(errorcode)`, `in`,
+#     and iteration over `errorcode` are NOT available — there is no dict
+#     object to call them on. The lookup direction (code -> name) and the
+#     KeyError-on-miss contract are preserved exactly.
+#   - EAGAIN == EWOULDBLOCK (both = 11; errorcode(11) == 'EAGAIN')
+#   - EDEADLK == EDEADLOCK (both = 35; errorcode(35) == 'EDEADLOCK', the
+#     OTHER alias — verified live against CPython 3.12's real errno module;
+#     an earlier draft had this backwards as 'EDEADLK', now fixed)
+#   - ENOTSUP == EOPNOTSUPP (both = 95; errorcode(95) == 'ENOTSUP')
+
+# Error Constants (133 items, all positive ints)
+EPERM: int = 1
+ENOENT: int = 2
+ESRCH: int = 3
+EINTR: int = 4
+EIO: int = 5
+ENXIO: int = 6
+E2BIG: int = 7
+ENOEXEC: int = 8
+EBADF: int = 9
+ECHILD: int = 10
+EAGAIN: int = 11
+EWOULDBLOCK: int = 11
+ENOMEM: int = 12
+EACCES: int = 13
+EFAULT: int = 14
+ENOTBLK: int = 15
+EBUSY: int = 16
+EEXIST: int = 17
+EXDEV: int = 18
+ENODEV: int = 19
+ENOTDIR: int = 20
+EISDIR: int = 21
+EINVAL: int = 22
+ENFILE: int = 23
+EMFILE: int = 24
+ENOTTY: int = 25
+ETXTBSY: int = 26
+EFBIG: int = 27
+ENOSPC: int = 28
+ESPIPE: int = 29
+EROFS: int = 30
+EMLINK: int = 31
+EPIPE: int = 32
+EDOM: int = 33
+ERANGE: int = 34
+EDEADLK: int = 35
+EDEADLOCK: int = 35
+ENAMETOOLONG: int = 36
+ENOLCK: int = 37
+ENOSYS: int = 38
+ENOTEMPTY: int = 39
+ELOOP: int = 40
+ENOMSG: int = 42
+EIDRM: int = 43
+ECHRNG: int = 44
+EL2NSYNC: int = 45
+EL3HLT: int = 46
+EL3RST: int = 47
+ELNRNG: int = 48
+EUNATCH: int = 49
+ENOCSI: int = 50
+EL2HLT: int = 51
+EBADE: int = 52
+EBADR: int = 53
+EXFULL: int = 54
+ENOANO: int = 55
+EBADRQC: int = 56
+EBADSLT: int = 57
+EBFONT: int = 59
+ENOSTR: int = 60
+ENODATA: int = 61
+ETIME: int = 62
+ENOSR: int = 63
+ENONET: int = 64
+ENOPKG: int = 65
+EREMOTE: int = 66
+ENOLINK: int = 67
+EADV: int = 68
+ESRMNT: int = 69
+ECOMM: int = 70
+EPROTO: int = 71
+EMULTIHOP: int = 72
+EDOTDOT: int = 73
+EBADMSG: int = 74
+EOVERFLOW: int = 75
+ENOTUNIQ: int = 76
+EBADFD: int = 77
+EREMCHG: int = 78
+ELIBACC: int = 79
+ELIBBAD: int = 80
+ELIBSCN: int = 81
+ELIBMAX: int = 82
+ELIBEXEC: int = 83
+EILSEQ: int = 84
+ERESTART: int = 85
+ESTRPIPE: int = 86
+EUSERS: int = 87
+ENOTSOCK: int = 88
+EDESTADDRREQ: int = 89
+EMSGSIZE: int = 90
+EPROTOTYPE: int = 91
+ENOPROTOOPT: int = 92
+EPROTONOSUPPORT: int = 93
+ESOCKTNOSUPPORT: int = 94
+ENOTSUP: int = 95
+EOPNOTSUPP: int = 95
+EPFNOSUPPORT: int = 96
+EAFNOSUPPORT: int = 97
+EADDRINUSE: int = 98
+EADDRNOTAVAIL: int = 99
+ENETDOWN: int = 100
+ENETUNREACH: int = 101
+ENETRESET: int = 102
+ECONNABORTED: int = 103
+ECONNRESET: int = 104
+ENOBUFS: int = 105
+EISCONN: int = 106
+ENOTCONN: int = 107
+ESHUTDOWN: int = 108
+ETOOMANYREFS: int = 109
+ETIMEDOUT: int = 110
+ECONNREFUSED: int = 111
+EHOSTDOWN: int = 112
+EHOSTUNREACH: int = 113
+EALREADY: int = 114
+EINPROGRESS: int = 115
+ESTALE: int = 116
+EUCLEAN: int = 117
+ENOTNAM: int = 118
+ENAVAIL: int = 119
+EISNAM: int = 120
+EREMOTEIO: int = 121
+EDQUOT: int = 122
+ENOMEDIUM: int = 123
+EMEDIUMTYPE: int = 124
+ECANCELED: int = 125
+ENOKEY: int = 126
+EKEYEXPIRED: int = 127
+EKEYREVOKED: int = 128
+EKEYREJECTED: int = 129
+EOWNERDEAD: int = 130
+ENOTRECOVERABLE: int = 131
+ERFKILL: int = 132
+
+# errorcode: maps error code (int) -> symbolic name (str).
+#
+# HARDENING (card 4b6d4c36): the writer's original `errorcode: dict[int, str]
+# = {...}` module-level literal DID NOT COMPILE — pyrst's module-level-const
+# relaxation (EPIC-6-A, `src/typeck/checks.rs::is_const_literal`) only
+# legalizes a bare int/float/str/bool literal at top level; a dict literal is
+# categorically rejected ("top-level statements other than function/class/
+# import definitions ... are not supported"), so G2 is NOT actually
+# accommodated by an "immutable const dict" — no such thing exists in pyrst.
+# Fixed by making `errorcode` a FUNCTION: `errorcode(code: int) -> str`
+# builds the same 130-entry table locally and indexes it, reusing the
+# compiler's real dict-subscript KeyError codegen (`KeyError\0{:?}` — see
+# `src/codegen/exprs.rs`), so a missing code still raises `KeyError` with the
+# offending int, matching CPython's `errorcode[code]` failure mode.
+#
+# DIVERGENCE (unavoidable, G2): call as `errorcode(code)`, NOT `errorcode[code]`
+# — CPython's real subscript syntax is not reproducible without module-level
+# dict state. `.get()`, `len(errorcode)`, `in`, and iteration are NOT
+# available (no dict object exists to call methods on). Documented as
+# `# parity: pyrst-only` in the parity test for this one entry point; the 133
+# scalar error constants above remain fully dual-run.
+def errorcode(code: int) -> str:
+    """Return the symbolic name for a POSIX error code (dict-subscript
+    stand-in — see DIVERGENCE note above). Raises KeyError for an unknown
+    code, exactly like CPython's `errorcode[code]`.
+    """
+    table: dict[int, str] = {
+    1: "EPERM",
+    2: "ENOENT",
+    3: "ESRCH",
+    4: "EINTR",
+    5: "EIO",
+    6: "ENXIO",
+    7: "E2BIG",
+    8: "ENOEXEC",
+    9: "EBADF",
+    10: "ECHILD",
+    11: "EAGAIN",
+    12: "ENOMEM",
+    13: "EACCES",
+    14: "EFAULT",
+    15: "ENOTBLK",
+    16: "EBUSY",
+    17: "EEXIST",
+    18: "EXDEV",
+    19: "ENODEV",
+    20: "ENOTDIR",
+    21: "EISDIR",
+    22: "EINVAL",
+    23: "ENFILE",
+    24: "EMFILE",
+    25: "ENOTTY",
+    26: "ETXTBSY",
+    27: "EFBIG",
+    28: "ENOSPC",
+    29: "ESPIPE",
+    30: "EROFS",
+    31: "EMLINK",
+    32: "EPIPE",
+    33: "EDOM",
+    34: "ERANGE",
+    35: "EDEADLOCK",
+    36: "ENAMETOOLONG",
+    37: "ENOLCK",
+    38: "ENOSYS",
+    39: "ENOTEMPTY",
+    40: "ELOOP",
+    42: "ENOMSG",
+    43: "EIDRM",
+    44: "ECHRNG",
+    45: "EL2NSYNC",
+    46: "EL3HLT",
+    47: "EL3RST",
+    48: "ELNRNG",
+    49: "EUNATCH",
+    50: "ENOCSI",
+    51: "EL2HLT",
+    52: "EBADE",
+    53: "EBADR",
+    54: "EXFULL",
+    55: "ENOANO",
+    56: "EBADRQC",
+    57: "EBADSLT",
+    59: "EBFONT",
+    60: "ENOSTR",
+    61: "ENODATA",
+    62: "ETIME",
+    63: "ENOSR",
+    64: "ENONET",
+    65: "ENOPKG",
+    66: "EREMOTE",
+    67: "ENOLINK",
+    68: "EADV",
+    69: "ESRMNT",
+    70: "ECOMM",
+    71: "EPROTO",
+    72: "EMULTIHOP",
+    73: "EDOTDOT",
+    74: "EBADMSG",
+    75: "EOVERFLOW",
+    76: "ENOTUNIQ",
+    77: "EBADFD",
+    78: "EREMCHG",
+    79: "ELIBACC",
+    80: "ELIBBAD",
+    81: "ELIBSCN",
+    82: "ELIBMAX",
+    83: "ELIBEXEC",
+    84: "EILSEQ",
+    85: "ERESTART",
+    86: "ESTRPIPE",
+    87: "EUSERS",
+    88: "ENOTSOCK",
+    89: "EDESTADDRREQ",
+    90: "EMSGSIZE",
+    91: "EPROTOTYPE",
+    92: "ENOPROTOOPT",
+    93: "EPROTONOSUPPORT",
+    94: "ESOCKTNOSUPPORT",
+    95: "ENOTSUP",
+    96: "EPFNOSUPPORT",
+    97: "EAFNOSUPPORT",
+    98: "EADDRINUSE",
+    99: "EADDRNOTAVAIL",
+    100: "ENETDOWN",
+    101: "ENETUNREACH",
+    102: "ENETRESET",
+    103: "ECONNABORTED",
+    104: "ECONNRESET",
+    105: "ENOBUFS",
+    106: "EISCONN",
+    107: "ENOTCONN",
+    108: "ESHUTDOWN",
+    109: "ETOOMANYREFS",
+    110: "ETIMEDOUT",
+    111: "ECONNREFUSED",
+    112: "EHOSTDOWN",
+    113: "EHOSTUNREACH",
+    114: "EALREADY",
+    115: "EINPROGRESS",
+    116: "ESTALE",
+    117: "EUCLEAN",
+    118: "ENOTNAM",
+    119: "ENAVAIL",
+    120: "EISNAM",
+    121: "EREMOTEIO",
+    122: "EDQUOT",
+    123: "ENOMEDIUM",
+    124: "EMEDIUMTYPE",
+    125: "ECANCELED",
+    126: "ENOKEY",
+    127: "EKEYEXPIRED",
+    128: "EKEYREVOKED",
+    129: "EKEYREJECTED",
+    130: "EOWNERDEAD",
+    131: "ENOTRECOVERABLE",
+    132: "ERFKILL",
+    }
+    return table[code]

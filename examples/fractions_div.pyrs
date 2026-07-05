@@ -1,0 +1,39 @@
+# fractions_div.pyrs — pinned golden for stdlib `fractions`'s `.div()` method.
+#
+# `.div()` REPLACES `/` (`__truediv__` is not an available pyrst dunder —
+# G5, see lib/fractions.pyrs's header). CPython's real `fractions.Fraction`
+# has no `.div()` method, so this file cannot dual-run under python3 (an
+# unmodified run raises `AttributeError: 'Fraction' object has no attribute
+# 'div'`) — the shared, dual-run-safe surface lives in
+# examples/parity_fractions.pyrs, mirroring the `random` module's
+# `parity_random.pyrs` / `random_freefns.pyrs` split for the same kind of
+# pyrst-only call shape.
+#
+# Every value and error message pinned here was ORACLE-VERIFIED against real
+# CPython 3.12 using the equivalent `/` spelling during authoring (e.g.
+# `Fraction(1, 2) / Fraction(1, 3)` under python3 prints the same
+# `Fraction(3, 2)` value pinned below via `.div()`), so the golden IS
+# CPython's `/` output — only the call shape differs.
+from fractions import Fraction
+
+
+def main() -> None:
+    print(Fraction(1, 2).div(Fraction(1, 3)))
+    print(Fraction(3, 4).div(Fraction(1, 2)))
+    print(Fraction(1, 2).div(Fraction(2, 1)))
+    print(Fraction(-3, 4).div(Fraction(1, 2)))
+    print(Fraction(6, 4).div(Fraction(3, 2)))
+    # HARDENING (w2-hardener pass): zero-dividend, negative/negative
+    # (double-negative cancels), and positive/negative (sign propagates to
+    # the result numerator) — all oracle-verified against real CPython's `/`.
+    print(Fraction(0, 1).div(Fraction(5, 3)))
+    print(Fraction(-3, 4).div(Fraction(-1, 2)))
+    print(Fraction(5, 7).div(Fraction(-2, 3)))
+    try:
+        Fraction(1, 2).div(Fraction(0, 1))
+    except ZeroDivisionError as e:
+        print(e)
+    try:
+        Fraction(7, 9).div(Fraction(0, 2))
+    except ZeroDivisionError as e:
+        print(e)

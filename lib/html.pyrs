@@ -1,0 +1,755 @@
+# pyrst standard library — html
+#
+# `html.escape` / `html.unescape` — a PURE-PYRST port of CPython's `html`
+# module. Embedded via `include_str!` (see `src/stdlib.rs`); `html` is not on
+# the resolver skip-list, so both `from html import escape, unescape` and
+# `import html; html.escape(s)` resolve. No external crate — hand-rolled
+# scanner instead of a regex dependency (see divergence notes below).
+#
+# Fidelity: 3.5/5 (per docs/design/w2-dossiers/html.md target). `escape()` is
+# a full CPython-exact port. `unescape()` implements CPython's EXACT
+# algorithm (same numeric-charref resolution table, same longest-prefix
+# named-entity backtracking, same Windows-1252 remap / invalid-codepoint
+# filtering) but over a DELIBERATELY NARROWED named-entity table — see
+# "NAMED-ENTITY COVERAGE" below. This is the one intentional scope cut (per
+# card d9182d50's AC), not a correctness bug: every entity name IN our table
+# resolves with byte-identical semantics to CPython, including the optional-
+# semicolon / longest-prefix-match / leftover-suffix edge cases.
+#
+# Public API (exact CPython names/signatures):
+#   - `escape(s: str, quote: bool = True) -> str` — replace `&` with
+#     `&amp;` FIRST (so already-escaped input double-escapes, matching
+#     CPython), then `<` -> `&lt;`, `>` -> `&gt;`; if `quote` is true also
+#     `"` -> `&quot;` and `'` -> `&#x27;` (CPython uses the HEX form for the
+#     apostrophe, not `&#39;` — verified against CPython 3.12.9).
+#   - `unescape(s: str) -> str` — convert named (`&lt;`), decimal (`&#65;`)
+#     and hex (`&#x41;` / `&#X41;`) character references back to Unicode.
+#     Fast path: if `s` contains no `&`, return `s` unchanged (matches
+#     CPython's `if '&' not in s: return s`).
+#
+# ALGORITHM (hand-rolled scanner — no `re` dependency; the dossier's HAZARD
+# 4.8 flagged CPython's regex `r'&(#[0-9]+;?|#[xX][0-9a-fA-F]+;?|
+# [^\t\n\f <&#;]{1,32};?)'` as a Pyrst-fidelity risk, so this is a
+# character-by-character re-implementation of the SAME two-phase algorithm
+# CPython's `_charref.sub(_replace_charref, s)` performs):
+#   1. Scan left to right. Any char other than `&` is copied through as-is.
+#   2. At an `&`: if followed by `#`, it's a NUMERIC charref — `#` + decimal
+#      digits, or `#x`/`#X` + hex digits, with an OPTIONAL trailing `;`. No
+#      digits at all (`&#x;`, `&#;`, `&;`) => NOT a charref at all; emit a
+#      literal `&` and re-scan from the very next character (matches
+#      CPython: the regex fails to match ANY alternative there, so `re.sub`
+#      leaves that lone `&` untouched and resumes scanning one char later).
+#   3. Otherwise it's a NAMED charref — CPython's char class excludes
+#      `\t\n\f <&#;`, capped at 32 chars, plus an optional trailing `;`.
+#      Zero word-chars captured => same "not a charref" literal fallback as
+#      step 2.
+#   4. Named-charref resolution mirrors CPython's `_replace_charref` EXACTLY:
+#      first try the ENTIRE captured word (honoring whether it needs a
+#      trailing `;` — see below); if that fails, walk decreasing-length
+#      PREFIXES of the bare word (from `len(word)-1` down to `2`, always as
+#      a "no semicolon required" lookup — CPython's `range(len(s)-1, 1, -1)`
+#      loop's one edge case at `x == len(word)` when a `;` was present is
+#      PROVABLY DEAD CODE: it re-tests the same "full word in table" fact
+#      Step 1 already tested unconditionally, so it can never independently
+#      succeed — proven during dossier verification, not guessed). The
+#      first prefix hit wins (LONGEST prefix, since we walk decreasing `x`);
+#      its resolved character is prepended to the un-matched leftover
+#      characters (plus the original trailing `;` if the whole captured
+#      chunk had one). No prefix hits at all => literal `&` + the whole
+#      captured word (+ `;` if present) is emitted UNCHANGED — provably
+#      identical, either way, to just re-scanning character-by-character,
+#      since a captured "word" can never itself contain another `&`.
+#   5. Numeric charref resolution mirrors CPython's exact priority order:
+#        a. value in the 34-entry Windows-1252 remap table (`_invalid_charrefs`
+#           — codepoints 0, 13, and 128-159) => that table's exact character
+#           (most of 128-159 map to a DIFFERENT Windows-1252 glyph; a few
+#           — 129/141/143/144/157 — have no such glyph and map to themselves).
+#        b. a lone UTF-16 surrogate (0xD800-0xDFFF) or beyond Unicode's
+#           range (> 0x10FFFF) => U+FFFD REPLACEMENT CHARACTER.
+#        c. one of CPython's 94 remaining "invalid codepoint" values (most
+#           C0 controls, the 0xFDD0-0xFDEF noncharacter block, and the
+#           `0xFFFE`/`0xFFFF` pair at the end of EVERY plane 0-16) => empty
+#           string. This pass compresses CPython's 126-entry
+#           `_invalid_codepoints` set to a closed-form check (verified
+#           against the live CPython set, not eyeballed): the trailing
+#           `0xFFFE`/`0xFFFF` pair recurs at `plane*0x10000 + 0xFFFE/F` for
+#           every plane, so `num % 0x10000 in {0xFFFE, 0xFFFF}` covers all
+#           17 planes' worth of that pair in one check.
+#        d. otherwise: `chr(value)`.
+#      Overflow guard: a digit run can be arbitrarily long (CPython parses
+#      it as a Python bigint); pyrst ints are `i64`, so accumulation FREEZES
+#      once the running value exceeds `0x10FFFF` (any value that has ever
+#      crossed that line is guaranteed to stay "> 0x10FFFF" — i.e. still
+#      resolves to the identical U+FFFD outcome — no matter how many more
+#      digits follow), which sidesteps overflow without changing the
+#      observable result for any input.
+#
+# NAMED-ENTITY COVERAGE (the deliberate scope cut, per card d9182d50's AC:
+# "ship a pragmatic named-entity subset — the ~252 name2codepoint core
+# rather than all 2231 html5 entries if size demands"): this module's named-
+# entity table is CPython's `html.entities.name2codepoint` (252 names,
+# python3.12.9-verified), NOT the full 2231-entry `html5` dict the dossier
+# describes. `html.entities` itself is NOT exposed at all (G3: pyrst has no
+# dotted submodules — `import html.entities` has no pyrst equivalent; the
+# dossier's own suggested workaround — inline the table, don't expose a
+# submodule — is exactly what this does).
+#   - COVERED: every name2codepoint entity, named-entity longest-prefix
+#     matching, and the optional-semicolon rule for the 100 of those 252
+#     names that are ALSO in html5's semicolon-optional set (`amp`, `lt`,
+#     `gt`, `quot`, `copy`, `nbsp`, `not`, ... — python3-verified exact set).
+#     The other 152 (Greek letters, math symbols, typographic marks — e.g.
+#     `notin`, `alpha`, `trade`) require the trailing `;`, matching CPython.
+#   - NOT COVERED: any of the ~1979 html5-only entities (multi-codepoint
+#     entities like `&NotEqualTilde;`, and EVERY uppercase/mixed-case ALIAS
+#     outside name2codepoint — e.g. `&LT;`/`&Lt;`/`&AMP;`/`&COPY;` are html5-
+#     only spellings NOT in name2codepoint, so they are NOT recognized here
+#     and pass through unchanged instead of resolving to `<`/`≪`/`&`/`©`).
+#     This is a KNOWN, DOCUMENTED divergence from full CPython fidelity —
+#     the dossier's own PARITY PLAN includes `&LT;`/`&Lt;` cases that this
+#     module does NOT match; our `examples/parity_html.pyrs` was reseeded to
+#     drop those two specific cases (every other dossier case is covered).
+#
+# NAME COLLISION (documented co-import restriction, precedent: `re.escape`):
+# `lib/re.pyrs` ALSO defines a top-level `escape` (regex-metachar escaping).
+# pyrst's module namespace is FLAT (co-import collision detection — card
+# 6c8b4a39), so a single program CANNOT `import html` and `import re`
+# together (or `from html import escape` + `from re import escape`) — the
+# resolver raises a clear cross-module-collision error at compile time
+# rather than silently letting one shadow the other. Both modules keep
+# their exact CPython name (`escape`) rather than renaming either away from
+# parity; a program needing both regex-escaping and HTML-escaping must pick
+# one qualified import path manually (not currently expressible in pyrst
+# without dotted submodules / aliasing).
+#
+# Errors: `escape`/`unescape` never raise in pyrst (both take a mandatory
+# `str` argument the type checker already enforces — the dossier's
+# `AttributeError`/`TypeError` probes are CPython's untyped-argument
+# behavior, not reachable through pyrst's static typing).
+#
+# `quote` kwarg: works exactly like every other pyrst default-arg parameter
+# — `html.escape(s, quote=False)` — CPython's truthy/falsy coercion (dossier
+# ERRORS: `quote=1`/`quote=0`) does not apply since pyrst's `quote` is
+# statically `bool`.
+
+def escape(s: str, quote: bool = True) -> str:
+    result: str = s.replace("&", "&amp;")
+    result = result.replace("<", "&lt;")
+    result = result.replace(">", "&gt;")
+    if quote:
+        result = result.replace("\"", "&quot;")
+        result = result.replace("'", "&#x27;")
+    return result
+
+
+def _html_is_word_char(c: str) -> bool:
+    if c == "\t" or c == "\n" or c == "\f" or c == " ":
+        return False
+    if c == "<" or c == "&" or c == "#" or c == ";":
+        return False
+    return True
+
+
+def _html_is_ascii_digit(c: str) -> bool:
+    return c >= "0" and c <= "9"
+
+
+def _html_is_hex_digit(c: str) -> bool:
+    if c >= "0" and c <= "9":
+        return True
+    if c >= "a" and c <= "f":
+        return True
+    return c >= "A" and c <= "F"
+
+
+def _html_dec_value(c: str) -> int:
+    return ord(c) - ord("0")
+
+
+def _html_hex_value(c: str) -> int:
+    if c >= "0" and c <= "9":
+        return ord(c) - ord("0")
+    if c >= "a" and c <= "f":
+        return ord(c) - ord("a") + 10
+    return ord(c) - ord("A") + 10
+
+
+# CPython's `_invalid_charrefs`: numeric charrefs 0, 13 and 128-159 resolve
+# through this Windows-1252 remap table BEFORE any other check (34 entries,
+# python3.12.9-verified). Most of 128-159 map to a distinct glyph; five
+# (129, 141, 143, 144, 157) have no Windows-1252 glyph and map to themselves.
+def _html_invalid_charref(num: int) -> Optional[str]:
+    if num == 0:
+        return chr(0xFFFD)
+    if num == 13:
+        return "\r"
+    if num == 128:
+        return chr(0x20AC)
+    if num == 129:
+        return chr(0x81)
+    if num == 130:
+        return chr(0x201A)
+    if num == 131:
+        return chr(0x192)
+    if num == 132:
+        return chr(0x201E)
+    if num == 133:
+        return chr(0x2026)
+    if num == 134:
+        return chr(0x2020)
+    if num == 135:
+        return chr(0x2021)
+    if num == 136:
+        return chr(0x2C6)
+    if num == 137:
+        return chr(0x2030)
+    if num == 138:
+        return chr(0x160)
+    if num == 139:
+        return chr(0x2039)
+    if num == 140:
+        return chr(0x152)
+    if num == 141:
+        return chr(0x8D)
+    if num == 142:
+        return chr(0x17D)
+    if num == 143:
+        return chr(0x8F)
+    if num == 144:
+        return chr(0x90)
+    if num == 145:
+        return chr(0x2018)
+    if num == 146:
+        return chr(0x2019)
+    if num == 147:
+        return chr(0x201C)
+    if num == 148:
+        return chr(0x201D)
+    if num == 149:
+        return chr(0x2022)
+    if num == 150:
+        return chr(0x2013)
+    if num == 151:
+        return chr(0x2014)
+    if num == 152:
+        return chr(0x2DC)
+    if num == 153:
+        return chr(0x2122)
+    if num == 154:
+        return chr(0x161)
+    if num == 155:
+        return chr(0x203A)
+    if num == 156:
+        return chr(0x153)
+    if num == 157:
+        return chr(0x9D)
+    if num == 158:
+        return chr(0x17E)
+    if num == 159:
+        return chr(0x178)
+    return None
+
+
+# CPython's 126-entry `_invalid_codepoints` set, compressed to a closed-form
+# check (python3.12.9-verified equivalent — see module header). Only reached
+# for numbers NOT resolved by `_html_invalid_charref` and not a surrogate /
+# out-of-range value.
+def _html_is_invalid_codepoint(num: int) -> bool:
+    if num >= 1 and num <= 8:
+        return True
+    if num == 11:
+        return True
+    if num >= 14 and num <= 31:
+        return True
+    if num == 127:
+        return True
+    if num >= 0xFDD0 and num <= 0xFDEF:
+        return True
+    if num % 0x10000 == 0xFFFE or num % 0x10000 == 0xFFFF:
+        return True
+    return False
+
+
+def _html_resolve_numeric(num: int) -> str:
+    special: Optional[str] = _html_invalid_charref(num)
+    if special is not None:
+        return special
+    if num >= 0xD800 and num <= 0xDFFF:
+        return chr(0xFFFD)
+    if num > 0x10FFFF:
+        return chr(0xFFFD)
+    if _html_is_invalid_codepoint(num):
+        return ""
+    return chr(num)
+
+
+# The ~252-name `name2codepoint` core (python3.12.9-verified exact set/
+# values). Rebuilt fresh on every `unescape()` call — pyrst has no
+# module-level mutable state (G2), so this cannot be a persistent cached
+# global; documented perf note, not a correctness concern.
+def _html_name2codepoint() -> dict[str, int]:
+    d: dict[str, int] = {}
+    d["AElig"] = 198
+    d["Aacute"] = 193
+    d["Acirc"] = 194
+    d["Agrave"] = 192
+    d["Alpha"] = 913
+    d["Aring"] = 197
+    d["Atilde"] = 195
+    d["Auml"] = 196
+    d["Beta"] = 914
+    d["Ccedil"] = 199
+    d["Chi"] = 935
+    d["Dagger"] = 8225
+    d["Delta"] = 916
+    d["ETH"] = 208
+    d["Eacute"] = 201
+    d["Ecirc"] = 202
+    d["Egrave"] = 200
+    d["Epsilon"] = 917
+    d["Eta"] = 919
+    d["Euml"] = 203
+    d["Gamma"] = 915
+    d["Iacute"] = 205
+    d["Icirc"] = 206
+    d["Igrave"] = 204
+    d["Iota"] = 921
+    d["Iuml"] = 207
+    d["Kappa"] = 922
+    d["Lambda"] = 923
+    d["Mu"] = 924
+    d["Ntilde"] = 209
+    d["Nu"] = 925
+    d["OElig"] = 338
+    d["Oacute"] = 211
+    d["Ocirc"] = 212
+    d["Ograve"] = 210
+    d["Omega"] = 937
+    d["Omicron"] = 927
+    d["Oslash"] = 216
+    d["Otilde"] = 213
+    d["Ouml"] = 214
+    d["Phi"] = 934
+    d["Pi"] = 928
+    d["Prime"] = 8243
+    d["Psi"] = 936
+    d["Rho"] = 929
+    d["Scaron"] = 352
+    d["Sigma"] = 931
+    d["THORN"] = 222
+    d["Tau"] = 932
+    d["Theta"] = 920
+    d["Uacute"] = 218
+    d["Ucirc"] = 219
+    d["Ugrave"] = 217
+    d["Upsilon"] = 933
+    d["Uuml"] = 220
+    d["Xi"] = 926
+    d["Yacute"] = 221
+    d["Yuml"] = 376
+    d["Zeta"] = 918
+    d["aacute"] = 225
+    d["acirc"] = 226
+    d["acute"] = 180
+    d["aelig"] = 230
+    d["agrave"] = 224
+    d["alefsym"] = 8501
+    d["alpha"] = 945
+    d["amp"] = 38
+    d["and"] = 8743
+    d["ang"] = 8736
+    d["aring"] = 229
+    d["asymp"] = 8776
+    d["atilde"] = 227
+    d["auml"] = 228
+    d["bdquo"] = 8222
+    d["beta"] = 946
+    d["brvbar"] = 166
+    d["bull"] = 8226
+    d["cap"] = 8745
+    d["ccedil"] = 231
+    d["cedil"] = 184
+    d["cent"] = 162
+    d["chi"] = 967
+    d["circ"] = 710
+    d["clubs"] = 9827
+    d["cong"] = 8773
+    d["copy"] = 169
+    d["crarr"] = 8629
+    d["cup"] = 8746
+    d["curren"] = 164
+    d["dArr"] = 8659
+    d["dagger"] = 8224
+    d["darr"] = 8595
+    d["deg"] = 176
+    d["delta"] = 948
+    d["diams"] = 9830
+    d["divide"] = 247
+    d["eacute"] = 233
+    d["ecirc"] = 234
+    d["egrave"] = 232
+    d["empty"] = 8709
+    d["emsp"] = 8195
+    d["ensp"] = 8194
+    d["epsilon"] = 949
+    d["equiv"] = 8801
+    d["eta"] = 951
+    d["eth"] = 240
+    d["euml"] = 235
+    d["euro"] = 8364
+    d["exist"] = 8707
+    d["fnof"] = 402
+    d["forall"] = 8704
+    d["frac12"] = 189
+    d["frac14"] = 188
+    d["frac34"] = 190
+    d["frasl"] = 8260
+    d["gamma"] = 947
+    d["ge"] = 8805
+    d["gt"] = 62
+    d["hArr"] = 8660
+    d["harr"] = 8596
+    d["hearts"] = 9829
+    d["hellip"] = 8230
+    d["iacute"] = 237
+    d["icirc"] = 238
+    d["iexcl"] = 161
+    d["igrave"] = 236
+    d["image"] = 8465
+    d["infin"] = 8734
+    d["int"] = 8747
+    d["iota"] = 953
+    d["iquest"] = 191
+    d["isin"] = 8712
+    d["iuml"] = 239
+    d["kappa"] = 954
+    d["lArr"] = 8656
+    d["lambda"] = 955
+    # lang/rang: `name2codepoint` carries the HTML4 legacy values U+2329/U+232A
+    # (9001/9002), but `html.unescape` resolves them via the html5 table to
+    # U+27E8/U+27E9 (10216/10217) — the ONLY two names where those two CPython
+    # tables disagree (batch-verified: all other 250 names match html.unescape
+    # exactly). unescape is the contract here, so use the html5 values.
+    d["lang"] = 10216
+    d["laquo"] = 171
+    d["larr"] = 8592
+    d["lceil"] = 8968
+    d["ldquo"] = 8220
+    d["le"] = 8804
+    d["lfloor"] = 8970
+    d["lowast"] = 8727
+    d["loz"] = 9674
+    d["lrm"] = 8206
+    d["lsaquo"] = 8249
+    d["lsquo"] = 8216
+    d["lt"] = 60
+    d["macr"] = 175
+    d["mdash"] = 8212
+    d["micro"] = 181
+    d["middot"] = 183
+    d["minus"] = 8722
+    d["mu"] = 956
+    d["nabla"] = 8711
+    d["nbsp"] = 160
+    d["ndash"] = 8211
+    d["ne"] = 8800
+    d["ni"] = 8715
+    d["not"] = 172
+    d["notin"] = 8713
+    d["nsub"] = 8836
+    d["ntilde"] = 241
+    d["nu"] = 957
+    d["oacute"] = 243
+    d["ocirc"] = 244
+    d["oelig"] = 339
+    d["ograve"] = 242
+    d["oline"] = 8254
+    d["omega"] = 969
+    d["omicron"] = 959
+    d["oplus"] = 8853
+    d["or"] = 8744
+    d["ordf"] = 170
+    d["ordm"] = 186
+    d["oslash"] = 248
+    d["otilde"] = 245
+    d["otimes"] = 8855
+    d["ouml"] = 246
+    d["para"] = 182
+    d["part"] = 8706
+    d["permil"] = 8240
+    d["perp"] = 8869
+    d["phi"] = 966
+    d["pi"] = 960
+    d["piv"] = 982
+    d["plusmn"] = 177
+    d["pound"] = 163
+    d["prime"] = 8242
+    d["prod"] = 8719
+    d["prop"] = 8733
+    d["psi"] = 968
+    d["quot"] = 34
+    d["rArr"] = 8658
+    d["radic"] = 8730
+    d["rang"] = 10217
+    d["raquo"] = 187
+    d["rarr"] = 8594
+    d["rceil"] = 8969
+    d["rdquo"] = 8221
+    d["real"] = 8476
+    d["reg"] = 174
+    d["rfloor"] = 8971
+    d["rho"] = 961
+    d["rlm"] = 8207
+    d["rsaquo"] = 8250
+    d["rsquo"] = 8217
+    d["sbquo"] = 8218
+    d["scaron"] = 353
+    d["sdot"] = 8901
+    d["sect"] = 167
+    d["shy"] = 173
+    d["sigma"] = 963
+    d["sigmaf"] = 962
+    d["sim"] = 8764
+    d["spades"] = 9824
+    d["sub"] = 8834
+    d["sube"] = 8838
+    d["sum"] = 8721
+    d["sup"] = 8835
+    d["sup1"] = 185
+    d["sup2"] = 178
+    d["sup3"] = 179
+    d["supe"] = 8839
+    d["szlig"] = 223
+    d["tau"] = 964
+    d["there4"] = 8756
+    d["theta"] = 952
+    d["thetasym"] = 977
+    d["thinsp"] = 8201
+    d["thorn"] = 254
+    d["tilde"] = 732
+    d["times"] = 215
+    d["trade"] = 8482
+    d["uArr"] = 8657
+    d["uacute"] = 250
+    d["uarr"] = 8593
+    d["ucirc"] = 251
+    d["ugrave"] = 249
+    d["uml"] = 168
+    d["upsih"] = 978
+    d["upsilon"] = 965
+    d["uuml"] = 252
+    d["weierp"] = 8472
+    d["xi"] = 958
+    d["yacute"] = 253
+    d["yen"] = 165
+    d["yuml"] = 255
+    d["zeta"] = 950
+    d["zwj"] = 8205
+    d["zwnj"] = 8204
+    return d
+
+
+# The 100-name subset of the 252 above that CPython's `html5` dict ALSO
+# lists WITHOUT a trailing `;` (python3.12.9-verified exact set — the
+# "legacy SGML" entities: `amp`, `lt`, `gt`, `quot`, `copy`, `nbsp`, `not`,
+# accented Latin-1 letters, etc.). The other 152 names in
+# `_html_name2codepoint` require the trailing `;` (matches CPython).
+def _html_no_semi_names() -> dict[str, bool]:
+    d: dict[str, bool] = {}
+    d["AElig"] = True
+    d["Aacute"] = True
+    d["Acirc"] = True
+    d["Agrave"] = True
+    d["Aring"] = True
+    d["Atilde"] = True
+    d["Auml"] = True
+    d["Ccedil"] = True
+    d["ETH"] = True
+    d["Eacute"] = True
+    d["Ecirc"] = True
+    d["Egrave"] = True
+    d["Euml"] = True
+    d["Iacute"] = True
+    d["Icirc"] = True
+    d["Igrave"] = True
+    d["Iuml"] = True
+    d["Ntilde"] = True
+    d["Oacute"] = True
+    d["Ocirc"] = True
+    d["Ograve"] = True
+    d["Oslash"] = True
+    d["Otilde"] = True
+    d["Ouml"] = True
+    d["THORN"] = True
+    d["Uacute"] = True
+    d["Ucirc"] = True
+    d["Ugrave"] = True
+    d["Uuml"] = True
+    d["Yacute"] = True
+    d["aacute"] = True
+    d["acirc"] = True
+    d["acute"] = True
+    d["aelig"] = True
+    d["agrave"] = True
+    d["amp"] = True
+    d["aring"] = True
+    d["atilde"] = True
+    d["auml"] = True
+    d["brvbar"] = True
+    d["ccedil"] = True
+    d["cedil"] = True
+    d["cent"] = True
+    d["copy"] = True
+    d["curren"] = True
+    d["deg"] = True
+    d["divide"] = True
+    d["eacute"] = True
+    d["ecirc"] = True
+    d["egrave"] = True
+    d["eth"] = True
+    d["euml"] = True
+    d["frac12"] = True
+    d["frac14"] = True
+    d["frac34"] = True
+    d["gt"] = True
+    d["iacute"] = True
+    d["icirc"] = True
+    d["iexcl"] = True
+    d["igrave"] = True
+    d["iquest"] = True
+    d["iuml"] = True
+    d["laquo"] = True
+    d["lt"] = True
+    d["macr"] = True
+    d["micro"] = True
+    d["middot"] = True
+    d["nbsp"] = True
+    d["not"] = True
+    d["ntilde"] = True
+    d["oacute"] = True
+    d["ocirc"] = True
+    d["ograve"] = True
+    d["ordf"] = True
+    d["ordm"] = True
+    d["oslash"] = True
+    d["otilde"] = True
+    d["ouml"] = True
+    d["para"] = True
+    d["plusmn"] = True
+    d["pound"] = True
+    d["quot"] = True
+    d["raquo"] = True
+    d["reg"] = True
+    d["sect"] = True
+    d["shy"] = True
+    d["sup1"] = True
+    d["sup2"] = True
+    d["sup3"] = True
+    d["szlig"] = True
+    d["thorn"] = True
+    d["times"] = True
+    d["uacute"] = True
+    d["ucirc"] = True
+    d["ugrave"] = True
+    d["uml"] = True
+    d["uuml"] = True
+    d["yacute"] = True
+    d["yen"] = True
+    d["yuml"] = True
+    return d
+
+
+# Resolve a captured named-charref `word` (the bare word chars, no leading
+# `&` and no trailing `;` even if one was present in the input) against the
+# entity table, honoring `had_semi` (whether the ORIGINAL input had a
+# trailing `;` right after `word`). Mirrors CPython's `_replace_charref`
+# longest-prefix search exactly (see module header for the dead-code proof
+# behind starting the prefix scan at `len(word) - 1` in BOTH the
+# had-semicolon and no-semicolon cases).
+def _html_match_named(
+    word: str, had_semi: bool, table: dict[str, int], no_semi: dict[str, bool]
+) -> Optional[str]:
+    if word in table:
+        if had_semi or word in no_semi:
+            return chr(table[word])
+    wlen: int = len(word)
+    x: int = wlen - 1
+    while x > 1:
+        prefix: str = word[0:x]
+        if prefix in table and prefix in no_semi:
+            suffix: str = word[x:wlen]
+            tail: str = suffix + (";" if had_semi else "")
+            return chr(table[prefix]) + tail
+        x = x - 1
+    return None
+
+
+def unescape(s: str) -> str:
+    if "&" not in s:
+        return s
+    table: dict[str, int] = _html_name2codepoint()
+    no_semi: dict[str, bool] = _html_no_semi_names()
+    result: str = ""
+    i: int = 0
+    n: int = len(s)
+    while i < n:
+        ch: str = s[i]
+        if ch != "&":
+            result += ch
+            i = i + 1
+            continue
+        j: int = i + 1
+        if j < n and s[j] == "#":
+            k: int = j + 1
+            is_hex: bool = k < n and (s[k] == "x" or s[k] == "X")
+            digit_start: int = k + 1 if is_hex else k
+            k2: int = digit_start
+            if is_hex:
+                while k2 < n and _html_is_hex_digit(s[k2]):
+                    k2 = k2 + 1
+            else:
+                while k2 < n and _html_is_ascii_digit(s[k2]):
+                    k2 = k2 + 1
+            if k2 == digit_start:
+                # No digits at all: not a charref (matches CPython — the
+                # regex fails every alternative here). Literal '&', re-scan
+                # from the very next char.
+                result += "&"
+                i = i + 1
+                continue
+            has_semi: bool = k2 < n and s[k2] == ";"
+            value: int = 0
+            di: int = digit_start
+            if is_hex:
+                while di < k2:
+                    d: int = _html_hex_value(s[di])
+                    if value <= 0x10FFFF:
+                        value = value * 16 + d
+                    di = di + 1
+            else:
+                while di < k2:
+                    d2: int = _html_dec_value(s[di])
+                    if value <= 0x10FFFF:
+                        value = value * 10 + d2
+                    di = di + 1
+            result += _html_resolve_numeric(value)
+            i = k2 + 1 if has_semi else k2
+            continue
+        # Named charref: capture up to 32 word chars, then an optional ';'.
+        count: int = 0
+        k3: int = j
+        while k3 < n and count < 32 and _html_is_word_char(s[k3]):
+            k3 = k3 + 1
+            count = count + 1
+        if count == 0:
+            result += "&"
+            i = i + 1
+            continue
+        word: str = s[j:k3]
+        had_semi2: bool = k3 < n and s[k3] == ";"
+        matched: Optional[str] = _html_match_named(word, had_semi2, table, no_semi)
+        if matched is not None:
+            result += matched
+        else:
+            result += "&" + word + (";" if had_semi2 else "")
+        i = k3 + 1 if had_semi2 else k3
+    return result

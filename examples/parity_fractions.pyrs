@@ -1,0 +1,173 @@
+# parity: dual-run
+# Dual-run CPython parity golden for stdlib `fractions` — seeded from
+# docs/design/w2-dossiers/fractions.md's PARITY PLAN, restricted to the
+# subset this module actually implements (see lib/fractions.pyrs's header for
+# the full divergence list). Every line below runs UNMODIFIED and
+# byte-identically under both the pyrst binary and real CPython 3.12 (the
+# harness prepends `from __future__ import annotations` and calls `main()`);
+# cross-checked during authoring.
+#
+# Adjustments from the dossier's literal PARITY PLAN (each is a documented,
+# necessary substitution — not a silent scope narrowing; none of them changes
+# dual-run compatibility, since CPython accepts every substituted spelling
+# identically):
+#
+#   - `Fraction()` (bare, zero-arg) is REPLACED by `Fraction(numerator=0,
+#     denominator=1)`. This module's constructor keeps CPython-shaped
+#     defaults (`numerator: int = 0, denominator: int = 1`) in its
+#     signature, but a REAL pyrst codegen bug (found while authoring this
+#     module — `src/codegen/exprs.rs`'s constructor-call arm only
+#     default-fills omitted parameters when the call ALSO carries at least
+#     one keyword argument) means a call with ZERO args and ZERO kwargs
+#     (`Fraction()`) does not compile at all right now. CPython accepts the
+#     keyword form identically (`Fraction(numerator=0, denominator=1) ==
+#     Fraction()`), so substituting it keeps this line dual-run safe without
+#     exercising the broken call shape.
+#   - `Fraction(0)` / `Fraction(1)` (single positional arg, omitted
+#     denominator) are REPLACED by `Fraction(numerator=0)` /
+#     `Fraction(numerator=1)` for the SAME reason: a lone keyword argument
+#     DOES hit the working (kwargs-present) default-fill path, and CPython
+#     accepts `Fraction(numerator=0)` identically to `Fraction(0)`.
+#   - String construction (`Fraction("1/2")`, `Fraction("42")`,
+#     `Fraction("-1/2")`) is DROPPED: this module only implements the
+#     int-pair constructor (no `*args`/`Union`-typed overloading in pyrst —
+#     see lib/fractions.pyrs's header).
+#   - Cross-type arithmetic/comparison with a bare `int` (`Fraction(1, 2) +
+#     2`, `2 + Fraction(1, 2)`, `Fraction(2, 1) == 2`, `Fraction(1, 2) > 0`)
+#     is DROPPED: `__add__`/`__sub__`/`__mul__`/`__eq__`/`__lt__` all require
+#     a `Fraction` on both sides (no operator overloading / reflected dunders
+#     in pyrst — see lib/fractions.pyrs's header). Wrap the bare int in
+#     `Fraction(n, 1)` instead.
+#   - `/` (`__truediv__`) is DROPPED ENTIRELY from this file: this module
+#     ships a `.div()` METHOD instead (G5 — `__truediv__` is not an available
+#     pyrst dunder), and `.div()` does not exist on CPython's real
+#     `fractions.Fraction`, so a line calling it would raise `AttributeError`
+#     under an unmodified python3 run and break dual-run byte-identity for
+#     every line after it. `.div()` is covered separately in the NON-dual-run
+#     golden `examples/fractions_div.pyrs` (oracle-pinned expected output,
+#     python3-verified during authoring, not diffed against a live python3
+#     run) — mirroring the `random` module's `parity_random.pyrs` /
+#     `random_freefns.pyrs` split for the same kind of pyrst-only call shape.
+#
+# `limit_denominator()` IS included (unlike the dossier's own conservative
+# exclusion) because this module ports CPython's exact continued-fraction
+# convergent-search algorithm; all three dossier-listed cases (already-
+# within-limit, `Fraction(22, 7)`, `Fraction(355, 113)`) were python3-
+# verified byte-identical during authoring.
+from fractions import Fraction
+
+
+def main() -> None:
+    # ── Construction & normalization ─────────────────────────────────────
+    print(Fraction(numerator=0, denominator=1))
+    print(Fraction(numerator=0))
+    print(Fraction(numerator=1))
+    print(Fraction(5, 2))
+    print(Fraction(6, 9))
+    print(Fraction(-3, 4))
+    print(Fraction(3, -4))
+    print(Fraction(-3, -4))
+    print(Fraction(0, 5))
+    print(Fraction(0, -1))
+
+    # ── repr / str ────────────────────────────────────────────────────────
+    print(repr(Fraction(3, 4)))
+    print(repr(Fraction(-5, 2)))
+    print(repr(Fraction(0, 1)))
+    print(str(Fraction(3, 4)))
+    print(str(Fraction(-5, 2)))
+    print(str(Fraction(numerator=0)))
+
+    # ── Arithmetic (exact, no float) ─────────────────────────────────────
+    print(Fraction(1, 2) + Fraction(1, 3))
+    print(Fraction(1, 2) - Fraction(1, 3))
+    print(Fraction(1, 2) * Fraction(1, 3))
+
+    # ── Unary ops ─────────────────────────────────────────────────────────
+    print(-Fraction(1, 2))
+    print(-Fraction(-1, 2))
+
+    # ── Comparisons ───────────────────────────────────────────────────────
+    print(Fraction(1, 2) == Fraction(2, 4))
+    print(Fraction(1, 2) < Fraction(2, 3))
+    # `<=`/`>=`/`>` are gated (G5 — __le__/__ge__/__gt__ unavailable);
+    # express them via `<`/`==`/`not`, the only comparisons this module ships.
+    print(Fraction(1, 2) == Fraction(2, 4) or Fraction(1, 2) < Fraction(2, 4))
+    print(Fraction(1, 2) < Fraction(3, 4))
+    print(not (Fraction(3, 4) < Fraction(3, 4)) and not (Fraction(3, 4) == Fraction(1, 2)))
+
+    # ── Methods ───────────────────────────────────────────────────────────
+    print(Fraction(3, 4).is_integer())
+    print(Fraction(2, 1).is_integer())
+    print(Fraction(4, 2).is_integer())
+    print(Fraction(3, 4).numerator)
+    print(Fraction(3, 4).denominator)
+    print(Fraction(-3, 4).numerator)
+    print(Fraction(-3, 4).denominator)
+    print(Fraction(7, 3).as_integer_ratio())
+    print(Fraction(3, 4).limit_denominator(100))
+    print(Fraction(22, 7).limit_denominator(5))
+    print(Fraction(355, 113).limit_denominator(100))
+
+    # ── Errors ────────────────────────────────────────────────────────────
+    try:
+        Fraction(1, 0)
+    except ZeroDivisionError as e:
+        print(e)
+    try:
+        Fraction(5, 0)
+    except ZeroDivisionError as e:
+        print(e)
+
+    # ── HARDENING: adversarial edge cases (w2-hardener pass) ────────────
+    # Both numerator and denominator zero: CPython's ZeroDivisionError check
+    # fires on the denominator FIRST, using the un-normalized numerator
+    # argument (0 here) verbatim in the message — python3-verified.
+    try:
+        Fraction(0, 0)
+    except ZeroDivisionError as e:
+        print(e)
+    # Negative numerator with zero denominator: message uses the exact
+    # (negative, un-normalized) numerator argument.
+    try:
+        Fraction(-1, 0)
+    except ZeroDivisionError as e:
+        print(e)
+    # Negative denominator alone (numerator positive) still normalizes via
+    # the sign-fold-then-GCD path, no error.
+    print(repr(Fraction(0, -1)))
+    print(repr(Fraction(-4, 2)))
+    # str()/repr() for a whole-number Fraction built from a negative
+    # keyword-only numerator (denominator defaults to 1).
+    print(str(Fraction(numerator=-5)))
+    print(repr(Fraction(numerator=-5)))
+    # Ties across construction paths: cross-sign-normalized equality/order.
+    print(Fraction(-1, 2) == Fraction(1, -2))
+    print(Fraction(-1, 2) < Fraction(1, 2))
+    print(Fraction(1, 2) < Fraction(-1, 2))
+    # limit_denominator on a NEGATIVE fraction (continued-fraction search
+    # must handle the floor-division of a negative numerator correctly).
+    print(repr(Fraction(-1, 3).limit_denominator(2)))
+    # limit_denominator when self is already exactly at the max (boundary,
+    # not just "already within limit").
+    print(repr(Fraction(1, 1).limit_denominator(1)))
+    # limit_denominator on zero.
+    print(repr(Fraction(0, 1).limit_denominator(5)))
+    # limit_denominator's own ValueError guard (max_denominator < 1).
+    try:
+        Fraction(1, 2).limit_denominator(0)
+    except ValueError as e:
+        print(e)
+    try:
+        Fraction(1, 2).limit_denominator(-5)
+    except ValueError as e:
+        print(e)
+    # i64 boundary construction (largest representable numerator, not
+    # overflowing) — confirms no premature truncation at the edge. (Note:
+    # the SMALLEST i64 value, -9223372036854775808, cannot be written as a
+    # literal at all here — pyrst's lexer parses a negative literal as unary
+    # minus applied to the positive literal, and +9223372036854775808 itself
+    # overflows i64::MAX; this is a pre-existing, module-independent lexer
+    # boundary identical to C/Rust's own literal-lexing behavior, not a
+    # `fractions`-specific defect, so it is intentionally not exercised here.)
+    print(repr(Fraction(9223372036854775807, 1)))

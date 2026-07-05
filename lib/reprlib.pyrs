@@ -1,0 +1,155 @@
+# pyrst standard library — reprlib
+#
+# Representation library for abbreviated repr of objects.
+#
+# FIDELITY: 2.5/5 — CPython's `reprlib.Repr` is a per-type-dispatch truncation
+# engine (`repr_list`/`repr_dict`/`repr_set`/`repr_tuple`/`repr_array`/
+# `repr_deque`/`repr_instance`/`repr1`) plus a `recursive_repr` decorator for
+# guarding `__repr__` against reference cycles. Most of that surface CANNOT be
+# expressed in pyrst and has been REMOVED rather than faked:
+#
+#   - NO GENERIC METHODS: pyrst methods on a class may not declare their own
+#     type parameters (`def repr_list[T](self, ...)` is a parse error — "generic
+#     methods are not supported (type parameters are only allowed on free
+#     functions)"). A per-type dispatch method that must accept an arbitrary
+#     `list[T]`/`dict[K,V]`/`set[T]`/tuple/instance therefore cannot be written
+#     as a METHOD at all.
+#   - NO BARE CONTAINER TYPES: the obvious workaround — annotating the
+#     parameter as bare `list`/`dict`/`set`/`tuple` (no type argument) — does
+#     not unify with a concrete `list[int]`/`dict[str, int]`/... value at the
+#     call site ("expected list, found list[int]"), so it would be a dead
+#     parameter type no caller could ever satisfy.
+#   - Net effect: `Repr.repr`, `Repr.repr1`, `Repr.repr_list`, `Repr.repr_tuple`,
+#     `Repr.repr_dict`, `Repr.repr_set`, `Repr.repr_frozenset`, `Repr.repr_array`,
+#     `Repr.repr_deque`, and `Repr.repr_instance` are DROPPED from this module.
+#     `Repr.repr_str` and `Repr.repr_int` are KEPT because `str`/`int` are
+#     concrete (non-generic) types, so they type-check normally.
+#   - `recursive_repr` is DROPPED too, for two independent, unavoidable reasons:
+#       1. It needs a generic type parameter `T` (the wrapped callable's
+#          argument type), but `recursive_repr(fillvalue: str = "...")` has no
+#          argument of type `T` to infer it from, and pyrst has no explicit
+#          type-argument call syntax (`recursive_repr[int]()`) to supply it by
+#          hand — "cannot infer type parameter `T` ... (explicit type arguments
+#          are not supported)".
+#       2. Even given a T, pyrst does not support applying a user-defined
+#          decorator FACTORY via `@decorator(...)` syntax to a method — only a
+#          small fixed set of built-in decorators (`@property`, `@staticmethod`,
+#          `@dataclass`) is recognized ("decorator `@recursive_repr` is not
+#          supported"). And since pyrst's value semantics forbid reference
+#          cycles in the first place, the guard `recursive_repr` exists to
+#          provide in CPython has no failure mode to protect against here.
+#
+# What remains is honest and functional:
+#   - `Repr` still holds the full CPython field surface (all eleven `max*`
+#     limits + `fillvalue` + `indent`) so code that only reads those fields
+#     works exactly like CPython.
+#   - NO MODULE-LEVEL `aRepr` SINGLETON: pyrst forbids module-level state that
+#     isn't a literal constant ("top-level statements other than function/class
+#     /import definitions (and module-level constants `NAME: T = <literal>`)
+#     are not supported") — `aRepr: Repr = Repr()` is a constructor CALL, not a
+#     literal, so it cannot be declared at module scope at all. CPython's
+#     `aRepr` is also a genuine shared, mutable global (code does
+#     `reprlib.aRepr.maxstring = 10` and expects it to stick); pyrst has no
+#     module-level mutable state full stop, so even a workaround could not
+#     replicate that sharing. `aRepr` is DROPPED; `default_repr()` is provided
+#     instead — it returns a FRESH `Repr()` with CPython's exact defaults on
+#     every call (not a shared singleton).
+#   - The module-level `repr(obj)` function is provided for CPython-name
+#     compatibility. It DELEGATES to the builtin `repr` (SIMPLIFIED — no
+#     truncation is actually applied; the `max*` limits on `Repr` are inert).
+#     This is safe, not an infinite loop: pyrst special-cases the identifier
+#     `repr` at every call site to always mean the compiler builtin, regardless
+#     of any same-named user-defined function in scope — so a module-level
+#     `def repr(...)` that itself calls `repr(...)` resolves to the builtin,
+#     not to itself.
+#   - SET/FROZENSET ORDERING: pyrst set iteration order may differ from
+#     CPython's hash table order (see `docs/design` value-semantics notes).
+#   - BIGNUM LIMIT: pyrst `int` is `i64`; CPython's arbitrary-precision ints
+#     have no equivalent here (truncation logic — had it been implementable —
+#     would only ever see representable-range integers).
+
+class Repr:
+    maxlevel: int
+    maxtuple: int
+    maxlist: int
+    maxarray: int
+    maxdict: int
+    maxset: int
+    maxfrozenset: int
+    maxdeque: int
+    maxstring: int
+    maxlong: int
+    maxother: int
+    fillvalue: str
+    indent: Optional[int]
+
+    def __init__(
+        self,
+        maxlevel: int = 6,
+        maxtuple: int = 6,
+        maxlist: int = 6,
+        maxarray: int = 5,
+        maxdict: int = 4,
+        maxset: int = 6,
+        maxfrozenset: int = 6,
+        maxdeque: int = 6,
+        maxstring: int = 30,
+        maxlong: int = 40,
+        maxother: int = 30,
+        fillvalue: str = "...",
+        indent: Optional[int] = None
+    ) -> None:
+        self.maxlevel = maxlevel
+        self.maxtuple = maxtuple
+        self.maxlist = maxlist
+        self.maxarray = maxarray
+        self.maxdict = maxdict
+        self.maxset = maxset
+        self.maxfrozenset = maxfrozenset
+        self.maxdeque = maxdeque
+        self.maxstring = maxstring
+        self.maxlong = maxlong
+        self.maxother = maxother
+        self.fillvalue = fillvalue
+        self.indent = indent
+
+    def repr_str(self, x: str, level: int) -> str:
+        return repr(x)
+
+    def repr_int(self, x: int, level: int) -> str:
+        return repr(x)
+
+def default_repr() -> Repr:
+    """Fresh Repr() with CPython's exact defaults. NOT a shared singleton —
+    pyrst has no module-level mutable state, so this cannot replicate
+    CPython's `aRepr` global object identity/mutation semantics.
+
+    NOTE: spells out every keyword explicitly (rather than `Repr()`) as a
+    workaround for a pyrst codegen bug (verified against a minimal repro,
+    reported upstream, out of scope to fix here): a class constructor called
+    with FEWER POSITIONAL args than it declares — including zero, e.g. bare
+    `Repr()` — emits an under-supplied `Repr::new(...)` Rust call that fails
+    to compile ("this function takes 13 arguments but 0 arguments were
+    supplied"), even though the same defaults resolve correctly for a FREE
+    FUNCTION call (`f()` with `def f(a: int = 5)` works) and for a class
+    constructor call using explicit KEYWORD args (`Repr(maxlevel=6, ...)` or
+    even a partial `Repr(maxlevel=1)` both work). Always construct `Repr` with
+    explicit keywords in this module until that codegen bug is fixed."""
+    return Repr(
+        maxlevel=6,
+        maxtuple=6,
+        maxlist=6,
+        maxarray=5,
+        maxdict=4,
+        maxset=6,
+        maxfrozenset=6,
+        maxdeque=6,
+        maxstring=30,
+        maxlong=40,
+        maxother=30,
+        fillvalue="...",
+        indent=None,
+    )
+
+def repr[T](obj: T) -> str:
+    return repr(obj)

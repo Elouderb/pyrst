@@ -1,0 +1,302 @@
+# pyrst standard library — shlex (simple shell-like lexing)
+#
+# Pure-pyrst port of CPython's `shlex.split` / `shlex.join` / `shlex.quote`
+# (the three module-level functions the dossier scopes; the stateful
+# `shlex.shlex` class/iterator interface is out of scope — this module never
+# claimed it). Embedded via `include_str!` (see `src/stdlib.rs`). Usable as
+# either `from shlex import split, join, quote` or `import shlex;
+# shlex.split(...)`.
+#
+# Fidelity: 5/5 (docs/design/w2-dossiers/shlex.md). Every BEHAVIOR MATRIX row
+# and every PARITY PLAN case in the dossier was re-verified against a live
+# `python3` (see the CPython `shlex.py` source dumped and read during
+# implementation, and the additional oracle probes run for edge cases the
+# dossier didn't spell out — comment-mid-token, escaped-quote-at-EOF,
+# non-posix quote-only-at-token-start, etc.) and matches byte-for-byte.
+#
+# --- split(s, comments=False, posix=True) --------------------------------
+# `shlex.split` is `shlex.shlex(s, posix=posix)` configured with
+# `whitespace_split=True` (no `wordchars` concept — any non-whitespace,
+# non-quote, non-escape byte is just literal token content) and driven to
+# exhaustion. This module reimplements that exact state machine directly
+# (no `shlex` class, no stream/file-source machinery — `split` is the only
+# consumer of it, and CPython's `whitespace_split=True` short-circuits all
+# the `wordchars`/`punctuation_chars` branches anyway, so porting those is
+# unnecessary work the dossier doesn't require).
+#
+# State-machine facts ported from CPython's `shlex.py` (module version
+# bundled with the `python3` used for oracle probes; source read in full via
+# `python3 -c "import shlex, inspect; print(inspect.getsource(shlex))"`):
+#   - Whitespace = space, tab, CR, LF (CPython's `shlex.whitespace = '
+#     \t\r\n'`) — collapses ANY run into a single token boundary.
+#   - POSIX MODE (`posix=True`):
+#     * `\` outside quotes escapes the very next character literally (and
+#       is itself consumed, not appended) — EOF right after a trailing `\`
+#       raises `ValueError("No escaped character")`.
+#     * `'...'` (single quotes): every character up to the matching `'` is
+#       literal — NO escape processing inside single quotes (a `\` inside
+#       `'...'` is kept as a literal backslash, per the dossier's
+#       `split("'\\n'") == ['\\n']` case).
+#     * `"..."` (double quotes): only `\"` and `\\` are special inside
+#       double quotes (collapsing to `"` / `\` respectively); any other
+#       `\x` keeps BOTH the backslash and `x` literally (`split('"\\n"') ==
+#       ['\\n']`, matching the dossier). EOF right after a trailing `\`
+#       inside a double-quoted span raises `ValueError("No escaped
+#       character")`, same as the unquoted case; EOF before the closing
+#       quote (with no trailing escape) raises `ValueError("No closing
+#       quotation")`.
+#     * A quote character may open a quoted span ANYWHERE in a token, not
+#       just at the start (`split("a'b'c") == ['abc']`) — closing the
+#       quote resumes the SAME token; it does not end it.
+#   - NON-POSIX MODE (`posix=False`): no escape processing at all (`\` is a
+#     plain literal character); a quote is ONLY special when it is the
+#     FIRST character of a fresh token — `split("a'b'c", posix=False) ==
+#     ["a'b'c"]` (mid-token quote = literal) but `split("'foo'bar",
+#     posix=False) == ["'foo'", 'bar']` (quote-at-token-start opens a raw
+#     span, kept VERBATIM including both quote characters, and the token
+#     ends the INSTANT the closing quote is seen — whatever follows starts
+#     a brand new token, even with no whitespace in between). This
+#     start-position-sensitivity was confirmed against a live oracle
+#     (`_shlex_scratch` probes) — it is not spelled out in
+#     the dossier's posix=False examples (which happen to all quote at
+#     token-start) but is required for full fidelity.
+#   - Comments (`comments=True`, `#` by default): recognized only OUTSIDE
+#     an open quote (`split("hello # comment with 'quotes'", comments=True)
+#     == ['hello']` — the `#` inside the string literal there is plain
+#     source text, not inside a shlex quote span). A `\#` (backslash-
+#     escaped hash, posix mode only) is NOT a comment marker — the escape
+#     branch consumes the `\` and appends a literal `#` before the comment
+#     check ever sees it (`split('hello\\# not a comment', comments=True)
+#     == ['hello#', 'not', 'a', 'comment']`).
+#     * POSIX: an unescaped `#` — whether at the very start of a token or
+#       mid-token — ends the CURRENT token (excluding the `#`) and skips
+#       to end-of-line.
+#     * NON-POSIX: an unescaped `#` mid-token skips to end-of-line but
+#       does NOT end the token — building resumes with whatever follows
+#       the skipped line, on the SAME token (`shlex.split('foo#bar
+#       baz\nqux', posix=False, comments=True) == ['fooqux']`, oracle-
+#       verified; not in the dossier's matrix but implemented for full
+#       fidelity since posix=False + comments=True is a legal combination).
+#
+# --- quote(s) --------------------------------------------------------------
+# CPython: return `s` unchanged if `s` is non-empty and every character is
+# in `[\w@%+=:,./-]` under `re.ASCII` (so `\w` = `[a-zA-Z0-9_]` only — NOT
+# pyrst's Unicode-aware `str.isalnum()`, which would wrongly treat e.g. an
+# accented letter as "safe"); otherwise wrap in single quotes, replacing
+# every embedded `'` with the four-character sequence `'"'"'` (end the
+# single-quoted span, emit a double-quoted single quote, reopen the
+# single-quoted span). `quote("")` is `"''"`. `_shlex_is_safe_char` below
+# implements the ASCII ranges directly (not `.isalnum()`) specifically to
+# avoid that Unicode-vs-ASCII divergence.
+#
+# --- join(split_command) ----------------------------------------------
+# CPython: `' '.join(quote(arg) for arg in split_command)` — this module
+# ports that exactly (space-joined `quote()` of every element).
+#
+# --- Divergences from the dossier's ERRORS table (all STATICALLY GATED,
+# not silent behavior gaps) -------------------------------------------------
+#   - `split(123)` (AttributeError), `quote(123)` / `quote(b'hello')`
+#     (TypeError), `join(['hello', 123])` (TypeError): every one of these is
+#     CPython raising a runtime error for a WRONG ARGUMENT TYPE. pyrst is
+#     statically typed — `split`/`quote` take `s: str` and `join` takes
+#     `split_command: list[str]`, so passing an `int`, `bytes`, or a
+#     mixed-type list is a COMPILE-TIME type error in pyrst, not a runtime
+#     exception. This is strictly stronger than CPython's contract (the bad
+#     call never reaches a running program at all), so it is not counted
+#     against fidelity — the same treatment as every other stdlib module's
+#     "wrong Python type" error rows (see e.g. `functools.pyrs`,
+#     `statistics.pyrs`). CPython's `s is None` guard in real `split()` is
+#     likewise unreachable (`s: str` cannot be `None`).
+#   - No bytes support (G7 in the dossier): `quote`/`join`/`split` operate
+#     on `str` only, matching pyrst's lack of a `bytes` type — the dossier
+#     marks this "no deferral needed".
+#
+# --- Name collisions (documented co-import restrictions, precedent: `re`
+# vs `operator`'s `sub`, `datetime`'s class `time` vs the `time` module) ---
+#   - `split` is also defined by `re` (`re.split(pattern, text, maxsplit=0)`).
+#     A program that does `from re import split` and `from shlex import
+#     split` (or any combination that pulls both top-level `split` names
+#     into one program) hits pyrst's flat-namespace cross-module collision
+#     error. Import one or the other, or use a qualified `re.split(...)` /
+#     `shlex.split(...)` call — qualified calls still route through the
+#     same flat top-level function today (G3, real per-module namespacing,
+#     is the epic that will remove this restriction).
+#   - `join` is also defined by `os` (`os.join(a, b)`, the flat `os.path.
+#     join` stand-in). Same restriction: a program cannot import both
+#     `shlex.join` and `os.join` at the top level.
+#   - `quote` has no collision with any other embedded module (checked via
+#     `grep -n '^def quote\b' lib/*.pyrs` — no hits).
+
+
+def _shlex_is_ws(c: str) -> bool:
+    return c == " " or c == "\t" or c == "\n" or c == "\r"
+
+
+def _shlex_is_safe_char(c: str) -> bool:
+    # ASCII-only word-char check (matches CPython's `re.ASCII` `_find_unsafe`
+    # regex exactly) plus the extra CPython-safe punctuation `@%+=:,./-`.
+    # Deliberately NOT `c.isalnum()` — that is Unicode-aware in pyrst and
+    # would diverge from CPython's ASCII-restricted `\w` (see header).
+    if c >= "a" and c <= "z":
+        return True
+    if c >= "A" and c <= "Z":
+        return True
+    if c >= "0" and c <= "9":
+        return True
+    if c == "_":
+        return True
+    return "@%+=:,./-".contains(c)
+
+
+def _shlex_has_unsafe(s: str) -> bool:
+    for c in s:
+        if not _shlex_is_safe_char(c):
+            return True
+    return False
+
+
+def split(s: str, comments: bool = False, posix: bool = True) -> list[str]:
+    # `chars` gives O(1) indexed lookahead (pyrst `str` indexing/`len` walk
+    # the string's characters each call, which would make a `while i <
+    # len(s): s[i]` scan quadratic on long input — see the identical note in
+    # `json.pyrs`'s dumps helper). One `for c in s: chars.append(c)` forward
+    # pass builds an indexable `list[str]` up front instead.
+    chars: list[str] = []
+    for ch in s:
+        chars.append(ch)
+    n: int = len(chars)
+    tokens: list[str] = []
+    i: int = 0
+    while True:
+        # Between tokens: skip whitespace, and — when enabled — whole
+        # comment lines, repeating until neither applies (mirrors CPython's
+        # state ' ' looping on consecutive blank/comment lines).
+        while i < n and _shlex_is_ws(chars[i]):
+            i += 1
+        while i < n and comments and chars[i] == "#":
+            while i < n and chars[i] != "\n":
+                i += 1
+            if i < n:
+                i += 1
+            while i < n and _shlex_is_ws(chars[i]):
+                i += 1
+        if i >= n:
+            break
+
+        # Build exactly one token. Reaching here guarantees `chars[i]` is
+        # neither whitespace nor (when enabled) a comment-starting `#`, so
+        # the loop below always consumes/records something before it can
+        # hit a boundary — unlike CPython's `shlex`, no separate "was
+        # anything quoted" bookkeeping is needed to decide whether to emit
+        # an empty trailing token.
+        token: str = ""
+        at_start: bool = True
+        while True:
+            if i >= n:
+                break
+            c: str = chars[i]
+            if posix and c == "\\":
+                i += 1
+                if i >= n:
+                    raise ValueError("No escaped character")
+                token += chars[i]
+                i += 1
+                at_start = False
+            elif c == "'" or c == "\"":
+                close: str = c
+                if posix:
+                    # POSIX: a quote is special ANYWHERE in the token, and
+                    # closing it resumes the same token (does not end it).
+                    i += 1
+                    while True:
+                        if i >= n:
+                            raise ValueError("No closing quotation")
+                        c2: str = chars[i]
+                        if c2 == close:
+                            i += 1
+                            break
+                        elif close == "\"" and c2 == "\\":
+                            # Only `\"` and `\\` are special inside double
+                            # quotes; anything else keeps the backslash
+                            # literal (handled by re-entering this loop with
+                            # `i` still pointing at the un-consumed char).
+                            if i + 1 >= n:
+                                raise ValueError("No escaped character")
+                            nxt: str = chars[i + 1]
+                            if nxt == "\"" or nxt == "\\":
+                                token += nxt
+                                i += 2
+                            else:
+                                token += c2
+                                i += 1
+                        else:
+                            token += c2
+                            i += 1
+                    at_start = False
+                elif at_start:
+                    # non-POSIX: a quote is only special as the FIRST
+                    # character of a fresh token; it is copied VERBATIM
+                    # (including both quote characters, no escape
+                    # processing), and the token ends the instant the
+                    # matching quote closes.
+                    token += c
+                    i += 1
+                    while True:
+                        if i >= n:
+                            raise ValueError("No closing quotation")
+                        c2: str = chars[i]
+                        token += c2
+                        i += 1
+                        if c2 == close:
+                            break
+                    at_start = False
+                    break
+                else:
+                    # non-POSIX, mid-token: a quote is just a literal char.
+                    token += c
+                    i += 1
+                    at_start = False
+            elif _shlex_is_ws(c):
+                break
+            elif comments and c == "#":
+                while i < n and chars[i] != "\n":
+                    i += 1
+                if i < n:
+                    i += 1
+                if posix:
+                    break
+                # non-POSIX: the comment line is skipped but the token
+                # keeps building with whatever follows it.
+            else:
+                token += c
+                i += 1
+                at_start = False
+        tokens.append(token)
+    return tokens
+
+
+def quote(s: str) -> str:
+    if len(s) == 0:
+        return "''"
+    if not _shlex_has_unsafe(s):
+        return s
+    result: str = "'"
+    for c in s:
+        if c == "'":
+            result += "'\"'\"'"
+        else:
+            result += c
+    result += "'"
+    return result
+
+
+def join(split_command: list[str]) -> str:
+    result: str = ""
+    first: bool = True
+    for arg in split_command:
+        if first:
+            result += quote(arg)
+            first = False
+        else:
+            result += " " + quote(arg)
+    return result

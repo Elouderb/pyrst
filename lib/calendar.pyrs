@@ -1,0 +1,431 @@
+# pyrst standard library — calendar
+#
+# Fidelity score: 4/5.
+#
+# Surface implemented (CPython-exact names; kwargs and default args match
+# CPython positional/keyword shapes except where noted below):
+#   - isleap(year: int) -> bool
+#   - leapdays(y1: int, y2: int) -> int
+#   - weekday(year: int, month: int, day: int) -> int          (0=Monday..6=Sunday)
+#   - monthrange(year: int, month: int) -> tuple[int, int]     (first weekday, days-in-month)
+#   - monthcalendar(year: int, month: int, firstweekday: int = 0) -> list[list[int]]
+#   - month(theyear: int, themonth: int, w: int = 0, l: int = 0, firstweekday: int = 0) -> str
+#   - calendar(theyear: int, w: int = 2, l: int = 1, c: int = 6, m: int = 3, firstweekday: int = 0) -> str
+#   - firstweekday() -> int                     (stateless stub, see DIVERGENCE below)
+#   - setfirstweekday(firstweekday: int) -> None (stateless stub, see DIVERGENCE below)
+#   - day_name() -> list[str]     (7: 'Monday'..'Sunday', index 0=Monday)
+#   - day_abbr() -> list[str]     (7: 'Mon'..'Sun')
+#   - month_name() -> list[str]  (13: [0]='' dummy, [1]='January'..[12]='December')
+#   - month_abbr() -> list[str]  (13: [0]='' dummy, [1]='Jan'..[12]='Dec')
+#   - mdays() -> list[int]        (13: [0]=0 dummy, non-leap days-per-month template)
+#   - MONDAY=0 TUESDAY=1 WEDNESDAY=2 THURSDAY=3 FRIDAY=4 SATURDAY=5 SUNDAY=6
+#   - JANUARY=1 FEBRUARY=2 MARCH=3 APRIL=4 MAY=5 JUNE=6 JULY=7 AUGUST=8
+#     SEPTEMBER=9 OCTOBER=10 NOVEMBER=11 DECEMBER=12
+#   - EPOCH: int = 1970
+#
+# DIVERGENCE 1 — no `Day`/`Month` enum types (G5, gated: pyrst has no enum
+# construct). CPython's `weekday()`/`monthrange()` return `calendar.Day`
+# (an `IntEnum`); here they return a plain `int` in the same 0-6 numbering.
+# `int(calendar.weekday(...))` in CPython and `calendar.weekday(...)` in
+# pyrst are therefore numerically identical — the dual-run parity example
+# below calls `int(...)` on the CPython side (per the dossier's PARITY PLAN)
+# so both sides compare the same plain integer. `MONDAY`..`SUNDAY` and
+# `JANUARY`..`DECEMBER` are plain `int` constants, not enum members, so
+# `calendar.MONDAY == 0` holds but `isinstance`-style enum checks (not
+# expressible in pyrst) are out of scope.
+#
+# DIVERGENCE 2 — no persistent module-level mutable state (G2, gated: pyrst
+# forbids module-level MUTABLE state; only constants are allowed). CPython's
+# `setfirstweekday()` mutates a module-global that `monthcalendar()`/
+# `month()`/`calendar()` (and `firstweekday()`) all read on every call. pyrst
+# cannot express that shared mutable cell, so the "first weekday" setting is
+# NOT global here — it is instead an explicit, optional `firstweekday: int =
+# 0` KEYWORD parameter added to `monthcalendar`, `month`, and `calendar`
+# (CPython's own default value, so omitting it reproduces CPython's default
+# behavior exactly). Call e.g. `calendar.monthcalendar(2024, 1,
+# firstweekday=6)` where CPython would have done
+# `calendar.setfirstweekday(6); calendar.monthcalendar(2024, 1)`.
+#   As a consequence: `firstweekday()` is a surface-completeness stub that
+#   always returns `0` (CPython's own default) — reachable ONLY as the default,
+#   since the setter below cannot change it. `setfirstweekday(firstweekday)`
+#   raises `NotImplementedError` naming this G2 gate and pointing at the
+#   `firstweekday=` keyword parameter, rather than silently discarding its
+#   argument: a silent no-op would invisibly break CPython's set-then-call
+#   idiom (the later `monthcalendar`/`month`/`calendar` would ignore the value
+#   and miscompute). This is a real behavioral divergence for code that depends
+#   on the global persisting; per the iron rule it fails LOUDLY at the setter
+#   rather than miscomputing later — see the two bodies below for the exact
+#   contract.
+#
+# DIVERGENCE 3 — custom exception hierarchy collapsed to ValueError (G3,
+# gated: pyrst has no user-defined exception classes). CPython's
+# `IllegalMonthError` dual-inherits `ValueError` AND `IndexError`;
+# `IllegalWeekdayError` inherits `ValueError`. Both are raised here as plain
+# `ValueError` with CPython's EXACT message text (verified against a live
+# python3, re-oracled for this pass), so `except ValueError`
+# catches identically; only `except IndexError` on an `IllegalMonthError`
+# would behave differently (uncatchable here), which is out of scope.
+#
+# DIVERGENCE 4a — `day_name`/`day_abbr`/`month_name`/`month_abbr`/`mdays` are
+# FUNCTIONS (`day_name()`), not subscriptable module CONSTANTS
+# (`calendar.day_name[0]` in CPython). pyrst's module-level-constant
+# relaxation only legalizes a bare scalar literal (`NAME: T = <int|float|str|
+# bool literal>`); a `list[...]` value is not a legal module constant (there
+# is no way to write a list LITERAL as a top-level const decl), and pyrst
+# forbids module-level MUTABLE state outright (G2), so a plain assignable
+# module-level list is unavailable either way. Each is instead a zero-arg
+# function that returns a freshly-built list (`calendar.day_name()[0]`,
+# `calendar.mdays()[2]`) — read-only and side-effect-free, so it is
+# observably equivalent to a constant for every use in the parity plan except
+# the `()` call syntax itself, which is called out explicitly here rather
+# than silently reshaped.
+#
+# DIVERGENCE 4 — text formatting (month()/calendar()) is a direct,
+# locale-independent (hardcoded "C" locale) transliteration of CPython's
+# `TextCalendar.formatmonth`/`formatyear` algorithm (day/month names are the
+# hardcoded English arrays above, not `datetime`/`strftime`-derived, so no
+# locale.setlocale() sensitivity exists in pyrst — a strict subset of
+# CPython's behavior, not a divergence in the *default* "C" locale that the
+# parity example exercises). Byte-exact against CPython for every case in the
+# dossier's BEHAVIOR MATRIX (re-verified live).
+#
+# DIVERGENCE 5 — `calendar(theyear, ..., m=<=0>)` raises `ValueError("m must
+# be a positive integer")`, which real CPython does NOT do for `m < 0`
+# (CPython silently returns a degenerate `"{theyear}\n"`-shaped string for
+# negative `m`; it only raises, with a different message, for `m == 0` —
+# `ValueError: range() arg 3 must not be zero`, an internal `range()`
+# implementation detail leaking through). This guard was ADDED during
+# adversarial hardening (w2-hardener, card eed0bb70) because, without it,
+# `m <= 0` drives the computed `header_width` negative, and a negative width
+# passed to `str.center()` currently crashes the WHOLE PROCESS in pyrst (a
+# real, general `str.center()` runtime bug — verified standalone,
+# `"x".center(-1)` aborts with a libc allocation failure, not a catchable
+# exception; not calendar-specific, out of this card's scope, flagged
+# separately rather than fixed here). Raising a clean, catchable `ValueError`
+# for the whole `m <= 0` range is judged safer than reproducing CPython's
+# narrower (and, for negative `m`, arguably accidental) behavior exactly.
+#
+# Not implemented / out of scope (documented, not silently dropped):
+#   - `prmonth`/`prcal`/`pryear`/`prweek` (print-to-stdout wrappers): trivial
+#     wrappers around `month()`/`calendar()`/`week()`; omitted only because
+#     they were not in the dossier's SURFACE table for this pass.
+#   - `Calendar`/`TextCalendar`/`HTMLCalendar`/`LocaleTextCalendar`/
+#     `LocaleHTMLCalendar` classes, `itermonthdays*`/`monthdatescalendar`/
+#     `yeardatescalendar` family, `timegm`, `weekheader`: not in the dossier's
+#     SURFACE table; deferred to a later pass if a consumer needs them.
+#   - Locale-aware month/day names (`LocaleTextCalendar`): needs a locale
+#     subsystem pyrst does not have (same gap as `time.strftime`'s `%c/%x/%X`).
+
+
+MONDAY: int = 0
+TUESDAY: int = 1
+WEDNESDAY: int = 2
+THURSDAY: int = 3
+FRIDAY: int = 4
+SATURDAY: int = 5
+SUNDAY: int = 6
+
+JANUARY: int = 1
+FEBRUARY: int = 2
+MARCH: int = 3
+APRIL: int = 4
+MAY: int = 5
+JUNE: int = 6
+JULY: int = 7
+AUGUST: int = 8
+SEPTEMBER: int = 9
+OCTOBER: int = 10
+NOVEMBER: int = 11
+DECEMBER: int = 12
+
+EPOCH: int = 1970
+
+def mdays() -> list[int]:
+    return [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+
+
+def day_name() -> list[str]:
+    return ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+
+def day_abbr() -> list[str]:
+    return ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+
+def month_name() -> list[str]:
+    return [
+        "", "January", "February", "March", "April", "May", "June",
+        "July", "August", "September", "October", "November", "December"
+    ]
+
+
+def month_abbr() -> list[str]:
+    return [
+        "", "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
+    ]
+
+
+def isleap(year: int) -> bool:
+    # DELIBERATE MIRROR of lib/datetime.pyrs `_dt_is_leap` (same Gregorian
+    # leap-year rule, logically identical). pyrst embedded lib modules cannot
+    # import each other, so this logic is duplicated on purpose — keep the two
+    # in sync if either is ever touched.
+    return year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
+
+
+def leapdays(y1: int, y2: int) -> int:
+    yy1: int = y1 - 1
+    yy2: int = y2 - 1
+    return (yy2 // 4 - yy1 // 4) - (yy2 // 100 - yy1 // 100) + (yy2 // 400 - yy1 // 400)
+
+
+def _calendar_validate_month(month: int) -> None:
+    if not (1 <= month <= 12):
+        raise ValueError("bad month number " + str(month) + "; must be 1-12")
+
+
+def _calendar_days_in_month(year: int, month: int) -> int:
+    if month == 2 and isleap(year):
+        return 29
+    return mdays()[month]
+
+
+def _calendar_days_from_civil(y: int, m: int, d: int) -> int:
+    # Howard Hinnant's `days_from_civil`, adapted to pyrst's Python-exact
+    # floor `//`/`%` (unlike the canonical C++ version, which relies on
+    # truncating division for the `era` term): with floor semantics,
+    # `era = yy // 400` and `yoe = yy % 400` land `yoe` in `[0, 399]` for ANY
+    # `yy` (positive or negative) with no extra case-split needed. Re-derived
+    # and numerically re-verified against `datetime.date(...)
+    # .toordinal()` across positive, negative, and extreme years — matches
+    # CPython's own `year = 2000 + year % 400` MINYEAR/MAXYEAR wraparound
+    # trick for out-of-range years for free, because the Gregorian calendar's
+    # weekday pattern is exactly periodic every 400 years (146097 days, an
+    # exact multiple of 7).
+    yy: int = y
+    if m <= 2:
+        yy = y - 1
+    era: int = yy // 400
+    yoe: int = yy % 400
+    madj: int = m + 9
+    if m > 2:
+        madj = m - 3
+    doy: int = (153 * madj + 2) // 5 + d - 1
+    doe: int = yoe * 365 + yoe // 4 - yoe // 100 + doy
+    return era * 146097 + doe - 719468
+
+
+def weekday(year: int, month: int, day: int) -> int:
+    if not (1 <= month <= 12):
+        raise ValueError("month must be in 1..12")
+    dim: int = _calendar_days_in_month(year, month)
+    if day < 1 or day > dim:
+        raise ValueError("day is out of range for month")
+    z: int = _calendar_days_from_civil(year, month, day)
+    return (z + 3) % 7
+
+
+def monthrange(year: int, month: int) -> tuple[int, int]:
+    _calendar_validate_month(month)
+    day1: int = weekday(year, month, 1)
+    ndays: int = _calendar_days_in_month(year, month)
+    return (day1, ndays)
+
+
+def monthcalendar(year: int, month: int, firstweekday: int = 0) -> list[list[int]]:
+    day1, ndays = monthrange(year, month)
+    days_before: int = (day1 - firstweekday) % 7
+    days_after: int = (firstweekday - day1 - ndays) % 7
+    # (compiler note: a non-annotated `days = days + [0]*n` re-assign here
+    # mistypes the local via `infer_expr_ty`'s BinOp::Add arm, which has no
+    # List+List case and falls back to `Ty::Int` — corrupting the tracked
+    # local type for the later slice below. Append-loops avoid the gap
+    # entirely and match the style already used in bisect.pyrs/heapq.pyrs.)
+    days: list[int] = []
+    bi: int = 0
+    while bi < days_before:
+        days.append(0)
+        bi += 1
+    d: int = 1
+    while d <= ndays:
+        days.append(d)
+        d += 1
+    ai: int = 0
+    while ai < days_after:
+        days.append(0)
+        ai += 1
+    weeks: list[list[int]] = []
+    k: int = 0
+    n: int = len(days)
+    while k < n:
+        weeks.append(days[k:k + 7])
+        k += 7
+    return weeks
+
+
+def firstweekday() -> int:
+    # STATELESS STUB — see "DIVERGENCE 2" in the module header. Always
+    # returns CPython's own default (0 = Monday); does not reflect any prior
+    # `setfirstweekday()` call, because pyrst has no module-level mutable
+    # state to hold it in.
+    return 0
+
+
+def setfirstweekday(firstweekday: int) -> None:
+    # HONEST ERROR (was a silent no-op) — see "DIVERGENCE 2" in the module
+    # header. CPython's `setfirstweekday()` mutates a module-global that
+    # `monthcalendar()`/`month()`/`calendar()` read on every later call; pyrst
+    # has NO module-level MUTABLE state (gate G2), so this call can retain no
+    # effect. A silent no-op would invisibly BREAK CPython's set-then-call
+    # idiom — `calendar.setfirstweekday(6); calendar.monthcalendar(2024, 1)`
+    # would silently ignore the 6 and compute a Monday-first calendar. Per the
+    # iron rule (honest errors over silent miscompiles) this raises instead of
+    # discarding the argument: pass `firstweekday=` directly to
+    # `monthcalendar()`/`month()`/`calendar()` (CPython's default is 0 = Monday).
+    raise NotImplementedError(
+        "calendar.setfirstweekday() is unsupported in pyrst: module-level mutable state is gated (G2), so the first-weekday setting cannot persist across calls. Pass firstweekday=" + str(firstweekday) + " directly to monthcalendar()/month()/calendar() instead."
+    )
+
+
+def _calendar_formatday(day: int, width: int) -> str:
+    s: str = ""
+    if day != 0:
+        raw: str = str(day)
+        if len(raw) < 2:
+            raw = " " + raw
+        s = raw
+    return s.center(width)
+
+
+def _calendar_formatweek(week: list[int], width: int) -> str:
+    parts: list[str] = []
+    for day in week:
+        parts.append(_calendar_formatday(day, width))
+    return " ".join(parts)
+
+
+def _calendar_formatweekday(day: int, width: int) -> str:
+    name: str = day_abbr()[day]
+    if width >= 9:
+        name = day_name()[day]
+    return name[0:width].center(width)
+
+
+def _calendar_formatweekheader(width: int, firstweekday: int) -> str:
+    parts: list[str] = []
+    i: int = 0
+    while i < 7:
+        day: int = (firstweekday + i) % 7
+        parts.append(_calendar_formatweekday(day, width))
+        i += 1
+    return " ".join(parts)
+
+
+def _calendar_formatmonthname(theyear: int, themonth: int, width: int, withyear: bool) -> str:
+    _calendar_validate_month(themonth)
+    s: str = month_name()[themonth]
+    if withyear:
+        s = s + " " + str(theyear)
+    return s.center(width)
+
+
+def month(theyear: int, themonth: int, w: int = 0, l: int = 0, firstweekday: int = 0) -> str:
+    ww: int = w
+    if ww < 2:
+        ww = 2
+    ll: int = l
+    if ll < 1:
+        ll = 1
+    s: str = _calendar_formatmonthname(theyear, themonth, 7 * (ww + 1) - 1, True)
+    s = s.rstrip()
+    s = s + "\n" * ll
+    s = s + _calendar_formatweekheader(ww, firstweekday).rstrip()
+    s = s + "\n" * ll
+    weeks: list[list[int]] = monthcalendar(theyear, themonth, firstweekday)
+    for week in weeks:
+        s += _calendar_formatweek(week, ww).rstrip()
+        s += "\n" * ll
+    return s
+
+
+def _calendar_formatstring(cols: list[str], colwidth: int, spacing: int) -> str:
+    spacer: str = " " * spacing
+    centered: list[str] = []
+    for col in cols:
+        centered.append(col.center(colwidth))
+    return spacer.join(centered)
+
+
+def calendar(theyear: int, w: int = 2, l: int = 1, c: int = 6, m: int = 3, firstweekday: int = 0) -> str:
+    # HARDENING (w2-hardener, card eed0bb70) — see DIVERGENCE 5 in the module
+    # header: `m <= 0` is guarded here and now raises, which is NOT what
+    # CPython does (CPython only raises for m == 0; m < 0 silently produces a
+    # degenerate "{year}\n" string). This guard is deliberately BROADER than
+    # CPython's own behavior because, without it, `m <= 0` drives `header_width`
+    # negative and that negative width reaches `str.center()`, which currently
+    # has a real pyrst compiler/runtime bug for ANY negative width (verified
+    # standalone: `"x".center(-1)` aborts the whole process with a libc
+    # allocation failure, not a catchable exception — a general str.center()
+    # defect, not calendar-specific, flagged separately, not fixed here since
+    # it's out of this card's scope). Raising a clean ValueError here converts
+    # an unrecoverable process abort into ordinary, catchable, documented
+    # control flow.
+    if m <= 0:
+        raise ValueError("m must be a positive integer")
+    ww: int = w
+    if ww < 2:
+        ww = 2
+    ll: int = l
+    if ll < 1:
+        ll = 1
+    cc: int = c
+    if cc < 2:
+        cc = 2
+    colwidth: int = (ww + 1) * 7 - 1
+    header_width: int = colwidth * m + cc * (m - 1)
+    parts: list[str] = []
+    parts.append(str(theyear).center(header_width).rstrip())
+    parts.append("\n" * ll)
+    header: str = _calendar_formatweekheader(ww, firstweekday)
+    num_rows: int = (12 + m - 1) // m
+    i: int = 0
+    while i < num_rows:
+        months_start: int = m * i + 1
+        months_end: int = m * (i + 1) + 1
+        if months_end > 13:
+            months_end = 13
+        parts.append("\n" * ll)
+        names: list[str] = []
+        mm: int = months_start
+        while mm < months_end:
+            names.append(_calendar_formatmonthname(theyear, mm, colwidth, False))
+            mm += 1
+        parts.append(_calendar_formatstring(names, colwidth, cc).rstrip())
+        parts.append("\n" * ll)
+        n_months_row: int = months_end - months_start
+        headers: list[str] = [header] * n_months_row
+        parts.append(_calendar_formatstring(headers, colwidth, cc).rstrip())
+        parts.append("\n" * ll)
+        month_weeks: list[list[list[int]]] = []
+        mm2: int = months_start
+        while mm2 < months_end:
+            month_weeks.append(monthcalendar(theyear, mm2, firstweekday))
+            mm2 += 1
+        height: int = 0
+        for cal in month_weeks:
+            if len(cal) > height:
+                height = len(cal)
+        j: int = 0
+        while j < height:
+            weeks_line: list[str] = []
+            for cal in month_weeks:
+                if j < len(cal):
+                    weeks_line.append(_calendar_formatweek(cal[j], ww))
+                else:
+                    weeks_line.append("")
+            parts.append(_calendar_formatstring(weeks_line, colwidth, cc).rstrip())
+            parts.append("\n" * ll)
+            j += 1
+        i += 1
+    return "".join(parts)

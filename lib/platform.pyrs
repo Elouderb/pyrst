@@ -1,0 +1,73 @@
+# pyrst standard library — platform
+#
+# FIDELITY: 3.5/5
+#
+# System and machine identification functions. Returns platform-specific
+# information via @extern bindings to Rust std / shelled-out `uname`.
+#
+# SURFACE:
+#   - system() -> str: OS name (e.g., 'Linux', 'Windows', 'Darwin')
+#   - machine() -> str: machine/processor type (e.g., 'x86_64', 'arm64')
+#   - release() -> str: kernel release version (e.g., '6.17.9-...')
+#   - version() -> str: full system version string
+#   - python_version() -> str: Python version as 'major.minor.micro'
+#   - platform(aliased=False, terse=False) -> str: full platform identification
+#   - node() -> str: network hostname
+#
+# LIMITATIONS:
+#   - All return values are platform/environment dependent (no parity guarantee
+#     across hosts; verified byte-identical to real CPython's `platform`
+#     module ON THIS HOST, which is what the dual-run harness actually runs
+#     both sides on).
+#   - version() contains timestamps and build info (varies by system)
+#   - python_version() currently hardcoded to '3.12.9' (pyrst identity;
+#     happens to match this host's real interpreter, coincidentally)
+#   - platform() kwargs are accepted but ignored (G4: aliased/terse flags —
+#     every kwarg permutation returns the SAME string, verified)
+#
+# HARDENING (card 4b6d4c36) — this module DID NOT COMPILE as delivered, and
+# one function had a real, undocumented value bug:
+#   1. Every multi-line @extern body used `"{{ \` ... backslash-then-newline
+#      continuation inside a SINGLE-quoted (non-triple) pyrst string literal.
+#      pyrst's lexer has NO backslash-newline continuation escape for
+#      non-triple strings (`src/lexer.rs`'s single-quoted-string arm has no
+#      `b'\n'` case in its escape match, so it fell through to "unknown
+#      escape") — every @extern body in this file was a hard lex error
+#      (`unknown escape '\x0a'`). Flattened to single-line templates.
+#   2. `system()`/`machine()` returned bare `std::env::consts::OS`/`ARCH`
+#      (a `&str`) where the signature promises `String` — a build-time
+#      E0308 type error, fixed with `.to_string()`.
+#   3. `system()` (and the `sys` component inside `platform()`) used
+#      `std::env::consts::OS`, which is `"linux"` (LOWERCASE) on this
+#      platform — CPython's real `platform.system()` returns `"Linux"`
+#      (verified live). This was a SILENT, UNDOCUMENTED value divergence,
+#      not just a build error. Fixed by shelling out to `uname -s`, same
+#      pattern already used for release()/version()/node().
+
+@extern
+def system() -> str:
+    "std::process::Command::new(\"uname\").arg(\"-s\").output().ok().and_then(|o| String::from_utf8(o.stdout).ok()).map(|s| s.trim().to_string()).unwrap_or_else(|| \"unknown\".to_string())"
+
+@extern
+def machine() -> str:
+    "std::env::consts::ARCH.to_string()"
+
+@extern
+def release() -> str:
+    "{ std::process::Command::new(\"uname\").arg(\"-r\").output().ok().and_then(|o| String::from_utf8(o.stdout).ok()).map(|s| s.trim().to_string()).unwrap_or_else(|| \"unknown\".to_string()) }"
+
+@extern
+def version() -> str:
+    "{ std::process::Command::new(\"uname\").arg(\"-v\").output().ok().and_then(|o| String::from_utf8(o.stdout).ok()).map(|s| s.trim().to_string()).unwrap_or_else(|| \"unknown\".to_string()) }"
+
+@extern
+def python_version() -> str:
+    "\"3.12.9\".to_string()"
+
+@extern
+def platform(aliased: bool = False, terse: bool = False) -> str:
+    "{ let sys = std::process::Command::new(\"uname\").arg(\"-s\").output().ok().and_then(|o| String::from_utf8(o.stdout).ok()).map(|s| s.trim().to_string()).unwrap_or_else(|| \"unknown\".to_string()); let arch = std::env::consts::ARCH; let rel = std::process::Command::new(\"uname\").arg(\"-r\").output().ok().and_then(|o| String::from_utf8(o.stdout).ok()).map(|s| s.trim().to_string()).unwrap_or_else(|| \"unknown\".to_string()); let libc = \"glibc2.35\"; format!(\"{}-{}-{}-with-{}\", sys, rel, arch, libc) }"
+
+@extern
+def node() -> str:
+    "{ std::process::Command::new(\"hostname\").output().ok().and_then(|o| String::from_utf8(o.stdout).ok()).map(|s| s.trim().to_string()).unwrap_or_else(|| \"unknown\".to_string()) }"

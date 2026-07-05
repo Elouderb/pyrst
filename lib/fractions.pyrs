@@ -1,0 +1,290 @@
+# pyrst standard library — fractions
+#
+# FIDELITY: 3/5 (per docs/design/w2-dossiers/fractions.md TARGET section).
+#
+# `Fraction` is an EXACT-rational class built on i64 numerator/denominator
+# pairs, canonicalized on construction: reduced via GCD, denominator always
+# POSITIVE (sign lives in the numerator). This matches CPython's
+# `fractions.Fraction` canonical-form invariant exactly, and the construction
+# algorithm below reproduces CPython's `Fraction.__new__` int-pair branch
+# (including its zero-numerator/zero-denominator edge cases) without any
+# special-casing beyond the shared GCD-reduce step — verified against
+# `Fraction(6, 9)`, `Fraction(3, -4)`, `Fraction(-3, -4)`, `Fraction(0, 5)`,
+# `Fraction(0, -1)` etc. (see docs/design/w2-dossiers/fractions.md BEHAVIOR
+# MATRIX; python3-cross-checked while authoring this module).
+#
+# Public API (all CPython-exact names):
+#   class Fraction(numerator: int = 0, denominator: int = 1):
+#     - numerator: int          canonical numerator (sign carried here)
+#     - denominator: int        canonical denominator (always > 0)
+#     - __str__                 "num/den", or "num" when denominator == 1
+#                                (str(Fraction(3,4)) == "3/4"; str(Fraction(0))
+#                                == "0") — CPython-exact.
+#     - __repr__                "Fraction(num, den)" — CPython-exact.
+#     - __eq__(other: Fraction) -> bool     canonical-form equality — exact.
+#     - __lt__(other: Fraction) -> bool     cross-multiply comparison (both
+#                                denominators are always positive post
+#                                canonicalization, so this is order-preserving)
+#                                — exact, modulo i64 overflow (see G9 below).
+#     - __add__(other: Fraction) -> Fraction   exact — CPython's cross-multiply
+#                                formula, renormalized via the constructor.
+#     - __sub__(other: Fraction) -> Fraction   exact, same technique.
+#     - __mul__(other: Fraction) -> Fraction   exact — numerator*numerator over
+#                                denominator*denominator, renormalized.
+#     - __neg__() -> Fraction    exact — negate the numerator, renormalize.
+#     - div(other: Fraction) -> Fraction        SEE G5 below: this REPLACES
+#                                `/` (`__truediv__` is not an available pyrst
+#                                dunder). Implements CPython's exact `_div`
+#                                cross-multiply formula, incl. its
+#                                `ZeroDivisionError('Fraction(%s, 0)' %
+#                                divisor.denominator)` message on division by
+#                                a zero Fraction (divisor.denominator is
+#                                always 1 for a canonical zero, so the message
+#                                is always "Fraction(1, 0)" — CPython-exact,
+#                                python3-verified).
+#     - is_integer() -> bool     denominator == 1 — exact.
+#     - as_integer_ratio() -> tuple[int, int]   (numerator, denominator) —
+#                                exact.
+#     - limit_denominator(max_denominator: int = 1000000) -> Fraction
+#                                CPython's EXACT Stern-Brocot / continued-
+#                                fraction convergent-search algorithm (ported
+#                                line-for-line from `Fraction.limit_denominator`
+#                                in CPython 3.x's `Lib/fractions.py`), so
+#                                results are bit-identical to CPython's for
+#                                every case tested (`Fraction(22, 7)
+#                                .limit_denominator(5)` == `Fraction(16, 5)`;
+#                                `Fraction(355, 113).limit_denominator(100)` ==
+#                                `Fraction(311, 99)`; already-within-limit
+#                                fractions return unchanged) — python3-
+#                                verified during authoring.
+#
+# Constructor error handling (CPython-exact wording, python3-verified):
+#   - `Fraction(n, 0)` raises `ZeroDivisionError` with message
+#     `"Fraction(<n>, 0)"` using the ORIGINAL (un-normalized) numerator
+#     argument — e.g. `Fraction(5, 0)` -> `"Fraction(5, 0)"`.
+#
+# DIVERGENCES / DEFERRALS (documented per dossier GATED section):
+#
+#   G5 — `__truediv__` is not an available pyrst dunder (the compiler's fixed
+#   dunder set is `__init__ __str__ __repr__ __eq__ __lt__ __add__ __sub__
+#   __mul__ __neg__ __bool__` — verified against `src/codegen/mod.rs`'s
+#   dunder allow-list). `/` cannot be spelled on `Fraction`; use `.div(other)`
+#   instead (documented above). Likewise `__hash__`, `__le__`, `__ge__`,
+#   `__gt__`, `__floordiv__`, `__mod__`, `__pow__`, `__abs__`, `__pos__`,
+#   `__int__`, `__float__` are ALL unavailable dunders — `Fraction` is
+#   therefore NOT hashable (cannot be a dict key / set element), has no
+#   `<=`/`>=`/`>` (only `<`/`==` — combine them, e.g. `not (b < a)` for
+#   `a <= b`), no `//`/`%`/`**`, and no `abs()`/`+x`/`int(x)`/`float(x)`
+#   builtin-conversion sugar. None of these are implemented as workaround
+#   methods in this pass — out of this card's scope (int-pair construction/
+#   normalization, __add__/__sub__/__mul__, __lt__/__eq__, limit_denominator,
+#   str/repr, i64-overflow honesty); left for a future card per the dossier's
+#   GATED table.
+#
+#   NEWLY DISCOVERED (not in the dossier — found while implementing this
+#   module): although `__bool__` IS in codegen's dunder-name allow-list
+#   (`src/codegen/mod.rs`), the typechecker (`src/typeck/checks.rs`)
+#   unconditionally REJECTS a user-defined `__bool__` method with "`__bool__`
+#   is not yet supported (object truthiness is not lowered)" — the compiler
+#   has no working object-truthiness lowering yet (`bool(obj)` / `if obj:` do
+#   not dispatch to a class method at all), so defining `__bool__` is a hard
+#   compile error, not silently ignored. `bool(Fraction(...))` /
+#   `if some_fraction:` are therefore UNSUPPORTED here; test/branch on
+#   `frac.numerator != 0` directly instead. Filed as a compiler-capability gap
+#   for whichever card owns object-truthiness lowering next.
+#
+#   No reflected/cross-type arithmetic (`__radd__`/`__rsub__`/`__rmul__`/
+#   `__rtruediv__`) and no `int`-cross-type arithmetic or comparison at all:
+#   `Fraction(1, 2) + 2`, `2 + Fraction(1, 2)`, `Fraction(2, 1) == 2` are all
+#   UNSUPPORTED call shapes here. Rust's dunder-trait lowering for `+`/`-`/`*`/
+#   `==`/`<` on a pyrst class requires the SAME concrete Rust type on both
+#   sides (there is no operator overloading / multiple dispatch in pyrst), so
+#   `other` must be a `Fraction` — wrap a bare int explicitly:
+#   `Fraction(1, 2) + Fraction(2, 1)` instead of `Fraction(1, 2) + 2`. This is
+#   a real, user-visible API-parity gap versus CPython (documented, not
+#   silently dropped).
+#
+#   No string / float / Decimal / Fraction-copy / bool constructor forms:
+#   CPython's `Fraction(numerator=0, denominator=None)` accepts a string
+#   ("3/2", "42"), another Rational, a float, a `decimal.Decimal`, or a bool,
+#   dispatching on `denominator is None` plus `isinstance` checks. pyrst has
+#   no `*args`/optional-typed-constructor overloading and no non-Optional
+#   `Union` types, so only the plain `Fraction(numerator: int, denominator:
+#   int)` two-int form is implemented; `denominator` defaults to `1` (not
+#   `None`) — the single-int case `Fraction(5)` is still expressible via the
+#   default. String/float/Decimal construction, `Fraction.from_float`,
+#   `Fraction.from_decimal`, and their `OverflowError`/`ValueError` edge
+#   cases (inf/NaN) are OUT OF SCOPE for this pass (deferred; not
+#   implemented, not faked).
+#
+#   No `TypeError`/`ValueError` variants for the unsupported constructor
+#   forms above (e.g. `Fraction(None, None)`, `Fraction("not a fraction")`)
+#   since those call shapes cannot be expressed with an `int`-only
+#   constructor signature in the first place.
+#
+#   `real`, `imag`, `conjugate()` (CPython's numeric-tower plumbing — all
+#   trivial no-ops for a real rational: `self`, `0`, `self` respectively) are
+#   NOT implemented in this pass — out of card scope, deferred.
+#
+#   G9 — Bignum: CPython's Fraction numerator/denominator are arbitrary-
+#   precision Python ints; pyrst's `int` is a fixed-width i64. Construction,
+#   arithmetic (`__add__`/`__sub__`/`__mul__`/`div`), and comparison
+#   (`__lt__`, whose cross-multiply can itself overflow before the GCD
+#   reduction that normal use keeps small) all overflow HONESTLY (pyrst's
+#   documented i64-overflow panic) once a numerator or denominator would
+#   exceed +-(2**63 - 1) — there is no silent wraparound and no bignum
+#   fallback. This is the single largest fidelity gap versus CPython, which
+#   handles e.g. `Fraction(10**100, 1)` seamlessly; pyrst cannot represent
+#   that value at all. Documented, not worked around.
+#
+#   `numerator`/`denominator` are exposed as plain pyrst class FIELDS (not
+#   CPython's read-only `@property`), so `f.numerator = 5` is technically
+#   assignable in pyrst where CPython would raise `AttributeError`. Treat
+#   both fields as immutable by convention; every constructor and operator
+#   above always produces a freshly-normalized `Fraction` rather than
+#   mutating one in place.
+#
+# Private helpers (per the module's `_fractions_`-prefix convention, so they
+# never collide with another stdlib module's top-level names — e.g.
+# `lib/math.pyrs` already defines a public `gcd`, so this module's internal
+# GCD is `_fractions_gcd`):
+#   - _fractions_gcd(a: int, b: int) -> int
+
+
+class Fraction:
+    numerator: int
+    denominator: int
+
+    def __init__(self, numerator: int = 0, denominator: int = 1) -> None:
+        # CPython's exact int-pair branch of `Fraction.__new__`: the
+        # zero-denominator check comes FIRST (against the un-normalized
+        # `numerator` argument, matching CPython's
+        # `ZeroDivisionError('Fraction(%s, 0)' % numerator)` message), then
+        # sign is folded onto the numerator when the denominator is negative,
+        # then both are reduced by their GCD. This single code path also
+        # produces the correct canonical zero (`Fraction(0, 1)`) for ANY
+        # zero-numerator input (`Fraction(0, 5)`, `Fraction(0, -1)`, ...)
+        # without a special case, since `_fractions_gcd(0, d) == d`.
+        if denominator == 0:
+            raise ZeroDivisionError(f"Fraction({numerator}, 0)")
+        n: int = numerator
+        d: int = denominator
+        if d < 0:
+            n = -n
+            d = -d
+        g: int = _fractions_gcd(n, d)
+        self.numerator = n // g
+        self.denominator = d // g
+
+    def __str__(self) -> str:
+        # A single ternary `return` (rather than an early `return` inside an
+        # `if` followed by a trailing `return`) — the compiler's Display::fmt
+        # lowering for `__str__` only special-cases the LAST statement of the
+        # method body (wrapping it in `write!(...)`); an earlier conditional
+        # `return` is emitted as a bare Rust `return <String>;`, which does
+        # not typecheck against `fmt::Result` (a real codegen gap found while
+        # authoring this module — designed around here rather than relying on
+        # multi-statement control flow in `__str__`).
+        return str(self.numerator) if self.denominator == 1 else f"{self.numerator}/{self.denominator}"
+
+    def __repr__(self) -> str:
+        return f"Fraction({self.numerator}, {self.denominator})"
+
+    def __eq__(self, other: Fraction) -> bool:
+        # Both sides are always in canonical (reduced, positive-denominator)
+        # form, so field-wise equality IS Rational equality.
+        return self.numerator == other.numerator and self.denominator == other.denominator
+
+    def __lt__(self, other: Fraction) -> bool:
+        # Cross-multiply: valid order test because both denominators are
+        # always positive post-canonicalization. i64 overflow is possible for
+        # very large operands (G9, documented above) — an honest panic, not a
+        # silent wraparound.
+        return self.numerator * other.denominator < other.numerator * self.denominator
+
+    def __add__(self, other: Fraction) -> Fraction:
+        num: int = self.numerator * other.denominator + other.numerator * self.denominator
+        den: int = self.denominator * other.denominator
+        return Fraction(num, den)
+
+    def __sub__(self, other: Fraction) -> Fraction:
+        sub_num: int = self.numerator * other.denominator - other.numerator * self.denominator
+        sub_den: int = self.denominator * other.denominator
+        return Fraction(sub_num, sub_den)
+
+    def __mul__(self, other: Fraction) -> Fraction:
+        return Fraction(self.numerator * other.numerator, self.denominator * other.denominator)
+
+    def __neg__(self) -> Fraction:
+        return Fraction(-self.numerator, self.denominator)
+
+    def div(self, other: Fraction) -> Fraction:
+        # Replaces `__truediv__` (G5 — unavailable pyrst dunder). Ports
+        # CPython's `Fraction._div` exactly: cross-multiply na*db / da*nb,
+        # renormalized via the constructor (which also folds any resulting
+        # negative-denominator sign). Division by a zero Fraction raises
+        # CPython's exact message: since a canonical zero always has
+        # denominator 1, this is always "Fraction(1, 0)" (python3-verified).
+        if other.numerator == 0:
+            raise ZeroDivisionError(f"Fraction({other.denominator}, 0)")
+        num: int = self.numerator * other.denominator
+        den: int = self.denominator * other.numerator
+        return Fraction(num, den)
+
+    def is_integer(self) -> bool:
+        return self.denominator == 1
+
+    def as_integer_ratio(self) -> tuple[int, int]:
+        return (self.numerator, self.denominator)
+
+    def limit_denominator(self, max_denominator: int = 1000000) -> Fraction:
+        # Ported line-for-line from CPython's `Fraction.limit_denominator`
+        # (Lib/fractions.py): the continued-fraction convergent/
+        # semiconvergent search for the best rational approximation with
+        # denominator <= max_denominator. Tuple-swap assignments are unrolled
+        # into explicit temporaries (equivalent to CPython's `p0, q0, p1, q1 =
+        # p1, q1, p0 + a*p1, q2`) to keep every step a plain two-target
+        # unpack.
+        if max_denominator < 1:
+            raise ValueError("max_denominator should be at least 1")
+        if self.denominator <= max_denominator:
+            return Fraction(self.numerator, self.denominator)
+        p0: int = 0
+        q0: int = 1
+        p1: int = 1
+        q1: int = 0
+        n: int = self.numerator
+        d: int = self.denominator
+        while True:
+            a: int = n // d
+            q2: int = q0 + a * q1
+            if q2 > max_denominator:
+                break
+            old_p0: int = p0
+            old_p1: int = p1
+            old_q1: int = q1
+            p0 = old_p1
+            q0 = old_q1
+            p1 = old_p0 + a * old_p1
+            q1 = q2
+            old_n: int = n
+            old_d: int = d
+            n = old_d
+            d = old_n - a * old_d
+        k: int = (max_denominator - q0) // q1
+        if 2 * d * (q0 + k * q1) <= self.denominator:
+            return Fraction(p1, q1)
+        return Fraction(p0 + k * p1, q0 + k * q1)
+
+
+def _fractions_gcd(a: int, b: int) -> int:
+    # Standard non-negative Euclidean GCD (private — module-prefixed so it
+    # never collides with `math.gcd`, a distinct public top-level name in
+    # another embedded stdlib module).
+    x: int = abs(a)
+    y: int = abs(b)
+    while y != 0:
+        t: int = y
+        y = x % y
+        x = t
+    return x

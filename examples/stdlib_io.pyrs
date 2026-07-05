@@ -1,0 +1,32 @@
+# Stdlib `io`: the pyrst-ONLY call shape for `StringIO.encoding`/`errors`/
+# `newlines`. These are real CPython `@property` attributes (`s.encoding`, no
+# parens) that always evaluate to `None`; here they are ordinary zero-arg
+# METHODS (`s.encoding()`) instead — see lib/io.pyrs's "COMPILER GAPS" #3 (a
+# `@property` returning `Optional[T]` is mistyped by this compiler at every use
+# site: `print(obj.prop)` fails to build, and so does `x: Optional[T] =
+# obj.prop`).
+#
+# This is NOT dual-run against python3: real CPython's `s.encoding()` (calling
+# the ALREADY-evaluated `None` property value) raises `TypeError: 'NoneType'
+# object is not callable`, whereas pyrst's `s.encoding()` (a real method call)
+# returns `None` successfully — the two languages fundamentally disagree on
+# this exact source once the property doesn't itself raise first (see
+# examples/parity_io.pyrs, which covers the SAME three names in the one case
+# where both languages DO agree: the closed-file check, where CPython's
+# property getter raises before the `()` is ever attempted).
+# parity: pyrst-only
+from io import StringIO
+
+
+def main() -> None:
+    s: StringIO = StringIO("hello")
+    print(s.encoding())
+    print(s.errors())
+    print(s.newlines())
+    s.close()
+    print(s.encoding())
+    print(s.errors())
+    try:
+        print(s.newlines())
+    except ValueError as e:
+        print(str(e))

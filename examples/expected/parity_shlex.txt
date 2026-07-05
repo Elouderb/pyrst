@@ -1,0 +1,130 @@
+[]
+['hello']
+['hello', 'world']
+['hello', 'world']
+['hello']
+['hello', 'world']
+['hello', 'world']
+['hello world']
+['helloworld']
+['helloworld']
+['abc']
+['\\n']
+['']
+['hello world']
+['helloworld']
+['abc']
+['\\n']
+['']
+['hello world']
+['hellonworld']
+['hellotworld']
+['hello\\world']
+['hello', 'world']
+[]
+[]
+['hello', '#', 'comment']
+['hello']
+['hello']
+[]
+['hello']
+['hello#', 'not', 'a', 'comment']
+['hello', 'world']
+["'hello world'"]
+['"hello world"']
+['hello\\', 'world']
+['hello\\nworld']
+hello
+hello123
+hello_world
+hello-world
+hello.world
+/path/to/file
+@
+=
++
+:
+''
+'hello world'
+'hello
+world'
+'hello	world'
+'~'
+'$'
+'`'
+';'
+'&'
+'|'
+'>'
+'<'
+'('
+')'
+'{'
+'}'
+'*'
+'?'
+''"'"'hello'"'"''
+'"hello"'
+'hello'"'"'world'
+'hello"world'
+''"'"''
+'"'
+
+hello
+hello world
+a b c
+''
+'' '' ''
+'hello world'
+hello '' world
+'a b' 'c d'
+''"'"'hello'"'"''
+'"hello"'
+'hello'"'"'world'
+'hello
+world'
+'hello	world'
+'hello\world'
+'$hello'
+'hello;world'
+['hello', 'world with spaces', 'foo']
+hello 'world with spaces' foo
+['hello', 'world with spaces', 'foo']
+True
+caught: No closing quotation
+caught: No closing quotation
+caught: No closing quotation
+caught: No closing quotation
+caught: No escaped character
+caught: No escaped character
+["a'b'c"]
+["foo'bar"]
+["'foo'", 'bar']
+['foo"bar"baz']
+['fooqux']
+['qux']
+['foo', 'qux']
+['café', 'monde']
+'café'
+['héllo wörld']
+['a😀b']
+'😀'
+['a', 'b']
+['a', 'b']
+['a\x0cb']
+['ab']
+['ab']
+['a\nb']
+['a\\', 'b']
+caught: No closing quotation
+caught: No escaped character
+['a']
+['a']
+'!'
+'#'
+a,b
+a:b
+['héllo', 'wörld with spaces', 'foo日本']
+'héllo' 'wörld with spaces' 'foo日本'
+['héllo', 'wörld with spaces', 'foo日本']
+True

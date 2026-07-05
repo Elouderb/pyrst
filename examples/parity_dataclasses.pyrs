@@ -1,0 +1,139 @@
+# DUAL-RUN parity (W2 card 855fe2e5, lib/dataclasses.pyrs). Seeded from
+# docs/design/w2-dossiers/dataclasses.md's PARITY PLAN, restricted to the
+# subset that is honestly achievable given pyrst's CURRENT `@dataclass`
+# support (bare `@dataclass` only — no `field()`, `order=`, `frozen=`,
+# `ClassVar`, or `__post_init__`; see lib/dataclasses.pyrs's header for why
+# each of those is deferred). Every line below dual-runs byte-identical
+# against real CPython 3.12's `dataclasses` module.
+#
+# Hardened during w2-hardener review (adversarial edge pass) with:
+#   - keyword-argument construction (Point(x=.., y=..))
+#   - nested dataclass fields (construction/attr access/repr/equality)
+#   - string fields: quote-escaping repr and non-ASCII (unicode) content
+#   - negative / near-i64-boundary int fields
+#   - a 3-level (grandchild) inheritance chain constructed with ALL-KEYWORD
+#     arguments — see the note above `GrandChild` below: positional
+#     construction of a 3+-level dataclass inheritance chain is a discovered
+#     COMPILER BUG (mis-maps positional args to the wrong field once the
+#     chain is 3 levels deep; all-keyword construction is unaffected and is
+#     the only safe spelling today). Not fixable from library-only pyrst
+#     source (this module still defines zero runtime names) — flagged to the
+#     card as a compiler-side follow-up, not exercised via the broken path
+#     here since that would not build.
+
+from dataclasses import dataclass
+
+# Test 1/2/3: creation, repr, equality, inequality.
+@dataclass
+class P1:
+    x: int
+    y: int
+
+# Test 4/25: single default, then multiple defaults with partial overrides.
+@dataclass
+class Multi:
+    a: int
+    b: int = 1
+    c: int = 2
+
+# Test 20: inheritance chain — field order is bases-before-own.
+@dataclass
+class Base:
+    x: int
+
+@dataclass
+class Derived(Base):
+    y: int
+
+# Test 22: empty dataclass.
+@dataclass
+class Empty:
+    pass
+
+# Nested dataclass fields (construction/attribute access/repr/equality).
+@dataclass
+class Inner:
+    a: int
+
+@dataclass
+class Outer:
+    inner: Inner
+
+# String fields: repr quote-escaping and unicode content.
+@dataclass
+class Named:
+    name: str
+    note: str = "o'reilly"
+
+# Negative / near-boundary int fields.
+@dataclass
+class Bounds:
+    lo: int
+    hi: int
+
+# 3-level (grandchild) inheritance chain. Positional construction of a
+# 3+-level chain is a discovered compiler bug (see header) — construct with
+# ALL keyword arguments, the only spelling that works correctly today.
+@dataclass
+class Mid(Base):
+    y: int
+
+@dataclass
+class GrandChild(Mid):
+    z: int
+
+
+def main() -> None:
+    p1: P1 = P1(1, 2)
+    print(repr(p1))                    # P1(x=1, y=2)
+
+    p2: P1 = P1(1, 2)
+    print(p1 == p2)                    # True
+
+    p3: P1 = P1(2, 1)
+    print(p1 != p3)                    # True
+
+    # keyword-argument construction (same values, CPython evaluation order).
+    p4: P1 = P1(y=2, x=1)
+    print(p1 == p4)                    # True
+
+    m1: Multi = Multi(5)
+    print(m1.b)                        # 1
+    print(m1.c)                        # 2
+
+    m2: Multi = Multi(5, 10)
+    print(m2.b)                        # 10
+    print(m2.c)                        # 2
+
+    m3: Multi = Multi(5, 10, 20)
+    print(m3.c)                        # 20
+
+    d: Derived = Derived(1, 2)
+    print(d.x)                         # 1
+    print(d.y)                         # 2
+    print(repr(d))                     # Derived(x=1, y=2)
+
+    e1: Empty = Empty()
+    e2: Empty = Empty()
+    print(e1 == e2)                    # True
+    print(repr(e1))                    # Empty()
+
+    o1: Outer = Outer(Inner(5))
+    print(repr(o1))                    # Outer(inner=Inner(a=5))
+    print(o1.inner.a)                  # 5
+    o2: Outer = Outer(Inner(5))
+    print(o1 == o2)                    # True
+
+    n1: Named = Named("café")
+    print(repr(n1))                    # Named(name='café', note="o'reilly")
+    n2: Named = Named(name="x", note="line1\nline2")
+    print(repr(n2))                    # Named(name='x', note='line1\nline2')
+
+    b: Bounds = Bounds(-9223372036854775807, 9223372036854775807)
+    print(repr(b))                     # Bounds(lo=-9223372036854775807, hi=9223372036854775807)
+    z: Bounds = Bounds(0, -0)
+    print(repr(z))                     # Bounds(lo=0, hi=0)
+
+    g: GrandChild = GrandChild(x=1, y=2, z=3)
+    print(repr(g))                     # GrandChild(x=1, y=2, z=3)
+    print(g.x, g.y, g.z)                # 1 2 3

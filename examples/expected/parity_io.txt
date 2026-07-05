@@ -1,0 +1,145 @@
+
+hello
+
+0
+3
+0
+1
+1000
+hi
+he
+llo
+hello
+abc
+hi
+
+hello
+
+world
+ll
+
+
+100
+
+line1
+
+6
+line1
+
+line2
+11
+hello
+hel
+
+x
+
+y
+
+3
+hel
+lo
+
+['a\n', 'b\n', 'c']
+[]
+['a\n', 'b\n', 'c']
+['a\n', 'b\n', 'c']
+['a\n', 'b\n', 'c']
+['a\n', 'b\n']
+test
+0
+3
+cde
+100
+5
+5
+3
+5
+hello
+0
+3
+abc
+3
+10
+hi
+0
+3
+hel
+8
+hXllo
+HIllo
+11
+[104, 101, 108, 108, 111, 0, 0, 0, 0, 0, 120]
+11
+abc
+x
+y
+
+False
+True
+True
+I/O operation on closed file
+I/O operation on closed file
+I/O operation on closed file.
+I/O operation on closed file
+I/O operation on closed file
+I/O operation on closed file
+I/O operation on closed file
+I/O operation on closed file
+I/O operation on closed file
+I/O operation on closed file
+I/O operation on closed file
+I/O operation on closed file.
+I/O operation on closed file
+I/O operation on closed file
+True
+True
+True
+True
+False
+False
+10
+1
+こんにちは
+
+4
+[97, 0, 0, 120]
+ab
+xyc
+Negative seek position -1
+Invalid whence (3, should be 0, 1 or 2)
+Can't do nonzero cur-relative seeks
+Can't do nonzero cur-relative seeks
+Negative size value -1
+Invalid whence (-1, should be 0, 1 or 2)
+Invalid whence (5, should be 0, 1 or 2)
+Can't do nonzero cur-relative seeks
+Can't do nonzero cur-relative seeks
+10
+hi
+10
+['a\n', 'b\n', 'c\n']
+['a\n', 'b\n', 'c\n']
+['a\n', 'b\n', 'c\n', 'd\n']
+['a\n', 'b\n', 'c\n', 'd\n']
+['a\n', 'b\n', 'c\n', 'd\n', 'e\n']
+['a\n', 'b\n', 'c\n', 'd\n', 'e\n']
+['a\n', 'b\n', 'c\n', 'd\n', 'e\n']
+['a\n', 'b\n', 'c\n', 'd\n', 'e\n']
+['世\n']
+['世\n', '界\n']
+['世\n', '界\n']
+
+
+hello
+
+2
+helXY 世界
+a
+
+bc
+
+d
+
+['a\r\n', 'b\rc\n', 'd']
+detach
+fileno

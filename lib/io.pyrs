@@ -1,0 +1,489 @@
+# pyrst standard library — io
+#
+# A PURE-PYRST `StringIO` (CPython's `io.StringIO`): an in-memory, seekable
+# text buffer. No external crate — the whole module is pyrst source, embedded
+# via `include_str!` (see `src/stdlib.rs`). Import as `from io import
+# StringIO` (the FLAT form). The QUALIFIED form (`import io; io.StringIO(...)`
+# / `s: io.StringIO`) does NOT work — this is an ALREADY-documented compiler
+# limitation, not new to this module: a qualified type annotation doesn't
+# parse and a qualified CONSTRUCTOR call doesn't resolve (`module io has no
+# function StringIO` — classes aren't looked up through the qualified-call
+# path, only module-level functions are), exactly as `random.Random` and
+# `collections.deque` already document. `io` has no free functions to fall
+# back on, so the qualified form is entirely unusable here (unlike `random`,
+# which offers qualified free functions alongside its unqualified-only
+# class).
+#
+# Dossier: docs/design/w2-dossiers/stringio.md (target fidelity 5/5, 32 parity
+# cases). This module RE-ORACLED every claim it relies on against a live
+# CPython 3 before committing to behavior below — several dossier claims were
+# refined or corrected in the process (see "RE-ORACLE CORRECTIONS").
+#
+# STATE — one class, `StringIO`, over three fields:
+#   buf: str        the whole buffer contents (getvalue() ignores position)
+#   pos: int        the current read/write cursor (char-indexed, not byte)
+#   _closed: bool   set True by close(); every I/O op raises ValueError after
+#
+# Public API (exact CPython names; signatures match CPython's REAL defaults,
+# confirmed via `inspect.signature` — e.g. `read`/`readline` default to `-1`,
+# not `None`; `truncate` defaults to `None`). EXCEPTIONS (all forced by
+# compiler-level gaps found while building this module — see "COMPILER GAPS"
+# below — not stylistic choices):
+#   - `StringIO.__init__`'s `initial_value` is REQUIRED, not defaulted
+#     (gap #1).
+#   - `truncate`'s `size` is a plain `int` with a sentinel default, not
+#     `Optional[int] = None` (gap #2).
+#   - `encoding`/`errors`/`newlines` are zero-arg METHODS (`s.encoding()`),
+#     not `@property` attributes like CPython's `s.encoding` (gap #3).
+#   class StringIO(initial_value: str)  # pass "" for CPython's `StringIO()`
+#     - write(s: str) -> int
+#     - read(size: int = -1) -> str
+#     - readline(size: int = -1) -> str
+#     - readlines(hint: int = -1) -> list[str]
+#     - getvalue() -> str
+#     - seek(pos: int, whence: int = 0) -> int
+#     - tell() -> int
+#     - truncate(size: int = <unset-sentinel>) -> int
+#     - close() -> None
+#     - flush() -> None
+#     - writelines(lines: list[str]) -> None
+#     - readable() -> bool / writable() -> bool / seekable() -> bool
+#     - isatty() -> bool
+#     - detach() -> (raises) / fileno() -> (raises)
+#     - @property closed -> bool / @property line_buffering -> bool
+#     - encoding() -> None / errors() -> None / newlines() -> None (methods)
+#
+# RE-ORACLE CORRECTIONS (dossier said X; live CPython 3.12 says Y):
+#   1. truncate() position: the dossier's HAZARDS section claimed "truncate()
+#      resets position to 0", and its BEHAVIOR MATRIX table listed `tell()`
+#      as `0` after every truncate() probe. Live-checked: truncate() NEVER
+#      changes `self.pos` — every probed case in the dossier happened to have
+#      `pos == 0` already (no seek before truncate), so the "0" was
+#      coincidental, not caused by truncate. Confirmed with a seek-then-
+#      truncate probe (`seek(8); truncate(3)` -> tell() stays 8). This module
+#      implements "position unchanged" (which the dossier's own SURFACE table
+#      row, not the HAZARDS prose, actually says).
+#   2. `readline()` position on `StringIO("line1\nline2")` after two calls:
+#      the dossier's BEHAVIOR MATRIX row claims "Position After: 12", but
+#      `len("line1\nline2") == 11` — 12 is out of range and impossible.
+#      Live-checked: `tell()` is 11 after both readlines. Treated as a dossier
+#      typo; the parity golden below uses the verified value (11).
+#   3. `seek(pos, whence=2)` (seek-relative-to-end) also ONLY accepts
+#      `pos == 0`, exactly like `whence=1` — the dossier's ERRORS section
+#      only demonstrated this for `whence=1`. A nonzero offset with
+#      `whence=2` raises the SAME message text CPython uses for whence=1
+#      (`"Can't do nonzero cur-relative seeks"` — yes, CPython reuses the
+#      "cur-relative" wording even for the end-relative case; verified
+#      byte-for-byte against `io.StringIO`).
+#   4. Closed-file error TEXT is not one uniform string: `read`/`readline`/
+#      `write`/`seek`/`truncate`/`getvalue`/`readable`/`writable`/`seekable`/
+#      `tell`/`line_buffering`/`newlines` all raise
+#      `ValueError("I/O operation on closed file")` (no trailing period), but
+#      `readlines()` and `isatty()` raise the SAME message WITH a trailing
+#      period: `"I/O operation on closed file."`. This is a genuine CPython
+#      quirk (two different internal check sites use different literal C
+#      strings) — verified with `repr(str(e))` on all of them side by side.
+#      Reproduced exactly, including which methods get the period.
+#   5. `flush()` NEVER raises, even on a closed StringIO (CPython's flush is
+#      an unconditional unchecked no-op) — not documented either way by the
+#      dossier's ERRORS section, so it was live-checked directly.
+#   6. `closed`/`encoding`/`errors` properties never raise, closed or not —
+#      also live-checked directly, not covered by the dossier's ERRORS list.
+#   7. `readlines(hint)`: the dossier says "hint >= 0 reads approximate hint
+#      bytes then stops"; live-checked precisely, the real rule is
+#      `hint > 0` (strictly), not `hint >= 0` — `readlines(0)` reads ALL
+#      lines (confirmed: `StringIO("a\nb\nc").readlines(0) ==
+#      ['a\n','b\n','c']`, matching the dossier's own probed case, but for
+#      the reason "hint<=0 means unlimited", not "hint==0 happens to admit
+#      everything"). Any `hint <= 0` (not just -1) means "read all"
+#      (`readlines(-5)` and `readlines(-100)` also read everything).
+#      Positive hints stop once the CUMULATIVE length of already-appended
+#      lines STRICTLY EXCEEDS the hint (checked with `>`, NOT `>=`, after
+#      appending each line — an easy off-by-one: `StringIO("a\nb\nc")
+#      .readlines(2)` returns `['a\n', 'b\n']` (TWO lines, cumulative 4),
+#      not one, even though the running total already EQUALS 2 after the
+#      first line. CPython-verified with `readlines(1)` (one line),
+#      `readlines(2)`/`readlines(3)` (two lines), and a 5-line buffer's
+#      `readlines(4)`/`readlines(5)`/`readlines(6)`/`readlines(7)` (three,
+#      three, four, and four lines respectively)).
+#   8. The dossier's "Complex Scenarios" row `StringIO("abc"); write("xy");
+#      getvalue()` claims `'abcxy'` ("write appends when at end"). This is
+#      simply WRONG: position starts at 0 for EVERY `initial_value` (the
+#      dossier's own SURFACE table says so, and its own "seek()/tell()"
+#      matrix row confirms `StringIO("hello").tell() == 0`), so writing at
+#      an UN-seeked, freshly-constructed StringIO OVERWRITES from the start,
+#      exactly like any other `pos == 0` write. Live-verified: `getvalue()`
+#      is `'xyc'`, not `'abcxy'` — reproduced in this module (and dual-run
+#      matched against real CPython in examples/parity_io.pyrs).
+#
+# COMPILER GAPS (found while building this module, not previously documented
+# anywhere in lib/*.pyrs — no prior stdlib module had exercised either shape,
+# so both had gone unobserved):
+#   1. A CONSTRUCTOR call that OMITS a trailing default-valued parameter fails
+#      to build (`argument #1 ... is missing` from rustc), even though the
+#      identical pattern on a free FUNCTION or a METHOD works correctly
+#      (verified: `def f(x: int = 5) -> int: ...; f()` builds and runs fine;
+#      `class C: def __init__(self, x: int = 5): ...; C()` does NOT — the
+#      minimal repro isn't specific to `Optional`, generics, or this module).
+#      Call-site default-fill is apparently wired for the function/method
+#      call path but not the `ClassName::new()` constructor path.
+#      Consequence: `StringIO.__init__`'s `initial_value` is a REQUIRED `str`
+#      parameter here (see above), not the CPython-matching
+#      `Optional[str] = None`.
+#   2. A METHOD call passing a bare (non-`None`) value POSITIONALLY into an
+#      `Optional[T]`-typed parameter fails to build (`expected Option<i64>,
+#      found i64`), even though the identical bare value flows fine into an
+#      `Optional[T]` parameter on a free FUNCTION call (verified:
+#      `f(1, 2)` with `def f(x: int, y: Optional[int] = None)` builds; the
+#      same shape as a METHOD, `c.m(5)` with `def m(self, y: Optional[int] =
+#      None)`, does not — only `c.m(y=5)` (keyword) or omitting the arg
+#      entirely works for a method). Consequence: `truncate`'s `size`
+#      parameter is typed as a plain `int` with an out-of-realistic-range
+#      sentinel default (`-9223372036854775807`, i.e. i64::MIN + 1 — a bare
+#      `-9223372036854775808` literal does not lex, since pyrst parses the
+#      sign and the magnitude separately and the magnitude alone overflows
+#      i64; no valid CPython `truncate` argument is ever legitimately this
+#      value) instead of `Optional[int] = None`, so the CPython-authentic
+#      POSITIONAL call
+#      shape `s.truncate(3)` keeps working (an `Optional[int]` parameter
+#      would have forced callers into `s.truncate(size=3)`, itself a
+#      divergence from real CPython, which is positional-only there).
+#   3. A `@property` whose return type is `Optional[T]` is MISTYPED by this
+#      compiler at every USE site. Minimal repro: `class C: @property\n def
+#      val(self) -> Optional[str]: return None`, then in `main`,
+#      `print(c.val)` fails to build (`Option<String>` doesn't implement
+#      `Display` — the print codegen didn't route it through the None-aware
+#      print path it uses for a plain `Optional[str]`-typed local or a
+#      REGULAR method's return value, both of which print `None`/the payload
+#      correctly), AND `x: Optional[str] = c.val` ALSO fails to build
+#      (wrongly re-`Some`-wraps an already-`Option<String>` value — E0308
+#      "expected String, found Option<String>"). Consequence: `encoding`,
+#      `errors`, and `newlines` (CPython attributes that are always `None`)
+#      are ordinary zero-arg METHODS here, called as `s.encoding()` rather
+#      than CPython's bare `s.encoding`.
+#   4. A `bool`-typed `@property`, when its access expression is printed (or
+#      `str()`'d) DIRECTLY (`print(obj.prop)` / `str(obj.prop)`), prints in
+#      Rust's native lowercase `true`/`false` instead of pyrst's
+#      Python-style `True`/`False` that every OTHER bool-producing
+#      expression uses (verified: an identical plain — non-`@property` —
+#      method returning the same `bool` field prints `True`/`False`
+#      correctly; `x: bool = obj.prop; print(x)` ALSO prints correctly —
+#      only the direct pipe into `print`/`str` is affected). `closed` and
+#      `line_buffering` stay `@property` (matching CPython's bare-attribute
+#      shape) since this is a PRINT-FORMATTING bug, not a build failure or a
+#      wrong stored value — assign to a local `bool` before printing/
+#      stringifying (as this module's own dual-run parity golden,
+#      examples/parity_io.pyrs, does) until it's fixed upstream.
+#   5. THE MOST SERIOUS FINDING: `str.find(sub)` returns a Rust-native BYTE
+#      offset, not CPython's CHAR (codepoint) offset — verified minimal
+#      repro: `"こんにちは\nworld".find("\n")` returns `15` in pyrst (the
+#      UTF-8 byte offset: 5 chars * 3 bytes) but `5` in CPython (the char
+#      offset). Since this compiler's STRING SLICING (`s[a:b]`) IS correctly
+#      char-indexed (separately verified), combining the two — exactly what
+#      `readline()`'s original `idx = rest.find("\n"); line = rest[:idx+1]`
+#      did — silently produces WRONG results (not a crash) for any non-ASCII
+#      content preceding the match. This is a general `str.find` defect, not
+#      specific to `io` — `rfind`/`index`/`rindex`/`count` share the same
+#      codegen shape (`src/codegen/exprs.rs`, the `"find"`/`"rfind"`/
+#      `"index"`/`"rindex"`/`"count"` arms all call the Rust method
+#      directly) and are LIKELY affected too, though only `find` was
+#      actually re-verified here — flagged for the integrator/compiler team
+#      as the highest-priority follow-up from this card. Worked around
+#      LOCALLY in this module with a hand-rolled char-indexed scan,
+#      `_io_find_newline` (below), instead of `str.find`.
+#
+#   All five are compiler-level fixes outside a stdlib module's scope —
+#   flagged for the integrator/compiler team, not silently worked around
+#   with a fake default or a silently-wrong call shape.
+#
+# DIVERGENCES (documented, not silently dropped):
+#   - Runtime TypeErrors for wrong ARGUMENT TYPES (`StringIO(123)`,
+#     `write(None)`, `read("5")`, `seek("1")`) are NOT reproduced: pyrst is
+#     statically typed, so these calls are REJECTED AT COMPILE TIME instead
+#     (a stronger, earlier failure than CPython's runtime TypeError). No
+#     valid, type-correct call is affected.
+#   - `bytes` initial_value (`StringIO(b"...")`) is out of scope — pyrst has
+#     no `bytes` type (G7).
+#   - `StringIO.__init__(*args, **kwargs)`'s real C signature is variadic
+#     (G4); modeled here as the one real parameter `initial_value: str`
+#     (REQUIRED — see "COMPILER GAP 1" above). Pass `""` for CPython's
+#     `StringIO()` and the text directly for `StringIO("text")`; the
+#     CPython keyword form `StringIO(initial_value="text")` also works
+#     (kwargs bind constructor params by name).
+#   - `truncate`'s sentinel-default `size` (see "COMPILER GAP 2" above) means
+#     passing the literal `-9223372036854775807` explicitly would be
+#     mis-read as "omitted" rather than raising `Negative size value
+#     -9223372036854775807` like real CPython would. Not reachable by any
+#     realistic caller (it is i64::MIN); documented rather than silently
+#     ignored.
+#   - KEYWORD ARGUMENTS ARE A DELIBERATE SUPERSET, not a gap: CPython's real
+#     `_io.StringIO` methods are C-implemented and POSITIONAL-ONLY
+#     (`inspect.signature` shows `(self, size=-1, /)` etc.) — real
+#     `s.read(size=2)` raises `TypeError: StringIO.read() takes no keyword
+#     arguments`! pyrst's methods accept `size=`/`whence=`/etc as keywords
+#     (kwargs v1), which is MORE permissive than real CPython, not less. Any
+#     call written the way real code is actually written (positionally, or
+#     omitting defaults) behaves identically either way.
+#   - `io.UnsupportedOperation` does not exist in pyrst (no custom exception
+#     classes — G-exceptions). CPython's `detach()`/`fileno()` raise that
+#     class, which is ITSELF a subclass of both `OSError` and `ValueError`;
+#     this module raises the closest builtin, `OSError`, with the identical
+#     message text (`"detach"` / `"fileno"`).
+#   - `seek(pos, whence=1)`/`seek(pos, whence=2)` with `pos == 0` are
+#     accepted as documented (no-ops that return the CURRENT position
+#     unchanged for whence=1, or the end-of-buffer position for whence=2).
+#   - `encoding`/`errors`/`newlines` are called as `s.encoding()` etc.
+#     (methods) rather than CPython's bare `s.encoding` (attributes) — see
+#     "COMPILER GAP 3" above.
+#   - `print(s.closed)`/`print(s.line_buffering)` (piped DIRECTLY into
+#     print) render lowercase `true`/`false` rather than `True`/`False` —
+#     see "COMPILER GAP 4" above. Assign to a local `bool` first.
+#
+# FIDELITY: 4/5. Every I/O and positioning behavior in the dossier's 32
+# parity cases, INCLUDING non-ASCII content (worked around at gap #5), is
+# bit-for-bit CPython-identical after the corrections and workarounds above.
+# The point below full marks is the accumulation of five real compiler-level
+# gaps this card surfaced (none previously documented anywhere in
+# lib/*.pyrs) — the API-shape ones (`initial_value` arity, sentinel
+# `truncate`, method-not-property `encoding`/`errors`/`newlines`, the
+# bool-property print quirk) are cosmetic call-shape divergences with no
+# behavioral effect on any call this module makes; `str.find`'s byte-vs-char
+# offset bug (#5) is the one with real behavioral teeth, and it required an
+# actual code workaround (`_io_find_newline`) rather than just a comment —
+# it is fully worked around WITHIN this module, but any caller outside it
+# who reaches for `str.find`/`rfind`/`index`/`rindex`/`count` on non-ASCII
+# pyrst strings should not assume char-offset semantics until it's fixed.
+
+# NOTE: `truncate()`'s "not given" sentinel (`-9223372036854775807`, i.e.
+# i64::MIN + 1 — see "COMPILER GAPS" #2 above) is inlined directly at its two
+# use sites below rather than factored into a module-level constant: this
+# compiler's module-level-constant relaxation only accepts a BARE literal
+# (`Expr::Int`/`Float`/`Str`/`Bool`) as the initializer, not a unary-minus
+# expression (`-N` parses as `UnaryOp(Neg, Int(N))`), so a NEGATIVE
+# module-level int constant does not build (another compiler-level gap worth
+# flagging, found the same way as the two above — no prior stdlib module had
+# ever tried a negative module constant either).
+
+
+def _io_find_newline(s: str) -> int:
+    # A hand-rolled CHAR-indexed scan for "\n", used by `readline()` INSTEAD
+    # of `s.find("\n")` — see "COMPILER GAPS" #5 in the module header: this
+    # compiler's `str.find` (and, presumably, `rfind`/`index`/`rindex`/
+    # `count` — not individually re-verified, but they share the same
+    # codegen shape) returns a Rust-native BYTE offset, not a Python-style
+    # CHAR offset, so it silently mis-indexes any search whose match is
+    # preceded by a multi-byte character. `s[:idx]`-style slicing IS
+    # correctly char-indexed (verified separately), so mixing the two
+    # produces wrong results only on non-ASCII input — caught by this
+    # module's own dual-run parity golden on `"こんにちは\nworld".readline()`
+    # (pyrst returned `"こんにちは\nworld"` whole, having computed a
+    # `\n`-index of 15 — the BYTE offset — against a 16-char string, instead
+    # of the correct char offset 5).
+    n: int = len(s)
+    i: int = 0
+    while i < n:
+        if s[i] == "\n":
+            return i
+        i = i + 1
+    return -1
+
+
+class StringIO:
+    buf: str
+    pos: int
+    _closed: bool
+
+    def __init__(self, initial_value: str) -> None:
+        # REQUIRED, not `Optional[str] = None` — see "COMPILER GAP" in the
+        # module header: constructor calls do not fill an OMITTED
+        # default-valued parameter in this compiler build (verified with a
+        # minimal repro, not specific to Optional). Pass `""` for CPython's
+        # no-arg `StringIO()` (empty buffer) — behaviorally identical.
+        self.buf = initial_value
+        self.pos = 0
+        self._closed = False
+
+    def _check_open(self) -> None:
+        if self._closed:
+            raise ValueError("I/O operation on closed file")
+
+    def write(self, s: str) -> int:
+        self._check_open()
+        buflen: int = len(self.buf)
+        n: int = len(s)
+        if self.pos >= buflen:
+            pad: int = self.pos - buflen
+            if pad > 0:
+                self.buf = self.buf + ("\0" * pad) + s
+            else:
+                self.buf = self.buf + s
+        else:
+            self.buf = self.buf[:self.pos] + s + self.buf[self.pos + n:]
+        self.pos = self.pos + n
+        return n
+
+    def read(self, size: int = -1) -> str:
+        self._check_open()
+        start: int = self.pos
+        result: str = ""
+        if size < 0:
+            result = self.buf[start:]
+        else:
+            result = self.buf[start:start + size]
+        self.pos = start + len(result)
+        return result
+
+    def readline(self, size: int = -1) -> str:
+        self._check_open()
+        start: int = self.pos
+        rest: str = self.buf[start:]
+        # `_io_find_newline` (a hand-rolled char scan), NOT `rest.find("\n")`
+        # — see "COMPILER GAP 5" in the module header: this compiler's
+        # `str.find` returns a BYTE offset, not a CHAR offset, so it silently
+        # mis-indexes any string with a multi-byte character before the
+        # match (found while testing this exact method against
+        # `"こんにちは\nworld"`).
+        idx: int = _io_find_newline(rest)
+        line: str = ""
+        if idx == -1:
+            line = rest
+        else:
+            line = rest[:idx + 1]
+        if size >= 0 and len(line) > size:
+            line = line[:size]
+        self.pos = start + len(line)
+        return line
+
+    def readlines(self, hint: int = -1) -> list[str]:
+        # closed check raises WITH a trailing period — one of the two
+        # methods (with isatty) that use the other C-level message literal.
+        if self._closed:
+            raise ValueError("I/O operation on closed file.")
+        result: list[str] = []
+        total: int = 0
+        while True:
+            line: str = self.readline()
+            if line == "":
+                break
+            result.append(line)
+            total = total + len(line)
+            # STRICT `>` (not `>=`) — re-oracled: `StringIO("a\nb\nc")
+            # .readlines(2)` returns TWO lines (`['a\n', 'b\n']`, total 4),
+            # not one, even though the running total (2) already equals the
+            # hint (2) after the first line. CPython only stops once the
+            # cumulative length EXCEEDS the hint.
+            if hint > 0 and total > hint:
+                break
+        return result
+
+    def getvalue(self) -> str:
+        self._check_open()
+        return self.buf
+
+    def seek(self, pos: int, whence: int = 0) -> int:
+        self._check_open()
+        if whence == 0:
+            if pos < 0:
+                raise ValueError(f"Negative seek position {pos}")
+            self.pos = pos
+        elif whence == 1:
+            if pos != 0:
+                raise OSError("Can't do nonzero cur-relative seeks")
+        elif whence == 2:
+            if pos != 0:
+                raise OSError("Can't do nonzero cur-relative seeks")
+            self.pos = len(self.buf)
+        else:
+            raise ValueError(f"Invalid whence ({whence}, should be 0, 1 or 2)")
+        return self.pos
+
+    def tell(self) -> int:
+        self._check_open()
+        return self.pos
+
+    def truncate(self, size: int = -9223372036854775807) -> int:
+        self._check_open()
+        real_size: int = size
+        if real_size == -9223372036854775807:
+            real_size = self.pos
+        elif real_size < 0:
+            raise ValueError(f"Negative size value {real_size}")
+        if real_size < len(self.buf):
+            self.buf = self.buf[:real_size]
+        # position is left UNCHANGED regardless of real_size (re-oracled —
+        # see "RE-ORACLE CORRECTIONS" #1 above).
+        return real_size
+
+    def close(self) -> None:
+        # Idempotent: closing an already-closed StringIO is a no-op, matching
+        # CPython (verified).
+        self._closed = True
+
+    def flush(self) -> None:
+        # Unconditional no-op — never raises, even when closed (re-oracled).
+        return None
+
+    def writelines(self, lines: list[str]) -> None:
+        for line in lines:
+            self.write(line)
+
+    def readable(self) -> bool:
+        self._check_open()
+        return True
+
+    def writable(self) -> bool:
+        self._check_open()
+        return True
+
+    def seekable(self) -> bool:
+        self._check_open()
+        return True
+
+    def isatty(self) -> bool:
+        # closed check raises WITH a trailing period (re-oracled — the other
+        # of the two methods sharing that message variant, with readlines).
+        if self._closed:
+            raise ValueError("I/O operation on closed file.")
+        return False
+
+    def detach(self) -> None:
+        # CPython raises io.UnsupportedOperation("detach") — no such class in
+        # pyrst; OSError is the closest builtin (UnsupportedOperation IS an
+        # OSError subclass in CPython). Message text matches exactly.
+        raise OSError("detach")
+
+    def fileno(self) -> int:
+        raise OSError("fileno")
+
+    @property
+    def closed(self) -> bool:
+        # Never raises, open or closed (re-oracled).
+        return self._closed
+
+    @property
+    def line_buffering(self) -> bool:
+        self._check_open()
+        return False
+
+    # `encoding`/`errors`/`newlines` are METHODS here, not `@property` —
+    # see "COMPILER GAPS" #3 in the module header: a `@property` whose return
+    # type is `Optional[T]` is mistyped by this compiler at every USE site
+    # (`print(obj.prop)` fails to compile — it emits a bare `Option<String>`
+    # into a `{}` Display format slot instead of the None-aware print path —
+    # and `x: Optional[str] = obj.prop` fails to compile too, wrongly
+    # Some-wrapping an already-`Option` value). `closed`/`line_buffering`
+    # above are unaffected because they return plain `bool`, not
+    # `Optional[T]`. CPython accesses these as bare attributes
+    # (`s.encoding`, no parens); pyrst callers here must write `s.encoding()`.
+
+    def encoding(self) -> Optional[str]:
+        # Always None — never raises, open or closed (re-oracled).
+        return None
+
+    def errors(self) -> Optional[str]:
+        # Always None — never raises, open or closed (re-oracled).
+        return None
+
+    def newlines(self) -> Optional[str]:
+        self._check_open()
+        return None

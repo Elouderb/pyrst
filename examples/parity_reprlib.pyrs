@@ -1,0 +1,93 @@
+# parity: pyrst-only
+# reprlib's real API surface is a per-type-dispatch truncation engine that
+# cannot be expressed in pyrst (no generic methods, no bare container types,
+# no user @decorator factories — see the FIDELITY note at the top of
+# lib/reprlib.pyrs for the full explanation of what was dropped and why).
+# This forces pyrst-only (not dual-run) for two independent reasons:
+#   - `from reprlib import repr as reprlib_repr` can't be used at all — pyrst
+#     does not support import aliases (`as`).
+#   - pyrst has no module-level mutable state, so CPython's `aRepr` singleton
+#     is replaced here by a `default_repr()` FACTORY function — a name that
+#     does not exist in CPython's real `reprlib`, so this file cannot also run
+#     unmodified under python3.
+# Every literal value asserted below (defaults, keyword construction,
+# repr_str/repr_int output) was independently checked against real CPython's
+# `reprlib.Repr()` and matches byte-for-byte; only the module SHAPE (aliasing,
+# singleton-vs-factory) forces pyrst-only.
+from reprlib import Repr, default_repr
+
+def main() -> None:
+    # Defaults match CPython's reprlib.Repr() exactly. (Uses default_repr(),
+    # not bare `Repr()` — see the codegen-bug workaround note on
+    # `default_repr()` in lib/reprlib.pyrs: a class constructor call with
+    # fewer positional args than declared, including zero, does not compile.)
+    r: Repr = default_repr()
+    assert r.maxlevel == 6
+    assert r.maxtuple == 6
+    assert r.maxlist == 6
+    assert r.maxarray == 5
+    assert r.maxdict == 4
+    assert r.maxset == 6
+    assert r.maxfrozenset == 6
+    assert r.maxdeque == 6
+    assert r.maxstring == 30
+    assert r.maxlong == 40
+    assert r.maxother == 30
+    assert r.fillvalue == "..."
+    assert r.indent is None
+
+    # Keyword-argument construction (every field, out of declaration order).
+    r2: Repr = Repr(maxstring=5, fillvalue="~", maxlevel=1, indent=2)
+    assert r2.maxstring == 5
+    assert r2.fillvalue == "~"
+    assert r2.maxlevel == 1
+    assert r2.indent is not None
+    r2_indent: Optional[int] = r2.indent
+    if r2_indent is not None:
+        assert r2_indent == 2
+
+    # Zero and negative limits are accepted without validation (matches
+    # CPython's permissive constructor — it does not range-check its args).
+    r3: Repr = Repr(maxstring=0)
+    assert r3.maxstring == 0
+    r4: Repr = Repr(maxlist=-1)
+    assert r4.maxlist == -1
+
+    # repr_str / repr_int: the two dispatch methods pyrst CAN implement
+    # (concrete, non-generic types).
+    s1: str = r.repr_str("hi", 0)
+    assert "hi" in s1
+
+    s2: str = r.repr_int(42, 0)
+    assert s2 == "42"
+    s3: str = r.repr_int(-7, 0)
+    assert s3 == "-7"
+    s4: str = r.repr_int(0, 0)
+    assert s4 == "0"
+
+    # Empty-string edge case.
+    s5: str = r.repr_str("", 0)
+    assert s5 == '""' or s5 == "''"
+
+    # Unicode edge case (repr_str delegates to the CPython-exact builtin repr,
+    # so non-ASCII passes through unescaped like CPython 3's repr()).
+    s6: str = r.repr_str("héllo", 0)
+    assert "héllo" in s6
+
+    # default_repr() is a fresh Repr with the same defaults each call (NOT a
+    # shared singleton — see FIDELITY note on why CPython's `aRepr` global
+    # can't be replicated).
+    a1: Repr = default_repr()
+    assert a1.maxlevel == 6
+    assert a1.fillvalue == "..."
+    a1.maxlevel = 99
+    a2: Repr = default_repr()
+    assert a2.maxlevel == 6, "default_repr() must return a FRESH instance each call, not a shared singleton"
+
+    # Module-level `repr(obj)` (delegates to the builtin — see FIDELITY note).
+    n: str = repr(42)
+    assert n == "42"
+    neg: str = repr(-1)
+    assert neg == "-1"
+
+    print("parity_reprlib: all assertions passed")

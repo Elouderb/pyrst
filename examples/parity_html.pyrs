@@ -1,0 +1,178 @@
+# parity: dual-run
+# Card d9182d50 — `lib/html.pyrs` (`escape`/`unescape`). Seeded from
+# docs/design/w2-dossiers/html.md's PARITY PLAN §6 (40 cases, python3.12.9-
+# verified), with TWO cases dropped by design: `unescape('&LT;')` and
+# `unescape('&Lt;')`. Both are html5-only uppercase/mixed-case entity
+# spellings that live OUTSIDE `html.entities.name2codepoint` (the ~252-name
+# core this module implements per card d9182d50's AC — see `lib/html.pyrs`'s
+# header "NAMED-ENTITY COVERAGE" section for the full python3-verified
+# boundary of what is/isn't covered). Every other dossier case is included
+# below and is byte-identical under CPython 3.12.9.
+#
+# w2-hardener pass (adversarial review): appended a HARDENING block below
+# the original dossier-seeded cases, covering categories the dossier didn't
+# probe — all python3.12.9-verified byte-identical: multi-byte Unicode
+# interleaved with entities/charrefs (string indexing/slicing is codepoint-
+# based here, not byte-based — verified explicitly), the scanner's 32-char
+# named-charref capture cap (CPython's regex `{1,32}` quantifier), every
+# Windows-1252 self-mapping codepoint (129/141/143/144/157 — the 5 of 32
+# remap-table entries with no distinct glyph), supplementary-plane charrefs
+# and the noncharacter pairs at higher-plane boundaries (0x1FFFE/0x1FFFF),
+# the i64-overflow guard on 30-digit numeric charref runs, back-to-back/
+# adjacent entities with no separator, and a semicolon-required entity name
+# embedded in a longer unmatched word (`&notinvalid` vs `&notinvalid;`).
+# No output here is dict-derived (module rebuilds its lookup tables per
+# call but nothing is ever printed in dict form), so this file stays
+# deterministic and dual-run eligible.
+
+from html import escape, unescape
+
+
+def _hz_repeat(ch: str, n: int) -> str:
+    out: str = ""
+    i: int = 0
+    while i < n:
+        out = out + ch
+        i = i + 1
+    return out
+
+
+def main() -> None:
+    # ── escape(s, quote=True) — default kwarg ──────────────────────────────
+    print(escape(""))                                    # (empty)
+    print(escape("hello"))                                # hello
+    print(escape("<"))                                    # &lt;
+    print(escape(">"))                                    # &gt;
+    print(escape("&"))                                    # &amp;
+    print(escape("\""))                                   # &quot;
+    print(escape("'"))                                    # &#x27;  (hex form)
+    print(escape("<tag>"))                                # &lt;tag&gt;
+    print(escape("&amp;"))                                # &amp;amp;  (& escaped first)
+    print(escape("<>\"'&"))                                # &lt;&gt;&quot;&#x27;&amp;
+
+    # ── escape(s, quote=False) ──────────────────────────────────────────────
+    print(escape("", False))                              # (empty)
+    print(escape("\"", False))                             # "  (unchanged)
+    print(escape("'", False))                              # '  (unchanged)
+    print(escape("<", False))                              # &lt;
+    print(escape("<\"'>", False))                          # &lt;"'&gt;
+
+    # ── whitespace/control pass-through (escape never touches these) ───────
+    print(escape(" "))                                    # (single space)
+    print(escape("\t") == "\t")                            # True
+    print(escape("\n") == "\n")                            # True
+    print(escape("\r") == "\r")                            # True
+
+    # ── unescape(s) — basic named entities ──────────────────────────────────
+    print(unescape(""))                                    # (empty)
+    print(unescape("hello"))                                # hello
+    print(unescape("&lt;"))                                 # <
+    print(unescape("&gt;"))                                 # >
+    print(unescape("&amp;"))                                # &
+    print(unescape("&quot;"))                               # "
+    print(unescape("&#x27;"))                               # '
+    print(unescape("&nbsp;"))                               # \xa0 (non-breaking space)
+    print(unescape("&copy;"))                               # (c) copyright sign
+    # lang/rang: html.unescape resolves these via the html5 table to U+27E8/
+    # U+27E9 (10216/10217), NOT the name2codepoint HTML4 legacy U+2329/U+232A —
+    # the only two names where those CPython tables disagree (regression guard).
+    print(unescape("&lang;"))                               # U+27E8 mathematical left angle bracket
+    print(unescape("&rang;"))                               # U+27E9 mathematical right angle bracket
+
+    # ── unescape(s) — numeric entities (decimal + hex, both cases) ─────────
+    print(unescape("&#65;"))                                # A
+    print(unescape("&#x41;"))                               # A
+    print(unescape("&#123;"))                               # {
+    print(unescape("&#x7B;"))                               # {
+    print(unescape("&#x7b;"))                               # {  (lowercase hex digit)
+    print(unescape("&#256;"))                                # Ā
+
+    # ── unescape(s) — edge cases and safety filtering ───────────────────────
+    print(unescape("&unknown;"))                            # &unknown;  (unchanged)
+    print(unescape("&#999999;"))                            # \U000f423f
+    print(unescape("&#x110000;"))                           # replacement char (out of range)
+    print(unescape("&#xD800;"))                              # replacement char (surrogate)
+    print(unescape("&#xDFFF;"))                              # replacement char (surrogate)
+    print(unescape("&#0;"))                                  # replacement char
+    print(unescape("&#1;"))                                  # (empty — invalid codepoint)
+    print(unescape("&#127;"))                                # (empty — invalid codepoint)
+    print(unescape("&#x7F;"))                                # (empty — invalid codepoint)
+    print(unescape("&#128;"))                                # euro sign (Windows-1252 remap)
+    print(unescape("&#x80;"))                                # euro sign (same, hex form)
+    print(unescape("&#130;"))                                # single low-9 quote (Windows-1252 remap)
+    print(unescape("&#256;"))                                 # Ā  (re-checked)
+    print(unescape("&#-1;"))                                  # &#-1;  (unchanged — no digits after -)
+    print(unescape("&#x;"))                                   # &#x;  (unchanged — no hex digits)
+    print(unescape("&#;"))                                    # &#;  (unchanged — no digits)
+    print(unescape("&;"))                                     # &;  (unchanged — no name chars)
+
+    # ── unescape(s) — semicolon-optional legacy names ───────────────────────
+    print(unescape("&quot"))                                  # "
+    print(unescape("&copy"))                                  # (c) copyright sign
+    print(unescape("&#65"))                                   # A
+
+    # ── unescape(s) — longest-prefix matching over the covered subset ──────
+    print(unescape("&not"))                                   # not sign
+    print(unescape("&notin"))                                 # not-sign + "in"  (not; is longest match)
+    print(unescape("&notinva"))                                # not-sign + "inva"
+
+    # ── unescape(s) — bare '&' / no-match fallbacks ─────────────────────────
+    print(unescape("&"))                                      # &
+    print(unescape("&&"))                                     # &&
+    print(unescape("& "))                                     # &<space>
+
+    # ── unescape(s) — roundtrip through escape() ────────────────────────────
+    escaped1: str = escape("<script>alert(\"xss\")</script>", True)
+    print(unescape(escaped1) == "<script>alert(\"xss\")</script>")  # True
+    escaped2: str = escape("<>\"'&", True)
+    print(unescape(escaped2) == "<>\"'&")                       # True
+    print(unescape("&lt;&gt;&quot;&#x27;&amp;"))                # <>"'&
+
+    # ── HARDENING: Unicode interleaved with entities/charrefs ───────────────
+    print(unescape("héllo&amp;wörld"))                          # héllo&wörld
+    print(unescape("日本語&lt;test&gt;"))                        # 日本語<test>
+    s3: str = "café <b>naïve</b> & 日本"
+    e3: str = escape(s3)
+    print(e3)
+    print(unescape(e3) == s3)                                   # True
+    print(unescape("&😀notin;"))                                # &😀notin;  (unmatched name)
+    print(escape("😀<😀"))                                       # 😀&lt;😀
+
+    # ── HARDENING: 32-char named-charref capture cap (regex `{1,32}`) ──────
+    cap_word: str = "notin" + _hz_repeat("x", 27)               # 32 chars total
+    print(len(cap_word))                                        # 32
+    print(unescape("&" + cap_word + ";"))                       # unmatched, unchanged
+    cap_word_uni: str = "notin" + _hz_repeat("é", 27)           # 32 CODEPOINTS
+    print(unescape("&" + cap_word_uni + ";"))                   # ¬in + 29 é's (cap is codepoint-based)
+
+    # ── HARDENING: Windows-1252 self-mapping remap entries (no distinct glyph) ─
+    print(unescape("&#129;") == chr(0x81))                      # True
+    print(unescape("&#141;") == chr(0x8D))                      # True
+    print(unescape("&#143;") == chr(0x8F))                      # True
+    print(unescape("&#144;") == chr(0x90))                      # True
+    print(unescape("&#157;") == chr(0x9D))                      # True
+
+    # ── HARDENING: supplementary plane + higher-plane noncharacter pairs ───
+    print(unescape("&#x10000;"))                                # U+10000 (supplementary plane)
+    print(unescape("&#65536;"))                                 # same, decimal
+    print(unescape("&#131070;"))                                # empty (U+1FFFE noncharacter)
+    print(unescape("&#131071;"))                                # empty (U+1FFFF noncharacter)
+
+    # ── HARDENING: i64-overflow guard on giant numeric-charref digit runs ──
+    print(unescape("&#" + _hz_repeat("9", 30) + ";"))           # replacement char
+    print(unescape("&#x" + _hz_repeat("f", 30) + ";"))          # replacement char
+
+    # ── HARDENING: adjacent/back-to-back entities, no separator ────────────
+    print(unescape("&amp;&lt;&amp;"))                           # &<&
+    print(unescape("&ampamp;"))                                 # &amp;  (amp; matches, leftover "amp;" literal)
+    print(unescape("&&&&"))                                     # &&&&  (all unmatched bare &)
+
+    # ── HARDENING: semicolon-required name embedded in a longer unmatched word ─
+    print(unescape("&notinvalid;"))                             # ¬invalid;  (not; is longest match, has semi)
+    print(unescape("&notinvalid"))                               # ¬invalid  (no semi at all: not matches via prefix)
+    print(unescape("&alphabeta;"))                              # &alphabeta;  (no prefix of "alphabeta" is in table)
+    print(unescape("&alphabeta"))                                # &alphabeta
+
+    # ── HARDENING: kwargs at the call site (evaluation order + defaults) ───
+    print(escape(s="<x>", quote=False))                         # &lt;x&gt;
+    print(escape(quote=True, s="'"))                             # &#x27;

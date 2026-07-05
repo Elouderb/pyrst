@@ -1,0 +1,6 @@
+# NEGATIVE (card aabf4ada): open() takes at most 2 positional arguments — pyrst
+# supports `open(path[, mode])` only. A 3rd+ positional arg (CPython's `buffering`)
+# was SILENTLY dropped: codegen read only args[0]/args[1]. Rejected honestly at check
+# so no positional argument is ever silently discarded.
+def main() -> None:
+    f = open("x.txt", "r", 1)

@@ -1065,13 +1065,98 @@ use super::test_support::*;
     }
 
     #[test]
-    fn infer_min_two_args_is_unknown_bug3() {
-        // BUG 3 (design choice): 2-arg min/max falls through to the generic path.
-        // ctx.funcs["min"] has ret=Unknown, so the result is Unknown.
+    fn infer_nary_scalar_min_max_is_first_arg_type() {
+        // (card b557b9c1) The n-ary scalar form min/max(a, b, ...) returns one of
+        // its homogeneous positional args, so its result type is the first arg's
+        // type. This was formerly the "BUG 3" Unknown fall-through, which starved
+        // the print-formatter of the float type (`max(1.0, 2.0, 3.0)` displayed
+        // `3` instead of `3.0`). Covers the 2-arg and 3-arg int / float / str forms.
         let ctx = TyCtx::new();
         let mut env = make_env(&ctx);
-        let e = call_fn("min", vec![int_lit(1), int_lit(2)]);
-        assert_eq!(check_expr(&e, &mut env).unwrap(), Ty::Unknown);
+        // 2-arg int -> Int (was Unknown).
+        let e_int2 = call_fn("min", vec![int_lit(1), int_lit(2)]);
+        assert_eq!(check_expr(&e_int2, &mut env).unwrap(), Ty::Int);
+        // 3-arg float -> Float (drives `__py_fmt_float` display).
+        let e_flt3 = call_fn("max", vec![float_lit(1.0), float_lit(2.0), float_lit(3.0)]);
+        assert_eq!(check_expr(&e_flt3, &mut env).unwrap(), Ty::Float);
+        // 3-arg str -> Str.
+        let e_str3 = call_fn("min", vec![str_lit("a"), str_lit("b"), str_lit("c")]);
+        assert_eq!(check_expr(&e_str3, &mut env).unwrap(), Ty::Str);
+    }
+
+    #[test]
+    fn nary_scalar_min_max_with_key_is_rejected() {
+        // (card b557b9c1) key= is only supported for the single-iterable form;
+        // combined with 2+ positional args it has no lowering and must be an honest
+        // check-time error (never a silent drop or a leaked rustc failure).
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        let mut e = call_fn("max", vec![int_lit(1), int_lit(2), int_lit(3)]);
+        if let Expr::Call { kwargs, .. } = &mut e {
+            kwargs.push(("key".to_string(), int_lit(0)));
+        }
+        assert_type_err(check_expr(&e, &mut env), "does not support");
+    }
+
+    #[test]
+    fn sum_three_args_is_rejected() {
+        // (card aabf4ada) `sum` is variadic-exempt from the generic arity check, so a
+        // 3rd positional arg was ACCEPTED and silently DROPPED at codegen. CPython
+        // raises TypeError; pyrst now rejects it honestly at check.
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        let e = call_fn("sum", vec![
+            Expr::List(vec![int_lit(1), int_lit(2), int_lit(3)], Span::DUMMY),
+            int_lit(10),
+            int_lit(20),
+        ]);
+        assert_type_err(check_expr(&e, &mut env), "at most 2 arguments");
+    }
+
+    #[test]
+    fn min_max_zero_args_is_rejected() {
+        // (card aabf4ada) min()/max() with ZERO args was a codegen `parts[0]`-on-
+        // empty-vec ICE (exit 101); CPython raises "expected at least 1 argument".
+        // Now an honest check-time arity error for both names.
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        assert_type_err(check_expr(&call_fn("min", vec![]), &mut env), "at least 1 argument");
+        assert_type_err(check_expr(&call_fn("max", vec![]), &mut env), "at least 1 argument");
+    }
+
+    #[test]
+    fn int_base_arg_is_rejected() {
+        // (card aabf4ada) `int(x, base)` DROPPED the base (int("10",2) -> 10 not 2, a
+        // silent miscompile surfaced by the variadic-exempt audit). pyrst's `int(x)`
+        // parses base 10 only; a 2nd arg is rejected honestly rather than miscompiled.
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        let e = call_fn("int", vec![str_lit("10"), int_lit(2)]);
+        assert_type_err(check_expr(&e, &mut env), "base argument is not supported");
+    }
+
+    #[test]
+    fn dynamic_attr_builtins_are_rejected() {
+        // (card aabf4ada) getattr/setattr/hasattr were silently-wrong codegen stubs
+        // (returned the NAME string / no-op'd / always-true). pyrst resolves
+        // attributes statically, so all three are honest check-time rejections.
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        for name in ["getattr", "setattr", "hasattr"] {
+            let e = call_fn(name, vec![ident("obj"), str_lit("attr")]);
+            assert_type_err(check_expr(&e, &mut env), "dynamic attribute access");
+        }
+    }
+
+    #[test]
+    fn open_extra_positional_arg_is_rejected() {
+        // (card aabf4ada) `open` read only args[0]/args[1] (path, mode) — a 3rd+
+        // positional arg (CPython's `buffering`) was silently DROPPED. pyrst supports
+        // `open(path[, mode])` only; a 3rd positional arg is rejected honestly.
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        let e = call_fn("open", vec![str_lit("x.txt"), str_lit("r"), int_lit(1)]);
+        assert_type_err(check_expr(&e, &mut env), "at most 2 positional arguments");
     }
 
     #[test]

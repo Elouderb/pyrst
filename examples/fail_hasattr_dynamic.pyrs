@@ -1,0 +1,11 @@
+# NEGATIVE (card aabf4ada): hasattr() (dynamic attribute access) is not supported —
+# pyrst resolves attributes statically. The old codegen stub was a SILENT miscompile:
+# it unconditionally emitted `true`, so `hasattr(c, "nope")` returned True for a
+# nonexistent attribute. Rejected honestly at check rather than always-true.
+class C:
+    x: int
+    def __init__(self) -> None:
+        self.x = 1
+def main() -> None:
+    c: C = C()
+    print(hasattr(c, "nope"))

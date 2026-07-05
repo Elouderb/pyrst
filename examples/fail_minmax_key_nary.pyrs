@@ -1,0 +1,10 @@
+# NEGATIVE (card b557b9c1): `key=` combined with 2+ POSITIONAL args has no
+# supported lowering — `key=` is only meaningful for the single-iterable form
+# `max(iterable, key=...)`. pyrst rejects this at CHECK time with a clear
+# message rather than silently dropping arguments or leaking a rustc error, so
+# typeck acceptance and codegen consumption stay in exact agreement.
+#
+# (CPython DOES accept `max(1, 2, 3, key=...)`; this is an explicit, documented
+# fidelity gap surfaced honestly, not a silent miscompile.)
+def main() -> None:
+    print(max(1, 2, 3, key=lambda x: -x))

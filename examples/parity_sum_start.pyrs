@@ -1,0 +1,48 @@
+# parity: dual-run
+# (card aabf4ada) sum(iterable, start): the 2-arg CPython form folds `start` in as
+# the accumulator seed. Regression cover for the P0 silent miscompile where codegen
+# consumed ONLY args[0] and DROPPED the start (`sum([1,2,3],10)` -> 6 not 16;
+# `sum(gen,100)` -> 14 not 114) — the same accept-N-consume-fewer class as the n-ary
+# min/max P0 (b557b9c1). Every line below is byte-diffed against python3 3.12:
+# int/float starts, BOTH float-promotion directions (int elems + float start ->
+# float; float elems + int start -> float, display `.0`), a generator source with a
+# start (int and float), an empty source (result == start), negative start, and the
+# 1-arg no-start form (unchanged).
+
+
+def squares() -> Iterator[int]:
+    for i in range(4):
+        yield i * i
+
+
+def halves() -> Iterator[float]:
+    for i in range(3):
+        yield i + 0.5
+
+
+def main() -> None:
+    # int elements + int start
+    print(sum([1, 2, 3], 10))
+    print(sum([10, 20, 30], 0))
+    print(sum([-1, -2, -3], -10))
+
+    # float elements + float start (DISPLAY must keep `.0`)
+    print(sum([1.5, 2.5, 3.0], 1.0))
+    print(sum([0.25, 0.75], 0.0))
+
+    # promotion: int elements + FLOAT start -> float (7.0, not 7)
+    print(sum([1, 2, 3], 1.0))
+    # promotion: float elements + INT start -> float (5.0, not 5)
+    print(sum([1.5, 2.5], 1))
+
+    # generator source WITH a start (the lazy path also folds it in)
+    print(sum(squares(), 100))
+    print(sum(halves(), 1.0))
+
+    # empty source: the result is exactly the start
+    empty: list[int] = []
+    print(sum(empty, 5))
+
+    # 1-arg no-start form is unchanged (start defaults to 0)
+    print(sum([1, 2, 3]))
+    print(sum([1.5, 2.5]))

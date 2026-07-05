@@ -98,10 +98,12 @@ def yiq_to_rgb(y: float, i: float, q: float) -> tuple[float, float, float]:
 
 def rgb_to_hls(r: float, g: float, b: float) -> tuple[float, float, float]:
     """Convert RGB to HLS (Hue, Lightness, Saturation); all ∈ [0,1]."""
-    maxc: float = r if r >= g else g
-    maxc = maxc if maxc >= b else b
-    minc: float = r if r <= g else g
-    minc = minc if minc <= b else b
+    # (card b557b9c1) n-ary min()/max() now fold ALL args with CPython's
+    # first-wins tie rule, so the former hand-rolled pairwise `>=`/`<=`
+    # ternaries (a deliberate dodge of the 3+-arg silent miscompile) are no
+    # longer needed. Byte-identical for the clamped-[0,1] inputs here.
+    maxc: float = max(r, g, b)
+    minc: float = min(r, g, b)
 
     l: float = (minc + maxc) / 2.0
 
@@ -175,10 +177,12 @@ def hls_to_rgb(h: float, l: float, s: float) -> tuple[float, float, float]:
 
 def rgb_to_hsv(r: float, g: float, b: float) -> tuple[float, float, float]:
     """Convert RGB to HSV (Hue, Saturation, Value); H,S ∈ [0,1], V ∈ [0,1]."""
-    maxc: float = r if r >= g else g
-    maxc = maxc if maxc >= b else b
-    minc: float = r if r <= g else g
-    minc = minc if minc <= b else b
+    # (card b557b9c1) n-ary min()/max() now fold ALL args with CPython's
+    # first-wins tie rule, so the former hand-rolled pairwise `>=`/`<=`
+    # ternaries (a deliberate dodge of the 3+-arg silent miscompile) are no
+    # longer needed. Byte-identical for the clamped-[0,1] inputs here.
+    maxc: float = max(r, g, b)
+    minc: float = min(r, g, b)
 
     v: float = maxc
 

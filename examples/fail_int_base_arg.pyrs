@@ -1,0 +1,7 @@
+# NEGATIVE (card aabf4ada): int(x, base) is not supported — pyrst's `int(x)` parses
+# base 10 only. This was a SILENT miscompile surfaced by the variadic-exempt audit:
+# codegen read only args[0] and DROPPED the base, so `int("10", 2)` returned 10 (base
+# 10) instead of CPython's 2. Rejected honestly at check rather than miscompile.
+# (A faithful `int(str, base)` via radix parsing is a documented follow-up feature.)
+def main() -> None:
+    print(int("10", 2))

@@ -1635,27 +1635,38 @@ impl<'a> Codegen<'a> {
                                     format!("{}.iter().cloned().min().unwrap_or_else(|| panic!(\"ValueError\\0min() iterable argument is empty\"))", a)
                                 }));
                             } else {
-                                // (REVIEW FOLLOW-UP on 577b04f, item 4) The 2-arg
-                                // scalar shape bare-moved both args via
-                                // `emit_expr` — fine for a Copy type (int/float),
-                                // but an E0382 use-after-move on reuse for a
-                                // non-Copy arg (str/object). Route through
-                                // `emit_consuming` like every other consuming
-                                // position (a Copy arg is unaffected — its own
-                                // `is_copy_type` check keeps it bare).
-                                let a = self.emit_consuming(&args[0])?;
-                                let b = self.emit_consuming(&args[1])?;
-                                // (W2 card ebd703d9) `::std::cmp::min` needs `Ord`,
-                                // which neither `f64` nor a `__lt__`-only class has —
-                                // both were silent 2-arg build-fails. Route those
-                                // through a FIRST-WINS `<` form (tie keeps the FIRST
-                                // arg, like CPython's `min(a, b)`); Ord scalars
-                                // (int/str/bool) keep the stdlib call.
-                                let arg_ty = self.type_of_expr(&args[0]);
-                                if self.elem_needs_partial_cmp(&arg_ty) {
-                                    return Ok(Some(format!("{{ let __a = {}; let __b = {}; if __b < __a {{ __b }} else {{ __a }} }}", a, b)));
+                                // (card b557b9c1) n-ary min: fold ALL positional
+                                // args left-to-right, FIRST-WINS on ties (replace
+                                // only on a STRICTLY smaller candidate), exactly
+                                // like CPython's `min(a, b, c, ...)`. The prior arm
+                                // consumed ONLY args[0]/args[1] and silently dropped
+                                // args[2..] — a P0 silent miscompile (`min(3,1,2)`
+                                // evaluated as `min(3,1)`). A uniform `<` fold needs
+                                // only `PartialOrd` (not the `Ord` that
+                                // `::std::cmp::min` required), so ONE shape covers
+                                // int / str AND f64 / a `__lt__`-only user class
+                                // (the `__lt__` typeck gate above already rejects a
+                                // class without `__lt__`); it also subsumes the old
+                                // 2-arg partial-cmp special case byte-for-byte. Each
+                                // arg is bound once (`__c`) so a side-effecting or
+                                // expensive arg evaluates exactly once, and is routed
+                                // through `emit_consuming` so a reusable place is
+                                // cloned, not moved (E0382). The RESULT type is the
+                                // (homogeneous) first arg's type — see the min/max
+                                // n-ary arm in `typeck::infer_expr_ty`, which restores
+                                // correct float DISPLAY (`min(1.0,2.0,3.0)` -> 1.0).
+                                let mut parts = Vec::with_capacity(args.len());
+                                for arg in args {
+                                    parts.push(self.emit_consuming(arg)?);
                                 }
-                                return Ok(Some(format!("::std::cmp::min({}, {})", a, b)));
+                                let mut fold = format!("let mut __best = {};", parts[0]);
+                                for p in &parts[1..] {
+                                    fold.push_str(&format!(
+                                        " {{ let __c = {}; if __c < __best {{ __best = __c; }} }}",
+                                        p
+                                    ));
+                                }
+                                return Ok(Some(format!("{{ {} __best }}", fold)));
                             }
                         }
                         "max" => {
@@ -1767,22 +1778,26 @@ impl<'a> Codegen<'a> {
                                     format!("{}.iter().cloned().max().unwrap_or_else(|| panic!(\"ValueError\\0max() iterable argument is empty\"))", a)
                                 }));
                             } else {
-                                // (REVIEW FOLLOW-UP on 577b04f, item 4) See the
-                                // `min` arm above: route both scalar args through
-                                // `emit_consuming` so a non-Copy arg is cloned
-                                // (not moved), fixing E0382 on reuse.
-                                let a = self.emit_consuming(&args[0])?;
-                                let b = self.emit_consuming(&args[1])?;
-                                // (W2 card ebd703d9) See the `min` 2-arg arm: `f64`
-                                // and a `__lt__`-only class are `PartialOrd`, not
-                                // `Ord`. FIRST-WINS `>` form (tie keeps the FIRST
-                                // arg, like CPython's `max(a, b)`); Ord scalars keep
-                                // the stdlib call.
-                                let arg_ty = self.type_of_expr(&args[0]);
-                                if self.elem_needs_partial_cmp(&arg_ty) {
-                                    return Ok(Some(format!("{{ let __a = {}; let __b = {}; if __b > __a {{ __b }} else {{ __a }} }}", a, b)));
+                                // (card b557b9c1) n-ary max: mirror the `min` n-ary
+                                // fold above with a FIRST-WINS `>` comparison — the
+                                // prior arm consumed only args[0]/args[1] and silently
+                                // dropped args[2..] (`max(1,2,3)` evaluated `max(1,2)`
+                                // -> 2). `>` (STRICTLY greater) keeps the EARLIER arg
+                                // on a tie, matching CPython's `max()` (Rust's own
+                                // `::std::cmp::max` keeps the LATER, and needs `Ord`);
+                                // `PartialOrd` covers int/str/f64/`__lt__`-class alike.
+                                let mut parts = Vec::with_capacity(args.len());
+                                for arg in args {
+                                    parts.push(self.emit_consuming(arg)?);
                                 }
-                                return Ok(Some(format!("::std::cmp::max({}, {})", a, b)));
+                                let mut fold = format!("let mut __best = {};", parts[0]);
+                                for p in &parts[1..] {
+                                    fold.push_str(&format!(
+                                        " {{ let __c = {}; if __c > __best {{ __best = __c; }} }}",
+                                        p
+                                    ));
+                                }
+                                return Ok(Some(format!("{{ {} __best }}", fold)));
                             }
                         }
                         "sorted" => {
@@ -1999,22 +2014,64 @@ impl<'a> Codegen<'a> {
                         "sum" => {
                             let a = self.emit_expr(&args[0])?;
                             let arg_ty = self.type_of_expr(&args[0]);
-                            // Determine the sum type based on the iterable's element type
-                            let sum_type = match &arg_ty {
-                                Ty::List(inner) | Ty::Set(inner) | Ty::Iterator(inner) => match inner.as_ref() {
-                                    Ty::Float => "f64",
-                                    _ => "i64",
-                                },
-                                _ => "i64",
+                            // The iterable's element type (float elements sum in f64).
+                            let elem_is_float = matches!(&arg_ty,
+                                Ty::List(inner) | Ty::Set(inner) | Ty::Iterator(inner)
+                                    if matches!(inner.as_ref(), Ty::Float));
+                            // (card aabf4ada) The 2-arg CPython form `sum(iterable,
+                            // start)` folds `start` in as the accumulator SEED. The
+                            // prior arm consumed ONLY args[0] and silently DROPPED the
+                            // start — a P0 miscompile (`sum([1,2,3],10)` -> 6 not 16;
+                            // `sum(gen,100)` -> 14 not 114) of the same
+                            // accept-N-consume-fewer class as the n-ary min/max fix
+                            // (b557b9c1). A 3+-arg call is rejected at typeck (CPython
+                            // TypeError), so args.len() is 1 or 2 here.
+                            let start = if args.len() >= 2 {
+                                let s = self.emit_expr(&args[1])?;
+                                let start_is_float = matches!(self.type_of_expr(&args[1]), Ty::Float);
+                                Some((s, start_is_float))
+                            } else {
+                                None
                             };
-                            // (LAZY-GEN V1-c) A generator source (`Gen<T>`) is
-                            // itself an `Iterator` yielding owned `T` — consume
-                            // it directly (no `.iter()`, `Gen` has none).
-                            if matches!(arg_ty, Ty::Iterator(_)) {
+                            // A FLOAT start promotes an int-element sum to f64
+                            // (CPython: `sum([1,2,3],1.0)` -> 7.0), matching the typeck
+                            // result-type oracle so the print-formatter's DISPLAY type
+                            // agrees. `Iterator::sum::<f64>` has no impl over `&i64`, so
+                            // when promoting int elements we map each element `as f64`
+                            // BEFORE summing.
+                            let result_is_float = elem_is_float
+                                || start.as_ref().is_some_and(|(_, f)| *f);
+                            let sum_type = if result_is_float { "f64" } else { "i64" };
+                            // (LAZY-GEN V1-c) A generator source (`Gen<T>`) is itself an
+                            // `Iterator` yielding OWNED `T` — consume it directly (no
+                            // `.iter()`/deref, `Gen` has none); a list/set is borrowed
+                            // via `.iter()` yielding `&T` (deref before the `as f64`).
+                            let body = if matches!(arg_ty, Ty::Iterator(_)) {
                                 let src = Self::iter_arg_source(&args[0], &a);
-                                return Ok(Some(format!("{}.sum::<{}>()", src, sum_type)));
-                            }
-                            return Ok(Some(format!("{}.iter().sum::<{}>()", a, sum_type)));
+                                if result_is_float && !elem_is_float {
+                                    format!("{}.map(|__x| __x as f64).sum::<f64>()", src)
+                                } else {
+                                    format!("{}.sum::<{}>()", src, sum_type)
+                                }
+                            } else if result_is_float && !elem_is_float {
+                                format!("{}.iter().map(|__x| *__x as f64).sum::<f64>()", a)
+                            } else {
+                                format!("{}.iter().sum::<{}>()", a, sum_type)
+                            };
+                            return Ok(Some(match start {
+                                None => body,
+                                // Coerce an int start to f64 only when the result is
+                                // promoted to float (an already-float start is emitted
+                                // as-is — no redundant cast).
+                                Some((s, start_is_float)) => {
+                                    let seed = if result_is_float && !start_is_float {
+                                        format!("({} as f64)", s)
+                                    } else {
+                                        s
+                                    };
+                                    format!("({} + {})", seed, body)
+                                }
+                            }));
                         }
                         "input" => {
                             if args.is_empty() {

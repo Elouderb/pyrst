@@ -490,7 +490,7 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
                     }
                     "sum" => {
                         // D4: sum() returns the type of the iterable's elements.
-                        if let Some(arg) = args.first() {
+                        let base = if let Some(arg) = args.first() {
                             match infer_expr_ty(arg, locals, ctx) {
                                 Ty::List(inner) => *inner,
                                 Ty::Set(inner) => *inner,
@@ -501,6 +501,22 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
                             }
                         } else {
                             Ty::Int
+                        };
+                        // (card aabf4ada) The 2-arg form `sum(iterable, start)` folds
+                        // the start seed in; a FLOAT start promotes an int-element sum
+                        // to float (CPython: `sum([1,2,3],1.0)` -> 7.0). Report Float
+                        // here so the print-formatter DISPLAYS `7.0`, agreeing with the
+                        // codegen sum arm's own promotion (codegen/exprs.rs). A float
+                        // element with an int start is already Float via `base`.
+                        if args.len() >= 2 {
+                            let start_ty = infer_expr_ty(&args[1], locals, ctx);
+                            if matches!(base, Ty::Float) || matches!(start_ty, Ty::Float) {
+                                Ty::Float
+                            } else {
+                                base
+                            }
+                        } else {
+                            base
                         }
                     }
                     "int" | "len" | "ord" | "round" | "pow" => Ty::Int,
@@ -616,6 +632,17 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
                             Ty::List(elem) | Ty::Set(elem) | Ty::Iterator(elem) => *elem,
                             _ => Ty::Unknown,
                         }
+                    }
+                    // (card b557b9c1) The n-ary scalar form `min(a, b, c, ...)`
+                    // returns one of its (homogeneous) positional args, so the
+                    // result type is the first arg's type. The old path fell through
+                    // to the hardcoded `min`/`max` FuncSig (`ret: Ty::Unknown`),
+                    // which starved the print-formatter of the float type and made
+                    // `max(1.0, 2.0, 3.0)` (and even the 2-arg `max(1.0, 2.0)`)
+                    // display as `2`/`3` instead of `2.0`/`3.0`. Mirrors the codegen
+                    // n-ary fold, which yields exactly this type.
+                    "min" | "max" if args.len() >= 2 => {
+                        infer_expr_ty(&args[0], locals, ctx)
                     }
                     n => {
                         // A class constructor yields an instance; a named user
@@ -1547,6 +1574,77 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                     }
                 }
             }
+            // (card aabf4ada) Honest arity / support gates for VARIADIC-EXEMPT
+            // builtins (typeck skips their arity check, so codegen was silently
+            // consuming FEWER args than typeck accepted — the P0 accept-N-consume-fewer
+            // miscompiles surfaced by THE AUDIT this card demands). Reject the
+            // unsupported shapes HERE (this pass runs for both `pyrst check` and
+            // `pyrst build`), keeping typeck acceptance and codegen consumption in
+            // EXACT agreement — the invariant the n-ary min/max fix (b557b9c1)
+            // established. Each closed leak was probed build+run vs python3:
+            //   sum(it, start, ...) -> `start` now folds in (fixed below); a 3+-arg
+            //     call is CPython TypeError.
+            //   min()/max()         -> CPython "expected at least 1 argument, got 0"
+            //     (was a codegen `parts[0]`-on-empty-vec ICE / exit 101).
+            //   int(x, base)        -> the base was DROPPED (int("10",2) -> 10 not 2).
+            //   open(p, m, extra..) -> the 3rd+ positional (buffering) was DROPPED.
+            //   getattr/setattr/hasattr -> dynamic-attribute stubs that returned the
+            //     NAME string / no-op'd / were always-true (silent WRONG output);
+            //     pyrst resolves attributes STATICALLY, so they have no faithful
+            //     lowering — reject rather than miscompile.
+            // These gates only REJECT; a valid arity falls through UNCHANGED to the
+            // arms below and is result-typed there / by the inference oracle.
+            if let Expr::Ident(bn, _) = callee.as_ref() {
+                match bn.as_str() {
+                    "sum" if args.len() > 2 => {
+                        return Err(Error::Type {
+                            span: *span,
+                            msg: format!(
+                                "sum() takes at most 2 arguments ({} given) — \
+                                 `sum(iterable[, start])`",
+                                args.len()
+                            ),
+                        });
+                    }
+                    "min" | "max" if args.is_empty() => {
+                        return Err(Error::Type {
+                            span: *span,
+                            msg: format!("{}() expected at least 1 argument, got 0", bn),
+                        });
+                    }
+                    "int" if args.len() > 1 => {
+                        return Err(Error::Type {
+                            span: *span,
+                            msg: format!(
+                                "int() with a base argument is not supported ({} arguments \
+                                 given) — pyrst's `int(x)` parses base 10 only",
+                                args.len()
+                            ),
+                        });
+                    }
+                    "open" if args.len() > 2 => {
+                        return Err(Error::Type {
+                            span: *span,
+                            msg: format!(
+                                "open() takes at most 2 positional arguments ({} given) — \
+                                 pyrst supports `open(path[, mode])` only",
+                                args.len()
+                            ),
+                        });
+                    }
+                    "getattr" | "setattr" | "hasattr" => {
+                        return Err(Error::Type {
+                            span: *span,
+                            msg: format!(
+                                "`{}` (dynamic attribute access) is not supported — pyrst \
+                                 resolves attributes statically; use direct field access",
+                                bn
+                            ),
+                        });
+                    }
+                    _ => {}
+                }
+            }
             // Check if this is a class constructor or function call.
             match callee.as_ref() {
                 Expr::Ident(name, _) => {
@@ -1619,9 +1717,8 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                         // Single-iterable min/max: the result is the element type
                         // of the list/set argument. A `key=`/other kwarg may also
                         // be present (e.g. `min(words, key=len)`) — the lone
-                        // positional arg is still the iterable. The 2-arg form
-                        // `min(a, b)` falls through to the generic path below and
-                        // stays Unknown (Rust's std::cmp::min already resolves it).
+                        // positional arg is still the iterable. The 2-arg / n-ary
+                        // scalar form `min(a, b, ...)` is handled by the next arm.
                         let arg_ty = check_expr(&args[0], env)?;
                         // Generics v1: `min`/`max` iterate the argument (and order
                         // its elements) — a bare type variable has neither
@@ -1636,6 +1733,39 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                             Ty::List(elem) | Ty::Set(elem) | Ty::Iterator(elem) => *elem,
                             _ => Ty::Unknown,
                         }
+                    } else if (name == "min" || name == "max") && args.len() >= 2 {
+                        // (card b557b9c1) n-ary scalar form `min(a, b, c, ...)`:
+                        // codegen folds ALL positional args (see codegen/exprs.rs).
+                        // `key=` is meaningful only for the single-iterable form;
+                        // combined with 2+ positional args it has no supported
+                        // lowering (the codegen `key=` arm treats arg0 as an
+                        // iterable), so reject it HONESTLY here rather than leak a
+                        // codegen/rustc error — keeping typeck acceptance and codegen
+                        // consumption in exact agreement.
+                        if kwargs.iter().any(|(k, _)| k == "key") {
+                            return Err(Error::Type {
+                                span: *span,
+                                msg: format!(
+                                    "`{}` with {} positional arguments does not support \
+                                     `key=` (pass a single iterable as `{}(iterable, key=...)`, \
+                                     or drop `key=`)",
+                                    name, args.len(), name
+                                ),
+                            });
+                        }
+                        // Check every argument so its own errors surface; the winner
+                        // is one of the (homogeneous) args, so the result type is the
+                        // first arg's type — restoring correct float DISPLAY that the
+                        // old generic `ret: Unknown` fall-through lost. A `__lt__`-less
+                        // user-class arg was already rejected by the ordering gate above.
+                        let mut result_ty = Ty::Unknown;
+                        for (i, a) in args.iter().enumerate() {
+                            let t = check_expr(a, env)?;
+                            if i == 0 {
+                                result_ty = t;
+                            }
+                        }
+                        result_ty
                     } else if name == "enumerate" && !args.is_empty() {
                         // enumerate(iterable[, start]) -> List(Tuple(Int, elem))
                         // Check all args/kwargs for their own errors first.

@@ -1,0 +1,60 @@
+# parity: dual-run
+# (card b557b9c1) n-ary min()/max(): fold ALL positional arguments left-to-right
+# with CPython's FIRST-WINS tie rule. Regression cover for the P0 silent
+# miscompile where 3+ positional args evaluated only the first two
+# (`max(1, 2, 3)` -> 2, `min(3.0, 1.0, 2.0)` -> 1). Every line below was
+# byte-diffed against python3 3.12: int / float / str n-ary, 4+ args, ties
+# (first-wins, observed through a distinguishable user class), negatives and
+# mixed magnitudes, plus the 2-arg float DISPLAY (`2.0`, not `2`) that shared
+# the same Unknown-result-type root as the n-ary float symptom.
+
+
+class Item:
+    rank: int
+    tag: str
+    def __init__(self, rank: int, tag: str) -> None:
+        self.rank = rank
+        self.tag = tag
+    def __lt__(self, other: Item) -> bool:
+        return self.rank < other.rank
+
+
+def main() -> None:
+    # int: 3, 4, 5, 8 positional args
+    print(max(1, 2, 3))
+    print(min(1, 2, 3))
+    print(max(5, 1, 9, 2, 7))
+    print(min(5, 1, 9, 2, 7))
+    print(max(3, 1, 4, 1, 5, 9, 2, 6))
+
+    # float n-ary: value AND display (must print 3.0, not 3)
+    print(max(1.0, 2.0, 3.0))
+    print(min(3.0, 1.0, 2.0))
+    print(max(0.5, 0.25, 0.75, 0.125))
+    # 2-arg float display (same Unknown-type root as the n-ary float symptom)
+    print(max(1.0, 2.0))
+    print(min(1.0, 2.0))
+
+    # str n-ary (lexicographic)
+    print(max("apple", "banana", "cherry"))
+    print(min("cherry", "apple", "banana"))
+
+    # negatives / mixed magnitudes
+    print(max(-5, -1, -9, -2))
+    print(min(-5, -1, -9, -2))
+    print(max(1000000, 999999, 1000001))
+
+    # ties -> FIRST-WINS, observed through a user class whose equal-rank items
+    # carry distinct tags: three rank-1 items -> the FIRST one is returned.
+    a: Item = Item(1, "first")
+    b: Item = Item(1, "second")
+    c: Item = Item(1, "third")
+    print(min(a, b, c).tag)
+    print(max(a, b, c).tag)
+
+    # user-class n-ary with a tie AT the extreme: two rank-5 items -> the first
+    # rank-5 tag wins for max; two rank-2 items -> the first rank-2 tag for min.
+    hi: Item = max(Item(2, "x"), Item(5, "hiA"), Item(3, "y"), Item(5, "hiB"))
+    lo: Item = min(Item(2, "loA"), Item(5, "z"), Item(2, "loB"))
+    print(hi.rank, hi.tag)
+    print(lo.rank, lo.tag)

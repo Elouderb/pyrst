@@ -1,0 +1,12 @@
+# NEGATIVE (card aabf4ada): setattr() (dynamic attribute access) is not supported —
+# pyrst resolves attributes statically. The old codegen stub was a SILENT miscompile:
+# it emitted `()` (a no-op), so `setattr(c, "x", 9)` left the field UNCHANGED instead
+# of writing it. Rejected honestly at check rather than silently do nothing.
+class C:
+    x: int
+    def __init__(self) -> None:
+        self.x = 1
+def main() -> None:
+    c: C = C()
+    setattr(c, "x", 9)
+    print(c.x)

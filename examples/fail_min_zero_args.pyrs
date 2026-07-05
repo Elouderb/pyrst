@@ -1,0 +1,6 @@
+# NEGATIVE (card aabf4ada): min() with ZERO arguments is a CPython TypeError
+# ("min expected at least 1 argument, got 0"). pyrst formerly ICE'd at build
+# (codegen folded an EMPTY positional list and indexed `parts[0]`, exit 101); it now
+# rejects this HONESTLY at check time.
+def main() -> None:
+    print(min())

@@ -1,0 +1,12 @@
+# NEGATIVE (card aabf4ada): getattr() (dynamic attribute access) is not supported —
+# pyrst resolves attributes statically. The old codegen stub was a SILENT miscompile:
+# it debug-formatted the attribute NAME string and ignored both the object and the
+# default, so `getattr(c, "x")` printed `"x"` instead of the field value. Rejected
+# honestly at check rather than emit garbage.
+class C:
+    x: int
+    def __init__(self) -> None:
+        self.x = 5
+def main() -> None:
+    c: C = C()
+    print(getattr(c, "x"))

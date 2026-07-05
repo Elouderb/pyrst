@@ -1,0 +1,13 @@
+# NEGATIVE (card b557b9c1): the __lt__ ordering gate must fire at N-ARY arity
+# too. n-ary max()/min() over instances of a user class WITHOUT __lt__ (and no
+# key=) is a check error — CPython raises TypeError: '<' not supported between
+# instances. This isolates the 3+-positional-arg path (the 1-arg-list form is
+# covered by fail_minmax_class_no_lt.pyrs) so the gate can never regress to
+# accept-and-miscompile at the arity the P0 fold newly consumes.
+class Node:
+    a: int
+    b: int
+
+def main() -> None:
+    worst: Node = max(Node(2, 1), Node(1, 2), Node(3, 3))
+    print(worst.a)

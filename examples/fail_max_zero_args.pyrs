@@ -1,0 +1,5 @@
+# NEGATIVE (card aabf4ada): max() with ZERO arguments is a CPython TypeError
+# ("max expected at least 1 argument, got 0"). Mirrors fail_min_zero_args — the same
+# codegen empty-fold `parts[0]` ICE (exit 101), now an honest check-time arity error.
+def main() -> None:
+    print(max())

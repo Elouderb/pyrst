@@ -1006,6 +1006,38 @@ def bad(x: int | str) -> str:
         assert_eq!(infer_expr_ty(&attr, &locals, &ctx), Ty::Float);
     }
 
+    #[test]
+    fn sum_two_arg_float_start_promotes_result_type() {
+        // (card aabf4ada) The 2-arg `sum(iterable, start)` result-type oracle: a FLOAT
+        // start promotes an int-element sum to Float (CPython `sum([1,2,3],1.0)` ->
+        // 7.0), so the print-formatter DISPLAYS `.0`, agreeing with codegen's own
+        // promotion. Int elems + int start stay Int; the 1-arg form is unchanged.
+        let ctx = TyCtx::new();
+        let locals = std::collections::HashMap::new();
+        let ints = || Expr::List(vec![int_lit(1), int_lit(2), int_lit(3)], Span::DUMMY);
+        let floats = || Expr::List(vec![float_lit(1.5), float_lit(2.5)], Span::DUMMY);
+        // int elems + FLOAT start -> Float (promotion)
+        assert_eq!(
+            infer_expr_ty(&call_fn("sum", vec![ints(), float_lit(1.0)]), &locals, &ctx),
+            Ty::Float
+        );
+        // float elems + int start -> Float (base is already Float)
+        assert_eq!(
+            infer_expr_ty(&call_fn("sum", vec![floats(), int_lit(1)]), &locals, &ctx),
+            Ty::Float
+        );
+        // int elems + int start -> Int (no promotion)
+        assert_eq!(
+            infer_expr_ty(&call_fn("sum", vec![ints(), int_lit(10)]), &locals, &ctx),
+            Ty::Int
+        );
+        // 1-arg no-start form is unchanged -> Int
+        assert_eq!(
+            infer_expr_ty(&call_fn("sum", vec![ints()]), &locals, &ctx),
+            Ty::Int
+        );
+    }
+
     /// BLOCKER-1 (honest-errors): a module constant whose NAME duplicates a
     /// function is rejected at `check` (constants and functions share a flat
     /// namespace; otherwise the call would route to the mangled const and

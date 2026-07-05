@@ -1,0 +1,7 @@
+# NEGATIVE (card aabf4ada): sum() takes at most 2 arguments — `sum(iterable[, start])`.
+# A 3rd positional arg is a CPython TypeError. pyrst (whose `sum` is variadic-exempt
+# from the generic arity check) formerly ACCEPTED extra args and silently dropped
+# them at codegen; it now rejects this at CHECK time, keeping typeck acceptance and
+# codegen consumption in exact agreement.
+def main() -> None:
+    print(sum([1, 2, 3], 10, 20))

@@ -2,6 +2,30 @@
 
 All notable changes to pyrst are documented here. This project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.3.0] — 2026-07-06
+
+The module-system release: dotted submodules are real, every module gets its own namespace, and the flat-namespace co-import restriction that shipped in 0.2.0 is gone. Every fixed behavior is python3-verified; the stdlib grows from 41 to 44 modules.
+
+### The module system: dotted submodules, per-module namespacing
+
+- **Dotted imports work end-to-end.** `import os.path`, `from urllib.parse import urlparse`, and qualified calls (`os.path.join(...)`) all resolve real submodules — embedded packages (`lib/os/path.pyrs`, `lib/urllib/parse.pyrs`) alongside local user packages. Unresolved dotted imports are now honest check-time errors naming the missing submodule; the old silent truncation (`import os.path` silently typechecking as `import os`, `from os.path import join` silently binding `os.join`) is dead.
+- **Per-module namespacing.** Every module's names emit into their own mangled namespace (`__pyrst_m_<owner>__<name>`) instead of one flat table. This dissolves **all 8 historical co-import restrictions**, each proven by a golden: `operator`+`re`, `html`+`re`, `os`+`shlex`, `re`+`shlex`, `datetime`+`time`, `platform`+`sys`, `copy`+`shutil`. The flat-namespace restriction section and its 8-pair collision table are retired from [PYTHON_COMPATIBILITY.md](PYTHON_COMPATIBILITY.md). Class names remain globally unique (class-vs-class collisions are still a named check-time error) — the one honest limit that remains.
+- **New stdlib: 41 → 44 modules.** A faithful `os.path` (a full posixpath port — `join`/`splitext`/`split`/`normpath`/`abspath`/`relpath`/`expanduser`/the fs predicates — replacing the flat W1 stand-ins, which stay as deprecated aliases for one release); `urllib.parse` (the first non-`os` dotted package: `urlparse`/`urlunparse`/`urljoin` oracled against the RFC 3986 test matrix, `quote`/`unquote`/`urlencode`/`parse_qs`, UTF-8 percent-encoding); `collections.abc` (an honest, zero-runtime-name documentation module — pyrst's ABCs are compile-time-native, so this just explains the mapping).
+
+### Compiler ergonomics
+
+- **Optional narrowing** now covers the negative-guard idiom (`if x is None: return`/`raise`/`continue`/`break`) and `while`-loop traversal (`while cur is not None: ... cur = cur.next` — the linked-list walk), with loop-scoped lifetimes and assignment-kill invalidation so the narrowing can't outlive its guard.
+- **Call-site default-fill uniformity:** constructors, methods, and dataclasses fill trailing defaults exactly like free functions do (`ConfigParser()`, `Fraction(0)`, positional defaults everywhere).
+- **User `__bool__`** is wired into every truthiness context: `if`/`elif`/`while`/`assert`/`not`/`bool()`/`and`/`or`/ternaries/comprehension filters.
+- **`except OSError`** now catches the complete CPython `OSError` family, not just the base class.
+- **Descending ranges work:** `range(10, 0, -1)` iterates like CPython (was silently empty) for both literal and runtime steps; a zero step raises a catchable `ValueError`.
+- CPython-valid 0-argument `int()`/`float()`/`str()`/`bool()`; `enumerate(it, start)`; `list()` over `range`/`enumerate`/`zip`.
+- **Fixed silent miscompiles found en route** (both python3-verified): a bare-lambda parameter shadowing a different-typed outer local silently bound the outer type instead of the parameter's; and, caught by the W3 code review, a cross-module default-argument expression could silently resolve its helper function in the *caller's* module instead of its own, calling the wrong function.
+
+### Quality
+
+- `./test_all.sh`: **436/436 positive examples**, **206/206 negative fixtures** rejected at both `check` and `build`; **572 `cargo test` cases**; 0 compiler warnings. The dual-run parity harness runs 89 parity programs total — **70 byte-identical against `python3`**, 19 documented `# parity: pyrst-only` — on every suite run. 321 import-free goldens were proven byte-identical across the entire module-system refactor by a full emit-diff. As of this release there remain **no known cases where an accepted program produces wrong output**.
+
 ## [0.2.0] — 2026-07-06
 
 The standard-library release: the stdlib grows from 15 to 41 modules, keyword arguments work everywhere, and a second honesty purge closes out the compiler's remaining silent-miscompile classes. Every fixed behavior is python3-verified; the dual-run parity harness now runs 51 programs byte-identical against CPython 3.12 on every suite pass.

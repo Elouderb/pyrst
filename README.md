@@ -31,14 +31,15 @@ def main() -> None:
 - **First-class functions:** lambdas, nested-`def` closures, `Callable[[A], R]` values
 - **Generators** (`yield`), **pattern matching** (`match`/`case`, incl. capture patterns), **exceptions** (`try`/`except`/`finally`/`raise`)
 - **Rust interop (`@extern`):** wrap Rust `std` — and **external crates** (`@crate`) — behind typed pyrst signatures
+- **A real module system:** dotted submodules (`import os.path`, `from urllib.parse import urlparse`), per-module namespacing so same-named top-level exports across modules never collide, and honest check-time errors on unresolved dotted imports
 - **A standard library** written in pyrst + `@extern` (see below)
 - **Editor support:** a language server (`pyrst lsp`) with diagnostics, hover, go-to-definition, completion, and semantic tokens; plus a VS Code extension
 
 ## Status
 
-**v0.2.0.** Full compiler pipeline (lexer → parser → resolver → type checker → Rust codegen → `rustc`), end-to-end.
+**v0.3.0.** Full compiler pipeline (lexer → parser → resolver → type checker → Rust codegen → `rustc`), end-to-end.
 
-`./test_all.sh`: **393/393 positive examples** build + run with matching output, **190/190 negative fixtures** correctly rejected (at both `check` and `build`), plus multi-file import demos. A dual-run parity harness runs 51 programs byte-identical against CPython 3.12 on every suite pass (69 parity files total; 18 documented pyrst-only). **543 in-crate `cargo test` cases**, 0 compiler warnings, CI green. Generators are **lazy** (infinite generators are safe); slice semantics are CPython-exact (verified against python3 on a 5,700+-case oracle); builtin runtime errors are catchable by their Python exception type; emitted Rust is rustfmt-formatted and deterministic. There are **no known cases where an accepted program produces wrong output** — every such bug found by this release's adversarial reviews (including two rounds of str.find byte/char-offset and float-modulo double-rounding fixes) was fixed or is honestly rejected at `check`.
+`./test_all.sh`: **436/436 positive examples** build + run with matching output, **206/206 negative fixtures** correctly rejected (at both `check` and `build`), plus multi-file import demos. A dual-run parity harness runs 70 programs byte-identical against CPython 3.12 on every suite pass (89 parity files total; 19 documented pyrst-only). **572 in-crate `cargo test` cases**, 0 compiler warnings, CI green. Generators are **lazy** (infinite generators are safe); slice semantics are CPython-exact (verified against python3 on a 5,700+-case oracle); builtin runtime errors are catchable by their Python exception type; emitted Rust is rustfmt-formatted and deterministic. There are **no known cases where an accepted program produces wrong output** — every such bug found by this release's adversarial reviews (including a bare-lambda parameter shadowing an outer local, and a cross-module default-argument helper resolving in the wrong module) was fixed or is honestly rejected at `check`.
 
 pyrst is **not** a Python-compatible subset or a Python runtime — it's its own statically typed language with Python-flavored syntax.
 
@@ -88,6 +89,7 @@ pyrst lsp                  # language server (stdin/stdout, for editors)
 - **`@extern`:** bind a Rust expression template behind a typed pyrst signature
 - **`@crate("name", "ver")`:** depend on an external crate (the build switches to a Cargo project); names/versions are validated to prevent `Cargo.toml` injection
 - Multi-file programs (`import` / `from … import`), a **44-module embedded standard library** (see below) including dotted submodules (`import os.path`, `import urllib.parse`), circular-import detection
+- **Per-module namespacing:** every module's names emit into their own namespace, so two modules exporting the same top-level name can be co-imported freely (`operator`+`re`, `os`+`shlex`, `datetime`+`time`, and every other former colliding pair now compile together); only same-named *classes* across modules remain a named check-time error
 
 ## Standard library
 
@@ -99,7 +101,7 @@ Both `import math; math.sqrt(x)` and `from math import sqrt` forms work, includi
 
 By design (see [SPEC.md](SPEC.md) / [PYTHON_COMPATIBILITY.md](PYTHON_COMPATIBILITY.md)): not Python-compatible; multiple inheritance, metaclasses, dynamic attribute access, `eval`/`exec`, and shared-mutable aliasing (`Rc`/`RefCell`) are out.
 
-Current v0.2.0 gaps (tracked, with workarounds):
+Current v0.3.0 gaps (tracked, with workarounds):
 - **Generators (`yield`) are lazy**, but a few shapes are deferred: `Iterator[T]` as a *parameter* type, generator **methods** (`yield` in a class method), `yield` inside `try`/`except`/`finally`, nested generator `def`s, generator expressions (`(x for x in ...)`), and explicit `next(g)`. Every non-lazy consumption (`len`/`gen[i]`/slicing/`reversed`/`str`/binops/`x in gen`/passing a generator where `list[T]` is required) is an honest `pyrst check` error suggesting `list(gen)` to materialize — see [PYTHON_COMPATIBILITY.md](PYTHON_COMPATIBILITY.md#generators-yield).
 - **Generic classes** can't be instantiated via a *qualified* name (`collections.deque[int]()`); use a flat import (`from collections import deque; d: deque[int] = deque()`).
 - **Generic methods inside a class** (`def m[U](self)`) are not yet supported (top-level generic functions are).

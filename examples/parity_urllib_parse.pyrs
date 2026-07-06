@@ -1,0 +1,156 @@
+# DUAL-RUN parity (card a7488511, W3-4): urllib.parse — the FIRST non-`os`
+# dotted stdlib PACKAGE. Every line below is byte-checked against a live
+# python3. See lib/urllib/parse.pyrs header + notes.md for the full oracle
+# transcript, fidelity score, and documented divergences.
+#
+# HARDENING PASS (W3-4-hardener): added edge/adversarial coverage beyond the
+# writer's original golden — empty/query-only/fragment-only urlparse inputs,
+# mailto:/file:// schemes, IPv6-bracket netloc, non-ASCII scheme-char
+# rejection (the one real bug this pass found+fixed, see notes.md), the full
+# RFC 3986 §5.4.2 "abnormal examples" resolution matrix, and an astral
+# (non-BMP) quote/unquote round trip.
+
+from urllib.parse import urlparse
+from urllib.parse import urlunparse
+from urllib.parse import urljoin
+from urllib.parse import quote
+from urllib.parse import quote_plus
+from urllib.parse import unquote
+from urllib.parse import unquote_plus
+from urllib.parse import urlencode
+from urllib.parse import parse_qs
+from urllib.parse import parse_qsl
+
+
+def main() -> None:
+    # --- urlparse / ParseResult / geturl ---
+    r1 = urlparse("http://user:pass@host.com:8080/path;params?query=1#frag")
+    print(r1.scheme)     # http
+    print(r1.netloc)     # user:pass@host.com:8080
+    print(r1.path)       # /path
+    print(r1.params)     # params
+    print(r1.query)      # query=1
+    print(r1.fragment)   # frag
+    print(r1.geturl())   # http://user:pass@host.com:8080/path;params?query=1#frag
+
+    r2 = urlparse("/just/a/path")
+    print(r2.scheme)     # (empty)
+    print(r2.path)       # /just/a/path
+    print(r2.geturl())   # /just/a/path
+
+    r3 = urlparse("HTTP://EXAMPLE.com/Path")
+    print(r3.scheme)     # http
+    print(r3.netloc)     # EXAMPLE.com
+
+    r4 = urlparse("scheme:opaque;params")
+    print(r4.scheme)     # scheme
+    print(r4.path)       # opaque;params
+    print(r4.params)     # (empty)
+
+    r5 = urlparse("//example.com/path")
+    print(r5.netloc)     # example.com
+    print(r5.geturl())   # //example.com/path
+
+    # --- urlunparse (list form) ---
+    parts: list[str] = ["https", "example.com", "/a/b", "", "x=1", "top"]
+    print(urlunparse(parts))   # https://example.com/a/b?x=1#top
+
+    # --- urljoin (RFC 3986 resolution matrix) ---
+    base: str = "http://a/b/c/d;p?q"
+    print(urljoin(base, "g"))                # http://a/b/c/g
+    print(urljoin(base, "./g"))              # http://a/b/c/g
+    print(urljoin(base, "g/"))               # http://a/b/c/g/
+    print(urljoin(base, "/g"))                # http://a/g
+    print(urljoin(base, "//g"))              # http://g
+    print(urljoin(base, "?y"))                # http://a/b/c/d;p?y
+    print(urljoin(base, "#s"))                # http://a/b/c/d;p?q#s
+    print(urljoin(base, ""))                  # http://a/b/c/d;p?q
+    print(urljoin(base, "."))                 # http://a/b/c/
+    print(urljoin(base, ".."))                # http://a/b/
+    print(urljoin(base, "../.."))             # http://a/
+    print(urljoin(base, "../../../g"))        # http://a/g
+    print(urljoin(base, "/./g"))              # http://a/g
+    print(urljoin(base, "/../g"))             # http://a/g
+    print(urljoin(base, "g/./h"))             # http://a/b/c/g/h
+    print(urljoin(base, "g/../h"))            # http://a/b/c/h
+    print(urljoin(base, "https://x/y"))       # https://x/y
+    print(urljoin("", "http://a/b"))          # http://a/b
+    print(urljoin("http://a/b", ""))          # http://a/b
+
+    # --- quote / quote_plus / unquote / unquote_plus ---
+    print(quote("a b/c?d=1"))                 # a%20b/c%3Fd%3D1
+    print(quote("héllo"))                     # h%C3%A9llo
+    print(quote("~_.-ABCabc123", safe=""))    # ~_.-ABCabc123
+    print(quote("100% sure"))                 # 100%25%20sure
+    print(quote_plus("a b+c"))                # a+b%2Bc
+    print(quote_plus("a b+c", safe="+"))      # a+b+c
+    print(quote_plus("hello world"))          # hello+world
+    print(unquote("100%"))                    # 100%
+    print(unquote("%"))                       # %
+    print(unquote("%2"))                      # %2
+    print(unquote("%zz"))                     # %zz
+    print(unquote("%e4%bd%a0"))                # 你
+    print(unquote("%C3%A9"))                   # é
+    print(unquote("a%20b"))                    # a b
+    print(unquote_plus("a+b%20c"))             # a b c
+    print(unquote("%E4%BD%A0%E5%A5%BD"))       # 你好
+
+    # --- urlencode (single-key dicts to dodge the sorted-order divergence) ---
+    d1: dict[str, str] = {"a": "1"}
+    print(urlencode(d1))                       # a=1
+    d2: dict[str, str] = {"name": "john doe"}
+    print(urlencode(d2))                       # name=john+doe
+
+    # --- parse_qs / parse_qsl ---
+    print(parse_qsl("a=1&b=2"))                        # [('a', '1'), ('b', '2')]
+    print(parse_qsl("a=1&b=&c=3"))                      # [('a', '1'), ('c', '3')]
+    print(parse_qsl("a=1&b&c=3"))                       # [('a', '1'), ('c', '3')]
+    print(parse_qsl("name=%E4%BD%A0%E5%A5%BD&x=a+b"))   # [('name', '你好'), ('x', 'a b')]
+    qs_dict = parse_qs("a=1&a=2&b=3")
+    print(qs_dict["a"])                        # ['1', '2']
+    print(qs_dict["b"])                        # ['3']
+
+    # --- HARDENING: urlparse edge/adversarial inputs ---
+    print(urlparse("").scheme)                          # (empty)
+    print(urlparse("#frag").fragment)                    # frag
+    print(urlparse("?q=1").query)                        # q=1
+    print(urlparse("mailto:user@example.com").scheme)    # mailto
+    print(urlparse("mailto:user@example.com").path)      # user@example.com
+    print(urlparse("file:///etc/passwd").netloc)          # (empty)
+    print(urlparse("file:///etc/passwd").path)            # /etc/passwd
+    print(urlparse("http://[::1]:8080/x").netloc)         # [::1]:8080
+    print(urlparse("http:").scheme)                       # http
+    print(urlparse("http:").path)                         # (empty)
+    # non-ASCII scheme char: CPython's scheme_chars is ASCII-only, so a
+    # scheme containing a non-ASCII letter is NOT extracted (whole string
+    # falls through to `path` with an empty scheme) — hardening-pass fix.
+    print(urlparse("httpā://example.com/x").scheme)       # (empty)
+    print(urlparse("httpā://example.com/x").path)         # httpā://example.com/x
+    print(urlparse("1http://example.com/x").scheme)       # (empty, digit can't start a scheme)
+
+    # --- HARDENING: urljoin RFC 3986 §5.4.2 "abnormal examples" ---
+    base2: str = "http://a/b/c/d;p?q"
+    print(urljoin(base2, "../../../g"))       # http://a/g
+    print(urljoin(base2, "../../../../g"))    # http://a/g
+    print(urljoin(base2, "/./g"))             # http://a/g
+    print(urljoin(base2, "/../g"))            # http://a/g
+    print(urljoin(base2, "g."))               # http://a/b/c/g.
+    print(urljoin(base2, ".g"))               # http://a/b/c/.g
+    print(urljoin(base2, "g.."))              # http://a/b/c/g..
+    print(urljoin(base2, "..g"))              # http://a/b/c/..g
+    print(urljoin(base2, "./../g"))           # http://a/b/g
+    print(urljoin(base2, "./g/."))            # http://a/b/c/g/
+    print(urljoin(base2, "g/./h"))            # http://a/b/c/g/h
+    print(urljoin(base2, "g/../h"))           # http://a/b/c/h
+    print(urljoin(base2, "g;x=1/./y"))        # http://a/b/c/g;x=1/y
+    print(urljoin(base2, "g;x=1/../y"))       # http://a/b/c/y
+    print(urljoin(base2, "g?y/./x"))          # http://a/b/c/g?y/./x
+    print(urljoin(base2, "g?y/../x"))         # http://a/b/c/g?y/../x
+    print(urljoin(base2, "g#s/./x"))          # http://a/b/c/g#s/./x
+    print(urljoin(base2, "g#s/../x"))         # http://a/b/c/g#s/../x
+
+    # --- HARDENING: astral (non-BMP) codepoint round trip ---
+    astral: str = "😀🚀A_b~-.é"
+    q_astral: str = quote(astral)
+    print(q_astral)               # %F0%9F%98%80%F0%9F%9A%80A_b~-.%C3%A9
+    print(unquote(q_astral))      # 😀🚀A_b~-.é

@@ -9,6 +9,12 @@
 # basename/dirname are faithful posixpath ports (the exact python3-verified string
 # logic re-homed from lib/os.pyrs); isabs is the trivial posixpath predicate. The
 # edge matrix mirrors parity_os.pyrs's posixpath string-logic matrix.
+#
+# W3-4 (card a7488511) extends this same dual-run golden with the PURE
+# additions to os.path: split, splitext, normpath, relpath. (join/exists/
+# isfile/isdir/abspath/expanduser are @extern-backed and get their own
+# pyrst-only golden, examples/parity_os_path_extern.pyrs — see that file's
+# header.) Every new line below is python3-oracled (see the card's notes.md).
 
 import os.path
 
@@ -22,3 +28,35 @@ def main() -> None:
     abs_cases: list[str] = ["/x", "x", "/", "", "a/b", "//y", "./z"]
     for ap in abs_cases:
         print(os.path.isabs(ap))
+
+    # split(p) == (dirname(p), basename(p)) -- same edge matrix as above.
+    for ep in edges:
+        d, b = os.path.split(ep)
+        print(d + "|" + b)
+
+    # splitext -- genericpath._splitext edge matrix (leading dots, multi-dot,
+    # no dot, dot-only names, trailing dot).
+    ext_cases: list[str] = ["a.txt", "a.tar.gz", ".bashrc", "a.", ".", "..", "a", "", "foo/bar.txt", "foo/.bashrc", "foo/..bashrc", "foo.bar/baz", "a..b", "...", "foo/bar.", "a/b.c.d"]
+    for xc in ext_cases:
+        root, ext = os.path.splitext(xc)
+        print(root + "|" + ext)
+
+    # normpath -- the dot-dot / leading-slash-count algorithm.
+    norm_cases: list[str] = ["a/b/../c", "./a/b", "../a", "a/./b", "a/../..", "/../a", "//../a", "a//b//c", "", "..", "/./", "a/b/../../..", "/a/b/../..", ".", "./", "///a/../b", "a/b/./../c/", "////", "/", "//", "///", "a", "a/"]
+    for nc in norm_cases:
+        print(os.path.normpath(nc))
+
+    # relpath -- both arguments already ABSOLUTE (the documented divergence
+    # from CPython's cwd-resolving default; see lib/os/path.pyrs's header).
+    rel_cases: list[tuple[str, str]] = [
+        ("/a/b/c", "/a/b"),
+        ("/a/b", "/a/b/c"),
+        ("/a/b/c", "/a/b/c"),
+        ("/a/b", "/a/b"),
+        ("/", "/a/b"),
+        ("/a/b", "/"),
+        ("/x/y", "/a/b"),
+        ("/a/./b", "/a/b/../c"),
+    ]
+    for rc_path, rc_start in rel_cases:
+        print(os.path.relpath(rc_path, rc_start))

@@ -1,0 +1,119 @@
+# collections.abc — pyrst embedded submodule (W3-4, card a7488511).
+#
+# FIDELITY: 0/5 as a runtime reimplementation — BY DESIGN, not by gap. This
+# file defines NO runtime names. It exists purely so `import collections.abc`
+# (a dotted submodule, registered under the key "collections.abc" in
+# `src/stdlib.rs`, directory layout `lib/collections/abc.pyrs` matching
+# CPython's `collections/abc.py`) resolves and typechecks instead of failing
+# with an honest `ImportNotFound` — see the precedent `lib/dataclasses.pyrs`
+# ("this file intentionally defines NO runtime names") for the same shape of
+# decision, reached the same way: probe what the module could honestly BE
+# before writing a single line of library code.
+#
+# THE ANALYSIS (probed against python3 3.12.9, the oracle, not memory):
+#
+# CPython's `collections.abc` exports 25 names (`sorted(collections.abc.__all__)`):
+# Container, Hashable, Iterable, Iterator, Reversible, Generator, Sized,
+# Callable, Collection, Set, MutableSet, Mapping, MutableMapping,
+# MappingView, KeysView, ItemsView, ValuesView, Sequence, MutableSequence,
+# ByteString, Buffer, Awaitable, Coroutine, AsyncIterable, AsyncIterator,
+# AsyncGenerator. Every one of them is built on TWO runtime mechanisms pyrst
+# does not have:
+#
+#   1. STRUCTURAL `isinstance()` via `ABCMeta.__subclasshook__` / `.register()`.
+#      Oracled: `isinstance(Foo(), abc.Sized)` is `True` for ANY class that
+#      merely happens to define `__len__`, with no explicit subclassing
+#      declared — a duck-typed runtime membership test over arbitrary values.
+#      pyrst's `isinstance()` "compiles but has limited utility under static
+#      typing" (`PYTHON_COMPATIBILITY.md`) — there is no runtime type registry
+#      to query, because pyrst resolves what a value structurally IS entirely
+#      at COMPILE time (the checker already knows every value's exact static
+#      type; there is nothing left for a runtime `isinstance` to discover). A
+#      `collections.abc.Sized`/`Iterable`/`Mapping` "class" with an `isinstance`
+#      that always returns whatever the checker already proved, or worse,
+#      always `True`/`False` regardless of the argument, would be exactly the
+#      "fake it" failure mode this analysis exists to reject.
+#
+#   2. ABSTRACT-METHOD ENFORCEMENT via `ABCMeta` at instantiation. Oracled:
+#      `class MyIter(Iterable): pass; MyIter()` raises `TypeError: Can't
+#      instantiate abstract class MyIter without an implementation for
+#      abstract method '__iter__'`. pyrst has no metaclasses
+#      (`PYTHON_COMPATIBILITY.md`: "Metaclasses — Not supported"), no
+#      `@abstractmethod`, and no multiple inheritance (single inheritance
+#      only) — so a class literally cannot "subclass" one of these ABCs the
+#      way CPython classes do, and there is no compiler hook to reject an
+#      incomplete implementation at construction the way `ABCMeta` does.
+#
+# Neither mechanism is a gap pyrst plans to close (both are correctly-scoped
+# NOT SUPPORTED per `PYTHON_COMPATIBILITY.md`'s "Abstract base classes" row),
+# so a library-only `collections/abc.pyrs` cannot honestly reproduce either
+# one — this is the dataclasses.pyrs precedent's reasoning class exactly:
+# "defining them would be exactly the fake-it failure mode this module is
+# meant to avoid."
+#
+# THE KEYSTONE POINT, though, is that pyrst does not NEED runtime ABCs for
+# the same reason it does not need runtime `isinstance`: every one of the 25
+# names above exists in CPython to describe a SHAPE that pyrst's static type
+# system already enforces structurally, at compile time, for free:
+#
+#   CPython collections.abc name  | pyrst static equivalent (compile-time-native)
+#   -------------------------------|-----------------------------------------------
+#   Iterable, Iterator             | `Iterator[T]`-returning generator functions
+#                                   | (`yield`); `for x in v` over any of pyrst's
+#                                   | built-in iterables (list/dict/set/str/range).
+#   Sequence, MutableSequence      | `list[T]` (already mutable — no separate
+#                                   | "Mutable" variant needed; value semantics
+#                                   | mean there is no aliasing distinction to
+#                                   | protect against).
+#   Mapping, MutableMapping        | `dict[K, V]` (same "already mutable" point).
+#   Set, MutableSet                | `set[T]` (same "already mutable" point).
+#   Hashable                       | the compiler's own derived `Hash` bound: a
+#                                   | class used as a dict key / set element with
+#                                   | all-hashable fields derives `Eq + Hash + Ord`
+#                                   | automatically (`PYTHON_COMPATIBILITY.md`
+#                                   | "Class instances as dict keys / set elements").
+#   Sized                          | the `len()` builtin, which only compiles
+#                                   | against a type the checker already knows has
+#                                   | a length (list/dict/set/str/tuple, or a class
+#                                   | with `__len__`) — an honest compile error
+#                                   | otherwise, not a runtime `AttributeError`.
+#   Callable                       | `Callable[[Arg, ...], Ret]` — a REAL,
+#                                   | already-parsed first-class function type
+#                                   | (`src/parser.rs` `parse_callable_type`),
+#                                   | monomorphized when generic (recent fix:
+#                                   | "monomorphize generic Callable[[T],..]
+#                                   | params"). No import needed — like
+#                                   | `Optional`/`list`/`dict`, it is recognized
+#                                   | directly as type syntax.
+#   Container (the `in` operator)  | dunder-based: a class opts in by defining
+#                                   | `__contains__`/`__eq__`; built-ins
+#                                   | (list/dict/set/str) already support `in`.
+#                                   | There is no separate "Container" TYPE to
+#                                   | name — `in` either typechecks against the
+#                                   | operand's static type or it doesn't.
+#   Collection (Sized+Iterable+    | the intersection of the rows above — every
+#     Container)                   | pyrst built-in collection already satisfies
+#                                   | all three structurally; nothing to name.
+#
+# NO equivalent exists (and none is a near-term goal) for: Reversible (no
+# `reversed()` protocol over a user class), Generator's full send/throw/close
+# surface (pyrst generators are yield-only, no two-way channel), MappingView /
+# KeysView / ItemsView / ValuesView (dict has no live "view" objects — `.keys()`
+# /`.items()`/`.values()` return materialized lists), ByteString / Buffer (no
+# `bytes` support at all — a documented mandatory-typing-era divergence), and
+# the entire Awaitable/Coroutine/AsyncIterable/AsyncIterator/AsyncGenerator
+# family (no `async`/`await` — "Not in current roadmap",
+# `PYTHON_COMPATIBILITY.md`).
+#
+# THE CALL: ship this as a real, dotted-registered, ZERO-runtime-name module
+# (not a hard resolver skip like `dataclasses`) — `import collections.abc`
+# typechecks and runs (see `examples/parity_collections_abc.pyrs`), and
+# `from collections.abc import Iterable` (or any of the 25 names) is an
+# honest compile-time "no such name" error, exactly as it should be: pyrst
+# has nothing dynamic to hand back for that name, and pretending otherwise
+# would be the fake-it failure mode. This differs from `dataclasses.pyrs`
+# only in WHY the module is inert — dataclasses is inert because its
+# companions are compiler-reflection-shaped gaps that may close later;
+# collections.abc is inert because runtime ABCs are not pyrst's model AT
+# ALL — the static type system already IS the answer, permanently, by
+# design, not by an interim gap.

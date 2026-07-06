@@ -87,11 +87,11 @@ pyrst lsp                  # language server (stdin/stdout, for editors)
 **Interop & modules**
 - **`@extern`:** bind a Rust expression template behind a typed pyrst signature
 - **`@crate("name", "ver")`:** depend on an external crate (the build switches to a Cargo project); names/versions are validated to prevent `Cargo.toml` injection
-- Multi-file programs (`import` / `from … import`), a **41-module embedded standard library** (see below), circular-import detection
+- Multi-file programs (`import` / `from … import`), a **44-module embedded standard library** (see below) including dotted submodules (`import os.path`, `import urllib.parse`), circular-import detection
 
 ## Standard library
 
-**41 modules**, written in pyrst (pure pyrst and/or `@extern`), embedded in the compiler binary and resolved on `import` — no filesystem install, no package manager. Highlights: `math`/`statistics`/`fractions`, `os`/`pathlib`/`shutil`/`tempfile`/`filecmp`, `datetime`/`calendar`/`time`, `collections`/`itertools`/`heapq`/`bisect`/`graphlib`, `re`/`json`/`csv`/`configparser`/`html`/`shlex`/`fnmatch`, `io` (`StringIO`), `dataclasses`/`enum`/`copy`/`reprlib`/`pprint`, and a seedable `random.Random` whose output is **byte-identical to CPython** (MT19937 with CPython's exact derivation chain — `Random(42)` matches `python3` seed-for-seed).
+**44 modules**, written in pyrst (pure pyrst and/or `@extern`), embedded in the compiler binary and resolved on `import` — no filesystem install, no package manager. Highlights: `math`/`statistics`/`fractions`, `os`/`os.path`/`pathlib`/`shutil`/`tempfile`/`filecmp`, `datetime`/`calendar`/`time`, `collections`/`itertools`/`heapq`/`bisect`/`graphlib`, `re`/`json`/`csv`/`configparser`/`html`/`shlex`/`fnmatch`/`urllib.parse`, `io` (`StringIO`), `dataclasses`/`enum`/`copy`/`reprlib`/`pprint`, and a seedable `random.Random` whose output is **byte-identical to CPython** (MT19937 with CPython's exact derivation chain — `Random(42)` matches `python3` seed-for-seed). Dotted submodules resolve as real package modules (W3): `import os.path` / `from urllib.parse import urlparse` work; note `import os` does not auto-expose `os.path` — import the submodule explicitly.
 
 Both `import math; math.sqrt(x)` and `from math import sqrt` forms work, including for generic stdlib functions (`import heapq; heapq.heappush(h, x)`). Each module carries a fidelity score and a dual-run parity golden (verified byte-for-byte against real `python3` where the surface is compatible) — see [PYTHON_COMPATIBILITY.md](PYTHON_COMPATIBILITY.md#standard-library) for the full module-by-module matrix (fidelity, surface, and divergences) rather than duplicating it here.
 

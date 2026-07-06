@@ -14,18 +14,19 @@
 # `ValueError`/`OverflowError` messages for every validated edge in the
 # dossier's ERRORS section. NO timezone support anywhere (see TZINFO_GATE).
 #
-# ── NAME COLLISION (documented, permanent — matches the card's warning) ────
-# `class time` (this module) collides with the TOP-LEVEL `def time()` in
-# `lib/time.pyrs` — pyrst's module namespace is FLAT (resolver
-# `detect_cross_module_collisions`, same class of restriction as an
-# operator/re-style name clash). A program that does `import time` AND
-# `import datetime` (or `from datetime import time` alongside `import time`)
-# gets a compile-time error: "name `time` is provided by both `time` and
-# `datetime`". Workaround: import only one of the two in a given program, or
-# alias at the call site is not available (pyrst has no `import x as y`) —
-# use qualified `datetime.time(...)` and avoid importing the `time` module in
-# the same file, or vice versa. Not a bug: an unavoidable flat-namespace
-# consequence, same shape as the pre-existing operator/re precedent.
+# ── NAME COLLISION — LIFTED by W3-2 per-module namespacing (historical) ────
+# `class time` (this module) shares its name with the TOP-LEVEL `def time()`
+# in `lib/time.pyrs`. Under the old FLAT module namespace this was a hard
+# co-import error (resolver `detect_cross_module_collisions`, same class of
+# restriction as the old operator/re clash). W3-2 narrowed that stopgap to
+# CLASS-vs-CLASS only, and owner-first checking lets a module's own fn shadow
+# a foreign same-named class — so `import time` AND `import datetime` in the
+# same program now co-import cleanly (proven by
+# examples/coimport_datetime_time.pyrs; qualified `time.time()` works in both
+# import orders). The remaining limit is the qualified-class-ctor gap:
+# `datetime.time(9, 30)` — constructing the CLASS through the qualified form —
+# is still unsupported (use `from datetime import time` construction instead);
+# see docs/design/w3-modules.md.
 #
 # ── DIVERGENCES (all honest, none silent) ───────────────────────────────────
 #
@@ -50,10 +51,11 @@
 #
 # 2. STRUCT_TIME_GATE: `timetuple()`/`utctimetuple()` are NOT implemented on
 #    `date`/`datetime` (dossier-gated). Implementing them would need
-#    `time.struct_time`, and importing `lib/time.pyrs` from this module would
-#    make the `class time` / `def time()` collision fire INSIDE this module's
-#    own compile, not just at a downstream co-import — so it is skipped
-#    entirely rather than partially faked.
+#    `time.struct_time` from `lib/time.pyrs`. (Historical note: this gate was
+#    originally forced by the flat-namespace `class time` / `def time()`
+#    collision, which W3-2's per-module namespacing has since lifted — but the
+#    cross-module dependency remains unimplemented, so the gate stands and the
+#    methods are skipped entirely rather than partially faked.)
 #
 # 3. CLASSMETHOD_GATE — mostly a non-issue for `date`/`time`/`timedelta`:
 #    pyrst has no `@classmethod`, but every dossier "classmethod" on THOSE
@@ -982,10 +984,11 @@ class date:
 
 
 class time:
-    # (NAME COLLISION — see module header) This class shares the name
-    # `time` with the top-level `def time()` in `lib/time.pyrs`; co-importing
-    # both modules is a compile-time error. Kept as the exact CPython name
-    # per the card's instruction (documented, not a bug).
+    # (NAME COLLISION — LIFTED, see module header) This class shares the name
+    # `time` with the top-level `def time()` in `lib/time.pyrs`; since W3-2
+    # per-module namespacing the two CO-IMPORT cleanly (class-vs-fn is legal;
+    # examples/coimport_datetime_time.pyrs). Kept as the exact CPython name
+    # per the card's instruction.
     hour: int
     minute: int
     second: int
@@ -1333,10 +1336,10 @@ class datetime:
 # `datetime` module", fails to find one (it's a class method), and rejects
 # with "module `datetime` has no function `foo`", even though `foo` is a
 # perfectly good static method on the class. This is DISTINCT from the
-# `class time` / `def time()` name COLLISION documented at the top of this
-# file (that one is a hard resolver error only on co-import of two files
-# sharing a top-level name); this one fires unconditionally, every time,
-# for THIS class alone, because it IS its own module.
+# `class time` / `def time()` name collision documented at the top of this
+# file (that one was a co-import-only resolver error, LIFTED by W3-2); this
+# one fires unconditionally, every time, for THIS class alone, because it IS
+# its own module.
 #
 # Workaround (this is the one place in this module where the public surface
 # genuinely cannot keep CPython's call shape): every `datetime` "classmethod"

@@ -1,9 +1,22 @@
 # pyrst standard library — os
 #
+# *** DEPRECATION NOTE (card a7488511, W3-4) ***
+# `os.path` now exists as a real, faithful, DOTTED submodule
+# (`lib/os/path.pyrs`, `import os.path` / `from os.path import join`) — see
+# that file's header for its full surface (join/basename/dirname/isabs/split/
+# splitext/normpath/relpath/abspath/exists/isfile/isdir/expanduser). The
+# path-shaped names on THIS flat `os` module (`basename`, `dirname`, `join`,
+# `path_exists`, `isfile`, `isdir`) are now DEPRECATED ALIASES, kept
+# byte-for-byte UNCHANGED for one release for backward compatibility with
+# existing `from os import join` call sites. New code should
+# `from os.path import join` (etc.) instead. Do not add further path-shaped
+# surface here — extend `os.path` instead.
+#
 # Fidelity-upgrade pass (card 97260dad, docs/design/stdlib-full.md §D row
 # "os"): fidelity score 3.5/5 (W1.5: basename/dirname are now CPython
 # posixpath-exact pure string logic; flat names — no os.path namespace — stay
-# the G3 gap). A handful of deterministic `@extern` bindings
+# the G3 gap, now closed by the sibling `os.path` submodule above). A handful
+# of deterministic `@extern` bindings
 # over Rust std (`std::env`, `std::path`, `std::fs`, `std::process`) plus one
 # `@crate("getrandom", ...)` binding for `urandom`. This file is EMBEDDED into
 # the pyrst compiler binary via `include_str!` (see `src/stdlib.rs`), so it

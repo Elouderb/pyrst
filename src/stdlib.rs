@@ -24,14 +24,27 @@
 /// time, so this map is fully static (no filesystem read at runtime).
 pub const EMBEDDED_STDLIB: &[(&str, &str)] = &[
     ("os", include_str!("../lib/os.pyrs")),
-    // (W3-3) DOTTED submodule key: `import os.path` / `from os.path import …`
-    // resolves this embedded package module (directory layout `lib/os/path.pyrs`,
-    // keyed by the dotted id `"os.path"`). `os` (a plain module, `lib/os.pyrs`) and
-    // `os.path` (a distinct submodule) coexist on disk exactly as in CPython, and
-    // are independent imports — `import os` does NOT expose `os.path` (explicit
-    // import required, a documented honest v1 divergence). W3-4 fills out the full
-    // faithful `os.path`; this is the minimal real module (basename/dirname/isabs).
+    // (W3-3, filled out W3-4 card a7488511) DOTTED submodule key: `import os.path` /
+    // `from os.path import …` resolves this embedded package module (directory
+    // layout `lib/os/path.pyrs`, keyed by the dotted id `"os.path"`). `os` (a plain
+    // module, `lib/os.pyrs`) and `os.path` (a distinct submodule) coexist on disk
+    // exactly as in CPython, and are independent imports — `import os` does NOT
+    // expose `os.path` (explicit import required, a documented honest v1
+    // divergence). W3-4 filled this out to the full faithful `os.path` port
+    // (join/basename/dirname/isabs/split/splitext/normpath/relpath/abspath/exists/
+    // isfile/isdir/expanduser) — see lib/os/path.pyrs's header.
     ("os.path", include_str!("../lib/os/path.pyrs")),
+    // (W3-4, card a7488511) `urllib.parse` — the FIRST non-`os` dotted stdlib
+    // PACKAGE: directory layout `lib/urllib/parse.pyrs`, keyed by the dotted
+    // id "urllib.parse". `import urllib.parse` / `from urllib.parse import
+    // urlparse` / `urllib.parse.urlparse(...)` all resolve per the W3 design.
+    // Pure pyrst (no `@extern`, no `@crate`): RFC 3986 urlparse/urlunparse/
+    // urljoin, percent-encoding quote/quote_plus/unquote/unquote_plus (hand-
+    // rolled UTF-8 byte encode/decode — pyrst has no `bytes` type), and
+    // urlencode/parse_qs/parse_qsl. See lib/urllib/parse.pyrs header for the
+    // fidelity score and documented divergences (dict-order urlencode, no
+    // qualified dotted-class construction, etc).
+    ("urllib.parse", include_str!("../lib/urllib/parse.pyrs")),
     ("time", include_str!("../lib/time.pyrs")),
     ("operator", include_str!("../lib/operator.pyrs")),
     ("functools", include_str!("../lib/functools.pyrs")),
@@ -52,6 +65,25 @@ pub const EMBEDDED_STDLIB: &[(&str, &str)] = &[
     ("bisect", include_str!("../lib/bisect.pyrs")),
     ("heapq", include_str!("../lib/heapq.pyrs")),
     ("collections", include_str!("../lib/collections.pyrs")),
+    // (W3-4, card a7488511) DOTTED submodule key: `collections.abc` is a
+    // documentation-only module (directory layout `lib/collections/abc.pyrs`,
+    // matching CPython's `collections/abc.py`) that defines NO runtime names —
+    // pyrst has no runtime `isinstance`-as-structural-membership and no
+    // `ABCMeta`/metaclasses/abstract-method enforcement, the two mechanisms
+    // every one of CPython's 25 `collections.abc` names is built on. Every name
+    // that names a SHAPE pyrst's static type system already enforces at compile
+    // time (Iterable/Iterator, Sequence, Mapping, Set, Hashable, Sized,
+    // Callable, Container) has a documented compile-time-native equivalent in
+    // the module header; the rest (Reversible, the View types, ByteString/
+    // Buffer, the async family) have no pyrst equivalent at all. Registering
+    // (rather than hard-skipping, cf. `dataclasses`) means `import
+    // collections.abc` itself typechecks and runs — see
+    // `examples/parity_collections_abc.pyrs` — while any USE of a name
+    // from-imported out of it (`Iterable()`, `x: Iterable`) stays an honest
+    // "undefined" compile error (an UNUSED `from collections.abc import X`
+    // is tolerated by the resolver's pre-existing empty-module leniency —
+    // see lib/collections/abc.pyrs's header).
+    ("collections.abc", include_str!("../lib/collections/abc.pyrs")),
     // Tier-3 batch: pure-pyrst modules over generics + classes with mutable
     // instance state. `itertools` is an EAGER combinatoric subset (`chain`/
     // `repeat`/`product`/`combinations`/`permutations` over `list[T]`, plus an

@@ -807,21 +807,33 @@ honest-rejection corpus (`examples/*fail*.pyrs`, 64 fixtures, plus
 ```python
 import foo                    # import module foo
 from foo import bar           # named import
-from foo import bar as baz    # aliased import
+import os.path                # dotted embedded submodule (W3)
+from urllib.parse import urlparse   # dotted from-import (W3)
 ```
 
 Multi-file programs are supported: imports are resolved via DFS over the import
-graph and the modules' declarations are merged into a flat namespace. In the
+graph, and each module's declarations are emitted under a per-module namespace
+(W3-2, `__pyrst_m_<owner>__<name>`), so two imported modules may define the
+same top-level function or constant name. Class names remain globally unique
+(class-vs-class collisions across modules are an honest check error). In the
 corpus, multi-file programs are organized as **sibling modules in a
 subdirectory** — e.g. `examples/multi_file_demo/` (`main.pyrs` doing
 `from common import clamp` and `from math_utils import safe_div, bounded_sum`,
 alongside `common.pyrs` and `math_utils.pyrs`).
 
 **Limitations:**
+- Import aliases (`import foo as f`, `from foo import bar as baz`) are
+  **rejected** with an honest parse/check error (not silently discarded).
 - Circular imports are **detected** (reported via cycle detection) but not
   resolved — see `examples/multi_file_fail/` for the negative scenario.
-- No package hierarchy (`foo/__init__.pyrs`), no relative imports, no import-time
-  side effects (modules are declarations only), and no Python stdlib imports.
+- Embedded stdlib packages resolve via dotted keys (`os.path`,
+  `urllib.parse`, `collections.abc`); `import os` does **not** auto-expose
+  `os.path` — import the submodule explicitly. A general user-defined package
+  hierarchy (`foo/__init__.pyrs`) and relative imports are not supported, and
+  there are no import-time side effects (modules are declarations only).
+- Python stdlib imports ARE supported: a 44-module embedded standard library
+  ships in the compiler binary — see
+  [PYTHON_COMPATIBILITY.md](PYTHON_COMPATIBILITY.md#standard-library).
 
 ---
 

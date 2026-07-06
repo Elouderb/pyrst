@@ -1190,22 +1190,28 @@ class Account:
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 
-    /// W3-3: a DOTTED from-import naming a symbol the submodule does not export is
-    /// an honest check error — it must NEVER fall back to the PARENT module. Here
-    /// `os` (imported too) DOES define `join`, but `os.path` does not, so
-    /// `from os.path import join` is rejected rather than silently binding `os.join`
-    /// (the from-import truncation the stage kills).
+    /// W3-3 (probe retargeted in W3-4, card a7488511): a DOTTED from-import naming
+    /// a symbol the submodule does not export is an honest check error — it must
+    /// NEVER fall back to the PARENT module. Here `os` (imported too) DOES define
+    /// `listdir`, but `os.path` does not (and deliberately never should — it is a
+    /// path-string module, not a filesystem-listing one), so
+    /// `from os.path import listdir` is rejected rather than silently binding
+    /// `os.listdir` (the from-import truncation the stage kills). The probe was
+    /// originally `join`, but W3-4 gave `os.path` a real faithful `join`, so that
+    /// name no longer tests the invariant.
     #[test]
     fn w3_dotted_from_import_unknown_name_is_rejected_not_truncated() {
         let root = temp_root(
-            "import os\nfrom os.path import join\n\ndef main() -> None:\n    print(join(\"a\", \"b\"))\n",
+            "import os\nfrom os.path import listdir\n\ndef main() -> None:\n    print(listdir(\".\"))\n",
         );
         match resolve(&root) {
-            Ok(_) => panic!("`from os.path import join` must be rejected (os.path has no `join`)"),
+            Ok(_) => {
+                panic!("`from os.path import listdir` must be rejected (os.path has no `listdir`)")
+            }
             Err(e) => {
                 let msg = e.to_string();
                 assert!(
-                    msg.contains("join") && msg.contains("os.path"),
+                    msg.contains("listdir") && msg.contains("os.path"),
                     "error must name the missing symbol and the submodule, got: {msg}"
                 );
             }

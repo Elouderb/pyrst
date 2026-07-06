@@ -1,0 +1,19 @@
+# W3-4 (card a7488511): `collections.abc` is a DOCUMENTATION-ONLY dotted
+# submodule (`lib/collections/abc.pyrs`, embedded under the dotted key
+# "collections.abc") that defines NO runtime names — see that file's header
+# for the full analysis (pyrst has no runtime `isinstance`-as-structural-
+# membership and no `ABCMeta`, the two mechanisms every CPython
+# `collections.abc` name is built on; every name that describes a shape pyrst
+# already enforces statically has a documented compile-time-native
+# equivalent instead).
+#
+# This golden proves the one thing that IS honestly true: `import
+# collections.abc` itself resolves, typechecks, and runs — a REAL dual-run,
+# since `collections.abc` is also a real (if unused-here) CPython module, so
+# python3 is a legitimate oracle for this exact program.
+
+import collections.abc
+
+
+def main() -> None:
+    print("collections.abc import ok")

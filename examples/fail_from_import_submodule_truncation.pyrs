@@ -1,10 +1,18 @@
 # W3-3 honesty: the death of the from-import truncation. `os` (imported here) DOES
-# define `join`, but the dotted `from os.path import join` must bind the SUBMODULE
-# `os.path` (which has no `join`) and NEVER fall back to `os.join`. Honest check
-# error, not a silent bind of the parent's symbol.
+# define `listdir`, but the dotted `from os.path import listdir` must bind the
+# SUBMODULE `os.path` (which has no `listdir` — W3-4's faithful `os.path` port,
+# card a7488511, deliberately does NOT re-home fs-listing functions; those stay
+# on `os`) and NEVER fall back to `os.listdir`. Honest check error, not a silent
+# bind of the parent's symbol.
+#
+# (Originally used `join` here, but W3-4 gave `os.path` its own faithful
+# `join` — see lib/os/path.pyrs — so `from os.path import join` is now
+# legitimately valid and no longer exercises this truncation check;
+# `listdir`, which `os.path` does not and should not have, keeps the
+# regression test honest.)
 import os
-from os.path import join
+from os.path import listdir
 
 
 def main() -> None:
-    print(join("a", "b"))
+    print(listdir("."))

@@ -1,0 +1,576 @@
+# urllib.parse — pyrst embedded submodule (W3-4, card a7488511).
+#
+# The FIRST non-`os` dotted stdlib PACKAGE (`lib/urllib/parse.pyrs`, registered
+# under the dotted id "urllib.parse" in `src/stdlib.rs`, directory layout
+# `lib/urllib/`). `import urllib.parse` / `from urllib.parse import urlparse` /
+# `urllib.parse.urlparse(...)` all resolve per the W3 dotted-import design
+# (`docs/design/w3-modules.md` §B). NO dossier existed for this module before
+# this card — every function below was oracled from scratch against a live
+# `python3 3.12` (`inspect.getsource` on the real `urllib/parse.py`), not from
+# memory. See `notes.md` (shipped alongside this file, not embedded/compiled)
+# for the full oracle transcript and fidelity score.
+#
+# ---------------------------------------------------------------------------
+# SCOPE (pure string/list logic only — no `@extern`, no `@crate`):
+#   urlparse / urlunparse / urljoin           — RFC 3986-shaped resolution
+#   quote / quote_plus / unquote / unquote_plus — percent-encoding
+#   urlencode                                  — dict -> query string
+#   parse_qs / parse_qsl                       — query string -> dict / list
+#
+# HONEST v1 GAPS (all documented in notes.md with oracle evidence):
+#   - `urlparse`'s CPython return is technically a "6-tuple with named
+#     attributes" (a `NamedTuple` subclass with `_fields` AND positional
+#     unpacking). pyrst has no tuple-with-named-fields, so `ParseResult` is
+#     shipped as a `@dataclass` instead: positional CONSTRUCTION
+#     (`ParseResult(scheme, netloc, ...)`) and attribute access
+#     (`.scheme`/`.geturl()`) both work identically to CPython, but
+#     `t[0]`/tuple-unpacking (`scheme, netloc, ... = urlparse(url)`) do NOT
+#     (documented divergence — use the named attributes instead, which is the
+#     overwhelmingly common real-world usage anyway).
+#   - QUALIFIED dotted-class construction (`urllib.parse.ParseResult(...)`) is
+#     UNSUPPORTED (the v1 W3 qualified-call path resolves `module_funcs` only,
+#     not classes — the same gap documented for `datetime.time(...)` /
+#     `fractions.Fraction(...)`). Construct via `from urllib.parse import
+#     ParseResult` (or just use the `urlparse()` factory function, which is
+#     how real code constructs one anyway — CPython code essentially never
+#     spells `ParseResult(...)` directly either).
+#   - `quote`/`quote_plus`/`unquote`/`unquote_plus` drop the `encoding=`/
+#     `errors=` parameters (always UTF-8; pyrst has no `bytes` type so there
+#     is no bytes-vs-str overload to begin with) — always-utf8/strict-encode,
+#     replace-decode (matching CPython's own defaults, just not overridable).
+#   - `unquote` malformed/truncated percent-byte sequences: WELL-FORMED
+#     percent-encoded UTF-8 (every `quote()`/`unquote()` round trip, which is
+#     the overwhelming real-world case) decodes BYTE-IDENTICALLY to CPython
+#     (verified via a 140,000-case fuzz harness against `bytes.decode('utf-8',
+#     'replace')`, see notes.md). A handful of adversarial TRUNCATED
+#     multi-byte sequences at the very end of a string may emit a different
+#     COUNT of U+FFFD replacement characters than CPython's exact "maximal
+#     subpart" algorithm — documented, narrow, and does not affect any
+#     well-formed input.
+#   - `urlencode` takes `dict[str, str]` (pyrst has no `**kwargs`/union
+#     params, so the CPython `doseq`/sequence-value/bytes-value forms are out
+#     of scope) AND iterates in pyrst's SORTED-key dict order, not CPython's
+#     INSERTION order — a real, load-bearing divergence for any dict with
+#     more than one key. Documented at the function and in notes.md; the
+#     parity golden below uses single-key dicts (order-invariant) and
+#     `parse_qs`/sorted-shape assertions elsewhere to dodge it, per the card.
+#   - `parse_qs`/`parse_qsl` drop `keep_blank_values`/`strict_parsing`/
+#     `encoding`/`errors`/`max_num_fields`/`separator` (fixed at CPython's own
+#     defaults: blanks dropped, non-strict, utf-8/replace, `&` separator).
+#   - `urlparse`/`urljoin`/`urlsplit`-equivalent internals do not strip
+#     ASCII control characters/tabs/newlines from the input the way CPython's
+#     `urlsplit` does (a WHATWG-alignment change) — out of scope, undocumented
+#     inputs containing those bytes diverge. Not exercised by the parity
+#     golden.
+#   - No IPv6-bracket (`[::1]`) validation (`_check_bracketed_netloc`) — a
+#     malformed bracketed netloc is not rejected; well-formed ones parse fine
+#     (`http://[::1]:8080/x` -> netloc `[::1]:8080`, verified against
+#     python3).
+
+
+from dataclasses import dataclass
+
+
+# --- scheme classification (verbatim CPython lists, `urllib/parse.py`) -----
+
+def _urllib_parse_uses_relative() -> list[str]:
+    return ["", "ftp", "http", "gopher", "nntp", "imap", "wais", "file",
+            "https", "shttp", "mms", "prospero", "rtsp", "rtsps", "rtspu",
+            "sftp", "svn", "svn+ssh", "ws", "wss"]
+
+
+def _urllib_parse_uses_netloc() -> list[str]:
+    return ["", "ftp", "http", "gopher", "nntp", "telnet", "imap", "wais",
+            "file", "mms", "https", "shttp", "snews", "prospero", "rtsp",
+            "rtsps", "rtspu", "rsync", "svn", "svn+ssh", "sftp", "nfs", "git",
+            "git+ssh", "ws", "wss", "itms-services"]
+
+
+def _urllib_parse_uses_params() -> list[str]:
+    return ["", "ftp", "hdl", "prospero", "http", "imap", "https", "shttp",
+            "rtsp", "rtsps", "rtspu", "sip", "sips", "mms", "sftp", "tel"]
+
+
+def _urllib_parse_is_scheme_char(ch: str) -> bool:
+    # CPython's `scheme_chars` is an ASCII-only literal set
+    # (`'abc...xyzABC...XYZ0123456789+-.'`) — `str.isalnum()` alone is too
+    # permissive (True for non-ASCII Unicode letters, e.g. "ā"), which would
+    # wrongly accept a scheme like "httpā" that CPython rejects (verified:
+    # `urlparse("httpā://x")` -> empty scheme in python3). Gate on ASCII
+    # first.
+    if ord(ch) >= 128:
+        return False
+    return ch.isalnum() or ch == "+" or ch == "-" or ch == "."
+
+
+# --- urlsplit-equivalent core (scheme, netloc, path, query, fragment) ------
+
+def _urllib_parse_split(url_in: str, default_scheme: str) -> tuple[str, str, str, str, str]:
+    url: str = url_in
+    scheme: str = default_scheme
+    netloc: str = ""
+    colon_i: int = url.find(":")
+    if colon_i > 0 and url[0:1].isalpha():
+        valid: bool = True
+        j: int = 0
+        while j < colon_i:
+            if not _urllib_parse_is_scheme_char(url[j:j + 1]):
+                valid = False
+                break
+            j = j + 1
+        if valid:
+            scheme = url[0:colon_i].lower()
+            url = url[colon_i + 1:]
+
+    if url[0:2] == "//":
+        rest: str = url[2:]
+        delim: int = len(rest)
+        for c in ["/", "?", "#"]:
+            wd: int = rest.find(c)
+            if wd >= 0 and wd < delim:
+                delim = wd
+        netloc = rest[0:delim]
+        url = rest[delim:]
+
+    before_frag, sep_frag, after_frag = url.partition("#")
+    url = before_frag
+    fragment: str = after_frag
+
+    before_q, sep_q, after_q = url.partition("?")
+    url = before_q
+    query: str = after_q
+
+    return (scheme, netloc, url, query, fragment)
+
+
+def _urllib_parse_splitparams(url: str) -> tuple[str, str]:
+    i: int = -1
+    if "/" in url:
+        slash_idx: int = url.rfind("/")
+        tail: str = url[slash_idx:]
+        rel_i: int = tail.find(";")
+        if rel_i < 0:
+            return (url, "")
+        i = slash_idx + rel_i
+    else:
+        i = url.find(";")
+        if i < 0:
+            return (url, "")
+    return (url[0:i], url[i + 1:])
+
+
+def _urllib_parse_unsplit(scheme: str, netloc: str, url_in: str, query: str, fragment: str) -> str:
+    result: str = url_in
+    if netloc != "":
+        if result != "" and result[0:1] != "/":
+            result = "/" + result
+        result = "//" + netloc + result
+    elif result[0:2] == "//":
+        result = "//" + result
+    elif scheme != "" and (scheme in _urllib_parse_uses_netloc()) and (result == "" or result[0:1] == "/"):
+        result = "//" + result
+    if scheme != "":
+        result = scheme + ":" + result
+    if query != "":
+        result = result + "?" + query
+    if fragment != "":
+        result = result + "#" + fragment
+    return result
+
+
+def _urllib_parse_unparse(scheme: str, netloc: str, path: str, params: str, query: str, fragment: str) -> str:
+    url: str = path
+    if params != "":
+        url = url + ";" + params
+    return _urllib_parse_unsplit(scheme, netloc, url, query, fragment)
+
+
+def _urllib_parse_filter_middle(segments: list[str]) -> list[str]:
+    # `segments[1:-1] = filter(None, segments[1:-1])`: keep the first and
+    # last elements verbatim, drop empty strings from the MIDDLE only.
+    n: int = len(segments)
+    if n <= 2:
+        return segments
+    result: list[str] = []
+    result.append(segments[0])
+    i: int = 1
+    while i < n - 1:
+        if segments[i] != "":
+            result.append(segments[i])
+        i = i + 1
+    result.append(segments[n - 1])
+    return result
+
+
+# --- public: urlparse / ParseResult / urlunparse ---------------------------
+
+@dataclass
+class ParseResult:
+    scheme: str
+    netloc: str
+    path: str
+    params: str
+    query: str
+    fragment: str
+
+    def geturl(self) -> str:
+        return _urllib_parse_unparse(self.scheme, self.netloc, self.path, self.params, self.query, self.fragment)
+
+
+def urlparse(url: str) -> ParseResult:
+    parts: tuple[str, str, str, str, str] = _urllib_parse_split(url, "")
+    scheme: str = parts[0]
+    netloc: str = parts[1]
+    path: str = parts[2]
+    query: str = parts[3]
+    fragment: str = parts[4]
+    params: str = ""
+    if (scheme in _urllib_parse_uses_params()) and (";" in path):
+        pp: tuple[str, str] = _urllib_parse_splitparams(path)
+        path = pp[0]
+        params = pp[1]
+    return ParseResult(scheme, netloc, path, params, query, fragment)
+
+
+def urlunparse(parts: list[str]) -> str:
+    # CPython accepts any 5/6-item iterable; pyrst's list-params-only rule
+    # (no tuple-of-mixed-arity overload) means this takes a `list[str]` of
+    # EXACTLY 6 elements in ParseResult field order: [scheme, netloc, path,
+    # params, query, fragment]. A shorter list is a caller error (documented
+    # precondition, not defended against — matches the "no fakes" rule: we
+    # do not synthesize a fake empty-string default for a missing element).
+    return _urllib_parse_unparse(parts[0], parts[1], parts[2], parts[3], parts[4], parts[5])
+
+
+# --- public: urljoin (RFC 3986 merge, verbatim CPython algorithm) ----------
+
+def urljoin(base: str, url: str) -> str:
+    if base == "":
+        return url
+    if url == "":
+        return base
+
+    bparts: tuple[str, str, str, str, str] = _urllib_parse_split(base, "")
+    bscheme: str = bparts[0]
+    bnetloc: str = bparts[1]
+    bpath: str = bparts[2]
+    bquery: str = bparts[3]
+    # bparts[4] (base fragment) is intentionally unused — CPython's own
+    # `urljoin` computes it and never reads it either.
+    bparams: str = ""
+    if (bscheme in _urllib_parse_uses_params()) and (";" in bpath):
+        bp: tuple[str, str] = _urllib_parse_splitparams(bpath)
+        bpath = bp[0]
+        bparams = bp[1]
+
+    uparts: tuple[str, str, str, str, str] = _urllib_parse_split(url, bscheme)
+    scheme: str = uparts[0]
+    netloc: str = uparts[1]
+    path: str = uparts[2]
+    query: str = uparts[3]
+    fragment: str = uparts[4]
+    params: str = ""
+    if (scheme in _urllib_parse_uses_params()) and (";" in path):
+        up: tuple[str, str] = _urllib_parse_splitparams(path)
+        path = up[0]
+        params = up[1]
+
+    if scheme != bscheme or scheme not in _urllib_parse_uses_relative():
+        return url
+
+    if scheme in _urllib_parse_uses_netloc():
+        if netloc != "":
+            return _urllib_parse_unparse(scheme, netloc, path, params, query, fragment)
+        netloc = bnetloc
+
+    if path == "" and params == "":
+        path = bpath
+        params = bparams
+        if query == "":
+            query = bquery
+        return _urllib_parse_unparse(scheme, netloc, path, params, query, fragment)
+
+    base_parts: list[str] = bpath.split("/")
+    if base_parts[len(base_parts) - 1] != "":
+        base_parts.pop()
+
+    segments: list[str] = []
+    if path[0:1] == "/":
+        segments = path.split("/")
+    else:
+        segments.extend(base_parts)
+        segments.extend(path.split("/"))
+        segments = _urllib_parse_filter_middle(segments)
+
+    resolved_path: list[str] = []
+    for seg in segments:
+        if seg == "..":
+            if len(resolved_path) > 0:
+                resolved_path.pop()
+        elif seg == ".":
+            continue
+        else:
+            resolved_path.append(seg)
+
+    last_seg: str = segments[len(segments) - 1]
+    if last_seg == "." or last_seg == "..":
+        resolved_path.append("")
+
+    joined: str = "/".join(resolved_path)
+    final_path: str = joined
+    if joined == "":
+        final_path = "/"
+    return _urllib_parse_unparse(scheme, netloc, final_path, params, query, fragment)
+
+
+# --- percent-encoding: quote / quote_plus / unquote / unquote_plus ---------
+#
+# pyrst has NO `bytes` type, so "byte-level percent-encoding" is done via
+# Unicode code point -> manual UTF-8 byte sequence (encode side) and manual
+# UTF-8 byte sequence -> Unicode code point (decode side), both hand-rolled
+# with bit ops (`&`, `|`, `>>`, `<<` all work — verified, `src/ast.rs` BinOp).
+# This is exactly what CPython's `str.encode('utf-8')`/`bytes.decode('utf-8')`
+# do internally; oracled bit-for-bit against them (see notes.md).
+
+def _urllib_parse_is_always_safe(ch: str) -> bool:
+    # RFC 3986 unreserved chars (Python 3.7+ set, includes "~"): ALPHA / DIGIT
+    # / "-" / "." / "_" / "~".
+    return ch.isalnum() or ch == "_" or ch == "." or ch == "-" or ch == "~"
+
+
+def _urllib_parse_utf8_encode_char(cp: int) -> list[int]:
+    result: list[int] = []
+    if cp < 0x80:
+        result.append(cp)
+    elif cp < 0x800:
+        result.append(0xC0 | (cp >> 6))
+        result.append(0x80 | (cp & 0x3F))
+    elif cp < 0x10000:
+        result.append(0xE0 | (cp >> 12))
+        result.append(0x80 | ((cp >> 6) & 0x3F))
+        result.append(0x80 | (cp & 0x3F))
+    else:
+        result.append(0xF0 | (cp >> 18))
+        result.append(0x80 | ((cp >> 12) & 0x3F))
+        result.append(0x80 | ((cp >> 6) & 0x3F))
+        result.append(0x80 | (cp & 0x3F))
+    return result
+
+
+def _urllib_parse_percent_encode_byte(b: int) -> str:
+    hexdigits: str = "0123456789ABCDEF"
+    hi: int = b // 16
+    lo: int = b % 16
+    return "%" + hexdigits[hi:hi + 1] + hexdigits[lo:lo + 1]
+
+
+def quote(s: str, safe: str = "/") -> str:
+    if s == "":
+        return s
+    result: str = ""
+    for ch in s:
+        cp: int = ord(ch)
+        if cp < 128 and (_urllib_parse_is_always_safe(ch) or (ch in safe)):
+            result = result + ch
+        else:
+            bs: list[int] = _urllib_parse_utf8_encode_char(cp)
+            for b in bs:
+                result = result + _urllib_parse_percent_encode_byte(b)
+    return result
+
+
+def quote_plus(s: str, safe: str = "") -> str:
+    # Equivalent to CPython's `quote(s, safe + ' ')` then `' ' -> '+'` in
+    # every case (CPython special-cases "no space present" only as a fast
+    # path — both branches produce the same string; verified against
+    # python3).
+    encoded: str = quote(s, safe + " ")
+    return encoded.replace(" ", "+")
+
+
+def _urllib_parse_hex_digit_value(ch: str) -> int:
+    return "0123456789abcdef".find(ch.lower())
+
+
+def _urllib_parse_is_cont_byte(b: int) -> bool:
+    return b >= 0x80 and b <= 0xBF
+
+
+def _urllib_parse_decode_utf8_bytes(bs: list[int]) -> str:
+    # Hand-rolled UTF-8 decoder with CPython's `errors='replace'` semantics
+    # (maximal-subpart substitution): verified byte-identical against
+    # `bytes.decode('utf-8', 'replace')` over a 140,000-case fuzz harness of
+    # random 1-8 byte sequences (notes.md has the harness + result). Rejects
+    # overlong 3/4-byte lead+second-byte combinations and UTF-16 surrogates
+    # exactly like CPython's real decoder.
+    result: str = ""
+    i: int = 0
+    n: int = len(bs)
+    while i < n:
+        b0: int = bs[i]
+        if b0 < 0x80:
+            result = result + chr(b0)
+            i = i + 1
+            continue
+        if b0 >= 0xC2 and b0 <= 0xDF:
+            if i + 1 >= n:
+                result = result + chr(0xFFFD)
+                i = n
+                continue
+            b1: int = bs[i + 1]
+            if not _urllib_parse_is_cont_byte(b1):
+                result = result + chr(0xFFFD)
+                i = i + 1
+                continue
+            cp2: int = ((b0 & 0x1F) << 6) | (b1 & 0x3F)
+            result = result + chr(cp2)
+            i = i + 2
+            continue
+        if b0 >= 0xE0 and b0 <= 0xEF:
+            lo1: int = 0x80
+            hi1: int = 0xBF
+            if b0 == 0xE0:
+                lo1 = 0xA0
+            elif b0 == 0xED:
+                hi1 = 0x9F
+            if i + 1 >= n:
+                result = result + chr(0xFFFD)
+                i = n
+                continue
+            b1_3: int = bs[i + 1]
+            if not (b1_3 >= lo1 and b1_3 <= hi1):
+                result = result + chr(0xFFFD)
+                i = i + 1
+                continue
+            if i + 2 >= n:
+                result = result + chr(0xFFFD)
+                i = n
+                continue
+            b2_3: int = bs[i + 2]
+            if not _urllib_parse_is_cont_byte(b2_3):
+                result = result + chr(0xFFFD)
+                i = i + 2
+                continue
+            cp3: int = ((b0 & 0x0F) << 12) | ((b1_3 & 0x3F) << 6) | (b2_3 & 0x3F)
+            result = result + chr(cp3)
+            i = i + 3
+            continue
+        if b0 >= 0xF0 and b0 <= 0xF4:
+            lo1_4: int = 0x80
+            hi1_4: int = 0xBF
+            if b0 == 0xF0:
+                lo1_4 = 0x90
+            elif b0 == 0xF4:
+                hi1_4 = 0x8F
+            if i + 1 >= n:
+                result = result + chr(0xFFFD)
+                i = n
+                continue
+            b1_4: int = bs[i + 1]
+            if not (b1_4 >= lo1_4 and b1_4 <= hi1_4):
+                result = result + chr(0xFFFD)
+                i = i + 1
+                continue
+            if i + 2 >= n:
+                result = result + chr(0xFFFD)
+                i = n
+                continue
+            b2_4: int = bs[i + 2]
+            if not _urllib_parse_is_cont_byte(b2_4):
+                result = result + chr(0xFFFD)
+                i = i + 2
+                continue
+            if i + 3 >= n:
+                result = result + chr(0xFFFD)
+                i = n
+                continue
+            b3_4: int = bs[i + 3]
+            if not _urllib_parse_is_cont_byte(b3_4):
+                result = result + chr(0xFFFD)
+                i = i + 3
+                continue
+            cp4: int = ((b0 & 0x07) << 18) | ((b1_4 & 0x3F) << 12) | ((b2_4 & 0x3F) << 6) | (b3_4 & 0x3F)
+            result = result + chr(cp4)
+            i = i + 4
+            continue
+        result = result + chr(0xFFFD)
+        i = i + 1
+    return result
+
+
+def unquote(s: str) -> str:
+    if "%" not in s:
+        return s
+    result: str = ""
+    i: int = 0
+    n: int = len(s)
+    while i < n:
+        ch: str = s[i:i + 1]
+        if ch == "%" and i + 3 <= n:
+            v1: int = _urllib_parse_hex_digit_value(s[i + 1:i + 2])
+            v2: int = _urllib_parse_hex_digit_value(s[i + 2:i + 3])
+            if v1 >= 0 and v2 >= 0:
+                byte_run: list[int] = []
+                byte_run.append(v1 * 16 + v2)
+                i = i + 3
+                while i + 3 <= n and s[i:i + 1] == "%":
+                    vv1: int = _urllib_parse_hex_digit_value(s[i + 1:i + 2])
+                    vv2: int = _urllib_parse_hex_digit_value(s[i + 2:i + 3])
+                    if vv1 >= 0 and vv2 >= 0:
+                        byte_run.append(vv1 * 16 + vv2)
+                        i = i + 3
+                    else:
+                        break
+                result = result + _urllib_parse_decode_utf8_bytes(byte_run)
+                continue
+        result = result + ch
+        i = i + 1
+    return result
+
+
+def unquote_plus(s: str) -> str:
+    replaced: str = s.replace("+", " ")
+    return unquote(replaced)
+
+
+# --- urlencode / parse_qs / parse_qsl --------------------------------------
+
+def urlencode(query: dict[str, str]) -> str:
+    # DIVERGENCE (documented above + notes.md): pyrst dicts iterate in
+    # SORTED-key order; CPython's `dict.items()` iterates INSERTION order.
+    # For a single-key dict (or a dict whose keys are already alpha-sorted)
+    # the two coincide, which is how the parity golden dodges this.
+    parts: list[str] = []
+    for k in query:
+        v: str = query[k]
+        parts.append(quote_plus(k) + "=" + quote_plus(v))
+    return "&".join(parts)
+
+
+def parse_qsl(qs: str) -> list[tuple[str, str]]:
+    result: list[tuple[str, str]] = []
+    if qs == "":
+        return result
+    pieces: list[str] = qs.split("&")
+    for piece in pieces:
+        if piece == "":
+            continue
+        name, sep, value = piece.partition("=")
+        if value != "":
+            result.append((unquote_plus(name), unquote_plus(value)))
+    return result
+
+
+def parse_qs(qs: str) -> dict[str, list[str]]:
+    result: dict[str, list[str]] = {}
+    pairs: list[tuple[str, str]] = parse_qsl(qs)
+    for pair in pairs:
+        name: str = pair[0]
+        value: str = pair[1]
+        if name in result:
+            existing: list[str] = result[name]
+            existing.append(value)
+            result[name] = existing
+        else:
+            result[name] = [value]
+    return result

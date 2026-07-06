@@ -1,0 +1,85 @@
+# parity: pyrst-only
+# W3-4 (card a7488511): pyrst-only golden for os.path's @extern-backed
+# functions — join, exists, isfile, isdir, abspath, expanduser. Each has a
+# Rust std::path/std::fs/std::env expression-template BODY (an `@extern`
+# docstring), so a literal python3 run of THIS FILE would call each function
+# and get back `None` (a Python function whose body is only a docstring is a
+# no-op) — not a meaningful comparison. This is exactly `examples/parity_os.pyrs`'s
+# own precedent for `os`'s @extern surface: every function's *semantics* was
+# instead cross-checked against python3's real os.path one-by-one while
+# writing lib/os/path.pyrs (see the card's notes.md oracle transcript), and
+# this golden asserts DETERMINISTIC facts only:
+#   - `join(a, b)` fixed-string cases (values python3-cross-checked; Rust's
+#     std::path::Path::join was independently verified to match
+#     posixpath.join on every case below — see notes.md)
+#   - `exists`/`isfile`/`isdir` booleans against real files/dirs this test
+#     creates and removes itself (no leftover state)
+#   - `abspath` on an already-ABSOLUTE input (no cwd dependency — asserted as
+#     an exact value, since `normpath` alone determines it)
+#   - `abspath` on a RELATIVE input, asserted *relationally* against
+#     `join(getcwd(), ...)` (never the raw, machine-dependent path)
+#   - `expanduser` against the real `HOME` env var read via `os.getenv`
+#     (skipped gracefully if `HOME` is unset in the running environment)
+#
+# The test creates all its scratch files/dirs under /tmp and removes every
+# one of them before exiting (no leftover state) — same discipline as
+# examples/parity_os.pyrs.
+
+from os import makedirs, write_file, remove, rmdir, getenv, getcwd
+from os.path import join, exists, isfile, isdir, abspath, expanduser, isabs
+
+
+def main() -> None:
+    # --- join: fixed-string cases (python3-cross-checked; see notes.md) -----
+    print(join("a", "b"))
+    print(join("a/", "b"))
+    print(join("a", "/b"))
+    print(join("a", ""))
+    print(join("", "b"))
+    print(join("", ""))
+    print(join("/a", "b/"))
+    print(join("a", "b/"))
+
+    # --- exists / isfile / isdir --------------------------------------------
+    base: str = join("/tmp", "pyrst_parity_os_path_extern_scratch")
+    makedirs(base, True)
+    write_file(join(base, "f.txt"), "x")
+    print(exists(join(base, "f.txt")))
+    print(isfile(join(base, "f.txt")))
+    print(isdir(base))
+    print(isfile(base))
+    print(isdir(join(base, "f.txt")))
+    print(exists(join(base, "nope.txt")))
+
+    # --- abspath on an already-absolute input: pure normpath, no cwd --------
+    print(abspath("/a/b/../c"))
+    print(abspath("/a//b/./c/"))
+
+    # --- abspath on a relative input: relational assertion only ------------
+    rel_abs: str = abspath("relsub/inner")
+    print(isabs(rel_abs))
+    print(rel_abs == join(getcwd(), "relsub/inner"))
+
+    cwd_abs: str = abspath(".")
+    print(cwd_abs == getcwd())
+
+    # --- expanduser: against the real HOME (skipped if unset) ---------------
+    home: str = getenv("HOME", "")
+    if home != "":
+        expected_home: str = home
+        end: int = len(expected_home)
+        while end > 0 and expected_home[end - 1] == "/":
+            end = end - 1
+        expected_home = expected_home[0:end]
+        print(expanduser("~") == expected_home)
+        print(expanduser("~/sub/dir") == expected_home + "/sub/dir")
+    else:
+        print(True)
+        print(True)
+    print(expanduser("noTilde") == "noTilde")
+    print(expanduser("~otheruser") == "~otheruser")
+
+    # --- cleanup -------------------------------------------------------------
+    remove(join(base, "f.txt"))
+    rmdir(base)
+    print(exists(base))

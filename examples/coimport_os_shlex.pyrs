@@ -1,0 +1,17 @@
+# (W3-2 payoff) Co-import: `os` and `shlex` BOTH define `join`, with DIFFERENT
+# signatures (os.join(a, b) path-join vs shlex.join(list) shell-join). Old flat
+# namespace rejected the co-import; per-module namespaced emission lowers them to
+# `__pyrst_m_os__join` / `__pyrst_m_shlex__join`, and — crucially — os's OWN
+# internal `join(top, e)` (inside os.walk) resolves owner-first to os's 2-arg join
+# rather than shlex's 1-arg join (typeck's per-module checking view).
+#
+# NOT a python3-parity file: pyrst's `os.join` is a pyrst-ism (CPython spells it
+# `os.path.join`; the alias re-homes to os.path in W3-4), so this is a pyrst
+# positive golden with a fixed expected output.
+import os
+import shlex
+
+
+def main() -> None:
+    print(os.join("usr", "local"))                # usr/local
+    print(shlex.join(["ls", "-l", "my file"]))    # ls -l 'my file'

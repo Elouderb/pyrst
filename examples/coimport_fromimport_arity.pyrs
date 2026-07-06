@@ -1,0 +1,12 @@
+# (W3-fix / F4) FROM-IMPORT collision differing in ARITY. CPython binds the LOCAL
+# name to the LAST `from` import; typeck must check the call against THAT owner's
+# signature (owner-first via the checking-ctx from-import fold), not the flat
+# last-MERGED collider — an order-dependent false "wrong number of arguments"
+# otherwise. Last import here is `fimpl_scale.combine` (1-arg), so `combine(5)`
+# checks+emits against it. python3-diffed both orders (W3-fix probes).
+from fimpl_add import combine
+from fimpl_scale import combine
+
+
+def main() -> None:
+    print(combine(5))

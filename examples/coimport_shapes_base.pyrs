@@ -1,0 +1,14 @@
+# (W3-2) Imported base-class module for coimport_xmod_poly.pyrs — the base of a
+# CROSS-MODULE companion enum (the design's probe A / P2, the single riskiest
+# interaction). Standalone this is a valid, output-free module (empty expected/):
+# its `Shape` struct/impl emit under the module's owner prefix
+# (`__pyrst_m_coimport_shapes_base__Shape`) when imported, and here at the crate
+# root when built alone.
+class Shape:
+    x: int
+    def __init__(self, x: int) -> None:
+        self.x = x
+    def area(self) -> int:
+        return 0
+    def kind(self) -> str:
+        return "shape"

@@ -24,19 +24,16 @@
 #     concretely-TYPED variable (e.g. `n: Optional[int] = None; copy.copy(n)`)
 #     works fine — see examples/parity_copy.pyrs.
 #
-# CROSS-UNIT NAME COLLISION (co-import restriction, confirmed empirically):
-# this module's `copy(x)` is an EXACT bare-name collision with the separately
-# -authored `fs-trio` unit's `lib/shutil.pyrs`, which declares its own
-# top-level `copy(src, dst)` (CPython's `shutil.copy`). Real CPython has the
-# identical name ambiguity and resolves it via real per-module namespacing
-# (`copy.copy` vs `shutil.copy` are two distinct functions); pyrst's module
-# namespace is FLAT (confirmed: `import copy; import shutilstub` where
-# `shutilstub` also declares `def copy(...)` fails with "name `copy` is
-# provided by both `copy` and `shutilstub`; pyrst's module namespace is flat
-# ... a program cannot import both"). A pyrst program therefore CANNOT
-# `import copy` and `import shutil` (or `from copy import copy` and `from
-# shutil import copy`) together — the same operator/re precedent this
-# codebase already uses for other unavoidable CPython-name collisions.
+# CROSS-UNIT NAME COLLISION — LIFTED by W3-2 per-module namespacing:
+# this module's `copy(x)` shares its bare name with `lib/shutil.pyrs`'s
+# top-level `copy(src, dst)` (CPython's `shutil.copy`). Real CPython resolves
+# this via real per-module namespacing (`copy.copy` vs `shutil.copy` are two
+# distinct functions) — which pyrst now HAS: each emits as a distinct
+# owner-qualified Rust item (`__pyrst_m_copy__copy` vs `__pyrst_m_shutil__copy`),
+# so `import copy` and `import shutil` NOW CO-IMPORT (the flat-namespace
+# restriction is retired for fn/const collisions; only class-vs-class stays
+# unique in v1). Proven by examples/coimport_copy_shutil.pyrs, which calls
+# BOTH `copy.copy(...)` and `shutil.copy(...)` in one program.
 # Neither module renames its function (that would itself be a CPython-name
 # divergence); this is kept and documented on both sides (see `shutil.pyrs`'s
 # own header for its matching note) rather than silently worked around.

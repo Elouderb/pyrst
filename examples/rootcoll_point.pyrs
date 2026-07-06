@@ -1,0 +1,7 @@
+# (W3-fix / F11) Local fixture for fail_root_import_class_collision: defines
+# `class Point` so the ROOT's own `class Point` triggers the (root-inclusive)
+# class-vs-class collision stopgap. Standalone: a valid, output-free class module.
+class Point:
+    x: int
+    def __init__(self, x: int) -> None:
+        self.x = x

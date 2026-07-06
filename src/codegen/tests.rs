@@ -364,12 +364,12 @@ def ipow(base: int, exp: int) -> int:
     }
 
     #[test]
-    fn qualified_module_call_lowers_to_flat_call() {
-        // `os.basename("/a/b.txt")` must lower to the FLAT Rust call
-        // `basename("/a/b.txt".to_string())` — the module qualifier is dropped
-        // (every imported module's functions are merged flat) and the call goes
-        // through the regular function-call path (string literal owned via
-        // `.to_string()`), exactly as `from os import basename; basename(...)`.
+    fn qualified_module_call_lowers_to_owner_mangled_call() {
+        // (W3-2) `os.basename("/a/b.txt")` lowers to the OWNER-QUALIFIED Rust call
+        // `__pyrst_m_os__basename("/a/b.txt".to_string())` — the qualifier `os` IS
+        // the owner module (threaded as `callee_owner`), so per-module namespacing
+        // keeps it distinct from any other module's `basename`. (Pre-W3 this was a
+        // flat `basename(..)`; the keystone owner-mangles it.)
         let ctx = ctx_with_os();
         let mut cg = Codegen::new(&ctx);
         let callee: Box<Expr> = Box::new(Expr::Attr {
@@ -381,19 +381,15 @@ def ipow(base: int, exp: int) -> int:
         let out = cg.emit_method_call_on_attr(&callee, &args, &[])
             .expect("emit must succeed")
             .expect("a tracked module call must be handled by emit_method_call_on_attr");
-        assert!(out.starts_with("basename("),
-            "module qualifier must be dropped, emitting a flat call; got: {}", out);
-        assert!(!out.contains("os"),
-            "the `os` qualifier must not appear in the emitted call; got: {}", out);
+        assert!(out.starts_with("__pyrst_m_os__basename("),
+            "qualified call must owner-mangle by the qualifier module; got: {}", out);
     }
 
     #[test]
-    fn math_qualified_call_lowers_to_flat_call() {
-        // `math` is now a REAL embedded module: `math.sqrt(x)` flows through the
-        // GENERAL qualified-module path and lowers to the FLAT Rust call
-        // `sqrt((16.0f64))` (the `@extern` `sqrt` wrapper is merged flat) — the
-        // former hardcoded math arm is gone, so the `math` qualifier is dropped
-        // exactly like any other module's call.
+    fn math_qualified_call_lowers_to_owner_mangled_call() {
+        // (W3-2) `math.sqrt(16.0)` flows through the general qualified-module path
+        // and owner-mangles to `__pyrst_m_math__sqrt((16.0f64))` — the qualifier is
+        // the owner, so co-imported same-named functions stay distinct.
         let mut ctx = TyCtx::new();
         ctx.funcs.insert("sqrt".into(), crate::typeck::FuncSig {
             params: vec![("x".into(), Ty::Float)],
@@ -412,19 +408,16 @@ def ipow(base: int, exp: int) -> int:
         let out = cg.emit_method_call_on_attr(&callee, &args, &[])
             .expect("emit must succeed")
             .expect("a tracked module call must be handled by emit_method_call_on_attr");
-        assert!(out.starts_with("sqrt("),
-            "module qualifier must be dropped, emitting a flat call; got: {}", out);
-        assert!(!out.contains("math"),
-            "the `math` qualifier must not appear in the emitted call; got: {}", out);
+        assert!(out.starts_with("__pyrst_m_math__sqrt("),
+            "qualified call must owner-mangle by the qualifier module; got: {}", out);
     }
 
     #[test]
-    fn module_constant_lowers_to_mangled_const_name() {
-        // A qualified module constant `math.pi` (a non-call attribute) lowers to
-        // the MANGLED const name `__pyrst_const_pi` (the prepass emits a top-level
-        // `const __pyrst_const_pi: f64`). Mangling prevents a lowercase const from
-        // being captured as a Rust const-pattern. The former hardcoded
-        // `::std::f64::consts::PI` arm is gone.
+    fn module_constant_lowers_to_owner_mangled_const_name() {
+        // (W3-2) A qualified module constant `math.pi` lowers to the OWNER-QUALIFIED
+        // mangled const `__pyrst_const_math__pi` — the owner prefix keeps a
+        // co-imported same-named const in another module distinct (the design-flagged
+        // const-vs-const collision). Mangling still prevents const-pattern capture.
         let mut ctx = TyCtx::new();
         ctx.module_consts.insert("math".into(), vec![("pi".into(), Ty::Float)]);
         let mut cg = Codegen::new(&ctx);
@@ -434,7 +427,7 @@ def ipow(base: int, exp: int) -> int:
             span: Span::DUMMY,
         };
         let out = cg.emit_expr(&attr).expect("emit must succeed");
-        assert_eq!(out, "__pyrst_const_pi", "math.pi must lower to the mangled const name; got: {}", out);
+        assert_eq!(out, "__pyrst_const_math__pi", "math.pi must lower to the owner-mangled const name; got: {}", out);
     }
 
     #[test]
@@ -747,4 +740,157 @@ def main() -> None:
 ";
         emit_bypassing_typeck(src, "readonlyblock")
             .expect("codegen must NOT reject a conflicting reassign read only within its block");
+    }
+
+    // ── W3-2: owner-qualified name mangling + owner lookup ─────────────────────
+
+    /// W3-2: `mangle_const` is owner-qualified — a ROOT const keeps the historical
+    /// `__pyrst_const_<name>` (byte-identical for import-free programs), a module
+    /// const gains its owner prefix, and a dotted module id sanitizes its dots.
+    #[test]
+    fn w3_mangle_const_owner_qualified() {
+        assert_eq!(mangle_const(None, "PI"), "__pyrst_const_PI");
+        assert_eq!(mangle_const(Some("sys"), "version"), "__pyrst_const_sys__version");
+        assert_eq!(mangle_const(Some("os.path"), "sep"), "__pyrst_const_os_path__sep");
+    }
+
+    /// W3-2: `emit_name` — a ROOT (None) free-function name stays crate-root
+    /// (`escape_ident`, a keyword still round-trips), a non-root owner mangles to
+    /// the flat `__pyrst_m_<owner>__<name>`, and dotted ids sanitize dots.
+    #[test]
+    fn w3_emit_name_owner_and_root() {
+        let ctx = TyCtx::new();
+        let cg = Codegen::new(&ctx);
+        assert_eq!(cg.emit_name(None, "escape"), "escape");
+        assert_eq!(cg.emit_name(None, "type"), "r#type"); // root keyword still escapes
+        assert_eq!(cg.emit_name(Some("re"), "escape"), "__pyrst_m_re__escape");
+        assert_eq!(cg.emit_name(Some("os.path"), "join"), "__pyrst_m_os_path__join");
+    }
+
+    /// W3-2: `emit_class_name` resolves the owner from the GLOBAL `class_owner`
+    /// map (class names are globally unique): a root class stays bare (byte-for-byte
+    /// the pre-W3 `n.clone()`), an imported class mangles by its owner.
+    #[test]
+    fn w3_emit_class_name_via_global_owner() {
+        let mut ctx = TyCtx::new();
+        ctx.class_owner.insert("Match".to_string(), "re".to_string());
+        let cg = Codegen::new(&ctx);
+        assert_eq!(cg.emit_class_name("Point"), "Point"); // root class: bare, unchanged
+        assert_eq!(cg.emit_class_name("Match"), "__pyrst_m_re__Match");
+    }
+
+    /// W3-2: `bare_owner_for` mirrors typeck's flat resolution — the ROOT's own def
+    /// shadows a from-import (`root_defined` wins → None → unwrapped); a from-import
+    /// binding at the root resolves to its OWNER module; and inside a module a bare
+    /// name resolves to that module's own definition. A globally-owned class name
+    /// is the final fallback.
+    #[test]
+    fn w3_bare_owner_for_resolution() {
+        use crate::typeck::{FuncSig, ModuleSymbols};
+        let mut ctx = TyCtx::new();
+        // operator owns `sub`; re owns a class `Match`.
+        let mut operator = ModuleSymbols::default();
+        operator.funcs.insert(
+            "sub".into(),
+            FuncSig { params: vec![], ret: Ty::Int, param_defaults: vec![], param_by_ref: vec![] },
+        );
+        ctx.module_symbols.insert("operator".into(), operator);
+        ctx.class_owner.insert("Match".into(), "re".into());
+        // root did `from operator import sub`, then defined its OWN `sub`.
+        ctx.import_bindings
+            .entry(crate::typeck::ROOT_MODULE_ID.into())
+            .or_default()
+            .insert("sub".into(), ("operator".into(), "sub".into()));
+
+        let mut cg = Codegen::new(&ctx);
+
+        // ROOT scope, `sub` is a from-import binding but NOT root-defined -> owner.
+        cg.current_module = None;
+        assert_eq!(cg.bare_owner_for("sub").as_deref(), Some("operator"));
+        // ROOT scope, a root-defined name shadows the import -> None (unwrapped).
+        cg.root_defined.insert("sub".into());
+        assert_eq!(cg.bare_owner_for("sub"), None);
+        // A globally-owned class name resolves to its owner even at the root.
+        assert_eq!(cg.bare_owner_for("Match").as_deref(), Some("re"));
+        // A plain unknown/builtin name -> None (unwrapped, import-free unchanged).
+        assert_eq!(cg.bare_owner_for("print"), None);
+
+        // MODULE scope `operator`: its OWN `sub` wins (same-module owner).
+        cg.root_defined.clear();
+        cg.current_module = Some("operator".into());
+        assert_eq!(cg.bare_owner_for("sub").as_deref(), Some("operator"));
+    }
+
+    /// W3-fix / F1,F14: `with_module_symbols_promoted` makes a module's OWN
+    /// function win over the flat last-writer AND drops a same-named FOREIGN class
+    /// from that module's checking view — so `time.pyrs`'s internal bare `time()`
+    /// resolves to its own fn, not `datetime`'s class `time`. The symmetric view
+    /// for `datetime` KEEPS the class (it owns it).
+    #[test]
+    fn w3fix_promoted_own_func_shadows_foreign_class() {
+        use crate::typeck::{FuncSig, ModuleSymbols};
+        let fn_sig = FuncSig { params: vec![], ret: Ty::Float, param_defaults: vec![], param_by_ref: vec![] };
+        let mut ctx = TyCtx::new();
+        // `time` module owns a FUNCTION `time`; `datetime` owns a CLASS `time`.
+        let mut timemod = ModuleSymbols::default();
+        timemod.funcs.insert("time".into(), fn_sig.clone());
+        ctx.module_symbols.insert("time".into(), timemod);
+        let mut dtmod = ModuleSymbols::default();
+        dtmod.classes.insert("time".into(), class_def("time", &[]));
+        ctx.module_symbols.insert("datetime".into(), dtmod);
+        // Flat facade (last-merged): the class won `ctx.classes`, the fn `ctx.funcs`.
+        ctx.funcs.insert("time".into(), fn_sig);
+        ctx.classes.insert("time".into(), class_def("time", &[]));
+
+        // Checking `time`: its own fn is promoted and the foreign class is removed.
+        let for_time = ctx.with_module_symbols_promoted(Some("time"));
+        assert!(for_time.funcs.contains_key("time"));
+        assert!(!for_time.classes.contains_key("time"), "foreign class `time` must be dropped for the fn-owning module");
+        // Checking `datetime`: it OWNS the class, so the class stays.
+        let for_dt = ctx.with_module_symbols_promoted(Some("datetime"));
+        assert!(for_dt.classes.contains_key("time"));
+    }
+
+    /// W3-fix / F4: the checking view folds a `from X import f` binding to X's REAL
+    /// signature (owner-first), overriding the flat last-MERGED collider — unless
+    /// the ROOT defines its own `f` (root-shadows-imports).
+    #[test]
+    fn w3fix_promoted_folds_from_import_owner_first() {
+        use crate::typeck::{FuncSig, ModuleSymbols};
+        let one_arg = FuncSig { params: vec![("a".into(), Ty::Int)], ret: Ty::Int, param_defaults: vec![None], param_by_ref: vec![false] };
+        let two_arg = FuncSig { params: vec![("a".into(), Ty::Int), ("b".into(), Ty::Int)], ret: Ty::Int, param_defaults: vec![None, None], param_by_ref: vec![false, false] };
+        let mut ctx = TyCtx::new();
+        // `modb` owns a 1-arg `combine`; the flat table holds a 2-arg collider.
+        let mut modb = ModuleSymbols::default();
+        modb.funcs.insert("combine".into(), one_arg);
+        ctx.module_symbols.insert("modb".into(), modb);
+        ctx.funcs.insert("combine".into(), two_arg);
+        // root did `from modb import combine`.
+        ctx.import_bindings
+            .entry(crate::typeck::ROOT_MODULE_ID.into())
+            .or_default()
+            .insert("combine".into(), ("modb".into(), "combine".into()));
+
+        // Root check: the binding owner's 1-arg sig wins.
+        let p = ctx.with_module_symbols_promoted(None);
+        assert_eq!(p.funcs["combine"].params.len(), 1, "from-import must resolve to modb's 1-arg sig");
+        // But a root that defines its OWN `combine` shadows the import.
+        ctx.root_defined.insert("combine".into());
+        let p2 = ctx.with_module_symbols_promoted(None);
+        assert_eq!(p2.funcs["combine"].params.len(), 2, "root's own def shadows the from-import");
+    }
+
+    /// W3-fix / F10,F14: a module's OWN const type is promoted over the flat
+    /// last-writer, so a bare const reference inside its body types owner-first.
+    #[test]
+    fn w3fix_promoted_promotes_own_const() {
+        use crate::typeck::ModuleSymbols;
+        let mut ctx = TyCtx::new();
+        let mut cfg = ModuleSymbols::default();
+        cfg.consts.insert("TAG".into(), Ty::Str);
+        ctx.module_symbols.insert("cfg".into(), cfg);
+        // Flat facade: another module's INT `TAG` merged last.
+        ctx.vars.insert("TAG".into(), Ty::Int);
+        let p = ctx.with_module_symbols_promoted(Some("cfg"));
+        assert_eq!(p.vars.get("TAG"), Some(&Ty::Str), "cfg's own str const type wins in its checking view");
     }

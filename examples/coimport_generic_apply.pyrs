@@ -1,0 +1,12 @@
+# (W3-fix / F2,F12) GENERIC-vs-NON-GENERIC collision. Codegen's generic
+# monomorphization (`generic_call_param_subst`) resolves the callee sig
+# OWNER-FIRST, so the generic's `Callable[[T],T]` slot monomorphizes to
+# `Rc<dyn Fn(i64)->i64>` instead of leaking a bare `T` (E0425) from the
+# non-generic sibling's flat sig. Both import orders verified in the W3-fix probes.
+import applymod_gen
+import applymod_str
+
+
+def main() -> None:
+    print(applymod_gen.apply(lambda n: n + 1, 5))
+    print(applymod_str.apply("a", "b"))

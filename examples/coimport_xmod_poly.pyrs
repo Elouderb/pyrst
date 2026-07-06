@@ -1,0 +1,36 @@
+# (W3-2) CROSS-MODULE polymorphism — the single riskiest interaction (design §F,
+# probe A / P2). The polymorphic BASE `Shape` lives in an IMPORTED module
+# (coimport_shapes_base), the SUBCLASS `Square` lives in the ROOT. Under mangling
+# the companion enum spans two owners in ONE flat enum with zero path juggling:
+#
+#   enum __pyrst_m_coimport_shapes_base__Shape__ {
+#       __pyrst_m_coimport_shapes_base__Shape(__pyrst_m_coimport_shapes_base__Shape),
+#       Square(Square),                      // root subclass — unwrapped
+#   }
+#
+# The enum's home is the BASE's module; each variant tag + payload is mangled by
+# ITS OWN owner (base by coimport_shapes_base, Square by root). Method dispatch
+# (`s.area()`, `s.kind()`) and the field accessor (`s.x`) route through the enum.
+from coimport_shapes_base import Shape
+
+
+class Square(Shape):
+    side: int
+    def __init__(self, x: int, side: int) -> None:
+        super().__init__(x)
+        self.side = side
+    def area(self) -> int:
+        return self.side * self.side
+    def kind(self) -> str:
+        return "square"
+
+
+def main() -> None:
+    s: Shape = Square(1, 4)
+    print(s.area())    # 16   (dispatch -> Square.area)
+    print(s.kind())    # square
+    print(s.x)         # 1    (field accessor across the enum)
+    b: Shape = Shape(7)
+    print(b.area())    # 0    (dispatch -> Shape.area, the imported base)
+    print(b.kind())    # shape
+    print(b.x)         # 7

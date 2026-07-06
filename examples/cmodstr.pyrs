@@ -1,0 +1,2 @@
+# (W3-fix / F8,F9) Sibling: a STR const TAG of the SAME name as cmodint.TAG.
+TAG: str = "seven"

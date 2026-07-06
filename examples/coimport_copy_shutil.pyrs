@@ -1,0 +1,28 @@
+# (W3-2 payoff) Co-import: `copy` and `shutil` BOTH define `copy` — as DIFFERENT
+# item kinds (copy.copy is a GENERIC `copy[T](x: T) -> T` shallow copy; shutil.copy
+# is a non-generic file copy). Old flat namespace rejected the co-import; per-module
+# namespacing emits `__pyrst_m_copy__copy` / `__pyrst_m_shutil__copy`, the generic
+# oracle keys off the OWNER's signature (so `shutil.copy` is NOT mistaken for the
+# generic `copy.copy`), and both resolve via their own qualified path.
+#
+# NOT a python3-parity file: shutil.copy does real filesystem I/O (paths would
+# diverge under a dual run), so this is a pyrst positive golden with a fixed
+# expected output. copy.copy is verified value-wise; shutil.copy round-trips a
+# small temp file to prove the (mangled) file-copy is the one that runs.
+import copy
+import shutil
+
+
+def main() -> None:
+    xs: list[int] = [1, 2, 3]
+    ys: list[int] = copy.copy(xs)   # shallow copy — independent list
+    ys.append(99)
+    print(xs)                        # [1, 2, 3]   (unchanged: copy.copy)
+    print(ys)                        # [1, 2, 3, 99]
+    src: str = "/tmp/pyrst_coimport_copy_src.txt"
+    dst: str = "/tmp/pyrst_coimport_copy_dst.txt"
+    with open(src, "w") as f:
+        f.write("shutil-copy-ok")
+    shutil.copy(src, dst)            # file copy (the OTHER `copy`)
+    with open(dst, "r") as g:
+        print(g.read())              # shutil-copy-ok

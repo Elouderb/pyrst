@@ -109,17 +109,15 @@
 #     module does NOT match; our `examples/parity_html.pyrs` was reseeded to
 #     drop those two specific cases (every other dossier case is covered).
 #
-# NAME COLLISION (documented co-import restriction, precedent: `re.escape`):
+# NAME COLLISION — LIFTED by W3-2 per-module namespacing (precedent: `re.escape`):
 # `lib/re.pyrs` ALSO defines a top-level `escape` (regex-metachar escaping).
-# pyrst's module namespace is FLAT (co-import collision detection — card
-# 6c8b4a39), so a single program CANNOT `import html` and `import re`
-# together (or `from html import escape` + `from re import escape`) — the
-# resolver raises a clear cross-module-collision error at compile time
-# rather than silently letting one shadow the other. Both modules keep
-# their exact CPython name (`escape`) rather than renaming either away from
-# parity; a program needing both regex-escaping and HTML-escaping must pick
-# one qualified import path manually (not currently expressible in pyrst
-# without dotted submodules / aliasing).
+# The old flat namespace rejected co-importing both; W3-2 emits them as distinct
+# `__pyrst_m_html__escape` / `__pyrst_m_re__escape` Rust items, so a single
+# program NOW CAN `import html` and `import re` together and call each
+# qualified. Proven by examples/parity_coimport_html_re.pyrs (dual-run vs
+# python3). Both modules keep their exact CPython name (`escape`); a program
+# needing both regex-escaping and HTML-escaping now just imports both and
+# writes `html.escape(...)` / `re.escape(...)` qualified.
 #
 # Errors: `escape`/`unescape` never raise in pyrst (both take a mandatory
 # `str` argument the type checker already enforces — the dossier's

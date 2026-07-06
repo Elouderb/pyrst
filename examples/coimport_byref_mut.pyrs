@@ -1,0 +1,12 @@
+# (W3-fix / F3) BY-REF-vs-PLAIN collision: the call site resolves per-param by-ref
+# flags OWNER-FIRST, so `byrefmod_a.stash`'s by-reference borrow is NOT silently
+# dropped by the plain sibling's flat flags — the caller's list mutation persists.
+import byrefmod_a
+import byrefmod_b
+
+
+def main() -> None:
+    xs: list[int] = [1, 2]
+    byrefmod_a.stash(xs, 99)
+    print(xs)
+    print(byrefmod_b.stash(3, 4))

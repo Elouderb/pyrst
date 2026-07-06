@@ -244,10 +244,26 @@ class identity by that bare name. Two co-imported modules each defining `class
 Foo` would be indistinguishable (`rust_ty(Ty::Class("Foo"))` can't pick an owner).
 So v1 keeps **class-name global uniqueness** an honest error, while fn-vs-fn,
 const-vs-const, and fn-vs-const collisions become co-importable. **None of the 8
-documented pairs is class-vs-class** (the `time` pair is a *class* `datetime.time`
-vs a *function* `time.time` — different Rust item kinds, both mangle cleanly), so
-this narrowing loses nothing today. Threading an owner into `Ty::Class` (true
-same-named-class co-import) is a documented v2 extension.
+documented pairs is class-vs-class** — the `time` pair is a *class* `datetime.time`
+vs a *function* `time.time`, distinct Rust item kinds that mangle to distinct
+symbols.
+
+**(W3-fix correction.)** "Distinct symbols" is necessary but was **not
+sufficient**: emission mangling alone did **not** make the `datetime` + `time`
+co-import work. `time.pyrs` calls its OWN bare `time()` internally, and a
+flat/class-first *resolution* bound that call to `datetime`'s CLASS `time`,
+breaking `check` *inside* `<stdlib>/time.pyrs`. The fix is **owner-first
+resolution**: a module's own top-level function shadows a foreign same-named
+class both in typeck (`with_module_symbols_promoted` drops the foreign class from
+the module's checking view) and in codegen (`emit_constructor_call` yields to a
+same-scope own function). With that, the co-import **checks, builds, and runs**;
+qualified `time.time()` / `time.time_ns()` work in both import orders (see
+`examples/coimport_datetime_time.pyrs`). The **residual** is orthogonal:
+qualified module-**CLASS** construction (`datetime.time(9, 30)`) is still
+unsupported — the qualified-call path resolves `module_funcs` only, not classes,
+the same gap as `fractions.Fraction(...)` — so it is a **v2 deferral**, not a
+"loses nothing" claim. Threading an owner into `Ty::Class` (true same-named-class
+co-import) remains the documented v2 extension.
 
 **From-import local-name conflicts — HONEST ERROR (fidelity decision).** If a
 single file does `from datetime import time` **and** `from time import time`, the

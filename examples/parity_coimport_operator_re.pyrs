@@ -1,0 +1,14 @@
+# (W3-2 payoff) Co-import parity: `operator` and `re` BOTH define a top-level
+# `sub`. Under the old flat namespace this was a hard check-time error (card
+# 6c8b4a39); per-module namespaced emission now lowers them to distinct
+# `__pyrst_m_operator__sub` / `__pyrst_m_re__sub`, so both co-import and each
+# resolves via its own qualified path. Dual-run against CPython (both `operator.sub`
+# and `re.sub` are real CPython public APIs), so the numbers must match python3.
+import operator
+import re
+
+
+def main() -> None:
+    print(operator.sub(5, 3))          # 2
+    print(operator.mul(4, 6))          # 24
+    print(re.sub("a", "o", "banana"))  # bonono

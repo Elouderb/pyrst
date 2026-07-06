@@ -378,14 +378,46 @@ pub(crate) fn infer_generic_call_result(
     ctx: &TyCtx,
     span: Span,
 ) -> Result<Option<Ty>> {
+    infer_generic_call_result_with_sig(name, None, arg_tys, ctx, span)
+}
+
+/// (W3-2) As [`infer_generic_call_result`], but with an OWNER-FIRST signature
+/// override. A QUALIFIED call to a co-imported generic (`copy.copy(xs)` where
+/// `shutil` ALSO defines a non-generic `copy`) must unify against COPY's generic
+/// params — but the flat `ctx.funcs["copy"]` holds whichever collider merged last
+/// (shutil's, with no type var), which would spuriously fail as "cannot infer
+/// `T`". The qualified check path resolves the sig owner-first and threads it here
+/// via `sig_override`; a bare call passes `None` and re-fetches from the (already
+/// owner-promoted, per `check_bodies`) flat table. The type-parameter LIST is
+/// still keyed by the bare `name` in `generic_funcs` (a same-named GENERIC in two
+/// modules is not among the co-import pairs; that remains a v2 edge).
+pub(crate) fn infer_generic_call_result_with_sig(
+    name: &str,
+    sig_override: Option<&FuncSig>,
+    arg_tys: &[Ty],
+    ctx: &TyCtx,
+    span: Span,
+) -> Result<Option<Ty>> {
     let type_params = match ctx.generic_funcs.get(name) {
         Some(tps) if !tps.is_empty() => tps,
         _ => return Ok(None),
     };
-    let sig = match ctx.funcs.get(name) {
+    let sig = match sig_override.or_else(|| ctx.funcs.get(name)) {
         Some(s) => s,
         None => return Ok(None),
     };
+    // (W3-2) `generic_funcs` is bare-keyed, so a co-imported NON-generic function
+    // sharing a generic function's name (`shutil.copy` vs the generic `copy.copy`)
+    // would spuriously match the generic markers here. When an OWNER-FIRST sig was
+    // supplied and it mentions NO type variable, the OWNER's function is genuinely
+    // non-generic — use its declared return (a real generic always has a
+    // type-var-bearing param or return).
+    if sig_override.is_some()
+        && !sig.params.iter().any(|(_, t)| contains_typevar(t))
+        && !contains_typevar(&sig.ret)
+    {
+        return Ok(None);
+    }
     let res = resolve_generic_call(&sig.params, &sig.ret, type_params, arg_tys);
     if let Some(msg) = res.conflict {
         return Err(Error::Type { span, msg });
@@ -419,6 +451,7 @@ pub(crate) fn infer_generic_call_result(
 /// path) just yields a partial map; codegen never errors on it.
 pub fn generic_call_param_subst(
     name: &str,
+    sig_override: Option<&FuncSig>,
     arg_tys: &[Ty],
     ctx: &TyCtx,
 ) -> Option<HashMap<String, Ty>> {
@@ -426,7 +459,22 @@ pub fn generic_call_param_subst(
         Some(tps) if !tps.is_empty() => tps,
         _ => return None,
     };
-    let sig = ctx.funcs.get(name)?;
+    // (W3-fix / F12) Resolve the callee's signature OWNER-FIRST (via `sig_override`,
+    // threaded from the call site's `resolve_callee_sig`), falling back to the flat
+    // table for a root fn / synthetic ctx. The flat `ctx.funcs[name]` holds only
+    // the last-merged collider, so a `copy.copy[T]` call co-imported with a
+    // non-generic `shutil.copy` would otherwise monomorphize against the WRONG sig.
+    let sig = sig_override.or_else(|| ctx.funcs.get(name))?;
+    // `generic_funcs` is bare-keyed, so a co-imported NON-generic callee sharing a
+    // generic's name spuriously matches the markers above. When an OWNER-FIRST sig
+    // was supplied and it mentions NO type variable, the owner's function is
+    // genuinely non-generic — there is nothing to monomorphize.
+    if sig_override.is_some()
+        && !sig.params.iter().any(|(_, t)| contains_typevar(t))
+        && !contains_typevar(&sig.ret)
+    {
+        return None;
+    }
     let mut subst: HashMap<String, Ty> = HashMap::new();
     for ((_, decl), actual) in sig.params.iter().zip(arg_tys.iter()) {
         // Ignore a conflict here — the checking path already rejected it; we
@@ -514,7 +562,10 @@ pub(crate) fn check_call_arg_types_and_result(
     }
     // GENERIC callee: unify + substitute the return type (and surface
     // conflicting / uninferable type parameters). Non-generic: declared return.
-    Ok(infer_generic_call_result(lookup_name, arg_tys, ctx, span)?
+    // (W3-2) Pass the OWNER-FIRST `sig` (the caller resolved it via
+    // `resolve_module_func`) so a co-imported same-named collider in the flat
+    // table cannot supply the wrong param list to the unifier.
+    Ok(infer_generic_call_result_with_sig(lookup_name, Some(sig), arg_tys, ctx, span)?
         .unwrap_or_else(|| sig.ret.clone()))
 }
 
@@ -927,7 +978,10 @@ pub fn reject_class_key_through_generic(
     if !bounds.values().any(|s| s.contains(&TypeVarBound::Hash)) {
         return Ok(());
     }
-    let subst = match generic_call_param_subst(name, arg_tys, ctx) {
+    // (W3-fix / F12) Bare-name hazard check run under the OWNER-FIRST checking ctx
+    // (`with_module_symbols_promoted`), so the flat table is already owner-correct
+    // here — no explicit sig override needed.
+    let subst = match generic_call_param_subst(name, None, arg_tys, ctx) {
         Some(s) => s,
         None => return Ok(()),
     };

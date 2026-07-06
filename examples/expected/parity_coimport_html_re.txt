@@ -1,0 +1,2 @@
+&lt;b&gt;&amp;amp&lt;/b&gt;
+a\.b\*c\+d

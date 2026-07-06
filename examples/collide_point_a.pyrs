@@ -1,0 +1,15 @@
+# (W3-2) Local library fixture for examples/fail_stdlib_name_collision.pyrs.
+# Defines `class Point` — co-imported alongside collide_point_b (which ALSO
+# defines `class Point`) it triggers the narrowed class-vs-class collision
+# stopgap. Standalone this is a valid, output-free module (its expected/ file is
+# empty): a class type is carried as a bare `Ty::Class("Point")`, so two
+# same-named classes in different modules cannot be told apart at a type
+# reference — hence class names stay globally unique in v1.
+class Point:
+    x: int
+    y: int
+    def __init__(self, x: int, y: int) -> None:
+        self.x = x
+        self.y = y
+    def norm2(self) -> int:
+        return self.x * self.x + self.y * self.y

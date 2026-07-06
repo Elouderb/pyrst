@@ -1,0 +1,10 @@
+# (W3-fix / F5,F7) Callee module for coimport_default_owner. `base_value` is
+# referenced ONLY as a parameter default (exercises the DCE default-walk, F7 —
+# without it `base_value` is pruned then re-emitted => E0425). Standalone:
+# output-free.
+def base_value() -> int:
+    return 111
+
+
+def apply_default(x: int = base_value()) -> int:
+    return x

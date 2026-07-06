@@ -111,19 +111,17 @@
 #     on `str` only, matching pyrst's lack of a `bytes` type — the dossier
 #     marks this "no deferral needed".
 #
-# --- Name collisions (documented co-import restrictions, precedent: `re`
-# vs `operator`'s `sub`, `datetime`'s class `time` vs the `time` module) ---
+# --- Name collisions — LIFTED by W3-2 per-module namespacing ---
 #   - `split` is also defined by `re` (`re.split(pattern, text, maxsplit=0)`).
-#     A program that does `from re import split` and `from shlex import
-#     split` (or any combination that pulls both top-level `split` names
-#     into one program) hits pyrst's flat-namespace cross-module collision
-#     error. Import one or the other, or use a qualified `re.split(...)` /
-#     `shlex.split(...)` call — qualified calls still route through the
-#     same flat top-level function today (G3, real per-module namespacing,
-#     is the epic that will remove this restriction).
+#     Under W3-2 the two emit as distinct `__pyrst_m_shlex__split` /
+#     `__pyrst_m_re__split` Rust items, so a program NOW CO-IMPORTS both and
+#     calls each qualified (`re.split(...)` / `shlex.split(...)`). Proven by
+#     examples/parity_coimport_re_shlex.pyrs (dual-run vs python3).
 #   - `join` is also defined by `os` (`os.join(a, b)`, the flat `os.path.
-#     join` stand-in). Same restriction: a program cannot import both
-#     `shlex.join` and `os.join` at the top level.
+#     join` stand-in). Also co-importable now (`__pyrst_m_os__join` /
+#     `__pyrst_m_shlex__join`); os's OWN internal `join(top, e)` still
+#     resolves owner-first to its 2-arg join. Proven by
+#     examples/coimport_os_shlex.pyrs.
 #   - `quote` has no collision with any other embedded module (checked via
 #     `grep -n '^def quote\b' lib/*.pyrs` — no hits).
 

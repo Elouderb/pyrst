@@ -1,0 +1,17 @@
+# (W3-2) ROOT-def-shadows-import: the root defines its OWN `basename` (3-arg),
+# which shadows the imported `os.basename` (1-arg) in the BARE namespace — the root
+# is merged last and wins, so a bare `basename(...)` is the root's, emitted
+# crate-root-unwrapped. The QUALIFIED `os.basename(...)` still resolves owner-first
+# to os's own 1-arg definition (`__pyrst_m_os__basename`). Emission must agree with
+# typeck here (both owner-first), or the two would disagree on this exact shape —
+# this golden pins that agreement.
+import os
+
+
+def basename(a: int, b: int, c: int) -> int:
+    return a + b + c
+
+
+def main() -> None:
+    print(basename(1, 2, 3))              # 6      (root's 3-arg basename, unwrapped)
+    print(os.basename("/a/b/c.txt"))      # c.txt  (os's 1-arg basename, owner-first)

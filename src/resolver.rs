@@ -40,7 +40,12 @@ impl Resolver {
     /// (`abs_path`). Reads + normalizes the source, then hands off to
     /// [`Resolver::process_module`] for the shared parse / recurse / cache work.
     /// After completion, `self.order` is in topological order.
-    fn visit(&mut self, abs_path: PathBuf, base_dir: &Path, import_span: Span) -> Result<()> {
+    ///
+    /// `module_id` is the canonical DOTTED import path that reached this module
+    /// (`None` for the ROOT), threaded through so [`Resolver::process_module`] can
+    /// stamp it onto the parsed [`Module`] — the per-module-namespace key, set
+    /// from the import path rather than the file stem (W3-1).
+    fn visit(&mut self, abs_path: PathBuf, base_dir: &Path, import_span: Span, module_id: Option<String>) -> Result<()> {
         // Cheap pre-check before reading the file: a module already finished or
         // currently in-flight needs no re-read. (`process_module` re-checks under
         // the post-read key, but for a file the key IS `abs_path`, so this also
@@ -65,7 +70,7 @@ impl Resolver {
                 }
             })?;
 
-        self.process_module(abs_path, src, base_dir, import_span)
+        self.process_module(abs_path, src, base_dir, import_span, module_id)
     }
 
     /// Shared DFS body for a single module, given its module KEY (`key`) and
@@ -78,12 +83,18 @@ impl Resolver {
     /// resolved as local files (for a file module, its parent dir; for an
     /// embedded module, the synthetic `<stdlib>` dir — which has no real files,
     /// so local lookups there harmlessly miss and fall through to embedded).
+    ///
+    /// `module_id` (the dotted import path that reached this module; `None` for
+    /// the ROOT) is stamped onto the parsed module as its per-module-namespace key
+    /// (W3-1), taken from the import path — NOT the file stem, which is ambiguous
+    /// for a dotted submodule (`lib/os/path.pyrs` → stem `"path"`, id `"os.path"`).
     fn process_module(
         &mut self,
         key: PathBuf,
         src: String,
         base_dir: &Path,
         import_span: Span,
+        module_id: Option<String>,
     ) -> Result<()> {
         // Already processed (diamond import case)
         if self.order.contains(&key) {
@@ -117,6 +128,11 @@ impl Resolver {
         let mut m = crate::parser::parse(&src)
             .map_err(|e| e.with_render_source(render_path, &src))?;
         m.source_path = Some(key.clone());
+        // (W3-1) Stamp the dotted import path that reached this module as its
+        // per-module-namespace key. Set from the import path (threaded via
+        // `module_id`), so a dotted submodule keeps its FULL id even though its
+        // file stem is ambiguous. `None` here means the ROOT program.
+        m.module_id = module_id;
 
         // Recurse into this module's imports BEFORE adding self to order (post-order DFS)
         for stmt in &m.stmts {
@@ -154,8 +170,10 @@ impl Resolver {
                 // SHADOWS an embedded stdlib module of the same name.
                 let dep_path = base_dir.join(format!("{}.pyrs", mod_name));
                 if let Ok(dep_abs) = dep_path.canonicalize() {
-                    // Local file found.
-                    self.visit(dep_abs, base_dir, *span)?;
+                    // Local file found. The dotted import path that reaches it is
+                    // its module id (W3-1); for a single-component `import mod` that
+                    // is `mod_name` itself.
+                    self.visit(dep_abs, base_dir, *span, Some(mod_name.clone()))?;
                 } else if let Some(embedded_src) = crate::stdlib::lookup(mod_name) {
                     // No local file → resolve from the EMBEDDED stdlib. Use a
                     // synthetic `<stdlib>/<mod>.pyrs` key so caching, cycle
@@ -165,7 +183,7 @@ impl Resolver {
                     let stdlib_dir = stdlib_synthetic_dir();
                     let dep_key = stdlib_dir.join(format!("{}.pyrs", mod_name));
                     let dep_src = crate::lexer::normalize_line_endings(embedded_src);
-                    self.process_module(dep_key, dep_src, &stdlib_dir, *span)?;
+                    self.process_module(dep_key, dep_src, &stdlib_dir, *span, Some(mod_name.clone()))?;
                 } else {
                     // Neither a local file nor an embedded module exists.
                     return Err(Error::ImportNotFound {
@@ -211,18 +229,34 @@ pub(crate) fn merge_ctx_from_module(m: &Module, ctx: &mut TyCtx, is_root: bool) 
     // is called with `is_root = true`, so this branch never runs there and
     // `module_funcs` stays empty (qualified calls don't resolve in the editor —
     // the same gap the rest of the stdlib has; it does not crash).
+    //
+    // (W3-1) The qualifier key is now the DOTTED module id the resolver stamped
+    // from the IMPORT PATH (`m.module_id`), not the file stem — a dotted submodule
+    // (`lib/os/path.pyrs`, id `"os.path"`) has the ambiguous stem `"path"`. For a
+    // single-component `import mod` the id equals the stem, so this is byte-for-byte
+    // the prior behaviour. The `or_else` stem fallback covers a non-root module a
+    // caller built without an id (the resolver always sets one); it never fires on
+    // the real path.
     let module_name: Option<String> = if is_root {
         None
     } else {
-        m.source_path
-            .as_ref()
-            .and_then(|p| p.file_stem())
-            .map(|s| s.to_string_lossy().into_owned())
+        m.module_id.clone().or_else(|| {
+            m.source_path
+                .as_ref()
+                .and_then(|p| p.file_stem())
+                .map(|s| s.to_string_lossy().into_owned())
+        })
     };
 
     for s in &m.stmts {
         match s {
             Stmt::Func(f) => {
+                // (W3-fix) Record the ROOT's own top-level fn names so owner-first
+                // resolution (typeck + codegen) lets a root def shadow a from-import
+                // of the same name (root-shadows-imports).
+                if is_root {
+                    ctx.root_defined.insert(f.name.clone());
+                }
                 // Skip main() from non-root modules
                 if f.name == "main" && !is_root {
                     continue;
@@ -244,7 +278,7 @@ pub(crate) fn merge_ctx_from_module(m: &Module, ctx: &mut TyCtx, is_root: bool) 
                 let params: Vec<(String, crate::typeck::Ty)> = f.params.iter()
                     .map(|p| crate::typeck::Ty::from_type_expr_scoped(&p.ty, p.span, &f.type_params).map(|ty| (p.name.clone(), ty)))
                     .collect::<crate::diag::Result<Vec<_>>>()?;
-                ctx.funcs.insert(f.name.clone(), crate::typeck::FuncSig {
+                let sig = crate::typeck::FuncSig {
                     params,
                     // A return annotation carries no span of its own; point at the
                     // function definition so a bad `-> ...` still gets a real caret.
@@ -259,7 +293,19 @@ pub(crate) fn merge_ctx_from_module(m: &Module, ctx: &mut TyCtx, is_root: bool) 
                         .filter(|p| p.name != "self")
                         .map(|p| p.by_ref)
                         .collect(),
-                });
+                };
+                // (W3-1) Record this function in its OWNING module's REAL per-module
+                // table + the owner index, alongside the flat facade below. Gated on
+                // `module_name` (Some iff non-root) exactly like `module_funcs`, so
+                // the per-module table, the owner index, and the qualifier index stay
+                // in lockstep. Owner-first qualified resolution reads the sig from
+                // here; the flat `ctx.funcs` insert stays for emission + every
+                // non-module lookup (unchanged this stage).
+                if let Some(mod_name) = &module_name {
+                    ctx.module_symbols.entry(mod_name.clone()).or_default().funcs.insert(f.name.clone(), sig.clone());
+                    ctx.func_owner.insert(f.name.clone(), mod_name.clone());
+                }
+                ctx.funcs.insert(f.name.clone(), sig);
                 // Generics v1: record the declared type-parameter list so call
                 // sites can unify and detect uninferable parameters. Only generic
                 // functions are inserted (a plain `def` is absent).
@@ -275,7 +321,20 @@ pub(crate) fn merge_ctx_from_module(m: &Module, ctx: &mut TyCtx, is_root: bool) 
             Stmt::Class(c) => {
                 let mut c = c.clone();
                 crate::typeck::extract_init_fields(&mut c);
+                if is_root {
+                    ctx.root_defined.insert(c.name.clone());
+                }
                 ctx.classes.insert(c.name.clone(), c.clone());
+                // (W3-1) Record this class in its OWNING module's real per-module
+                // table + the owner index (non-root only). Class names stay globally
+                // unique this stage (the stopgap keeps class-vs-class an error), so
+                // the flat `ctx.classes` and `class_owner` never conflict; the owner
+                // index is what stage 2's `rust_ty` will mangle a cross-module type
+                // reference by.
+                if let Some(mod_name) = &module_name {
+                    ctx.module_symbols.entry(mod_name.clone()).or_default().classes.insert(c.name.clone(), c.clone());
+                    ctx.class_owner.insert(c.name.clone(), mod_name.clone());
+                }
                 // Generics v2 (generic CLASSES): record the declared type-param
                 // names so substitution sites can zip them against an instance's
                 // `Ty::Class(name, args)`. ONLY a generic class (non-empty
@@ -331,6 +390,9 @@ pub(crate) fn merge_ctx_from_module(m: &Module, ctx: &mut TyCtx, is_root: bool) 
                 // This also makes a BARE reference to a module-level constant
                 // resolve inside its defining module (it lands in `ctx.vars`).
                 let resolved = crate::typeck::Ty::from_type_expr(t, *span)?;
+                if is_root && crate::typeck::is_const_literal(value) {
+                    ctx.root_defined.insert(target.clone());
+                }
                 ctx.vars.insert(target.clone(), resolved.clone());
                 // MODULE CONSTANTS (mirror of `module_funcs`): when the value is a
                 // const literal (int/float/str/bool) and this is a NON-ROOT
@@ -341,6 +403,11 @@ pub(crate) fn merge_ctx_from_module(m: &Module, ctx: &mut TyCtx, is_root: bool) 
                 // (via `ctx.vars` above), never as `root.CONST`.
                 if let Some(mod_name) = &module_name {
                     if crate::typeck::is_const_literal(value) {
+                        // (W3-1) Record the const in its OWNING module's real
+                        // per-module table + owner index, alongside the flat
+                        // `module_consts` facade the fallback path still reads.
+                        ctx.module_symbols.entry(mod_name.clone()).or_default().consts.insert(target.clone(), resolved.clone());
+                        ctx.const_owner.insert(target.clone(), mod_name.clone());
                         ctx.module_consts
                             .entry(mod_name.clone())
                             .or_default()
@@ -388,12 +455,18 @@ fn detect_cross_module_collisions(
 ) -> Result<()> {
     // top-level public name -> (owning imported module name, its source text).
     let mut owner: HashMap<String, String> = HashMap::new();
-    let total = order.len();
-    for (idx, path) in order.iter().enumerate() {
-        // The root program's own top-level names are allowed to shadow imports.
-        if idx + 1 == total {
-            continue;
-        }
+    for path in order.iter() {
+        // (W3-fix / F11) The root's own top-level FUNCTIONS / CONSTANTS may still
+        // shadow imports (only class-vs-class is tracked here). But a root CLASS
+        // sharing a name with an imported class is the SAME `Ty::Class`
+        // owner-blindness that makes import-vs-import class collisions unresolvable
+        // — `rust_ty`/`class_owner`/the companion enum key class identity by the
+        // bare name, so a root `class Point` + an imported `class Point` cannot be
+        // told apart at a type reference. So the root participates in the global
+        // class-name uniqueness check too (coherent with import-vs-import), rather
+        // than silently mangling the root's own class to the import's owner. Imports
+        // are visited BEFORE the root (topological order), so a collision is
+        // reported against the root's class span.
         let (m, src) = &cache[path];
         let module_name: String = m
             .source_path
@@ -403,15 +476,21 @@ fn detect_cross_module_collisions(
             .unwrap_or_default();
 
         for s in &m.stmts {
-            // Collect this statement's top-level public name and a span to blame.
+            // (W3-2) NARROWED to CLASS-vs-CLASS only. With per-module namespaced
+            // emission (`__pyrst_m_<owner>__<name>`), two co-imported modules that
+            // each define a same-named FUNCTION or CONST now emit DISTINCT Rust
+            // items, so fn-vs-fn / const-vs-const / fn-vs-const collisions are
+            // co-importable — they are no longer collected here. A CLASS name,
+            // however, is carried through the type system as a BARE `Ty::Class(name,
+            // ..)` (no owner), and `rust_ty` / `class_owner` / the companion enum all
+            // key class identity by that bare name — so two same-named classes in
+            // different modules would be indistinguishable at a type reference. v1
+            // therefore keeps CLASS-name global uniqueness an honest error (threading
+            // an owner into `Ty::Class` for true same-named-class co-import is the
+            // documented v2 extension). A fn-vs-class name pair is fine (distinct
+            // Rust item kinds, distinct mangling), so only class-vs-class is tracked.
             let named: Option<(&str, Span)> = match s {
-                Stmt::Func(f) if f.name != "main" => Some((f.name.as_str(), f.span)),
                 Stmt::Class(c) => Some((c.name.as_str(), c.span)),
-                Stmt::Assign { target, ty: Some(_), value, span }
-                    if crate::typeck::is_const_literal(value) =>
-                {
-                    Some((target.as_str(), *span))
-                }
                 _ => None,
             };
             let Some((name, span)) = named else { continue };
@@ -423,9 +502,11 @@ fn detect_cross_module_collisions(
                     return Err(Error::Type {
                         span,
                         msg: format!(
-                            "name `{}` is provided by both `{}` and `{}`; pyrst's \
-                             module namespace is flat (real per-module namespacing \
-                             is the G3 epic) — a program cannot import both",
+                            "class `{}` is defined by both `{}` and `{}`; pyrst v1 \
+                             keeps class names globally unique (a class type is carried \
+                             as a bare name with no owner, so two same-named classes \
+                             cannot be told apart at a type reference) — rename one, or \
+                             (v2) thread a module owner into the class type",
                             name, prev, module_name
                         ),
                     })
@@ -446,7 +527,9 @@ pub fn resolve(root_path: &Path) -> Result<ResolvedProgram> {
     let root_dir = abs_root.parent().unwrap_or_else(|| Path::new("."));
 
     let mut resolver = Resolver::new();
-    resolver.visit(abs_root.clone(), root_dir, Span::DUMMY)?;
+    // The ROOT program has no dotted import path (`module_id = None`): it is the
+    // sentinel root whose own top-level names stay crate-root-unwrapped (W3-1).
+    resolver.visit(abs_root.clone(), root_dir, Span::DUMMY, None)?;
 
     // (card 6c8b4a39) Reject co-importing two modules that share a top-level
     // public name BEFORE the flat merge silently picks a last-write-wins winner.
@@ -465,6 +548,56 @@ pub fn resolve(root_path: &Path) -> Result<ResolvedProgram> {
         let render_path = if total_modules > 1 { m.source_path.clone() } else { None };
         merge_ctx_from_module(m, &mut ctx, is_root)
             .map_err(|e| e.with_render_source(render_path, src))?;
+    }
+
+    // (W3-1) Build the from-import local-binding map: `from X import f` records
+    // `f -> ("X", "f")` in the IMPORTING module's scope (the root keyed under
+    // ROOT_MODULE_ID; every other module under its own dotted id). Owner-first bare
+    // resolution consults this before the root-locals; stage 2 consumes it to
+    // owner-qualify a bare from-imported call. This stage only makes it REAL and
+    // queryable — emission stays flat. The `dataclasses` skip-list is mirrored so
+    // its decorator-only import is excluded exactly as in the resolution loop.
+    for (idx, path) in resolver.order.iter().enumerate() {
+        let (m, _src) = &resolver.cache[path];
+        let importer: String = if idx + 1 == total_modules {
+            crate::typeck::ROOT_MODULE_ID.to_string()
+        } else {
+            m.module_id.clone().unwrap_or_else(|| crate::typeck::ROOT_MODULE_ID.to_string())
+        };
+        for s in &m.stmts {
+            if let Stmt::Import { path: imp_path, names, .. } = s {
+                // A plain `import X` (empty `names`) binds no LOCAL name — only
+                // `from X import f, g` records local bindings.
+                if names.is_empty() {
+                    continue;
+                }
+                if matches!(imp_path.first().map(String::as_str), Some("dataclasses")) {
+                    continue;
+                }
+                // (W3-fix / F16) The binding OWNER must equal the module id the
+                // resolver actually registers this import under. Today a dotted
+                // import resolves only its FIRST component (`mod_name = &path[0]`,
+                // the same-directory single-component module), so the owner is
+                // `path[0]` — recording the full dotted `a.b` would leave the bare
+                // `f` mangling to `__pyrst_m_a_b__f` while the def emits
+                // `__pyrst_m_a__f` (E0425). Byte-identical for a single-component
+                // import (`path[0] == path.join(".")`).
+                // TODO(w3-stage3): when real dotted module ids land, record the full
+                // resolved dotted path here (and register the module under it).
+                let owner = imp_path
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| imp_path.join("."));
+                for (local, _alias) in names {
+                    // Aliases are rejected at parse, so the local name IS the
+                    // imported name; record `local -> (owner, original)`.
+                    ctx.import_bindings
+                        .entry(importer.clone())
+                        .or_default()
+                        .insert(local.clone(), (owner.clone(), local.clone()));
+                }
+            }
+        }
     }
 
     // Build output: (Module, source_text) pairs in dependency order
@@ -640,28 +773,58 @@ class Account:
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 
-    /// Card 6c8b4a39: co-importing two modules that define the SAME top-level
-    /// public name (`operator` and `re` both `def sub`) is an honest error naming
-    /// both modules — never a silent last-import-wins overwrite.
+    /// (W3-2) The KEYSTONE payoff: co-importing two modules that each define the
+    /// same top-level FUNCTION (`operator` and `re` both `def sub`) now RESOLVES —
+    /// per-module namespaced emission (`__pyrst_m_operator__sub` /
+    /// `__pyrst_m_re__sub`) dissolves the flat collision. The former card-6c8b4a39
+    /// stopgap rejected this; W3-2 narrows the stopgap to class-vs-class only.
     #[test]
-    fn cross_module_name_collision_is_rejected() {
+    fn cross_module_function_collision_is_now_coimportable() {
         let root = temp_root(
             "import operator\nimport re\n\ndef main() -> None:\n    print(operator.sub(5, 3))\n    print(re.sub(\"a\", \"b\", \"banana\"))\n",
         );
-        // resolve() wraps the collision Type error in `Error::Sourced` (for the
-        // rendered snippet); its Display delegates to the inner message, so match
-        // on the message text rather than the outer variant.
+        assert!(
+            resolve(&root).is_ok(),
+            "co-importing operator and re (both define `sub`) must resolve under per-module namespacing"
+        );
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    /// (W3-2) The narrowed stopgap STILL rejects a class-vs-class name collision:
+    /// two local modules each defining `class Point` cannot co-import (a class type
+    /// is carried as a bare `Ty::Class("Point")` with no owner, so `rust_ty` cannot
+    /// pick which owner to mangle — v1 keeps class names globally unique). Written
+    /// as sibling local modules since NO stdlib pair is class-vs-class.
+    #[test]
+    fn cross_module_class_collision_is_rejected() {
+        // The root just co-imports both modules; the class-vs-class collision is
+        // detected purely from the two imported modules each defining `Point`
+        // (independent of how the root uses them).
+        let root = temp_root(
+            "import geo_a\nimport geo_b\n\ndef main() -> None:\n    print(1)\n",
+        );
+        let dir = root.parent().unwrap();
+        std::fs::write(
+            dir.join("geo_a.pyrs"),
+            "class Point:\n    x: int\n    y: int\n    def __init__(self, x: int, y: int) -> None:\n        self.x = x\n        self.y = y\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("geo_b.pyrs"),
+            "class Point:\n    px: int\n    py: int\n    def __init__(self, px: int, py: int) -> None:\n        self.px = px\n        self.py = py\n",
+        )
+        .unwrap();
         match resolve(&root) {
-            Ok(_) => panic!("co-importing operator and re (both define `sub`) must not resolve"),
+            Ok(_) => panic!("co-importing two modules that each define `class Point` must be rejected"),
             Err(e) => {
                 let msg = e.to_string();
                 assert!(
-                    msg.contains("`sub`") && msg.contains("operator") && msg.contains("re"),
-                    "collision error must name `sub` and both modules, got: {msg}"
+                    msg.contains("Point") && msg.contains("geo_a") && msg.contains("geo_b"),
+                    "class-collision error must name the class and both modules, got: {msg}"
                 );
             }
         }
-        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// The collision guard must NOT over-reject: importing ONLY `re` (its `sub`
@@ -688,5 +851,169 @@ class Account:
             resolve(&root).is_ok(),
             "a root def may shadow an imported name (only imported x imported collides)"
         );
+    }
+
+    // ── W3-1: per-module symbol tables + owner-first qualified resolution ──────
+
+    /// W3-1: `import os` stamps the embedded module with the DOTTED module id from
+    /// the import path (`"os"`), builds a REAL per-module table keyed by that id,
+    /// and records the owner index; the ROOT carries no module id.
+    #[test]
+    fn w3_import_builds_dotted_module_id_and_owner_maps() {
+        let root = temp_root("import os\n\ndef main() -> None:\n    print(os.basename(\"/a/b.txt\"))\n");
+        let prog = resolve(&root).expect("`import os` resolves via the embedded stdlib");
+
+        // The os module carries module_id = "os" (from the import path, not a stem
+        // coincidence); the root is the sentinel with no dotted id.
+        assert!(
+            prog.modules.iter().any(|(m, _)| m.module_id.as_deref() == Some("os")),
+            "os module carries the dotted module_id \"os\""
+        );
+        let (root_mod, _) = prog.modules.last().expect("root is last in topological order");
+        assert_eq!(root_mod.module_id, None, "the root program has no dotted module id");
+
+        // Real per-module table, keyed by the dotted id, holds os's own functions.
+        let os_syms = prog.ctx.module_symbols.get("os").expect("os has a per-module symbol table");
+        assert!(os_syms.funcs.contains_key("basename"), "os.basename lives in os's per-module table");
+        assert!(os_syms.funcs.contains_key("getenv"), "os.getenv lives in os's per-module table");
+        // Owner index maps the bare definition name back to its owning dotted id.
+        assert_eq!(prog.ctx.func_owner.get("basename").map(String::as_str), Some("os"));
+
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    /// W3-1: owner-first qualified function/const resolution — a real member HITS
+    /// the owning module's table; a non-member (with no flat/builtin entry) MISSES
+    /// to `None` rather than fabricating a signature.
+    #[test]
+    fn w3_qualified_resolution_owner_first_hit_and_miss() {
+        let root = temp_root("import os\n\ndef main() -> None:\n    print(os.getenv(\"X\", \"y\"))\n");
+        let prog = resolve(&root).expect("`import os` resolves");
+
+        // HIT: os.getenv resolves owner-first to os's declared (str, str) -> str sig.
+        let hit = prog.ctx.resolve_module_func("os", "getenv").expect("os.getenv hits its owner table");
+        assert_eq!(hit.params.len(), 2, "os.getenv(key, default)");
+        assert!(matches!(hit.ret, Ty::Str), "os.getenv returns str");
+
+        // MISS: a name os does not define (and that is not a builtin/flat entry)
+        // resolves to None through both helpers.
+        assert!(
+            prog.ctx.resolve_module_func("os", "no_such_os_function").is_none(),
+            "a qualified function miss must not fabricate a signature"
+        );
+        assert!(
+            prog.ctx.resolve_module_const("os", "NO_SUCH_CONST").is_none(),
+            "a qualified const miss must be None"
+        );
+
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    /// W3-1: `from X import f` binds the LOCAL name to `(owner, original)` in the
+    /// importing file's scope (root under `ROOT_MODULE_ID`); a plain `import X`
+    /// binds no local name.
+    #[test]
+    fn w3_from_import_records_local_binding() {
+        let root = temp_root("from os import getenv\n\ndef main() -> None:\n    print(getenv(\"X\", \"y\"))\n");
+        let prog = resolve(&root).expect("`from os import getenv` resolves");
+
+        let root_scope = prog
+            .ctx
+            .import_bindings
+            .get(crate::typeck::ROOT_MODULE_ID)
+            .expect("the root has a from-import binding scope");
+        assert_eq!(
+            root_scope.get("getenv"),
+            Some(&("os".to_string(), "getenv".to_string())),
+            "`from os import getenv` binds getenv -> (\"os\", \"getenv\")"
+        );
+
+        // A plain `import os` in a separate program records NO local binding.
+        let plain = temp_root("import os\n\ndef main() -> None:\n    print(os.getenv(\"X\", \"y\"))\n");
+        let plain_prog = resolve(&plain).expect("`import os` resolves");
+        let has_local = plain_prog
+            .ctx
+            .import_bindings
+            .get(crate::typeck::ROOT_MODULE_ID)
+            .is_some_and(|s| s.contains_key("getenv"));
+        assert!(!has_local, "plain `import os` must not create a from-import local binding");
+
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+        let _ = std::fs::remove_dir_all(plain.parent().unwrap());
+    }
+
+    /// W3-1: shadow precedence (documented root-over-import). A root `def basename`
+    /// (3-arg) shadows the imported os.basename (1-arg) in the FLAT / bare
+    /// namespace, but the OWNER-FIRST qualified path still resolves os's real
+    /// signature from os's per-module table, unpolluted by the root shadow.
+    #[test]
+    fn w3_root_shadow_flat_but_owner_first_resolves_module() {
+        let root = temp_root(
+            "import os\n\ndef basename(a: int, b: int, c: int) -> int:\n    return a + b + c\n\ndef main() -> None:\n    print(basename(1, 2, 3))\n",
+        );
+        let prog = resolve(&root).expect("a root def may shadow an imported name");
+
+        // Flat / bare namespace: the ROOT's 3-arg basename wins (root merged last).
+        let flat = prog.ctx.funcs.get("basename").expect("flat basename registered");
+        assert_eq!(flat.params.len(), 3, "root's 3-arg basename shadows the flat table");
+        assert!(matches!(flat.ret, Ty::Int), "root's basename returns int");
+
+        // Owner index + per-module table still point at os's real 1-arg definition.
+        assert_eq!(
+            prog.ctx.func_owner.get("basename").map(String::as_str),
+            Some("os"),
+            "the DEFINING owner of basename is os (root shadows are not recorded as owners)"
+        );
+        let qualified = prog.ctx.resolve_module_func("os", "basename").expect("os.basename resolves owner-first");
+        assert_eq!(qualified.params.len(), 1, "os.basename is 1-arg — owner-first ignores the root shadow");
+        assert!(matches!(qualified.ret, Ty::Str), "os.basename returns str");
+
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    /// W3-1: the KEYSTONE table-level property — two co-imported modules that each
+    /// define `sub` with DIFFERENT signatures coexist in the per-module tables and
+    /// resolve via their OWN qualified path, even though the flat table (and thus
+    /// stage-1 emission) can hold only one. This is a pure table/helper unit test:
+    /// it never runs the resolver, so the emission-level collision stopgap is
+    /// neither exercised nor relaxed — retiring it is stage 2's job.
+    #[test]
+    fn w3_same_name_two_modules_resolve_via_each_qualified_path() {
+        use crate::typeck::{FuncSig, ModuleSymbols};
+        let mut ctx = TyCtx::new();
+
+        // operator.sub(a: int, b: int) -> int
+        let op_sub = FuncSig {
+            params: vec![("a".into(), Ty::Int), ("b".into(), Ty::Int)],
+            ret: Ty::Int,
+            param_defaults: vec![None, None],
+            param_by_ref: vec![false, false],
+        };
+        // re.sub(pattern: str, repl: str, s: str) -> str
+        let re_sub = FuncSig {
+            params: vec![("pattern".into(), Ty::Str), ("repl".into(), Ty::Str), ("s".into(), Ty::Str)],
+            ret: Ty::Str,
+            param_defaults: vec![None, None, None],
+            param_by_ref: vec![false, false, false],
+        };
+
+        let mut operator = ModuleSymbols::default();
+        operator.funcs.insert("sub".into(), op_sub);
+        ctx.module_symbols.insert("operator".into(), operator);
+        let mut re = ModuleSymbols::default();
+        re.funcs.insert("sub".into(), re_sub);
+        ctx.module_symbols.insert("re".into(), re);
+
+        // The FLAT table can hold only ONE `sub` — leave it empty to prove
+        // owner-first resolution does not depend on it.
+        assert!(!ctx.funcs.contains_key("sub"), "flat table intentionally holds no `sub`");
+
+        let a = ctx.resolve_module_func("operator", "sub").expect("operator.sub resolves via its own table");
+        let b = ctx.resolve_module_func("re", "sub").expect("re.sub resolves via its own table");
+        // Each qualified path resolves to its OWN module's distinct signature.
+        assert_eq!(a.params.len(), 2, "operator.sub is binary");
+        assert!(matches!(a.ret, Ty::Int), "operator.sub returns int");
+        assert_eq!(b.params.len(), 3, "re.sub is ternary");
+        assert!(matches!(b.ret, Ty::Str), "re.sub returns str");
     }
 }

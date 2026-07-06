@@ -1,0 +1,16 @@
+# (W3-fix / F1) datetime + time CO-IMPORT: `datetime` defines `class time` while
+# `time` defines `def time()` — a class-vs-fn name pair across two stdlib modules.
+# Before the fix, co-importing broke CHECK inside <stdlib>/time.pyrs (its own bare
+# `time()` resolved to datetime's CLASS `time`). With owner-first checking (a
+# module's own fn shadows a foreign same-named class), the co-import now checks,
+# builds, and runs; qualified `time.time()` / `time.time_ns()` work in both orders.
+# Qualified module-CLASS construction `datetime.time(9, 30)` remains a v2 deferral
+# (qualified class construction is unsupported — same gap as fractions.Fraction;
+# see docs/design/w3-modules.md).
+import datetime
+import time
+
+
+def main() -> None:
+    print(time.time() >= 0.0)
+    print(time.time_ns() >= 0)

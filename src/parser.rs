@@ -65,7 +65,7 @@ impl Parser {
             stmts.push(self.parse_stmt()?);
             while matches!(self.peek(), Tok::Newline) { self.bump(); }
         }
-        Ok(Module { stmts, source_path: None })
+        Ok(Module { stmts, source_path: None, module_id: None })
     }
 
     fn parse_stmt(&mut self) -> Result<Stmt> {

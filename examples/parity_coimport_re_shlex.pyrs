@@ -1,0 +1,12 @@
+# (W3-2 payoff) Co-import parity: `re` and `shlex` BOTH define `split` (re.split
+# on a regex, shlex.split shell-style). Old flat namespace rejected it; per-module
+# namespacing emits `__pyrst_m_re__split` / `__pyrst_m_shlex__split`. Dual-run vs
+# CPython (both are real public APIs, and re.split on a literal + shlex.split of a
+# quoted token match CPython exactly).
+import re
+import shlex
+
+
+def main() -> None:
+    print(re.split(",", "a,b,c"))            # ['a', 'b', 'c']
+    print(shlex.split("ls -l  'my file'"))   # ['ls', '-l', 'my file']

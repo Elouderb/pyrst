@@ -245,11 +245,76 @@ pub struct FuncSig {
     pub param_by_ref: Vec<bool>,
 }
 
+/// (W3-1) The sentinel module id for the ROOT (user) program. Real module ids
+/// are dotted import paths (`"os"`, `"os.path"`), so the angle-bracketed sentinel
+/// — mirroring the resolver's `<stdlib>` synthetic dir — can never collide with a
+/// real module. The root's own top-level names stay crate-root-unwrapped, so this
+/// id keys only the root's from-import bindings (`import_bindings`), never the
+/// owner maps (a name absent from `func_owner`/`class_owner`/`const_owner` is, by
+/// construction, root-owned and unmangled).
+pub const ROOT_MODULE_ID: &str = "<root>";
+
+/// (W3-1) One imported module's OWN top-level symbol table, keyed by bare name.
+/// This is the REAL per-module namespace the W3 design layers under the flat
+/// lookups: two co-imported modules that each define `sub` keep DISTINCT entries
+/// here (the flat `funcs`/`classes`/`vars` cannot hold both, which is exactly why
+/// the collision stopgap still guards the flat *emitted* namespace until stage 2
+/// makes emission owner-qualified). Populated by `merge_ctx_from_module` for
+/// NON-ROOT modules only; empty on the LSP single-file path (`is_root = true`).
+#[derive(Debug, Clone, Default)]
+pub struct ModuleSymbols {
+    /// This module's own top-level free functions (bare name → signature).
+    pub funcs: HashMap<String, FuncSig>,
+    /// This module's own top-level classes (bare name → definition).
+    pub classes: HashMap<String, ClassDef>,
+    /// This module's own top-level annotated-literal constants (bare name → type).
+    pub consts: HashMap<String, Ty>,
+}
+
+/// (W3-2) `Clone` supports a per-module CHECKING overlay: when typeck checks a
+/// NON-ROOT module's body, it clones the ctx and promotes that module's OWN
+/// top-level funcs over the flat table so an INTERNAL bare call resolves to the
+/// module's own signature — a co-imported same-named collider (now legal once the
+/// stopgap is narrowed) must not shadow a module's own function inside its body
+/// (`os.walk`'s `join(top, e)` must be os's 2-arg join, not shlex's 1-arg join).
+/// For a module with no name collision this promotion is a no-op (its own funcs
+/// already equal the flat values), so every existing program is unaffected.
+#[derive(Clone)]
 pub struct TyCtx {
     // global symbol table — function name → signature (params + return type)
     pub funcs: HashMap<String, FuncSig>,
     pub classes: HashMap<String, ClassDef>,
     pub vars: HashMap<String, Ty>,
+    /// (W3-1) REAL per-module symbol tables, keyed by the dotted module id
+    /// (`"os"`, `"os.path"`). Each entry is the owning module's OWN top-level
+    /// funcs/classes/consts — the per-module namespace on which owner-first
+    /// qualified resolution and (stage 2) owner-qualified emission rest.
+    /// Populated by the resolver for NON-ROOT modules; the flat `funcs`/`classes`/
+    /// `vars` above stay as a FACADE (emission is still flat this stage, and the
+    /// LSP / unit-test contexts that never build this map fall back to the flat
+    /// tables). Empty on the LSP single-file path.
+    pub module_symbols: HashMap<String, ModuleSymbols>,
+    /// (W3-1) Owner index for EMISSION (consumed by stage 2's `emit_name`): a
+    /// defined top-level free-function's bare name → the dotted module id that
+    /// owns it. Only NON-ROOT (imported) functions are recorded; a name ABSENT
+    /// here is root-owned and (stage 2) stays crate-root-unwrapped. The collision
+    /// stopgap keeps this a well-defined single-owner map for fn/const today.
+    pub func_owner: HashMap<String, String>,
+    /// (W3-1) Owner index for EMISSION: a defined top-level class's bare name →
+    /// its owning dotted module id (non-root only). Stage 2's `rust_ty` Class arm
+    /// mangles a cross-module type reference by this owner.
+    pub class_owner: HashMap<String, String>,
+    /// (W3-1) Owner index for EMISSION: a defined top-level annotated-literal
+    /// constant's bare name → its owning dotted module id (non-root only).
+    pub const_owner: HashMap<String, String>,
+    /// (W3-1) From-import local-binding map, keyed by the IMPORTING module's id
+    /// (the root uses [`ROOT_MODULE_ID`]): `local_name → (owner_module_id,
+    /// original_name)`. `from os import getcwd` records `getcwd → ("os",
+    /// "getcwd")` in the importing file's scope. Stage 2 consumes this so a bare
+    /// `getcwd()` in that file emits the owner-qualified `__pyrst_m_os__getcwd`;
+    /// this stage only builds it (emission stays flat). Built by the resolver over
+    /// the resolved module set; empty on the LSP single-file path.
+    pub import_bindings: HashMap<String, HashMap<String, (String, String)>>,
     /// Qualified-module-call support: an IMPORTED file/stdlib module's NAME (its
     /// source-file stem, e.g. `"os"`) → the names of the top-level functions that
     /// module defines. Populated by `merge_ctx_from_module` for NON-ROOT modules
@@ -352,6 +417,15 @@ pub struct TyCtx {
     /// (`collect_promoted_consts`), so typeck and codegen share ONE decision. Empty
     /// for programs without enum-style class constants (emission byte-for-byte same).
     pub promoted_consts: std::collections::HashMap<String, std::collections::HashSet<String>>,
+    /// (W3-fix) The ROOT program's OWN top-level fn/class/const bare names. A bare
+    /// reference at the root resolves to the root's own definition FIRST
+    /// (root-shadows-imports — matching the flat merge, where the root is last and
+    /// wins the bare namespace), so [`with_module_symbols_promoted`] must NOT fold
+    /// a from-import binding whose local name the root also defines. Mirrors
+    /// codegen's `Codegen::root_defined`; populated by the resolver from the root
+    /// module's statements (empty on the LSP single-file / hand-built ctx paths,
+    /// which never fold from-imports because `import_bindings` is empty there).
+    pub root_defined: std::collections::HashSet<String>,
 }
 
 impl TyCtx {
@@ -466,7 +540,7 @@ impl TyCtx {
         // function is merged in, so the keyword→positional mapper can tell a
         // real user signature from a builtin stub (see `builtin_funcs` docs).
         let builtin_funcs: std::collections::HashSet<String> = funcs.keys().cloned().collect();
-        Self { funcs, classes: HashMap::new(), vars, module_funcs: HashMap::new(), module_consts: HashMap::new(), generic_funcs: HashMap::new(), generic_func_bodies: HashMap::new(), generic_classes: HashMap::new(), builtin_funcs, hash_key_classes: std::collections::HashSet::new(), promoted_consts: std::collections::HashMap::new() }
+        Self { funcs, classes: HashMap::new(), vars, module_symbols: HashMap::new(), func_owner: HashMap::new(), class_owner: HashMap::new(), const_owner: HashMap::new(), import_bindings: HashMap::new(), module_funcs: HashMap::new(), module_consts: HashMap::new(), generic_funcs: HashMap::new(), generic_func_bodies: HashMap::new(), generic_classes: HashMap::new(), builtin_funcs, hash_key_classes: std::collections::HashSet::new(), promoted_consts: std::collections::HashMap::new(), root_defined: std::collections::HashSet::new() }
     }
 
     /// (enabler-fix-1 #3) The class that DECLARES `field` as an own field, walking
@@ -503,6 +577,118 @@ impl TyCtx {
             Some(d) => self.promoted_consts.get(&d).is_some_and(|s| s.contains(field)),
             None => false,
         }
+    }
+
+    /// (W3-1) Owner-first resolution of a QUALIFIED module function `X.f()`:
+    /// resolve `f`'s signature against module `X`'s OWN per-module table, falling
+    /// back to the flat `funcs` table only for synthetic single-module contexts
+    /// (LSP / hand-built unit ctxs) that never populate `module_symbols`. Every
+    /// call site guards membership via `module_funcs[X]` first, so the flat
+    /// fallback fires only when `X` genuinely owns `f`. Because the collision
+    /// stopgap keeps the flat namespace collision-free, the per-module table and
+    /// the flat table agree for every real program — the per-module table only
+    /// DIVERGES (correctly) when the ROOT shadows an imported name, a case the
+    /// flat table cannot express and no golden exercises.
+    pub fn resolve_module_func(&self, module_id: &str, name: &str) -> Option<&FuncSig> {
+        self.module_symbols
+            .get(module_id)
+            .and_then(|ms| ms.funcs.get(name))
+            .or_else(|| self.funcs.get(name))
+    }
+
+    /// (W3-1) Owner-first resolution of a QUALIFIED module constant `X.CONST`:
+    /// the const's type comes from module `X`'s OWN per-module table, falling back
+    /// to the (already module-keyed) `module_consts` index for synthetic contexts.
+    /// Both sources are module-keyed, so — unlike the function path — this never
+    /// diverges; routing it through `module_symbols` keeps funcs and consts
+    /// consistently owner-first and makes the per-module const table live.
+    pub fn resolve_module_const(&self, module_id: &str, name: &str) -> Option<&Ty> {
+        if let Some(ty) = self.module_symbols.get(module_id).and_then(|ms| ms.consts.get(name)) {
+            return Some(ty);
+        }
+        self.module_consts
+            .get(module_id)
+            .and_then(|cs| cs.iter().find(|(c, _)| c == name).map(|(_, t)| t))
+    }
+
+    /// (W3-fix) A per-module CHECKING view of this ctx: a clone in which the module
+    /// being checked (`module_id`; `None` = the ROOT) resolves every UNQUALIFIED
+    /// top-level name OWNER-FIRST — exactly as codegen's `bare_owner_for` resolves
+    /// it at emission — so typeck and codegen agree on which owner a bare `f` /
+    /// `CONST` / `Class` binds to once the collision stopgap is narrowed and two
+    /// co-imported modules may share a name. Used by `check_bodies` for EVERY
+    /// module.
+    ///
+    /// Grows the former `with_module_funcs_promoted` (funcs-only) to the full set:
+    ///   1. FROM-IMPORTS (`from X import f`): bind each local to its BINDING
+    ///      OWNER's real sig/type/class. The flat table holds only the last-MERGED
+    ///      (topological-order) collider, which need not match CPython's
+    ///      last-`from`-wins LOCAL binding, so a bare `f(...)` would otherwise be
+    ///      arity/type-checked against the wrong owner's signature (F4). A local
+    ///      the module DEFINES ITSELF is skipped — own def shadows an import
+    ///      (root-shadows-imports / module-shadows-imports).
+    ///   2. This module's OWN top-level funcs/classes/consts win over the flat
+    ///      last-writer, so an INTERNAL bare call/const/type resolves to its OWN
+    ///      symbol (`os.walk`'s `join(top, e)` is os's 2-arg join, not shlex's) —
+    ///      F14, and the const half of F10.
+    ///   3. A name the module owns as a FUNCTION drops any same-named FOREIGN class
+    ///      from THIS clone, so the foreign class cannot hijack the bare call as a
+    ///      constructor (F1: datetime's class `time` must not shadow time.pyrs's
+    ///      own `time()`). Safe: a module references only classes it owns or
+    ///      imports, never an unrelated co-import's class, so the removal touches
+    ///      only the erroneous shadow.
+    ///
+    /// A no-op for a single-owner program — every promoted entry already equals
+    /// the flat value and no foreign collision exists — so existing programs are
+    /// byte-for-byte unaffected (the gate's import-free byte-identity proves it).
+    pub fn with_module_symbols_promoted(&self, module_id: Option<&str>) -> TyCtx {
+        let mut c = self.clone();
+        let ikey = module_id.unwrap_or(ROOT_MODULE_ID);
+        // (1) From-import bindings resolve to their binding owner's real symbol,
+        // unless this module defines its own (own def shadows an import).
+        if let Some(binds) = self.import_bindings.get(ikey) {
+            for (local, (owner, orig)) in binds {
+                let self_defines = match module_id {
+                    Some(m) => self.module_symbols.get(m).is_some_and(|ms| {
+                        ms.funcs.contains_key(local)
+                            || ms.classes.contains_key(local)
+                            || ms.consts.contains_key(local)
+                    }),
+                    None => self.root_defined.contains(local),
+                };
+                if self_defines {
+                    continue;
+                }
+                if let Some(sig) = self.resolve_module_func(owner, orig) {
+                    c.funcs.insert(local.clone(), sig.clone());
+                }
+                if let Some(ty) = self.resolve_module_const(owner, orig) {
+                    c.vars.insert(local.clone(), ty.clone());
+                }
+                if let Some(cd) = self.module_symbols.get(owner).and_then(|ms| ms.classes.get(orig)) {
+                    c.classes.insert(local.clone(), cd.clone());
+                }
+            }
+        }
+        // (2) This module's OWN symbols win; (3) an own function drops a foreign
+        // same-named class from this checking clone.
+        if let Some(m) = module_id {
+            if let Some(ms) = self.module_symbols.get(m) {
+                for (name, sig) in &ms.funcs {
+                    c.funcs.insert(name.clone(), sig.clone());
+                    if !ms.classes.contains_key(name) {
+                        c.classes.remove(name);
+                    }
+                }
+                for (name, cd) in &ms.classes {
+                    c.classes.insert(name.clone(), cd.clone());
+                }
+                for (name, ty) in &ms.consts {
+                    c.vars.insert(name.clone(), ty.clone());
+                }
+            }
+        }
+        c
     }
 
     pub fn get_all_fields(&self, class_name: &str) -> Vec<crate::ast::Param> {

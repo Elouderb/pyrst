@@ -19,12 +19,140 @@ fn read_after_reassign_codegen_error(name: &str, outer: &Ty, inner: &Ty) -> crat
 
 impl<'a> Codegen<'a> {
     pub fn new(ctx: &'a TyCtx) -> Self {
-        Self { ctx, out: String::new(), indent: 0, locals: HashMap::new(), declared: Default::default(), current_class: None, current_ret_ty: Ty::Unit, dead_funcs: Default::default(), mut_self: HashMap::new(), by_ref_locals: Default::default(), poly_map: HashMap::new(), concrete_struct_params: Default::default(), const_names: Default::default(), const_strs: Default::default(), in_generator: false, try_return_escape: false, try_loopctl_escape: false, current_class_type_params: Vec::new(), current_fn_type_params: Vec::new(), hoisted: Default::default(), shadow_map: Default::default(), shadow_counter: 0, pending_inline_lambda_params: None }
+        Self { ctx, out: String::new(), indent: 0, locals: HashMap::new(), declared: Default::default(), current_class: None, current_ret_ty: Ty::Unit, dead_funcs: Default::default(), mut_self: HashMap::new(), by_ref_locals: Default::default(), poly_map: HashMap::new(), concrete_struct_params: Default::default(), const_names: Default::default(), const_strs: Default::default(), in_generator: false, try_return_escape: false, try_loopctl_escape: false, current_class_type_params: Vec::new(), current_fn_type_params: Vec::new(), hoisted: Default::default(), shadow_map: Default::default(), shadow_counter: 0, pending_inline_lambda_params: None, current_module: None, root_defined: Default::default() }
+    }
+
+    /// (W3-2) Emit a TOP-LEVEL free-function / const-adjacent name owner-qualified.
+    /// `None` owner = the ROOT program → crate-root-unwrapped (`escape_ident`, so a
+    /// keyword-named root fn still round-trips). A non-root owner → the flat
+    /// mangled identifier `__pyrst_m_<owner>__<name>` (dots in a dotted module id
+    /// sanitized to `_`, e.g. `os.path` → `os_path`). The mangled prefix can never
+    /// be a Rust keyword, so no escaping is needed there. Applied IDENTICALLY at a
+    /// definition and at every use of the same name so def/use stay in sync.
+    pub(crate) fn emit_name(&self, owner: Option<&str>, name: &str) -> String {
+        match owner {
+            None => escape_ident(name),
+            Some(m) => format!("__pyrst_m_{}__{}", m.replace('.', "_"), name),
+        }
+    }
+
+    /// (W3-2) Emit a CLASS/struct name owner-qualified. Unlike free functions,
+    /// class names are GLOBALLY unique (the narrowed collision stopgap keeps
+    /// class-vs-class an honest error), so the owner is the global
+    /// `ctx.class_owner` map — no scope context needed. A ROOT class stays the
+    /// bare `name` (byte-identical to the pre-W3 `n.clone()`); a non-root class →
+    /// `__pyrst_m_<owner>__<name>`. Consumed by `rust_ty`'s Class arm, every
+    /// constructor / struct-literal / static-call / class-const site, and the
+    /// companion enum.
+    pub(crate) fn emit_class_name(&self, name: &str) -> String {
+        // (W3-fix / F11) A ROOT class stays crate-root-unwrapped even if
+        // `class_owner` were to record a same-named IMPORTED class: the root's own
+        // def shadows the import (root-shadows-imports), mirroring `bare_owner_for`.
+        // The stopgap now rejects a root-vs-import class-name collision outright, so
+        // this guard is defensive depth — byte-identical for a valid program (a root
+        // class is absent from `class_owner`; an imported class is absent from
+        // `root_defined`).
+        if self.root_defined.contains(name) {
+            return name.to_string();
+        }
+        match self.ctx.class_owner.get(name) {
+            None => name.to_string(),
+            Some(m) => format!("__pyrst_m_{}__{}", m.replace('.', "_"), name),
+        }
+    }
+
+    /// (W3-2) Resolve an UNQUALIFIED top-level reference (a bare fn / const / class
+    /// name that is NOT a local) to its NON-ROOT owner module, or `None` when it is
+    /// root-owned or not a top-level module name (→ crate-root-unwrapped). Mirrors
+    /// typeck's flat resolution: the CURRENT scope's own definition shadows a
+    /// from-import (root-shadows-imports; a module's own def shadows its imports).
+    ///   - Root scope (`current_module = None`): the root's own def wins
+    ///     (`root_defined` → `None`, unwrapped); else a `from X import n` binding;
+    ///     else a globally-owned class name.
+    ///   - Module scope `M`: `M`'s own def (`module_symbols[M]`); else `M`'s
+    ///     from-import binding; else a globally-owned class name.
+    /// The from-import binding's owner is always a real (non-root) module, so it
+    /// always mangles; a globally-owned class name likewise. Returns `None` for a
+    /// root-owned name / a name absent from every table (a builtin passed as a
+    /// value, etc.) — those stay unwrapped, keeping import-free output identical.
+    pub(crate) fn bare_owner_for(&self, n: &str) -> Option<String> {
+        match self.current_module.as_deref() {
+            Some(cur) => {
+                if let Some(ms) = self.ctx.module_symbols.get(cur) {
+                    if ms.funcs.contains_key(n) || ms.consts.contains_key(n) || ms.classes.contains_key(n) {
+                        return Some(cur.to_string());
+                    }
+                }
+                if let Some((owner, _)) = self.ctx.import_bindings.get(cur).and_then(|b| b.get(n)) {
+                    return Some(owner.clone());
+                }
+            }
+            None => {
+                // Root scope: the root's own definition shadows any import.
+                if self.root_defined.contains(n) {
+                    return None;
+                }
+                if let Some((owner, _)) = self
+                    .ctx
+                    .import_bindings
+                    .get(crate::typeck::ROOT_MODULE_ID)
+                    .and_then(|b| b.get(n))
+                {
+                    return Some(owner.clone());
+                }
+            }
+        }
+        // A class name is globally owner-keyed (class names are globally unique).
+        self.ctx.class_owner.get(n).cloned()
+    }
+
+    /// (W3-2) Resolve the FuncSig of a call CALLEE owner-first, so a co-imported
+    /// same-named function (`operator.sub` 2-arg vs `re.sub` 3-arg) uses the RIGHT
+    /// signature for default-fill / kwarg-mapping / Optional coercion — the flat
+    /// `ctx.funcs[name]` holds only the last-merged collider and would mis-fill the
+    /// other. A QUALIFIED call (`callee_owner = Some(X)`) resolves against `X`'s own
+    /// module table; a BARE call resolves the current-scope owner
+    /// (`bare_owner_for`: from-import / same-module) then that module's table; both
+    /// fall back to the flat table for a root fn / synthetic ctx (byte-identical for
+    /// every non-colliding program, where the owner table and flat table agree).
+    pub(crate) fn resolve_callee_sig(
+        &self,
+        name: &str,
+        callee_owner: Option<&str>,
+    ) -> Option<crate::typeck::FuncSig> {
+        if let Some(owner) = callee_owner {
+            return self.ctx.resolve_module_func(owner, name).cloned();
+        }
+        if let Some(owner) = self.bare_owner_for(name) {
+            if let Some(sig) = self.ctx.resolve_module_func(&owner, name) {
+                return Some(sig.clone());
+            }
+        }
+        self.ctx.funcs.get(name).cloned()
     }
 
     pub fn with_dead_funcs(mut self, dead: std::collections::HashSet<String>) -> Self {
         self.dead_funcs = dead;
         self
+    }
+
+    /// (W3-fix / F5,F6) Emit a CALLEE's default-parameter value expression under the
+    /// CALLEE's OWNER module, restoring `current_module` afterward. A default lives
+    /// textually in the callee's body, so a bare helper/const inside it must resolve
+    /// owner-first to the callee's module — not the CALLER's current emit scope. A
+    /// root program calling an imported `f(x = helper())` would otherwise re-emit
+    /// `helper()` under the root and bind the ROOT's `helper`, a silent cross-module
+    /// miscompile. `owner` is the module that DEFINES the callee (`None` = root);
+    /// for a single-owner program it equals the current scope, so this is a no-op.
+    pub(crate) fn with_default_scope<T>(
+        &mut self,
+        owner: Option<String>,
+        f: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let saved = std::mem::replace(&mut self.current_module, owner);
+        let r = f(self);
+        self.current_module = saved;
+        r
     }
 
     /// Thin wrapper over the single shared copy-ness predicate
@@ -102,7 +230,7 @@ impl<'a> Codegen<'a> {
                         // struct-literal default (matches the struct field def).
                         format!("{}: {}", escape_ident(&f.name), self.zeroed_default(&inner_ty))
                     }).collect();
-                    format!("{} {{ {} }}", n, fields.join(", "))
+                    format!("{} {{ {} }}", self.emit_class_name(n), fields.join(", "))
                 } else {
                     "Default::default()".to_string()
                 };
@@ -112,7 +240,9 @@ impl<'a> Codegen<'a> {
                 // wrong type for the enum slot). Leaf/non-polymorphic classes keep
                 // the plain struct init.
                 if self.is_polymorphic_base(n) {
-                    format!("{}__::{}({})", n, n, struct_init)
+                    // (W3-2) `B__::B(B{..})` with base + variant owner-qualified.
+                    let nm = self.emit_class_name(n);
+                    format!("{}__::{}({})", nm, nm, struct_init)
                 } else {
                     struct_init
                 }
@@ -795,8 +925,10 @@ impl<'a> Codegen<'a> {
                 // `coerced = true` — applies the SAME Optional-wrap / `Callable`
                 // cast the free-call path uses (the method path previously emitted
                 // a plain `emit_consuming`, silently dropping both).
+                // (W3-fix / F5) A method's defaults belong to its class's module.
+                let def_owner = self.ctx.class_owner.get(cls).cloned();
                 let (prelude, mparts) =
-                    self.emit_slotted_args(&slots, args, kwargs, sig, &param_tys, /*coerced=*/ true)?;
+                    self.emit_slotted_args(&slots, args, kwargs, sig, &param_tys, /*coerced=*/ true, def_owner.as_deref())?;
                 return Ok(Self::hoist_wrap(
                     &prelude,
                     format!("{}.{}({})", obj_s, method_name, mparts.join(", ")),
@@ -911,7 +1043,8 @@ impl<'a> Codegen<'a> {
                 // A constructor `C(...)` is a RAW struct temp -> wrap as variant C.
                 if let Some(ctor) = self.constructor_class(value) {
                     let inner = self.emit_consuming(value)?;
-                    return Ok(format!("{}__::{}({})", b, ctor, inner));
+                    // (W3-2) enum base + variant owner-qualified (each by its module).
+                    return Ok(format!("{}__::{}({})", self.emit_class_name(b), self.emit_class_name(&ctor), inner));
                 }
                 let et = self.type_of_expr(value);
                 match &et {
@@ -939,7 +1072,8 @@ impl<'a> Codegen<'a> {
                     // (leaf) subclass of `B` -> RAW struct -> wrap as variant `et`.
                     Ty::Class(c, _) => {
                         let inner = self.emit_consuming(value)?;
-                        Ok(format!("{}__::{}({})", b, c, inner))
+                        // (W3-2) enum base + variant owner-qualified.
+                        Ok(format!("{}__::{}({})", self.emit_class_name(b), self.emit_class_name(c), inner))
                     }
                     // Non-class value into a base slot — should not occur (typeck);
                     // emit unchanged so any genuine mismatch surfaces as rustc E0308.
@@ -1123,6 +1257,12 @@ impl<'a> Codegen<'a> {
         sig: &crate::typeck::FuncSig,
         param_tys: &[Ty],
         coerced: bool,
+        // (W3-fix / F5) The owner module of the CALLEE whose defaults are being
+        // filled (`None` = root). A default expression is emitted under this owner
+        // (not the caller's current scope) so a bare helper/const inside it resolves
+        // owner-first to the callee's module. Provided args stay in the CALLER's
+        // scope — only the omitted-default fill below is re-scoped.
+        default_owner: Option<&str>,
     ) -> Result<(Vec<String>, Vec<String>)> {
         use crate::typeck::ArgSlot;
         let n = slots.len();
@@ -1191,7 +1331,12 @@ impl<'a> Codegen<'a> {
                             // `Option<i64>` slot -> rustc E0308). emit_call_arg_value
                             // applies coerce_to_option (and the Callable / poly-base
                             // casts) in both the coerced and constructor paths.
-                            call_parts.push(self.emit_call_arg_value(&e, param_tys, p, coerced)?);
+                            // (W3-fix / F5) …under the CALLEE's owner module.
+                            let owner = default_owner.map(str::to_string);
+                            let v = self.with_default_scope(owner, |cg| {
+                                cg.emit_call_arg_value(&e, param_tys, p, coerced)
+                            })?;
+                            call_parts.push(v);
                         }
                         None => {
                             return Err(crate::diag::Error::Codegen(
@@ -1300,7 +1445,12 @@ impl<'a> Codegen<'a> {
                 if self.ctx.funcs.contains_key(n.as_str())
                     && !self.locals.contains_key(n.as_str()) =>
             {
-                Ok(format!("::std::rc::Rc::new({}) as {}", escape_ident(n), rc_ty))
+                // (W3-2) A top-level function used as a first-class VALUE mangles by
+                // its owner exactly like a call callee (a from-imported `mul` becomes
+                // `__pyrst_m_operator__mul`); `bare_owner_for` returns `None` for a
+                // root fn (unwrapped `escape_ident`, byte-identical for import-free).
+                let owner = self.bare_owner_for(n);
+                Ok(format!("::std::rc::Rc::new({}) as {}", self.emit_name(owner.as_deref(), n), rc_ty))
             }
             Expr::Lambda { params, body, .. } => {
                 // Annotate each closure param with the slot's argument type so the
@@ -1503,7 +1653,10 @@ impl<'a> Codegen<'a> {
                 "emit_const_decl called on a non-assignment".to_string(),
             ));
         };
-        let name = mangle_const(target);
+        // (W3-2) Owner-qualify by the module currently being emitted (set by
+        // emit_program's const prepass; `None` = root → the historical
+        // `__pyrst_const_<name>`, byte-identical for import-free programs).
+        let name = mangle_const(self.current_module.as_deref(), target);
         let decl = match value {
             Expr::Int(n, _) => format!("const {}: i64 = {};", name, n),
             // Suffix `f64` so a whole-number float literal (`6.0` formats as
@@ -1616,7 +1769,17 @@ impl<'a> Codegen<'a> {
             .find(|p| p.name.as_str() == field_name)
             .and_then(|p| p.default.as_ref())
         {
-            Some(d) => self.emit_struct_field_value(class_name, class_def, field_name, d),
+            // (W3-fix / F5) A field's OMITTED default belongs to the class's module —
+            // emit under that owner so a bare helper/const in a non-literal default
+            // resolves owner-first there (a literal default is scope-independent, so
+            // this is byte-identical for the common dataclass case).
+            Some(d) => {
+                let owner = self.ctx.class_owner.get(class_name).cloned();
+                let d = d.clone();
+                self.with_default_scope(owner, |cg| {
+                    cg.emit_struct_field_value(class_name, class_def, field_name, &d)
+                })
+            }
             None => Err(crate::diag::Error::Codegen(format!(
                 "class `{}` missing a required argument: `{}`",
                 class_name, field_name

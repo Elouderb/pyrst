@@ -1,0 +1,4 @@
+# (W3-fix / F2,F12) Sibling: a NON-generic 2-arg str `apply` of the SAME name as
+# applymod_gen.apply. Standalone: output-free.
+def apply(s: str, t: str) -> str:
+    return s + t

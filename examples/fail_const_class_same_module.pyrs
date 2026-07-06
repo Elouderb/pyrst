@@ -1,0 +1,15 @@
+# (W3-fix / F13) SAME-MODULE const-vs-class clash stays an honest error (a const
+# and a class in ONE module share a bare-name namespace). The CROSS-module case is
+# now LEGAL (owner-qualified emission distinguishes them) — see the W3-fix probes.
+# Rejected by `pyrst check`.
+class Dup:
+    a: int
+    def __init__(self, a: int) -> None:
+        self.a = a
+
+
+Dup: int = 5
+
+
+def main() -> None:
+    print(Dup)

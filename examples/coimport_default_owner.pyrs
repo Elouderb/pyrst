@@ -1,0 +1,15 @@
+# (W3-fix / F5,F7) CROSS-MODULE default: `apply_default`'s default `base_value()`
+# is a helper in the CALLEE's module. The ROOT also defines `base_value` with a
+# DIFFERENT value — re-emitting the default under the CALLER's scope would
+# silently bind the ROOT's helper (a silent cross-module miscompile). The default
+# is emitted under the CALLEE's owner module. python3-diffed: CPython binds a
+# default at def-time in the DEFINING module (=> 111, not the root's 999).
+from defmod_helper import apply_default
+
+
+def base_value() -> int:
+    return 999
+
+
+def main() -> None:
+    print(apply_default())

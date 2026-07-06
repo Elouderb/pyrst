@@ -1,0 +1,12 @@
+# (W3-fix / F8,F9) CONST collision: `cmodint.TAG` (int) and `cmodstr.TAG` (str)
+# share a bare name. Const-membership and the `.to_string()` str-ness fix-up are
+# OWNER-KEYED `(owner, name)`, so the int const is not `.to_string()`-mangled by
+# the co-imported str const and vice versa. python3-diffed.
+import cmodint
+import cmodstr
+
+
+def main() -> None:
+    print(cmodint.TAG)
+    print(cmodstr.TAG)
+    print(cmodstr.TAG + "!")

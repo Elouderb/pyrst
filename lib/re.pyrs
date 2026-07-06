@@ -152,12 +152,14 @@ def split(pattern: str, text: str, maxsplit: int = 0) -> list[str]:
 # and digits are left alone). See the module-header divergence note re `\v`.
 #
 # NAME COLLISION (card d9182d50): `lib/html.pyrs` ALSO defines a top-level
-# `escape` (HTML entity escaping). pyrst's module namespace is FLAT, so a
-# single program cannot `import re` and `import html` together (nor
-# `from re import escape` + `from html import escape`) — the resolver's
-# cross-module-collision detector (card 6c8b4a39) raises a compile-time
-# error rather than letting one shadow the other. Both modules keep their
-# exact CPython name; see `lib/html.pyrs`'s header for the full writeup.
+# `escape` (HTML entity escaping). W3-2 per-module namespacing LIFTS the old
+# flat-namespace restriction: `re.escape` and `html.escape` emit as distinct
+# `__pyrst_m_re__escape` / `__pyrst_m_html__escape` Rust items, so a single
+# program NOW CO-IMPORTS `re` and `html` and calls each qualified. `re` also
+# co-imports with `operator` (both define `sub`) and `shlex` (both define
+# `split`). Both modules keep their exact CPython name; see
+# examples/parity_coimport_html_re.pyrs / parity_coimport_operator_re.pyrs /
+# parity_coimport_re_shlex.pyrs.
 def escape(pattern: str) -> str:
     specials: str = "()[]{}?*+-|^$\\.&~# \t\n\r\f"
     out: str = ""

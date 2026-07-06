@@ -1,0 +1,19 @@
+# (W3-fix / F11) ROOT class collides with an IMPORTED module's class of the same
+# name. A class type is carried as a BARE `Ty::Class("Point")` with no owner, so a
+# root `Point` and an imported `Point` are indistinguishable at a type reference —
+# the SAME owner-blindness that makes import-vs-import class collisions
+# unresolvable. The collision stopgap therefore covers the ROOT too (coherent
+# honest error), rather than silently mangling the root's own class to the import's
+# owner. Rejected by BOTH `pyrst check` and `pyrst build`.
+import rootcoll_point
+
+
+class Point:
+    y: int
+    def __init__(self, y: int) -> None:
+        self.y = y
+
+
+def main() -> None:
+    p: Point = Point(3)
+    print(p.y)

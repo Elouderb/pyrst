@@ -1,0 +1,4 @@
+# (W3-fix / F4) Sibling for coimport_fromimport_arity: a 1-arg `combine` of the
+# SAME name as fimpl_add.combine. Standalone: a valid, output-free module.
+def combine(a: int) -> int:
+    return a * 10

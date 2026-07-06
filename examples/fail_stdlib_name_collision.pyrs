@@ -1,18 +1,27 @@
-# (card 6c8b4a39): pyrst's module namespace is FLAT — every imported module's
-# top-level names merge into one table under their bare name. `operator` defines
-# `def sub(a, b)` and `re` defines `def sub(pattern, repl, string, count=0)`, so
-# co-importing both let whichever imported SECOND silently OWN `sub`, and even a
-# qualified `operator.sub(5, 3)` type-checked against re's 4-arg signature (a
-# silent wrong-function miscompile once two colliders share an arity). This is
-# now an honest check-time error naming both modules. Renaming is NOT the fix —
-# both are legitimate CPython public APIs. Real per-module namespacing is the G3
-# epic. This file must be rejected by BOTH `pyrst check` and `pyrst build`.
-import operator
-import re
+# (W3-2) RETARGETED from the former flat-namespace fn-collision negative.
+#
+# With per-module namespaced emission (`__pyrst_m_<owner>__<name>`), co-importing
+# two modules that each define the same top-level FUNCTION or CONST is now LEGAL —
+# `operator.sub` and `re.sub` emit as `__pyrst_m_operator__sub` /
+# `__pyrst_m_re__sub` and co-import cleanly (see examples/coimport_operator_re.pyrs).
+# The collision stopgap is therefore NARROWED to CLASS-vs-CLASS only.
+#
+# A class type is carried through the type system as a BARE `Ty::Class("Point")`
+# with NO owner, and `rust_ty` / `class_owner` / the companion enum all key class
+# identity by that bare name — so two same-named classes in different modules are
+# indistinguishable at a type reference. pyrst v1 keeps class names GLOBALLY
+# UNIQUE an honest error (threading an owner into `Ty::Class`, for true
+# same-named-class co-import, is the documented v2 extension). No stdlib pair is
+# class-vs-class, so this uses two LOCAL sibling modules (collide_point_a.pyrs and
+# collide_point_b.pyrs) that each define `class Point`.
+#
+# This file must be rejected by BOTH `pyrst check` and `pyrst build`.
+import collide_point_a
+import collide_point_b
 
 
 def main() -> None:
-    # ERROR: `sub` is provided by both `operator` and `re` — a program cannot
-    # import both while the module namespace is flat.
-    print(operator.sub(5, 3))
-    print(re.sub("a", "b", "banana"))
+    # ERROR: `Point` is defined by BOTH collide_point_a and collide_point_b — a
+    # class name must be globally unique in pyrst v1 (a bare class type cannot
+    # carry its owner module).
+    print(1)

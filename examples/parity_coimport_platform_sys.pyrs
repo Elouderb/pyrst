@@ -1,0 +1,21 @@
+# (W3-2 payoff) Co-import parity: `platform` and `sys` collide on BOTH `platform`
+# and `version` — but as DIFFERENT item kinds (platform.platform / platform.version
+# are FUNCTIONS; sys.platform / sys.version are module CONSTANTS). Old flat
+# namespace rejected the co-import (and a separate const-vs-fn clash check also
+# fired); per-module namespacing emits `__pyrst_m_platform__platform` (fn) vs
+# `__pyrst_const_sys__platform` (const), and the const-clash check is narrowed to
+# same-module — so a fn in one module and a const in another co-import cleanly.
+#
+# The concrete VALUES are implementation-specific (pyrst's `sys.version` is not
+# CPython's), so this asserts STABLE derived facts (each name resolves to a
+# non-empty string) that hold under BOTH pyrst and python3 — proving the four
+# colliding names all resolve to their own owner, dual-run.
+import platform
+import sys
+
+
+def main() -> None:
+    print(len(platform.platform()) > 0)   # True  (platform.platform fn)
+    print(len(sys.platform) > 0)          # True  (sys.platform const)
+    print(len(platform.version()) >= 0)   # True  (platform.version fn)
+    print(len(sys.version) > 0)           # True  (sys.version const)

@@ -1,0 +1,4 @@
+# (W3-fix / F3) Sibling: a BY-REFERENCE `stash` (Mut[list[int]], mutates caller's
+# list). Standalone: output-free.
+def stash(xs: Mut[list[int]], v: int) -> None:
+    xs.append(v)

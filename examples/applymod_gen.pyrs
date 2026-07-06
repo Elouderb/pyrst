@@ -1,0 +1,3 @@
+# (W3-fix / F2,F12) Sibling: a GENERIC `apply[T]`. Standalone: output-free.
+def apply[T](f: Callable[[T], T], x: T) -> T:
+    return f(x)

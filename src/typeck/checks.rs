@@ -503,13 +503,27 @@ pub fn check_bodies(m: &Module, ctx: &TyCtx) -> Result<()> {
     // accepted here and lowered via codegen's `escape_ident`.
     reject_reserved_idents(m)?;
 
+    // (W3-fix) Check EVERY module's body against an OWNER-FIRST view of the ctx
+    // (`with_module_symbols_promoted`): its own top-level funcs/classes/consts and
+    // its `from X import f` bindings resolve to the RIGHT owner, matching codegen's
+    // `bare_owner_for` emission — so once the collision stopgap is narrowed and two
+    // co-imported modules share a name, a bare INTERNAL call/const/type resolves to
+    // the intended owner, not the flat last-writer (`os.walk`'s `join(top, e)` is
+    // os's 2-arg join; a `from` import binds its declared owner; time.pyrs's
+    // `time()` is its own fn, not datetime's class `time`). The ROOT is included
+    // now too so its `from`-import bindings resolve owner-first (F4). The view is a
+    // no-op for a single-owner program (every promoted entry equals the flat value,
+    // no foreign collision), so those programs are byte-for-byte unaffected.
+    let eff = ctx.with_module_symbols_promoted(m.module_id.as_deref());
+    let eff_ctx: &TyCtx = &eff;
+
     // Second pass: type-check each top-level item's body, fail-fast (first
     // error stops the pass). The per-item work lives in `check_one_stmt` so the
     // collecting entry point `check_all` can reuse it without changing this
     // function's observable first-error-and-stop behavior (the CLI exit codes,
     // EPIC-8 multi-file sourcing, and the 64 negative fixtures depend on it).
     for s in &m.stmts {
-        check_one_stmt(s, ctx)?;
+        check_one_stmt(s, eff_ctx, m.module_id.as_deref())?;
     }
     Ok(())
 }
@@ -574,7 +588,7 @@ pub fn check_all(m: &Module, ctx: &TyCtx) -> Vec<Error> {
             // Import statements have no body to check (resolved by the resolver).
             Stmt::Import { .. } => {}
             _ => {
-                if let Err(e) = check_top_level_other(s, ctx) {
+                if let Err(e) = check_top_level_other(s, ctx, m.module_id.as_deref()) {
                     errors.push(e);
                 }
             }
@@ -594,7 +608,7 @@ pub fn check_all(m: &Module, ctx: &TyCtx) -> Vec<Error> {
 /// [`check_bodies`], which `?`-propagates the first error. Composes the same
 /// per-item helpers [`check_all`] uses, so the two entry points apply
 /// byte-identical per-item checks — only their continue-vs-stop policy differs.
-pub(crate) fn check_one_stmt(s: &Stmt, ctx: &TyCtx) -> Result<()> {
+pub(crate) fn check_one_stmt(s: &Stmt, ctx: &TyCtx, module_id: Option<&str>) -> Result<()> {
     match s {
         Stmt::Func(f) => check_one_func(f, ctx)?,
         Stmt::Class(c) => {
@@ -606,7 +620,9 @@ pub(crate) fn check_one_stmt(s: &Stmt, ctx: &TyCtx) -> Result<()> {
         // Import statements are resolved by the resolver and are
         // intentionally not type-checked here (no body to check).
         Stmt::Import { .. } => {}
-        _ => check_top_level_other(s, ctx)?,
+        // (W3-2) `module_id` = the module whose top-level statement this is (None =
+        // root), threaded so the const-vs-fn clash narrows to a SAME-MODULE clash.
+        _ => check_top_level_other(s, ctx, module_id)?,
     }
     Ok(())
 }
@@ -1437,7 +1453,7 @@ pub(crate) fn const_literal_ty(e: &Expr) -> Option<Ty> {
 /// (`NAME: T = <literal>`, the EPIC-6-A relaxation that lets a module hold
 /// constants like `math.pi`); rejects any other stray top-level statement.
 /// Fail-fast.
-pub(crate) fn check_top_level_other(s: &Stmt, ctx: &TyCtx) -> Result<()> {
+pub(crate) fn check_top_level_other(s: &Stmt, ctx: &TyCtx, module_id: Option<&str>) -> Result<()> {
     // A bare top-level `main()` call is the conventional pyrst entry-point idiom
     // and is already driven by the synthetic Rust `fn main() { user_main(); }`.
     if is_bare_main_call(s) {
@@ -1465,32 +1481,57 @@ pub(crate) fn check_top_level_other(s: &Stmt, ctx: &TyCtx) -> Result<()> {
             // The const NAME must not be a Rust non-raw keyword nor use the
             // reserved compiler-generated prefix (the mangled-const namespace).
             reject_if_reserved(target, *span, "module constant")?;
-            // (Honest-errors) The module-const namespace is FLAT — codegen emits
-            // one top-level Rust `const __pyrst_const_<name>` and rewrites bare /
-            // qualified references to it. A const whose name DUPLICATES a function
-            // (built-in OR user/stdlib, any module — `ctx.funcs` is the merged flat
-            // table) or a class is ambiguous: a call `name()` would route to the
-            // const and miscompile (E0618). Reject it honestly at `check` time
-            // rather than deferring the clash to rustc at `build`. This single
-            // check at the const site catches the symmetric pair regardless of
-            // source order (ctx is fully merged before checking) and the
-            // cross-module case (flat table).
-            if ctx.funcs.contains_key(target) {
+            // (Honest-errors) A const whose name DUPLICATES a function or class is
+            // ambiguous for a BARE reference (`name()` would route to the const and
+            // miscompile, E0618). (W3-2) NARROWED: with per-module namespaced
+            // emission a const `foo` (`__pyrst_const_<owner>__foo`) and a same-named
+            // FUNCTION in a DIFFERENT module (`__pyrst_m_<other>__foo`) are distinct
+            // Rust items resolved owner-first, so only a SAME-MODULE const-vs-fn
+            // clash is a real bare-name ambiguity — `sys.platform` (const) now
+            // co-imports cleanly with `platform.platform` (fn). Same-module test: the
+            // const's OWN module also defines a function of that name (for the ROOT,
+            // a `ctx.funcs` entry that is NOT owned by an imported module —
+            // `func_owner` records only non-root owners, so this still catches a
+            // root const clashing with a root def OR a builtin stub).
+            let fn_clash = match module_id {
+                Some(mid) => ctx
+                    .module_symbols
+                    .get(mid)
+                    .is_some_and(|ms| ms.funcs.contains_key(target)),
+                None => ctx.funcs.contains_key(target) && !ctx.func_owner.contains_key(target),
+            };
+            if fn_clash {
                 return Err(Error::Type {
                     span: *span,
                     msg: format!(
-                        "module constant `{}` clashes with a function of the same name; \
-                         rename one (constants and functions share a flat namespace)",
+                        "module constant `{}` clashes with a function of the same name \
+                         in the same module; rename one (a const and a function in one \
+                         module share a bare-name namespace)",
                         target
                     ),
                 });
             }
-            if ctx.classes.contains_key(target) {
+            // (W3-fix / F13) NARROWED to a SAME-MODULE clash, mirroring the
+            // const-vs-fn sibling above: with owner-qualified emission a const
+            // `foo` (`__pyrst_const_<owner>__foo`) and a same-named CLASS in a
+            // DIFFERENT module (`__pyrst_m_<other>__foo`) are distinct Rust items
+            // resolved owner-first, so only a const and a class in ONE module share
+            // a bare-name namespace. (Root: a class that is root-owned — absent from
+            // `class_owner`, which records non-root owners only.)
+            let class_clash = match module_id {
+                Some(mid) => ctx
+                    .module_symbols
+                    .get(mid)
+                    .is_some_and(|ms| ms.classes.contains_key(target)),
+                None => ctx.classes.contains_key(target) && !ctx.class_owner.contains_key(target),
+            };
+            if class_clash {
                 return Err(Error::Type {
                     span: *span,
                     msg: format!(
-                        "module constant `{}` clashes with a class of the same name; \
-                         rename one (constants and classes share a flat namespace)",
+                        "module constant `{}` clashes with a class of the same name \
+                         in the same module; rename one (a const and a class in one \
+                         module share a bare-name namespace)",
                         target
                     ),
                 });
@@ -1588,10 +1629,22 @@ pub(crate) fn collect_calls_from_stmt(stmt: &Stmt, called: &mut std::collections
             for s in body { collect_calls_from_stmt(s, called); }
         }
         Stmt::Func(f) => {
+            // (W3-fix / F7) A helper referenced ONLY in a parameter DEFAULT
+            // (`def f(x: int = helper())`) is emitted at the call site's
+            // default-fill, so it must be kept alive through dead-code elimination —
+            // otherwise codegen emits a call to a pruned function (E0425, a
+            // check-passes/build-fails). Walk each default expr. (Also resolves half
+            // of backlog card 34de9b41.)
+            for p in &f.params {
+                if let Some(d) = &p.default { collect_calls_from_expr(d, called); }
+            }
             for s in &f.body { collect_calls_from_stmt(s, called); }
         }
         Stmt::Class(c) => {
             for m in &c.methods {
+                for p in &m.params {
+                    if let Some(d) = &p.default { collect_calls_from_expr(d, called); }
+                }
                 for s in &m.body { collect_calls_from_stmt(s, called); }
             }
         }

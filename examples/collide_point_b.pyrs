@@ -1,0 +1,16 @@
+# (W3-2) Local library fixture for examples/fail_stdlib_name_collision.pyrs.
+# ALSO defines `class Point` (a DIFFERENT shape than collide_point_a's) — the two
+# co-imported modules each defining `Point` are the class-vs-class collision the
+# narrowed stopgap still rejects. Standalone this is a valid, output-free module
+# (empty expected/): only when BOTH Point-defining modules are co-imported does
+# the collision fire.
+class Point:
+    px: int
+    py: int
+    label: str
+    def __init__(self, px: int, py: int, label: str) -> None:
+        self.px = px
+        self.py = py
+        self.label = label
+    def describe(self) -> str:
+        return self.label

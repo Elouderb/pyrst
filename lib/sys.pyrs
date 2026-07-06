@@ -117,20 +117,16 @@
 #       lib/*.pyrs): the sibling unit `sep-quad`'s `platform` module (its stand-in for
 #       CPython's `platform` module) defines top-level `def version() -> str`
 #       and `def platform(...) -> str`, which collide with this module's
-#       `version: str` and `platform: str` module consts under pyrst's FLAT
-#       stdlib namespace (confirmed live: registering a throwaway stub module
-#       with `version`/`platform` top-level names alongside this one produces
-#       `type error: name 'version' is provided by both 'sys' and
-#       '<other>'; pyrst's module namespace is flat ... a program cannot
-#       import both`). This is the SAME class of unavoidable CPython-name
-#       collision the project already accepts for `datetime.time` vs. the
-#       `time` module (operator/re precedent) — `sys.version`/`sys.platform`
-#       are kept under their canonical CPython names here (this module is
-#       the more natural home for both), and a program that also needs
-#       `plat`'s `version()`/`platform()` functions cannot co-import `sys`
-#       and `plat` until real per-module namespacing (G3 epic) lands. Flagged
-#       to the integrator for cross-unit resolution — not something either
-#       individual module can unilaterally fix.
+#       `version: str` and `platform: str` module CONSTS collide by bare name
+#       with `platform`'s `version()` / `platform()` FUNCTIONS. W3-2 per-module
+#       namespacing LIFTS this: the consts emit as owner-qualified
+#       `__pyrst_const_sys__version` / `__pyrst_const_sys__platform` and the
+#       functions as `__pyrst_m_platform__version` / `__pyrst_m_platform__platform`
+#       — distinct Rust items — and the const-vs-fn clash check is narrowed to
+#       SAME-MODULE only, so `import sys` and `import platform` NOW CO-IMPORT.
+#       `sys.version`/`sys.platform` keep their canonical CPython names. Proven by
+#       examples/parity_coimport_platform_sys.pyrs (dual-run vs python3, asserting
+#       stable derived facts since the concrete values are implementation-specific).
 #
 # REGISTRATION: this module was ALSO removed from `resolver.rs`'s stdlib
 # skip-list (it previously silently no-op'd `import sys` as a "not yet a

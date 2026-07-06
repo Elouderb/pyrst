@@ -216,7 +216,13 @@ impl<'a> Codegen<'a> {
                             // into emit_plain_func_call's keyword→positional
                             // mapping (`textwrap.fill(text, width=10)` lowers
                             // exactly like the flat `fill(text, width=10)`).
-                            return Ok(Some(self.emit_plain_func_call(&flat_callee, args, kwargs)?));
+                            // (W3-2) The qualifier `modname` IS the owner module
+                            // (single-component id today; dotted is stage 3): thread
+                            // it as `callee_owner` so the callee emits the
+                            // owner-mangled `__pyrst_m_<modname>__<name>` while the
+                            // synthesized BARE `Ident(name)` still drives the sig /
+                            // kwarg / coercion lookups (which key by bare name).
+                            return Ok(Some(self.emit_plain_func_call(&flat_callee, args, kwargs, Some(modname.clone()))?));
                         }
                     }
 
@@ -245,15 +251,24 @@ impl<'a> Codegen<'a> {
                                         if parts.len() < sig.params.len() {
                                             let start = sig.param_defaults.len()
                                                 .saturating_sub(sig.params.len() - parts.len());
+                                            // (W3-fix / F6) A static method's default
+                                            // expression lives in its CLASS's module —
+                                            // emit it under that owner so a bare
+                                            // helper/const inside resolves owner-first
+                                            // there, not the caller's scope.
+                                            let def_owner = self.ctx.class_owner.get(class_name).cloned();
                                             for (off, def_expr) in sig.param_defaults[start..].iter().enumerate() {
                                                 if let Some(e) = def_expr {
                                                     let e = e.clone();
-                                                    parts.push(self.emit_call_arg_value(&e, &param_tys, start + off, /*coerced=*/ true)?);
+                                                    let v = self.with_default_scope(def_owner.clone(), |cg| {
+                                                        cg.emit_call_arg_value(&e, &param_tys, start + off, /*coerced=*/ true)
+                                                    })?;
+                                                    parts.push(v);
                                                 }
                                             }
                                         }
                                     }
-                                    return Ok(Some(format!("{}::{}({})", class_name, name, parts.join(", "))));
+                                    return Ok(Some(format!("{}::{}({})", self.emit_class_name(class_name), name, parts.join(", "))));
                                 }
                             }
                         }
@@ -998,7 +1013,35 @@ impl<'a> Codegen<'a> {
     ) -> Result<Option<String>> {
                 // Check if this is a class constructor call.
                 if let Expr::Ident(name, _) = callee.as_ref() {
-                    if let Some(class_def) = self.ctx.classes.get(name.as_str()).cloned() {
+                    // (W3-fix / F1) Owner-first: if the CURRENT emit scope resolves
+                    // `name` to its OWN top-level FUNCTION, a same-named FOREIGN class
+                    // must not hijack the bare call as a constructor — datetime's
+                    // class `time` must not capture time.pyrs's internal `time()`.
+                    // Non-root: the emit module owns a `fn name`. Root: the root
+                    // defines `name` while an IMPORT owns the class of that name
+                    // (root-vs-import class collision is an honest stopgap error, so a
+                    // root def coexisting with an imported class `name` is a fn/const,
+                    // never a class → it shadows). Byte-identical for single-owner
+                    // programs (no imports → `class_owner` empty → never fires).
+                    let own_func_shadows = match self.current_module.as_deref() {
+                        Some(cur) => self
+                            .ctx
+                            .module_symbols
+                            .get(cur)
+                            .is_some_and(|ms| ms.funcs.contains_key(name.as_str())),
+                        None => self.root_defined.contains(name.as_str())
+                            && self.ctx.class_owner.contains_key(name.as_str()),
+                    };
+                    if let Some(class_def) = if own_func_shadows {
+                        None
+                    } else {
+                        self.ctx.classes.get(name.as_str()).cloned()
+                    } {
+                        // (W3-2) The owner-qualified Rust struct name emitted for the
+                        // `::new(..)` / struct-literal construction. `name` stays bare
+                        // for every ctx LOOKUP (classes.get, the `<name>.__init__`
+                        // funcs key) — only the EMITTED constructor identifier mangles.
+                        let cname = self.emit_class_name(name);
                         let has_init = class_def.methods.iter().any(|m| m.name == "__init__");
 
                         // Use ::new() constructor whenever __init__ is defined —
@@ -1099,12 +1142,16 @@ impl<'a> Codegen<'a> {
                                     sig.param_by_ref = Vec::new();
                                     let param_tys: Vec<Ty> =
                                         init_params.iter().map(|(_, t)| t.clone()).collect();
+                                    // (W3-fix / F5) `__init__` defaults belong to the
+                                    // class's module — fill them under that owner.
+                                    let def_owner = self.ctx.class_owner.get(name.as_str()).cloned();
                                     let (prelude, call_parts) = self.emit_slotted_args(
                                         &slots, args, kwargs, &sig, &param_tys, /*coerced=*/ false,
+                                        def_owner.as_deref(),
                                     )?;
                                     return Ok(Some(Self::hoist_wrap(
                                         &prelude,
-                                        format!("{}::new({})", name, call_parts.join(", ")),
+                                        format!("{}::new({})", cname, call_parts.join(", ")),
                                     )));
                                 }
                             }
@@ -1112,7 +1159,7 @@ impl<'a> Codegen<'a> {
                             for (i, a) in args.iter().enumerate() {
                                 call_parts.push(self.emit_arg_into_slot(a, init_params.get(i).map(|(_, t)| t))?);
                             }
-                            return Ok(Some(format!("{}::new({})", name, call_parts.join(", "))));
+                            return Ok(Some(format!("{}::new({})", cname, call_parts.join(", "))));
                         }
 
                         // Class constructor: emit a Rust struct literal.
@@ -1175,7 +1222,7 @@ impl<'a> Codegen<'a> {
                                 // positional struct-literal init.
                                 parts.push(format!("{}: {}", escape_ident(field_name), v));
                             }
-                            return Ok(Some(format!("{} {{ {} }}", name, parts.join(", "))));
+                            return Ok(Some(format!("{} {{ {} }}", cname, parts.join(", "))));
                         }
 
                         // Keyword-args form (possibly MIXED with positional args).
@@ -1234,7 +1281,7 @@ impl<'a> Codegen<'a> {
                                 let v = self.emit_omitted_field_default(name, &class_def, &all_params, field_name)?;
                                 parts.push(format!("{}: {}", escape_ident(field_name), v));
                             }
-                            return Ok(Some(format!("{} {{ {} }}", name, parts.join(", "))));
+                            return Ok(Some(format!("{} {{ {} }}", cname, parts.join(", "))));
                         }
 
                         // No args at all: emit default struct literal.
@@ -1271,7 +1318,7 @@ impl<'a> Codegen<'a> {
                             // default struct-literal init.
                             parts.push(format!("{}: {}", escape_ident(fname), default));
                         }
-                        return Ok(Some(format!("{} {{ {} }}", name, parts.join(", "))));
+                        return Ok(Some(format!("{} {{ {} }}", cname, parts.join(", "))));
                     }
                 }
         Ok(None)
@@ -2785,14 +2832,33 @@ impl<'a> Codegen<'a> {
                     // code is byte-for-byte unchanged. A shadowed name is always a
                     // local, so this correctly precedes the module-const path.
                     m
-                } else if self.const_names.contains(n) && !self.locals.contains_key(n) {
-                    if self.const_strs.contains(n) {
-                        format!("{}.to_string()", mangle_const(n))
-                    } else {
-                        mangle_const(n)
-                    }
-                } else {
+                } else if self.locals.contains_key(n) {
+                    // A local always wins its bare name (shadows a module const/fn).
                     escape_ident(n)
+                } else {
+                    // (W3-2 / W3-fix F8,F9) Resolve the owner ONCE the same way typeck
+                    // does (current-module own def / from-import / root), then decide
+                    // const-vs-fn/class by OWNER-KEYED membership: a bare `FOO` in a
+                    // module that OWNS a function `FOO` no longer matches a same-named
+                    // CONST owned by a co-imported module, and the str-ness `.to_string()`
+                    // fix-up is likewise per-(owner,name). The owner also owner-qualifies
+                    // the mangled name so co-imported same-named symbols stay distinct;
+                    // a root-owned name / builtin resolves to `None` → `escape_ident`
+                    // (import-free output byte-identical).
+                    let owner = self.bare_owner_for(n);
+                    let key = (owner.clone(), n.clone());
+                    if self.const_names.contains(&key) {
+                        if self.const_strs.contains(&key) {
+                            format!("{}.to_string()", mangle_const(owner.as_deref(), n))
+                        } else {
+                            mangle_const(owner.as_deref(), n)
+                        }
+                    } else {
+                        match owner {
+                            Some(o) => self.emit_name(Some(&o), n),
+                            None => escape_ident(n),
+                        }
+                    }
                 }
             }
             Expr::Call { callee, args, kwargs, .. } => {
@@ -2831,7 +2897,10 @@ impl<'a> Codegen<'a> {
                                     .and_then(|f| f.default.as_ref()),
                                 Some(Expr::Str(..))
                             );
-                            let path = format!("{}::{}", dc, escape_ident(name));
+                            // (W3-2) `Color::RED` targets the DEFINING class's
+                            // owner-qualified struct (the assoc const lives on its
+                            // impl block); `dc` stays bare for the lookup above.
+                            let path = format!("{}::{}", self.emit_class_name(&dc), escape_ident(name));
                             return Ok(if is_str {
                                 format!("{}.to_string()", path)
                             } else {
@@ -2856,10 +2925,15 @@ impl<'a> Codegen<'a> {
                         .get(modname)
                         .is_some_and(|cs| cs.iter().any(|(c, _)| c == name))
                     {
-                        return Ok(if self.const_strs.contains(name) {
-                            format!("{}.to_string()", mangle_const(name))
+                        // (W3-2 / W3-fix F9) The qualifier IS the owner: emit the
+                        // owner-qualified mangled const so `sys.version` and any
+                        // co-imported module's same-named const stay distinct Rust
+                        // items, and check str-ness OWNER-KEYED so a same-named int
+                        // const elsewhere can't flip the `.to_string()` fix-up.
+                        return Ok(if self.const_strs.contains(&(Some(modname.clone()), name.clone())) {
+                            format!("{}.to_string()", mangle_const(Some(modname), name))
                         } else {
-                            mangle_const(name)
+                            mangle_const(Some(modname), name)
                         });
                     }
                 }
@@ -3701,7 +3775,9 @@ impl<'a> Codegen<'a> {
                 // unchanged legacy lowering (plain `n` / companion enum `n__`).
                 if !args.is_empty() {
                     let arg_strs = args.iter().map(|a| self.rust_ty(a)).collect::<Vec<_>>().join(", ");
-                    return format!("{}<{}>", n, arg_strs);
+                    // (W3-2) Owner-qualify the generic class's name (root class stays
+                    // bare, an imported one becomes `__pyrst_m_<owner>__<name>`).
+                    return format!("{}<{}>", self.emit_class_name(n), arg_strs);
                 }
                 // (EPIC-5 C2-2b-i) Polymorphism activation. A class that is a
                 // polymorphic base (has ≥1 subclass in this unit) lowers to its
@@ -3712,9 +3788,12 @@ impl<'a> Codegen<'a> {
                 // gate sites + list literals) and field-read lowering keep the
                 // emitted Rust well-typed against this `n__` slot.
                 if self.is_polymorphic_base(n) {
-                    format!("{}__", n)
+                    // (W3-2) Companion enum type: the base's owner-qualified name +
+                    // `__` (matches emit_companion_enum's `enum_name`).
+                    format!("{}__", self.emit_class_name(n))
                 } else {
-                    n.clone()
+                    // (W3-2) Plain value-struct type, owner-qualified (root = bare).
+                    self.emit_class_name(n)
                 }
             }
             Ty::File => "PyFile".into(),

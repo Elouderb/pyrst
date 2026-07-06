@@ -1,0 +1,13 @@
+# (W3-2 payoff) Co-import parity: `html` and `re` BOTH define `escape` (with
+# DIFFERENT signatures — html.escape(s, quote=True) vs re.escape(pattern)). Old
+# flat namespace rejected the co-import; per-module namespacing emits
+# `__pyrst_m_html__escape` / `__pyrst_m_re__escape` and each qualified call binds
+# its OWN signature (the owner-first default-fill is what lets html.escape's
+# `quote` default apply while re.escape stays 1-arg). Dual-run vs CPython.
+import html
+import re
+
+
+def main() -> None:
+    print(html.escape("<b>&amp</b>"))   # &lt;b&gt;&amp;amp&lt;/b&gt;
+    print(re.escape("a.b*c+d"))         # a\.b\*c\+d

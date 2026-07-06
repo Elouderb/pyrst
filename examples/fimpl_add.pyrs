@@ -1,0 +1,4 @@
+# (W3-fix / F4) Sibling for coimport_fromimport_arity: a 2-arg `combine`.
+# Standalone: a valid, output-free module.
+def combine(a: int, b: int) -> int:
+    return a + b

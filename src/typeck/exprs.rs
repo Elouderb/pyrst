@@ -419,10 +419,11 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
             // the former hardcoded `math.pi` typing — `math` is now a real
             // embedded module whose consts are tracked here.
             if let Expr::Ident(modname, _) = obj.as_ref() {
-                if let Some(consts) = ctx.module_consts.get(modname) {
-                    if let Some((_, ty)) = consts.iter().find(|(c, _)| c == name) {
-                        return ty.clone();
-                    }
+                // (W3-1) OWNER-FIRST: the const's type comes from `modname`'s own
+                // per-module table (flat `module_consts` fallback for synthetic
+                // ctxs). Both are module-keyed, so this never diverges.
+                if let Some(ty) = ctx.resolve_module_const(modname, name) {
+                    return ty.clone();
                 }
             }
             // (card 03eb4e2c) A class-NAME receiver `ClassName.FIELD` — e.g. an
@@ -697,7 +698,14 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
                         // codegen sees a CONCRETE result type — the same handling as
                         // the flat form, via the shared `oracle_generic_call_ret`. A
                         // non-generic module fn returns its declared type unchanged.
-                        return match ctx.funcs.get(name) {
+                        // (W3-1) OWNER-FIRST: resolve the signature against
+                        // module `modname`'s OWN per-module table (guarded above by
+                        // its `module_funcs` membership), not the flat table. For a
+                        // real program this is the module's own sig; it falls back
+                        // to the flat table only for synthetic single-module ctxs.
+                        // `oracle_generic_call_ret` still keys generics by the bare
+                        // `name` against the (flat, global) generic maps — unchanged.
+                        return match ctx.resolve_module_func(modname, name) {
                             Some(sig) => {
                                 let arg_tys: Vec<Ty> = args.iter()
                                     .map(|a| infer_expr_ty(a, locals, ctx))
@@ -2296,8 +2304,11 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                         if let Expr::Ident(modname, _) = obj.as_ref() {
                             if let Some(mod_fns) = env.ctx.module_funcs.get(modname) {
                                 if mod_fns.iter().any(|n| n == name) {
-                                    // f is defined by module X — resolve its flat sig.
-                                    let sig = env.ctx.funcs.get(name).cloned().ok_or_else(|| Error::Type {
+                                    // (W3-1) f is defined by module `modname` —
+                                    // resolve its signature OWNER-FIRST against that
+                                    // module's own per-module table (flat fallback
+                                    // only for synthetic ctxs), not the flat table.
+                                    let sig = env.ctx.resolve_module_func(modname, name).cloned().ok_or_else(|| Error::Type {
                                         span: *attr_span,
                                         msg: format!("module `{}` function `{}` has no signature", modname, name),
                                     })?;
@@ -2582,10 +2593,10 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
             // Unknown); `math` is now a real embedded module whose consts are
             // tracked in `module_consts`.
             if let Expr::Ident(modname, _) = obj.as_ref() {
-                if let Some(consts) = env.ctx.module_consts.get(modname) {
-                    if let Some((_, ty)) = consts.iter().find(|(c, _)| c == name) {
-                        return Ok(ty.clone());
-                    }
+                // (W3-1) OWNER-FIRST qualified const type (flat `module_consts`
+                // fallback for synthetic ctxs); both module-keyed, never diverges.
+                if let Some(ty) = env.ctx.resolve_module_const(modname, name) {
+                    return Ok(ty.clone());
                 }
                 // (Honest-errors) `X.attr` (non-call) where X is a KNOWN imported
                 // module (it has tracked functions or constants) but `attr` is

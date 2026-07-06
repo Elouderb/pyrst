@@ -1752,7 +1752,7 @@ impl<'a> Codegen<'a> {
 
                 if let Some(__s) = self.emit_method_call_on_attr(callee, args, kwargs)? { return Ok(__s); }
 
-                self.emit_plain_func_call(callee, args, kwargs)
+                self.emit_plain_func_call(callee, args, kwargs, None)
     }
 
     /// Emit a REGULAR function call (not a builtin / constructor / super /
@@ -1768,6 +1768,13 @@ impl<'a> Codegen<'a> {
         callee: &Box<Expr>,
         args: &[Expr],
         kwargs: &[(String, Expr)],
+        // (W3-2) The owner module of a QUALIFIED call `X.f()` re-dispatched here
+        // (`Some("X")`), or `None` for a bare call whose callee owner is resolved
+        // from the current emit scope (`bare_owner_for`, via the Ident arm). Passed
+        // to `emit_callee_with_inline_lambda_types` so ONLY the callee name is
+        // owner-mangled — threaded as a param (not a Codegen flag) because args
+        // emit BEFORE the callee and a nested arg-call must not consume it.
+        callee_owner: Option<String>,
     ) -> Result<String> {
                 // (kwargs v1, card 8a7b7714) A keyword-bearing call maps each
                 // keyword to its parameter slot and lowers as a FULL positional
@@ -1778,7 +1785,9 @@ impl<'a> Codegen<'a> {
                 // typeck rejects it, this is the defensive backstop.
                 let kw_sig: Option<crate::typeck::FuncSig> = if !kwargs.is_empty() {
                     let sig = if let Expr::Ident(n, _) = callee.as_ref() {
-                        self.ctx.funcs.get(n.as_str()).cloned()
+                        // (W3-2) Owner-first so a co-imported same-named callee maps
+                        // kwargs against ITS signature, not the flat last-merged one.
+                        self.resolve_callee_sig(n, callee_owner.as_deref())
                     } else {
                         None
                     };
@@ -1812,7 +1821,9 @@ impl<'a> Codegen<'a> {
                 // already-Optional value) — the same coercion as assignment and
                 // return. Methods / unknown callees keep the bare emission.
                 let mut param_tys: Vec<Ty> = if let Expr::Ident(n, _) = callee.as_ref() {
-                    self.ctx.funcs.get(n.as_str())
+                    // (W3-2) Owner-first param types (Optional-wrap / poly-base coercion)
+                    // so a co-imported same-named callee coerces against ITS params.
+                    self.resolve_callee_sig(n, callee_owner.as_deref())
                         .map(|sig| sig.params.iter().map(|(_, t)| t.clone()).collect())
                         .unwrap_or_default()
                 } else {
@@ -1866,8 +1877,14 @@ impl<'a> Codegen<'a> {
                                 })
                                 .collect(),
                         };
+                        // (W3-fix / F2) Owner-first sig so a co-imported generic
+                        // (`copy.copy[T]`) monomorphizes against ITS type-var params,
+                        // not a non-generic same-named sibling (`shutil.copy`) that
+                        // merged last — which would leave a `Callable[[T],T]` slot a
+                        // bare `T` and fail rustc (E0425).
+                        let owner_sig = self.resolve_callee_sig(n, callee_owner.as_deref());
                         if let Some(subst) =
-                            crate::typeck::generic_call_param_subst(n.as_str(), &arg_tys, self.ctx)
+                            crate::typeck::generic_call_param_subst(n.as_str(), owner_sig.as_ref(), &arg_tys, self.ctx)
                         {
                             for pt in param_tys.iter_mut() {
                                 *pt = crate::typeck::apply_typevar_subst(pt, &subst);
@@ -1879,8 +1896,12 @@ impl<'a> Codegen<'a> {
                 // free-function callee. Parallel to `args` (free functions have no
                 // `self`, so `param_by_ref[i]` lines up with `args[i]` directly).
                 let param_by_ref: Vec<bool> = if let Expr::Ident(n, _) = callee.as_ref() {
-                    self.ctx.funcs.get(n.as_str())
-                        .map(|sig| sig.param_by_ref.clone())
+                    // (W3-fix / F3) Owner-first so a co-imported same-named callee
+                    // borrows against ITS by-ref flags — the flat table holds only
+                    // the last-merged collider, which would SILENTLY drop a `Mut[T]`
+                    // mutation (or spuriously add a borrow) for the other owner.
+                    self.resolve_callee_sig(n, callee_owner.as_deref())
+                        .map(|sig| sig.param_by_ref)
                         .unwrap_or_default()
                 } else {
                     Vec::new()
@@ -1895,9 +1916,17 @@ impl<'a> Codegen<'a> {
                 // wrap per param slot.
                 if let Some(slots) = &kw_slots {
                     let sig = kw_sig.as_ref().expect("kw slots imply a resolved signature");
+                    // (W3-fix / F5) The callee's own module owns its default exprs.
+                    let def_owner = callee_owner.clone().or_else(|| {
+                        if let Expr::Ident(n, _) = callee.as_ref() {
+                            self.bare_owner_for(n)
+                        } else {
+                            None
+                        }
+                    });
                     let (prelude, call_parts) =
-                        self.emit_slotted_args(slots, args, kwargs, sig, &param_tys, /*coerced=*/ true)?;
-                    let callee_s = self.emit_callee_with_inline_lambda_types(callee, args)?;
+                        self.emit_slotted_args(slots, args, kwargs, sig, &param_tys, /*coerced=*/ true, def_owner.as_deref())?;
+                    let callee_s = self.emit_callee_with_inline_lambda_types(callee, args, callee_owner)?;
                     return Ok(Self::hoist_wrap(
                         &prelude,
                         format!("{}({})", callee_s, call_parts.join(", ")),
@@ -1929,7 +1958,13 @@ impl<'a> Codegen<'a> {
                 // Inject default arguments for named functions (positional-only
                 // under-application).
                 if let Expr::Ident(n, _) = callee.as_ref() {
-                    if let Some(sig) = self.ctx.funcs.get(n.as_str()).cloned() {
+                    // (W3-2) Owner-first so a co-imported same-named callee fills ITS
+                    // trailing defaults (operator.sub 2-arg vs re.sub 3-arg+default).
+                    // (W3-fix / F5) The default EXPRESSION belongs to the callee's
+                    // module — emit it under that owner so a bare helper/const inside
+                    // it resolves owner-first there, not the caller's scope.
+                    let def_owner = callee_owner.clone().or_else(|| self.bare_owner_for(n));
+                    if let Some(sig) = self.resolve_callee_sig(n, callee_owner.as_deref()) {
                         let expected = sig.params.len();
                         if parts.len() < expected && !sig.param_defaults.is_empty() {
                             let defaults_needed = expected - parts.len();
@@ -1942,7 +1977,12 @@ impl<'a> Codegen<'a> {
                                     // default, Callable / poly-base casts) instead of
                                     // a bare emit_expr, which emitted `describe(5i64)`
                                     // into an `Option<i64>` slot -> rustc E0308.
-                                    Some(e) => parts.push(self.emit_call_arg_value(e, &param_tys, pidx, /*coerced=*/ true)?),
+                                    Some(e) => {
+                                        let v = self.with_default_scope(def_owner.clone(), |cg| {
+                                            cg.emit_call_arg_value(e, &param_tys, pidx, /*coerced=*/ true)
+                                        })?;
+                                        parts.push(v);
+                                    }
                                     None => return Err(crate::diag::Error::Codegen("missing required argument".into())),
                                 }
                             }
@@ -1950,7 +1990,7 @@ impl<'a> Codegen<'a> {
                     }
                 }
 
-                let callee_s = self.emit_callee_with_inline_lambda_types(callee, args)?;
+                let callee_s = self.emit_callee_with_inline_lambda_types(callee, args, callee_owner)?;
                 Ok(format!("{}({})", callee_s, parts.join(", ")))
     }
 
@@ -1966,7 +2006,19 @@ impl<'a> Codegen<'a> {
         &mut self,
         callee: &Expr,
         args: &[Expr],
+        callee_owner: Option<String>,
     ) -> Result<String> {
+        // (W3-2) A QUALIFIED module call `X.f()` re-dispatched here supplies its
+        // owner `X` explicitly (always non-root): emit the callee as the
+        // owner-mangled top-level name directly, bypassing the Ident arm's
+        // scope-based `bare_owner_for` (which would resolve `f` against the CURRENT
+        // emit module, not the qualifier). A bare call passes `None` and falls
+        // through to the normal Ident-arm resolution below.
+        if let Some(owner) = callee_owner {
+            if let Expr::Ident(n, _) = callee {
+                return Ok(self.emit_name(Some(&owner), n));
+            }
+        }
         // (card c34ac64a fix A) Pass the arg-derived param types as HINTS via
         // `pending_inline_lambda_params` rather than writing `self.locals` here: the
         // Lambda arm shadows its own params (removing a bare param so an outer

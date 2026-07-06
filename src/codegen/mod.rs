@@ -82,13 +82,24 @@ pub struct Codegen<'a> {
     /// in a closure/`for`/`match` position. Populated by `emit_program` from
     /// every module's const declarations before emission; empty on paths that
     /// build a `Codegen` directly (no module constants there).
-    const_names: std::collections::HashSet<String>,
+    ///
+    /// (W3-fix / F8) OWNER-KEYED `(owner_module, const_name)` (`None` = root), so a
+    /// bare `FOO` in a module that OWNS a function `FOO` is NOT mistaken for a
+    /// same-named CONST owned by a co-imported module (fn-vs-const misroute). The
+    /// owner at a reference site comes from `bare_owner_for` (bare) / the qualifier
+    /// (`X.CONST`) — the SAME resolution the mangled name is built from, so
+    /// membership and mangling never disagree.
+    const_names: std::collections::HashSet<(Option<String>, String)>,
     /// Names of module-level STRING constants (a subset of `const_names`). A str
     /// const lowers to a Rust `const NAME: &str` (a `String` is not
     /// const-constructible), so a reference to it must additionally append
     /// `.to_string()` to recover pyrst's `str == Rust String` value type.
     /// int/float/bool consts are `Copy` and need no such fix-up.
-    const_strs: std::collections::HashSet<String>,
+    ///
+    /// (W3-fix / F9) OWNER-KEYED like `const_names`, so a `.to_string()` fix-up
+    /// fires per (owner, name): a str const `FOO` in one module and an int const
+    /// `FOO` in another no longer cross-contaminate the str-ness decision.
+    const_strs: std::collections::HashSet<(Option<String>, String)>,
     /// Generators (LAZY-GEN V1-b): true while emitting a function whose body
     /// contains `yield`. Such a function lowers to the lazy `Gen<T>` coroutine
     /// (docs/design/lazy-generators.md §C): its body is wrapped in a
@@ -181,6 +192,23 @@ pub struct Codegen<'a> {
     /// `None` everywhere except across that single inline-invoke emit; a nested
     /// lambda inside the body sees `None` (the `.take()` consumed it).
     pending_inline_lambda_params: Option<std::collections::HashMap<String, Ty>>,
+    /// (W3-2) The dotted module id of the module whose top-level items are
+    /// CURRENTLY being emitted (`None` = the ROOT program, whose own top-level
+    /// names stay crate-root-unwrapped). Threaded by `emit_program`'s const
+    /// prepass + main emit loop from each `Module.module_id`; consulted by
+    /// `emit_func` / `emit_const_decl` (the DEFINITION owner) and `bare_owner_for`
+    /// (a SAME-MODULE unqualified reference). Like `current_class`, it scopes a
+    /// single emission pass and is `None` on every non-`emit_program` path (a
+    /// directly built `Codegen` emits a single root unit — root-unwrapped).
+    current_module: Option<String>,
+    /// (W3-2) The ROOT program's OWN top-level fn/class/const bare names. A bare
+    /// reference at the root resolves to the root's own definition FIRST
+    /// (root-shadows-imports — matching typeck's flat last-writer merge), so this
+    /// guards `bare_owner_for` from mangling a root name that ALSO happens to be
+    /// from-imported (a redefinition CPython would last-bind). Empty except during
+    /// `emit_program`; irrelevant for import-free programs (every bare name is
+    /// root-owned and unwrapped regardless).
+    root_defined: std::collections::HashSet<String>,
 }
 
 
@@ -255,8 +283,21 @@ pub fn escape_ident(name: &str) -> String {
 /// definition AND at every reference (bare `CONST` and qualified `X.CONST`); a
 /// missed site is a def/use mismatch. The pyrst-level name is unchanged in
 /// typeck and diagnostics — only the emitted Rust identifier is mangled.
-pub fn mangle_const(name: &str) -> String {
-    format!("__pyrst_const_{}", name)
+///
+/// (W3-2) OWNER-QUALIFIED: a ROOT const (`owner = None`) keeps the historical
+/// `__pyrst_const_<name>` (so import-free programs are byte-identical), while an
+/// IMPORTED module's const gains its owner prefix `__pyrst_const_<owner>__<name>`
+/// (dots in a dotted module id sanitized to `_`). This closes the previously
+/// latent const-vs-const collision (two co-imported modules each defining a
+/// same-named const now emit DISTINCT Rust consts). Applied identically at the
+/// const definition (`emit_const_decl`, owner = the emitting module) and at every
+/// reference (bare `CONST` owner-resolved via `bare_owner_for`; qualified
+/// `X.CONST` owner = `X`).
+pub fn mangle_const(owner: Option<&str>, name: &str) -> String {
+    match owner {
+        None => format!("__pyrst_const_{}", name),
+        Some(m) => format!("__pyrst_const_{}__{}", m.replace('.', "_"), name),
+    }
 }
 
 /// Build a comprehension closure-parameter pattern from its loop target(s),
@@ -795,6 +836,27 @@ pub fn emit_program(modules: &[(Module, String)], ctx: &TyCtx) -> Result<String>
 
     let mut cg = Codegen::new(ctx).with_dead_funcs(dead_funcs);
 
+    // (W3-2) Record the ROOT program's OWN top-level fn/class/const bare names.
+    // A bare reference at the root resolves to the root's own definition FIRST
+    // (root-shadows-imports — matching typeck's flat merge, where the root is last
+    // and wins the bare namespace), so `bare_owner_for` will not mangle a root name
+    // that ALSO happens to be from-imported. The root is the module with no dotted
+    // id (`module_id == None`; it is also last in topological order).
+    for (m, _src) in modules {
+        if m.module_id.is_none() {
+            for s in &m.stmts {
+                match s {
+                    Stmt::Func(f) => { cg.root_defined.insert(f.name.clone()); }
+                    Stmt::Class(c) => { cg.root_defined.insert(c.name.clone()); }
+                    Stmt::Assign { target, .. } if crate::typeck::is_module_const_decl(s) => {
+                        cg.root_defined.insert(target.clone());
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
     // (EPIC-4 V3) Compute the transitive `&mut self` decision for every
     // (class, method) BEFORE any emission, so `emit_func` can consult it. Reads
     // only `ctx.classes` (the resolved MRO), so it is independent of the
@@ -1025,15 +1087,21 @@ pub fn emit_program(modules: &[(Module, String)], ctx: &TyCtx) -> Result<String>
     // of source order across modules. `emit_top_stmt` treats these assigns as a
     // no-op (they are emitted here), so each const is emitted exactly once.
     for (m, _src) in modules {
+        // (W3-2) Owner-qualify this module's consts by its dotted id (None=root).
+        cg.current_module = m.module_id.clone();
         for s in &m.stmts {
             if crate::typeck::is_module_const_decl(s) {
                 // Record const names BEFORE emitting bodies so every reference
                 // (bare `CONST` / qualified `X.CONST`) lowers to the MANGLED name,
                 // and str consts additionally get `.to_string()`.
                 if let Stmt::Assign { target, value, .. } = s {
-                    cg.const_names.insert(target.clone());
+                    // (W3-fix / F8,F9) Key by (owner module, name); `m.module_id` is
+                    // the owner (`None` = root), matching `bare_owner_for` / the
+                    // qualifier at every reference site.
+                    let owner = m.module_id.clone();
+                    cg.const_names.insert((owner.clone(), target.clone()));
                     if matches!(value, Expr::Str(..)) {
-                        cg.const_strs.insert(target.clone());
+                        cg.const_strs.insert((owner, target.clone()));
                     }
                 }
                 cg.emit_const_decl(s)?;
@@ -1043,12 +1111,19 @@ pub fn emit_program(modules: &[(Module, String)], ctx: &TyCtx) -> Result<String>
 
     // Emit all modules in order (imports first, root last)
     for (m, _src) in modules {
+        // (W3-2) The owner threaded into every top-level DEFINITION emitted below
+        // (`emit_func` name, `emit_class` struct/impls, and same-module bare refs
+        // via `bare_owner_for`). `None` for the root → crate-root-unwrapped.
+        cg.current_module = m.module_id.clone();
         for s in &m.stmts {
             // Skip import statements — they're resolved, not emitted
             if matches!(s, Stmt::Import { .. }) { continue; }
             cg.emit_top_stmt(s)?;
         }
     }
+    // (W3-2) Companion enums resolve every class name via the GLOBAL class_owner
+    // map (not current_module), but reset to the root for clarity/defensiveness.
+    cg.current_module = None;
 
     // (EPIC-5 C2-2a) Emit the companion-enum machinery (closed-set enum +
     // method-dispatch impl + field-accessor impl) for every polymorphic base,

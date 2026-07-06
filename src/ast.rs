@@ -256,4 +256,13 @@ impl Expr {
 pub struct Module {
     pub stmts: Vec<Stmt>,
     pub source_path: Option<std::path::PathBuf>,
+    /// (W3-1) The canonical DOTTED import path that REACHED this module (`"os"`,
+    /// `"os.path"`, `"a.b"`) — the per-module-namespace KEY for owner-first
+    /// qualified resolution and (stage 2) owner-qualified emission. Set by the
+    /// resolver from the *import path*, NOT the file stem: `lib/os/path.pyrs` has
+    /// the ambiguous stem `"path"` but the module id `"os.path"`. `None` for the
+    /// ROOT program (the sentinel root, whose own top-level names stay
+    /// crate-root-unwrapped) and for the LSP single-file path (which never
+    /// resolves imports, so it has no dotted id).
+    pub module_id: Option<String>,
 }

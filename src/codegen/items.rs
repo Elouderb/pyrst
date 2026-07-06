@@ -3,16 +3,18 @@ use super::*;
 impl<'a> Codegen<'a> {
     pub(crate) fn emit_func(&mut self, f: &Func, method_of: Option<&str>) -> Result<()> {
         let is_static = f.decorators.contains(&"staticmethod".to_string());
-        let name = if f.name == "main" && method_of.is_none() {
+        let name = if f.name == "main" && method_of.is_none() && self.current_module.is_none() {
             "user_main".to_string()
         } else if method_of.is_none() {
-            // (EPIC-6) Free-function name: escape a keyword name so the `fn` def
-            // matches every call site (call sites emit the name through
-            // `emit_expr`'s Ident arm, which escapes identically). METHOD names
-            // are deliberately NOT escaped here — method-name escaping is the
-            // sibling dispatch card's concern, and escaping only the definition
-            // would desync it from the (untouched) dispatch call sites.
-            escape_ident(&f.name)
+            // (EPIC-6 + W3-2) Free-function name: owner-qualify by the module being
+            // emitted. A ROOT fn stays `escape_ident(&f.name)` (a keyword name still
+            // round-trips; import-free = byte-identical); an IMPORTED module's fn
+            // becomes `__pyrst_m_<owner>__<name>`. Call sites emit the SAME name via
+            // `emit_expr`'s Ident arm (`bare_owner_for`) or the qualified re-dispatch
+            // (`callee_owner`), so def/use stay in sync. METHOD names are deliberately
+            // NOT mangled (method_of.is_some() → the untouched `f.name.clone()`) —
+            // a method is namespaced by its receiver struct, never by a module.
+            self.emit_name(self.current_module.as_deref(), &f.name)
         } else {
             f.name.clone()
         };
@@ -522,8 +524,16 @@ impl<'a> Codegen<'a> {
         // class type vars in scope (a `v: T` lowers to the Rust `T`).
         let (struct_generics, impl_generics, ty_args) = self.class_generic_clauses(c);
 
+        // (W3-2) The owner-qualified Rust identifier for this class's struct — root
+        // class = bare `c.name` (byte-identical to pre-W3), imported class =
+        // `__pyrst_m_<owner>__<name>`. Used at the struct decl, the inherent-impl
+        // head, `recv_ty_str` (every trait-impl head + method receiver), and the
+        // constructor struct literals. `c.name` stays bare at every ctx LOOKUP and
+        // inside `Ty::Class(c.name, ..)` (those flow through `rust_ty`, which mangles).
+        let struct_name = self.emit_class_name(&c.name);
+
         self.line(&derives);
-        self.line(&format!("struct {}{} {{", c.name, struct_generics));
+        self.line(&format!("struct {}{} {{", struct_name, struct_generics));
         self.indent += 1;
         for f in &all_fields {
             // Generics v2: scope the field annotation with the class type params
@@ -559,7 +569,7 @@ impl<'a> Codegen<'a> {
         // `&Box<T>` — without the `<T>` rustc raises E0107 "missing generics");
         // for a non-generic class it is the bare struct name `Point`, so every
         // existing dunder impl is byte-for-byte unchanged.
-        let recv_ty_str = format!("{}{}", c.name, ty_args);
+        let recv_ty_str = format!("{}{}", struct_name, ty_args);
         // The `Ty` typing for a `self`/`other` local — carries the class's type
         // params as type vars for a generic class (drives field-read lowering),
         // empty args for a non-generic class (the legacy `Ty::Class(name, [])`).
@@ -585,7 +595,7 @@ impl<'a> Codegen<'a> {
         if has_init || has_regular_methods || (is_dataclass && !has_init) || !const_fields.is_empty() {
             // Generics v2: `impl<T: Clone + ..> Box<T> { .. }`. Bounds clause +
             // type-args; both empty for a non-generic class (`impl Point { .. }`).
-            self.line(&format!("impl{} {}{} {{", impl_generics, c.name, ty_args));
+            self.line(&format!("impl{} {}{} {{", impl_generics, struct_name, ty_args));
             self.indent += 1;
 
             // (card 03eb4e2c) Class-level constants (enum members) first: emit each
@@ -669,7 +679,7 @@ impl<'a> Codegen<'a> {
                     // infers `T` once `__init__` fills the `T`-typed field). Keeping
                     // the non-generic case on `c.name` preserves byte-identity for
                     // every existing class.
-                    let inst_ty = if c.type_params.is_empty() { c.name.clone() } else { "Self".to_string() };
+                    let inst_ty = if c.type_params.is_empty() { struct_name.clone() } else { "Self".to_string() };
                     self.line(&format!("fn new({}) -> Self {{", param_strs.join(", ")));
                     self.indent += 1;
                     self.line(&format!("let mut __inst = {} {{ {} }};", inst_ty, defaults.join(", ")));
@@ -712,7 +722,7 @@ impl<'a> Codegen<'a> {
                 let field_inits = field_inits?;
                 self.line(&format!("fn new({}) -> Self {{", param_strs.join(", ")));
                 self.indent += 1;
-                self.line(&format!("{} {{ {} }}", c.name, field_inits.join(", ")));
+                self.line(&format!("{} {{ {} }}", struct_name, field_inits.join(", ")));
                 self.indent -= 1;
                 self.line("}");
                 self.line("");
@@ -1024,7 +1034,9 @@ impl<'a> Codegen<'a> {
                 })
                 .collect();
             // PyRepr: `ClassName(f1=<repr>, f2=<repr>)` (empty dataclass -> `C()`).
-            self.line(&format!("impl PyRepr for {} {{", c.name));
+            // (W3-2) The impl TARGET is the mangled struct; the repr TEXT below
+            // keeps the bare pyrst class name (Python-visible output).
+            self.line(&format!("impl PyRepr for {} {{", struct_name));
             self.indent += 1;
             self.line("fn py_repr(&self) -> String {");
             self.indent += 1;
@@ -1036,7 +1048,7 @@ impl<'a> Codegen<'a> {
             self.line("}");
             self.line("");
             // Display delegates to the same synthesized repr (str()/print()).
-            self.line(&format!("impl ::std::fmt::Display for {} {{", c.name));
+            self.line(&format!("impl ::std::fmt::Display for {} {{", struct_name));
             self.indent += 1;
             self.line("fn fmt(&self, __f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {");
             self.indent += 1;
@@ -1160,7 +1172,14 @@ impl<'a> Codegen<'a> {
         if let Some(subs) = self.poly_map.get(base) {
             variants.extend(subs.iter().cloned());
         }
-        let enum_name = format!("{}__", base);
+        // (W3-2) The companion enum is owned by the BASE's module: its name is the
+        // base's owner-qualified struct name + `__` (matches `rust_ty`'s `{}__`).
+        // `variants` stays a Vec of BARE class names (for `resolved_methods` /
+        // `get_all_fields` lookups); each variant TAG + PAYLOAD is mangled by ITS
+        // OWN owner (`emit_class_name`) at every emission site below — so a base in
+        // one module and a subclass in another coexist in one flat enum (design §F,
+        // probe A).
+        let enum_name = format!("{}__", self.emit_class_name(base));
 
         // 1. The enum. Always exactly `#[derive(Clone, Debug)]`: a data-variant
         // enum cannot derive Default or Copy, and Display/PartialEq for the enum
@@ -1171,7 +1190,10 @@ impl<'a> Codegen<'a> {
         self.line(&format!("enum {} {{", enum_name));
         self.indent += 1;
         for v in &variants {
-            self.line(&format!("{}({}),", v, v));
+            // (W3-2) Variant TAG and PAYLOAD struct both = the variant's
+            // owner-qualified name (base by its module, each subclass by its own).
+            let vm = self.emit_class_name(v);
+            self.line(&format!("{}({}),", vm, vm));
         }
         self.indent -= 1;
         self.line("}");
@@ -1240,7 +1262,7 @@ impl<'a> Codegen<'a> {
             };
             let arms: Vec<String> = variants
                 .iter()
-                .map(|v| format!("{}::{}(x) => {}", enum_name, v, read))
+                .map(|v| format!("{}::{}(x) => {}", enum_name, self.emit_class_name(v), read))
                 .collect();
             self.line(&format!(
                 "fn __field_{}(&self) -> {} {{ match self {{ {} }} }}",
@@ -1280,7 +1302,7 @@ impl<'a> Codegen<'a> {
         if all_have_display {
             let arms: Vec<String> = variants
                 .iter()
-                .map(|v| format!("{}::{}(x) => write!(__f, \"{{}}\", x)", enum_name, v))
+                .map(|v| format!("{}::{}(x) => write!(__f, \"{{}}\", x)", enum_name, self.emit_class_name(v)))
                 .collect();
             self.line("#[allow(dead_code)]");
             self.line(&format!("impl ::std::fmt::Display for {} {{", enum_name));
@@ -1300,7 +1322,7 @@ impl<'a> Codegen<'a> {
         if all_have_eq {
             let mut arms: Vec<String> = variants
                 .iter()
-                .map(|v| format!("({0}::{1}(a), {0}::{1}(b)) => a == b", enum_name, v))
+                .map(|v| format!("({0}::{1}(a), {0}::{1}(b)) => a == b", enum_name, self.emit_class_name(v)))
                 .collect();
             // Cross-variant: Python `Dog(..) == Cat(..)` is False.
             arms.push("_ => false".to_string());
@@ -1326,7 +1348,7 @@ impl<'a> Codegen<'a> {
             let mut arms: Vec<String> = variants
                 .iter()
                 .map(|v| {
-                    format!("({0}::{1}(a), {0}::{1}(b)) => a.partial_cmp(b)", enum_name, v)
+                    format!("({0}::{1}(a), {0}::{1}(b)) => a.partial_cmp(b)", enum_name, self.emit_class_name(v))
                 })
                 .collect();
             // Cross-variant: two different concrete types are uncomparable → None.
@@ -1404,7 +1426,7 @@ impl<'a> Codegen<'a> {
         let fwd_args = fwd.join(", ");
         let arms: Vec<String> = variants
             .iter()
-            .map(|v| format!("{}::{}(x) => x.{}({})", enum_name, v, m.name, fwd_args))
+            .map(|v| format!("{}::{}(x) => x.{}({})", enum_name, self.emit_class_name(v), m.name, fwd_args))
             .collect();
 
         let mut sig = format!("fn {}({}", m.name, receiver);
@@ -1453,7 +1475,13 @@ impl<'a> Codegen<'a> {
     /// temporary rvalue and returns false.
     pub(crate) fn is_borrowable_place(&self, e: &Expr) -> bool {
         match e {
-            Expr::Ident(n, _) => !(self.const_names.contains(n) && !self.locals.contains_key(n)),
+            // (W3-fix / F8) Owner-keyed const membership: a bare name is a
+            // non-borrowable temp iff it resolves to a module CONST (`&'static` /
+            // `.to_string()`); a local shadows and stays a borrowable place.
+            Expr::Ident(n, _) => {
+                self.locals.contains_key(n)
+                    || !self.const_names.contains(&(self.bare_owner_for(n), n.clone()))
+            }
             Expr::Attr { obj, name, .. } => {
                 if self.is_property_access(obj, name) {
                     return false;

@@ -18,17 +18,16 @@
 # checking this pass's public names against every other in-flight W2 unit's
 # drop-dir notes): the separately-authored `ccr-trio` unit's `copy.pyrs`
 # module (CPython's `copy` module) also declares a top-level `copy(x)` —
-# an EXACT bare-name collision with `shutil.copy(src, dst)` here (different
-# arity, same name; the resolver's cross-module duplicate-name check is by
-# name only). Real CPython has the identical ambiguity (`shutil.copy` vs
-# `copy.copy` are two distinct, correctly-named functions) and resolves it
-# via `import shutil` / `import copy` qualified access — a pattern this
-# compiler cannot express (no `import X as Y` aliasing: see
-# `src/parser.rs`'s explicit "import aliases (`as`) are not yet supported"
-# rejection). Per the existing `operator`/`re` and `datetime.time`/`time`
-# precedent, this is KEPT (both names are CPython-exact and correct) and
-# documented as a co-import restriction: a pyrst program may `from shutil
-# import copy` OR `from copy import copy`, never both in the same program.
+# a bare-name collision with `shutil.copy(src, dst)` here (different arity,
+# same name). Real CPython resolves this via qualified per-module access
+# (`shutil.copy` vs `copy.copy`) — which pyrst NOW supports via W3-2 per-module
+# namespaced emission: the two lower to distinct `__pyrst_m_shutil__copy` /
+# `__pyrst_m_copy__copy` Rust items, so `import shutil` and `import copy`
+# CO-IMPORT (the flat-namespace co-import restriction is RETIRED for fn/const
+# collisions). Both names stay CPython-exact. Proven by
+# examples/coimport_copy_shutil.pyrs (calls both qualified). (The generic
+# `copy.copy[T]` and this non-generic `shutil.copy` are told apart owner-first,
+# so `shutil.copy` is never mistaken for the generic one.)
 # ORACLE RE-VERIFICATION (this pass re-probed live CPython 3.12 rather than
 # trusting the dossier verbatim — the instructions call this out explicitly):
 #   - `copyfile` does NOT preserve the source file's permission bits (dst gets

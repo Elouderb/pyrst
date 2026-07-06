@@ -159,6 +159,12 @@ def hls_to_rgb(h: float, l: float, s: float) -> tuple[float, float, float]:
     # significant digit for h=10.5, l=s=0.5). Mirrors CPython's structure
     # exactly (fresh `% 1.0` per channel) to reproduce its rounding
     # bit-for-bit.
+    # (card 2f615b52) The per-channel `% 1.0` now lowers to a CPython-exact
+    # fmod-based float modulo (`__py_fmod`). The old lowering was
+    # `(((a % b) + b) % b)`, which DOUBLE-ROUNDED — so this hls bit-for-bit
+    # match was previously coincidental for the tested inputs; it is now
+    # guaranteed by the operator itself (re-verified bit-identical across a
+    # 126-case h/l/s round-trip probe, incl. large/negative |h|).
     def _hls_value_at(hue_in: float) -> float:
         hue: float = hue_in % 1.0
         if hue < ONE_SIXTH:

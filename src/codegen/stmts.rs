@@ -554,9 +554,14 @@ impl<'a> Codegen<'a> {
                         // Python's %= takes the sign of the divisor; Rust's %= takes the
                         // sign of the dividend. Mirror the BinOp lowering.
                         if matches!(target_ty, Ty::Float) {
+                            // (card 2f615b52) route through the SAME shared CPython
+                            // fmod helper as binary `%` (see __py_fmod) — the old
+                            // `(((x % b) + b) % b)` double-rounded (`x %= 1.0` on
+                            // x==0.1 gave 0.10000000000000009) and NaN'd on a zero
+                            // divisor instead of raising ZeroDivisionError.
                             self.line(&format!(
-                                "{{ let __b = ({} as f64); {} = ((({} as f64) % __b) + __b) % __b; }}",
-                                v, target, target
+                                "{} = __py_fmod({} as f64, ({}) as f64);",
+                                target, target, v
                             ));
                         } else {
                             self.line(&format!("{} = __py_mod(({}), ({}));", target, target, v));

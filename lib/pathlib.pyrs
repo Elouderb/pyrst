@@ -154,7 +154,12 @@ class PurePosixPath:
     @property
     def suffix(self) -> str:
         nm: str = self.name
-        idx: int = _pathlib_rfind_dot(nm)
+        # (card dfd89c12) builtin `str.rfind` now returns a CHAR offset like
+        # CPython (it used to leak Rust's BYTE offset, overshooting the char
+        # index on names like `"café.txt"`); `nm[idx:n]` slicing is
+        # char-indexed, so the former hand-rolled `_pathlib_rfind_dot` scan is
+        # no longer needed and the builtin is consistent with it.
+        idx: int = nm.rfind(".")
         n: int = len(nm)
         if idx > 0 and idx < n - 1:
             return nm[idx:n]
@@ -435,29 +440,6 @@ def _pathlib_join_str(root: str, segs: list[str]) -> str:
 def _pathlib_normalize(path: str) -> str:
     parsed: tuple[str, list[str]] = _pathlib_split_raw(path)
     return _pathlib_join_str(parsed[0], parsed[1])
-
-
-# Find the LAST '.' in `s`, returning its CHARACTER (not byte) index, or -1
-# if none. A hand-rolled loop, not `str.rfind(".")` — pyrst's `str.rfind`
-# codegens straight to Rust's `str::rfind`, which returns a UTF-8 BYTE
-# offset, while `len()`/slicing/`s[i]` are character-count-based (see
-# src/codegen/exprs.rs `"len"` vs `"rfind"` arms); for any name with a
-# multi-byte character before the last dot (e.g. `"café.txt"`), the byte
-# offset from `.rfind(".")` overshoots the character offset `suffix` needs,
-# corrupting the slice (`"café.txt"` gave stem `"café."` / suffix `"txt"`
-# instead of `"café"` / `".txt"` before this fix). This is a pre-existing,
-# general pyrst compiler bug (not pathlib-specific — any module doing
-# `x.rfind(pat)` then slicing/comparing against `len(x)` on a non-ASCII `x`
-# hits it); worked around HERE by never calling `.rfind()` on `nm`, only
-# character indexing/`len()`, which are mutually consistent.
-def _pathlib_rfind_dot(s: str) -> int:
-    n: int = len(s)
-    i: int = n - 1
-    while i >= 0:
-        if s[i] == ".":
-            return i
-        i = i - 1
-    return -1
 
 
 # Strip LEADING '.' characters only (str.lstrip in pyrst only trims

@@ -1,0 +1,57 @@
+# DUAL-RUN parity (card dfd89c12): str.find / rfind / index / rindex must
+# return CHARACTER offsets like CPython, NOT Rust's UTF-8 BYTE offsets.
+# pyrst's len()/indexing/slicing are all char-based, so a byte offset here
+# silently corrupts every downstream slice/index on a string with a multibyte
+# char before the match (before the fix, "café.txt".rfind(".") gave 5, not 4).
+#
+# Matrix: needle at start / middle / end / absent, multichar and empty needles,
+# over é (2-byte) / ß (2-byte) / CJK (3-byte) / astral emoji (4-byte) / Greek,
+# plus the ValueError-on-miss paths of index / rindex (caught, so both runtimes
+# print the same marker rather than aborting mid-run).
+def main() -> None:
+    cafe: str = "café.txt"
+    strasse: str = "straße.txt"
+    cjk: str = "日本語.txt"
+    emoji: str = "a😀b😀c"
+    greek: str = "αβγ.δεζ.η"
+
+    # find — needle at start / middle / end / absent
+    print(cafe.find("c"))          # 0  (start)
+    print(cafe.find("."))          # 4  (middle, after the 2-byte é)
+    print(cafe.find("t"))          # 5
+    print(cafe.find("z"))          # -1 (absent)
+    print(strasse.find("."))       # 6  (after the 2-byte ß)
+    print(cjk.find("."))           # 3  (after three 3-byte CJK chars)
+    print(cjk.find("語"))          # 2
+    print(emoji.find("b"))         # 2  (after a 4-byte astral emoji)
+    print(emoji.find("😀"))        # 1  (first astral)
+    print(emoji.find("c"))         # 4
+    print(greek.find("."))         # 3  (first dot)
+    print(greek.find("δεζ"))       # 4  (multichar needle)
+    print(cafe.find(""))           # 0  (empty needle)
+
+    # rfind — last occurrence
+    print(cafe.rfind("."))         # 4
+    print(strasse.rfind("."))      # 6
+    print(emoji.rfind("😀"))       # 3  (last astral)
+    print(greek.rfind("."))        # 7  (last dot)
+    print(greek.rfind("z"))        # -1
+    print(cafe.rfind(""))          # 8  (empty needle == char length of café.txt)
+
+    # index / rindex — found cases (char offsets)
+    print(cafe.index("."))         # 4
+    print(cjk.index("語"))         # 2
+    print(emoji.rindex("😀"))      # 3
+    print(greek.index("δεζ"))      # 4
+
+    # index / rindex — ValueError on miss, caught (CPython "substring not found")
+    try:
+        found_i: int = cafe.index("z")
+        print(found_i)
+    except ValueError:
+        print("index ValueError")
+    try:
+        found_j: int = emoji.rindex("z")
+        print(found_j)
+    except ValueError:
+        print("rindex ValueError")

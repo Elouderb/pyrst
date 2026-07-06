@@ -196,7 +196,8 @@ def main() -> None:
 
     # ── HARDENING (w2-hardener, card cc0ff8fe) ──────────────────────────────
     # unicode names — regression test for the `str.rfind` byte-vs-char-offset
-    # bug in `suffix` (fixed by `_pathlib_rfind_dot`; see module header)
+    # bug in `suffix` (fixed at the compiler level, card dfd89c12 — `suffix`
+    # now calls the builtin `str.rfind`; this pins its char-offset semantics)
     cafe: PurePosixPath = PurePosixPath("café.txt")
     print(cafe.stem)                      # café
     print(cafe.suffix)                    # .txt

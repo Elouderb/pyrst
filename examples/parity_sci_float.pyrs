@@ -2,6 +2,13 @@
 # (1e-5, 2.5E3, 1e+3, 1E10, leading-dot .5e3, underscore 1_0e2) must lex to the
 # same f64 values CPython produces AND str()/print round-trip byte-identically
 # (str==repr for floats in Py3, incl. the sci-notation thresholds this exercises).
+#
+# (card 2f615b52) Also pins FLOAT MODULO `%` / `%=` to CPython bit-for-bit: the
+# old `(((a % b) + b) % b)` lowering double-rounded (`0.1 % 1.0` ->
+# 0.10000000000000009 instead of 0.1). CPython is fmod-based with the divisor's
+# sign, a signed-zero rule (`5.0 % -5.0` == -0.0), inf/nan shapes, and a
+# ZeroDivisionError on a 0.0 divisor (caught below). Int `%` (Python floor-mod)
+# is unchanged and regression-guarded here.
 def main() -> None:
     print(1e5)
     print(1e10)
@@ -24,3 +31,42 @@ def main() -> None:
     x: float = 1e20
     print(x)
     print(x + 1.0)
+
+    # ── float modulo `%` / `%=` (card 2f615b52) ────────────────────────────
+    print(0.1 % 1.0)          # 0.1  (was 0.10000000000000009)
+    print(0.2 % 1.0)          # 0.2
+    print(1.1 % 1.0)          # 0.10000000000000009 (this one IS exact in Py)
+    print((-7.5) % 3.0)       # 1.5  (sign of the divisor)
+    print(7.5 % (-3.0))       # -1.5
+    print((-0.5) % (-2.0))    # -0.5
+    print(0.0 % 5.0)          # 0.0
+    print((-0.0) % 5.0)       # 0.0
+    print(5.0 % (-5.0))       # -0.0 (signed zero takes the divisor's sign)
+    print((-5.0) % 5.0)       # 0.0
+    print(2.5 % 0.5)          # 0.0
+    print(10.0 % 3.0)         # 1.0
+    pinf: float = float("inf")
+    ninf: float = float("-inf")
+    nan: float = float("nan")
+    print(5.0 % pinf)         # 5.0
+    print(5.0 % ninf)         # -inf
+    print((-5.0) % pinf)      # inf
+    print(nan % 5.0)          # nan
+    print(5.0 % nan)          # nan
+    # int `%` must stay Python floor-mod — unchanged by this fix (guard)
+    print(-7 % 3)             # 2
+    print(7 % -3)             # -2
+    # `%=` (float target) routes through the same helper
+    m: float = 0.1
+    m %= 1.0
+    print(m)                  # 0.1
+    m2: float = -7.5
+    m2 %= 3.0
+    print(m2)                 # 1.5
+    # ZeroDivisionError on a float `% 0.0` — caught, so both runtimes print the
+    # marker instead of aborting (CPython raises "float modulo").
+    try:
+        z: float = 5.0 % 0.0
+        print(z)
+    except ZeroDivisionError:
+        print("float modulo ZeroDivisionError")

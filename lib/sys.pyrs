@@ -73,7 +73,7 @@
 #     iteration, `len()`, `tuple()`/`list()` conversion, and `>=` comparison
 #     against a tuple literal are NOT supported. Documented divergence, not a
 #     bug.
-#   - `version` is a plain honest-identity string: `"pyrst 0.1.3 (compiles to
+#   - `version` is a plain honest-identity string: `"pyrst 0.2.0 (compiles to
 #     Rust; not CPython-compatible)"`.
 #
 # `platform` — HARDCODED to `"linux"` (a bare module-level literal constant,
@@ -154,7 +154,7 @@ maxsize: int = 9223372036854775807
 
 platform: str = "linux"
 
-version: str = "pyrst 0.1.3 (compiles to Rust; not CPython-compatible)"
+version: str = "pyrst 0.2.0 (compiles to Rust; not CPython-compatible)"
 
 
 @dataclass

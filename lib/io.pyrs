@@ -174,23 +174,17 @@
 #      wrong stored value — assign to a local `bool` before printing/
 #      stringifying (as this module's own dual-run parity golden,
 #      examples/parity_io.pyrs, does) until it's fixed upstream.
-#   5. THE MOST SERIOUS FINDING: `str.find(sub)` returns a Rust-native BYTE
-#      offset, not CPython's CHAR (codepoint) offset — verified minimal
-#      repro: `"こんにちは\nworld".find("\n")` returns `15` in pyrst (the
-#      UTF-8 byte offset: 5 chars * 3 bytes) but `5` in CPython (the char
-#      offset). Since this compiler's STRING SLICING (`s[a:b]`) IS correctly
-#      char-indexed (separately verified), combining the two — exactly what
-#      `readline()`'s original `idx = rest.find("\n"); line = rest[:idx+1]`
-#      did — silently produces WRONG results (not a crash) for any non-ASCII
-#      content preceding the match. This is a general `str.find` defect, not
-#      specific to `io` — `rfind`/`index`/`rindex`/`count` share the same
-#      codegen shape (`src/codegen/exprs.rs`, the `"find"`/`"rfind"`/
-#      `"index"`/`"rindex"`/`"count"` arms all call the Rust method
-#      directly) and are LIKELY affected too, though only `find` was
-#      actually re-verified here — flagged for the integrator/compiler team
-#      as the highest-priority follow-up from this card. Worked around
-#      LOCALLY in this module with a hand-rolled char-indexed scan,
-#      `_io_find_newline` (below), instead of `str.find`.
+#   5. [FIXED — card dfd89c12] `str.find`/`rfind`/`index`/`rindex` used to
+#      return a Rust-native BYTE offset instead of CPython's CHAR (codepoint)
+#      offset — verified minimal repro: `"こんにちは\nworld".find("\n")`
+#      returned `15` in pyrst (the UTF-8 byte offset: 5 chars * 3 bytes) but
+#      `5` in CPython. Since this compiler's STRING SLICING (`s[a:b]`) IS
+#      correctly char-indexed, combining the two silently produced WRONG
+#      results (not a crash) for any non-ASCII content before the match. Now
+#      fixed at the emitter (char-offset lowering via `__py_str_find`/`rfind`/
+#      `index`/`rindex` — src/codegen/exprs.rs, src/codegen/mod.rs), so the
+#      `readline()` path below calls the builtin `rest.find("\n")` directly;
+#      the former hand-rolled `_io_find_newline` char scan has been removed.
 #
 #   All five are compiler-level fixes outside a stdlib module's scope —
 #   flagged for the integrator/compiler team, not silently worked around
@@ -248,11 +242,10 @@
 # `truncate`, method-not-property `encoding`/`errors`/`newlines`, the
 # bool-property print quirk) are cosmetic call-shape divergences with no
 # behavioral effect on any call this module makes; `str.find`'s byte-vs-char
-# offset bug (#5) is the one with real behavioral teeth, and it required an
-# actual code workaround (`_io_find_newline`) rather than just a comment —
-# it is fully worked around WITHIN this module, but any caller outside it
-# who reaches for `str.find`/`rfind`/`index`/`rindex`/`count` on non-ASCII
-# pyrst strings should not assume char-offset semantics until it's fixed.
+# offset bug (#5) was the one with real behavioral teeth — it has since been
+# fixed at the compiler level (card dfd89c12), so this module now calls the
+# builtin `str.find` directly (the former `_io_find_newline` workaround was
+# removed) and callers everywhere get CPython char-offset semantics.
 
 # NOTE: `truncate()`'s "not given" sentinel (`-9223372036854775807`, i.e.
 # i64::MIN + 1 — see "COMPILER GAPS" #2 above) is inlined directly at its two
@@ -263,29 +256,6 @@
 # module-level int constant does not build (another compiler-level gap worth
 # flagging, found the same way as the two above — no prior stdlib module had
 # ever tried a negative module constant either).
-
-
-def _io_find_newline(s: str) -> int:
-    # A hand-rolled CHAR-indexed scan for "\n", used by `readline()` INSTEAD
-    # of `s.find("\n")` — see "COMPILER GAPS" #5 in the module header: this
-    # compiler's `str.find` (and, presumably, `rfind`/`index`/`rindex`/
-    # `count` — not individually re-verified, but they share the same
-    # codegen shape) returns a Rust-native BYTE offset, not a Python-style
-    # CHAR offset, so it silently mis-indexes any search whose match is
-    # preceded by a multi-byte character. `s[:idx]`-style slicing IS
-    # correctly char-indexed (verified separately), so mixing the two
-    # produces wrong results only on non-ASCII input — caught by this
-    # module's own dual-run parity golden on `"こんにちは\nworld".readline()`
-    # (pyrst returned `"こんにちは\nworld"` whole, having computed a
-    # `\n`-index of 15 — the BYTE offset — against a 16-char string, instead
-    # of the correct char offset 5).
-    n: int = len(s)
-    i: int = 0
-    while i < n:
-        if s[i] == "\n":
-            return i
-        i = i + 1
-    return -1
 
 
 class StringIO:
@@ -337,13 +307,12 @@ class StringIO:
         self._check_open()
         start: int = self.pos
         rest: str = self.buf[start:]
-        # `_io_find_newline` (a hand-rolled char scan), NOT `rest.find("\n")`
-        # — see "COMPILER GAP 5" in the module header: this compiler's
-        # `str.find` returns a BYTE offset, not a CHAR offset, so it silently
-        # mis-indexes any string with a multi-byte character before the
-        # match (found while testing this exact method against
-        # `"こんにちは\nworld"`).
-        idx: int = _io_find_newline(rest)
+        # (card dfd89c12) `str.find` now returns a CHAR offset like CPython
+        # (it used to leak Rust's BYTE offset, silently mis-indexing any
+        # multi-byte char before the match, e.g. `"こんにちは\nworld"`), so
+        # this consumes the builtin directly again. `rest[:idx + 1]` slicing is
+        # char-indexed, so the two are now consistent.
+        idx: int = rest.find("\n")
         line: str = ""
         if idx == -1:
             line = rest

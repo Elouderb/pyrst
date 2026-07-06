@@ -432,8 +432,8 @@ def main() -> None:
 
     # Default newline handling: StringIO's default `newline='\n'` mode splits
     # ONLY on a bare "\n" — bare "\r" and "\r\n" are ordinary content
-    # characters, not line boundaries. Confirms `_io_find_newline`'s
-    # deliberately-narrow "\n"-only scan is correct, not an oversight.
+    # characters, not line boundaries. Confirms `readline()`'s
+    # deliberately-narrow "\n"-only match is correct, not an oversight.
     s37: StringIO = StringIO("a\r\nb\rc\nd")
     print(s37.readline())
     print(s37.readline())

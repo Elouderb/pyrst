@@ -36,9 +36,9 @@ def main() -> None:
 
 ## Status
 
-**v0.1.3.** Full compiler pipeline (lexer → parser → resolver → type checker → Rust codegen → `rustc`), end-to-end.
+**v0.2.0.** Full compiler pipeline (lexer → parser → resolver → type checker → Rust codegen → `rustc`), end-to-end.
 
-`./test_all.sh`: **310/310 positive examples** build + run with matching output, **140/140 negative fixtures** correctly rejected (at both `check` and `build`), plus multi-file import demos. **524 in-crate `cargo test` cases**, 0 compiler warnings, CI green. Generators are **lazy** (infinite generators are safe); slice semantics are CPython-exact (verified against python3 on a 5,700+-case oracle); builtin runtime errors are catchable by their Python exception type; emitted Rust is rustfmt-formatted and deterministic. There are **no known cases where an accepted program produces wrong output** — every such bug found by this release's adversarial reviews was fixed or is honestly rejected at `check`.
+`./test_all.sh`: **393/393 positive examples** build + run with matching output, **190/190 negative fixtures** correctly rejected (at both `check` and `build`), plus multi-file import demos. A dual-run parity harness runs 51 programs byte-identical against CPython 3.12 on every suite pass (69 parity files total; 18 documented pyrst-only). **543 in-crate `cargo test` cases**, 0 compiler warnings, CI green. Generators are **lazy** (infinite generators are safe); slice semantics are CPython-exact (verified against python3 on a 5,700+-case oracle); builtin runtime errors are catchable by their Python exception type; emitted Rust is rustfmt-formatted and deterministic. There are **no known cases where an accepted program produces wrong output** — every such bug found by this release's adversarial reviews (including two rounds of str.find byte/char-offset and float-modulo double-rounding fixes) was fixed or is honestly rejected at `check`.
 
 pyrst is **not** a Python-compatible subset or a Python runtime — it's its own statically typed language with Python-flavored syntax.
 
@@ -66,12 +66,12 @@ pyrst lsp                  # language server (stdin/stdout, for editors)
 ## What's implemented
 
 **Types & data**
-- Functions with type annotations and default arguments
-- Classes & methods: single inheritance, `super()`/`__init__`, dunder methods (`__eq__`/`__lt__`/`__add__`/`__str__`/…), `@property`/`@staticmethod`
+- Functions with type annotations, default arguments, and **keyword arguments** (free functions, methods, and constructors — CPython's left-to-right evaluation order for mixed positional/keyword calls; constructor kwargs bind `__init__` params)
+- Classes & methods: single inheritance, `super()`/`__init__`, dunder methods (`__eq__`/`__lt__`/`__add__`/`__str__`/…), `@property`/`@staticmethod`; `@dataclass` synthesizes onto the same class machinery (`__init__`/`__repr__`/`__eq__`)
 - Class subtyping via companion-enum polymorphism (closed-set dispatch)
 - **Generics:** `def f[T](..)`; **bounded** generics — `PartialOrd`/`PartialEq`/`Add`/`Display`/`Hash+Eq` inferred from the operations used on `T`, with transitive propagation across generic calls; **generic classes** `class Box[T]`; generic `Callable` parameters
-- Collections: `list[T]`, `dict[K, V]`, `tuple[..]`, `set[T]`
-- `Optional[T]` / `T | None` with explicit narrowing (`is None` / `is not None`)
+- Collections: `list[T]`, `dict[K, V]`, `tuple[..]`, `set[T]` — including user classes as `dict` keys and `set` elements
+- `Optional[T]` / `T | None` with explicit narrowing (`is None` / `is not None`); recursive `Optional[Self]` class fields (linked lists, trees); class-level constants
 - Value semantics (clone-on-use); `Mut[T]` parameter mode for by-reference mutation
 
 **Control & functions**
@@ -80,31 +80,26 @@ pyrst lsp                  # language server (stdin/stdout, for editors)
 - **First-class functions:** lambdas, nested-`def` closures (lexical capture), `Callable[[A], R]` values
 - **Pattern matching:** `match`/`case` with literal, `_` wildcard, and capture (`case y:`) patterns + guards
 - **Exceptions:** `try`/`except`/`else`/`finally`, `raise`, type-matched handlers with the builtin hierarchy (`except LookupError:` catches `KeyError`/`IndexError`), `except E as e`
-- Comprehensions (list/set/dict) with filters; f-strings; triple-quoted strings; tuple unpacking
-- `enumerate()`/`zip()`/`range()`, `assert`, operator chaining (`a < b < c`)
+- Comprehensions (list/set/dict) with filters; f-strings; triple-quoted strings; tuple unpacking (CPython-exact `ValueError`s on arity mismatch)
+- `enumerate()`/`zip()`/`range()`, `assert`, operator chaining (`a < b < c`); `min`/`max` over classes defining `__lt__` and as true n-ary calls; `sum(iterable, start)`
+- CPython-exact `repr()`/`str()`/float formatting (round-half-even tie doubles, `Optional[T]` printing); hex/octal/binary/underscore-separated and scientific-notation numeric literals
 
 **Interop & modules**
 - **`@extern`:** bind a Rust expression template behind a typed pyrst signature
 - **`@crate("name", "ver")`:** depend on an external crate (the build switches to a Cargo project); names/versions are validated to prevent `Cargo.toml` injection
-- Multi-file programs (`import` / `from … import`), an embedded standard library, circular-import detection
+- Multi-file programs (`import` / `from … import`), a **41-module embedded standard library** (see below), circular-import detection
 
 ## Standard library
 
-Written in pyrst (pure pyrst and/or `@extern`), embedded in the compiler binary and resolved on `import`:
+**41 modules**, written in pyrst (pure pyrst and/or `@extern`), embedded in the compiler binary and resolved on `import` — no filesystem install, no package manager. Highlights: `math`/`statistics`/`fractions`, `os`/`pathlib`/`shutil`/`tempfile`/`filecmp`, `datetime`/`calendar`/`time`, `collections`/`itertools`/`heapq`/`bisect`/`graphlib`, `re`/`json`/`csv`/`configparser`/`html`/`shlex`/`fnmatch`, `io` (`StringIO`), `dataclasses`/`enum`/`copy`/`reprlib`/`pprint`, and a seedable `random.Random` whose output is **byte-identical to CPython** (MT19937 with CPython's exact derivation chain — `Random(42)` matches `python3` seed-for-seed).
 
-| | Modules |
-|---|---|
-| **Core** | `math`, `os`, `time`, `operator`, `functools` (`reduce`), `statistics`, `string` |
-| **Data structures / algorithms** | `bisect`, `heapq`, `collections` (`Counter`, `deque`, `defaultdict`), `itertools`, `textwrap` |
-| **Parsing / external** | `re` (via the `regex` crate), `json` (a pure-pyrst recursive-descent parser + serializer over a dynamic `JsonValue`), `random` (a seedable `Random` class) |
-
-Both `import math; math.sqrt(x)` and `from math import sqrt` forms work, including for generic stdlib functions (`import heapq; heapq.heappush(h, x)`).
+Both `import math; math.sqrt(x)` and `from math import sqrt` forms work, including for generic stdlib functions (`import heapq; heapq.heappush(h, x)`). Each module carries a fidelity score and a dual-run parity golden (verified byte-for-byte against real `python3` where the surface is compatible) — see [PYTHON_COMPATIBILITY.md](PYTHON_COMPATIBILITY.md#standard-library) for the full module-by-module matrix (fidelity, surface, and divergences) rather than duplicating it here.
 
 ## Known limitations (honest status)
 
 By design (see [SPEC.md](SPEC.md) / [PYTHON_COMPATIBILITY.md](PYTHON_COMPATIBILITY.md)): not Python-compatible; multiple inheritance, metaclasses, dynamic attribute access, `eval`/`exec`, and shared-mutable aliasing (`Rc`/`RefCell`) are out.
 
-Current v0.1.3 gaps (tracked, with workarounds):
+Current v0.2.0 gaps (tracked, with workarounds):
 - **Generators (`yield`) are lazy**, but a few shapes are deferred: `Iterator[T]` as a *parameter* type, generator **methods** (`yield` in a class method), `yield` inside `try`/`except`/`finally`, nested generator `def`s, generator expressions (`(x for x in ...)`), and explicit `next(g)`. Every non-lazy consumption (`len`/`gen[i]`/slicing/`reversed`/`str`/binops/`x in gen`/passing a generator where `list[T]` is required) is an honest `pyrst check` error suggesting `list(gen)` to materialize — see [PYTHON_COMPATIBILITY.md](PYTHON_COMPATIBILITY.md#generators-yield).
 - **Generic classes** can't be instantiated via a *qualified* name (`collections.deque[int]()`); use a flat import (`from collections import deque; d: deque[int] = deque()`).
 - **Generic methods inside a class** (`def m[U](self)`) are not yet supported (top-level generic functions are).

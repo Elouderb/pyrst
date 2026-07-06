@@ -2,6 +2,38 @@
 
 All notable changes to pyrst are documented here. This project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.2.0] — 2026-07-06
+
+The standard-library release: the stdlib grows from 15 to 41 modules, keyword arguments work everywhere, and a second honesty purge closes out the compiler's remaining silent-miscompile classes. Every fixed behavior is python3-verified; the dual-run parity harness now runs 51 programs byte-identical against CPython 3.12 on every suite pass.
+
+### Standard library: 15 → 41 modules
+
+- 26 new modules across two waves — a W1 fidelity pass over the original 15, then W2 growth to 41: `datetime`, `calendar`, `csv`, `configparser`, `html`, `shlex`, `fnmatch`, `difflib`, `fractions`, `graphlib`, `pprint`, `pathlib`, `shutil`, `tempfile`, `filecmp`, `io` (`StringIO`), `sys`, `enum`, `dataclasses`, `colorsys`, `copy`, `reprlib`, `stat`, `errno`, `platform`, `getpass`.
+- Every module carries a fidelity score and a parity golden — dual-run against real `python3` where the surface is byte-for-byte compatible, marked `# parity: pyrst-only` where it deliberately diverges. See [PYTHON_COMPATIBILITY.md](PYTHON_COMPATIBILITY.md#standard-library)'s Standard Library matrix for per-module fidelity, surface highlights, and divergences rather than duplicating it here.
+- The flat import namespace means two modules that export the same top-level name can't be co-imported; the 8 colliding pairs across all 41 modules (e.g. `operator.sub` vs. `re.sub`) now produce a named **check-time error** instead of a silent last-import-wins overwrite.
+
+### Keyword arguments, everywhere
+
+- Free functions, module-qualified calls, methods, and constructors all accept keyword arguments, with CPython's left-to-right evaluation order for mixed positional/keyword calls; constructor keyword arguments bind `__init__` parameters directly.
+- `random.Random(seed)` is **seed-compatible with CPython**: a from-scratch MT19937 implementation following CPython's exact derivation chain makes `Random(42)`'s output sequence byte-identical to `python3`'s.
+
+### Language & compiler
+
+- `@dataclass` synthesizes onto pyrst's existing class machinery (the `__init__`/`__repr__`/`__eq__` it already generates).
+- User classes as `dict` keys and `set` elements; recursive `Optional[Self]` class fields (linked lists, trees); class-level constants.
+- CPython-exact `repr()`/`str()`/float formatting, including round-half-even tie-breaking on doubles, and `Optional[T]` printing.
+- List-unpacking raises CPython's exact `ValueError`s on arity mismatch; hex/octal/binary/underscore-separated integer literals and scientific-notation float literals.
+- `str.casefold`/`translate`/`maketrans`/`rsplit`/`expandtabs`, and `partition`/`rpartition` returning real tuples.
+- `min`/`max` now work over classes that define `__lt__` and accept true n-ary argument lists (`min(a, b, c, ...)`); `sum(iterable, start)`.
+
+### Correctness — the second honesty purge
+
+This release's soul: another round of silent-miscompile classes found and killed, every one python3-verified. N-ary `min`/`max` and `sum(iterable, start)` used to silently drop arguments past the first two; `getattr`/`setattr`/`hasattr` were silent no-op stubs and are now honest errors; `int(s, base)` silently dropped the `base` argument; `str.find`/`rfind`/`index`/`rindex` returned Rust's byte offset instead of CPython's character offset, silently corrupting any downstream slice/index on a string with a multibyte character before the match; float `%`/`%=` double-rounded instead of CPython's fmod-based rule (`0.1 % 1.0` gave `0.10000000000000009` instead of `0.1`); `@crate` release builds silently wrapped `i64` overflow instead of trapping it; `tempfile` created world-readable temp files (now `0o700` dirs / `0o600` files); `str.expandtabs` miscompiled its tab-stop math; several call-argument evaluation-order inversions were corrected to CPython's left-to-right rule; and the module resolver's last-import-wins name collisions are now honest co-import errors (see the flat-namespace note above).
+
+### Quality
+
+- `./test_all.sh`: **393/393 positive examples**, **190/190 negative fixtures** rejected at both `check` and `build`; **543 `cargo test` cases**; 0 compiler warnings. The dual-run parity harness runs 69 parity programs total — **51 byte-identical against `python3`**, 18 documented `# parity: pyrst-only` — on every suite run.
+
 ## [0.1.3] — 2026-07-03
 
 The idiom release: the Python you actually write now works. Every fix python3-verified; three adversarial review rounds on the final batch alone.

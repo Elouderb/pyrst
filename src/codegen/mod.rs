@@ -810,6 +810,22 @@ pub fn emit_program(modules: &[(Module, String)], ctx: &TyCtx) -> Result<String>
     cg.line("    let q = a / b;");
     cg.line("    if (a % b != 0) && ((a % b < 0) != (b < 0)) { q - 1 } else { q }");
     cg.line("}");
+    // Python FLOAT modulo (`x % y` where either operand is a float). CPython's
+    // `float_rem` (Objects/floatobject.c) is fmod-based, NOT the divisor-signed
+    // `(((a % b) + b) % b)` reformulation this used to emit — that form
+    // DOUBLE-ROUNDS (`0.1 % 1.0` computed `fmod(1.1, 1.0)` and lost the low
+    // bits -> 0.10000000000000009 instead of 0.1). Rust's `f64 %` IS fmod, so
+    // mirror CPython exactly: take fmod, adjust the sign to the DIVISOR only
+    // when the remainder is non-zero (a single add, no second rounding), and in
+    // the signed-zero case return a zero carrying the divisor's sign (CPython's
+    // `copysign(0.0, b)` rule, so `5.0 % -5.0` is `-0.0` like python3). A zero
+    // divisor raises the catchable `ZeroDivisionError\0float modulo` (CPython's
+    // exact text) instead of Rust's silent NaN.
+    cg.line("fn __py_fmod(a: f64, b: f64) -> f64 {");
+    cg.line("    if b == 0.0 { panic!(\"ZeroDivisionError\\0float modulo\"); }");
+    cg.line("    let m = a % b;");
+    cg.line("    if m != 0.0 { if (b < 0.0) != (m < 0.0) { m + b } else { m } } else { (0.0_f64).copysign(b) }");
+    cg.line("}");
     // int() from str: panics with catchable "ValueError\0..." payload
     // instead of Rust's generic unwrap message.
     cg.line("fn __py_int_from_str(s: &str) -> i64 {");
@@ -825,6 +841,28 @@ pub fn emit_program(modules: &[(Module, String)], ctx: &TyCtx) -> Result<String>
     cg.line("fn __py_ipow(base: i64, exp: i64) -> i64 {");
     cg.line("    if exp < 0 { panic!(\"ValueError\\0negative exponent for integer ** integer\"); }");
     cg.line("    base.pow(exp as u32)");
+    cg.line("}");
+    // Python str.find / rfind / index / rindex. These return a CHARACTER offset
+    // in CPython, but Rust's `str::find`/`rfind` return a UTF-8 BYTE offset —
+    // and pyrst's len()/indexing/slicing are all char-based, so emitting the
+    // raw byte offset silently corrupted every downstream slice/index on a
+    // string with a multibyte char before the match (`"café.txt".rfind(".")`
+    // gave 5, python3 gives 4). Convert byte->char once via the matched prefix's
+    // `chars().count()` (O(n), correctness over cleverness). find/rfind return
+    // -1 when absent; index/rindex raise the catchable
+    // `ValueError\0substring not found` (CPython's `ValueError: substring not
+    // found`), matching the inline panic the str.index arm already emitted.
+    cg.line("fn __py_str_find(__s: &str, __sub: &str) -> i64 {");
+    cg.line("    match __s.find(__sub) { Some(__b) => __s[..__b].chars().count() as i64, None => -1i64 }");
+    cg.line("}");
+    cg.line("fn __py_str_rfind(__s: &str, __sub: &str) -> i64 {");
+    cg.line("    match __s.rfind(__sub) { Some(__b) => __s[..__b].chars().count() as i64, None => -1i64 }");
+    cg.line("}");
+    cg.line("fn __py_str_index(__s: &str, __sub: &str) -> i64 {");
+    cg.line("    match __s.find(__sub) { Some(__b) => __s[..__b].chars().count() as i64, None => panic!(\"ValueError\\0substring not found\") }");
+    cg.line("}");
+    cg.line("fn __py_str_rindex(__s: &str, __sub: &str) -> i64 {");
+    cg.line("    match __s.rfind(__sub) { Some(__b) => __s[..__b].chars().count() as i64, None => panic!(\"ValueError\\0substring not found\") }");
     cg.line("}");
     // List-unpacking length check (`a, b = xs` where xs is a list). Panics with
     // CPython 3.12's EXACT ValueError text — "not enough values to unpack

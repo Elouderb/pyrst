@@ -556,19 +556,24 @@ impl<'a> Codegen<'a> {
                         )));
                     }
                     if name == "find" && !parts.is_empty() {
-                        return Ok(Some(format!("{}.find({}.as_str()).map(|i| i as i64).unwrap_or(-1i64)", obj_s, parts[0])));
+                        // (card dfd89c12) CHARACTER offset like CPython — the old
+                        // `str::find(...).map(|i| i as i64)` leaked Rust's BYTE offset,
+                        // silently corrupting slice/index math on any multibyte string
+                        // (`"café.txt".find(".")` gave 5, python3 gives 4). __py_str_find
+                        // converts byte->char and binds the receiver once (no double eval).
+                        return Ok(Some(format!("__py_str_find(&({}), &({}))", obj_s, parts[0])));
                     }
                     if name == "contains" && !parts.is_empty() {
                         return Ok(Some(format!("{}.contains({}.as_str())", obj_s, parts[0])));
                     }
                     if name == "rfind" && !parts.is_empty() {
-                        return Ok(Some(format!("{}.rfind({}.as_str()).map(|i| i as i64).unwrap_or(-1i64)", obj_s, parts[0])));
+                        // (card dfd89c12) CHARACTER offset like CPython (see find above).
+                        return Ok(Some(format!("__py_str_rfind(&({}), &({}))", obj_s, parts[0])));
                     }
                     if name == "rindex" && !parts.is_empty() {
-                        return Ok(Some(format!(
-                            "{{ let __idx = {}.rfind({}.as_str()); match __idx {{ Some(i) => i as i64, None => panic!(\"ValueError\\0substring not found\") }} }}",
-                            obj_s, parts[0]
-                        )));
+                        // (card dfd89c12) CHARACTER offset; raises the catchable
+                        // ValueError on a miss (CPython `substring not found`).
+                        return Ok(Some(format!("__py_str_rindex(&({}), &({}))", obj_s, parts[0])));
                     }
 
                     // String utility methods
@@ -726,10 +731,9 @@ impl<'a> Codegen<'a> {
                         let obj_ty = self.type_of_expr(obj);
                         match obj_ty {
                             Ty::Str => {
-                                return Ok(Some(format!(
-                                    "{}.find({}.as_str()).map(|i| i as i64).unwrap_or_else(|| panic!(\"ValueError\\0substring not found\"))",
-                                    obj_s, parts[0]
-                                )));
+                                // (card dfd89c12) CHARACTER offset like CPython; raises the
+                                // catchable ValueError on a miss (see find/__py_str_index).
+                                return Ok(Some(format!("__py_str_index(&({}), &({}))", obj_s, parts[0])));
                             }
                             _ => {} // Fall through to list index below
                         }
@@ -3143,10 +3147,11 @@ impl<'a> Codegen<'a> {
                         // helper for ints (single evaluation), rem_euclid-style for floats.
                         let is_float = matches!(lt, Ty::Float) || matches!(rt, Ty::Float);
                         if is_float {
-                            return Ok(format!(
-                                "{{ let __a = ({} as f64); let __b = ({} as f64); (((__a % __b) + __b) % __b) }}",
-                                l, r
-                            ));
+                            // (card 2f615b52) CPython fmod-based float modulo — see
+                            // __py_fmod. The old `(((a%b)+b)%b)` double-rounded
+                            // (`0.1 % 1.0` -> 0.10000000000000009 instead of 0.1) and
+                            // returned a silent NaN on a zero divisor.
+                            return Ok(format!("__py_fmod(({}) as f64, ({}) as f64)", l, r));
                         }
                         return Ok(format!("__py_mod(({}), ({}))", l, r));
                     }

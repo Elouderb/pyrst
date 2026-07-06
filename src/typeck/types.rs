@@ -426,6 +426,29 @@ pub struct TyCtx {
     /// module's statements (empty on the LSP single-file / hand-built ctx paths,
     /// which never fold from-imports because `import_bindings` is empty there).
     pub root_defined: std::collections::HashSet<String>,
+    /// (W4-a) Whole-program MUTABLE-GLOBAL set: OWNER module id (`None` = root) ->
+    /// (module-level binding NAME -> its declared `Ty`). A binding is promoted to a
+    /// `thread_local!` mutable static — instead of an immutable Rust `const` — iff
+    /// (a) some function in its owning module declares `global NAME` AND rebinds it,
+    /// OR (b) its initializer is not a scalar literal (a container/constructor/
+    /// `@extern` call). Computed once over the whole program by
+    /// [`collect_mutable_globals`] (a sibling of `collect_promoted_consts`), so the
+    /// promotion decision, codegen's static/read/write emission, and — via the same
+    /// `global`-declaration signal — the `UnboundLocal` trap exclusion cannot
+    /// disagree (the design's riskiest interaction). EMPTY for every program that
+    /// uses no module-level mutable state, so scalar-literal never-rebound bindings
+    /// keep the existing `const` path byte-for-byte (the zero-regression bar).
+    pub mutable_globals: std::collections::HashMap<Option<String>, std::collections::HashMap<String, Ty>>,
+    /// (W4-a, F6) Per-OWNER set of every module-level ANNOTATED binding NAME
+    /// (`NAME: T = <init>`) a module declares at top level — owner id (`None` =
+    /// root) -> {name}. This is the authoritative "is `global NAME` a real binding
+    /// of THIS module?" set (the same per-owner scoping [`collect_mutable_globals`]
+    /// uses), so a `global BAR` naming a binding that lives only in an IMPORTED
+    /// module — or a builtin stub name like `int`/`list` seeded in the flat `vars`
+    /// — is an honest error instead of a silently-dead local write. Populated by
+    /// [`collect_mutable_globals`]. EMPTY on the LSP single-file / hand-built ctx
+    /// paths (the validator then falls back to the flat `vars` existence check).
+    pub module_level_bindings: std::collections::HashMap<Option<String>, std::collections::HashSet<String>>,
 }
 
 impl TyCtx {
@@ -540,7 +563,24 @@ impl TyCtx {
         // function is merged in, so the keyword→positional mapper can tell a
         // real user signature from a builtin stub (see `builtin_funcs` docs).
         let builtin_funcs: std::collections::HashSet<String> = funcs.keys().cloned().collect();
-        Self { funcs, classes: HashMap::new(), vars, module_symbols: HashMap::new(), func_owner: HashMap::new(), class_owner: HashMap::new(), const_owner: HashMap::new(), import_bindings: HashMap::new(), module_funcs: HashMap::new(), module_consts: HashMap::new(), generic_funcs: HashMap::new(), generic_func_bodies: HashMap::new(), generic_classes: HashMap::new(), builtin_funcs, hash_key_classes: std::collections::HashSet::new(), promoted_consts: std::collections::HashMap::new(), root_defined: std::collections::HashSet::new() }
+        Self { funcs, classes: HashMap::new(), vars, module_symbols: HashMap::new(), func_owner: HashMap::new(), class_owner: HashMap::new(), const_owner: HashMap::new(), import_bindings: HashMap::new(), module_funcs: HashMap::new(), module_consts: HashMap::new(), generic_funcs: HashMap::new(), generic_func_bodies: HashMap::new(), generic_classes: HashMap::new(), builtin_funcs, hash_key_classes: std::collections::HashSet::new(), promoted_consts: std::collections::HashMap::new(), root_defined: std::collections::HashSet::new(), mutable_globals: std::collections::HashMap::new(), module_level_bindings: std::collections::HashMap::new() }
+    }
+
+    /// (W4-a) Whether module `owner` (`None` = root) has a promoted mutable global
+    /// named `name`, i.e. a `thread_local!` static rather than an immutable const.
+    /// Empty-map fast path keeps every global-free program's lookups a no-op.
+    pub fn is_mutable_global(&self, owner: Option<&str>, name: &str) -> bool {
+        self.mutable_globals
+            .get(&owner.map(|s| s.to_string()))
+            .is_some_and(|m| m.contains_key(name))
+    }
+
+    /// (W4-a) The declared `Ty` of a promoted mutable global, or `None` if `name`
+    /// is not a mutable global of module `owner`.
+    pub fn mutable_global_ty(&self, owner: Option<&str>, name: &str) -> Option<&Ty> {
+        self.mutable_globals
+            .get(&owner.map(|s| s.to_string()))?
+            .get(name)
     }
 
     /// (enabler-fix-1 #3) The class that DECLARES `field` as an own field, walking

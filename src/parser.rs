@@ -123,6 +123,20 @@ impl Parser {
                 self.eat_newline()?;
                 Ok(Stmt::Del { target, span })
             }
+            Tok::Global => {
+                let span = self.peek_span();
+                self.bump(); // consume 'global'
+                let names = self.parse_name_list("global")?;
+                self.eat_newline()?;
+                Ok(Stmt::Global { names, span })
+            }
+            Tok::Nonlocal => {
+                let span = self.peek_span();
+                self.bump(); // consume 'nonlocal'
+                let names = self.parse_name_list("nonlocal")?;
+                self.eat_newline()?;
+                Ok(Stmt::Nonlocal { names, span })
+            }
             Tok::Match => self.parse_match(),
             Tok::Return => {
                 let span = self.peek_span();
@@ -803,6 +817,18 @@ impl Parser {
         self.expect(&Tok::Colon, "for loop")?;
         let body = self.parse_block()?;
         Ok(Stmt::For { targets, iter, body, span })
+    }
+
+    /// (W4-a) Parse a non-empty comma-separated identifier list for a `global` /
+    /// `nonlocal` statement (`global a, b, c`). `kw` names the keyword for the
+    /// error message. At least one name is required (a bare `global` is a syntax
+    /// error, matching Python).
+    fn parse_name_list(&mut self, kw: &str) -> Result<Vec<String>> {
+        let mut names = vec![self.expect_ident(kw)?];
+        while self.eat(&Tok::Comma) {
+            names.push(self.expect_ident(kw)?);
+        }
+        Ok(names)
     }
 
     fn parse_import(&mut self) -> Result<Stmt> {

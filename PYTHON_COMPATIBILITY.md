@@ -425,7 +425,8 @@ The 26 modules from `datetime` through `tempfile` in the table above shipped in 
 | Operator overloading | ✅ Supported | Dunder methods (see Classes) |
 | Generators / `yield` | ✅ Supported (lazy) | `Iterator[T]`-returning functions; on-demand execution, infinite generators OK — see [Generators (`yield`)](#generators-yield) below |
 | Coroutines / `async` / `await` | ❌ Not Supported | Not in current roadmap |
-| `global` / `nonlocal` | ❌ Not Supported | No module-level mutable state rebinding |
+| `global` (module-level mutable state) | ✅ Supported | A module binding rebound under `global` (or with a non-scalar-literal initializer) lowers to a `thread_local!` `Cell`/`RefCell` mutable static; a scalar-literal, never-rebound binding stays an immutable `const`. Mutation (`items.append(x)`) needs no `global`; a rebind (`items = …`) needs it — CPython-faithful. See [Module-Level Mutable State](#module-level-mutable-state-global) for the documented divergences. |
+| `nonlocal` | ❌ Not Supported | Rebinding an enclosing function's local from a closure needs shared-mutable frame capture, which EPIC-4 clone-on-capture value semantics disallow — honest typeck error (use a class field, a returned value, or a module `global`). |
 | Decorators (general) | ⚠️ Partial | Only `@dataclass`/`@staticmethod`/`@property` |
 | Descriptors | ❌ Not Supported | Not part of the object model |
 | Metaclasses | ❌ Not Supported | Not supported |
@@ -433,6 +434,48 @@ The 26 modules from `datetime` through `tempfile` in the table above shipped in 
 | Multiple inheritance | ❌ Not Supported | Single inheritance only |
 | Abstract base classes | ❌ Not Supported | No ABC support |
 | `typing` module metadata | ⚠️ Partial | Static types enforced; no runtime metadata |
+
+---
+
+## Module-Level Mutable State (`global`)
+
+A module-level binding becomes a `thread_local!` mutable static (a `Cell<T>` for a
+Copy scalar, a `RefCell<T>` for a `str`/`list`/`dict`/`set`/user class) when either
+(a) some function declares `global NAME` and rebinds it, or (b) its initializer is
+not a scalar literal (a container/constructor/`@extern` call). A scalar-literal,
+never-rebound binding keeps the immutable `const` path unchanged. Initializers run
+**eagerly top-down at startup** (`__pyrst_init_globals()` before `main()`), matching
+CPython's import-time order (a root initializer that textually precedes an `import`
+runs before the imported module's; imported modules interleave around their own
+imports, DFS with a visited set). Reads clone out of the cell (value semantics);
+rebinds `set`/`*borrow_mut() =`; in-place mutations `borrow_mut().push(…)`. Live at
+call time inside closures.
+
+**Documented divergences (honest gaps, not silent miscompiles):**
+
+- **Clone-on-read snapshot semantics (EPIC-4).** Reading a global *clones* it, so a
+  binding captured before a later mutation is an independent **snapshot**: `xs = g`
+  then `g.append(4)` leaves `xs == [1, 2, 3]` in pyrst where CPython **aliases** it
+  (`xs == [1, 2, 3, 4]`). This is pyrst's uniform value-semantics contract (no
+  `Rc<RefCell>` aliasing); full alias fidelity is the EPIC-4 `Mut[T]` surface.
+- **`del items[0]` on a global silently no-ops.** `del` on an indexed place is
+  unimplemented for locals too (a pre-existing gap, not W4-specific): today it lowers
+  to a discarded clone-and-drop rather than removing the element. Use
+  `items.pop(i)` / a rebind under `global` instead. (An honest guard is a candidate
+  follow-up; the limitation predates module globals.)
+- **Forward-reference detection is DIRECT-only.** A module global whose initializer
+  *directly* references a name defined later in the module (`x: int = y + 1` before
+  `y`, or `a: int = helper()` before `def helper`) is an honest check error (CPython
+  raises `NameError` at import). A **transitive** forward read — an initializer that
+  calls an *earlier-defined* function whose body reads a *later-defined* global — is
+  **not** caught and still diverges from CPython's import-time `NameError`. This
+  residual is out of W4-a scope; keep an initializer's transitive reachability
+  self-contained.
+- **`nonlocal` and cross-module writes are deferred.** `nonlocal` is an honest
+  typeck error (closures capture by value). A `global NAME` that names a binding
+  living only in an *imported* module (or a builtin stub like `int`) is an honest
+  error — owner-module rebinds only; cross-module writes (`import m; m.x = 5`) are a
+  v1 deferral (qualified *reads* `m.x` work).
 
 ---
 

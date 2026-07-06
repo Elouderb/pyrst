@@ -1,0 +1,38 @@
+# W4-a (F1) regression: a `global` REBIND inside an operator dunder must write the
+# module `thread_local!` static, not a dead local shadow. `__eq__` counts every
+# comparison into a module global; `__add__` accumulates into another. Before the
+# fix the inline dunder emitters never set `fn_globals`, so the writes lowered to a
+# discarded local (silent miscompile: pyrst printed 0 where python3 prints 2). Dual-
+# run vs python3 proves the counters accumulate identically.
+compares: int = 0
+adds: int = 0
+
+class Vec2:
+    x: int
+    y: int
+    def __init__(self, x: int, y: int) -> None:
+        self.x = x
+        self.y = y
+    def __eq__(self, other: Vec2) -> bool:
+        global compares
+        compares = compares + 1
+        return self.x == other.x and self.y == other.y
+    def __add__(self, other: Vec2) -> Vec2:
+        global adds
+        adds += 1
+        return Vec2(self.x + other.x, self.y + other.y)
+
+def main() -> None:
+    a: Vec2 = Vec2(1, 2)
+    b: Vec2 = Vec2(1, 2)
+    c: Vec2 = Vec2(3, 4)
+    print(a == b)
+    print(a == c)
+    s: Vec2 = a + c
+    t: Vec2 = s + b
+    print(s.x)
+    print(s.y)
+    print(t.x)
+    print(t.y)
+    print(compares)
+    print(adds)

@@ -1,0 +1,19 @@
+# W4-a: a module-level mutable global (`counter`) rebound from two functions via
+# `global` + aug-assign. The scalar-literal binding IS promoted to a thread_local
+# Cell<i64> (rule (a): global + rebind), NOT the immutable const path. Dual-run
+# vs python3 proves the two writes accumulate identically.
+counter: int = 0
+
+def bump() -> None:
+    global counter
+    counter += 1
+
+def bump_by(n: int) -> None:
+    global counter
+    counter = counter + n
+
+def main() -> None:
+    bump()
+    bump_by(10)
+    bump()
+    print(counter)

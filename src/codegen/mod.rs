@@ -209,6 +209,15 @@ pub struct Codegen<'a> {
     /// `emit_program`; irrelevant for import-free programs (every bare name is
     /// root-owned and unwrapped regardless).
     root_defined: std::collections::HashSet<String>,
+    /// (W4-a) Names declared `global` in the function CURRENTLY being emitted (set
+    /// from the function body in `emit_func`/`emit_nested_def`, saved/restored
+    /// around a nested def). A `global`-declared name that is also a promoted
+    /// mutable global is REBOUND (`=` / `op=`) to the module static rather than a
+    /// function-local; a rebind WITHOUT `global` stays a local shadow (Python's
+    /// exact rule). READs and in-place MUTATIONS of a global need no `global`
+    /// declaration, so they consult `ctx.mutable_globals` directly, not this set.
+    /// Empty for every function with no `global` statement.
+    fn_globals: std::collections::HashSet<String>,
 }
 
 
@@ -327,6 +336,24 @@ pub fn mangle_const(owner: Option<&str>, name: &str) -> String {
     match owner {
         None => format!("__pyrst_const_{}", name),
         Some(m) => format!("__pyrst_const_{}__{}", mangle_mod_id(m), name),
+    }
+}
+
+/// (W4-a) Mangle a MODULE-LEVEL MUTABLE GLOBAL's pyrst name into the Rust
+/// `thread_local!` static identifier emitted for it. A DISTINCT namespace from
+/// `mangle_const` (`__pyrst_g_` vs `__pyrst_const_`) so a promoted global and a
+/// hypothetical same-named const never collide, and — like `mangle_const` — the
+/// reserved prefix keeps a lowercase global name (`counter`, `argv`) from being
+/// captured as a Rust const-pattern. OWNER-QUALIFIED exactly like a const: a ROOT
+/// global (`owner = None`) keeps `__pyrst_g_<name>` (import-free output stays
+/// self-contained), while an imported module's global gains its collision-proof
+/// owner prefix `__pyrst_g_<mangle_mod_id(owner)>__<name>`. Applied identically at
+/// the static definition (`emit_program`'s globals prepass) and at every
+/// read / rebind / mutation site; a missed site is a def/use mismatch.
+pub fn mangle_global(owner: Option<&str>, name: &str) -> String {
+    match owner {
+        None => format!("__pyrst_g_{}", name),
+        Some(m) => format!("__pyrst_g_{}__{}", mangle_mod_id(m), name),
     }
 }
 
@@ -1125,10 +1152,19 @@ pub fn emit_program(modules: &[(Module, String)], ctx: &TyCtx) -> Result<String>
                 // (bare `CONST` / qualified `X.CONST`) lowers to the MANGLED name,
                 // and str consts additionally get `.to_string()`.
                 if let Stmt::Assign { target, value, .. } = s {
+                    // (W4-a) A scalar-literal binding PROMOTED to a mutable static
+                    // (rule (a): `global`+rebind) is a `thread_local!`, NOT a
+                    // `const` — the globals prepass below emits it. Skip it here so
+                    // it is not double-emitted (and so references resolve to the
+                    // static, not a stale const). A never-rebound scalar literal
+                    // stays the const path, byte-identical.
+                    let owner = m.module_id.clone();
+                    if cg.ctx.is_mutable_global(owner.as_deref(), target) {
+                        continue;
+                    }
                     // (W3-fix / F8,F9) Key by (owner module, name); `m.module_id` is
                     // the owner (`None` = root), matching `bare_owner_for` / the
                     // qualifier at every reference site.
-                    let owner = m.module_id.clone();
                     cg.const_names.insert((owner.clone(), target.clone()));
                     if matches!(value, Expr::Str(..)) {
                         cg.const_strs.insert((owner, target.clone()));
@@ -1138,6 +1174,13 @@ pub fn emit_program(modules: &[(Module, String)], ctx: &TyCtx) -> Result<String>
             }
         }
     }
+
+    // (W4-a) MUTABLE-GLOBAL prepass: emit the `thread_local!` statics + the eager
+    // top-down `__pyrst_init_globals()`. Returns whether any global was emitted, so
+    // `main()` calls the init fn FIRST (CPython import-time semantics). Emits
+    // nothing — and `has_globals` stays false — for a program with no module-level
+    // mutable state, keeping the const path byte-identical.
+    let has_globals = cg.emit_mutable_globals(modules)?;
 
     // Emit all modules in order (imports first, root last)
     for (m, _src) in modules {
@@ -1163,10 +1206,20 @@ pub fn emit_program(modules: &[(Module, String)], ctx: &TyCtx) -> Result<String>
     // it in.
     cg.emit_companion_enums()?;
 
-    // Synthetic entry point (same as current emit_module logic)
+    // Synthetic entry point (same as current emit_module logic). (W4-a) When the
+    // program has mutable globals, `__pyrst_init_globals()` runs FIRST — before any
+    // user code — so every module global is initialized eagerly, top-down, in
+    // import order (CPython import-time semantics). Import-free / global-free
+    // programs keep the exact `fn main() { user_main(); }` / `fn main() {}` byte
+    // sequence (`has_globals` is false → no init call), so their emission is
+    // byte-identical.
+    let init_call = if has_globals { "__pyrst_init_globals(); " } else { "" };
     if ctx.funcs.contains_key("main") {
         cg.line("");
-        cg.line("fn main() { user_main(); }");
+        cg.line(&format!("fn main() {{ {}user_main(); }}", init_call));
+    } else if has_globals {
+        cg.line("");
+        cg.line("fn main() { __pyrst_init_globals(); }");
     } else {
         cg.line("");
         cg.line("fn main() {}");

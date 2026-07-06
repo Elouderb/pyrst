@@ -658,6 +658,191 @@ pub(crate) fn collect_promoted_consts(modules: &[(Module, String)], ctx: &mut Ty
     ctx.promoted_consts = out;
 }
 
+/// (W4-a) Compute the whole-program MUTABLE-GLOBAL set and store it on
+/// `ctx.mutable_globals` (the sibling of [`collect_promoted_consts`]). A
+/// module-level annotated binding `NAME: T = <init>` becomes a `thread_local!`
+/// mutable static — instead of an immutable Rust `const` — iff EITHER:
+///   (a) some function in its OWNING module declares `global NAME` AND rebinds it
+///       within that same function scope (Python's explicit-intent marker for a
+///       module write); OR
+///   (b) its initializer is NOT a scalar literal (a container literal, a
+///       constructor call, an `@extern` call) — not const-evaluable, so it cannot
+///       be a Rust `const` regardless of reassignment (probe PE legalizes it here
+///       on the static path only).
+/// A scalar-literal binding never rebound-under-`global` stays the existing
+/// immutable `const` (§C), so the resulting map is EMPTY for programs with no
+/// module-level mutable state and their emission is byte-identical. This is the
+/// SINGLE source of truth the promotion decision, codegen's static/read/write
+/// emission, and (via the same `global`-declaration signal computed by
+/// [`collect_global_decls`]) the `UnboundLocal` trap exclusion all rest on.
+pub(crate) fn collect_mutable_globals(modules: &[(Module, String)], ctx: &mut TyCtx) {
+    let mut out: HashMap<Option<String>, HashMap<String, Ty>> = HashMap::new();
+    // (F6) Per-owner set of EVERY module-level annotated binding name — the
+    // authoritative "does THIS module declare `NAME` at top level?" set the
+    // `global`-decl validator scopes against (so a cross-module or builtin-stub
+    // `global` name is an honest error, not a dead local write).
+    let mut owned_bindings: HashMap<Option<String>, HashSet<String>> = HashMap::new();
+    for (m, _) in modules {
+        let owner = m.module_id.clone();
+        // 1. This module's own module-level annotated bindings:
+        //    name -> (declared Ty, whether its initializer is a scalar literal).
+        let mut bindings: HashMap<String, (Ty, bool)> = HashMap::new();
+        for s in &m.stmts {
+            if let Stmt::Assign { target, ty: Some(t), value, span } = s {
+                if let Ok(ty) = Ty::from_type_expr(t, *span) {
+                    bindings.insert(
+                        target.clone(),
+                        (ty, crate::typeck::is_const_literal(value)),
+                    );
+                }
+            }
+        }
+        // Record the owning module's full binding-name set (const OR mutable) for
+        // the F6 per-owner `global`-existence check — an EMPTY set included, so a
+        // program with no module-level bindings anywhere never leaves the map empty
+        // and lets the flat-`vars` fallback admit builtin stub names like `int`.
+        owned_bindings
+            .entry(owner.clone())
+            .or_default()
+            .extend(bindings.keys().cloned());
+        if bindings.is_empty() {
+            continue;
+        }
+        // 2. Names rebound under `global` anywhere in this module's function code
+        //    (each def/method/nested-def scanned as its own scope; `global`
+        //    always refers to THIS module regardless of nesting depth).
+        let mut rebound_under_global: HashSet<String> = HashSet::new();
+        for s in &m.stmts {
+            scan_scopes_global_rebinds(std::slice::from_ref(s), &mut rebound_under_global);
+        }
+        // 3. Promote each binding per rule (a) [rebound-under-global] or
+        //    rule (b) [non-scalar-literal initializer].
+        for (name, (ty, is_scalar)) in bindings {
+            if rebound_under_global.contains(&name) || !is_scalar {
+                out.entry(owner.clone()).or_default().insert(name, ty);
+            }
+        }
+    }
+    ctx.mutable_globals = out;
+    ctx.module_level_bindings = owned_bindings;
+}
+
+/// (W4-a) The names declared `global` in ONE function scope — every `global NAME`
+/// statement reachable through control-flow blocks (`if`/`while`/`for`/`with`/
+/// `try`/`match`) but NOT descending into a nested `def`/`class` (each is its own
+/// scope). Shared by [`collect_mutable_globals`] (rule (a)) and the per-function
+/// `UnboundLocal` trap exclusion, so the promotion set and the trap can never
+/// disagree on which names a function declares `global`.
+pub(crate) fn collect_global_decls(stmts: &[Stmt], out: &mut HashSet<String>) {
+    for s in stmts {
+        match s {
+            Stmt::Global { names, .. } => {
+                for n in names {
+                    out.insert(n.clone());
+                }
+            }
+            Stmt::If { then, elifs, else_, .. } => {
+                collect_global_decls(then, out);
+                for (_, b) in elifs {
+                    collect_global_decls(b, out);
+                }
+                if let Some(b) = else_ {
+                    collect_global_decls(b, out);
+                }
+            }
+            Stmt::While { body, .. } | Stmt::For { body, .. } | Stmt::With { body, .. } => {
+                collect_global_decls(body, out);
+            }
+            Stmt::Try { body, handlers, else_, finally_, .. } => {
+                collect_global_decls(body, out);
+                for h in handlers {
+                    collect_global_decls(&h.body, out);
+                }
+                if let Some(b) = else_ {
+                    collect_global_decls(b, out);
+                }
+                if let Some(b) = finally_ {
+                    collect_global_decls(b, out);
+                }
+            }
+            Stmt::Match { arms, .. } => {
+                for a in arms {
+                    collect_global_decls(&a.body, out);
+                }
+            }
+            // Func / Class: a nested scope — not this scope's `global` decls.
+            _ => {}
+        }
+    }
+}
+
+/// (W4-a) Walk `stmts`, treating every function/method/nested-def body found as
+/// its OWN scope: record into `out` each name that is both declared `global` and
+/// rebound (any binding form) within that scope — a module-global write per
+/// rule (a) of [`collect_mutable_globals`]. Reuses the trap's `collect_bound_names`
+/// / `collect_augassign_targets` for the "rebound" set so the two analyses share
+/// one notion of a binding.
+fn scan_scopes_global_rebinds(stmts: &[Stmt], out: &mut HashSet<String>) {
+    for s in stmts {
+        match s {
+            Stmt::Func(f) => scan_one_scope_global_rebinds(&f.body, out),
+            Stmt::Class(c) => {
+                for meth in &c.methods {
+                    scan_one_scope_global_rebinds(&meth.body, out);
+                }
+            }
+            Stmt::If { then, elifs, else_, .. } => {
+                scan_scopes_global_rebinds(then, out);
+                for (_, b) in elifs {
+                    scan_scopes_global_rebinds(b, out);
+                }
+                if let Some(b) = else_ {
+                    scan_scopes_global_rebinds(b, out);
+                }
+            }
+            Stmt::While { body, .. } | Stmt::For { body, .. } | Stmt::With { body, .. } => {
+                scan_scopes_global_rebinds(body, out);
+            }
+            Stmt::Try { body, handlers, else_, finally_, .. } => {
+                scan_scopes_global_rebinds(body, out);
+                for h in handlers {
+                    scan_scopes_global_rebinds(&h.body, out);
+                }
+                if let Some(b) = else_ {
+                    scan_scopes_global_rebinds(b, out);
+                }
+                if let Some(b) = finally_ {
+                    scan_scopes_global_rebinds(b, out);
+                }
+            }
+            Stmt::Match { arms, .. } => {
+                for a in arms {
+                    scan_scopes_global_rebinds(&a.body, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// (W4-a) For ONE function scope: intersect its `global`-declared names with its
+/// rebound names and record the intersection in `out`, then recurse into every
+/// nested def/method as its own scope.
+fn scan_one_scope_global_rebinds(body: &[Stmt], out: &mut HashSet<String>) {
+    let mut declared = HashSet::new();
+    collect_global_decls(body, &mut declared);
+    if !declared.is_empty() {
+        let mut rebound = HashSet::new();
+        collect_bound_names(body, &mut rebound);
+        collect_augassign_targets(body, &mut rebound);
+        for n in declared.intersection(&rebound) {
+            out.insert(n.clone());
+        }
+    }
+    // Nested defs/methods are their own scopes (still this module's globals).
+    scan_scopes_global_rebinds(body, out);
+}
+
 /// (card e131f8b0) Whether class `cname` can soundly derive `Eq + Hash` (and the
 /// `Ord` pyrst needs for deterministic sorted-key iteration) so it may be used as
 /// a `dict` key / `set` element. Returns `Ok(())` when eligible, or `Err(reason)`
@@ -1528,7 +1713,8 @@ pub(crate) fn live_in_stmt(s: &Stmt, live_out: &HashSet<String>) -> HashSet<Stri
             expr_reads(value, &mut live);
             live
         }
-        Stmt::Pass(_) | Stmt::Break(_) | Stmt::Continue(_) | Stmt::Import { .. } => live_out.clone(),
+        Stmt::Pass(_) | Stmt::Break(_) | Stmt::Continue(_) | Stmt::Import { .. }
+        | Stmt::Global { .. } | Stmt::Nonlocal { .. } => live_out.clone(),
         Stmt::If { cond, then, elifs, else_, .. } => {
             let mut live = HashSet::new();
             live.extend(live_in_stmts(then, live_out));
@@ -1669,6 +1855,7 @@ pub(crate) fn detect_module_const_unbound_local(
     body: &[Stmt],
     consts: &HashSet<String>,
     params: &HashSet<String>,
+    globals_declared: &HashSet<String>,
 ) -> Result<()> {
     if consts.is_empty() {
         return Ok(());
@@ -1678,9 +1865,20 @@ pub(crate) fn detect_module_const_unbound_local(
     let mut local_names = HashSet::new();
     collect_bound_names(body, &mut local_names);
     collect_augassign_targets(body, &mut local_names);
+    // (W4-a §F) The ONE surgical change: a `global`-declared name is NOT a
+    // function-local shadow — a rebind of it writes the module mutable static, so
+    // it is EXCLUDED from the shadow set here (joining `params` in the "not a
+    // shadow" exclusion). A rebind WITHOUT `global` is unchanged: still a shadow,
+    // still trapped (probe PA still fires). The `globals_declared` set and the
+    // promotion set are both derived from the same `global NAME` statements
+    // (`collect_global_decls`), so the trap and codegen cannot disagree.
     let shadowed: HashSet<String> = consts
         .iter()
-        .filter(|c| local_names.contains(*c) && !params.contains(*c))
+        .filter(|c| {
+            local_names.contains(*c)
+                && !params.contains(*c)
+                && !globals_declared.contains(*c)
+        })
         .cloned()
         .collect();
     if !shadowed.is_empty() {
@@ -1704,7 +1902,11 @@ fn check_nested_defs(body: &[Stmt], consts: &HashSet<String>) -> Result<()> {
         match s {
             Stmt::Func(f) => {
                 let fparams: HashSet<String> = f.params.iter().map(|p| p.name.clone()).collect();
-                detect_module_const_unbound_local(&f.body, consts, &fparams)?;
+                // (W4-a) A nested def is its own scope, so it has its OWN `global`
+                // declarations — collect them for this def's trap exclusion.
+                let mut fglobals: HashSet<String> = HashSet::new();
+                collect_global_decls(&f.body, &mut fglobals);
+                detect_module_const_unbound_local(&f.body, consts, &fparams, &fglobals)?;
             }
             Stmt::If { then, elifs, else_, .. } => {
                 check_nested_defs(then, consts)?;
@@ -2383,6 +2585,24 @@ pub(crate) fn collect_returned_param_idents_expr(
 pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
     match s {
         Stmt::Pass(_) | Stmt::Break(_) | Stmt::Continue(_) => Ok(()),
+        // (W4-a) `global NAME` inside a function: the whole-function scope effect
+        // (marking each name a module binding and injecting its module type into
+        // `locals`) is applied ONCE up-front by `check_one_func`/`check_one_method`
+        // (Python applies `global` to the entire function regardless of where the
+        // statement textually appears), and the existence check runs there too. So
+        // when the walk reaches the statement itself it is a no-op.
+        Stmt::Global { .. } => Ok(()),
+        // (W4-a) `nonlocal` is honestly deferred — rebinding an enclosing function's
+        // local from an inner closure needs shared-mutable frame capture, which
+        // EPIC-4's clone-on-capture value semantics rule out.
+        Stmt::Nonlocal { span, .. } => Err(Error::Type {
+            span: *span,
+            msg: "`nonlocal` is not supported: pyrst closures capture by value \
+                  (EPIC-4 value semantics), so an inner function cannot rebind an \
+                  enclosing function's local; use a class field, a returned value, \
+                  or a module-level `global`"
+                .to_string(),
+        }),
         Stmt::Assert { cond, msg, .. } => {
             let cond_ty = check_expr(cond, env)?;
             // Generics v1: `assert t` puts a bare type variable in a boolean
@@ -2481,6 +2701,41 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
         }
         Stmt::Assign { target, ty, value, span } => {
             let val_ty = check_expr(value, env)?;
+            // (W4-a) A rebind of a `global`-declared name WRITES the module mutable
+            // static, whose Rust type is FIXED — unlike a plain local, it cannot be
+            // shadowed to a divergent type. Enforce the value against the module
+            // binding's declared type and keep `locals[target]` at that type (do not
+            // let the general shadow path below retype the slot). An explicit
+            // re-annotation on a global rebind is also rejected (the type is set at
+            // the module declaration).
+            if env.globals_declared.contains(target.as_str()) {
+                if ty.is_some() {
+                    return Err(Error::Type {
+                        span: *span,
+                        msg: format!(
+                            "re-annotating `global {0}` on assignment is not allowed; \
+                             its type is fixed at the module-level declaration",
+                            target
+                        ),
+                    });
+                }
+                let module_ty = env.ctx.vars.get(target.as_str()).cloned().unwrap_or(Ty::Unknown);
+                if !types_compatible(&val_ty, &module_ty, env.ctx) {
+                    return Err(Error::Type {
+                        span: *span,
+                        msg: format!(
+                            "cannot assign {} to module global `{}` declared {} — a \
+                             module-level mutable static has a fixed type (Python would \
+                             rebind it, but pyrst's static cannot change type)",
+                            val_ty, target, module_ty
+                        ),
+                    });
+                }
+                if env.params.contains(target.as_str()) {
+                    env.reassigned_params.insert(target.clone());
+                }
+                return Ok(());
+            }
             // Generics v1: a local annotation `y: T` inside a generic function
             // resolves `T` to the same `Ty::TypeVar` the params/return use, so an
             // assignment of a type-var value to a type-var-annotated local
@@ -2601,6 +2856,26 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             };
             for (i, t) in targets.iter().enumerate() {
                 let ty = elem_tys.get(i).cloned().unwrap_or(Ty::Unknown);
+                // (W4-a, F2) A `global`-declared unpack target REBINDS the module
+                // static, whose Rust type is FIXED — enforce the element type against
+                // the module binding's declared type and keep the slot at that type
+                // (do not retype it to the element, which would let a mistyped unpack
+                // `global a; a, b = "s", 6` leak a raw rustc E0308 at build).
+                if env.globals_declared.contains(t.as_str()) {
+                    let module_ty = env.ctx.vars.get(t.as_str()).cloned().unwrap_or(Ty::Unknown);
+                    if !matches!(ty, Ty::Unknown) && !types_compatible(&ty, &module_ty, env.ctx) {
+                        return Err(Error::Type {
+                            span: *span,
+                            msg: format!(
+                                "cannot unpack {} into module global `{}` declared {} — a \
+                                 module-level mutable static has a fixed type (Python would \
+                                 rebind it, but pyrst's static cannot change type)",
+                                ty, t, module_ty
+                            ),
+                        });
+                    }
+                    continue;
+                }
                 env.locals.insert(t.clone(), ty);
             }
             Ok(())
@@ -2924,6 +3199,25 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             Ok(())
         }
         Stmt::AttrAssign { obj, attr, value, span } => {
+            // (W4-a) Cross-module WRITE `m.x = 5` (rebinding another module's global)
+            // is a v1 honest error — the write surface stays owner-local (qualified
+            // READS `m.x` work for free via W3). Detected as a bare module qualifier
+            // (not a local) whose `attr` is a mutable global of that module.
+            if let Expr::Ident(modname, _) = obj.as_ref() {
+                if !env.locals.contains_key(modname)
+                    && env.ctx.is_mutable_global(Some(modname), attr)
+                {
+                    return Err(Error::Type {
+                        span: *span,
+                        msg: format!(
+                            "cross-module mutation of `{0}.{1}` is not supported; \
+                             mutate it from a function inside `{0}` (a `def` in `{0}` \
+                             that declares `global {1}` and assigns it)",
+                            modname, attr
+                        ),
+                    });
+                }
+            }
             // Validate the target base chain (the base expr must type-check;
             // unknown names / bad nested attributes are rejected by check_expr).
             let obj_ty = check_expr(obj, env)?;
@@ -3083,9 +3377,18 @@ pub(crate) fn check_nested_def(f: &Func, env: &mut FuncEnv) -> Result<()> {
     // it honestly. A nested-local (a name first BOUND inside the body) is allowed;
     // we seed `nested_locals` with the params and grow it as we scan assignments,
     // so an assignment to a fresh name (a new nested local) is never flagged.
+    // (W4-a, F9) The nested def's OWN `global` declarations. A `global g; g = ...`
+    // inside the nested def writes the module static — NOT a captured enclosing
+    // local — so seed those names into `nested_locals` up front: without this, if
+    // the ENCLOSING function also declared `global g` (so `g` sits in `env.locals`
+    // as an injected global), the legitimate nested rebind would be wrongly
+    // rejected as a captured-variable mutation.
+    let mut nested_globals: std::collections::HashSet<String> = std::collections::HashSet::new();
+    crate::typeck::collect_global_decls(&f.body, &mut nested_globals);
     {
         let mut nested_locals: std::collections::HashSet<String> =
             nested_param_names.iter().map(|s| s.to_string()).collect();
+        nested_locals.extend(nested_globals.iter().cloned());
         reject_captured_mutation(&f.body, env, &mut nested_locals)?;
     }
 
@@ -3170,7 +3473,18 @@ pub(crate) fn check_nested_def(f: &Func, env: &mut FuncEnv) -> Result<()> {
     // Carry the enclosing generic type-parameter scope so an op on a captured
     // type-var value is still rejected by the same gate inside the nested body.
     nested_env.type_params = env.type_params.clone();
+    // (W4-a, F9) Inherit the owning module so the nested def's `global` decls
+    // validate against the SAME per-owner bindings the enclosing scope uses.
+    nested_env.module_id = env.module_id.clone();
     collect_returned_param_idents(&f.body, &nested_env.params, &mut nested_env.returned_params);
+    // (W4-a, F9) Apply the nested def's own `global` declarations to its checking
+    // env BEFORE the body check — the same processing top-level functions/methods
+    // get: per-owner existence (F6), parameter collision (F7), use-before-decl
+    // (F8), and injection of each global's module type so a rebind is TYPE-CHECKED
+    // against it (the `Stmt::Assign` global arm), turning a type-mismatched nested
+    // rebind (`global counter; counter = "s"`) into an honest pyrst error instead
+    // of a leaked rustc E0308.
+    crate::typeck::apply_global_decls(&f.body, &mut nested_env)?;
     // (fix-b) Snapshot before check_body mutates locals (see check_one_func).
     let entry_env = nested_env.clone();
     check_body(&f.body, &mut nested_env)?;

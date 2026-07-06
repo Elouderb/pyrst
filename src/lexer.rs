@@ -84,6 +84,8 @@ pub enum Tok {
     With,
     Del,
     Lambda,
+    Global,
+    Nonlocal,
 
     // Punctuation
     LParen,
@@ -687,6 +689,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
                 "with" => Tok::With,
                 "del" => Tok::Del,
                 "lambda" => Tok::Lambda,
+                "global" => Tok::Global,
+                "nonlocal" => Tok::Nonlocal,
                 "True" => Tok::True,
                 "False" => Tok::False,
                 "None" => Tok::None_,

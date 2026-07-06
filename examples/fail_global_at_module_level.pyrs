@@ -1,0 +1,4 @@
+# W4-a negative: `global` is only valid inside a function body; at module level
+# a name is already the module binding.
+global x
+x: int = 5

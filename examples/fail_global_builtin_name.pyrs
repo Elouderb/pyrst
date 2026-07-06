@@ -1,0 +1,13 @@
+# W4-a (F6) negative: `global NAME` must name a real module-level binding of THIS
+# module. A builtin type-name stub (`int`, `list`, ...) is not a module binding, so
+# `global int` cannot be promoted and its write would lower to a dead local — an
+# honest error instead (the same per-owner scoping that rejects a cross-module
+# `global` whose name lives only in an imported module).
+counter: int = 0
+
+def f() -> None:
+    global int
+    int = 5
+
+def main() -> None:
+    f()

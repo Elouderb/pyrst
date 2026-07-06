@@ -1,0 +1,22 @@
+# W4-a: a module-level mutable global user-struct (`origin`) whose FIELDS are
+# mutated in place from a function (no `global` needed — a field write is a
+# mutation). Lowers to a thread_local RefCell<Point> with borrow_mut().field = v.
+class Point:
+    x: int
+    y: int
+
+    def __init__(self, x: int, y: int) -> None:
+        self.x = x
+        self.y = y
+
+origin: Point = Point(0, 0)
+
+def shift(dx: int, dy: int) -> None:
+    origin.x = origin.x + dx
+    origin.y = origin.y + dy
+
+def main() -> None:
+    shift(3, 4)
+    shift(1, 1)
+    print(origin.x)
+    print(origin.y)

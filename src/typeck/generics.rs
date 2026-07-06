@@ -1259,7 +1259,7 @@ pub(crate) fn collect_prop_edges_stmt(
             collect_prop_edges_expr(idx, locals, ctx, edges);
             collect_prop_edges_expr(value, locals, ctx, edges);
         }
-        Stmt::Func(_) | Stmt::Class(_) => {}
+        Stmt::Func(_) | Stmt::Class(_) | Stmt::Global { .. } | Stmt::Nonlocal { .. } => {}
     }
 }
 
@@ -1549,8 +1549,9 @@ pub(crate) fn infer_bounds_stmt(
         // A nested `def`/`class` is its own generic scope (nested generic defs are
         // parser-rejected, and a nested non-generic def cannot reference the
         // outer `T` as a bound op since typeck scopes type params per function);
-        // no outer-`T` bound flows out of it.
-        Stmt::Func(_) | Stmt::Class(_) => {}
+        // no outer-`T` bound flows out of it. `global`/`nonlocal` carry no
+        // expression to infer bounds from.
+        Stmt::Func(_) | Stmt::Class(_) | Stmt::Global { .. } | Stmt::Nonlocal { .. } => {}
     }
 }
 

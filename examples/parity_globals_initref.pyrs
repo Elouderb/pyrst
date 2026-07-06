@@ -1,0 +1,17 @@
+# W4-a: an eager, top-down `__pyrst_init_globals()` runs at startup in source
+# order, so a global initializer that reads an EARLIER global (`B = A * 2`) sees
+# A's init-time value, and a LATER mutation of A does not retro-change B —
+# CPython import-time semantics reproduced exactly.
+A: int = 3
+B: int = A * 2
+
+def bump_a() -> None:
+    global A
+    A = 100
+
+def main() -> None:
+    print(A)
+    print(B)
+    bump_a()
+    print(A)
+    print(B)

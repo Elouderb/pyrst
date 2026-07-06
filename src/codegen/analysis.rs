@@ -1,6 +1,46 @@
 use super::*;
 use std::collections::HashSet;
 
+/// (W4-a, F5) Depth-first walk of the import graph from the ROOT (module id
+/// `None`), visiting each module's top-level statements in SOURCE order and, at an
+/// import, recursing into the imported module at that exact point — a `visited` set
+/// initializes each module exactly once, on first import. This reproduces CPython's
+/// import-time interleave for `__pyrst_init_globals`: a root initializer that
+/// TEXTUALLY precedes an import runs BEFORE the imported module's initializers, and
+/// one that follows the import runs AFTER (the old imports-first-root-last flat
+/// order diverged). Appends each promoted mutable global as `(owner, name)` in
+/// force order. `thread_local!` statics stay lazy — only this force ORDER is
+/// observable, so the static DECLARATIONS need no reordering.
+fn dfs_global_init_order(
+    module_id: Option<String>,
+    modules_by_id: &std::collections::HashMap<Option<String>, &crate::ast::Module>,
+    ctx: &crate::typeck::TyCtx,
+    visited: &mut HashSet<Option<String>>,
+    order: &mut Vec<(Option<String>, String)>,
+) {
+    if !visited.insert(module_id.clone()) {
+        return;
+    }
+    let m = match modules_by_id.get(&module_id) {
+        Some(m) => *m,
+        None => return,
+    };
+    let owner = module_id;
+    for s in &m.stmts {
+        match s {
+            crate::ast::Stmt::Import { path, .. } => {
+                dfs_global_init_order(Some(path.join(".")), modules_by_id, ctx, visited, order);
+            }
+            crate::ast::Stmt::Assign { target, ty: Some(_), .. } => {
+                if ctx.is_mutable_global(owner.as_deref(), target) {
+                    order.push((owner.clone(), target.clone()));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// The LOUD codegen error for a residual read-after-conflicting-reassign (it
 /// should have been rejected at `check`; see
 /// [`Codegen::assert_no_read_after_divergent_reassign`]).
@@ -19,7 +59,7 @@ fn read_after_reassign_codegen_error(name: &str, outer: &Ty, inner: &Ty) -> crat
 
 impl<'a> Codegen<'a> {
     pub fn new(ctx: &'a TyCtx) -> Self {
-        Self { ctx, out: String::new(), indent: 0, locals: HashMap::new(), declared: Default::default(), current_class: None, current_ret_ty: Ty::Unit, dead_funcs: Default::default(), mut_self: HashMap::new(), by_ref_locals: Default::default(), poly_map: HashMap::new(), concrete_struct_params: Default::default(), const_names: Default::default(), const_strs: Default::default(), in_generator: false, try_return_escape: false, try_loopctl_escape: false, current_class_type_params: Vec::new(), current_fn_type_params: Vec::new(), hoisted: Default::default(), shadow_map: Default::default(), shadow_counter: 0, pending_inline_lambda_params: None, current_module: None, root_defined: Default::default() }
+        Self { ctx, out: String::new(), indent: 0, locals: HashMap::new(), declared: Default::default(), current_class: None, current_ret_ty: Ty::Unit, dead_funcs: Default::default(), mut_self: HashMap::new(), by_ref_locals: Default::default(), poly_map: HashMap::new(), concrete_struct_params: Default::default(), const_names: Default::default(), const_strs: Default::default(), in_generator: false, try_return_escape: false, try_loopctl_escape: false, current_class_type_params: Vec::new(), current_fn_type_params: Vec::new(), hoisted: Default::default(), shadow_map: Default::default(), shadow_counter: 0, pending_inline_lambda_params: None, current_module: None, root_defined: Default::default(), fn_globals: Default::default() }
     }
 
     /// (W3-2) Emit a TOP-LEVEL free-function / const-adjacent name owner-qualified.
@@ -84,6 +124,13 @@ impl<'a> Codegen<'a> {
                         return Some(cur.to_string());
                     }
                 }
+                // (W4-a) A promoted MUTABLE GLOBAL of the current module lives in
+                // its own module namespace (a container global is absent from
+                // `ms.consts`), so resolve its owner here too — else a bare read
+                // inside the module would mis-mangle to the root static.
+                if self.ctx.is_mutable_global(Some(cur), n) {
+                    return Some(cur.to_string());
+                }
                 if let Some((owner, _)) = self.ctx.import_bindings.get(cur).and_then(|b| b.get(n)) {
                     return Some(owner.clone());
                 }
@@ -105,6 +152,43 @@ impl<'a> Codegen<'a> {
         }
         // A class name is globally owner-keyed (class names are globally unique).
         self.ctx.class_owner.get(n).cloned()
+    }
+
+    /// (W4-a) Resolve a BARE name (that is NOT a function-local) to a promoted
+    /// mutable global: its `(owner, Ty)` if the name is a `thread_local!` static in
+    /// scope, else `None`. The owner is resolved exactly like a const
+    /// (`bare_owner_for`), so the mangled static name matches the definition site.
+    /// The empty-`mutable_globals` fast path keeps every global-free program a
+    /// no-op here (byte-identical output).
+    pub(crate) fn resolve_bare_global(&self, name: &str) -> Option<(Option<String>, Ty)> {
+        if self.ctx.mutable_globals.is_empty() {
+            return None;
+        }
+        let owner = self.bare_owner_for(name);
+        let ty = self.ctx.mutable_global_ty(owner.as_deref(), name)?.clone();
+        Some((owner, ty))
+    }
+
+    /// (W4-a) Whether a mutable global of type `ty` lowers to a `Cell<T>` (a Copy
+    /// scalar: `int`/`float`/`bool`) rather than a `RefCell<T>` (everything else —
+    /// `str`/`list`/`dict`/`set`/tuple/user class). Mirrors the design's
+    /// Cell-vs-RefCell split and the `is_copy` predicate for the scalar cases.
+    pub(crate) fn global_is_cell(ty: &Ty) -> bool {
+        matches!(ty, Ty::Int | Ty::Float | Ty::Bool)
+    }
+
+    /// (W4-a) Emit a mutable-global READ as a value: `G.with(|c| c.get())` for a
+    /// Cell scalar, `G.with(|c| c.borrow().clone())` for a RefCell (the
+    /// value-semantics CLONE — a read is an independent snapshot, exactly the
+    /// `str`-const `.to_string()` precedent generalized). Evaluated at the read
+    /// site (inside a closure body for a live call-time read), never captured.
+    pub(crate) fn emit_global_read(&self, owner: Option<&str>, name: &str, ty: &Ty) -> String {
+        let g = crate::codegen::mangle_global(owner, name);
+        if Self::global_is_cell(ty) {
+            format!("{}.with(|c| c.get())", g)
+        } else {
+            format!("{}.with(|c| c.borrow().clone())", g)
+        }
     }
 
     /// (W3-2) Resolve the FuncSig of a call CALLEE owner-first, so a co-imported
@@ -1619,6 +1703,18 @@ impl<'a> Codegen<'a> {
                 if crate::typeck::is_module_const_decl(other) {
                     return Ok(());
                 }
+                // (W4-a) A promoted MUTABLE GLOBAL (`NAME: T = <container/ctor/…>`,
+                // or a scalar rebound under `global`) is emitted as a
+                // `thread_local!` static by `emit_mutable_globals`, so its
+                // module-level assignment is likewise a no-op here.
+                if let Stmt::Assign { target, ty: Some(_), .. } = other {
+                    if self
+                        .ctx
+                        .is_mutable_global(self.current_module.as_deref(), target)
+                    {
+                        return Ok(());
+                    }
+                }
                 // Any other unsupported top-level statement is an honest error.
                 // This arm is a backstop; typeck's check_bodies fires the same
                 // rejection earlier (at `pyrst check` time).
@@ -1674,6 +1770,115 @@ impl<'a> Codegen<'a> {
         };
         self.line(&decl);
         Ok(())
+    }
+
+    /// (W4-a) Emit the MUTABLE-GLOBAL prepass: for every promoted module global a
+    /// crate-root `thread_local!` static (`Cell<T>` for a Copy scalar, `RefCell<T>`
+    /// otherwise), plus a `__pyrst_init_globals()` that forces each static's
+    /// initializer eagerly, TOP-DOWN in topological module + source order (imports
+    /// first, root last). This makes the thread-local's otherwise-lazy first-access
+    /// init observably eager at startup in dependency order — CPython import-time
+    /// semantics, so a global whose initializer reads an EARLIER global sees the
+    /// earlier init value and a later mutation does not retro-change it. Returns
+    /// whether any static was emitted (so `main()` calls the init fn first). Emits
+    /// NOTHING when the program has no mutable globals (the const path is
+    /// byte-identical).
+    pub(crate) fn emit_mutable_globals(&mut self, modules: &[(Module, String)]) -> Result<bool> {
+        if self.ctx.mutable_globals.is_empty() {
+            return Ok(false);
+        }
+        // Collect promoted globals in emission order: (owner, name, Ty, init expr).
+        let mut globals: Vec<(Option<String>, String, Ty, Expr)> = Vec::new();
+        for (m, _src) in modules {
+            let owner = m.module_id.clone();
+            for s in &m.stmts {
+                if let Stmt::Assign { target, ty: Some(_), value, .. } = s {
+                    if self.ctx.is_mutable_global(owner.as_deref(), target) {
+                        let gty = self
+                            .ctx
+                            .mutable_global_ty(owner.as_deref(), target)
+                            .cloned()
+                            .unwrap_or(Ty::Unknown);
+                        globals.push((owner.clone(), target.clone(), gty, value.clone()));
+                    }
+                }
+            }
+        }
+        if globals.is_empty() {
+            return Ok(false);
+        }
+        // The `thread_local!` block. Each static holds the REAL initializer; the
+        // eager init fn below forces it (and its ordering) at startup.
+        self.line("thread_local! {");
+        self.indent += 1;
+        for (owner, name, gty, value) in &globals {
+            // Emit the initializer under the OWNER module so its own bare refs
+            // (a helper / const / an earlier global) resolve owner-first.
+            self.current_module = owner.clone();
+            let g = crate::codegen::mangle_global(owner.as_deref(), name);
+            let inner = self.rust_ty(gty);
+            let init = self.emit_global_value(value, gty)?;
+            if Self::global_is_cell(gty) {
+                self.line(&format!(
+                    "static {}: ::std::cell::Cell<{}> = ::std::cell::Cell::new({});",
+                    g, inner, init
+                ));
+            } else {
+                self.line(&format!(
+                    "static {}: ::std::cell::RefCell<{}> = ::std::cell::RefCell::new({});",
+                    g, inner, init
+                ));
+            }
+        }
+        self.indent -= 1;
+        self.line("}");
+        // (F5) Eager top-down init, but in CPYTHON IMPORT ORDER: a DFS from the root
+        // that interleaves each module's initializers around its own imports (not the
+        // flat imports-first-root-last order, which ran a root pre-import initializer
+        // AFTER the imported module's). The `thread_local!` statics above are lazy, so
+        // only this force order is observable.
+        let modules_by_id: std::collections::HashMap<Option<String>, &crate::ast::Module> =
+            modules.iter().map(|(m, _)| (m.module_id.clone(), m)).collect();
+        let mut init_order: Vec<(Option<String>, String)> = Vec::new();
+        let mut visited: HashSet<Option<String>> = HashSet::new();
+        // Root = the `None`-id module (the DFS start).
+        dfs_global_init_order(None, &modules_by_id, self.ctx, &mut visited, &mut init_order);
+        // Defensive: force any promoted static the DFS did not reach (a well-formed
+        // import graph reaches all; this guards a stray unreferenced module so every
+        // static is still initialized exactly once).
+        for (owner, name, _, _) in &globals {
+            if !init_order.iter().any(|(o, n)| o == owner && n == name) {
+                init_order.push((owner.clone(), name.clone()));
+            }
+        }
+        self.line("fn __pyrst_init_globals() {");
+        self.indent += 1;
+        for (owner, name) in &init_order {
+            let g = crate::codegen::mangle_global(owner.as_deref(), name);
+            self.line(&format!("{}.with(|_| ());", g));
+        }
+        self.indent -= 1;
+        self.line("}");
+        self.current_module = None;
+        Ok(true)
+    }
+
+    /// (W4-a) Emit a value flowing INTO a mutable global (its `thread_local!`
+    /// initializer, or a `global`-declared rebind's RHS), matching the coercions a
+    /// typed local binding applies so the value fits the global's declared inner
+    /// Rust type: `emit_consuming` (value semantics), Optional `Some`-wrapping, and
+    /// the int→f64 cast for a float slot (`x: float = 2 ** 3`). Shared by the
+    /// globals prepass and the rebind emission so the two never drift.
+    pub(crate) fn emit_global_value(&mut self, value: &Expr, gty: &Ty) -> Result<String> {
+        let v = self.emit_consuming(value)?;
+        let v = self.coerce_to_option(v, value, gty);
+        if matches!(gty, Ty::Float)
+            && (matches!(self.type_of_expr(value), Ty::Int) || self.emits_int_pow(value))
+        {
+            Ok(format!("{} as f64", v))
+        } else {
+            Ok(v)
+        }
     }
 
     /// (card 30e4fdd0) True when a field of lowered type `ty` on class `cname`

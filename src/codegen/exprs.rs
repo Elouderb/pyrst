@@ -165,6 +165,92 @@ impl<'a> Codegen<'a> {
     ) -> Result<Option<String>> {
                 // Method call with attribute callee — handle method name remapping
                 if let Expr::Attr { obj, name, .. } = callee.as_ref() {
+                    // (W4-a) In-place MUTATING method on a module global container
+                    // (`items.append(x)` on a `thread_local!` RefCell<Vec>). Needs no
+                    // `global` declaration (Python: a mutation, not a rebind). The
+                    // whole mutation runs inside one `.with()` so the `borrow_mut()`
+                    // is scoped to the call and never aliases a read. A NON-mutating
+                    // method (`items.count(x)`) is a read and falls through — its
+                    // receiver is the value-semantics clone snapshot (correct). This
+                    // only handles a BARE global receiver; a subscripted-global chain
+                    // (`grid[i].append(x)`) is a later increment.
+                    if MUTATING_METHODS.contains(&name.as_str()) {
+                        if let Expr::Ident(g, _) = obj.as_ref() {
+                            if !self.locals.contains_key(g) {
+                                if let Some((owner, _)) = self.resolve_bare_global(g) {
+                                    let gname = crate::codegen::mangle_global(owner.as_deref(), g);
+                                    // Clean single-call mutators (borrow_mut().M(args)):
+                                    // append→push, plus the direct-mapping ones. The
+                                    // richer mutators (sort/pop/remove/insert/…) need
+                                    // the full method machinery on a place and are a
+                                    // W4-b follow-on — honest codegen error, not a
+                                    // silent mutate-a-clone.
+                                    let mapped = match name.as_str() {
+                                        "append" => Some("push"),
+                                        "extend" => Some("extend"),
+                                        "clear" => Some("clear"),
+                                        "reverse" => Some("reverse"),
+                                        "add" => Some("insert"),
+                                        _ => None,
+                                    };
+                                    match mapped {
+                                        Some(m) => {
+                                            // (W4-a, F3) Hoist every argument into a
+                                            // block-local temp BEFORE entering
+                                            // `.with(borrow_mut())`. An argument that
+                                            // READS the same global (`g.append(g[0])`,
+                                            // `g.append(len(g))`) then evaluates its own
+                                            // `.with(borrow())` FIRST — the read borrow is
+                                            // released before the mutating borrow — so the
+                                            // RefCell is never re-entrantly borrowed (the
+                                            // old inline emission panicked, exit 101).
+                                            // Mirrors the block-temp discipline of every
+                                            // other W4-a write path.
+                                            let base = self.shadow_counter;
+                                            self.shadow_counter += 1;
+                                            let mut prelude = String::new();
+                                            let mut temp_names: Vec<String> = Vec::with_capacity(args.len());
+                                            for (i, a) in args.iter().enumerate() {
+                                                let av = self.emit_consuming(a)?;
+                                                let tn = format!("__pyrst_gm_{}_{}", base, i);
+                                                prelude.push_str(&format!("let {} = {}; ", tn, av));
+                                                temp_names.push(tn);
+                                            }
+                                            let call_args = temp_names.join(", ");
+                                            // Mirror the general per-type lowering so a
+                                            // global receiver behaves IDENTICALLY to a
+                                            // local one: `HashSet::insert` (add) returns a
+                                            // `bool`, so wrap it in a braces+semicolon unit
+                                            // discard exactly like the general set-path's
+                                            // `{ s.insert(x); }`; push/extend/clear/reverse
+                                            // already return `()`.
+                                            let mutation = if m == "insert" {
+                                                format!(
+                                                    "{}.with(|__gc| {{ __gc.borrow_mut().insert({}); }})",
+                                                    gname, call_args
+                                                )
+                                            } else {
+                                                format!(
+                                                    "{}.with(|__gc| __gc.borrow_mut().{}({}))",
+                                                    gname, m, call_args
+                                                )
+                                            };
+                                            return Ok(Some(format!("{{ {}{} }}", prelude, mutation)));
+                                        }
+                                        None => {
+                                            return Err(crate::diag::Error::Codegen(format!(
+                                                "in-place `{}.{}(...)` on a module global \
+                                                 is not yet supported (W4-b); for now use \
+                                                 `append`/`extend`/`clear`/`reverse`/`add`, \
+                                                 or rebind the whole global under `global {}`",
+                                                g, name, g
+                                            )));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     // (card 49170944) `str.maketrans(x, y)` -> a `HashMap<i64, i64>`
                     // code-point map (zip the from/to chars as ords). Feeds
                     // `s.translate(table)`. 2-arg equal-length form is the honest
@@ -2849,6 +2935,14 @@ impl<'a> Codegen<'a> {
                 } else if self.locals.contains_key(n) {
                     // A local always wins its bare name (shadows a module const/fn).
                     escape_ident(n)
+                } else if let Some((owner, gty)) = self.resolve_bare_global(n) {
+                    // (W4-a) A bare read of a promoted MUTABLE GLOBAL that is NOT a
+                    // local: `G.with(|c| c.get())` (Cell) / `G.with(|c| c.borrow()
+                    // .clone())` (RefCell) — a value-semantics snapshot, evaluated at
+                    // the read site (so a read inside a closure body is call-time
+                    // LIVE, never captured). Locals win above (a rebind without
+                    // `global` is a local shadow), matching Python name resolution.
+                    self.emit_global_read(owner.as_deref(), n, &gty)
                 } else {
                     // (W3-2 / W3-fix F8,F9) Resolve the owner ONCE the same way typeck
                     // does (current-module own def / from-import / root), then decide
@@ -2938,6 +3032,11 @@ impl<'a> Codegen<'a> {
                         .module_consts
                         .get(modname)
                         .is_some_and(|cs| cs.iter().any(|(c, _)| c == name))
+                        // (W4-a) A scalar-literal binding promoted to a mutable global
+                        // is registered in `module_consts` too, but it is a
+                        // `thread_local!` static — NOT a `const`. Skip the const arm
+                        // so it routes to the mutable-global read below.
+                        && !self.ctx.is_mutable_global(Some(modname), name)
                     {
                         // (W3-2 / W3-fix F9) The qualifier IS the owner: emit the
                         // owner-qualified mangled const so `sys.version` and any
@@ -2949,6 +3048,25 @@ impl<'a> Codegen<'a> {
                         } else {
                             mangle_const(Some(modname), name)
                         });
+                    }
+                }
+                // (W4-a) Qualified MUTABLE-GLOBAL READ `m.x` for a real imported
+                // module: the qualifier IS the owner, so emit the owner-qualified
+                // `thread_local!` read (value-semantics snapshot) — the same owner
+                // path a qualified const read uses (W3 resolves the owner for free).
+                // Guarded on `m` not being a local (a class-typed local's field of
+                // the same name must not be intercepted). Cross-module WRITES are a
+                // v1 honest error (rejected at `check`); only reads reach here.
+                if let Expr::Ident(modname, _) = obj.as_ref() {
+                    if !self.locals.contains_key(modname)
+                        && self.ctx.is_mutable_global(Some(modname), name)
+                    {
+                        let gty = self
+                            .ctx
+                            .mutable_global_ty(Some(modname), name)
+                            .cloned()
+                            .unwrap_or(Ty::Unknown);
+                        return Ok(self.emit_global_read(Some(modname), name, &gty));
                     }
                 }
 

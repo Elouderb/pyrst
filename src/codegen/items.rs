@@ -1,5 +1,21 @@
 use super::*;
 
+/// (W4-a, F1) Saved codegen resolution state around an inline dunder/helper body.
+/// The inline trait-impl emitters (`__str__`/`__repr__` via Display, `__add__`,
+/// `__eq__`, `__sub__`, `__mul__`, `__neg__`, `__lt__`, and the `__lt_impl` /
+/// `__repr_impl` inherent helpers) emit their statements directly, WITHOUT the
+/// `fn_globals` setup and the locals/declared/hoisted teardown `emit_func` performs.
+/// This scope restores both, so (a) a `global N` rebind inside a dunder writes the
+/// module `thread_local!` static instead of a dead local shadow, and (b) no local
+/// the dunder body introduces leaks into the shared maps and corrupts a
+/// later-emitted function.
+struct DunderBodyScope {
+    fn_globals: std::collections::HashSet<String>,
+    locals: HashMap<String, Ty>,
+    declared: std::collections::HashSet<String>,
+    hoisted: std::collections::HashSet<String>,
+}
+
 impl<'a> Codegen<'a> {
     pub(crate) fn emit_func(&mut self, f: &Func, method_of: Option<&str>) -> Result<()> {
         let is_static = f.decorators.contains(&"staticmethod".to_string());
@@ -299,6 +315,16 @@ impl<'a> Codegen<'a> {
         // nested blocks) so un-annotated locals are typed from their value and
         // refined by later uses (e.g. `d = {}` then `d[k] = some_str`, or an
         // `acc = 0` accumulator later assigned a float).
+        // (W4-a) Record this function's `global`-declared names BEFORE the prescan
+        // and hoist so a rebind target (`total = ...` under `global total`) is never
+        // treated as a function-local: it is excluded from hoisting below and purged
+        // from `locals` after the prescan (which infers a type for every assigned
+        // name), so the Ident arm resolves it to the module `thread_local!` static
+        // instead of a bare local. Saved/restored around the body so a nested def
+        // sees its own set and the enclosing set is intact afterward.
+        let mut fn_globals = std::collections::HashSet::new();
+        crate::typeck::collect_global_decls(&f.body, &mut fn_globals);
+        let saved_fn_globals = std::mem::replace(&mut self.fn_globals, fn_globals);
         self.prescan_types(&f.body);
         // (LAZY-GEN V1-d BLOCKER insurance) Defence-in-depth: a bare local assigned
         // divergent types across sibling `if` branches would let the hoist silently
@@ -321,7 +347,10 @@ impl<'a> Codegen<'a> {
         Self::collect_hoistable(&f.body, 0, &mut block_assigned);
         let params: std::collections::HashSet<&str> = f.params.iter().map(|p| p.name.as_str()).collect();
         let mut hoist: Vec<String> = block_assigned.into_iter()
-            .filter(|n| !params.contains(n.as_str()) && !self.declared.contains(n))
+            .filter(|n| !params.contains(n.as_str()) && !self.declared.contains(n)
+                        // (W4-a) A `global`-declared name is the module static, not a
+                        // function-local — never hoist it.
+                        && !self.fn_globals.contains(n))
             .collect();
         hoist.sort();
         for name in hoist {
@@ -336,10 +365,21 @@ impl<'a> Codegen<'a> {
                 self.declared.insert(name);
             }
         }
+        // (W4-a) Purge any `global`-declared name the prescan inferred into `locals`
+        // (it types every assigned name): a rebind target must resolve to the module
+        // static via the Ident arm's `resolve_bare_global`, not as a bare local.
+        for g in self.fn_globals.clone() {
+            self.locals.remove(&g);
+            self.declared.remove(&g);
+            self.hoisted.remove(&g);
+        }
 
         for s in &f.body {
             self.emit_stmt(s)?;
         }
+        // (W4-a) Restore the enclosing function's `global` set (set before the
+        // prescan above); a nested def saved/restored its own within its emit.
+        self.fn_globals = saved_fn_globals;
         // (LAZY-GEN V1-b) Close the generator's `async move` coroutine and hand
         // back the `__PyrstGen<T>`. Fall-off-the-end completes the future naturally
         // (the driver reports `None` on `Poll::Ready`); a bare `return` inside the
@@ -369,6 +409,55 @@ impl<'a> Codegen<'a> {
         self.try_return_escape = saved_try_return_escape;
         self.try_loopctl_escape = saved_try_loopctl_escape;
         self.current_fn_type_params = saved_fn_type_params;
+        Ok(())
+    }
+
+    /// (W4-a, F1) BEGIN an inline dunder/helper body: register the body's `global`
+    /// declarations (mirroring `emit_func`'s `collect_global_decls` setup) so a
+    /// `global N; N = ...` rebind routes to the module `thread_local!` write, and
+    /// purge those names from the resolution maps. Returns the state to hand back
+    /// to `exit_dunder_body`, which also restores `locals`/`declared`/`hoisted` so
+    /// a local the body introduces cannot leak (inline dunders do not clear those
+    /// maps the way `emit_func` does). Call AFTER the caller inserts `self`/`other`
+    /// so those are in the snapshot and the caller's own `.remove()` cleanup stays
+    /// valid.
+    fn enter_dunder_body(&mut self, body: &[Stmt]) -> DunderBodyScope {
+        let mut fn_globals = std::collections::HashSet::new();
+        crate::typeck::collect_global_decls(body, &mut fn_globals);
+        let saved_fn_globals = std::mem::replace(&mut self.fn_globals, fn_globals);
+        // A rebind target under `global` must resolve to the module static via the
+        // Ident/Assign arms' `resolve_bare_global`, not as a bare local.
+        for g in self.fn_globals.clone() {
+            self.locals.remove(&g);
+            self.declared.remove(&g);
+            self.hoisted.remove(&g);
+        }
+        DunderBodyScope {
+            fn_globals: saved_fn_globals,
+            locals: self.locals.clone(),
+            declared: self.declared.clone(),
+            hoisted: self.hoisted.clone(),
+        }
+    }
+
+    /// (W4-a, F1) END an inline dunder/helper body: restore the `global` set and the
+    /// locals/declared/hoisted maps captured by `enter_dunder_body`.
+    fn exit_dunder_body(&mut self, scope: DunderBodyScope) {
+        self.locals = scope.locals;
+        self.declared = scope.declared;
+        self.hoisted = scope.hoisted;
+        self.fn_globals = scope.fn_globals;
+    }
+
+    /// (W4-a, F1) Emit an inline dunder/helper body with the global-rebind + leak
+    /// handling of a real method (see `enter_dunder_body`). Replaces the bare
+    /// `for s in &body { self.emit_stmt(s)?; }` every inline trait-impl emitter used.
+    fn emit_dunder_body(&mut self, body: &[Stmt]) -> Result<()> {
+        let scope = self.enter_dunder_body(body);
+        for s in body {
+            self.emit_stmt(s)?;
+        }
+        self.exit_dunder_body(scope);
         Ok(())
     }
 
@@ -774,7 +863,7 @@ impl<'a> Codegen<'a> {
                         // `other: &c.name` is the CONCRETE struct here — exempt it
                         // from base-field-read lowering (C2-2b-i).
                         self.concrete_struct_params.insert("other".into());
-                        for s in &m.body { self.emit_stmt(s)?; }
+                        self.emit_dunder_body(&m.body)?;
                         self.concrete_struct_params.remove("other");
                         self.locals.remove("self");
                         self.locals.remove("other");
@@ -793,7 +882,7 @@ impl<'a> Codegen<'a> {
                         self.line("fn __repr_impl(&self) -> String {");
                         self.indent += 1;
                         self.locals.insert("self".into(), self_class_ty.clone());
-                        for s in &m.body { self.emit_stmt(s)?; }
+                        self.emit_dunder_body(&m.body)?;
                         self.locals.remove("self");
                         self.indent -= 1;
                         self.line("}");
@@ -849,6 +938,10 @@ impl<'a> Codegen<'a> {
                         self.line("write!(__f, \"{}\", self.__repr_impl())");
                     } else {
                         self.locals.insert("self".into(), self_class_ty.clone());
+                        // (W4-a, F1) Same global-rebind + leak handling as the other
+                        // inline dunders, wrapping the split (body-prefix + final
+                        // write!) emission this Display source uses.
+                        let __ds = self.enter_dunder_body(&m.body);
                         let body = &m.body;
                         let split_at = if body.is_empty() { 0 } else { body.len() - 1 };
                         for s in &body[..split_at] { self.emit_stmt(s)?; }
@@ -859,6 +952,7 @@ impl<'a> Codegen<'a> {
                             if let Some(s) = body.last() { self.emit_stmt(s)?; }
                             self.line("Ok(())");
                         }
+                        self.exit_dunder_body(__ds);
                         self.locals.remove("self");
                     }
                     self.indent -= 1;
@@ -882,7 +976,7 @@ impl<'a> Codegen<'a> {
                     self.indent += 1;
                     self.locals.insert("self".into(), self_class_ty.clone());
                     self.locals.insert("other".into(), other_ty);
-                    for s in &m.body { self.emit_stmt(s)?; }
+                    self.emit_dunder_body(&m.body)?;
                     self.locals.remove("self");
                     self.locals.remove("other");
                     self.indent -= 1;
@@ -901,7 +995,7 @@ impl<'a> Codegen<'a> {
                     // `other: &c.name` is the CONCRETE struct here — exempt it
                     // from base-field-read lowering (C2-2b-i).
                     self.concrete_struct_params.insert("other".into());
-                    for s in &m.body { self.emit_stmt(s)?; }
+                    self.emit_dunder_body(&m.body)?;
                     self.concrete_struct_params.remove("other");
                     self.locals.remove("self");
                     self.locals.remove("other");
@@ -926,7 +1020,7 @@ impl<'a> Codegen<'a> {
                     self.indent += 1;
                     self.locals.insert("self".into(), self_class_ty.clone());
                     self.locals.insert("other".into(), other_ty);
-                    for s in &m.body { self.emit_stmt(s)?; }
+                    self.emit_dunder_body(&m.body)?;
                     self.locals.remove("self");
                     self.locals.remove("other");
                     self.indent -= 1;
@@ -950,7 +1044,7 @@ impl<'a> Codegen<'a> {
                     self.indent += 1;
                     self.locals.insert("self".into(), self_class_ty.clone());
                     self.locals.insert("other".into(), other_ty);
-                    for s in &m.body { self.emit_stmt(s)?; }
+                    self.emit_dunder_body(&m.body)?;
                     self.locals.remove("self");
                     self.locals.remove("other");
                     self.indent -= 1;
@@ -968,7 +1062,7 @@ impl<'a> Codegen<'a> {
                     self.line(&format!("fn neg(self) -> {} {{", ret_s));
                     self.indent += 1;
                     self.locals.insert("self".into(), self_class_ty.clone());
-                    for s in &m.body { self.emit_stmt(s)?; }
+                    self.emit_dunder_body(&m.body)?;
                     self.locals.remove("self");
                     self.indent -= 1;
                     self.line("}");

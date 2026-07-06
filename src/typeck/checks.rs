@@ -39,6 +39,15 @@ pub(crate) struct FuncEnv<'a> {
     /// (arithmetic, comparison, `print`, calling a method, ...) into an honest
     /// error. Empty for every non-generic function/method/lambda.
     pub(crate) type_params: std::collections::HashSet<String>,
+    /// (W4-a) Names declared `global` in THIS function (whole-function scope,
+    /// collected up-front from every `global NAME` statement — Python applies the
+    /// declaration to the entire function regardless of where it appears). A name
+    /// here refers to the module-level binding, not a function-local: a rebind of
+    /// it writes the module mutable static, and it is EXCLUDED from the
+    /// `UnboundLocal` trap's shadow set (§F, the one surgical change). Each such
+    /// name is also injected into `locals` with its module type so reads /
+    /// aug-assigns type-check. Empty for every function with no `global` statement.
+    pub(crate) globals_declared: std::collections::HashSet<String>,
     /// (card c34ac64a fix B2c/B3) Locals CURRENTLY under a PERSISTENT narrow:
     /// name -> the var's DECLARED `Option<T>` type (its type BEFORE the narrow).
     /// Set by the `if x is None: <terminates>` negative-narrowing gate (the only
@@ -48,6 +57,14 @@ pub(crate) struct FuncEnv<'a> {
     /// on a still-narrowed name is a statically-decided guard — an honest error
     /// rather than a leaked rustc `.is_none()`-on-`T`. Empty in the common case.
     pub(crate) narrowed: HashMap<String, Ty>,
+    /// (W4-a, F6/F9) The OWNER module id of the function/method being checked
+    /// (`None` = root). Threaded from the per-module check dispatch so a `global`
+    /// declaration validates against the OWNING module's own bindings (a
+    /// cross-module `global BAR` — BAR lives only in an imported module — is an
+    /// honest error), and inherited by a nested def so its `global` decls apply
+    /// with the same owner scope. `None` on the LSP single-file / synthetic-ctx
+    /// paths (the validator then falls back to the flat existence check).
+    pub(crate) module_id: Option<String>,
 }
 
 impl<'a> FuncEnv<'a> {
@@ -64,7 +81,7 @@ impl<'a> FuncEnv<'a> {
             param_set.insert(name.clone());
         }
         let by_ref_params = by_ref_names.iter().cloned().collect();
-        FuncEnv { ctx, locals, ret_ty, used_vars, params: param_set, reassigned_params: std::collections::HashSet::new(), returned_params: std::collections::HashSet::new(), by_ref_params, is_generator: false, type_params: std::collections::HashSet::new(), narrowed: HashMap::new() }
+        FuncEnv { ctx, locals, ret_ty, used_vars, params: param_set, reassigned_params: std::collections::HashSet::new(), returned_params: std::collections::HashSet::new(), by_ref_params, is_generator: false, type_params: std::collections::HashSet::new(), globals_declared: std::collections::HashSet::new(), narrowed: HashMap::new(), module_id: None }
     }
 
     /// The enclosing generic function's declared type-parameter names as a
@@ -223,7 +240,9 @@ pub(crate) fn stmt_span(s: &Stmt) -> Span {
         | Stmt::Match { span, .. }
         | Stmt::AttrAssign { span, .. }
         | Stmt::IndexAssign { span, .. }
-        | Stmt::Import { span, .. } => *span,
+        | Stmt::Import { span, .. }
+        | Stmt::Global { span, .. }
+        | Stmt::Nonlocal { span, .. } => *span,
         Stmt::Return(_, span) | Stmt::Yield(_, span) | Stmt::Pass(span) | Stmt::Break(span) | Stmt::Continue(span) => *span,
         Stmt::Func(f) => f.span,
         Stmt::Class(c) => c.span,
@@ -457,6 +476,70 @@ pub(crate) fn reject_reserved_in_expr(e: &Expr) -> Result<()> {
     Ok(())
 }
 
+/// (W4-a) Reject any `nonlocal` statement ANYWHERE in the module, as an honest
+/// deferral (rebinding an enclosing function's local from an inner closure needs
+/// shared-mutable frame capture, which EPIC-4's clone-on-capture value semantics
+/// rule out). Runs as a module-wide pre-pass — walking every function / method /
+/// nested-def body and control-flow block — so the specific `nonlocal` message
+/// always fires before a more generic gate (e.g. the captured-mutation check) can
+/// pre-empt it with a less precise diagnostic.
+pub(crate) fn reject_nonlocal(m: &Module) -> Result<()> {
+    fn walk(stmts: &[Stmt]) -> Result<()> {
+        for s in stmts {
+            match s {
+                Stmt::Nonlocal { span, .. } => {
+                    return Err(Error::Type {
+                        span: *span,
+                        msg: "`nonlocal` is not supported: pyrst closures capture by \
+                              value (EPIC-4 value semantics), so an inner function cannot \
+                              rebind an enclosing function's local; use a class field, a \
+                              returned value, or a module-level `global`"
+                            .to_string(),
+                    });
+                }
+                Stmt::Func(f) => walk(&f.body)?,
+                Stmt::Class(c) => {
+                    for meth in &c.methods {
+                        walk(&meth.body)?;
+                    }
+                }
+                Stmt::If { then, elifs, else_, .. } => {
+                    walk(then)?;
+                    for (_, b) in elifs {
+                        walk(b)?;
+                    }
+                    if let Some(b) = else_ {
+                        walk(b)?;
+                    }
+                }
+                Stmt::While { body, .. } | Stmt::For { body, .. } | Stmt::With { body, .. } => {
+                    walk(body)?;
+                }
+                Stmt::Try { body, handlers, else_, finally_, .. } => {
+                    walk(body)?;
+                    for h in handlers {
+                        walk(&h.body)?;
+                    }
+                    if let Some(b) = else_ {
+                        walk(b)?;
+                    }
+                    if let Some(b) = finally_ {
+                        walk(b)?;
+                    }
+                }
+                Stmt::Match { arms, .. } => {
+                    for a in arms {
+                        walk(&a.body)?;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+    walk(&m.stmts)
+}
+
 /// (EPIC-6) Reject every USER identifier whose name is a non-raw Rust keyword
 /// (`crate`/`self`/`super`/`Self`) BEFORE body type-checking, so both `check`
 /// and `build` fail honestly. The method receiver `self` is exempt (it is the
@@ -497,11 +580,73 @@ pub(crate) fn reject_reserved_idents(m: &Module) -> Result<()> {
     Ok(())
 }
 
+/// (W4-a, F4) Reject a module-level global whose initializer DIRECTLY references a
+/// name defined LATER in this module's source order. A module initializer runs
+/// eagerly top-down at import (`__pyrst_init_globals`, CPython import-time
+/// semantics), so `x: int = y + 1` declared before `y: int = 10`, or
+/// `a: int = helper()` before `def helper`, reads a name that does not exist yet —
+/// CPython raises `NameError` at import, but pyrst's lazy `thread_local` would
+/// silently compute a value. Reject it honestly instead. Only DIRECT references in
+/// the initializer expression are policed (bare identifier or call target, anywhere
+/// in the tree); a TRANSITIVE read through the body of an earlier-defined function
+/// called in the initializer is out of scope (documented in PYTHON_COMPATIBILITY).
+pub(crate) fn reject_forward_referencing_global_inits(m: &Module) -> Result<()> {
+    // Every module-level name DEFINED in THIS module: annotated bindings, top-level
+    // functions, and top-level classes (a constructor call is a `class` reference).
+    let mut module_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for s in &m.stmts {
+        match s {
+            Stmt::Assign { target, ty: Some(_), .. } => { module_names.insert(target.clone()); }
+            Stmt::Func(f) => { module_names.insert(f.name.clone()); }
+            Stmt::Class(c) => { module_names.insert(c.name.clone()); }
+            _ => {}
+        }
+    }
+    let mut defined_before: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for s in &m.stmts {
+        // A referencing initializer is a NON-scalar-literal one (a scalar literal
+        // has no references); that is exactly the mutable-static promotion path.
+        if let Stmt::Assign { target, ty: Some(_), value, span } = s {
+            if !is_const_literal(value) {
+                let mut refs = std::collections::HashSet::new();
+                crate::typeck::expr_reads(value, &mut refs);
+                for r in &refs {
+                    if r != target && module_names.contains(r) && !defined_before.contains(r) {
+                        return Err(Error::Type {
+                            span: *span,
+                            msg: format!(
+                                "module global `{0}`'s initializer references `{1}`, which is \
+                                 defined LATER in this module. Module-level initializers run \
+                                 top-down at startup, so `{1}` does not exist yet when `{0}` is \
+                                 initialized (Python raises NameError at import). Move `{1}`'s \
+                                 definition above `{0}`.",
+                                target, r
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+        // Now this statement's own name(s) become available to later initializers.
+        match s {
+            Stmt::Assign { target, ty: Some(_), .. } => { defined_before.insert(target.clone()); }
+            Stmt::Func(f) => { defined_before.insert(f.name.clone()); }
+            Stmt::Class(c) => { defined_before.insert(c.name.clone()); }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 pub fn check_bodies(m: &Module, ctx: &TyCtx) -> Result<()> {
     // (EPIC-6) Reject non-raw-keyword user identifiers up front (honest in both
     // `check` and `build`). Escapable Rust keywords (`type`, `loop`, ...) are
     // accepted here and lowered via codegen's `escape_ident`.
     reject_reserved_idents(m)?;
+    // (W4-a) Reject `nonlocal` up front with its specific deferral message.
+    reject_nonlocal(m)?;
+    // (W4-a, F4) Reject a global initializer that forward-references a later name.
+    reject_forward_referencing_global_inits(m)?;
 
     // (W3-fix) Check EVERY module's body against an OWNER-FIRST view of the ctx
     // (`with_module_symbols_promoted`): its own top-level funcs/classes/consts and
@@ -560,12 +705,20 @@ pub fn check_all(m: &Module, ctx: &TyCtx) -> Vec<Error> {
     if let Err(e) = reject_reserved_idents(m) {
         return vec![e];
     }
+    // (W4-a) Reject `nonlocal` up front (module-wide) with its specific message.
+    if let Err(e) = reject_nonlocal(m) {
+        return vec![e];
+    }
+    // (W4-a, F4) Reject a global initializer that forward-references a later name.
+    if let Err(e) = reject_forward_referencing_global_inits(m) {
+        return vec![e];
+    }
 
     let mut errors: Vec<Error> = Vec::new();
     for s in &m.stmts {
         match s {
             Stmt::Func(f) => {
-                if let Err(e) = check_one_func(f, ctx) {
+                if let Err(e) = check_one_func(f, ctx, m.module_id.as_deref()) {
                     errors.push(e);
                 }
             }
@@ -580,7 +733,7 @@ pub fn check_all(m: &Module, ctx: &TyCtx) -> Vec<Error> {
                 // Collect one error per failing method (the L4 method-level
                 // granularity), continuing past a failing method to the next.
                 for method in &c.methods {
-                    if let Err(e) = check_one_method(c, method, ctx) {
+                    if let Err(e) = check_one_method(c, method, ctx, m.module_id.as_deref()) {
                         errors.push(e);
                     }
                 }
@@ -610,11 +763,11 @@ pub fn check_all(m: &Module, ctx: &TyCtx) -> Vec<Error> {
 /// byte-identical per-item checks — only their continue-vs-stop policy differs.
 pub(crate) fn check_one_stmt(s: &Stmt, ctx: &TyCtx, module_id: Option<&str>) -> Result<()> {
     match s {
-        Stmt::Func(f) => check_one_func(f, ctx)?,
+        Stmt::Func(f) => check_one_func(f, ctx, module_id)?,
         Stmt::Class(c) => {
             check_class_prelude(c, ctx)?;
             for method in &c.methods {
-                check_one_method(c, method, ctx)?;
+                check_one_method(c, method, ctx, module_id)?;
             }
         }
         // Import statements are resolved by the resolver and are
@@ -627,8 +780,264 @@ pub(crate) fn check_one_stmt(s: &Stmt, ctx: &TyCtx, module_id: Option<&str>) -> 
     Ok(())
 }
 
+/// (W4-a) Apply a function's `global NAME` declarations to its checking env BEFORE
+/// the body is checked: (1) validate each name is a real module-level binding —
+/// pyrst cannot CREATE a module global from inside a function (no annotation to
+/// give it), so an unknown name is an honest error; (2) inject its module type
+/// into `env.locals` so reads and aug-assigns of it type-check; (3) record the
+/// whole-function set in `env.globals_declared`, consumed by the `UnboundLocal`
+/// trap exclusion (§F). A rebind's TYPE is enforced against the module type in the
+/// `Stmt::Assign` arm of `check_stmt`. No-op for a function with no `global`.
+pub(crate) fn apply_global_decls(body: &[Stmt], env: &mut FuncEnv) -> Result<()> {
+    let mut declared = std::collections::HashSet::new();
+    crate::typeck::collect_global_decls(body, &mut declared);
+    if declared.is_empty() {
+        return Ok(());
+    }
+    // (F8) A `global n` must PRECEDE every use of `n` in the SAME scope — CPython
+    // raises `SyntaxError: name 'n' is used prior to global declaration` otherwise.
+    reject_global_after_use(body)?;
+    // (F6 per-owner existence + F7 param collision) validated before any env
+    // mutation. `env.module_id` scopes existence to the OWNING module's own
+    // bindings (a cross-module `global BAR` / a builtin-stub `global int` is an
+    // honest error); `env.params` catches a parameter/global name clash.
+    validate_global_decls(body, env.ctx, env.module_id.as_deref(), &env.params)?;
+    for name in &declared {
+        if let Some(ty) = env.ctx.vars.get(name) {
+            env.locals.insert(name.clone(), ty.clone());
+            env.used_vars.insert(name.clone());
+        }
+    }
+    env.globals_declared = declared;
+    Ok(())
+}
+
+/// (W4-a, F8) Reject a `global n` that appears AFTER a use (read OR write) of `n`
+/// earlier in the SAME scope — CPython's `SyntaxError: name 'n' is used prior to
+/// global declaration`. Walks the scope in source order, accumulating every name
+/// referenced so far (descending into control-flow blocks, which are part of the
+/// same function scope) and checking each `global n` against it. A use inside a
+/// nested `def`/`class` is a DIFFERENT scope and is intentionally not descended
+/// into, so it never counts.
+fn reject_global_after_use(body: &[Stmt]) -> Result<()> {
+    let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
+    global_after_use_walk(body, &mut used)
+}
+
+fn global_after_use_walk(
+    body: &[Stmt],
+    used: &mut std::collections::HashSet<String>,
+) -> Result<()> {
+    for s in body {
+        match s {
+            Stmt::Global { names, span } => {
+                for n in names {
+                    if used.contains(n) {
+                        return Err(Error::Type {
+                            span: *span,
+                            msg: format!(
+                                "`global {0}` appears after `{0}` is already used in this \
+                                 scope; the `global` declaration must come before any use \
+                                 of `{0}` (Python raises SyntaxError: name '{0}' is used \
+                                 prior to global declaration)",
+                                n
+                            ),
+                        });
+                    }
+                }
+            }
+            // A nested def/class opens a NEW scope; its uses do not count here (and
+            // it validates its own `global` decls separately).
+            Stmt::Func(_) | Stmt::Class(_) => {}
+            // Control-flow blocks belong to the SAME scope: collect the header's
+            // references, then descend into the body in source order.
+            Stmt::If { cond, then, elifs, else_, .. } => {
+                crate::typeck::expr_reads(cond, used);
+                global_after_use_walk(then, used)?;
+                for (c, b) in elifs {
+                    crate::typeck::expr_reads(c, used);
+                    global_after_use_walk(b, used)?;
+                }
+                if let Some(b) = else_ {
+                    global_after_use_walk(b, used)?;
+                }
+            }
+            Stmt::While { cond, body, .. } => {
+                crate::typeck::expr_reads(cond, used);
+                global_after_use_walk(body, used)?;
+            }
+            Stmt::For { targets, iter, body, .. } => {
+                crate::typeck::expr_reads(iter, used);
+                for t in targets { used.insert(t.clone()); }
+                global_after_use_walk(body, used)?;
+            }
+            Stmt::With { ctx_expr, as_name, body, .. } => {
+                crate::typeck::expr_reads(ctx_expr, used);
+                if let Some(v) = as_name { used.insert(v.clone()); }
+                global_after_use_walk(body, used)?;
+            }
+            Stmt::Try { body, handlers, else_, finally_, .. } => {
+                global_after_use_walk(body, used)?;
+                for h in handlers {
+                    global_after_use_walk(&h.body, used)?;
+                }
+                if let Some(b) = else_ { global_after_use_walk(b, used)?; }
+                if let Some(b) = finally_ { global_after_use_walk(b, used)?; }
+            }
+            Stmt::Match { subject, arms, .. } => {
+                crate::typeck::expr_reads(subject, used);
+                for a in arms {
+                    global_after_use_walk(&a.body, used)?;
+                }
+            }
+            // A simple statement: every name it references (read or write) is a
+            // "use" for the global-prior rule (CPython flags `n = 5` before
+            // `global n` too — "assigned to before global declaration").
+            _ => stmt_name_refs(s, used),
+        }
+    }
+    Ok(())
+}
+
+/// (F8 helper) Insert every name a SIMPLE statement references — reads AND write
+/// targets — into `used`. Assignment/aug-assign/unpack targets are writes (which
+/// also count as a "use" for the global-prior-declaration rule); expression reads
+/// come from `expr_reads`.
+fn stmt_name_refs(s: &Stmt, used: &mut std::collections::HashSet<String>) {
+    match s {
+        Stmt::Assign { target, value, .. } => {
+            used.insert(target.clone());
+            crate::typeck::expr_reads(value, used);
+        }
+        Stmt::AugAssign { target, value, .. } => {
+            used.insert(target.clone());
+            crate::typeck::expr_reads(value, used);
+        }
+        Stmt::Unpack { targets, value, .. } => {
+            for t in targets { used.insert(t.clone()); }
+            crate::typeck::expr_reads(value, used);
+        }
+        Stmt::AttrAssign { obj, value, .. } => {
+            crate::typeck::expr_reads(obj, used);
+            crate::typeck::expr_reads(value, used);
+        }
+        Stmt::IndexAssign { obj, idx, value, .. } => {
+            crate::typeck::expr_reads(obj, used);
+            crate::typeck::expr_reads(idx, used);
+            crate::typeck::expr_reads(value, used);
+        }
+        Stmt::Expr(e) => crate::typeck::expr_reads(e, used),
+        Stmt::Return(Some(e), _) | Stmt::Yield(e, _) => {
+            crate::typeck::expr_reads(e, used);
+        }
+        Stmt::Raise { exc: Some(e), .. } => crate::typeck::expr_reads(e, used),
+        Stmt::Assert { cond, msg, .. } => {
+            crate::typeck::expr_reads(cond, used);
+            if let Some(m) = msg { crate::typeck::expr_reads(m, used); }
+        }
+        _ => {}
+    }
+}
+
+/// (W4-a) Reject a `global NAME` that (F6) does not name a module-level binding of
+/// the OWNING module, or (F7) collides with an enclosing-callable parameter, at the
+/// offending statement's span. Walks control-flow blocks but not nested defs (each
+/// validates its own scope).
+fn validate_global_decls(
+    body: &[Stmt],
+    ctx: &TyCtx,
+    module_id: Option<&str>,
+    params: &std::collections::HashSet<String>,
+) -> Result<()> {
+    for s in body {
+        match s {
+            Stmt::Global { names, span } => {
+                for n in names {
+                    // (F7) A name cannot be both a parameter and a global — CPython
+                    // raises `SyntaxError: name 'n' is parameter and global`.
+                    if params.contains(n) {
+                        return Err(Error::Type {
+                            span: *span,
+                            msg: format!(
+                                "`global {0}` conflicts with parameter `{0}`: a name cannot \
+                                 be both a parameter and a global in the same function \
+                                 (Python raises SyntaxError: name '{0}' is parameter and \
+                                 global)",
+                                n
+                            ),
+                        });
+                    }
+                    // (F6) `n` must be a module-level binding of the OWNING module.
+                    if !global_binding_exists(ctx, module_id, n) {
+                        return Err(Error::Type {
+                            span: *span,
+                            msg: format!(
+                                "`global {0}`: there is no module-level `{0}` in this module \
+                                 to bind. pyrst cannot create a module global from inside a \
+                                 function, and cross-module global WRITES are not supported \
+                                 (a `{0}` living only in an imported module cannot be rebound \
+                                 here) — declare `{0}: T = <init>` at this module's top level",
+                                n
+                            ),
+                        });
+                    }
+                }
+            }
+            Stmt::If { then, elifs, else_, .. } => {
+                validate_global_decls(then, ctx, module_id, params)?;
+                for (_, b) in elifs {
+                    validate_global_decls(b, ctx, module_id, params)?;
+                }
+                if let Some(b) = else_ {
+                    validate_global_decls(b, ctx, module_id, params)?;
+                }
+            }
+            Stmt::While { body, .. } | Stmt::For { body, .. } | Stmt::With { body, .. } => {
+                validate_global_decls(body, ctx, module_id, params)?;
+            }
+            Stmt::Try { body, handlers, else_, finally_, .. } => {
+                validate_global_decls(body, ctx, module_id, params)?;
+                for h in handlers {
+                    validate_global_decls(&h.body, ctx, module_id, params)?;
+                }
+                if let Some(b) = else_ {
+                    validate_global_decls(b, ctx, module_id, params)?;
+                }
+                if let Some(b) = finally_ {
+                    validate_global_decls(b, ctx, module_id, params)?;
+                }
+            }
+            Stmt::Match { arms, .. } => {
+                for a in arms {
+                    validate_global_decls(&a.body, ctx, module_id, params)?;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// (W4-a, F6) Whether `n` is a module-level binding of the OWNING module
+/// (`module_id`, `None` = root) — the per-owner scoping [`collect_mutable_globals`]
+/// records in `ctx.module_level_bindings`. When that prepass never ran (an empty
+/// map — the LSP single-file / hand-built synthetic-ctx paths), fall back to the
+/// flat `vars` existence check so those paths keep their prior behavior. A
+/// non-empty map with NO entry for this owner means the owner declares no top-level
+/// binding, so no `global` name of it can exist.
+fn global_binding_exists(ctx: &TyCtx, module_id: Option<&str>, n: &str) -> bool {
+    let owner = module_id.map(|s| s.to_string());
+    if let Some(owned) = ctx.module_level_bindings.get(&owner) {
+        return owned.contains(n);
+    }
+    if ctx.module_level_bindings.is_empty() {
+        return ctx.vars.contains_key(n);
+    }
+    false
+}
+
 /// Type-check ONE top-level function (decorators + signature + body), fail-fast.
-pub(crate) fn check_one_func(f: &Func, ctx: &TyCtx) -> Result<()> {
+pub(crate) fn check_one_func(f: &Func, ctx: &TyCtx, module_id: Option<&str>) -> Result<()> {
     // Reject unsupported decorators on top-level functions.
     validate_decorators(&f.decorators, f.span)?;
 
@@ -670,6 +1079,7 @@ pub(crate) fn check_one_func(f: &Func, ctx: &TyCtx) -> Result<()> {
     reject_iterator_params(&f.params)?;
     let ret = Ty::from_type_expr_scoped(&f.ret, f.span, &f.type_params)?;
     let mut env = FuncEnv::with_by_ref(ctx, &params, &by_ref_names, ret);
+    env.module_id = module_id.map(|s| s.to_string());
     env.type_params = f.type_params.iter().cloned().collect();
     env.is_generator = check_generator_signature(&f.body, &f.ret, f.span)?;
     // (LAZY-GEN V1-d) `yield` inside `try` cannot be lowered (E0728, §C.4) — reject.
@@ -682,12 +1092,19 @@ pub(crate) fn check_one_func(f: &Func, ctx: &TyCtx) -> Result<()> {
     // type is read as its final (post-reassignment) type and the divergence is
     // missed (a param `xs: list[int]` reassigned to a generator in a block).
     let entry_env = env.clone();
+    // (W4-a) Apply `global` declarations to the whole-function scope BEFORE the
+    // body check (validate existence, inject module types, record the set). Placed
+    // after the `entry_env` snapshot so the read-after-reassign pass — which
+    // reasons about function-local slots — ignores module globals.
+    apply_global_decls(&f.body, &mut env)?;
     check_body(&f.body, &mut env)?;
     // (W0-b, honesty hole p09) Reject the module-constant `UnboundLocalError`
     // (assign-to-a-const's-name shadows it local, and reading it before that
     // assignment is an error) that would otherwise leak as a raw rustc E0425.
+    // (W4-a §F) `global`-declared names are excluded from the shadow set — a rebind
+    // of one writes the module mutable static instead of trapping.
     let module_consts: std::collections::HashSet<String> = ctx.vars.keys().cloned().collect();
-    detect_module_const_unbound_local(&f.body, &module_consts, &env.params)?;
+    detect_module_const_unbound_local(&f.body, &module_consts, &env.params, &env.globals_declared)?;
     check_all_paths_return(&f.body, &env, &f.name, f.span)?;
     // (fix-b) Reject the residual non-sibling silent value-drop: a bare outer-scope
     // local reassigned to a divergent type inside a single nested block and read
@@ -1283,7 +1700,7 @@ pub(crate) fn check_class_prelude(c: &ClassDef, ctx: &TyCtx) -> Result<()> {
 
 /// Type-check ONE method of class `c` (decorators + dunder restrictions +
 /// signature + body), fail-fast. The receiver type is `c`'s class type.
-pub(crate) fn check_one_method(c: &ClassDef, method: &Func, ctx: &TyCtx) -> Result<()> {
+pub(crate) fn check_one_method(c: &ClassDef, method: &Func, ctx: &TyCtx, module_id: Option<&str>) -> Result<()> {
     // Reject unsupported decorators on class methods.
     validate_decorators(&method.decorators, method.span)?;
 
@@ -1376,6 +1793,7 @@ pub(crate) fn check_one_method(c: &ClassDef, method: &Func, ctx: &TyCtx) -> Resu
     reject_iterator_params(&method.params)?;
     let ret = Ty::from_type_expr_scoped(&method.ret, method.span, &c.type_params)?;
     let mut env = FuncEnv::with_by_ref(ctx, &params, &by_ref_names, ret);
+    env.module_id = module_id.map(|s| s.to_string());
     env.type_params = c.type_params.iter().cloned().collect();
     env.is_generator = check_generator_signature(&method.body, &method.ret, method.span)?;
     // (LAZY-GEN V1-d) Generator METHODS are a V2 feature (V2-b): the returned
@@ -1398,12 +1816,15 @@ pub(crate) fn check_one_method(c: &ClassDef, method: &Func, ctx: &TyCtx) -> Resu
     reject_yield_in_try(&method.body)?;
     collect_returned_param_idents(&method.body, &env.params, &mut env.returned_params);
     let entry_env = env.clone();
+    // (W4-a) Apply a method's `global` declarations before the body check.
+    apply_global_decls(&method.body, &mut env)?;
     check_body(&method.body, &mut env)?;
     // (W0-b, honesty hole p09) Same module-constant `UnboundLocalError` guard as
     // free functions — a method body that reassigns a module const's name and
-    // reads it beforehand would otherwise leak rustc E0425.
+    // reads it beforehand would otherwise leak rustc E0425. (W4-a §F) `global`-
+    // declared names are excluded (a rebind writes the module mutable static).
     let module_consts: std::collections::HashSet<String> = ctx.vars.keys().cloned().collect();
-    detect_module_const_unbound_local(&method.body, &module_consts, &env.params)?;
+    detect_module_const_unbound_local(&method.body, &module_consts, &env.params, &env.globals_declared)?;
     check_all_paths_return(&method.body, &env, &method.name, method.span)?;
     detect_read_after_conflicting_reassign(&method.body, &entry_env)?;
     Ok(())
@@ -1469,6 +1890,51 @@ pub(crate) fn check_top_level_other(s: &Stmt, ctx: &TyCtx, module_id: Option<&st
                   inside a generator function declared `Iterator[T]`)"
                 .to_string(),
         });
+    }
+    // (W4-a) `global` / `nonlocal` at MODULE level is meaningless — there is no
+    // enclosing function to reach out of (Python raises a SyntaxError). Honest
+    // error rather than the generic fall-through, so the diagnostic is specific.
+    if let Stmt::Global { span, .. } = s {
+        return Err(Error::Type {
+            span: *span,
+            msg: "`global` is only valid inside a function body (at module level a \
+                  name is already the module binding — declare `NAME: T = <init>` \
+                  directly)"
+                .to_string(),
+        });
+    }
+    if let Stmt::Nonlocal { span, .. } = s {
+        return Err(Error::Type {
+            span: *span,
+            msg: "`nonlocal` is only valid inside a nested function, and is not \
+                  supported by pyrst (closures capture by value; use a class field, \
+                  a returned value, or a module-level `global`)"
+                .to_string(),
+        });
+    }
+    // (W4-a) A MUTABLE-STATIC module binding whose initializer is NOT a scalar
+    // literal (a container literal, a constructor, an `@extern` call) — the §C
+    // path (b). The const path below rejects such an initializer (probe PE); this
+    // legalizes it ONLY when the promotion prepass marked it a mutable global. The
+    // initializer is type-checked against the declared type in a bare env, so its
+    // own errors (and a genuine declared/actual mismatch) still surface honestly.
+    if let Stmt::Assign { target, ty: Some(t), value, span } = s {
+        if !is_const_literal(value) && ctx.is_mutable_global(module_id, target) {
+            reject_if_reserved(target, *span, "module global")?;
+            let declared = Ty::from_type_expr(t, *span)?;
+            let mut env = FuncEnv::with_by_ref(ctx, &[], &[], Ty::Unit);
+            let init_ty = crate::typeck::check_expr(value, &mut env)?;
+            if !types_compatible(&init_ty, &declared, ctx) {
+                return Err(Error::Type {
+                    span: *span,
+                    msg: format!(
+                        "type mismatch in module global: declared {}, initializer is {}",
+                        declared, init_ty
+                    ),
+                });
+            }
+            return Ok(());
+        }
     }
     // A module-level constant (`NAME: T = <literal>`) is the narrow EPIC-6-A
     // relaxation: it is the ONLY assignment form accepted at top level — an

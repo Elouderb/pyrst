@@ -445,6 +445,15 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
                 if let Some(ty) = ctx.resolve_module_const(modname, name) {
                     return ty.clone();
                 }
+                // (W4-a) A qualified MUTABLE-GLOBAL read `m.x` (a container global is
+                // absent from `module_consts`) types as its declared `Ty`, so a
+                // print site formats it correctly (a list as `[..]`, not `{}`).
+                // Guarded on `m` not being a local (a class-typed local's field).
+                if !locals.contains_key(modname) {
+                    if let Some(ty) = ctx.mutable_global_ty(Some(modname), name) {
+                        return ty.clone();
+                    }
+                }
             }
             // (card 03eb4e2c) A class-NAME receiver `ClassName.FIELD` — e.g. an
             // enum-member const `Color.RED` — types as the field's declared type.
@@ -1190,9 +1199,14 @@ pub(crate) fn lambda_ret_with_elem(
                 // function's type variables are not in scope for the lambda's own
                 // params, so this stays empty.
                 type_params: std::collections::HashSet::new(),
+                // A lambda cannot contain a `global` statement (it has no
+                // statement body), so it declares no module globals.
+                globals_declared: std::collections::HashSet::new(),
                 // A lambda body is a single expression (no reassignment/guard),
                 // so the narrow-tracking map is never consulted — start empty.
                 narrowed: std::collections::HashMap::new(),
+                // (W4-a) Inherit the enclosing function's owning module.
+                module_id: env.module_id.clone(),
             };
             // Bind every param: the first to the iterable element type, the
             // rest to their declared type or Unknown (map/filter pass a single
@@ -1294,6 +1308,9 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 reassigned_params: env.reassigned_params.clone(),
                 returned_params: env.returned_params.clone(),
                 by_ref_params: env.by_ref_params.clone(),
+                // A comprehension runs inside the enclosing function scope, so it
+                // inherits any `global` declarations (its body may read a global).
+                globals_declared: env.globals_declared.clone(),
                 // A comprehension lives inside the current function; inherit its
                 // generator status so the bare-return / yield rules stay coherent
                 // (a `yield` cannot appear inside a comprehension expression, but
@@ -1307,6 +1324,9 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 // body sees the same narrowed view (it is a single expression and
                 // never reassigns, so the map is only ever read here).
                 narrowed: env.narrowed.clone(),
+                // (W4-a) A comprehension runs in the enclosing function scope —
+                // inherit its owning module so any global it reads resolves per-owner.
+                module_id: env.module_id.clone(),
             };
             bind_comp_targets(targets, elem_ty, &mut inner_env.locals);
             if let Some(c) = cond { check_expr(c, &mut inner_env)?; }
@@ -1338,6 +1358,9 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 reassigned_params: env.reassigned_params.clone(),
                 returned_params: env.returned_params.clone(),
                 by_ref_params: env.by_ref_params.clone(),
+                // A comprehension runs inside the enclosing function scope, so it
+                // inherits any `global` declarations (its body may read a global).
+                globals_declared: env.globals_declared.clone(),
                 // A comprehension lives inside the current function; inherit its
                 // generator status so the bare-return / yield rules stay coherent
                 // (a `yield` cannot appear inside a comprehension expression, but
@@ -1351,6 +1374,9 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 // body sees the same narrowed view (it is a single expression and
                 // never reassigns, so the map is only ever read here).
                 narrowed: env.narrowed.clone(),
+                // (W4-a) A comprehension runs in the enclosing function scope —
+                // inherit its owning module so any global it reads resolves per-owner.
+                module_id: env.module_id.clone(),
             };
             bind_comp_targets(targets, elem_ty, &mut inner_env.locals);
             if let Some(c) = cond { check_expr(c, &mut inner_env)?; }
@@ -1385,6 +1411,9 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 reassigned_params: env.reassigned_params.clone(),
                 returned_params: env.returned_params.clone(),
                 by_ref_params: env.by_ref_params.clone(),
+                // A comprehension runs inside the enclosing function scope, so it
+                // inherits any `global` declarations (its body may read a global).
+                globals_declared: env.globals_declared.clone(),
                 // A comprehension lives inside the current function; inherit its
                 // generator status so the bare-return / yield rules stay coherent
                 // (a `yield` cannot appear inside a comprehension expression, but
@@ -1398,6 +1427,9 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 // body sees the same narrowed view (it is a single expression and
                 // never reassigns, so the map is only ever read here).
                 narrowed: env.narrowed.clone(),
+                // (W4-a) A comprehension runs in the enclosing function scope —
+                // inherit its owning module so any global it reads resolves per-owner.
+                module_id: env.module_id.clone(),
             };
             bind_comp_targets(targets, elem_ty, &mut inner_env.locals);
             if let Some(c) = cond { check_expr(c, &mut inner_env)?; }
@@ -2682,6 +2714,17 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 if let Some(ty) = env.ctx.resolve_module_const(modname, name) {
                     return Ok(ty.clone());
                 }
+                // (W4-a) Qualified MUTABLE-GLOBAL READ `m.x`: a container/promoted
+                // global is absent from `module_consts`, so resolve it here to its
+                // declared type. Qualified reads work for free (W3 owner machinery);
+                // cross-module WRITES are rejected in the `AttrAssign` arm. Guarded
+                // on `m` not being a local so a class-typed local's field of the
+                // same name is not intercepted.
+                if !env.locals.contains_key(modname) {
+                    if let Some(ty) = env.ctx.mutable_global_ty(Some(modname), name) {
+                        return Ok(ty.clone());
+                    }
+                }
                 // (Honest-errors) `X.attr` (non-call) where X is a KNOWN imported
                 // module (it has tracked functions or constants) but `attr` is
                 // neither a constant nor a function of X is an UNKNOWN ATTRIBUTE.
@@ -3080,8 +3123,12 @@ pub(crate) fn lambda_body_ty(
         is_generator: false,
         // A lambda's params are its own; enclosing type variables don't apply.
         type_params: std::collections::HashSet::new(),
+        // A lambda has no statement body, so it declares no `global`s.
+        globals_declared: std::collections::HashSet::new(),
         // A lambda body is a single expression — narrow-tracking is never used.
         narrowed: std::collections::HashMap::new(),
+        // (W4-a) Inherit the enclosing function's owning module.
+        module_id: env.module_id.clone(),
     };
     for (param_name, param_ty) in params {
         let ty = lambda_param_ty(param_ty);

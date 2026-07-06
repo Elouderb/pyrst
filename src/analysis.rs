@@ -425,7 +425,9 @@ fn walk_stmt<'a>(
         Stmt::Pass(_)
         | Stmt::Break(_)
         | Stmt::Continue(_)
-        | Stmt::Import { .. } => {}
+        | Stmt::Import { .. }
+        | Stmt::Global { .. }
+        | Stmt::Nonlocal { .. } => {}
     }
 }
 
@@ -1215,6 +1217,8 @@ fn stmt_span(s: &Stmt) -> crate::diag::Span {
         | Stmt::Del { span, .. }
         | Stmt::Match { span, .. }
         | Stmt::Import { span, .. }
+        | Stmt::Global { span, .. }
+        | Stmt::Nonlocal { span, .. }
         | Stmt::AttrAssign { span, .. }
         | Stmt::IndexAssign { span, .. } => *span,
         Stmt::Return(_, span) | Stmt::Yield(_, span) => *span,
@@ -1895,7 +1899,8 @@ fn collect_stmt_tokens<'a>(
             collect_expr_tokens(idx, ctx, src, func, class, out);
             collect_expr_tokens(value, ctx, src, func, class, out);
         }
-        Stmt::Pass(_) | Stmt::Break(_) | Stmt::Continue(_) | Stmt::Import { .. } => {}
+        Stmt::Pass(_) | Stmt::Break(_) | Stmt::Continue(_) | Stmt::Import { .. }
+        | Stmt::Global { .. } | Stmt::Nonlocal { .. } => {}
     }
 }
 

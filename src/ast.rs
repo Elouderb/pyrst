@@ -186,6 +186,22 @@ pub enum Stmt {
     },
     Func(Func),
     Class(ClassDef),
+    /// (W4-a) `global NAME[, NAME...]` — a function-body declaration that the
+    /// listed names refer to the enclosing MODULE's bindings, not function locals.
+    /// A subsequent rebind of such a name writes the module-level mutable static
+    /// (`thread_local!`) instead of creating a function-local (Python's own
+    /// explicit-intent marker for module-level mutable state). Parsed anywhere a
+    /// statement is; typeck rejects it at MODULE level (there is no enclosing
+    /// function to reach out of) and validates each name is a real module binding.
+    /// Carries no runtime effect of its own — codegen emits nothing for it.
+    Global { names: Vec<String>, span: Span },
+    /// (W4-a) `nonlocal NAME[, NAME...]` — honestly DEFERRED. Rebinding an enclosing
+    /// function's local from an inner closure needs shared-mutable frame capture,
+    /// which EPIC-4's clone-on-capture value semantics disallow; typeck emits an
+    /// honest error naming the deferral (use a class field, a returned value, or a
+    /// module global via `global`). Parsed so the diagnostic is specific, not a
+    /// generic parse failure.
+    Nonlocal { names: Vec<String>, span: Span },
     Import { path: Vec<String>, names: Vec<(String, Option<String>)>, span: Span },
     // Assignment targets carry an arbitrary lvalue *base* as a boxed Expr
     // (e.g. `self`, `self.dict`, `rooms[i]`, `a.b`) rather than a bare name, so

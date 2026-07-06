@@ -682,6 +682,13 @@ pub fn resolve(root_path: &Path) -> Result<ResolvedProgram> {
     // so typeck and codegen share one usage-gated decision.
     crate::typeck::collect_promoted_consts(&modules, &mut ctx);
 
+    // (W4-a) Compute the whole-program MUTABLE-GLOBAL set (module-level bindings
+    // promoted to `thread_local!` statics — global+rebind OR non-scalar-literal
+    // initializer), the single source of truth typeck's promotion/trap-exclusion
+    // and codegen's static/read/write emission share. Empty for programs with no
+    // module-level mutable state, so the const path stays byte-identical.
+    crate::typeck::collect_mutable_globals(&modules, &mut ctx);
+
     // (enabler-fix-2 #1a/#1c) Close `hash_key_classes` over the WHOLE program:
     // TRANSITIVE user-class fields of a key class (nested classes need the derive
     // too) + annotation-less constructor-keyed dict/set literals. Runs after every

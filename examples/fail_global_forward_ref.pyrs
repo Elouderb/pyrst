@@ -1,0 +1,9 @@
+# W4-a (F4) negative: a module global's initializer must not DIRECTLY reference a
+# name defined LATER in the module. Initializers run eagerly top-down at startup, so
+# `total` reads `base` before it exists — CPython raises NameError at import; pyrst
+# rejects it honestly at check rather than silently computing a value.
+total: int = base + 1
+base: int = 10
+
+def main() -> None:
+    print(total)

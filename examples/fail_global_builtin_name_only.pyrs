@@ -1,0 +1,13 @@
+# W4-a (F6) negative: `global int` must be rejected even when the program has NO
+# module-level bindings at all — the per-owner map must record an empty set for
+# every module, or the flat-vars fallback would admit builtin stub names and the
+# rebind would silently diverge from Python (which lets `int = 5` shadow the
+# builtin, so `int(3.7)` raises TypeError where pyrst would print 3).
+
+def f() -> None:
+    global int
+    int = 5
+
+def main() -> None:
+    f()
+    print(int(3.7))

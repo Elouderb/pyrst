@@ -1,0 +1,15 @@
+# W4-a (F3) regression: an in-place mutating method on a global whose ARGUMENT
+# reads the SAME global (`grid.append(grid[0])`, `grid.append(len(grid))`) must
+# hoist the argument into a temp BEFORE borrowing the RefCell. Before the fix the
+# argument's read borrow was nested inside the mutating `borrow_mut()` closure — a
+# RefCell double borrow that panicked at runtime (exit 101). Dual-run vs python3.
+grid: list[int] = [1, 2, 3]
+
+def grow() -> None:
+    grid.append(grid[0])
+    grid.append(len(grid))
+
+def main() -> None:
+    grow()
+    print(grid)
+    print(len(grid))

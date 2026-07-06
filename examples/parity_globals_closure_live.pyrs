@@ -1,0 +1,19 @@
+# W4-a: a closure READS a module global (`g`) LIVE — the read lowers to a
+# `.with()` INSIDE the closure body (never captured), so mutating `g` AFTER the
+# closure is created is observed at call time (10 -> 99), CPython-identical.
+g: int = 10
+
+def make_reader() -> Callable[[], int]:
+    def reader() -> int:
+        return g
+    return reader
+
+def set_g(n: int) -> None:
+    global g
+    g = n
+
+def main() -> None:
+    r: Callable[[], int] = make_reader()
+    print(r())
+    set_g(99)
+    print(r())

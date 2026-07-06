@@ -4,6 +4,15 @@ impl<'a> Codegen<'a> {
     pub(crate) fn emit_stmt(&mut self, s: &Stmt) -> Result<()> {
         match s {
             Stmt::Pass(_) => self.line("// pass"),
+            // (W4-a) `global NAME` is a compile-time scope declaration only — the
+            // mutable static and its eager init are emitted by `emit_program`'s
+            // globals prepass, and every rebind/read/mutation of a global resolves
+            // through `self.fn_globals` (set per function). The declaration itself
+            // has no runtime effect, so it emits nothing.
+            Stmt::Global { .. } => {}
+            // (W4-a) `nonlocal` is rejected at `check` (honest deferral); it can
+            // never reach codegen. A defensive comment documents that invariant.
+            Stmt::Nonlocal { .. } => self.line("// nonlocal (unreachable: rejected at check)"),
             Stmt::Break(_) => {
                 // (try/except control flow) A `break` at the try-body loop level
                 // must escape the catch_unwind closure (it targets the loop that
@@ -178,6 +187,27 @@ impl<'a> Codegen<'a> {
                 }
             }
             Stmt::Assign { target, ty, value, span, .. } => {
+                // (W4-a) A rebind of a `global`-declared name WRITES the module
+                // mutable static, not a function-local. `set` for a Cell scalar,
+                // `*borrow_mut() =` for a RefCell. The RHS is evaluated into a
+                // block-local temp FIRST (releasing any read borrow of the SAME
+                // global inside it, e.g. `counter = counter + 1`) before the write
+                // `.with()` borrows — so a RefCell never re-entrant-borrows itself
+                // regardless of Rust's assignment eval order. A rebind WITHOUT
+                // `global` falls through to the local-shadow machinery below
+                // (Python's exact rule: only `global`+`=` writes the module state).
+                if self.fn_globals.contains(target) {
+                    if let Some((owner, gty)) = self.resolve_bare_global(target) {
+                        let v = self.emit_global_value(value, &gty)?;
+                        let g = mangle_global(owner.as_deref(), target);
+                        if Self::global_is_cell(&gty) {
+                            self.line(&format!("{{ let __g = {}; {}.with(|c| c.set(__g)); }}", v, g));
+                        } else {
+                            self.line(&format!("{{ let __g = {}; {}.with(|c| *c.borrow_mut() = __g); }}", v, g));
+                        }
+                        return Ok(());
+                    }
+                }
                 // Uniform clone-on-use: assigning from a non-Copy place (`y = x`,
                 // `y = self.field`) deep-clones so the two bindings are independent
                 // (Python value semantics). Owned temps (call/literal/binop) are bare.
@@ -426,7 +456,15 @@ impl<'a> Codegen<'a> {
                     let mut seen = std::collections::HashSet::with_capacity(targets.len());
                     !targets.iter().all(|t| seen.insert(t.as_str()))
                 };
-                let all_new = targets.iter().all(|t| !self.declared.contains(t)) && !has_dup_targets;
+                // (W4-a, F2) A `global`-declared target is NOT a fresh local, so a
+                // list with any global target must NOT take the destructuring-`let`
+                // (`all_new`) or destructuring-assignment (`all_simple_reassign`)
+                // fast paths — both would emit fresh locals and never touch the
+                // module statics. Force the temp-split MIXED path, whose shared
+                // per-target helper routes each global target through the .with
+                // write (and each local target through its normal lowering).
+                let any_global = targets.iter().any(|t| self.fn_globals.contains(t));
+                let all_new = targets.iter().all(|t| !self.declared.contains(t)) && !has_dup_targets && !any_global;
                 let all_declared = targets.iter().all(|t| self.declared.contains(t));
                 let any_shadow = targets.iter().any(|t| self.shadow_map.contains_key(t));
                 // A pre-existing target whose slot is incompatible with its component
@@ -488,6 +526,32 @@ impl<'a> Codegen<'a> {
                 }
             }
             Stmt::AugAssign { target, op, value, span } => {
+                // (W4-a) `NAME op= v` under `global NAME` writes the module mutable
+                // static. Desugar to the rebind of `NAME op v` and route through the
+                // global-write form, so ALL operator lowering (str/list `+`,
+                // `__py_mod`/`__py_floordiv`, set algebra, …) is reused via the
+                // synthesized BinOp, and the RHS (which reads the global) is
+                // evaluated into a temp before the write borrows (Cell `set` /
+                // RefCell `*borrow_mut() =`). A `op=` WITHOUT `global` falls through
+                // (a rebind of a non-global name is trapped at `check`).
+                if self.fn_globals.contains(target) {
+                    if let Some((owner, gty)) = self.resolve_bare_global(target) {
+                        let desugar = Expr::BinOp {
+                            op: *op,
+                            lhs: Box::new(Expr::Ident(target.clone(), *span)),
+                            rhs: Box::new(value.clone()),
+                            span: *span,
+                        };
+                        let v = self.emit_global_value(&desugar, &gty)?;
+                        let g = mangle_global(owner.as_deref(), target);
+                        if Self::global_is_cell(&gty) {
+                            self.line(&format!("{{ let __g = {}; {}.with(|c| c.set(__g)); }}", v, g));
+                        } else {
+                            self.line(&format!("{{ let __g = {}; {}.with(|c| *c.borrow_mut() = __g); }}", v, g));
+                        }
+                        return Ok(());
+                    }
+                }
                 let target_ty = self.locals.get(target.as_str()).cloned().unwrap_or(Ty::Unknown);
                 // (W0-c) Set augmented assignment `s |= t` / `&=` / `-=` / `^=`:
                 // Rust `HashSet` has no compound-assignment trait, so desugar to
@@ -1009,6 +1073,25 @@ impl<'a> Codegen<'a> {
                 self.line(&format!("drop({});", t));
             }
             Stmt::AttrAssign { obj, attr, value, .. } => {
+                // (W4-a) In-place FIELD mutation of a module global struct
+                // (`p.x = v` where `p` is a `thread_local!` RefCell<Struct>). Needs
+                // no `global` declaration (Python: a mutation, not a rebind). The
+                // value is evaluated into a temp FIRST (releasing any read borrow of
+                // the same global inside it), then the field is stored through
+                // `borrow_mut()` inside a single `.with()`.
+                if let Expr::Ident(g, _) = obj.as_ref() {
+                    if !self.locals.contains_key(g) {
+                        if let Some((owner, _)) = self.resolve_bare_global(g) {
+                            let v = self.emit_consuming(value)?;
+                            let gname = mangle_global(owner.as_deref(), g);
+                            self.line(&format!(
+                                "{{ let __g = {}; {}.with(|c| c.borrow_mut().{} = __g); }}",
+                                v, gname, escape_ident(attr)
+                            ));
+                            return Ok(());
+                        }
+                    }
+                }
                 // (EPIC-5 C2-2b-i) A field-WRITE through a polymorphic-base var
                 // (`a.balance = ...` where `a: Account` and Account has subclasses)
                 // would target a `B__` enum, which has no fields. A mutating
@@ -1083,6 +1166,33 @@ impl<'a> Codegen<'a> {
                 self.line(&format!("{}.{} = {};", place, escape_ident(attr), v));
             }
             Stmt::IndexAssign { obj, idx, value, .. } => {
+                // (W4-a) In-place INDEX mutation of a module global container
+                // (`items[i] = v` on a global list, `d[k] = v` on a global dict).
+                // Needs no `global` declaration. Value + key/index evaluated into
+                // temps FIRST (releasing any read borrow), then stored through
+                // `borrow_mut()` in one `.with()`.
+                if let Expr::Ident(g, _) = obj.as_ref() {
+                    if !self.locals.contains_key(g) {
+                        if let Some((owner, gty)) = self.resolve_bare_global(g) {
+                            let gname = mangle_global(owner.as_deref(), g);
+                            let v = self.emit_consuming(value)?;
+                            if matches!(gty, Ty::Dict(..)) {
+                                let k = self.emit_consuming(idx)?;
+                                self.line(&format!(
+                                    "{{ let __gk = {}; let __gv = {}; {}.with(|c| {{ c.borrow_mut().insert(__gk, __gv); }}); }}",
+                                    k, v, gname
+                                ));
+                            } else {
+                                let i = self.emit_expr(idx)?;
+                                self.line(&format!(
+                                    "{{ let __gi = {}; let __gv = {}; {}.with(|c| c.borrow_mut()[(__gi) as usize] = __gv); }}",
+                                    i, v, gname
+                                ));
+                            }
+                            return Ok(());
+                        }
+                    }
+                }
                 let v = self.emit_consuming(value)?;
                 // (card cc7ae370, item 1) Hoist EVERY subscript index — the
                 // base-chain ones (`emit_place_hoisted`) AND the leaf index below —
@@ -1150,6 +1260,30 @@ impl<'a> Codegen<'a> {
     /// shadow-mangling and int->float slot widening) so a mixed or divergent unpack
     /// component behaves exactly like the equivalent single assignment.
     pub(crate) fn emit_unpack_target(&mut self, target: &str, rhs: &str, comp_ty: &Ty) {
+        // (W4-a, F2) A `global`-declared unpack target REBINDS the module mutable
+        // static, not a function-local. `rhs` is ALWAYS a fully-evaluated temp here
+        // (both the tuple-mixed and list-unpack callers bind the whole RHS to temps
+        // FIRST), so writing it into the Cell/RefCell is swap-safe and never
+        // re-enters a borrow — `global a, b; a, b = b, a` swaps the two statics
+        // correctly. A genuinely-local target keeps its normal declare/reassign
+        // lowering below, so a MIXED local+global target list works.
+        if self.fn_globals.contains(target) {
+            if let Some((owner, gty)) = self.resolve_bare_global(target) {
+                let g = crate::codegen::mangle_global(owner.as_deref(), target);
+                // Int component into a float global: cast to keep the static's type.
+                let val = if matches!(gty, Ty::Float) && matches!(comp_ty, Ty::Int) {
+                    format!("{} as f64", rhs)
+                } else {
+                    rhs.to_string()
+                };
+                if Self::global_is_cell(&gty) {
+                    self.line(&format!("{}.with(|c| c.set({}));", g, val));
+                } else {
+                    self.line(&format!("{}.with(|c| *c.borrow_mut() = {});", g, val));
+                }
+                return;
+            }
+        }
         let target_e = escape_ident(target);
         if !self.declared.contains(target) {
             // Fresh binding.
@@ -1333,6 +1467,14 @@ impl<'a> Codegen<'a> {
         // captured-shadow entry so they resolve to the closure's binding.
         let saved_shadow_map = self.shadow_map.clone();
         let saved_shadow_counter = std::mem::replace(&mut self.shadow_counter, 0);
+        // (W4-a) A nested def has its OWN `global` declarations — a `global NAME`
+        // in a closure still refers to the enclosing MODULE (never the enclosing
+        // function), so a rebind of it under `global` writes the module static.
+        // Reads of a global inside the closure need no declaration and are emitted
+        // directly (never captured), so they are call-time live.
+        let mut nested_globals = std::collections::HashSet::new();
+        crate::typeck::collect_global_decls(&f.body, &mut nested_globals);
+        let saved_fn_globals = std::mem::replace(&mut self.fn_globals, nested_globals);
 
         // Overlay the nested params onto the captured locals (a param SHADOWS a
         // captured enclosing name of the same identifier).
@@ -1366,7 +1508,9 @@ impl<'a> Codegen<'a> {
         Self::collect_hoistable(&f.body, 0, &mut block_assigned);
         let params: std::collections::HashSet<&str> = f.params.iter().map(|p| p.name.as_str()).collect();
         let mut hoist: Vec<String> = block_assigned.into_iter()
-            .filter(|n| !params.contains(n.as_str()) && !self.declared.contains(n))
+            .filter(|n| !params.contains(n.as_str()) && !self.declared.contains(n)
+                        // (W4-a) A `global`-declared name is the module static.
+                        && !self.fn_globals.contains(n))
             .collect();
         hoist.sort();
         for hname in hoist {
@@ -1380,6 +1524,13 @@ impl<'a> Codegen<'a> {
                 self.hoisted.insert(hname.clone());
                 self.declared.insert(hname);
             }
+        }
+        // (W4-a) Purge any `global`-declared name the prescan inferred into `locals`
+        // so a rebind resolves to the module static, not a captured/hoisted local.
+        for g in self.fn_globals.clone() {
+            self.locals.remove(&g);
+            self.declared.remove(&g);
+            self.hoisted.remove(&g);
         }
         for s in &f.body {
             self.emit_stmt(s)?;
@@ -1396,6 +1547,7 @@ impl<'a> Codegen<'a> {
         self.hoisted = saved_hoisted;
         self.shadow_map = saved_shadow_map;
         self.shadow_counter = saved_shadow_counter;
+        self.fn_globals = saved_fn_globals;
 
         self.indent -= 1;
         if wrap_block {

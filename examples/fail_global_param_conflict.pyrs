@@ -1,0 +1,12 @@
+# W4-a (F7) negative: a name cannot be both a PARAMETER and a `global` in the same
+# function. CPython raises SyntaxError ("name 'x' is parameter and global"); pyrst
+# silently ignored the passed argument before and operated on the module global —
+# now an honest check error.
+x: int = 0
+
+def f(x: int) -> int:
+    global x
+    return x
+
+def main() -> None:
+    print(f(5))

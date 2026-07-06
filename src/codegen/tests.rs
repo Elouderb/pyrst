@@ -931,3 +931,165 @@ def main() -> None:
         let p = ctx.with_module_symbols_promoted(Some("cfg"));
         assert_eq!(p.vars.get("TAG"), Some(&Ty::Str), "cfg's own str const type wins in its checking view");
     }
+
+    // ── W4-a fix round (F1/F2/F3/F5/F6) ─────────────────────────────────────────
+
+    /// Unique temp directory for a multi-file test (each writes its own `.pyrs`
+    /// files and drives `resolver::resolve`). Cleaned up by the caller.
+    fn w4a_tmp_dir(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("pyrst_w4a_{}_{}_{}", tag, std::process::id(), nanos));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// (F5) `__pyrst_init_globals` forces globals in CPYTHON IMPORT ORDER: a root
+    /// initializer that textually PRECEDES an import runs before the imported
+    /// module's, and one after it runs after — a DFS interleave, not the old flat
+    /// imports-first-root-last order.
+    #[test]
+    fn w4a_f5_init_order_interleaves_imports_cpython_order() {
+        let dir = w4a_tmp_dir("f5");
+        std::fs::write(
+            dir.join("helper.pyrs"),
+            "def h_emit(tag: str) -> int:\n    print(tag)\n    return 0\n_h: int = h_emit(\"helper-init\")\n",
+        ).unwrap();
+        let root = dir.join("rootmain.pyrs");
+        std::fs::write(
+            &root,
+            "def r_emit(tag: str) -> int:\n    print(tag)\n    return 0\n_pre: int = r_emit(\"root-pre\")\nimport helper\n_post: int = r_emit(\"root-post\")\ndef main() -> None:\n    print(\"main\")\n",
+        ).unwrap();
+        let prog = crate::resolver::resolve(&root).expect("resolve");
+        let rust = crate::codegen::emit_program(&prog.modules, &prog.ctx).expect("emit");
+        // Isolate the init fn body and assert the force order interleaves.
+        let after = rust.split("fn __pyrst_init_globals()").nth(1).expect("init fn present");
+        let body = &after[..after.find('}').expect("init fn body")];
+        let p_pre = body.find("__pyrst_g__pre").expect("_pre forced");
+        let p_h = body.find("__pyrst_g_helper___h").expect("helper _h forced");
+        let p_post = body.find("__pyrst_g__post").expect("_post forced");
+        assert!(
+            p_pre < p_h && p_h < p_post,
+            "init order must be root-pre < helper < root-post (CPython interleave), got:\n{}",
+            body
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (F6) A `global BAR` naming a binding that lives only in an IMPORTED module
+    /// (not the declaring module) is an honest check error — cross-module global
+    /// writes are deferred, so the write would otherwise lower to a dead local.
+    #[test]
+    fn w4a_f6_cross_module_global_write_rejected() {
+        let dir = w4a_tmp_dir("f6");
+        std::fs::write(
+            dir.join("bmod.pyrs"),
+            "BAR: int = 5\ndef get_bar() -> int:\n    return BAR\n",
+        ).unwrap();
+        let root = dir.join("amod.pyrs");
+        std::fs::write(
+            &root,
+            "import bmod\ndef f() -> None:\n    global BAR\n    BAR = 999\ndef main() -> None:\n    f()\n    print(bmod.get_bar())\n",
+        ).unwrap();
+        let prog = crate::resolver::resolve(&root).expect("resolve");
+        let mut rejected = false;
+        for (m, _src) in &prog.modules {
+            if let Err(e) = crate::typeck::check_bodies(m, &prog.ctx) {
+                let msg = format!("{}", e);
+                if msg.contains("BAR") && msg.contains("module") {
+                    rejected = true;
+                }
+            }
+        }
+        assert!(rejected, "cross-module `global BAR` must be an honest check error");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (F1) A `global` rebind inside an operator dunder lowers to the module
+    /// `thread_local!` write, not a discarded local shadow.
+    #[test]
+    fn w4a_f1_dunder_rebind_writes_static() {
+        let src = "\
+compares: int = 0
+
+class P:
+    v: int
+    def __init__(self, v: int) -> None:
+        self.v = v
+    def __eq__(self, other: P) -> bool:
+        global compares
+        compares = compares + 1
+        return self.v == other.v
+
+def main() -> None:
+    print(P(1) == P(1))
+    print(compares)
+";
+        let rust = crate::driver::compile_str(src).expect("compile_str");
+        assert!(
+            rust.contains("__pyrst_g_compares.with(|c| c.set("),
+            "a `global` rebind inside __eq__ must write the thread_local Cell, got:\n{}",
+            rust
+        );
+        assert!(
+            !rust.contains("let mut compares"),
+            "the __eq__ rebind must NOT lower to a local shadow, got:\n{}",
+            rust
+        );
+    }
+
+    /// (F2) A tuple-unpack rebind of `global`-declared names lowers each target to
+    /// its module static write, not a fresh destructuring `let`.
+    #[test]
+    fn w4a_f2_tuple_unpack_rebind_writes_statics() {
+        let src = "\
+a: int = 1
+b: int = 2
+
+def swap() -> None:
+    global a, b
+    a, b = b, a
+
+def main() -> None:
+    swap()
+    print(a)
+    print(b)
+";
+        let rust = crate::driver::compile_str(src).expect("compile_str");
+        assert!(
+            rust.contains("__pyrst_g_a.with(|c| c.set(") && rust.contains("__pyrst_g_b.with(|c| c.set("),
+            "both swapped globals must be written via their statics, got:\n{}",
+            rust
+        );
+        assert!(
+            !rust.contains("let (mut a, mut b)"),
+            "the global tuple-unpack must NOT emit a fresh destructuring `let`, got:\n{}",
+            rust
+        );
+    }
+
+    /// (F3) A mutating method on a global whose argument reads the same global
+    /// hoists the argument into a temp BEFORE the mutating `borrow_mut()` closure.
+    #[test]
+    fn w4a_f3_self_referencing_append_hoists_arg() {
+        let src = "\
+grid: list[int] = [1, 2, 3]
+
+def grow() -> None:
+    grid.append(grid[0])
+
+def main() -> None:
+    grow()
+    print(grid)
+";
+        let rust = crate::driver::compile_str(src).expect("compile_str");
+        assert!(
+            rust.contains("__pyrst_gm_") && rust.contains("__gc.borrow_mut().push("),
+            "the append argument must be hoisted into a `__pyrst_gm_` temp before the \
+             mutating borrow, got:\n{}",
+            rust
+        );
+    }

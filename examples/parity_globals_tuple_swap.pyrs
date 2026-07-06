@@ -1,0 +1,27 @@
+# W4-a (F2) regression: a tuple-unpack REBIND of `global`-declared names must write
+# the module mutable statics, not fresh locals. Before the fix the multi-target
+# assign path emitted `let (mut a, mut b) = ...` and never touched the statics
+# (silent miscompile: python3 5,6 / pyrst 1,2). Covers a pure swap AND a mixed
+# local+global target list. Dual-run vs python3.
+a: int = 1
+b: int = 2
+
+def swap() -> None:
+    global a, b
+    a, b = b, a
+
+def rotate(n: int) -> int:
+    global a, b
+    local: int = n
+    # mixed list: two globals (a, b) + one genuine local (local)
+    a, b, local = b, local, a
+    return local
+
+def main() -> None:
+    swap()
+    print(a)
+    print(b)
+    r: int = rotate(100)
+    print(a)
+    print(b)
+    print(r)

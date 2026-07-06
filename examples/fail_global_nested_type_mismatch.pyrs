@@ -1,0 +1,16 @@
+# W4-a (F9) negative: a `global` rebind inside a NESTED def is type-checked against
+# the module binding's declared type, exactly like one in a top-level function.
+# `counter` is declared int, so rebinding it to a str inside the nested `inner` is a
+# pyrst type error — before the fix `check_nested_def` never applied global decls, so
+# this passed check and died as a raw rustc E0308 at build.
+counter: int = 0
+
+def outer() -> None:
+    def inner() -> None:
+        global counter
+        counter = "oops"
+    inner()
+
+def main() -> None:
+    outer()
+    print(counter)

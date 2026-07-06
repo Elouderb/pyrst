@@ -1,0 +1,9 @@
+# W4-a negative: `nonlocal` is honestly deferred — pyrst closures capture by
+# value (EPIC-4), so an inner function cannot rebind an enclosing local.
+def outer() -> int:
+    x: int = 0
+    def inner() -> None:
+        nonlocal x
+        x = 5
+    inner()
+    return x

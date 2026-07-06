@@ -1,0 +1,22 @@
+# W4-a: a module-level mutable global list (`items`) MUTATED in place by
+# `.append()` from a function WITHOUT a `global` declaration — CPython-faithful
+# (a mutation needs no `global`; only a rebind does). Lowers to a thread_local
+# RefCell<Vec<i64>> whose borrow_mut().push() runs inside one `.with()`.
+items: list[int] = []
+
+def add(x: int) -> None:
+    items.append(x)
+
+def total() -> int:
+    s: int = 0
+    for v in items:
+        s = s + v
+    return s
+
+def main() -> None:
+    add(1)
+    add(2)
+    add(3)
+    print(items)
+    print(len(items))
+    print(total())

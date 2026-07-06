@@ -1,0 +1,9 @@
+# W4-a negative: rebinding a module binding inside a function WITHOUT `global`
+# makes it a function-local for the whole function, so reading it before the
+# local assignment is Python's UnboundLocalError. pyrst rejects it honestly (the
+# p09 trap) instead of silently reading the stale module value.
+counter: int = 0
+
+def f() -> int:
+    counter = counter + 1
+    return counter

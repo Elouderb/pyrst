@@ -1,0 +1,5 @@
+# W4-a negative: `global NAME` must name a real module-level binding — pyrst
+# cannot create a module global from inside a function (no type annotation).
+def f() -> None:
+    global undeclared_thing
+    undeclared_thing = 5

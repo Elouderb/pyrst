@@ -183,6 +183,8 @@ impl Formatter {
             Stmt::Pass(_) => self.writeln("pass"),
             Stmt::Break(_) => self.writeln("break"),
             Stmt::Continue(_) => self.writeln("continue"),
+            Stmt::Global { names, .. } => self.writeln(&format!("global {}", names.join(", "))),
+            Stmt::Nonlocal { names, .. } => self.writeln(&format!("nonlocal {}", names.join(", "))),
             Stmt::Assert { cond, msg, .. } => {
                 let cond_str = self.format_expr(cond)?;
                 if let Some(m) = msg {

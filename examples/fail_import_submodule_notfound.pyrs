@@ -1,0 +1,8 @@
+# W3-3 honesty: an unresolved dotted import is an ImportNotFound naming the FULL
+# dotted id EVEN when the parent resolves. `os` is a real embedded module but
+# `os.nonexistent` is not — this must error (never silently truncate to `os`).
+import os.nonexistent
+
+
+def main() -> None:
+    print(1)

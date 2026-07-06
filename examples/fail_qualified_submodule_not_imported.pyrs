@@ -1,0 +1,9 @@
+# W3-3 honesty (explicit-import-required): `import os` does NOT auto-expose the
+# `os.path` submodule (a documented v1 divergence from CPython). A qualified
+# `os.path.basename(...)` without `import os.path` is an honest check error that
+# SUGGESTS the missing submodule import — never a silent truncation to `os`.
+import os
+
+
+def main() -> None:
+    print(os.path.basename("/a/b.txt"))

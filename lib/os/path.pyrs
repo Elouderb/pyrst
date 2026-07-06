@@ -1,0 +1,55 @@
+# os.path — pyrst embedded submodule (W3-3 placeholder; W3-4 ships the full port)
+#
+# A DOTTED submodule resolved by `import os.path` / `from os.path import …`,
+# registered under the dotted id "os.path" in src/stdlib.rs (directory layout
+# lib/os/path.pyrs, matching CPython's posixpath). It is a DISTINCT module from
+# the plain `os` (lib/os.pyrs): `import os` does not expose `os.path` — you must
+# import `os.path` explicitly (documented honest v1 divergence from CPython,
+# which re-exports posixpath as an attribute of the `os` module object; pyrst has
+# no module-object-as-value, so the honest form is an explicit submodule import).
+#
+# W3-3 scope: three PURE (no @extern, no @crate) string-logic functions, each a
+# faithful port of CPython's posixpath — so a dual-run parity golden against
+# python3's real os.path holds byte-for-byte. basename/dirname are the exact,
+# already-python3-verified string logic re-homed from lib/os.pyrs (the flat
+# os.basename/os.dirname stay as deprecated aliases there for one release, per the
+# W3 design §E); isabs is the trivial posixpath predicate. W3-4 adds
+# join/split/splitext/normpath/… on top of this same infrastructure.
+
+
+def basename(p: str) -> str:
+    # CPython posixpath.basename is PURE STRING logic: everything after the last
+    # "/" (may be empty for a trailing slash; "." and ".." are returned verbatim).
+    parts: list[str] = p.split("/")
+    return parts[len(parts) - 1]
+
+
+def dirname(p: str) -> str:
+    # CPython posixpath.dirname, pure string logic: everything up to (and
+    # excluding) the last "/", with trailing slashes stripped UNLESS the head is
+    # all slashes ("//x" -> "//", "/" -> "/").
+    parts: list[str] = p.split("/")
+    n: int = len(parts)
+    if n == 1:
+        return ""
+    head_parts: list[str] = []
+    i: int = 0
+    while i < n - 1:
+        head_parts.append(parts[i])
+        i = i + 1
+    head: str = "/".join(head_parts) + "/"
+    all_slash: bool = True
+    for ch in head:
+        if ch != "/":
+            all_slash = False
+    if not all_slash:
+        end: int = len(head)
+        while end > 0 and head[end - 1] == "/":
+            end = end - 1
+        head = head[0:end]
+    return head
+
+
+def isabs(p: str) -> bool:
+    # CPython posixpath.isabs: a path is absolute iff it starts with "/".
+    return p.startswith("/")

@@ -1,0 +1,23 @@
+# W3-3: `import os` and `import os.path` TOGETHER — the plain module and its
+# dotted submodule coexist with NO interference. Both define `basename`/`dirname`,
+# but under per-module namespacing they emit as distinct owner-mangled symbols
+# (`__pyrst_m_os__*` vs `__pyrst_m_os_dpath__*`), and the qualified `os.X` /
+# `os.path.X` calls resolve owner-first to the RIGHT module. This uses only
+# CPython-valid, deterministic surface (os.sep + pure os.path functions) so it
+# dual-runs against python3 as the golden oracle.
+
+import os
+import os.path
+
+
+def main() -> None:
+    # os module: the separator constant (deterministic "/").
+    print(os.sep)
+
+    # os.path submodule: pure string functions, unaffected by the co-imported os.
+    print(os.path.basename("/a/b.txt"))
+    print(os.path.dirname("/a/b.txt"))
+
+    # Combine both modules in one expression: os.path.isabs of os.sep.
+    print(os.path.isabs(os.sep))
+    print(os.path.basename(os.sep))

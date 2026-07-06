@@ -1,0 +1,16 @@
+# W3-3: `from os.path import …` binds the FULL dotted owner "os.path" (the F16
+# fix — no truncation to "os"), so a BARE call to the imported name lowers to the
+# submodule's owner-mangled symbol `__pyrst_m_os_dpath__<name>`, matching the
+# definition emitted for lib/os/path.pyrs. Dual-runs against python3, which also
+# supports `from os.path import basename, dirname, isabs`.
+
+from os.path import basename, dirname, isabs
+
+
+def main() -> None:
+    print(basename("/usr/local/bin/pyrst"))
+    print(dirname("/usr/local/bin/pyrst"))
+    print(isabs("/usr/local/bin/pyrst"))
+    print(isabs("relative/path"))
+    print(basename("noslash"))
+    print(dirname("noslash"))

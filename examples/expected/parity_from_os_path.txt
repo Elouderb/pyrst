@@ -1,0 +1,5 @@
+pyrst
+/usr/local/bin
+True
+False
+noslash

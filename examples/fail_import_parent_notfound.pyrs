@@ -1,0 +1,7 @@
+# W3-3 honesty: an unresolved dotted import whose PARENT also does not resolve is
+# an ImportNotFound naming the full dotted id.
+import nope.alsonope
+
+
+def main() -> None:
+    print(1)

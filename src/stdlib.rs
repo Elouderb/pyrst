@@ -24,6 +24,14 @@
 /// time, so this map is fully static (no filesystem read at runtime).
 pub const EMBEDDED_STDLIB: &[(&str, &str)] = &[
     ("os", include_str!("../lib/os.pyrs")),
+    // (W3-3) DOTTED submodule key: `import os.path` / `from os.path import …`
+    // resolves this embedded package module (directory layout `lib/os/path.pyrs`,
+    // keyed by the dotted id `"os.path"`). `os` (a plain module, `lib/os.pyrs`) and
+    // `os.path` (a distinct submodule) coexist on disk exactly as in CPython, and
+    // are independent imports — `import os` does NOT expose `os.path` (explicit
+    // import required, a documented honest v1 divergence). W3-4 fills out the full
+    // faithful `os.path`; this is the minimal real module (basename/dirname/isabs).
+    ("os.path", include_str!("../lib/os/path.pyrs")),
     ("time", include_str!("../lib/time.pyrs")),
     ("operator", include_str!("../lib/operator.pyrs")),
     ("functools", include_str!("../lib/functools.pyrs")),

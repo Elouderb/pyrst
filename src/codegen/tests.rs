@@ -751,7 +751,8 @@ def main() -> None:
     fn w3_mangle_const_owner_qualified() {
         assert_eq!(mangle_const(None, "PI"), "__pyrst_const_PI");
         assert_eq!(mangle_const(Some("sys"), "version"), "__pyrst_const_sys__version");
-        assert_eq!(mangle_const(Some("os.path"), "sep"), "__pyrst_const_os_path__sep");
+        // (W3-3) A dotted owner sanitizes collision-proof: `.` → `_d`.
+        assert_eq!(mangle_const(Some("os.path"), "sep"), "__pyrst_const_os_dpath__sep");
     }
 
     /// W3-2: `emit_name` — a ROOT (None) free-function name stays crate-root
@@ -764,7 +765,43 @@ def main() -> None:
         assert_eq!(cg.emit_name(None, "escape"), "escape");
         assert_eq!(cg.emit_name(None, "type"), "r#type"); // root keyword still escapes
         assert_eq!(cg.emit_name(Some("re"), "escape"), "__pyrst_m_re__escape");
-        assert_eq!(cg.emit_name(Some("os.path"), "join"), "__pyrst_m_os_path__join");
+        // (W3-3) A dotted owner sanitizes collision-proof: `os.path` → `os_dpath`.
+        assert_eq!(cg.emit_name(Some("os.path"), "join"), "__pyrst_m_os_dpath__join");
+    }
+
+    /// (W3-3) The mangler is COLLISION-PROOF: a dotted module id and a hypothetical
+    /// flat module whose bare name contains the sanitized separator must NEVER
+    /// produce the same emitted identifier (the naive `.replace('.', "_")` would
+    /// map both `a.b` and `a_b` to `a_b`, silently cross-wiring their symbols).
+    /// `mangle_mod_id` escapes `_` → `_u` and `.` → `_d`, so the mapping is
+    /// injective — distinct module ids give distinct fragments, at every emission
+    /// site (`emit_name`, `emit_class_name`, `mangle_const`).
+    #[test]
+    fn w3_mangler_is_collision_proof() {
+        // The exact collision the design flagged: dotted `a.b` vs flat `a_b`.
+        assert_eq!(mangle_mod_id("a.b"), "a_db");
+        assert_eq!(mangle_mod_id("a_b"), "a_ub");
+        assert_ne!(mangle_mod_id("a.b"), mangle_mod_id("a_b"));
+
+        // Boundary cases: a trailing/leading underscore adjacent to the separator
+        // must not alias two DIFFERENT dotted ids onto one fragment.
+        assert_ne!(mangle_mod_id("a_.b"), mangle_mod_id("a._b"));
+        assert_eq!(mangle_mod_id("a_.b"), "a_u_db");
+        assert_eq!(mangle_mod_id("a._b"), "a_d_ub");
+
+        // A single-component id with no underscore is unchanged (existing single
+        // -module mangled names stay byte-identical).
+        assert_eq!(mangle_mod_id("os"), "os");
+        assert_eq!(mangle_mod_id("re"), "re");
+
+        // The property propagates through every emission site.
+        let mut ctx = TyCtx::new();
+        ctx.class_owner.insert("C".to_string(), "a.b".to_string());
+        let cg = Codegen::new(&ctx);
+        assert_ne!(cg.emit_name(Some("a.b"), "f"), cg.emit_name(Some("a_b"), "f"));
+        assert_eq!(cg.emit_name(Some("a.b"), "f"), "__pyrst_m_a_db__f");
+        assert_eq!(cg.emit_class_name("C"), "__pyrst_m_a_db__C");
+        assert_ne!(mangle_const(Some("a.b"), "K"), mangle_const(Some("a_b"), "K"));
     }
 
     /// W3-2: `emit_class_name` resolves the owner from the GLOBAL `class_owner`

@@ -154,6 +154,26 @@ pub fn kwargs_provided_in_eval_order<'a>(
 ///     the corresponding call branch validates names/duplicates/missing and the
 ///     call lowers as a full positional call.
 ///
+/// (W3-3) Extract the MODULE owner named by a qualified-call callee's receiver
+/// `obj`, supporting both a single-component `X.f()` (`obj = Ident("X")` → owner
+/// `"X"`) and a TWO-component dotted `a.b.f()` (`obj = Attr{Ident("a"), "b"}` →
+/// owner `"a.b"`). Any other shape — a longer chain, a non-`Ident` base, or an
+/// instance receiver — is `None`, so the caller falls through to the
+/// instance-method / field paths unchanged. A returned owner is only ever treated
+/// as a module when it is an actually-registered module id (checked against
+/// `module_funcs` / `module_symbols`), so a genuine local `a.b.f()` method chain
+/// (where `"a.b"` is not a module) never false-matches.
+pub(crate) fn module_owner_of(obj: &Expr) -> Option<String> {
+    match obj {
+        Expr::Ident(a, _) => Some(a.clone()),
+        Expr::Attr { obj: inner, name: b, .. } => match inner.as_ref() {
+            Expr::Ident(a, _) => Some(format!("{}.{}", a, b)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Still rejected (honest, check-time): keyword arguments on builtin stubs
 /// (`abs(x=5)` — CPython builtins are positional-only), on `@staticmethod`
 /// calls via the class name, on function-valued locals / lambdas, and on
@@ -691,8 +711,13 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
                 // real embedded module (`lib/math.pyrs`), so `math.sqrt(x)` flows
                 // through here (its @extern `sqrt` lives in `module_funcs`); the
                 // former hardcoded math return-typing arm is gone.
-                if let Expr::Ident(modname, _) = obj.as_ref() {
-                    if ctx.module_funcs.get(modname).is_some_and(|fns| fns.iter().any(|n| n == name)) {
+                if let Some(modname) = module_owner_of(obj) {
+                    // (W3-3) `modname` is the single- OR two-component module owner
+                    // (`os` for `os.f()`, `os.path` for `os.path.f()`); both resolve
+                    // identically once registered under their dotted id. A non-module
+                    // `a.b` (local method chain) misses `module_funcs` and falls to
+                    // the instance path below.
+                    if ctx.module_funcs.get(&modname).is_some_and(|fns| fns.iter().any(|n| n == name)) {
                         // Generics v1: a QUALIFIED generic stdlib call
                         // (`heapq.heappop(h)`) substitutes its inferred type args so
                         // codegen sees a CONCRETE result type — the same handling as
@@ -705,7 +730,7 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
                         // to the flat table only for synthetic single-module ctxs.
                         // `oracle_generic_call_ret` still keys generics by the bare
                         // `name` against the (flat, global) generic maps — unchanged.
-                        return match ctx.resolve_module_func(modname, name) {
+                        return match ctx.resolve_module_func(&modname, name) {
                             Some(sig) => {
                                 let arg_tys: Vec<Ty> = args.iter()
                                     .map(|a| infer_expr_ty(a, locals, ctx))
@@ -1484,9 +1509,41 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
             if env.locals.contains_key(name.as_str()) {
                 env.used_vars.insert(name.clone());
             }
-            // Allow standard library modules (math, dataclasses, etc.) to be Ty::Unknown
-            if matches!(name.as_str(), "math" | "dataclasses" | "sys" | "os" | "json" | "re" | "collections" | "itertools") {
+            // A bare STDLIB module name (used opaquely as the base of `os.x` before
+            // the Attr/Call arm recurses here) types as `Ty::Unknown`. `dataclasses`
+            // is the decorator-only skip-list module (never a real loaded module), so
+            // it stays unconditionally opaque as before.
+            //
+            // (W3-3) IMPORT-AWARENESS: the other stdlib names are opaque ONLY when
+            // the module is actually IMPORTED. An UNIMPORTED stdlib name used
+            // qualified — `os.getcwd()` / `os.sep` with only `import os.path` (or no
+            // `os` import at all) — is an honest "not imported" CHECK error, not a
+            // silent `Ty::Unknown` that passes `check` and then dies at rustc as an
+            // undefined `os` (E0425). This is the death of the `import os.path`
+            // silent-truncation symptom (design P3b): `import os.path` no longer
+            // loads `os`, so a bare `os.getcwd()` beside it must be rejected, and
+            // rejected HERE (at check) rather than deferred to `build`. A LOCAL
+            // variable that happens to share a stdlib name (`string = "hi"`) is a
+            // normal local and resolves via `env.lookup` below (the `!locals` guard),
+            // so no real program regresses.
+            if name == "dataclasses" {
                 Ty::Unknown
+            } else if matches!(name.as_str(), "math" | "sys" | "os" | "json" | "re" | "collections" | "itertools")
+                && !env.locals.contains_key(name.as_str())
+            {
+                let imported = env.ctx.module_funcs.contains_key(name.as_str())
+                    || env.ctx.module_consts.contains_key(name.as_str())
+                    || env.ctx.module_symbols.contains_key(name.as_str());
+                if imported {
+                    Ty::Unknown
+                } else {
+                    return Err(Error::Type {
+                        span: *span,
+                        msg: format!(
+                            "module `{name}` is used but not imported; add `import {name}`"
+                        ),
+                    });
+                }
             } else {
                 env.lookup(name).ok_or_else(|| Error::Type {
                     span: *span,
@@ -2301,14 +2358,16 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                     // here (see the unknown-qualified-call rejection below), not a
                     // silently-Unknown call.
                     if let Expr::Attr { obj, name, span: attr_span } = callee.as_ref() {
-                        if let Expr::Ident(modname, _) = obj.as_ref() {
-                            if let Some(mod_fns) = env.ctx.module_funcs.get(modname) {
+                        if let Some(modname) = module_owner_of(obj) {
+                            // (W3-3) `modname` is the single- OR two-component module
+                            // owner (`os` for `os.f()`, `os.path` for `os.path.f()`).
+                            if let Some(mod_fns) = env.ctx.module_funcs.get(&modname) {
                                 if mod_fns.iter().any(|n| n == name) {
                                     // (W3-1) f is defined by module `modname` —
                                     // resolve its signature OWNER-FIRST against that
                                     // module's own per-module table (flat fallback
                                     // only for synthetic ctxs), not the flat table.
-                                    let sig = env.ctx.resolve_module_func(modname, name).cloned().ok_or_else(|| Error::Type {
+                                    let sig = env.ctx.resolve_module_func(&modname, name).cloned().ok_or_else(|| Error::Type {
                                         span: *attr_span,
                                         msg: format!("module `{}` function `{}` has no signature", modname, name),
                                     })?;
@@ -2375,6 +2434,31 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                                     return Err(Error::Type {
                                         span: *attr_span,
                                         msg: format!("module `{}` has no function `{}`", modname, name),
+                                    });
+                                }
+                            } else if let Some((parent, sub)) = modname.split_once('.') {
+                                // (W3-3, item 3) `a.b.f()` where the dotted module
+                                // `a.b` is NOT imported, but its PARENT `a` IS a known
+                                // module. pyrst does not auto-expose submodules on
+                                // `import a` (the explicit-import-required divergence),
+                                // so this is an honest error that SUGGESTS the missing
+                                // submodule import — never a silent `Ty::Unknown` call
+                                // that then dies at rustc, and never a truncation to
+                                // the parent (`os.path.join(...)` must not run
+                                // `os.join`).
+                                if env.ctx.module_funcs.contains_key(parent)
+                                    || env.ctx.module_consts.contains_key(parent)
+                                    || env.ctx.module_symbols.contains_key(parent)
+                                {
+                                    return Err(Error::Type {
+                                        span: *attr_span,
+                                        msg: format!(
+                                            "module `{parent}` has no attribute `{sub}`; \
+                                             if `{modname}` is a submodule, import it \
+                                             explicitly with `import {modname}` (pyrst \
+                                             does not auto-expose submodules on `import \
+                                             {parent}`)"
+                                        ),
                                     });
                                 }
                             }

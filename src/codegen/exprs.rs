@@ -207,8 +207,20 @@ impl<'a> Codegen<'a> {
                     // cross-module same-name collision between two modules is
                     // unresolved (stdlib uses distinct names; per-module
                     // namespacing `X__f` is a later refinement).
-                    if let Expr::Ident(modname, _) = obj.as_ref() {
-                        if self.ctx.module_funcs.get(modname).is_some_and(|fns| fns.iter().any(|n| n == name)) {
+                    // (W3-2/W3-3) The qualifier is the owner module id: a
+                    // single-component `X.f()` (`obj = Ident("X")` → owner "X") or a
+                    // TWO-component dotted `a.b.f()` (`obj = Attr{Ident("a"), "b"}` →
+                    // owner "a.b"). Any other receiver shape is not a module call.
+                    let qual_owner: Option<String> = match obj.as_ref() {
+                        Expr::Ident(m, _) => Some(m.clone()),
+                        Expr::Attr { obj: inner, name: b, .. } => match inner.as_ref() {
+                            Expr::Ident(a, _) => Some(format!("{}.{}", a, b)),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some(modname) = qual_owner {
+                        if self.ctx.module_funcs.get(&modname).is_some_and(|fns| fns.iter().any(|n| n == name)) {
                             let span = callee.span();
                             let flat_callee: Box<Expr> = Box::new(Expr::Ident(name.clone(), span));
                             // (card d8a1ed83, kwargs v1) Forward `kwargs` (NOT
@@ -216,13 +228,15 @@ impl<'a> Codegen<'a> {
                             // into emit_plain_func_call's keyword→positional
                             // mapping (`textwrap.fill(text, width=10)` lowers
                             // exactly like the flat `fill(text, width=10)`).
-                            // (W3-2) The qualifier `modname` IS the owner module
-                            // (single-component id today; dotted is stage 3): thread
-                            // it as `callee_owner` so the callee emits the
-                            // owner-mangled `__pyrst_m_<modname>__<name>` while the
-                            // synthesized BARE `Ident(name)` still drives the sig /
-                            // kwarg / coercion lookups (which key by bare name).
-                            return Ok(Some(self.emit_plain_func_call(&flat_callee, args, kwargs, Some(modname.clone()))?));
+                            // (W3-2/W3-3) The qualifier `modname` IS the owner module
+                            // (single or dotted id): thread it as `callee_owner` so
+                            // the callee emits the owner-mangled
+                            // `__pyrst_m_<mangle_mod_id(modname)>__<name>` (e.g.
+                            // `os.path.basename` → `__pyrst_m_os_dpath__basename`)
+                            // while the synthesized BARE `Ident(name)` still drives
+                            // the sig / kwarg / coercion lookups (which key by bare
+                            // name).
+                            return Ok(Some(self.emit_plain_func_call(&flat_callee, args, kwargs, Some(modname))?));
                         }
                     }
 

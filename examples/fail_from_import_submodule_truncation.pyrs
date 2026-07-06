@@ -1,0 +1,10 @@
+# W3-3 honesty: the death of the from-import truncation. `os` (imported here) DOES
+# define `join`, but the dotted `from os.path import join` must bind the SUBMODULE
+# `os.path` (which has no `join`) and NEVER fall back to `os.join`. Honest check
+# error, not a silent bind of the parent's symbol.
+import os
+from os.path import join
+
+
+def main() -> None:
+    print(join("a", "b"))

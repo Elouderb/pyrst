@@ -137,8 +137,16 @@ impl Resolver {
         // Recurse into this module's imports BEFORE adding self to order (post-order DFS)
         for stmt in &m.stmts {
             if let Stmt::Import { path, span, .. } = stmt {
-                // Phase 8: only use first component of dotted path (same-directory imports only)
-                let mod_name = &path[0];
+                // (W3-3) Resolve the FULL dotted import path against a DIRECTORY
+                // layout, keyed by the canonical dotted module id (`path.join(".")`)
+                // — killing the old `path[0]` truncation (`import os.path` used to
+                // silently compile as `import os`, dropping `.path`; a violation of
+                // pyrst's honest-errors invariant). A single-component `import os`
+                // has `mod_id == path[0]`, so its resolution is byte-identical to the
+                // pre-W3-3 path. An empty path cannot arise from the parser, but the
+                // `unwrap_or` keeps this total rather than panicking.
+                let mod_id = path.join(".");
+                let mod_name = mod_id.as_str();
 
                 // Skip standard library modules that are NOT yet real modules
                 // (no codegen, no embedded source). `dataclasses` has dedicated
@@ -162,32 +170,59 @@ impl Resolver {
                 // `platform`/`version`/`version_info`/`exit`), so it must
                 // reach the resolution path. `dataclasses` stays: it has no
                 // real module body, only decorator handling.
-                if matches!(mod_name.as_str(), "dataclasses") {
+                if mod_name == "dataclasses" {
                     continue;
                 }
 
-                // Resolution order: a LOCAL `<base_dir>/<mod>.pyrs` on disk
-                // SHADOWS an embedded stdlib module of the same name.
-                let dep_path = base_dir.join(format!("{}.pyrs", mod_name));
+                // (W3-3) DIRECTORY layout: a dotted id `a.b.c` maps to the nested
+                // relative path `a/b/c.pyrs` — the leaf `.pyrs` under a package
+                // directory chain (`import a.b` → `a/b.pyrs`; `import os` →
+                // `os.pyrs`, byte-identical to the pre-W3-3 single-file join). This
+                // mirrors CPython packages (`urllib/parse.py`) and is the natural
+                // shape for a LOCAL user package. `path` is always non-empty from the
+                // parser; `split_last` therefore always succeeds.
+                let rel_layout = |base: &Path| -> PathBuf {
+                    match path.split_last() {
+                        Some((last, prefix)) => {
+                            let mut p = base.to_path_buf();
+                            for seg in prefix {
+                                p = p.join(seg);
+                            }
+                            p.join(format!("{}.pyrs", last))
+                        }
+                        None => base.join(format!("{}.pyrs", mod_name)),
+                    }
+                };
+
+                // Resolution order: a LOCAL `<base_dir>/a/b.pyrs` on disk SHADOWS an
+                // embedded stdlib module keyed by the same dotted id.
+                let dep_path = rel_layout(base_dir);
                 if let Ok(dep_abs) = dep_path.canonicalize() {
-                    // Local file found. The dotted import path that reaches it is
-                    // its module id (W3-1); for a single-component `import mod` that
-                    // is `mod_name` itself.
-                    self.visit(dep_abs, base_dir, *span, Some(mod_name.clone()))?;
+                    // Local file found. Its module id is the FULL dotted import path
+                    // that reached it (W3-1/W3-3) — for a single-component `import
+                    // mod` that is `mod_name` itself.
+                    self.visit(dep_abs, base_dir, *span, Some(mod_id.clone()))?;
                 } else if let Some(embedded_src) = crate::stdlib::lookup(mod_name) {
-                    // No local file → resolve from the EMBEDDED stdlib. Use a
-                    // synthetic `<stdlib>/<mod>.pyrs` key so caching, cycle
-                    // detection, and diagnostics all work like a file module, and
-                    // resolve the embedded module's OWN imports against the same
-                    // synthetic stdlib dir (local-then-embedded, recursively).
+                    // No local file → resolve from the EMBEDDED stdlib, keyed by the
+                    // DOTTED id (`EMBEDDED_STDLIB` gained dotted entries, e.g.
+                    // `"os.path"` → `lib/os/path.pyrs`). Use a synthetic
+                    // `<stdlib>/a/b.pyrs` key (mirroring the directory layout) so
+                    // caching, cycle detection, and diagnostics all work like a file
+                    // module, and resolve the embedded module's OWN imports against
+                    // the synthetic stdlib dir (local-then-embedded, recursively).
                     let stdlib_dir = stdlib_synthetic_dir();
-                    let dep_key = stdlib_dir.join(format!("{}.pyrs", mod_name));
+                    let dep_key = rel_layout(&stdlib_dir);
                     let dep_src = crate::lexer::normalize_line_endings(embedded_src);
-                    self.process_module(dep_key, dep_src, &stdlib_dir, *span, Some(mod_name.clone()))?;
+                    self.process_module(dep_key, dep_src, &stdlib_dir, *span, Some(mod_id.clone()))?;
                 } else {
-                    // Neither a local file nor an embedded module exists.
+                    // Neither a local file nor an embedded module exists for the FULL
+                    // dotted id. This is the honest death of the `path[0]` truncation:
+                    // `import os.nonexistent` (parent `os` real, submodule not) and
+                    // `import os.path` (before `lib/os/path.pyrs` exists) both error
+                    // here naming the FULL missing id `os.nonexistent` / `os.path` —
+                    // never silently resolving to the parent `os`.
                     return Err(Error::ImportNotFound {
-                        path: mod_name.clone(),
+                        path: mod_id.clone(),
                         span: *span,
                         importing_file: key.display().to_string(),
                     });
@@ -558,14 +593,14 @@ pub fn resolve(root_path: &Path) -> Result<ResolvedProgram> {
     // queryable — emission stays flat. The `dataclasses` skip-list is mirrored so
     // its decorator-only import is excluded exactly as in the resolution loop.
     for (idx, path) in resolver.order.iter().enumerate() {
-        let (m, _src) = &resolver.cache[path];
+        let (m, src) = &resolver.cache[path];
         let importer: String = if idx + 1 == total_modules {
             crate::typeck::ROOT_MODULE_ID.to_string()
         } else {
             m.module_id.clone().unwrap_or_else(|| crate::typeck::ROOT_MODULE_ID.to_string())
         };
         for s in &m.stmts {
-            if let Stmt::Import { path: imp_path, names, .. } = s {
+            if let Stmt::Import { path: imp_path, names, span } = s {
                 // A plain `import X` (empty `names`) binds no LOCAL name — only
                 // `from X import f, g` records local bindings.
                 if names.is_empty() {
@@ -574,20 +609,52 @@ pub fn resolve(root_path: &Path) -> Result<ResolvedProgram> {
                 if matches!(imp_path.first().map(String::as_str), Some("dataclasses")) {
                     continue;
                 }
-                // (W3-fix / F16) The binding OWNER must equal the module id the
-                // resolver actually registers this import under. Today a dotted
-                // import resolves only its FIRST component (`mod_name = &path[0]`,
-                // the same-directory single-component module), so the owner is
-                // `path[0]` — recording the full dotted `a.b` would leave the bare
-                // `f` mangling to `__pyrst_m_a_b__f` while the def emits
-                // `__pyrst_m_a__f` (E0425). Byte-identical for a single-component
-                // import (`path[0] == path.join(".")`).
-                // TODO(w3-stage3): when real dotted module ids land, record the full
-                // resolved dotted path here (and register the module under it).
-                let owner = imp_path
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| imp_path.join("."));
+                // (W3-3, was F16) The binding OWNER is the FULL dotted module id the
+                // resolver registered this import under (`imp_path.join(".")`) — the
+                // same id `process_module` stamped onto the module and
+                // `merge_ctx_from_module` keyed its per-module table by. The old
+                // `path[0]` truncation bound `from os.path import join` to owner `os`
+                // (silently binding `os.join`); the full id binds it to `os.path`, so
+                // the bare `join` mangles to `os.path`'s namespace — matching its def
+                // (or, when `os.path` has no `join`, caught by the validation below).
+                // Byte-identical for a single-component import (`join(".") == path[0]`).
+                let owner = imp_path.join(".");
+
+                // (W3-3) DOTTED from-import NAME validation — the honest death of the
+                // from-import truncation. `from os.path import join` must NEVER fall
+                // back to `os.join`: if the (real, resolved) submodule `os.path` does
+                // not export `join`, that is an honest check error here, not a bare
+                // `join()` that flat-resolves to a co-imported `os`'s `join` and then
+                // dies at rustc as an undefined `__pyrst_m_os_dpath__join` (E0425).
+                // SCOPED to dotted owners: a single-component `from os import getenv`
+                // keeps its exact prior behaviour (no new validation, zero regression
+                // risk) — truncation only ever affected dotted from-imports. The
+                // owner is always in `module_symbols` once resolved (merge records
+                // every non-root module's own funcs/classes/consts); if it somehow is
+                // not, we stay lenient rather than reject.
+                if owner.contains('.') {
+                    if let Some(syms) = ctx.module_symbols.get(&owner) {
+                        for (local, _alias) in names {
+                            let exported = syms.funcs.contains_key(local)
+                                || syms.classes.contains_key(local)
+                                || syms.consts.contains_key(local);
+                            if !exported {
+                                return Err(Error::Type {
+                                    span: *span,
+                                    msg: format!(
+                                        "cannot import name `{}` from submodule `{}` \
+                                         (it exports no top-level function, class, or \
+                                         constant named `{}`); a dotted `from {} import \
+                                         {}` never falls back to the parent module",
+                                        local, owner, local, owner, local
+                                    ),
+                                })
+                                .map_err(|e| e.with_render_source(m.source_path.clone(), src));
+                            }
+                        }
+                    }
+                }
+
                 for (local, _alias) in names {
                     // Aliases are rejected at parse, so the local name IS the
                     // imported name; record `local -> (owner, original)`.
@@ -1015,5 +1082,134 @@ class Account:
         assert!(matches!(a.ret, Ty::Int), "operator.sub returns int");
         assert_eq!(b.params.len(), 3, "re.sub is ternary");
         assert!(matches!(b.ret, Ty::Str), "re.sub returns str");
+    }
+
+    // ── W3-3: dotted-import resolution + embedded packages ────────────────────
+
+    /// W3-3: `import os.path` resolves the EMBEDDED submodule (`lib/os/path.pyrs`,
+    /// dotted key `"os.path"`) under the FULL dotted module id — NOT truncated to
+    /// `os`. Its per-module table + qualifier index are keyed by the dotted id, and
+    /// `os` itself is NOT loaded (explicit-import-required: `import os.path` does
+    /// not pull in the parent module).
+    #[test]
+    fn w3_dotted_embedded_submodule_resolves_under_full_id() {
+        let root = temp_root("import os.path\n\ndef main() -> None:\n    print(os.path.basename(\"/a/b.txt\"))\n");
+        let prog = resolve(&root).expect("`import os.path` resolves via the embedded stdlib");
+
+        // The submodule carries the DOTTED id "os.path" (not the ambiguous stem
+        // "path", and not the truncated "os").
+        assert!(
+            prog.modules.iter().any(|(m, _)| m.module_id.as_deref() == Some("os.path")),
+            "the submodule carries module_id \"os.path\""
+        );
+        // Its per-module table + qualifier index are keyed by the dotted id.
+        let syms = prog.ctx.module_symbols.get("os.path").expect("os.path has a per-module table");
+        assert!(syms.funcs.contains_key("basename"), "os.path.basename lives in os.path's table");
+        assert!(
+            prog.ctx.module_funcs.get("os.path").is_some_and(|fns| fns.iter().any(|n| n == "basename")),
+            "os.path.basename is qualifiable under the dotted id"
+        );
+        // Explicit-import-required: `import os.path` does NOT load the parent `os`.
+        assert!(
+            !prog.ctx.module_symbols.contains_key("os"),
+            "`import os.path` must NOT auto-load the parent `os` module"
+        );
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    /// W3-3: the death of the `path[0]` truncation. An unresolved dotted import is
+    /// an honest `ImportNotFound` naming the FULL dotted id — even when the PARENT
+    /// resolves (`import os.nonexistent`) and when the parent does not
+    /// (`import nope.whatever`). It must NEVER silently resolve to the parent.
+    #[test]
+    fn w3_unresolved_dotted_import_names_full_id() {
+        // Parent `os` is real, submodule is not: names the submodule, not `os`.
+        let root = temp_root("import os.nonexistent\n\ndef main() -> None:\n    print(1)\n");
+        match resolve(&root) {
+            Err(Error::ImportNotFound { path, .. }) => {
+                assert_eq!(path, "os.nonexistent", "ImportNotFound must name the FULL dotted id");
+            }
+            other => panic!("expected ImportNotFound(os.nonexistent), got: {:?}", other.map(|_| ())),
+        }
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+
+        // Parent also unresolved: names the full dotted id too.
+        let root2 = temp_root("import nope.whatever\n\ndef main() -> None:\n    print(1)\n");
+        match resolve(&root2) {
+            Err(Error::ImportNotFound { path, .. }) => {
+                assert_eq!(path, "nope.whatever");
+            }
+            other => panic!("expected ImportNotFound(nope.whatever), got: {:?}", other.map(|_| ())),
+        }
+        let _ = std::fs::remove_dir_all(root2.parent().unwrap());
+    }
+
+    /// W3-3: LOCAL user package via DIRECTORY layout — `import pkg.geo` resolves the
+    /// on-disk `pkg/geo.pyrs` relative to the importing file, under the dotted id
+    /// `"pkg.geo"`, with its functions qualifiable.
+    #[test]
+    fn w3_local_package_directory_layout_resolves() {
+        let root = temp_root("import pkg.geo\n\ndef main() -> None:\n    print(pkg.geo.area(3, 4))\n");
+        let dir = root.parent().unwrap();
+        std::fs::create_dir_all(dir.join("pkg")).unwrap();
+        std::fs::write(
+            dir.join("pkg").join("geo.pyrs"),
+            "def area(w: int, h: int) -> int:\n    return w * h\n",
+        )
+        .unwrap();
+
+        let prog = resolve(&root).expect("`import pkg.geo` resolves the local package file pkg/geo.pyrs");
+        assert!(
+            prog.modules.iter().any(|(m, _)| m.module_id.as_deref() == Some("pkg.geo")),
+            "the local submodule carries module_id \"pkg.geo\""
+        );
+        assert!(
+            prog.ctx.module_funcs.get("pkg.geo").is_some_and(|fns| fns.iter().any(|n| n == "area")),
+            "pkg.geo.area is qualifiable under the dotted id"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// W3-3 (was F16): `from a.b import f` binds the FULL dotted owner `"a.b"` (not
+    /// the truncated `"a"`), so the bare `f` mangles into the submodule's namespace
+    /// and matches its definition.
+    #[test]
+    fn w3_dotted_from_import_binds_full_owner() {
+        let root = temp_root("from os.path import basename\n\ndef main() -> None:\n    print(basename(\"/a/b.txt\"))\n");
+        let prog = resolve(&root).expect("`from os.path import basename` resolves");
+        let root_scope = prog
+            .ctx
+            .import_bindings
+            .get(crate::typeck::ROOT_MODULE_ID)
+            .expect("the root has a from-import binding scope");
+        assert_eq!(
+            root_scope.get("basename"),
+            Some(&("os.path".to_string(), "basename".to_string())),
+            "`from os.path import basename` binds basename -> owner \"os.path\" (NOT truncated to \"os\")"
+        );
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    /// W3-3: a DOTTED from-import naming a symbol the submodule does not export is
+    /// an honest check error — it must NEVER fall back to the PARENT module. Here
+    /// `os` (imported too) DOES define `join`, but `os.path` does not, so
+    /// `from os.path import join` is rejected rather than silently binding `os.join`
+    /// (the from-import truncation the stage kills).
+    #[test]
+    fn w3_dotted_from_import_unknown_name_is_rejected_not_truncated() {
+        let root = temp_root(
+            "import os\nfrom os.path import join\n\ndef main() -> None:\n    print(join(\"a\", \"b\"))\n",
+        );
+        match resolve(&root) {
+            Ok(_) => panic!("`from os.path import join` must be rejected (os.path has no `join`)"),
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("join") && msg.contains("os.path"),
+                    "error must name the missing symbol and the submodule, got: {msg}"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 }

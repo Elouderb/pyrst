@@ -1,0 +1,24 @@
+# W3-3 end-to-end golden: the DOTTED submodule `os.path` (lib/os/path.pyrs,
+# embedded under the dotted key "os.path") resolves via `import os.path`, and the
+# qualified two-component `os.path.f(...)` calls lower to the owner-mangled
+# `__pyrst_m_os_dpath__f`. This is a REAL dual-run (unlike parity_os.pyrs, whose
+# @extern-backed `os` is out of literal-Python scope): `os.path`'s functions are
+# PURE string logic, and `import os.path` + `os.path.basename/dirname/isabs` are
+# all valid, identical CPython — so python3 is the golden oracle byte-for-byte.
+#
+# basename/dirname are faithful posixpath ports (the exact python3-verified string
+# logic re-homed from lib/os.pyrs); isabs is the trivial posixpath predicate. The
+# edge matrix mirrors parity_os.pyrs's posixpath string-logic matrix.
+
+import os.path
+
+
+def main() -> None:
+    edges: list[str] = ["a/b/c", "a/b/", "/", "", ".", "..", "a", "a//b", "//x", "trailing/", "/abs/path", "a/.", "///", "x/.."]
+    for ep in edges:
+        print(os.path.basename(ep) + "|" + os.path.dirname(ep))
+
+    # isabs: absolute iff it starts with "/"
+    abs_cases: list[str] = ["/x", "x", "/", "", "a/b", "//y", "./z"]
+    for ap in abs_cases:
+        print(os.path.isabs(ap))

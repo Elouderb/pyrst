@@ -272,6 +272,36 @@ pub fn escape_ident(name: &str) -> String {
     }
 }
 
+/// (W3-3) Sanitize a dotted MODULE ID into the identifier fragment embedded in a
+/// mangled top-level name (`__pyrst_m_<frag>__<name>` /
+/// `__pyrst_const_<frag>__<name>`). Module ids are Python identifiers joined by
+/// `.` — each component matches `[A-Za-z_][A-Za-z0-9_]*`, so a component MAY
+/// itself contain `_`. The naive `owner.replace('.', "_")` is therefore NOT
+/// injective: the dotted id `a.b` and a hypothetical flat module literally named
+/// `a_b` both map to `a_b`, so their `basename`s would mangle to the SAME
+/// `__pyrst_m_a_b__basename` (a silent def/use cross-wire). We instead escape so
+/// the mapping is INJECTIVE: every literal `_` → `_u`, every `.` separator →
+/// `_d`. After escaping, a `_` only ever appears as the first char of a `_u`/`_d`
+/// digraph, so the encoding is prefix-free / uniquely decodable and distinct
+/// module ids always produce distinct fragments (`a.b` → `a_db`, flat `a_b` →
+/// `a_ub`; `a_.b` → `a_u_db`, `a._b` → `a_d_ub` — no boundary collision). A
+/// single-component id with NO underscore is unchanged (`os` → `os`, `re` →
+/// `re`), so every existing single-module mangled name is byte-identical; only
+/// dotted ids and underscore-bearing names shift to the escaped form. The result
+/// is always a valid Rust identifier fragment (never a keyword, given the
+/// `__pyrst_m_`/`__pyrst_const_` prefix).
+pub(crate) fn mangle_mod_id(owner: &str) -> String {
+    let mut s = String::with_capacity(owner.len() + 2);
+    for ch in owner.chars() {
+        match ch {
+            '_' => s.push_str("_u"),
+            '.' => s.push_str("_d"),
+            c => s.push(c),
+        }
+    }
+    s
+}
+
 /// Mangle a MODULE-LEVEL CONSTANT's pyrst name into the Rust identifier emitted
 /// for it. Module consts lower to top-level Rust `const` items, and a lowercase
 /// const name (e.g. `k`, `i`, `e`) would otherwise be a CONSTANT PATTERN at any
@@ -287,16 +317,16 @@ pub fn escape_ident(name: &str) -> String {
 /// (W3-2) OWNER-QUALIFIED: a ROOT const (`owner = None`) keeps the historical
 /// `__pyrst_const_<name>` (so import-free programs are byte-identical), while an
 /// IMPORTED module's const gains its owner prefix `__pyrst_const_<owner>__<name>`
-/// (dots in a dotted module id sanitized to `_`). This closes the previously
-/// latent const-vs-const collision (two co-imported modules each defining a
-/// same-named const now emit DISTINCT Rust consts). Applied identically at the
-/// const definition (`emit_const_decl`, owner = the emitting module) and at every
-/// reference (bare `CONST` owner-resolved via `bare_owner_for`; qualified
-/// `X.CONST` owner = `X`).
+/// (the dotted module id sanitized collision-proof via [`mangle_mod_id`]). This
+/// closes the previously latent const-vs-const collision (two co-imported modules
+/// each defining a same-named const now emit DISTINCT Rust consts). Applied
+/// identically at the const definition (`emit_const_decl`, owner = the emitting
+/// module) and at every reference (bare `CONST` owner-resolved via
+/// `bare_owner_for`; qualified `X.CONST` owner = `X`).
 pub fn mangle_const(owner: Option<&str>, name: &str) -> String {
     match owner {
         None => format!("__pyrst_const_{}", name),
-        Some(m) => format!("__pyrst_const_{}__{}", m.replace('.', "_"), name),
+        Some(m) => format!("__pyrst_const_{}__{}", mangle_mod_id(m), name),
     }
 }
 

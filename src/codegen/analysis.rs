@@ -25,14 +25,15 @@ impl<'a> Codegen<'a> {
     /// (W3-2) Emit a TOP-LEVEL free-function / const-adjacent name owner-qualified.
     /// `None` owner = the ROOT program → crate-root-unwrapped (`escape_ident`, so a
     /// keyword-named root fn still round-trips). A non-root owner → the flat
-    /// mangled identifier `__pyrst_m_<owner>__<name>` (dots in a dotted module id
-    /// sanitized to `_`, e.g. `os.path` → `os_path`). The mangled prefix can never
-    /// be a Rust keyword, so no escaping is needed there. Applied IDENTICALLY at a
-    /// definition and at every use of the same name so def/use stay in sync.
+    /// mangled identifier `__pyrst_m_<owner>__<name>` (the dotted module id
+    /// sanitized collision-proof via [`mangle_mod_id`], e.g. `os.path` →
+    /// `os_dpath`). The mangled prefix can never be a Rust keyword, so no escaping
+    /// is needed there. Applied IDENTICALLY at a definition and at every use of the
+    /// same name so def/use stay in sync.
     pub(crate) fn emit_name(&self, owner: Option<&str>, name: &str) -> String {
         match owner {
             None => escape_ident(name),
-            Some(m) => format!("__pyrst_m_{}__{}", m.replace('.', "_"), name),
+            Some(m) => format!("__pyrst_m_{}__{}", mangle_mod_id(m), name),
         }
     }
 
@@ -57,7 +58,7 @@ impl<'a> Codegen<'a> {
         }
         match self.ctx.class_owner.get(name) {
             None => name.to_string(),
-            Some(m) => format!("__pyrst_m_{}__{}", m.replace('.', "_"), name),
+            Some(m) => format!("__pyrst_m_{}__{}", mangle_mod_id(m), name),
         }
     }
 

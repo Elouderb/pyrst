@@ -64,13 +64,17 @@
 #     Surface: `set_maxlen`, `rotate`, `extend`, `extendleft`, `count`,
 #     `remove`, `clear`, `size`, `is_empty`, `peek`, `peekleft`, `to_list`.
 #     - `set_maxlen(n)`: CPython's `maxlen` is a CONSTRUCTOR keyword
-#       (`deque(iterable, maxlen=n)`); pyrst's zero-arg `deque()` + default-arg
-#       lowering in a generic `__init__` does not thread a default through the
-#       zero-arg call site (compiler gap, not a language-design limit) — so
-#       `maxlen` is set post-construction: `d: deque[int] = deque();
+#       (`deque(iterable, maxlen=n)`). The compiler gap this note used to cite —
+#       a generic `__init__`'s default arg not being threaded through a zero-arg
+#       `deque()` call site — is now FIXED (phase2-fix2, card 63870682: a generic
+#       zero-arg ctor DOES fill a defaulted param now). This module keeps the
+#       `set_maxlen` post-construction API unchanged (behavior is identical, and
+#       re-plumbing `deque`'s ctor is out of the cleanup's scope) — so `maxlen`
+#       is still set post-construction: `d: deque[int] = deque();
 #       d.set_maxlen(3)`. Calling it immediately after construction (before any
-#       append) is semantically equivalent to CPython's constructor kwarg.
-#       Setting it trims existing overflow from the LEFT, matching CPython.
+#       append) is semantically equivalent to CPython's constructor kwarg; a real
+#       `maxlen=` constructor kwarg is now feasible as a follow-up. Setting it
+#       trims existing overflow from the LEFT, matching CPython.
 #     - `rotate(n)`: n>0 rotates right (last `n` to the front), n<0 rotates
 #       left; matches CPython `deque.rotate`.
 #     - `remove(x)` raises `ValueError` if `x` is not present. Message: CPython
@@ -262,8 +266,9 @@ class deque[T]:
         self.maxlen = -1
 
     def set_maxlen(self, n: int) -> None:
-        # See module header: maxlen is applied post-construction (compiler
-        # gap around default-arg lowering in a generic zero-arg __init__).
+        # See module header: maxlen is applied post-construction (the generic
+        # zero-arg-ctor default-arg gap that motivated this is now fixed; the
+        # post-construction API is retained by choice, not necessity).
         # Trims existing overflow from the LEFT, like CPython's constructor.
         self.maxlen = n
         while self.maxlen >= 0 and len(self.front) + len(self.back) > self.maxlen:

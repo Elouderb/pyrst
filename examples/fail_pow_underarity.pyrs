@@ -1,0 +1,6 @@
+# HONEST REJECTION (card c34ac64a fix D): pow() needs at least a base and an
+# exponent. Under-arity (0 or 1 args) ICE'd at BUILD (missing-arg index -> exit
+# 101); now an honest CHECK arity error with CPython 3.12's wording
+# ("pow() missing required argument 'exp' (pos 2)").
+def main() -> None:
+    print(pow(2))

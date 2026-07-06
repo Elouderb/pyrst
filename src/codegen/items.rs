@@ -1548,8 +1548,16 @@ impl<'a> Codegen<'a> {
         match e {
             Expr::Ident(..) => Ok(format!("{}.clone()", self.emit_expr(e)?)),
             Expr::Attr { obj, name, .. } => {
-                if self.is_property_access(obj, name) {
-                    // Owned temp from a getter call — already owned, do not clone.
+                // Both a `@property` access (a getter call) and a boxed
+                // self-referential field read (`x.next` -> emitted as
+                // `x.next.clone().map(|__b| *__b)`, which already deep-clones and
+                // unboxes) produce a fresh OWNED rvalue temp — appending a second
+                // `.clone()` is redundant (a wasted deep clone of the whole
+                // remaining chain). Only an ordinary struct-field read is a
+                // reusable place that must clone here.
+                if self.is_property_access(obj, name)
+                    || self.attr_read_is_boxed_recursive(obj, name)
+                {
                     self.emit_expr(e)
                 } else {
                     Ok(format!("{}.clone()", self.emit_expr(e)?))
@@ -1559,7 +1567,8 @@ impl<'a> Codegen<'a> {
             Expr::Index { .. } => self.emit_expr(e),
             // Clone the arm PLACES, not the whole owned if-temp.
             Expr::IfExp { test, body, orelse, .. } => {
-                let t = self.emit_expr(test)?;
+                // (card c34ac64a fix C) IfExp test is a truthiness context.
+                let t = self.emit_truthy(test)?;
                 let b = self.emit_consuming(body)?;
                 let o = self.emit_consuming(orelse)?;
                 Ok(format!("(if {} {{ {} }} else {{ {} }})", t, b, o))
@@ -1725,6 +1734,13 @@ impl<'a> Codegen<'a> {
     /// rule, so the hoist-slot type and the divergence check agree.
     pub(crate) fn prescan_merge_ty(existing: Option<&Ty>, vt: Ty) -> Ty {
         match existing {
+            // (card c34ac64a fix B2a) `None` assigned into an Option slot is NOT a
+            // divergence — None is a valid Option value. Keep the `Option<T>` slot
+            // so the narrowing shadow is still emitted; a divergent slot silently
+            // SKIPPED the shadow (codegen keys `narrowed` off the slot being
+            // `Option<_>`), leaking a rustc E0308/E0369 on a read of the narrowed
+            // var. This is the correct merge irrespective of any narrowing.
+            Some(prev @ Ty::Option(_)) if matches!(vt, Ty::NoneVal) => prev.clone(),
             Some(prev) if crate::typeck::branch_divergent(prev, &vt) => vt,
             Some(prev) => Self::unify_ty(prev.clone(), vt),
             None => vt,

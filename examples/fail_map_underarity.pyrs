@@ -1,0 +1,10 @@
+# HONEST REJECTION (card c34ac64a fix D): map() needs a function AND at least one
+# iterable. Under-arity (fewer than 2 args) ICE'd at BUILD; now an honest CHECK
+# arity error ("map() must have at least two arguments.", CPython 3.12).
+def dbl(x: int) -> int:
+    return x * 2
+
+
+def main() -> None:
+    xs = list(map(dbl))
+    print(xs)

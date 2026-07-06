@@ -1,0 +1,9 @@
+# HONEST REJECTION (card c34ac64a fix D): open() with no arguments ICE'd at BUILD
+# (codegen indexed a missing positional arg -> panic / exit 101). It is now an
+# honest CHECK-time arity error using CPython 3.12's exact wording
+# ("open() missing required argument 'file' (pos 1)"). Sibling gates cover
+# pow()/map()/filter() under-arity (see fail_pow_underarity / fail_map_underarity /
+# fail_filter_underarity); round() 0-arg matches CPython's own message too.
+def main() -> None:
+    f = open()
+    print(f)

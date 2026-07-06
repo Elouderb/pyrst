@@ -1,0 +1,48 @@
+# parity: dual-run
+# Dual-run CPython parity golden for card 97e02e09: String + String inside a
+# lambda BODY. The lambda-body `BinOp::Add` over `Str` operands now routes
+# through the SAME `format!("{}{}", ..)` lowering the statement path uses (a bare
+# `a + b` emitted `String + String`, which rustc rejects). Every str-concat
+# lambda shape below compiles and runs byte-identically under pyrst and CPython;
+# the numeric lambdas guard against a regression (str `+` must NOT stringify an
+# int `+`). Each line runs under the harness's `from __future__ import
+# annotations` + `main()` convention.
+
+
+def apply2(f: Callable[[str, str], str], a: str, b: str) -> str:
+    return f(a, b)
+
+
+def main() -> None:
+    # 1. str-concat lambda STORED IN a Callable slot, then called
+    concat: Callable[[str, str], str] = lambda x, y: x + y
+    print(concat("foo", "bar"))
+    print(apply2(concat, "hello, ", "world"))
+
+    # 2. str-concat lambda passed positionally into a Callable param (func-slot)
+    print(apply2(lambda x, y: x + y + "!", "a", "b"))
+
+    # 3. captured str concatenated in the body
+    prefix = "pre-"
+    addpref: Callable[[str], str] = lambda s: prefix + s
+    print(addpref("fix"))
+
+    # 4. INLINE-INVOKED str-concat lambda
+    print((lambda a, b: a + b)("in", "line"))
+    print((lambda a, b, c: a + b + c)("x", "y", "z"))
+
+    # 5. str concat inside a sorted key= lambda
+    words = ["bb", "a", "ccc"]
+    print(sorted(words, key=lambda w: w + "z"))
+
+    # --- numeric-lambda regression guards (must print integer sums, not "34") ---
+    add: Callable[[int, int], int] = lambda a, b: a + b
+    print(add(3, 4))
+    print(apply_int(lambda a, b: a + b, 10, 20))
+    print((lambda x, y: x + y)(5, 6))
+    nums = [3, 1, 2]
+    print(sorted(nums, key=lambda n: -n))
+
+
+def apply_int(f: Callable[[int, int], int], a: int, b: int) -> int:
+    return f(a, b)

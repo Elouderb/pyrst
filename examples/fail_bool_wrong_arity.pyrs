@@ -1,0 +1,21 @@
+# HONEST REJECTION (card c34ac64a fix E, workflow #10): `__bool__` must be
+# `__bool__(self) -> bool` — it takes NO arguments other than self (CPython calls
+# it with none). A `__bool__(self, extra)` with extra parameters is rejected at
+# CHECK. This re-covers the wrong-arity shape from the deleted
+# fail_bool_dunder_unsupported.pyrs (whose other assertion — a VALID __bool__
+# being rejected — is obsolete now that object truthiness is lowered; see
+# parity_user_bool.pyrs and fail_bool_returns_nonbool.pyrs).
+class Widget:
+    v: int
+
+    def __init__(self, v: int) -> None:
+        self.v = v
+
+    def __bool__(self, extra: int) -> bool:
+        return self.v > extra
+
+
+def main() -> None:
+    w = Widget(5)
+    if w:
+        print("truthy")

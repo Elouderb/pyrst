@@ -1,0 +1,28 @@
+# DUAL-RUN parity (phase2-fix2 item 3): list(...) over the INLINED lazy iterator
+# adapters `enumerate` and `zip`. Both TYPE as list[...] but LOWER to a lazy Rust
+# `Map`/`Zip` chain, so before this fix `list(enumerate(...))` and `list(zip(...))`
+# returned the bare adapter and leaked a raw rustc E0308 (a `Map`/`Zip` is not a
+# `Vec`) even though `pyrst check` passed. They are now `.collect()`-materialized,
+# exactly like `list(range(...))`. python3 is the oracle.
+def main() -> None:
+    xs: list[str] = ["a", "b", "c"]
+
+    # list(enumerate(iterable)) — default start 0
+    e0: list[tuple[int, str]] = list(enumerate(xs))
+    for p in e0:
+        print(p[0], p[1])
+
+    # list(enumerate(iterable, start)) — the counter is seeded at `start`
+    e1: list[tuple[int, str]] = list(enumerate(xs, 10))
+    for q in e1:
+        print(q[0], q[1])
+
+    # list(zip(a, b)) — the 2-arg inlined Zip adapter
+    a: list[int] = [1, 2, 3]
+    b: list[str] = ["x", "y", "z"]
+    z2: list[tuple[int, str]] = list(zip(a, b))
+    for r in z2:
+        print(r[0], r[1])
+
+    # the materialized lengths (a bare adapter has no len())
+    print(len(e0), len(e1), len(z2))

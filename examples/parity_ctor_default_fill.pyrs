@@ -1,0 +1,120 @@
+# parity: dual-run
+# Dual-run CPython parity golden for card 63870682 (Phase 2 Batch A):
+# call-site default-fill UNIFORMITY across all three call forms — free
+# functions (already worked), METHODS, and CONSTRUCTORS — plus the 3-level
+# @dataclass positional-construction slot ordering. Every line runs
+# byte-identically under the pyrst binary and real CPython 3.12 (the harness
+# prepends `from __future__ import annotations` and calls `main()`).
+#
+# Before this card, a purely-positional / zero-arg constructor call that
+# omitted a trailing default (`Point()`, `Counter(3)`, `Fraction(0)`-shape) and
+# a positional literal into an `Optional[T]`-default method param leaked a
+# rustc error; the default-fill was gated behind kwargs-nonempty. Now all three
+# call forms fill trailing declared defaults through the shared slot-mapping
+# machinery (map_kwargs_to_slots / emit_slotted_args).
+from dataclasses import dataclass
+
+
+class Point:
+    x: int
+    y: int
+    def __init__(self, x: int = 0, y: int = 0) -> None:
+        self.x = x
+        self.y = y
+
+
+class Counter:
+    n: int
+    step: int
+    def __init__(self, n: int, step: int = 1) -> None:
+        self.n = n
+        self.step = step
+
+
+class Greeter:
+    name: str
+    def __init__(self, name: str) -> None:
+        self.name = name
+    def greet(self, times: int = 1) -> str:
+        return (self.name + "! ") * times
+    def pick(self, label: Optional[str] = None) -> str:
+        if label is not None:
+            return label
+        return self.name
+
+
+class MathBox:
+    @staticmethod
+    def add(a: int, b: int = 10) -> int:
+        return a + b
+
+
+class Box[T]:
+    val: T
+    def __init__(self, val: T) -> None:
+        self.val = val
+    def scale(self, factor: int = 2) -> str:
+        return str(self.val) * factor
+
+
+@dataclass
+class Base:
+    a: int
+    b: int
+
+
+@dataclass
+class Mid(Base):
+    c: int
+
+
+@dataclass
+class Leaf(Mid):
+    d: int
+
+
+@dataclass
+class Config:
+    host: str
+    port: int = 8080
+    debug: bool = False
+
+
+def main() -> None:
+    # --- constructor default-fill: zero-arg, partial positional, full, keyword
+    p0 = Point()
+    p1 = Point(5)
+    p2 = Point(5, 7)
+    pk = Point(y=9)
+    print(p0.x, p0.y, p1.x, p1.y, p2.x, p2.y, pk.x, pk.y)
+    c1 = Counter(3)
+    c2 = Counter(3, 2)
+    print(c1.n, c1.step, c2.n, c2.step)
+
+    # --- method default-fill + positional-into-Optional-default
+    g = Greeter("hi")
+    print(g.greet())
+    print(g.greet(2))
+    print(g.pick())
+    print(g.pick("tag"))
+
+    # --- static-method default-fill
+    print(MathBox.add(5), MathBox.add(5, 6))
+
+    # --- generic-class ctor + generic-method default-fill
+    b = Box(7)
+    print(b.scale(), b.scale(3))
+
+    # --- 3-level @dataclass positional construction (base-chain slot order)
+    leaf = Leaf(1, 2, 3, 4)
+    print(leaf.a, leaf.b, leaf.c, leaf.d)
+    leaf_kw = Leaf(a=10, b=20, c=30, d=40)
+    print(leaf_kw.a, leaf_kw.b, leaf_kw.c, leaf_kw.d)
+    print(leaf)
+    print(Mid(5, 6, 7))
+
+    # --- @dataclass trailing-default fields, positional
+    print(Config("localhost"))
+    print(Config("h", 90))
+    print(Config("h", 90, True))
+    print(Config("k", debug=True))

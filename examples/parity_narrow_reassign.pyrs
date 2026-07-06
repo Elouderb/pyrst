@@ -1,0 +1,67 @@
+# parity: dual-run
+# DUAL-RUN CPython parity golden for card c34ac64a fix B2: reassigning a var that
+# was NARROWED by an early-return guard. Each shape below built+ran with a raw
+# rustc leak (E0308/E0369) before the fix and now compiles and runs
+# byte-identically under pyrst and CPython.
+#
+#   B2a reassign-to-None:  a narrowed `x` reassigned to bare `None`. `None` is a
+#       valid Option value, so the slot stays `Option<T>` (prescan merge) and the
+#       narrowing shadow is still emitted; the read of the earlier-bound value is
+#       correct. (Was: slot diverged -> shadow skipped -> E0308.)
+#   B2b reassign-to-other-Optional: a narrowed `x: Optional[int]` reassigned to a
+#       differently-typed Optional value, then re-narrowed and used. The reconverge
+#       conflict check now recurses into the Option payloads. (Was: Option<int> vs
+#       Option<str> treated compatible -> E0308.)
+#   B2c reassign-then-reguard: a reassignment KILLS the narrow, so a SECOND
+#       `if x is None:` on the re-widened var is a valid guard again.
+#
+# Runs under the harness `from __future__ import annotations` + `main()` convention.
+
+
+def guard_then_none(x: Optional[int]) -> int:
+    # B2a: narrowed to int, bind it, then rebind x to None; the bound value stands.
+    if x is None:
+        return -1
+    total: int = x + 10
+    x = None
+    return total
+
+
+def swap_type(x: Optional[int], y: Optional[str]) -> str:
+    # B2b: narrowed int, used, then rebind to an Optional[str], re-narrow, use as str.
+    if x is None:
+        return "no-x"
+    doubled: int = x + x
+    x = y
+    if x is None:
+        return "no-y:" + str(doubled)
+    return x + "!" + str(doubled)
+
+
+def maybe_half(n: int) -> Optional[int]:
+    if n % 2 == 0:
+        return n // 2
+    return None
+
+
+def reguard(x: Optional[int]) -> int:
+    # B2c: after the first guard x is int; reassigning to an Optional re-widens it,
+    # so the SECOND guard is a real (non-dead) None-check.
+    if x is None:
+        return -1
+    base: int = x
+    x = maybe_half(base)
+    if x is None:
+        return base * 100
+    return x + base
+
+
+def main() -> None:
+    print(guard_then_none(5))
+    print(guard_then_none(None))
+    print(swap_type(3, "hi"))
+    print(swap_type(None, "hi"))
+    print(swap_type(3, None))
+    print(reguard(8))
+    print(reguard(7))
+    print(reguard(None))

@@ -1860,3 +1860,27 @@ def my_fn() -> float:
         assert!(check_src("def f[T](t: T) -> int:\n    if t:\n        return 1\n    return 0\n").is_err());
         assert!(check_src("def f[T](t: T) -> int:\n    return len(t)\n").is_err());
     }
+
+    // ── (card 18682938) user `__bool__` dunder ────────────────────────────────
+
+    #[test]
+    fn user_bool_method_and_if_context_accepted() {
+        // A class with a well-formed `__bool__` type-checks, and using an instance
+        // in a bool context (`if c:`) is accepted.
+        let src = "class C:\n    n: int\n    def __init__(self) -> None:\n        self.n = 0\n    def __bool__(self) -> bool:\n        return self.n > 0\ndef use(c: C) -> int:\n    if c:\n        return 1\n    return 0\n";
+        assert!(check_src(src).is_ok());
+    }
+
+    #[test]
+    fn user_bool_nonbool_return_rejected() {
+        // `__bool__` must return bool — an `int` return is a check error.
+        let src = "class C:\n    n: int\n    def __init__(self) -> None:\n        self.n = 0\n    def __bool__(self) -> int:\n        return self.n\ndef main() -> None:\n    pass\n";
+        assert_type_err_unit(check_src(src), "__bool__ must return bool");
+    }
+
+    #[test]
+    fn user_bool_extra_param_rejected() {
+        // `__bool__` takes only `self`.
+        let src = "class C:\n    n: int\n    def __init__(self) -> None:\n        self.n = 0\n    def __bool__(self, x: int) -> bool:\n        return True\ndef main() -> None:\n    pass\n";
+        assert_type_err_unit(check_src(src), "no arguments other than self");
+    }

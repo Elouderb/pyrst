@@ -39,6 +39,15 @@ pub(crate) struct FuncEnv<'a> {
     /// (arithmetic, comparison, `print`, calling a method, ...) into an honest
     /// error. Empty for every non-generic function/method/lambda.
     pub(crate) type_params: std::collections::HashSet<String>,
+    /// (card c34ac64a fix B2c/B3) Locals CURRENTLY under a PERSISTENT narrow:
+    /// name -> the var's DECLARED `Option<T>` type (its type BEFORE the narrow).
+    /// Set by the `if x is None: <terminates>` negative-narrowing gate (the only
+    /// narrow that outlives its block); `locals[x]` holds the narrowed inner `T`
+    /// meanwhile. A REASSIGNMENT of `x` KILLS the narrow (removed here, and
+    /// re-widened in `locals` to match codegen's reconverge). A SECOND None-guard
+    /// on a still-narrowed name is a statically-decided guard — an honest error
+    /// rather than a leaked rustc `.is_none()`-on-`T`. Empty in the common case.
+    pub(crate) narrowed: HashMap<String, Ty>,
 }
 
 impl<'a> FuncEnv<'a> {
@@ -55,7 +64,7 @@ impl<'a> FuncEnv<'a> {
             param_set.insert(name.clone());
         }
         let by_ref_params = by_ref_names.iter().cloned().collect();
-        FuncEnv { ctx, locals, ret_ty, used_vars, params: param_set, reassigned_params: std::collections::HashSet::new(), returned_params: std::collections::HashSet::new(), by_ref_params, is_generator: false, type_params: std::collections::HashSet::new() }
+        FuncEnv { ctx, locals, ret_ty, used_vars, params: param_set, reassigned_params: std::collections::HashSet::new(), returned_params: std::collections::HashSet::new(), by_ref_params, is_generator: false, type_params: std::collections::HashSet::new(), narrowed: HashMap::new() }
     }
 
     /// The enclosing generic function's declared type-parameter names as a
@@ -1287,21 +1296,27 @@ pub(crate) fn check_one_method(c: &ClassDef, method: &Func, ctx: &TyCtx) -> Resu
         });
     }
 
-    // `__bool__` is listed among the dunder-trait names in codegen (so it is
-    // skipped by the inherent-methods loop) but has no trait-impl arm, which
-    // would silently DROP a user-defined `__bool__`. pyrst also has no working
-    // object-truthiness lowering today: `bool(obj)` lowers numerically and an
-    // `if obj:` / `while obj:` condition is not constrained to `bool`, so a
-    // class instance in a truthiness position emits invalid Rust regardless.
-    // Rather than mislead the user with a silently-ignored method, reject
-    // `__bool__` honestly here (it is then caught by both `check` and `build`).
-    // Lowering object truthiness is a separate, larger feature.
+    // (card 18682938) `__bool__` IS supported: object truthiness lowers to a
+    // `.__bool__()` call at every bool-context site codegen threads through
+    // `emit_truthy` (if / while / bool() / not / assert / and / or). `__bool__` is
+    // emitted as an ordinary inherent method (it was removed from codegen's
+    // DUNDER_TRAIT_NAMES), so require the CPython-faithful signature — a `self`
+    // receiver with NO other parameters, returning `bool` — so the emitted method
+    // and every call site are well-typed.
     if method.name == "__bool__" {
-        return Err(Error::Type {
-            span: method.span,
-            msg: "__bool__ is not yet supported (object truthiness is not lowered); \
-                  define an explicit predicate method instead".to_string(),
-        });
+        if method.params.iter().any(|p| p.name != "self") {
+            return Err(Error::Type {
+                span: method.span,
+                msg: "__bool__ takes no arguments other than self".to_string(),
+            });
+        }
+        let ret = Ty::from_type_expr(&method.ret, method.span).unwrap_or(Ty::Unknown);
+        if !matches!(ret, Ty::Bool) {
+            return Err(Error::Type {
+                span: method.span,
+                msg: format!("__bool__ must return bool, found {}", ret),
+            });
+        }
     }
 
     // (EPIC-4 V2-c) `Mut[T]` is unsupported on a CONSTRUCTOR parameter. The

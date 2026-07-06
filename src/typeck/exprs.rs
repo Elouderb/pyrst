@@ -1157,6 +1157,9 @@ pub(crate) fn lambda_ret_with_elem(
                 // function's type variables are not in scope for the lambda's own
                 // params, so this stays empty.
                 type_params: std::collections::HashSet::new(),
+                // A lambda body is a single expression (no reassignment/guard),
+                // so the narrow-tracking map is never consulted — start empty.
+                narrowed: std::collections::HashMap::new(),
             };
             // Bind every param: the first to the iterable element type, the
             // rest to their declared type or Unknown (map/filter pass a single
@@ -1178,6 +1181,11 @@ pub(crate) fn lambda_ret_with_elem(
     check_expr(callable, env)?;
     Ok(None)
 }
+
+// (card 87bd8eb4) The former `range_step_nonpositive_literal` gate is GONE:
+// a 3-arg range now lowers through the direction-aware `__py_range_step` builder
+// (codegen), so a negative literal step DESCENDS and a zero step raises a
+// catchable runtime `ValueError` — both valid CPython, no longer a check error.
 
 pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
     Ok(match e {
@@ -1262,6 +1270,10 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 // comprehension body inside a generic function keeps the
                 // ops-on-`T` restriction.
                 type_params: env.type_params.clone(),
+                // Inherit the enclosing scope's active narrows so the comprehension
+                // body sees the same narrowed view (it is a single expression and
+                // never reassigns, so the map is only ever read here).
+                narrowed: env.narrowed.clone(),
             };
             bind_comp_targets(targets, elem_ty, &mut inner_env.locals);
             if let Some(c) = cond { check_expr(c, &mut inner_env)?; }
@@ -1302,6 +1314,10 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 // comprehension body inside a generic function keeps the
                 // ops-on-`T` restriction.
                 type_params: env.type_params.clone(),
+                // Inherit the enclosing scope's active narrows so the comprehension
+                // body sees the same narrowed view (it is a single expression and
+                // never reassigns, so the map is only ever read here).
+                narrowed: env.narrowed.clone(),
             };
             bind_comp_targets(targets, elem_ty, &mut inner_env.locals);
             if let Some(c) = cond { check_expr(c, &mut inner_env)?; }
@@ -1345,6 +1361,10 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 // comprehension body inside a generic function keeps the
                 // ops-on-`T` restriction.
                 type_params: env.type_params.clone(),
+                // Inherit the enclosing scope's active narrows so the comprehension
+                // body sees the same narrowed view (it is a single expression and
+                // never reassigns, so the map is only ever read here).
+                narrowed: env.narrowed.clone(),
             };
             bind_comp_targets(targets, elem_ty, &mut inner_env.locals);
             if let Some(c) = cond { check_expr(c, &mut inner_env)?; }
@@ -1612,6 +1632,75 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                             msg: format!("{}() expected at least 1 argument, got 0", bn),
                         });
                     }
+                    // (card 00fb0e6d) 0-arg calls to arity-expecting builtins ICE'd
+                    // at BUILD (codegen indexes `parts[0]` on an empty arg vec ->
+                    // panic / exit 101 — loud but ugly, and below the diagnostics
+                    // bar). Each needs at least one positional argument in CPython;
+                    // reject them at CHECK (this pass runs for `check` AND `build`)
+                    // with CPython's own wording. DELIBERATELY EXCLUDED: int / float /
+                    // str / bool, whose 0-arg form CPython makes VALID (0 / 0.0 / '' /
+                    // False) — those fall through and are defaulted in codegen.
+                    "abs" | "len" | "ord" | "chr" | "hex" | "oct" | "bin" | "any" | "all"
+                        if args.is_empty() => {
+                        return Err(Error::Type {
+                            span: *span,
+                            msg: format!("{}() takes exactly one argument (0 given)", bn),
+                        });
+                    }
+                    // (card c34ac64a fix D) 0-arg (and under-arity) calls to these
+                    // builtins ICE'd at BUILD (codegen indexes a missing positional
+                    // arg -> panic / exit 101 — loud but below the diagnostics bar).
+                    // Reject at CHECK (this pass runs for `check` AND `build`) with
+                    // CPython 3.12's exact wording. round() gets its own message
+                    // (`missing required argument 'number' (pos 1)`) rather than the
+                    // shared "takes exactly one argument" above (workflow #19).
+                    "round" if args.is_empty() => {
+                        return Err(Error::Type {
+                            span: *span,
+                            msg: "round() missing required argument 'number' (pos 1)".to_string(),
+                        });
+                    }
+                    "open" if args.is_empty() => {
+                        return Err(Error::Type {
+                            span: *span,
+                            msg: "open() missing required argument 'file' (pos 1)".to_string(),
+                        });
+                    }
+                    "pow" if args.len() < 2 => {
+                        return Err(Error::Type {
+                            span: *span,
+                            msg: if args.is_empty() {
+                                "pow() missing required argument 'base' (pos 1)".to_string()
+                            } else {
+                                "pow() missing required argument 'exp' (pos 2)".to_string()
+                            },
+                        });
+                    }
+                    "map" if args.len() < 2 => {
+                        return Err(Error::Type {
+                            span: *span,
+                            msg: "map() must have at least two arguments.".to_string(),
+                        });
+                    }
+                    "filter" if args.len() < 2 => {
+                        return Err(Error::Type {
+                            span: *span,
+                            msg: format!("filter expected 2 arguments, got {}", args.len()),
+                        });
+                    }
+                    "sum" | "sorted" | "reversed" if args.is_empty() => {
+                        return Err(Error::Type {
+                            span: *span,
+                            msg: format!("{}() expected at least 1 argument, got 0", bn),
+                        });
+                    }
+                    // (card 87bd8eb4) A 3-arg `range(a, b, step)` with a
+                    // negative/zero literal step is NO LONGER rejected: codegen now
+                    // lowers 3-arg range through the direction-aware `__py_range_step`
+                    // builder, so a negative literal DESCENDS (valid CPython) and a
+                    // zero step raises a catchable `ValueError` at runtime — exactly
+                    // CPython's behavior. (Was an honest rejection when range only
+                    // lowered to an ascending Rust range.)
                     "int" if args.len() > 1 => {
                         return Err(Error::Type {
                             span: *span,
@@ -2554,6 +2643,30 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                     });
                 }
             }
+            // (card c34ac64a, shape 1b) ATTRIBUTE-CHAIN narrowing is REJECTED, not
+            // silently narrowed. Accessing `.{name}` on an Optional value (`o.slot.v`
+            // where `o.slot: Optional[Slot]`) may be a None deref; without this it
+            // fell to `Ty::Unknown` and leaked a rustc E0609 (`no field on
+            // Option<_>`). pyrst deliberately does NOT flow-narrow a FIELD/ATTRIBUTE
+            // *place*: unlike a local, a field can be invalidated between the
+            // `is not None` guard and the use by ANY intervening call or assignment
+            // (`o.mutate()`, `o.slot = None`), so a place-narrowing would be unsound
+            // in the general case — the same soundness wall CPython's type-checkers
+            // hit. Bind the Optional to a LOCAL first; a local narrows soundly
+            // (name-based, no aliasing). Honest error naming that idiom.
+            if matches!(&obj_ty, Ty::Option(_)) {
+                return Err(Error::Type {
+                    span: *span,
+                    msg: format!(
+                        "attribute `{}` accessed on an Optional value — it may be None. \
+                         pyrst does not narrow an attribute/field place (an intervening \
+                         call or assignment could invalidate it); bind it to a local \
+                         first and narrow the local: `tmp = <the Optional expression>; \
+                         if tmp is not None: tmp.{}`",
+                        name, name
+                    ),
+                });
+            }
             Ty::Unknown
         }
         Expr::Index { obj, idx, span } => {
@@ -2872,6 +2985,8 @@ pub(crate) fn lambda_body_ty(
         is_generator: false,
         // A lambda's params are its own; enclosing type variables don't apply.
         type_params: std::collections::HashSet::new(),
+        // A lambda body is a single expression — narrow-tracking is never used.
+        narrowed: std::collections::HashMap::new(),
     };
     for (param_name, param_ty) in params {
         let ty = lambda_param_ty(param_ty);

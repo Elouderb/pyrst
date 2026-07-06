@@ -1,0 +1,10 @@
+# HONEST REJECTION (card 00fb0e6d): calling an arity-expecting builtin with zero
+# arguments used to ICE at BUILD (codegen indexed `parts[0]` on an empty arg vec
+# -> panic / exit 101 — loud but ugly, below the diagnostics bar). It is now an
+# honest CHECK-time arity error, mirroring min()/max(). The same gate covers
+# len/sum/sorted/any/all/round/ord/chr/reversed/hex/oct/bin. (int/float/str/bool
+# are DELIBERATELY not here — their 0-arg form is CPython-valid; see
+# parity_builtin_0arg.pyrs.)
+def main() -> None:
+    x: int = abs()
+    print(x)

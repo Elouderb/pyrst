@@ -25,7 +25,7 @@ impl<'a> Codegen<'a> {
                 }
             }
             Stmt::Assert { cond, msg, .. } => {
-                let c = self.emit_expr(cond)?;
+                let c = self.emit_truthy(cond)?;
                 match msg {
                     Some(m) => {
                         let m_s = self.emit_expr(m)?;
@@ -308,7 +308,12 @@ impl<'a> Codegen<'a> {
                         // local is live (a prior block statement retyped it away from
                         // its function-scope slot). `v` above already read the shadow
                         // through its mangled name.
-                        if !Self::types_conflict(&slot_ty, &value_ty) {
+                        // (card c34ac64a fix B2b) The STRUCTURAL Option check
+                        // recurses into payloads, so `Option<int>` vs `Option<str>`
+                        // is a real conflict (the discriminant-only `types_conflict`
+                        // wrongly reconverged them into one slot -> rustc E0308); a
+                        // bare `None` still reconverges into any Option slot.
+                        if !crate::typeck::option_slot_conflict(&slot_ty, &value_ty) {
                             // RECONVERGE: the value fits the slot again -> write the
                             // ORIGINAL (slot) binding and drop the shadow, so the
                             // materialized value reaches the hoisted slot and later
@@ -655,7 +660,7 @@ impl<'a> Codegen<'a> {
                         Some(Ty::Option(inner)) => Some((var, is_not_none, (**inner).clone())),
                         _ => None,
                     });
-                let c = self.emit_expr(cond)?;
+                let c = self.emit_truthy(cond)?;
                 self.line(&format!("if {} {{", c));
                 self.indent += 1;
                 // (card 575bcf3a) Isolate this branch's block-scope emission state
@@ -688,7 +693,11 @@ impl<'a> Codegen<'a> {
                 self.scope_exit(__then_scope);
                 self.indent -= 1;
                 for (c, b) in elifs {
-                    let cs = self.emit_expr(c)?;
+                    // (card c34ac64a fix C) `elif` is a truthiness context too — a
+                    // class-with-`__bool__` condition must lower via `.__bool__()`
+                    // (was `emit_expr` -> rustc E0308). emit_truthy passes plain
+                    // bool conditions through byte-for-byte.
+                    let cs = self.emit_truthy(c)?;
                     self.line(&format!("}} else if {} {{", cs));
                     self.indent += 1;
                     let __elif_scope = self.scope_enter();
@@ -719,6 +728,38 @@ impl<'a> Codegen<'a> {
                     self.indent -= 1;
                 }
                 self.line("}");
+                // (card c34ac64a, shape 1a) NEGATIVE narrowing — the early-return
+                // guard idiom `if x is None: <terminates>`. When the guard is `is
+                // None`, there is no elif/else, and the then-block definitely
+                // transfers control away (return/raise/break/continue), the code
+                // AFTER the `if` runs only when `x is not None`. Persistently narrow
+                // it for the rest of THIS block: bind the unwrapped payload to a
+                // mangled shadow and redirect reads to it (`shadow_map`), retyping
+                // the local to the inner `T`. The unwrap is safe (the None case
+                // diverged). A later `x = <Option<T>>` reassignment RECONVERGES to
+                // the outer slot in `Stmt::Assign` (writing the original binding and
+                // clearing the shadow), so the narrowing coexists with rebinding.
+                // The shadow lives until the enclosing block's `scope_exit` (or the
+                // function-end reset), matching the narrowed region exactly. Mirrors
+                // typeck's `Stmt::If` negative-narrowing gate.
+                if let Some((var, is_not_none, inner)) = narrowed.as_ref() {
+                    if !*is_not_none
+                        && elifs.is_empty()
+                        && else_.is_none()
+                        && crate::typeck::block_terminates_flow(then)
+                    {
+                        let m = self.fresh_shadow_name(var);
+                        // (card c34ac64a fix B2b) Unwrap through any ACTIVE shadow of
+                        // `var` — after a reassignment (`x = <Option>`) reads of `x`
+                        // resolve to a mangled shadow binding, so unwrapping the raw
+                        // name would deref the STALE original slot (leaked a rustc
+                        // E0308 when the reassigned Option had a different payload).
+                        let src = self.shadow_read_name(var).unwrap_or_else(|| escape_ident(var));
+                        self.line(&format!("let {} = {}.clone().unwrap();", m, src));
+                        self.shadow_map.insert(var.clone(), (m, Ty::Option(Box::new(inner.clone()))));
+                        self.locals.insert(var.clone(), inner.clone());
+                    }
+                }
             }
             Stmt::While { cond, body, .. } => {
                 // `while True:` (the LITERAL `True` condition) lowers to Rust
@@ -730,10 +771,21 @@ impl<'a> Codegen<'a> {
                 // and `continue` inside still behave identically. This mirrors
                 // typeck's missing-return gate, which treats a break-free
                 // `while True` as diverging. Any other condition stays `while`.
+                // (card c34ac64a, shape 1c) WHILE-loop narrowing for the linked-list
+                // traversal idiom `while cur is not None:`. Detect the `is not None`
+                // guard on a local `Option<T>` BEFORE emitting the header, so the
+                // header (and every back-edge re-test) reads the OUTER Option binding
+                // (`while cur.is_some()`), never the unwrapped view.
+                let while_narrow: Option<(String, Ty)> = extract_narrowing(cond)
+                    .filter(|(_, is_not_none)| *is_not_none)
+                    .and_then(|(var, _)| match self.locals.get(var.as_str()) {
+                        Some(Ty::Option(inner)) => Some((var, (**inner).clone())),
+                        _ => None,
+                    });
                 if matches!(cond, Expr::Bool(true, _)) {
                     self.line("loop {");
                 } else {
-                    let c = self.emit_expr(cond)?;
+                    let c = self.emit_truthy(cond)?;
                     self.line(&format!("while {} {{", c));
                 }
                 self.indent += 1;
@@ -747,6 +799,26 @@ impl<'a> Codegen<'a> {
                 // (card 575bcf3a) The loop body is a Rust `{}` scope; isolate its
                 // block-scope emission state so a shadow inside it never leaks out.
                 let __while_scope = self.scope_enter();
+                // (card c34ac64a, shape 1c) Inside the loop scope, bind the unwrapped
+                // payload to a mangled shadow and REDIRECT reads of the name to it
+                // (via `shadow_map`), retyping the local to the inner `T` so
+                // type-dispatched emission inside the body sees the payload. The
+                // loop-carried `cur = cur.next` (value `Option<T>`) then RECONVERGES to
+                // the outer slot in `Stmt::Assign`, writing the ORIGINAL binding (the
+                // loop variable the header re-tests) and clearing the shadow — so the
+                // loop advances and terminates. `scope_exit` restores the Optional
+                // view after the loop. `.clone().unwrap()` leaves the outer binding
+                // intact for that reassignment (a bare `.unwrap()` would move it).
+                if let Some((var, inner)) = &while_narrow {
+                    let m = self.fresh_shadow_name(var);
+                    // (card c34ac64a fix B2b) Unwrap through any active shadow of
+                    // `var` (see the negative-narrow gate above) — a raw-name unwrap
+                    // would deref a stale slot when `var` was reassigned earlier.
+                    let src = self.shadow_read_name(var).unwrap_or_else(|| escape_ident(var));
+                    self.line(&format!("let {} = {}.clone().unwrap();", m, src));
+                    self.shadow_map.insert(var.clone(), (m, Ty::Option(Box::new(inner.clone()))));
+                    self.locals.insert(var.clone(), inner.clone());
+                }
                 for s in body { self.emit_stmt(s)?; }
                 self.scope_exit(__while_scope);
                 self.try_loopctl_escape = saved_loopctl;
@@ -1825,12 +1897,7 @@ impl<'a> Codegen<'a> {
                     let sig = kw_sig.as_ref().expect("kw slots imply a resolved signature");
                     let (prelude, call_parts) =
                         self.emit_slotted_args(slots, args, kwargs, sig, &param_tys, /*coerced=*/ true)?;
-                    let callee_s = self.emit_expr(callee)?;
-                    let callee_s = if matches!(callee.as_ref(), Expr::Lambda { .. }) {
-                        format!("({})", callee_s)
-                    } else {
-                        callee_s
-                    };
+                    let callee_s = self.emit_callee_with_inline_lambda_types(callee, args)?;
                     return Ok(Self::hoist_wrap(
                         &prelude,
                         format!("{}({})", callee_s, call_parts.join(", ")),
@@ -1883,14 +1950,49 @@ impl<'a> Codegen<'a> {
                     }
                 }
 
-                let callee_s = self.emit_expr(callee)?;
-                // Parenthesize lambda expressions when used as callees
-                let callee_s = if matches!(callee.as_ref(), Expr::Lambda { .. }) {
-                    format!("({})", callee_s)
-                } else {
-                    callee_s
-                };
+                let callee_s = self.emit_callee_with_inline_lambda_types(callee, args)?;
                 Ok(format!("{}({})", callee_s, parts.join(", ")))
+    }
+
+    /// Emit a call CALLEE, parenthesizing an inline lambda `(|..| body)`. For an
+    /// INLINE-INVOKED lambda `(lambda a, b: a + b)("x", "y")` the argument
+    /// expressions pin each param's type, so register them as scoped locals while
+    /// the lambda body is emitted — otherwise a `Str` param's `a + b` fell through
+    /// to the numeric `(a + b)`, which rustc rejects for `String + String` (card
+    /// 97e02e09). The body must route str `+` through the statement path's
+    /// `format!("{}{}", ..)` lowering. `self.locals` is restored afterward, and a
+    /// non-lambda callee is emitted unchanged.
+    pub(crate) fn emit_callee_with_inline_lambda_types(
+        &mut self,
+        callee: &Expr,
+        args: &[Expr],
+    ) -> Result<String> {
+        // (card c34ac64a fix A) Pass the arg-derived param types as HINTS via
+        // `pending_inline_lambda_params` rather than writing `self.locals` here: the
+        // Lambda arm shadows its own params (removing a bare param so an outer
+        // same-named local can't bleed in), which would clobber a locals write.
+        // A hint IS the param's real type, so the arm keeps it (a `Str` param then
+        // routes `+` through `format!` instead of the numeric `(a+b)` rustc rejects
+        // for `String + String`).
+        if let Expr::Lambda { params, .. } = callee {
+            let mut hints = std::collections::HashMap::new();
+            for (i, (name, _)) in params.iter().enumerate() {
+                if let Some(a) = args.get(i) {
+                    let at = self.type_of_expr(a);
+                    if !matches!(at, Ty::Unknown) {
+                        hints.insert(name.clone(), at);
+                    }
+                }
+            }
+            self.pending_inline_lambda_params = Some(hints);
+        }
+        let s = self.emit_expr(callee)?;
+        self.pending_inline_lambda_params = None;
+        Ok(if matches!(callee, Expr::Lambda { .. }) {
+            format!("({})", s)
+        } else {
+            s
+        })
     }
 
 }

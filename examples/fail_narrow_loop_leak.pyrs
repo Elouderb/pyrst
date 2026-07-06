@@ -1,0 +1,17 @@
+# HONEST REJECTION (card c34ac64a fix B1): a negative narrow born INSIDE a for-loop
+# body must NOT leak past the loop. `if v is None: continue` narrows `v` to `int`
+# for the rest of THAT iteration, but the loop runs 0..n times, so AFTER the loop
+# `v` is `Optional[int]` again (it could still be None). Using `v + 1` after the
+# loop is therefore rejected at CHECK; before the fix the narrow leaked past the
+# loop edge and `v + 1` leaked a raw rustc E0369 (add i64 to Option<i64>).
+def f(v: Optional[int]) -> int:
+    total: int = 0
+    for i in range(3):
+        if v is None:
+            continue
+        total = total + v + i
+    return v + 1
+
+
+def main() -> None:
+    print(f(5))

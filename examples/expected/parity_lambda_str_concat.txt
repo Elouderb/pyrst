@@ -1,0 +1,11 @@
+foobar
+hello, world
+ab!
+pre-fix
+inline
+xyz
+['a', 'bb', 'ccc']
+7
+30
+11
+[3, 2, 1]

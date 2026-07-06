@@ -226,24 +226,22 @@
 #
 # ── COMPILER BUG WORKAROUNDS (internal only — no user-visible effect) ──────
 #
-# Two more genuine, previously-unknown `pyrst` codegen bugs were found and
-# worked around WITHIN this module (neither changes any documented behavior
-# above — both are purely about making the generated Rust compile):
+# Two genuine `pyrst` codegen bugs were found and worked around WITHIN this
+# module (neither changes any documented behavior above — both are purely about
+# making the generated Rust compile). The FIRST is now RESOLVED; the SECOND is
+# still live and its workaround must stay:
 #
-#   - A constructor call supplying FEWER positional arguments than the
-#     class's full `__init__` param count (relying on trailing defaults, the
-#     way a plain function call correctly does — confirmed working for
-#     ordinary `def`s) does NOT get the omitted defaults filled in at
-#     codegen for a CLASS CONSTRUCTOR specifically: `SomeClass(a, b)` against
-#     an `__init__(self, a, b, c=0)` emits `SomeClass::new(a, b)` verbatim,
-#     which fails to compile (`rustc` E0061, missing argument) — confirmed
-#     with a standalone repro. Every internal constructor call in this
-#     module therefore supplies ALL parameters explicitly (positionally) —
-#     never relies on a trailing default when constructing `date`/`time`/
-#     `datetime` from inside this file. (Keyword-form construction, e.g.
-#     `timedelta(days=5)`, is unaffected — confirmed working — since it goes
-#     through a different, kwarg-aware call-site lowering.)
-#   - A dunder method that is CODEGEN-SPECIAL-CASED (`__add__`/`__sub__`/
+#   - RESOLVED (phase2-fix2, card 63870682): a constructor call supplying FEWER
+#     positional arguments than the class's full `__init__` param count (relying
+#     on trailing defaults) NOW gets the omitted defaults filled in for a CLASS
+#     CONSTRUCTOR, the same way a plain `def` call does — `SomeClass(a, b)`
+#     against `__init__(self, a, b, c=0)` builds correctly (was `rustc` E0061).
+#     The internal constructor calls in this module still supply ALL parameters
+#     explicitly (positionally) — a harmless, byte-identical convention that is
+#     no longer required. (Keyword-form construction, e.g. `timedelta(days=5)`,
+#     was always fine — a different, kwarg-aware call-site lowering.)
+#   - STILL LIVE (verified phase2-fix2 — do NOT remove the prefix workaround
+#     below): a dunder method that is CODEGEN-SPECIAL-CASED (`__add__`/`__sub__`/
 #     `__mul__`/`__neg__`/`__str__`/`__repr__` — lowered directly to a Rust
 #     trait impl by `codegen::items::emit_class`, NOT through the shared
 #     `emit_func` that ordinary methods and free functions use) leaks its

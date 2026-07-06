@@ -41,31 +41,31 @@ from graphlib import TopologicalSorter
 
 def main() -> None:
     # --- Basic topology: empty, single node, chains, diamonds ---
-    e1: TopologicalSorter[str] = TopologicalSorter(None)
+    e1: TopologicalSorter[str] = TopologicalSorter()
     print(list(e1.static_order()))
 
     e2: TopologicalSorter[str] = TopologicalSorter({})
     print(list(e2.static_order()))
 
-    single: TopologicalSorter[str] = TopologicalSorter(None)
+    single: TopologicalSorter[str] = TopologicalSorter()
     single.add("X")
     print(list(single.static_order()))
 
     # No-dependency insertion-order tie-break (dossier case 9 / 51 / 52).
-    zam: TopologicalSorter[str] = TopologicalSorter(None)
+    zam: TopologicalSorter[str] = TopologicalSorter()
     zam.add("Z")
     zam.add("A")
     zam.add("M")
     print(list(zam.static_order()))
 
-    cba: TopologicalSorter[str] = TopologicalSorter(None)
+    cba: TopologicalSorter[str] = TopologicalSorter()
     cba.add("C")
     cba.add("B")
     cba.add("A")
     print(list(cba.static_order()))
 
     # Linear chain (dossier case 18).
-    chain: TopologicalSorter[str] = TopologicalSorter(None)
+    chain: TopologicalSorter[str] = TopologicalSorter()
     chain.add("E", ["D"])
     chain.add("D", ["C"])
     chain.add("C", ["B"])
@@ -76,7 +76,7 @@ def main() -> None:
     # Diamond (dossier case 19) — exact order, not just endpoints, since
     # this module's list-tracked insertion order reproduces CPython's
     # tie-break precisely (see module header ORDERING note).
-    diamond: TopologicalSorter[str] = TopologicalSorter(None)
+    diamond: TopologicalSorter[str] = TopologicalSorter()
     diamond.add("apex", ["left", "right"])
     diamond.add("left", ["base"])
     diamond.add("right", ["base"])
@@ -84,7 +84,7 @@ def main() -> None:
     print(list(diamond.static_order()))
 
     # Disconnected components (dossier case 20).
-    disc: TopologicalSorter[str] = TopologicalSorter(None)
+    disc: TopologicalSorter[str] = TopologicalSorter()
     disc.add("A", ["B"])
     disc.add("B")
     disc.add("X", ["Y"])
@@ -92,19 +92,19 @@ def main() -> None:
     print(list(disc.static_order()))
 
     # Implicit node creation (dossier case 13).
-    impl: TopologicalSorter[str] = TopologicalSorter(None)
+    impl: TopologicalSorter[str] = TopologicalSorter()
     impl.add("A", ["B"])
     impl.add("B")
     print(list(impl.static_order()))
 
     # Duplicate dependencies union rather than duplicate (dossier case 15/16).
-    dup: TopologicalSorter[str] = TopologicalSorter(None)
+    dup: TopologicalSorter[str] = TopologicalSorter()
     dup.add("A", ["B", "C"])
     dup.add("A", ["B"])
     print(list(dup.static_order()))
 
     # Multiple predecessors (dossier case 17).
-    multi: TopologicalSorter[str] = TopologicalSorter(None)
+    multi: TopologicalSorter[str] = TopologicalSorter()
     multi.add("A", ["B", "C", "D"])
     multi.add("B")
     multi.add("C")
@@ -112,7 +112,7 @@ def main() -> None:
     print(list(multi.static_order()))
 
     # Numeric nodes / chain (dossier case 31, shrunk from 100 to 10).
-    nums: TopologicalSorter[int] = TopologicalSorter(None)
+    nums: TopologicalSorter[int] = TopologicalSorter()
     i: int = 1
     while i <= 10:
         nums.add(i, [i - 1])
@@ -120,7 +120,7 @@ def main() -> None:
     print(list(nums.static_order()))
 
     # Tuple nodes (dossier case 28).
-    tup: TopologicalSorter[tuple[int, int]] = TopologicalSorter(None)
+    tup: TopologicalSorter[tuple[int, int]] = TopologicalSorter()
     tup.add((1, 2), [(3, 4)])
     tup.add((3, 4))
     print(list(tup.static_order()))
@@ -134,7 +134,7 @@ def main() -> None:
     print(list(dinit.static_order()))
 
     # --- prepare / get_ready / done state machine (dossier case 21-26) ---
-    sm: TopologicalSorter[str] = TopologicalSorter(None)
+    sm: TopologicalSorter[str] = TopologicalSorter()
     sm.add("A", ["B"])
     sm.add("B")
     sm.prepare()
@@ -148,7 +148,7 @@ def main() -> None:
 
     # Multiple ready nodes returned together, in insertion order (dossier
     # case 24-26).
-    wide: TopologicalSorter[str] = TopologicalSorter(None)
+    wide: TopologicalSorter[str] = TopologicalSorter()
     wide.add("A", ["D", "E"])
     wide.add("B", ["D", "E"])
     wide.add("C", ["D", "E"])
@@ -162,7 +162,7 @@ def main() -> None:
     print(list(wide.get_ready()))
 
     # --- Cycle errors (dossier ERRORS + case 32/33/34/54/55) ---
-    self_cycle: TopologicalSorter[str] = TopologicalSorter(None)
+    self_cycle: TopologicalSorter[str] = TopologicalSorter()
     self_cycle.add("A", ["A"])
     try:
         list(self_cycle.static_order())
@@ -171,7 +171,7 @@ def main() -> None:
         print("nodes are in a cycle" in str(e))
         print(str(e))
 
-    two_cycle: TopologicalSorter[str] = TopologicalSorter(None)
+    two_cycle: TopologicalSorter[str] = TopologicalSorter()
     two_cycle.add("A", ["B"])
     two_cycle.add("B", ["A"])
     try:
@@ -181,7 +181,7 @@ def main() -> None:
         print("nodes are in a cycle" in str(e))
         print(str(e))
 
-    three_cycle: TopologicalSorter[str] = TopologicalSorter(None)
+    three_cycle: TopologicalSorter[str] = TopologicalSorter()
     three_cycle.add("A", ["B"])
     three_cycle.add("B", ["C"])
     three_cycle.add("C", ["A"])
@@ -193,7 +193,7 @@ def main() -> None:
         print(str(e))
 
     # --- State-machine ValueErrors (dossier ERRORS section) ---
-    add_after_prepare: TopologicalSorter[str] = TopologicalSorter(None)
+    add_after_prepare: TopologicalSorter[str] = TopologicalSorter()
     add_after_prepare.add("A", ["B"])
     add_after_prepare.prepare()
     try:
@@ -202,7 +202,7 @@ def main() -> None:
     except ValueError as e:
         print("cannot be added after" in str(e))
 
-    prepare_twice: TopologicalSorter[str] = TopologicalSorter(None)
+    prepare_twice: TopologicalSorter[str] = TopologicalSorter()
     prepare_twice.add("A")
     prepare_twice.prepare()
     try:
@@ -211,7 +211,7 @@ def main() -> None:
     except ValueError as e:
         print("more than once" in str(e))
 
-    ready_no_prepare: TopologicalSorter[str] = TopologicalSorter(None)
+    ready_no_prepare: TopologicalSorter[str] = TopologicalSorter()
     ready_no_prepare.add("A")
     try:
         ready_no_prepare.get_ready()
@@ -219,7 +219,7 @@ def main() -> None:
     except ValueError as e:
         print("must be called first" in str(e))
 
-    done_no_prepare: TopologicalSorter[str] = TopologicalSorter(None)
+    done_no_prepare: TopologicalSorter[str] = TopologicalSorter()
     done_no_prepare.add("A")
     try:
         done_no_prepare.done(["A"])
@@ -227,7 +227,7 @@ def main() -> None:
     except ValueError as e:
         print("must be called first" in str(e))
 
-    done_unknown: TopologicalSorter[str] = TopologicalSorter(None)
+    done_unknown: TopologicalSorter[str] = TopologicalSorter()
     done_unknown.add("A", ["B"])
     done_unknown.add("B")
     done_unknown.prepare()
@@ -237,7 +237,7 @@ def main() -> None:
     except ValueError as e:
         print("was not added" in str(e))
 
-    done_unready: TopologicalSorter[str] = TopologicalSorter(None)
+    done_unready: TopologicalSorter[str] = TopologicalSorter()
     done_unready.add("A", ["B"])
     done_unready.add("B")
     done_unready.prepare()
@@ -247,7 +247,7 @@ def main() -> None:
     except ValueError as e:
         print("not passed out" in str(e))
 
-    done_twice: TopologicalSorter[str] = TopologicalSorter(None)
+    done_twice: TopologicalSorter[str] = TopologicalSorter()
     done_twice.add("A", ["B"])
     done_twice.add("B")
     done_twice.prepare()
@@ -265,7 +265,7 @@ def main() -> None:
     # surface independent, genuinely-ready nodes elsewhere in the graph — real
     # CPython populates its ready set BEFORE the cycle check, by design (see
     # module header). Verified against real CPython 3.12.9.
-    cycle_partial: TopologicalSorter[str] = TopologicalSorter(None)
+    cycle_partial: TopologicalSorter[str] = TopologicalSorter()
     cycle_partial.add("cycA", ["cycB"])
     cycle_partial.add("cycB", ["cycA"])
     cycle_partial.add("free1")
@@ -280,7 +280,7 @@ def main() -> None:
     # H2 (missing method, added): is_active() lifecycle, and its ValueError
     # before prepare(). CPython: `nfinished < npassedout` OR a non-empty
     # ready queue.
-    active: TopologicalSorter[str] = TopologicalSorter(None)
+    active: TopologicalSorter[str] = TopologicalSorter()
     active.add("X")
     active.prepare()
     print(active.is_active())
@@ -289,7 +289,7 @@ def main() -> None:
     active.done(active_ready)
     print(active.is_active())
 
-    active_no_prepare: TopologicalSorter[str] = TopologicalSorter(None)
+    active_no_prepare: TopologicalSorter[str] = TopologicalSorter()
     active_no_prepare.add("Y")
     try:
         active_no_prepare.is_active()
@@ -298,27 +298,27 @@ def main() -> None:
         print("must be called first" in str(e))
 
     # Unicode nodes (dossier scope didn't probe non-ASCII).
-    uni: TopologicalSorter[str] = TopologicalSorter(None)
+    uni: TopologicalSorter[str] = TopologicalSorter()
     uni.add("café", ["naïve"])
     uni.add("naïve")
     uni.add("日本語")
     print(list(uni.static_order()))
 
     # Negative int nodes.
-    neg: TopologicalSorter[int] = TopologicalSorter(None)
+    neg: TopologicalSorter[int] = TopologicalSorter()
     neg.add(-5, [-10])
     neg.add(-10)
     neg.add(0)
     print(list(neg.static_order()))
 
     # Explicit empty predecessors list (as opposed to omitting the arg).
-    emptypred: TopologicalSorter[str] = TopologicalSorter(None)
+    emptypred: TopologicalSorter[str] = TopologicalSorter()
     emptypred.add("A", [])
     print(list(emptypred.static_order()))
 
     # Cycle confined to one of two disconnected components; the acyclic
     # component's node must still surface via get_ready() after the raise.
-    multi_comp: TopologicalSorter[str] = TopologicalSorter(None)
+    multi_comp: TopologicalSorter[str] = TopologicalSorter()
     multi_comp.add("V1", ["V0"])
     multi_comp.add("V0")
     multi_comp.add("C1", ["C0"])
@@ -332,7 +332,7 @@ def main() -> None:
 
     # add() after a CYCLE-RAISING prepare() must still raise (prepared==True
     # is latched before the cycle check runs).
-    add_after_cycle: TopologicalSorter[str] = TopologicalSorter(None)
+    add_after_cycle: TopologicalSorter[str] = TopologicalSorter()
     add_after_cycle.add("A", ["A"])
     try:
         add_after_cycle.prepare()
@@ -346,7 +346,7 @@ def main() -> None:
 
     # done() with the SAME node duplicated in one call: the second occurrence
     # is already marked done by the first, within the same call.
-    done_dup: TopologicalSorter[str] = TopologicalSorter(None)
+    done_dup: TopologicalSorter[str] = TopologicalSorter()
     done_dup.add("A")
     done_dup.prepare()
     done_dup.get_ready()

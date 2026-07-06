@@ -12,22 +12,16 @@
 # dual-run compatibility, since CPython accepts every substituted spelling
 # identically):
 #
-#   - `Fraction()` (bare, zero-arg) is REPLACED by `Fraction(numerator=0,
-#     denominator=1)`. This module's constructor keeps CPython-shaped
-#     defaults (`numerator: int = 0, denominator: int = 1`) in its
-#     signature, but a REAL pyrst codegen bug (found while authoring this
-#     module — `src/codegen/exprs.rs`'s constructor-call arm only
-#     default-fills omitted parameters when the call ALSO carries at least
-#     one keyword argument) means a call with ZERO args and ZERO kwargs
-#     (`Fraction()`) does not compile at all right now. CPython accepts the
-#     keyword form identically (`Fraction(numerator=0, denominator=1) ==
-#     Fraction()`), so substituting it keeps this line dual-run safe without
-#     exercising the broken call shape.
-#   - `Fraction(0)` / `Fraction(1)` (single positional arg, omitted
-#     denominator) are REPLACED by `Fraction(numerator=0)` /
-#     `Fraction(numerator=1)` for the SAME reason: a lone keyword argument
-#     DOES hit the working (kwargs-present) default-fill path, and CPython
-#     accepts `Fraction(numerator=0)` identically to `Fraction(0)`.
+#   - Constructor default-fill (card 63870682, Phase 2 Batch A): the bare
+#     `Fraction()` (zero-arg, all defaults) and `Fraction(0)` / `Fraction(1)`
+#     (single positional, omitted `denominator`) call shapes NOW compile —
+#     the constructor-call arm (`src/codegen/exprs.rs`) fills omitted trailing
+#     defaults for a purely-positional / zero-arg call, not just a
+#     keyword-bearing one. These lines were formerly REPLACED by the
+#     `Fraction(numerator=0, denominator=1)` / `Fraction(numerator=0)` keyword
+#     spellings to sidestep that gap; they are restored to the natural CPython
+#     shapes here (CPython accepts both identically, so dual-run stays
+#     byte-identical).
 #   - String construction (`Fraction("1/2")`, `Fraction("42")`,
 #     `Fraction("-1/2")`) is DROPPED: this module only implements the
 #     int-pair constructor (no `*args`/`Union`-typed overloading in pyrst —
@@ -59,9 +53,9 @@ from fractions import Fraction
 
 def main() -> None:
     # ── Construction & normalization ─────────────────────────────────────
-    print(Fraction(numerator=0, denominator=1))
-    print(Fraction(numerator=0))
-    print(Fraction(numerator=1))
+    print(Fraction())
+    print(Fraction(0))
+    print(Fraction(1))
     print(Fraction(5, 2))
     print(Fraction(6, 9))
     print(Fraction(-3, 4))
@@ -76,7 +70,7 @@ def main() -> None:
     print(repr(Fraction(0, 1)))
     print(str(Fraction(3, 4)))
     print(str(Fraction(-5, 2)))
-    print(str(Fraction(numerator=0)))
+    print(str(Fraction(0)))
 
     # ── Arithmetic (exact, no float) ─────────────────────────────────────
     print(Fraction(1, 2) + Fraction(1, 3))
@@ -171,3 +165,18 @@ def main() -> None:
     # boundary identical to C/Rust's own literal-lexing behavior, not a
     # `fractions`-specific defect, so it is intentionally not exercised here.)
     print(repr(Fraction(9223372036854775807, 1)))
+
+    # ── Truthiness (__bool__ — card 18682938) ────────────────────────────
+    # A Fraction is falsy iff it is zero (canonical numerator == 0). Now that
+    # `__bool__` is a supported dunder, `bool(frac)` / `if frac:` / `not frac`
+    # dispatch to it and match CPython exactly (formerly a documented gap —
+    # users had to test `frac.numerator != 0`).
+    print(bool(Fraction(0)))
+    print(bool(Fraction(3, 4)))
+    print(bool(Fraction(0, 5)))
+    print(not Fraction(0))
+    print(not Fraction(1, 2))
+    if Fraction(2, 3):
+        print("nonzero")
+    if not Fraction(0):
+        print("zero")

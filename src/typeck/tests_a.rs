@@ -229,6 +229,202 @@ use super::test_support::*;
     }
 
     #[test]
+    fn optional_is_none_early_return_narrows_after() {
+        // (card c34ac64a, shape 1a) NEGATIVE narrowing: `if x is None: return`
+        // (no elif/else, terminating then) narrows x to its payload for the REST
+        // of the scope — the early-return guard idiom.
+        let ctx = TyCtx::new();
+        let mut env = make_env_ret(&ctx, Ty::Int);
+        env.locals.insert("x".into(), Ty::Option(Box::new(Ty::Int)));
+        let guard = Stmt::If {
+            cond: Expr::BinOp {
+                op: BinOp::Is,
+                lhs: Box::new(ident("x")),
+                rhs: Box::new(Expr::None_(Span::DUMMY)),
+                span: Span::DUMMY,
+            },
+            then: vec![Stmt::Return(Some(int_lit(0)), Span::DUMMY)],
+            elifs: vec![],
+            else_: None,
+            span: Span::DUMMY,
+        };
+        check_stmt(&guard, &mut env).unwrap();
+        // x narrows to int after the terminating `is None` guard...
+        assert_eq!(env.locals.get("x"), Some(&Ty::Int));
+        // ...so `x + 1` now type-checks as int (was an "operator on Optional" error).
+        let add = Expr::BinOp {
+            op: BinOp::Add,
+            lhs: Box::new(ident("x")),
+            rhs: Box::new(int_lit(1)),
+            span: Span::DUMMY,
+        };
+        assert_eq!(check_expr(&add, &mut env).unwrap(), Ty::Int);
+    }
+
+    #[test]
+    fn optional_is_none_guard_with_else_does_not_persist() {
+        // The negative narrowing is restricted to the else-less/elif-less shape:
+        // an `else` may fall through (and reassign x), so x stays Optional after.
+        let ctx = TyCtx::new();
+        let mut env = make_env_ret(&ctx, Ty::Int);
+        env.locals.insert("x".into(), Ty::Option(Box::new(Ty::Int)));
+        let guard = Stmt::If {
+            cond: Expr::BinOp {
+                op: BinOp::Is,
+                lhs: Box::new(ident("x")),
+                rhs: Box::new(Expr::None_(Span::DUMMY)),
+                span: Span::DUMMY,
+            },
+            then: vec![Stmt::Return(Some(int_lit(0)), Span::DUMMY)],
+            elifs: vec![],
+            else_: Some(vec![Stmt::Pass(Span::DUMMY)]),
+            span: Span::DUMMY,
+        };
+        check_stmt(&guard, &mut env).unwrap();
+        assert_eq!(env.locals.get("x"), Some(&Ty::Option(Box::new(Ty::Int))));
+    }
+
+    #[test]
+    fn optional_while_not_none_narrows_body() {
+        // (card c34ac64a, shape 1c) WHILE-loop narrowing: `while x is not None:`
+        // narrows x to its payload inside the body (so `x + 1` checks), restored
+        // to Option after the loop.
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        env.locals.insert("x".into(), Ty::Option(Box::new(Ty::Int)));
+        let body_assign = Stmt::Assign {
+            target: "y".into(),
+            ty: None,
+            value: Expr::BinOp {
+                op: BinOp::Add,
+                lhs: Box::new(ident("x")),
+                rhs: Box::new(int_lit(1)),
+                span: Span::DUMMY,
+            },
+            span: Span::DUMMY,
+        };
+        let while_stmt = Stmt::While {
+            cond: Expr::BinOp {
+                op: BinOp::IsNot,
+                lhs: Box::new(ident("x")),
+                rhs: Box::new(Expr::None_(Span::DUMMY)),
+                span: Span::DUMMY,
+            },
+            body: vec![body_assign],
+            span: Span::DUMMY,
+        };
+        check_stmt(&while_stmt, &mut env).unwrap();
+        assert_eq!(env.locals.get("x"), Some(&Ty::Option(Box::new(Ty::Int))));
+    }
+
+    #[test]
+    fn optional_narrow_dies_after_for_loop() {
+        // (card c34ac64a fix B1) A negative narrow born INSIDE a for-loop body
+        // (`if v is None: continue`) must NOT leak past the loop — the body runs
+        // 0..n times, so `v` is Optional again AFTER the loop.
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        env.locals.insert("v".into(), Ty::Option(Box::new(Ty::Int)));
+        let guard = Stmt::If {
+            cond: Expr::BinOp {
+                op: BinOp::Is,
+                lhs: Box::new(ident("v")),
+                rhs: Box::new(Expr::None_(Span::DUMMY)),
+                span: Span::DUMMY,
+            },
+            then: vec![Stmt::Continue(Span::DUMMY)],
+            elifs: vec![],
+            else_: None,
+            span: Span::DUMMY,
+        };
+        let for_stmt = Stmt::For {
+            targets: vec!["i".into()],
+            iter: call_fn("range", vec![int_lit(3)]),
+            body: vec![guard],
+            span: Span::DUMMY,
+        };
+        check_stmt(&for_stmt, &mut env).unwrap();
+        // The body-born narrow died at the loop edge: v is Optional again.
+        assert_eq!(env.locals.get("v"), Some(&Ty::Option(Box::new(Ty::Int))));
+    }
+
+    #[test]
+    fn second_none_guard_on_narrowed_var_rejected() {
+        // (card c34ac64a fix B3) After `if x is None: return` narrows x to int, a
+        // SECOND `if x is None:` is statically always-false — an honest CHECK error
+        // (was a leaked rustc `.is_none()`-on-i64).
+        let ctx = TyCtx::new();
+        let mut env = make_env_ret(&ctx, Ty::Int);
+        env.locals.insert("x".into(), Ty::Option(Box::new(Ty::Int)));
+        let mk_guard = || Stmt::If {
+            cond: Expr::BinOp {
+                op: BinOp::Is,
+                lhs: Box::new(ident("x")),
+                rhs: Box::new(Expr::None_(Span::DUMMY)),
+                span: Span::DUMMY,
+            },
+            then: vec![Stmt::Return(Some(int_lit(-1)), Span::DUMMY)],
+            elifs: vec![],
+            else_: None,
+            span: Span::DUMMY,
+        };
+        // First guard narrows x -> int.
+        check_stmt(&mk_guard(), &mut env).unwrap();
+        assert_eq!(env.locals.get("x"), Some(&Ty::Int));
+        // Second identical guard is rejected (x can no longer be None).
+        assert!(check_stmt(&mk_guard(), &mut env).is_err());
+    }
+
+    #[test]
+    fn reassign_narrowed_var_to_none_rewidens() {
+        // (card c34ac64a fix B2c) A reassignment KILLS the narrow: after
+        // `if x is None: return`, `x = None` re-widens x back to Optional
+        // (matching codegen's reconverge into the Option slot).
+        let ctx = TyCtx::new();
+        let mut env = make_env_ret(&ctx, Ty::Int);
+        env.locals.insert("x".into(), Ty::Option(Box::new(Ty::Int)));
+        let guard = Stmt::If {
+            cond: Expr::BinOp {
+                op: BinOp::Is,
+                lhs: Box::new(ident("x")),
+                rhs: Box::new(Expr::None_(Span::DUMMY)),
+                span: Span::DUMMY,
+            },
+            then: vec![Stmt::Return(Some(int_lit(-1)), Span::DUMMY)],
+            elifs: vec![],
+            else_: None,
+            span: Span::DUMMY,
+        };
+        check_stmt(&guard, &mut env).unwrap();
+        assert_eq!(env.locals.get("x"), Some(&Ty::Int));
+        // `x = None` reassignment re-widens to the declared Option.
+        let reassign = Stmt::Assign {
+            target: "x".into(),
+            ty: None,
+            value: Expr::None_(Span::DUMMY),
+            span: Span::DUMMY,
+        };
+        check_stmt(&reassign, &mut env).unwrap();
+        assert_eq!(env.locals.get("x"), Some(&Ty::Option(Box::new(Ty::Int))));
+        assert!(!env.narrowed.contains_key("x"));
+    }
+
+    #[test]
+    fn optional_attribute_access_rejected() {
+        // (card c34ac64a, shape 1b) Accessing an attribute on an Optional value is
+        // an honest error (bind to a local first) — never a silent rustc leak.
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        env.locals.insert("s".into(), Ty::Option(Box::new(Ty::Int)));
+        let attr = Expr::Attr {
+            obj: Box::new(ident("s")),
+            name: "v".into(),
+            span: Span::DUMMY,
+        };
+        assert_type_err(check_expr(&attr, &mut env), "Optional value");
+    }
+
+    #[test]
     fn return_none_in_optional_fn_typechecks() {
         // `return None` and `return <bare int>` both satisfy an Optional[int] ret.
         let ctx = TyCtx::new();

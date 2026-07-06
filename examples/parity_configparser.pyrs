@@ -6,15 +6,15 @@
 # precedent — `import configparser` resolves to CPython's own stdlib module
 # in the python3 twin and to `lib/configparser.pyrs` under pyrst).
 #
-# CONSTRUCTOR CALL SHAPE: every `ConfigParser(...)` call below passes BOTH
-# `defaults=` and `allow_no_value=` explicitly by keyword, rather than the
-# common bare `ConfigParser()`. This works around a pre-existing pyrst
-# compiler gap where `__init__`'s default-arg VALUES are not filled in at a
-# call site that omits them (the same root cause `lib/collections.pyrs`'s
-# `deque` header documents for its zero-arg generic constructor) — explicit
-# args of the RIGHT names sidestep the gap while remaining valid, identically-
-# behaved calls under real CPython too (`dict_type` keeps ITS OWN default
-# since untouched).
+# CONSTRUCTOR CALL SHAPE: the bare `ConfigParser()` (both `defaults=` and
+# `allow_no_value=` omitted, taking their defaults) NOW compiles — card
+# 63870682 (Phase 2 Batch A) taught the constructor-call arm to fill omitted
+# trailing defaults for a purely-positional / zero-arg call, not only a
+# keyword-bearing one. These calls formerly passed BOTH kwargs explicitly to
+# sidestep that gap; they are restored to the natural bare `ConfigParser()`
+# here. (The three `ConfigParser(defaults={...})` calls below still pass a
+# non-default `defaults` by keyword.) CPython behaves identically for every
+# shape, so dual-run stays byte-identical.
 #
 # DICT-PRINTING RULE: `defaults()` returns a `dict[str, str]`; per pyrst
 # convention this is NEVER printed directly (pyrst `dict` iteration is not
@@ -35,7 +35,7 @@ from configparser import ConfigParser
 
 def main() -> None:
     # 1-6: basic section/option/get/has_section/has_option/options
-    cp: ConfigParser = ConfigParser(defaults=None, allow_no_value=False)
+    cp: ConfigParser = ConfigParser()
     cp.add_section('test')
     cp.set('test', 'key', 'value')
     print(cp.sections())                        # ['test']
@@ -64,15 +64,15 @@ def main() -> None:
     print(('def', 'val') in cp2.items('s'))       # True
 
     # 15-16: read_string basic + DEFAULT section
-    cp3: ConfigParser = ConfigParser(defaults=None, allow_no_value=False)
+    cp3: ConfigParser = ConfigParser()
     cp3.read_string('[s]\nk=v')
     print(cp3.get('s', 'k'))                      # v
-    cp4: ConfigParser = ConfigParser(defaults=None, allow_no_value=False)
+    cp4: ConfigParser = ConfigParser()
     cp4.read_string('[DEFAULT]\nd=dv\n[s]\nl=lv')
     print(cp4.get('s', 'd'))                      # dv
 
     # 17-18: BasicInterpolation + raw
-    cp5: ConfigParser = ConfigParser(defaults=None, allow_no_value=False)
+    cp5: ConfigParser = ConfigParser()
     cp5.add_section('s')
     cp5.set('s', 'base', '/home')
     cp5.set('s', 'path', '%(base)s/user')
@@ -86,13 +86,13 @@ def main() -> None:
     print(cp6.get('s', 'cfg'))                    # /opt/conf
 
     # 20: interpolation with vars
-    cp7: ConfigParser = ConfigParser(defaults=None, allow_no_value=False)
+    cp7: ConfigParser = ConfigParser()
     cp7.add_section('s')
     cp7.set('s', 'cfg', '%(home)s/conf')
     print(cp7.get('s', 'cfg', vars={'home': '/var'}))  # /var/conf
 
     # 22-23: empty value + value with equals
-    cp8: ConfigParser = ConfigParser(defaults=None, allow_no_value=False)
+    cp8: ConfigParser = ConfigParser()
     cp8.add_section('s')
     cp8.set('s', 'empty', '')
     print(cp8.get('s', 'empty'))                  # (blank line)
@@ -108,12 +108,12 @@ def main() -> None:
     # InterpolationDepthError is NOT a ValueError subclass while pyrst has no
     # custom exception classes and raises a plain ValueError with the identical
     # message, so it is verified separately rather than in this dual-run.)
-    cpd: ConfigParser = ConfigParser(defaults=None, allow_no_value=False)
+    cpd: ConfigParser = ConfigParser()
     cpd.read_string('[s]\na1=%(a2)s\na2=%(a3)s\na3=%(a4)s\na4=%(a5)s\na5=%(a6)s\na6=%(a7)s\na7=%(a8)s\na8=%(a9)s\na9=%(a10)s\na10=%(a11)s\na11=DONE')
     print(cpd.get('s', 'a1'))                     # DONE
 
     # 24-27: fallback parameters
-    cp9: ConfigParser = ConfigParser(defaults=None, allow_no_value=False)
+    cp9: ConfigParser = ConfigParser()
     cp9.add_section('s')
     print(cp9.get('s', 'missing', fallback='def'))       # def
     print(cp9.getint('s', 'missing', fallback=99))       # 99
@@ -121,15 +121,15 @@ def main() -> None:
     print(cp9.getboolean('s', 'missing', fallback=False)) # False
 
     # 28-29: whitespace strip + multiline value
-    cp10: ConfigParser = ConfigParser(defaults=None, allow_no_value=False)
+    cp10: ConfigParser = ConfigParser()
     cp10.read_string('[s]\n  k  =  v  ')
     print(cp10.get('s', 'k'))                     # v
-    cp11: ConfigParser = ConfigParser(defaults=None, allow_no_value=False)
+    cp11: ConfigParser = ConfigParser()
     cp11.read_string('[s]\nk=line1\n line2\n line3')
     print(cp11.get('s', 'k'))                     # line1\nline2\nline3
 
     # 30-33: option-name case transform + section case sensitivity
-    cp12: ConfigParser = ConfigParser(defaults=None, allow_no_value=False)
+    cp12: ConfigParser = ConfigParser()
     cp12.read_string('[s]\nMyOpt=val')
     print(cp12.options('s'))                      # ['myopt']
     print(cp12.get('s', 'MYOPT'))                  # val
@@ -137,7 +137,7 @@ def main() -> None:
     print(cp12.has_section('S'))                   # False
 
     # 34-41: boolean forms
-    cp13: ConfigParser = ConfigParser(defaults=None, allow_no_value=False)
+    cp13: ConfigParser = ConfigParser()
     cp13.add_section('s')
     cp13.set('s', 'b', 'yes')
     print(cp13.getboolean('s', 'b'))               # True
@@ -157,7 +157,7 @@ def main() -> None:
     print(cp13.getboolean('s', 'b'))                # False
 
     # 42-43: remove_option / remove_section
-    cp14: ConfigParser = ConfigParser(defaults=None, allow_no_value=False)
+    cp14: ConfigParser = ConfigParser()
     cp14.add_section('s')
     cp14.set('s', 'k', 'v')
     cp14.remove_option('s', 'k')
@@ -167,14 +167,14 @@ def main() -> None:
     print(cp14.has_section('s2'))                   # False
 
     # 44-45: literal percent escape
-    cp15: ConfigParser = ConfigParser(defaults=None, allow_no_value=False)
+    cp15: ConfigParser = ConfigParser()
     cp15.add_section('s')
     cp15.set('s', 'pct', 'val %% here')
     print(cp15.get('s', 'pct', raw=False))          # val % here
     print(cp15.get('s', 'pct', raw=True))           # val %% here
 
     # 46-50: numeric edge cases
-    cp16: ConfigParser = ConfigParser(defaults=None, allow_no_value=False)
+    cp16: ConfigParser = ConfigParser()
     cp16.add_section('s')
     cp16.set('s', 'k', '0')
     print(cp16.getint('s', 'k'))                    # 0
@@ -188,7 +188,7 @@ def main() -> None:
     print(cp16.getfloat('s', 'k'))                  # 1e-10
 
     # Nested interpolation (BEHAVIOR MATRIX)
-    cp17: ConfigParser = ConfigParser(defaults=None, allow_no_value=False)
+    cp17: ConfigParser = ConfigParser()
     cp17.add_section('s')
     cp17.set('s', 'base', '/home')
     cp17.set('s', 'user', 'alice')
@@ -203,26 +203,26 @@ def main() -> None:
     print(cp18.items('section1'))                   # [('global_key', 'global_val'), ('local_key', 'local_val')]
 
     # Insertion order preservation (options / sections)
-    cp19: ConfigParser = ConfigParser(defaults=None, allow_no_value=False)
+    cp19: ConfigParser = ConfigParser()
     cp19.add_section('s')
     cp19.set('s', 'z', '1')
     cp19.set('s', 'a', '2')
     cp19.set('s', 'm', '3')
     print(cp19.options('s'))                        # ['z', 'a', 'm']
-    cp20: ConfigParser = ConfigParser(defaults=None, allow_no_value=False)
+    cp20: ConfigParser = ConfigParser()
     cp20.add_section('z')
     cp20.add_section('a')
     cp20.add_section('m')
     print(cp20.sections())                          # ['z', 'a', 'm']
 
     # DEFAULT section modification via set('DEFAULT', ...)
-    cp21: ConfigParser = ConfigParser(defaults=None, allow_no_value=False)
+    cp21: ConfigParser = ConfigParser()
     cp21.read_string('[DEFAULT]\nd1=v1')
     cp21.set('DEFAULT', 'd2', 'v2')
     print(sorted(cp21.defaults().items()))          # [('d1', 'v1'), ('d2', 'v2')]
 
     # Unicode support
-    cp22: ConfigParser = ConfigParser(defaults=None, allow_no_value=False)
+    cp22: ConfigParser = ConfigParser()
     cp22.add_section('s')
     cp22.set('s', 'unicode', '你好')
     print(cp22.get('s', 'unicode'))                 # 你好

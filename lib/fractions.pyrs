@@ -81,17 +81,14 @@
 #   str/repr, i64-overflow honesty); left for a future card per the dossier's
 #   GATED table.
 #
-#   NEWLY DISCOVERED (not in the dossier — found while implementing this
-#   module): although `__bool__` IS in codegen's dunder-name allow-list
-#   (`src/codegen/mod.rs`), the typechecker (`src/typeck/checks.rs`)
-#   unconditionally REJECTS a user-defined `__bool__` method with "`__bool__`
-#   is not yet supported (object truthiness is not lowered)" — the compiler
-#   has no working object-truthiness lowering yet (`bool(obj)` / `if obj:` do
-#   not dispatch to a class method at all), so defining `__bool__` is a hard
-#   compile error, not silently ignored. `bool(Fraction(...))` /
-#   `if some_fraction:` are therefore UNSUPPORTED here; test/branch on
-#   `frac.numerator != 0` directly instead. Filed as a compiler-capability gap
-#   for whichever card owns object-truthiness lowering next.
+#   OBJECT TRUTHINESS (card 18682938 — RESOLVED): `__bool__` is now a supported
+#   dunder. The typechecker accepts a `def __bool__(self) -> bool` method and
+#   codegen lowers object truthiness to a `.__bool__()` call at every bool
+#   context (`if frac:` / `while frac:` / `bool(frac)` / `not frac` / `and` /
+#   `or`). This module defines `__bool__` (numerator != 0), so `bool(Fraction(
+#   ...))` / `if some_fraction:` now match CPython exactly — exercised in
+#   parity_fractions.pyrs. (Was formerly a hard compile error: "`__bool__` is
+#   not yet supported (object truthiness is not lowered)".)
 #
 #   No reflected/cross-type arithmetic (`__radd__`/`__rsub__`/`__rmul__`/
 #   `__rtruediv__`) and no `int`-cross-type arithmetic or comparison at all:
@@ -233,6 +230,13 @@ class Fraction:
 
     def is_integer(self) -> bool:
         return self.denominator == 1
+
+    def __bool__(self) -> bool:
+        # (card 18682938) A Fraction is truthy iff it is non-zero. In canonical
+        # form a zero Fraction has numerator 0 (the denominator normalizes to 1),
+        # so `numerator != 0` is the exact CPython truthiness. Enables
+        # `bool(frac)` / `if frac:` / `not frac` (see parity_fractions.pyrs).
+        return self.numerator != 0
 
     def as_integer_ratio(self) -> tuple[int, int]:
         return (self.numerator, self.denominator)

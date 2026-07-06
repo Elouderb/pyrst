@@ -52,3 +52,10 @@ Fraction(0, 1)
 max_denominator should be at least 1
 max_denominator should be at least 1
 Fraction(9223372036854775807, 1)
+False
+True
+False
+True
+False
+nonzero
+zero

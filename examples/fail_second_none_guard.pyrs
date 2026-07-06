@@ -1,0 +1,17 @@
+# HONEST REJECTION (card c34ac64a fix B3): a SECOND None-guard on a var an earlier
+# guard already narrowed. After `if x is None: return`, `x` is `int` for the rest
+# of the scope, so a second `if x is None:` is statically ALWAYS FALSE — `x` can
+# no longer be None. pyrst rejects it at CHECK (the guard names a non-Optional
+# value); without this the second guard emitted `.is_none()` on the unwrapped
+# `i64` shadow and leaked a raw rustc E0599. To test x against None again, reassign
+# it first (reassignment re-widens the narrow — see parity_narrow_reassign.pyrs).
+def f(x: Optional[int]) -> int:
+    if x is None:
+        return -1
+    if x is None:
+        return -2
+    return x + 1
+
+
+def main() -> None:
+    print(f(9))

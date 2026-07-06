@@ -1067,9 +1067,20 @@ impl<'a> Codegen<'a> {
                             // hoisted into source-ordered temps so side
                             // effects still run left-to-right (CPython call
                             // order), mirroring emit_plain_func_call.
-                            if !kwargs.is_empty() {
-                                let init_key = format!("{}.__init__", name);
-                                if let Some(mut sig) = self.ctx.funcs.get(&init_key).cloned() {
+                            let init_key = format!("{}.__init__", name);
+                            if let Some(mut sig) = self.ctx.funcs.get(&init_key).cloned() {
+                                // (card 63870682) A keyword-bearing OR UNDER-APPLIED
+                                // (trailing-default-taking) constructor call routes through
+                                // the shared slot mapper so declared defaults fill the
+                                // `::new` params — matching the free-fn and method call
+                                // sites. The default-fill was previously gated behind
+                                // kwargs-nonempty, so a purely-positional under-application
+                                // (`Point(5)`, `Fraction(0)`, zero-arg `ConfigParser()`)
+                                // emitted `::new` with too few args and leaked rustc E0061.
+                                // A FULLY-applied positional call (args.len() ==
+                                // sig.params.len(), no kwargs) still takes the
+                                // byte-identical plain positional loop below.
+                                if !kwargs.is_empty() || args.len() < sig.params.len() {
                                     let slots = crate::typeck::map_kwargs_to_slots(
                                         &init_key, &sig, args.len(), kwargs, callee.span(),
                                     )?;
@@ -1110,22 +1121,23 @@ impl<'a> Codegen<'a> {
                         // are associated `const`s, not struct fields (items.rs excludes
                         // them from the struct too), so counting one as a required ctor
                         // arg gave the wrong arity / a bogus struct-field init.
+                        // (card 63870682) Build the field set from the FULL transitive
+                        // ancestry (`get_all_fields`: ancestors-first, then own, deduped
+                        // by name, class-constants excluded) — the SAME walk emit_class
+                        // uses for the struct layout and the synthesized `new()`. The old
+                        // inline walk descended only ONE level into `class_def.bases`
+                        // (each direct base's OWN `fields`), so a 3-level dataclass chain
+                        // (Base→Mid→Leaf) dropped the grandparent's fields: a positional
+                        // `Leaf(a,b,c,d)` then mis-bound against `[c, d]` (wrong-arity /
+                        // E0062), while the keyword form — which emits each field by name —
+                        // still worked. Sourcing from get_all_fields keeps the call-site
+                        // field order byte-identical to the struct definition.
                         let mut all_field_names: Vec<String> = Vec::new();
-                        for base in &class_def.bases {
-                            if let Some(bd) = self.ctx.classes.get(base.as_str()).cloned() {
-                                for f in &bd.fields {
-                                    if !all_field_names.contains(&f.name)
-                                        && !self.is_class_const_field(name, &f.name)
-                                    {
-                                        all_field_names.push(f.name.clone());
-                                    }
-                                }
+                        for f in self.ctx.get_all_fields(name.as_str()) {
+                            if self.is_class_const_field(name, &f.name) {
+                                continue;
                             }
-                        }
-                        for f in &class_def.fields {
-                            if !all_field_names.contains(&f.name)
-                                && !self.is_class_const_field(name, &f.name)
-                            {
+                            if !all_field_names.contains(&f.name) {
                                 all_field_names.push(f.name.clone());
                             }
                         }
@@ -1144,39 +1156,20 @@ impl<'a> Codegen<'a> {
                             // default value. typeck already rejected an omitted field
                             // that has NO default (map_kwargs_to_slots), so a missing
                             // default here is a defensive codegen error only.
+                            // (dedupe, phase2-fix2) Each field emits via the shared
+                            // struct-literal helpers: a provided positional through
+                            // `emit_struct_field_value` (class_field_type coercion —
+                            // incl. the EPIC-5 C2-3 polymorphic-base variant wrap — +
+                            // enabler-fix-1 #4a self-referential boxing), an omitted
+                            // TRAILING field through `emit_omitted_field_default`
+                            // (default-fill, or the "missing required argument" error).
                             let all_params = self.ctx.get_all_fields(name.as_str());
                             let mut parts = Vec::new();
                             for (i, field_name) in all_field_names.iter().enumerate() {
-                                // (EPIC-5 C2-3) The struct field lowers to `B__` for
-                                // a polymorphic-base field, so a raw-struct/subclass
-                                // value wraps in its variant (same as the ctor/new
-                                // path above).
-                                let fty = self.class_field_type(&class_def, field_name);
                                 let v = if i < args.len() {
-                                    self.emit_arg_into_slot(&args[i], fty.as_ref())?
+                                    self.emit_struct_field_value(name, &class_def, field_name, &args[i])?
                                 } else {
-                                    match all_params
-                                        .iter()
-                                        .find(|p| &p.name == field_name)
-                                        .and_then(|p| p.default.as_ref())
-                                    {
-                                        Some(d) => self.emit_arg_into_slot(d, fty.as_ref())?,
-                                        None => {
-                                            return Err(crate::diag::Error::Codegen(format!(
-                                                "class `{}` missing a required argument: `{}`",
-                                                name, field_name
-                                            )))
-                                        }
-                                    }
-                                };
-                                // (enabler-fix-1 #4a) Box a self-referential field
-                                // value: the struct stores `Option<Box<Node>>`, so a
-                                // direct struct-literal ctor (dataclass / no-__init__)
-                                // must `.map(Box::new)` the value here (the `self.x=..`
-                                // boxing path never runs for direct construction).
-                                let v = match &fty {
-                                    Some(ft) => self.box_recursive_field_value(name, ft, v),
-                                    None => v,
+                                    self.emit_omitted_field_default(name, &class_def, &all_params, field_name)?
                                 };
                                 // (EPIC-6) Escape a keyword field name in the
                                 // positional struct-literal init.
@@ -1200,27 +1193,46 @@ impl<'a> Codegen<'a> {
                             // source order. typeck (map_kwargs_to_slots against the
                             // synthesized field signature) has already rejected any
                             // duplicate / unknown / missing / too-many argument.
+                            // (dedupe, phase2-fix2) Leading positionals then keywords,
+                            // each through the shared `emit_struct_field_value`
+                            // (class_field_type coercion + enabler-fix-1 #4a boxing).
                             for (field_name, arg) in all_field_names.iter().zip(args.iter()) {
-                                let fty = self.class_field_type(&class_def, field_name);
-                                let v = self.emit_arg_into_slot(arg, fty.as_ref())?;
-                                // (enabler-fix-1 #4a) Box a self-referential field.
-                                let v = match &fty {
-                                    Some(ft) => self.box_recursive_field_value(name, ft, v),
-                                    None => v,
-                                };
+                                let v = self.emit_struct_field_value(name, &class_def, field_name, arg)?;
                                 parts.push(format!("{}: {}", escape_ident(field_name), v));
                             }
                             for (kw, val) in kwargs {
-                                let fty = self.class_field_type(&class_def, kw);
-                                let v = self.emit_arg_into_slot(val, fty.as_ref())?;
-                                // (enabler-fix-1 #4a) Box a self-referential field.
-                                let v = match &fty {
-                                    Some(ft) => self.box_recursive_field_value(name, ft, v),
-                                    None => v,
-                                };
+                                let v = self.emit_struct_field_value(name, &class_def, kw, val)?;
                                 // (EPIC-6) Escape a keyword field name in the
                                 // keyword-arg struct-literal init.
                                 parts.push(format!("{}: {}", escape_ident(kw), v));
+                            }
+                            // (card 63870682) Fill any field left UNCOVERED by both
+                            // the positionals (which bind the leading `args.len()`
+                            // fields) and the keywords with its declared default — the
+                            // same middle/trailing default-fill the positional-only and
+                            // `__init__` (`::new`) paths perform, making the dataclass
+                            // struct-literal keyword form uniform with them. typeck
+                            // (map_kwargs_to_slots over the synthesized field signature)
+                            // already rejected an omitted field with NO default, so a
+                            // missing default here is a defensive codegen error only. A
+                            // Rust struct literal is order-insensitive, so appending the
+                            // filled defaults after the provided fields is well-formed.
+                            // Without this, a mixed/keyword call that omitted a defaulted
+                            // field (`Config("k", debug=True)` leaving `port` to default)
+                            // emitted an incomplete struct literal (rustc E0063).
+                            let provided_by_kw: std::collections::HashSet<&str> =
+                                kwargs.iter().map(|(k, _)| k.as_str()).collect();
+                            let all_params = self.ctx.get_all_fields(name.as_str());
+                            for (i, field_name) in all_field_names.iter().enumerate() {
+                                if i < args.len() || provided_by_kw.contains(field_name.as_str()) {
+                                    continue;
+                                }
+                                // (dedupe, phase2-fix2) Fill an uncovered field with
+                                // its declared default via the shared helper (same
+                                // default-fill + missing-argument error as the
+                                // positional-only path).
+                                let v = self.emit_omitted_field_default(name, &class_def, &all_params, field_name)?;
+                                parts.push(format!("{}: {}", escape_ident(field_name), v));
                             }
                             return Ok(Some(format!("{} {{ {} }}", name, parts.join(", "))));
                         }
@@ -1244,14 +1256,9 @@ impl<'a> Codegen<'a> {
                                 // — an unpromoted defaulted instance field would have
                                 // been silently zeroed (`level` -> 0 instead of 1).
                                 match &f.default {
-                                    Some(d) => {
-                                        let fty = self.class_field_type(&class_def, fname);
-                                        let v = self.emit_arg_into_slot(d, fty.as_ref())?;
-                                        match &fty {
-                                            Some(ft) => self.box_recursive_field_value(name, ft, v),
-                                            None => v,
-                                        }
-                                    }
+                                    // (dedupe, phase2-fix2) Honor a declared default via
+                                    // the shared struct-literal emit core.
+                                    Some(d) => self.emit_struct_field_value(name, &class_def, fname, d)?,
                                     None => {
                                         let ty = Ty::from_type_expr(&f.ty, f.span)?;
                                         self.zeroed_default(&ty)
@@ -1318,14 +1325,20 @@ impl<'a> Codegen<'a> {
                             let a = self.emit_expr(&args[0])?;
                             let b = self.emit_expr(&args[1])?;
                             let step = self.emit_expr(&args[2])?;
-                            return Ok(Some(format!("({}..{}).step_by({} as usize)", a, b, step)));
+                            // (card 87bd8eb4) Direction-aware: a negative step
+                            // descends (CPython), a zero step is a catchable
+                            // ValueError. `.step_by(neg as usize)` silently yielded
+                            // nothing. Materializes a `Vec<i64>` (range types as
+                            // list[int] already), consumed uniformly by for-loops /
+                            // list() / comprehensions (they see a list, not a `..`).
+                            return Ok(Some(format!("__py_range_step({}, {}, {})", a, b, step)));
                         }
                     }
                 }
 
-                // Inline enumerate(iter) — emits iterator chain without collecting
+                // Inline enumerate(iter[, start]) — emits iterator chain without collecting
                 if let Expr::Ident(n, _) = callee.as_ref() {
-                    if n == "enumerate" && args.len() == 1 {
+                    if n == "enumerate" && (args.len() == 1 || args.len() == 2) {
                         let a = self.emit_expr(&args[0])?;
                         let is_range = a.contains("..");
                         let iter_chain = if is_range {
@@ -1350,6 +1363,21 @@ impl<'a> Codegen<'a> {
                         } else {
                             format!("{}.iter().cloned()", a)
                         };
+                        // (card 00fb0e6d) CPython `enumerate(it, start)` seeds the
+                        // counter at `start` (default 0).
+                        // (card c34ac64a fix E) `start` must be evaluated exactly
+                        // ONCE (CPython), not once per element. Splicing it into the
+                        // per-element `.map()` closure re-ran a side-effecting /
+                        // non-idempotent `start` on every step. HOIST it to a
+                        // pre-call temp via a block expression and `move`-capture it
+                        // (an int is Copy). The 1-arg form is byte-identical to before.
+                        if args.len() == 2 {
+                            let s = self.emit_expr(&args[1])?;
+                            return Ok(Some(format!(
+                                "{{ let __enum_start: i64 = ({}); {}.enumerate().map(move |(i, v)| (i as i64 + __enum_start, v)) }}",
+                                s, iter_chain
+                            )));
+                        }
                         return Ok(Some(format!("{}.enumerate().map(|(i, v)| (i as i64, v))", iter_chain)));
                     }
                 }
@@ -1447,6 +1475,12 @@ impl<'a> Codegen<'a> {
                             return Ok(Some(format!("({}.len() as i64)", a)));
                         }
                         "str" => {
+                            // (card 00fb0e6d) CPython `str()` with no argument is the
+                            // EMPTY string (not an error). Handle before touching
+                            // `args[0]` (an empty-vec index was the exit-101 ICE).
+                            if args.is_empty() {
+                                return Ok(Some("String::new()".into()));
+                            }
                             let a = self.emit_expr(&args[0])?;
                             match self.type_of_expr(&args[0]) {
                                 // Match print/f-string formatting: a whole float is
@@ -1471,6 +1505,10 @@ impl<'a> Codegen<'a> {
                             return Ok(Some(format!("__py_open(&{}, &{})", path, mode)));
                         }
                         "int" => {
+                            // (card 00fb0e6d) CPython `int()` with no argument is 0.
+                            if args.is_empty() {
+                                return Ok(Some("0i64".into()));
+                            }
                             let a = self.emit_expr(&args[0])?;
                             let arg_type = self.type_of_expr(&args[0]);
                             match arg_type {
@@ -1483,6 +1521,10 @@ impl<'a> Codegen<'a> {
                             }
                         }
                         "float" => {
+                            // (card 00fb0e6d) CPython `float()` with no argument is 0.0.
+                            if args.is_empty() {
+                                return Ok(Some("0.0f64".into()));
+                            }
                             let a = self.emit_expr(&args[0])?;
                             let arg_type = self.type_of_expr(&args[0]);
                             match arg_type {
@@ -1495,6 +1537,18 @@ impl<'a> Codegen<'a> {
                             }
                         }
                         "bool" => {
+                            // (card 00fb0e6d) CPython `bool()` with no argument is False.
+                            if args.is_empty() {
+                                return Ok(Some("false".into()));
+                            }
+                            // (card 18682938) `bool(obj)` for a class-with-`__bool__`
+                            // lowers to `obj.__bool__()`; numeric/other args keep the
+                            // `!= 0` truthiness lowering.
+                            if let Ty::Class(cls, _) = self.type_of_expr(&args[0]) {
+                                if self.ctx.get_method(&cls, "__bool__").is_some() {
+                                    return Ok(Some(self.emit_truthy(&args[0])?));
+                                }
+                            }
                             let a = self.emit_expr(&args[0])?;
                             return Ok(Some(format!("(({}) != 0)", a)));
                         }
@@ -2257,6 +2311,46 @@ impl<'a> Codegen<'a> {
                             if args.is_empty() {
                                 return Ok(Some("Vec::<i64>::new()".to_string()));
                             } else {
+                                // (card 00fb0e6d) `list(range(...))` — a `range(...)`
+                                // lowers to a Rust Range / StepBy ITERATOR, but
+                                // `range()` types as `list[int]` (its Python result),
+                                // so the already-a-list fast path below would return
+                                // the bare iterator and fail rustc (E0308 vs Vec, or
+                                // E0599 on the StepBy step form). Detect the range CALL
+                                // structurally and `.collect()` it — the same iterator
+                                // the `for`-loop lowering consumes, now materialized.
+                                if let Expr::Call { callee: rc, .. } = &args[0] {
+                                    if matches!(rc.as_ref(), Expr::Ident(rn, _) if rn == "range") {
+                                        let r = self.emit_expr(&args[0])?;
+                                        // (card 87bd8eb4) A 1/2-arg range is a lazy
+                                        // Rust `..` iterator -> `.collect()`. A 3-arg
+                                        // range already materializes a `Vec<i64>`
+                                        // (__py_range_step, direction-aware) -> return
+                                        // it directly (`.collect()` on a Vec is E0599).
+                                        if r.contains("..") {
+                                            return Ok(Some(format!("({}).collect::<Vec<_>>()", r)));
+                                        }
+                                        return Ok(Some(r));
+                                    }
+                                }
+                                // (phase2-fix2 item 3) `list(enumerate(it[, start]))`
+                                // and `list(zip(...))`: these builtins are INLINED
+                                // (the `enumerate`/`zip` arms earlier in this fn) into
+                                // a LAZY Rust adapter chain (`.enumerate().map(..)`,
+                                // `.zip(..)`), yet they TYPE as `list[...]` (their
+                                // Python result), so the already-a-list fast path below
+                                // returned the bare adapter and leaked a rustc E0308
+                                // (a `Map`/`Zip` is not a `Vec`). Detect the adapter
+                                // CALL structurally — exactly like `range` above — and
+                                // `.collect()` the emitted chain. typeck has already
+                                // validated the callee's arity, so the inlined chain is
+                                // always a collectible iterator here.
+                                if let Expr::Call { callee: ac, .. } = &args[0] {
+                                    if matches!(ac.as_ref(), Expr::Ident(an, _) if an == "enumerate" || an == "zip") {
+                                        let a = self.emit_expr(&args[0])?;
+                                        return Ok(Some(format!("({}).collect::<Vec<_>>()", a)));
+                                    }
+                                }
                                 let a = self.emit_expr(&args[0])?;
                                 let arg_type = self.type_of_expr(&args[0]);
                                 // If the argument is already a list, just return it. Otherwise collect the iterator.
@@ -2365,6 +2459,35 @@ impl<'a> Codegen<'a> {
                 }
         Ok(None)
     }
+    /// (card 18682938) Emit `e` as a Rust `bool` for a TRUTHINESS context
+    /// (if/while/assert conditions, `not`, `and`/`or`, `bool(x)`). When `e` is an
+    /// instance of a user class that defines `__bool__`, lower object truthiness to
+    /// a `.__bool__()` call (CPython semantics). Every other type emits exactly as
+    /// `emit_expr` does — so a `bool`-typed condition (comparison, bool local, …) is
+    /// byte-for-byte unchanged, and pyrst's existing "condition must be bool"
+    /// requirement is untouched for non-class operands.
+    pub(crate) fn emit_truthy(&mut self, e: &Expr) -> Result<String> {
+        // `and`/`or` in a truthiness context: RECURSE so a class-with-`__bool__`
+        // operand on either side lowers via `__bool__` too (`if a and b:`). Handled
+        // here (not in the generic BinOp path) to keep the hot arithmetic path
+        // untouched; pyrst's `and`/`or` already lower to `&&`/`||` (bool-only), so
+        // this stays consistent. A nested `not` reaches the UnOp arm, which itself
+        // routes its operand through `emit_truthy`.
+        if let Expr::BinOp { op: op @ (BinOp::And | BinOp::Or), lhs, rhs, .. } = e {
+            let l = self.emit_truthy(lhs)?;
+            let r = self.emit_truthy(rhs)?;
+            let op_s = if matches!(op, BinOp::And) { "&&" } else { "||" };
+            return Ok(format!("({} {} {})", l, op_s, r));
+        }
+        let s = self.emit_expr(e)?;
+        if let Ty::Class(cls, _) = self.type_of_expr(e) {
+            if self.ctx.get_method(&cls, "__bool__").is_some() {
+                return Ok(format!("({}).__bool__()", s));
+            }
+        }
+        Ok(s)
+    }
+
     pub(crate) fn emit_expr(&mut self, e: &Expr) -> Result<String> {
         Ok(match e {
             // A numeric literal is a primary expression, so bare `0i64` / `1.5f64`
@@ -2514,7 +2637,10 @@ impl<'a> Codegen<'a> {
                 // (mirrors the `Stmt::For` lowering).
                 let target = comp_target_pat(targets);
                 let result = if let Some(cond_expr) = cond {
-                    let cond_s = self.emit_expr(cond_expr)?;
+                    // (card c34ac64a fix C) A comprehension `if`-filter is a
+                    // truthiness context — a `__bool__` class lowers via
+                    // `.__bool__()` (was E0308); plain bool filters pass through.
+                    let cond_s = self.emit_truthy(cond_expr)?;
                     format!("{}.filter_map(|{}| if {} {{ Some({}) }} else {{ None }} ).collect::<Vec<_>>()",
                         chain, target, cond_s, elt_s)
                 } else {
@@ -2554,7 +2680,8 @@ impl<'a> Codegen<'a> {
                 // (EPIC-6) Escape the comprehension target(s) (see ListComp above).
                 let target = comp_target_pat(targets);
                 let result = if let Some(cond_expr) = cond {
-                    let cond_s = self.emit_expr(cond_expr)?;
+                    // (card c34ac64a fix C) See ListComp: filter is a truthiness ctx.
+                    let cond_s = self.emit_truthy(cond_expr)?;
                     format!("{}.filter_map(|{}| if {} {{ Some({}) }} else {{ None }} ).collect::<::std::collections::HashSet<_>>()",
                         chain, target, cond_s, elt_s)
                 } else {
@@ -2595,7 +2722,8 @@ impl<'a> Codegen<'a> {
                 // (EPIC-6) Escape the comprehension target(s) (see ListComp above).
                 let target = comp_target_pat(targets);
                 let result = if let Some(cond_expr) = cond {
-                    let cond_s = self.emit_expr(cond_expr)?;
+                    // (card c34ac64a fix C) See ListComp: filter is a truthiness ctx.
+                    let cond_s = self.emit_truthy(cond_expr)?;
                     format!("{}.filter_map(|{}| if {} {{ Some(({}, {})) }} else {{ None }} ).collect::<::std::collections::HashMap<_,_>>()",
                         chain, target, cond_s, key_s, val_s)
                 } else {
@@ -2772,17 +2900,7 @@ impl<'a> Codegen<'a> {
                     // value semantics — the documented aliasing divergence from
                     // Python's reference semantics) and unboxes each element. A
                     // non-recursive field keeps the ordinary clone-on-use read.
-                    let boxed_recursive = if let Ty::Class(cn, _) = self.type_of_expr(obj) {
-                        self.ctx
-                            .classes
-                            .get(&cn)
-                            .cloned()
-                            .and_then(|cd| self.class_field_type(&cd, name))
-                            .is_some_and(|ft| self.field_needs_box(&cn, &ft))
-                    } else {
-                        false
-                    };
-                    if boxed_recursive {
+                    if self.attr_read_is_boxed_recursive(obj, name) {
                         // (EPIC-6) escape the keyword field name as elsewhere.
                         format!("{}.{}.clone().map(|__b| *__b)", o, escape_ident(name))
                     } else {
@@ -3208,6 +3326,11 @@ impl<'a> Codegen<'a> {
                 // are not value-consuming dunders, so they stay on emit_expr.
                 let e = if matches!(op, UnOp::Neg) && matches!(self.type_of_expr(expr), Ty::Class(..)) {
                     self.emit_consuming(expr)?
+                } else if matches!(op, UnOp::Not) {
+                    // (card 18682938) `not obj` is a truthiness context: a
+                    // class-with-`__bool__` operand lowers to `!obj.__bool__()`.
+                    // emit_truthy emits the operand exactly once (no double-eval).
+                    self.emit_truthy(expr)?
                 } else {
                     self.emit_expr(expr)?
                 };
@@ -3230,12 +3353,50 @@ impl<'a> Codegen<'a> {
                 let param_strs: Vec<String> = params.iter()
                     .map(|(name, _ty)| escape_ident(name))
                     .collect();
+                // (card 97e02e09) Register each param with its ANNOTATED type (a bare
+                // lambda's params are `Any`->Unknown, but a `Callable`-slot / map /
+                // key lambda reaches other arms; this arm also serves inline-invoked
+                // and annotated lambdas) so `type_of_expr` inside the body sees the
+                // param type and a `Str` param's `a + b` routes through the statement
+                // path's `format!("{}{}", ..)` lowering instead of the numeric `(a+b)`
+                // that rustc rejects for `String + String`. Restored after the body.
+                //
+                // (card c34ac64a fix A) Each param is a FRESH binding that SHADOWS any
+                // outer local / narrowing shadow of the same name for the body's
+                // duration. scope_enter snapshots locals + shadow_map (+ declared);
+                // scope_exit restores them. A BARE (Unknown) param must be REMOVED from
+                // `locals` — otherwise an outer same-named local (e.g. `a: str`) bleeds
+                // its type in and mis-lowers `a + b` as string concat (silent
+                // miscompile: prints "34" for `f(3,4)`); after removal `type_of_expr`
+                // falls back to inference and rustc types the param from the call site.
+                // The `shadow_map` entry is dropped for EVERY param name so a live outer
+                // narrowing shadow (unwrapped binding) never resolves a param read.
+                // (card c34ac64a fix A) Consume any inline-invoke param-type hints
+                // (`(lambda a,b: ..)(x,y)`), so a bare param pinned to a call arg's
+                // type keeps it; `.take()` clears them so a nested lambda in the body
+                // does not inherit them.
+                let hints = self.pending_inline_lambda_params.take();
+                let __lam_snap = self.scope_enter();
+                for (name, ty) in params.iter() {
+                    let pty = crate::typeck::lambda_param_ty(ty);
+                    self.shadow_map.remove(name);
+                    if !matches!(pty, Ty::Unknown) {
+                        self.locals.insert(name.clone(), pty);
+                    } else if let Some(hint) = hints.as_ref().and_then(|h| h.get(name)) {
+                        self.locals.insert(name.clone(), hint.clone());
+                    } else {
+                        self.locals.remove(name);
+                    }
+                }
                 let body_s = self.emit_expr(body)?;
+                self.scope_exit(__lam_snap);
                 format!("|{}| {}", param_strs.join(", "), body_s)
             }
             Expr::IfExp { test, body, orelse, .. } => {
                 // Python's `body if test else orelse` -> Rust's if-expression.
-                let t = self.emit_expr(test)?;
+                // (card c34ac64a fix C) The ternary TEST is a truthiness context —
+                // a class-with-`__bool__` lowers via `.__bool__()` (was E0308).
+                let t = self.emit_truthy(test)?;
                 let b = self.emit_expr(body)?;
                 let o = self.emit_expr(orelse)?;
                 format!("(if {} {{ {} }} else {{ {} }})", t, b, o)

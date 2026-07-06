@@ -163,33 +163,24 @@
 #      Public API note above. No `re` dependency was pulled in for one
 #      predicate; the common "blank line" and "bare `#` line" cases (the
 #      only shapes CPython's own docstring examples exercise) are exact.
-#   6. **`SequenceMatcher(...)` positional calls must supply all FOUR
-#      constructor args (or use keyword args for the omitted trailing
-#      ones)**: a pyrst CODEGEN GAP (not a stdlib design choice) means a
-#      class `__init__`'s trailing DEFAULT arguments are not filled in for a
-#      plain positional call that omits them (`SequenceMatcher(None, "a",
-#      "b")` — 3 positional args, relying on `autojunk`'s default — fails
-#      to build with a Rust `E0061` arg-count mismatch). The SAME
-#      trailing-default omission works FINE for ordinary free functions
-#      (e.g. `get_close_matches("x", ["y"])`, omitting `n`/`cutoff`,
-#      compiles and runs correctly) and also works fine via an explicit
-#      KEYWORD call on the constructor itself
-#      (`SequenceMatcher(isjunk=None, a="a", b="b")` builds and runs
-#      correctly) — so the gap is specific to POSITIONAL-with-omission on a
-#      class constructor. WORKAROUND used throughout this module and its
-#      parity file: always pass all four constructor positionals
-#      explicitly (`SequenceMatcher(None, a, b, True)`), which is equally
-#      valid CPython syntax (an explicit `True` for the already-default
-#      `autojunk` changes nothing observable) so dual-run byte-identical
-#      parity is unaffected — only the LITERAL 3-arg spelling from the
-#      dossier's own PARITY PLAN snippets had to be expanded to 4 args.
-#      The SAME family of gap also showed up on `find_longest_match`'s
-#      `Optional[int]` params: a positional literal int
-#      (`find_longest_match(0, 6, 0, 6)`) fails to coerce to `Some(6)` for
-#      a class METHOD (whereas a plain free FUNCTION with an
-#      `Optional[int]` parameter, e.g. `bisect_left(a, 3, 1, 5)`, coerces
-#      the positional literal fine) — worked around the same way, with
-#      keyword args (`find_longest_match(alo=0, ahi=6, blo=0, bhi=6)`).
+#   6. **RESOLVED (phase2-fix2) — was: "`SequenceMatcher(...)` positional
+#      calls must supply all FOUR constructor args."** A class `__init__`'s
+#      trailing DEFAULT arguments are NOW filled in for a plain positional
+#      call that omits them (`SequenceMatcher(None, "a", "b")` — 3 positional
+#      args, relying on `autojunk`'s default — builds and runs), and a
+#      positional literal int NOW coerces into a class METHOD's `Optional[int]`
+#      parameter (`find_longest_match(0, 6, 0, 6)` -> `Some(6)`). Both were the
+#      same constructor/method arg-lowering gap, fixed by the constructor
+#      default-fill + positional-into-Optional work (card 63870682) and verified
+#      against python3 — 3-arg positional `SequenceMatcher(...)` and positional
+#      `find_longest_match(...)` are byte-identical to CPython. This module and
+#      its parity file STILL pass all four constructor positionals explicitly
+#      (`SequenceMatcher(None, a, b, True)`) and STILL use keyword args on
+#      `find_longest_match` — a harmless, byte-identical CONVENTION that is no
+#      longer required (an explicit `True` for the already-default `autojunk`
+#      changes nothing observable). NOTE 7a below is a DISTINCT, still-open gap
+#      (an `Optional[Callable]` value passed DIRECTLY into a constructor is not
+#      `Some(Rc::new(...))`-wrapped), not this one — keep its workaround.
 #   7a. **HARDENING (card fb63e9dc, reviewer w2-hardener): a real pyrst
 #      COMPILER gap, not a difflib bug — passing a custom `isjunk`/
 #      `linejunk`/`charjunk` callable (a bare top-level function name, OR a

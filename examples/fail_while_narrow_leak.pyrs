@@ -1,0 +1,17 @@
+# HONEST REJECTION (card c34ac64a fix B1): a negative narrow born INSIDE a while
+# body must NOT leak past the loop. The `if v is None: break` narrows `v` for the
+# rest of that iteration only; after the loop `v` is `Optional[int]` again, so
+# `v + 1` after the loop is rejected at CHECK. Before the fix the while restored
+# only its own condition narrow, so the body-nested narrow leaked and `v + 1`
+# leaked a raw rustc E0369.
+def f(v: Optional[int]) -> int:
+    n: int = 0
+    while n < 3:
+        if v is None:
+            break
+        n = n + 1
+    return v + 1
+
+
+def main() -> None:
+    print(f(5))

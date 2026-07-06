@@ -1,0 +1,54 @@
+# parity: dual-run
+# DUAL-RUN CPython parity golden for card c34ac64a fix A: a lambda PARAM that
+# collides with an outer local of a DIFFERENT type must SHADOW that outer local
+# for the body's duration — the param is a fresh binding, not the outer one.
+#
+# The pre-fix codegen skipped registering a BARE (untyped) lambda param, so an
+# outer `a: str` bled its type into the body and `a + b` was mis-lowered as
+# STRING CONCAT: `lambda a, b: a + b` applied to (3, 4) printed "34" instead of
+# 7 (a SILENT MISCOMPILE). It also failed to drop an active NARROWING shadow of
+# the same name, so a param reusing a narrowed name resolved to the outer
+# unwrapped binding. Both are fixed: each shape below runs byte-identically under
+# pyrst and CPython. Runs under the harness `from __future__ import annotations`
+# + explicit `main()` convention.
+
+
+def apply2(f: Callable[[int, int], int], a: int, b: int) -> int:
+    return f(a, b)
+
+
+def main() -> None:
+    # 1. THE P0: a BARE lambda param `a` collides with an outer `a: str`.
+    #    Body `a + b` must be INTEGER addition over the params (7), not str
+    #    concat over the outer str ("34").
+    a: str = "outer"
+    add = lambda a, b: a + b
+    print(add(3, 4))
+    # the outer `a` is untouched by the lambda param
+    print(a)
+
+    # 2. TYPED (Callable-slot) lambdas whose param name also collides with `a`.
+    gi: Callable[[int, int], int] = lambda a, b: a + b
+    print(gi(10, 20))
+    gs: Callable[[str, str], str] = lambda a, b: a + b
+    print(gs("x", "y"))
+
+    # 3. NARROWED-OUTER collision: inside `if v is not None:` the outer `v` is
+    #    narrowed (an unwrapped shadow). A lambda param reusing `v` must read the
+    #    PARAM (3 -> 30), not the outer unwrapped value; the outer `v` stays
+    #    narrowed for `v + 1` (6).
+    v: Optional[int] = 5
+    if v is not None:
+        scale = lambda v: v * 10
+        print(scale(3))
+        print(v + 1)
+
+    # 4. no-collision numeric regression: a plain int-adding lambda still works.
+    tot: int = 0
+    plus = lambda x, y: x + y
+    tot = plus(100, 23)
+    print(tot)
+
+    # 5. lambda passed positionally into a Callable param (param name collides
+    #    with the outer `a: str`).
+    print(apply2(lambda a, b: a * b, 6, 7))

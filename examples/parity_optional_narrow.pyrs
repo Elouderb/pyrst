@@ -1,0 +1,85 @@
+# DUAL-RUN parity (card c34ac64a): the Optional NARROWING ergonomics family.
+#   - WHILE-loop narrowing with a loop-carried reassignment — the linked-list
+#     traversal idiom `while cur is not None: ...; cur = cur.next`. The body sees
+#     the unwrapped payload; the reassignment restores Optional at the back-edge,
+#     so the loop advances and terminates.
+#   - NEGATIVE (early-return guard) narrowing — `if x is None: <terminates>`
+#     narrows x to its payload for the REST of the scope. Exercised with all four
+#     terminators: return, raise (only the None path raises), continue, break.
+# python3 is the oracle (`from __future__ import annotations` stringizes the pyrst
+# annotations; main() is called explicitly by the harness).
+from dataclasses import dataclass
+
+
+@dataclass
+class Node:
+    val: int
+    next: Optional[Node]
+
+
+def cons(val: int, rest: Optional[Node]) -> Node:
+    return Node(val, rest)
+
+
+def sum_while(head: Optional[Node]) -> int:
+    acc: int = 0
+    cur: Optional[Node] = head
+    while cur is not None:
+        acc = acc + cur.val
+        cur = cur.next
+    return acc
+
+
+def collect(head: Optional[Node]) -> list[int]:
+    out: list[int] = []
+    cur: Optional[Node] = head
+    while cur is not None:
+        out.append(cur.val)
+        cur = cur.next
+    return out
+
+
+def first_or(head: Optional[Node], dflt: int) -> int:
+    if head is None:
+        return dflt
+    return head.val
+
+
+def must_val(head: Optional[Node]) -> int:
+    if head is None:
+        raise ValueError("empty")
+    return head.val
+
+
+def sum_present(d: dict[str, int], keys: list[str]) -> int:
+    acc: int = 0
+    for k in keys:
+        v = d.get(k)
+        if v is None:
+            continue
+        acc = acc + v
+    return acc
+
+
+def until_missing(d: dict[str, int], keys: list[str]) -> int:
+    acc: int = 0
+    for k in keys:
+        v = d.get(k)
+        if v is None:
+            break
+        acc = acc + v
+    return acc
+
+
+def main() -> None:
+    head: Optional[Node] = cons(10, cons(20, cons(30, None)))
+    print(sum_while(head))
+    print(collect(head))
+    print(sum_while(None))
+    print(collect(None))
+    print(first_or(head, -1))
+    print(first_or(None, -1))
+    print(must_val(head))
+    d: dict[str, int] = {"a": 1, "b": 2, "c": 3}
+    print(sum_present(d, ["a", "x", "b", "y", "c"]))
+    print(until_missing(d, ["a", "b", "z", "c"]))

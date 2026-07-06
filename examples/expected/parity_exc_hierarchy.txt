@@ -1,0 +1,29 @@
+-- OSError family via except OSError --
+OSError OSError
+FileNotFoundError OSError
+FileExistsError OSError
+IsADirectoryError OSError
+NotADirectoryError OSError
+SameFileError OSError
+-- OSError family via except Exception --
+OSError Exception
+FileNotFoundError Exception
+FileExistsError Exception
+IsADirectoryError Exception
+NotADirectoryError Exception
+SameFileError Exception
+-- non-OSError controls via except OSError (must be 'other') --
+ValueError other
+TypeError other
+KeyError other
+ZeroDivisionError other
+-- LookupError family --
+KeyError LookupError
+IndexError LookupError
+-- ArithmeticError family --
+ZeroDivisionError ArithmeticError
+OverflowError ArithmeticError
+-- RuntimeError family --
+NotImplementedError RuntimeError
+-- LookupError control: ValueError must be 'other' --
+ValueError other

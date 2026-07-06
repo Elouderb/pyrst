@@ -7,16 +7,13 @@
 # CPython-verified error messages). All scratch state is created under a
 # fresh `mkdtemp()` directory and removed before exiting.
 #
-# NOTE: `dircmp(a, b)` — the CPython 2-positional-argument call shape — hits
-# a compiler gap independent of this stdlib pass: a class constructor call
-# with ZERO keyword arguments does not fill a trailing `__init__` default
-# (only a free-function call or an explicit keyword/full-positional
-# constructor call goes through the default-filling path — verified against
-# `lib/bisect.pyrs`'s free-function defaults, which DO work 1-arg-short; see
-# the card history for the isolated repro). Every `dircmp(...)` call below passes
-# `ignore` explicitly (`None` or a list) to stay on the working path; this is
-# flagged for the integrator rather than worked around silently in a way that
-# would mask the gap.
+# NOTE: `dircmp(a, b)` — the natural CPython 2-positional-argument call shape,
+# omitting the trailing `ignore: Optional[list[str]] = None` default — NOW
+# compiles. Card 63870682 (Phase 2 Batch A) taught the constructor-call arm to
+# fill omitted trailing `__init__` defaults for a purely-positional / zero-arg
+# call (matching the free-function and method call sites), so the `dircmp(a, b)`
+# calls below are restored to the natural shape; only the one row that
+# genuinely needs a non-default `ignore` list still passes it explicitly.
 
 from os import mkdir, write_file, join
 from filecmp import cmp, cmpfiles, dircmp
@@ -88,7 +85,7 @@ def main() -> None:
     print(errors3)
 
     # --- dircmp: basic attributes ------------------------------------------------
-    dcmp: dircmp = dircmp(dir_a, dir_b, None)
+    dcmp: dircmp = dircmp(dir_a, dir_b)
     print(sorted(dcmp.same_files))
     print(sorted(dcmp.diff_files))
     print(sorted(dcmp.left_only))
@@ -100,7 +97,7 @@ def main() -> None:
     # --- dircmp: left_only / right_only ------------------------------------------
     write_file(join(dir_a, "only_left.txt"), "l")
     write_file(join(dir_b, "only_right.txt"), "r")
-    dcmp2: dircmp = dircmp(dir_a, dir_b, None)
+    dcmp2: dircmp = dircmp(dir_a, dir_b)
     print(sorted(dcmp2.left_only))
     print(sorted(dcmp2.right_only))
 
@@ -113,7 +110,7 @@ def main() -> None:
 
     # --- dircmp: missing directory -> FileNotFoundError --------------------------
     try:
-        dircmp(dir_a, join(base, "no_such_dir"), None)
+        dircmp(dir_a, join(base, "no_such_dir"))
         print("no error")
     except FileNotFoundError as e:
         print(e.replace(base, "<base>"))
@@ -123,7 +120,7 @@ def main() -> None:
     mkdir(join(dir_b, "subdir"))
     write_file(join(join(dir_a, "subdir"), "file.txt"), "sub")
     write_file(join(join(dir_b, "subdir"), "file.txt"), "sub")
-    dcmp4: dircmp = dircmp(dir_a, dir_b, None)
+    dcmp4: dircmp = dircmp(dir_a, dir_b)
     print(sorted(dcmp4.subdirs.keys()))
     nested: dircmp = dcmp4.subdirs["subdir"]
     print(sorted(nested.same_files))
@@ -162,7 +159,7 @@ def main() -> None:
     not_a_dir: str = join(base, "hard_not_a_dir.txt")
     write_file(not_a_dir, "x")
     try:
-        dircmp(not_a_dir, dir_x, None)
+        dircmp(not_a_dir, dir_x)
         print("no error")
     except NotADirectoryError as e:
         print(e.replace(base, "<base>"))

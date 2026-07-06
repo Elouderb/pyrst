@@ -136,19 +136,16 @@
 #      is unaffected and dual-runs byte-identical; this is a real latent
 #      hazard for OTHER graphs, called out per the dossier's HAZARDS section.
 #
-#   9. `TopologicalSorter()` (bare, zero-arg) does NOT compile — a general
-#      pyrst compiler gap: `rustc` E0061 "this function takes 1 argument but
-#      0 arguments were supplied" on the generated `TopologicalSorter::new()`
-#      call, because default-arg lowering doesn't thread an `Optional[T] =
-#      None` default through a GENERIC class's zero-arg call site (confirmed
-#      via an isolated minimal, non-generic repro too — the same class of gap
-#      already documented for `collections.deque`'s `set_maxlen`). Callers
-#      MUST pass the graph argument explicitly: `TopologicalSorter(None)`
-#      instead of bare `TopologicalSorter()` — valid, semantically-identical
-#      CPython syntax too, so this costs nothing for parity (used throughout
-#      the parity file), but pyrst cannot support the bare zero-arg call
-#      CPython users are most likely to write. Flagged for the compiler-gap
-#      backlog; not a `graphlib`-specific defect.
+#   9. `TopologicalSorter()` (bare, zero-arg) NOW compiles — card 63870682
+#      (Phase 2 Batch A) fixed the constructor-call default-fill gap: the
+#      constructor-call arm now fills an omitted trailing `Optional[T] = None`
+#      default for a purely-positional / zero-arg call, threading through the
+#      generic class's `::new()` correctly (the gap formerly raised `rustc`
+#      E0061 "takes 1 argument but 0 arguments were supplied"). The parity file
+#      is restored to the natural bare `TopologicalSorter()` throughout;
+#      `TopologicalSorter({...})` (a non-default graph dict) is of course still
+#      passed explicitly. Historic note: the same class of gap was documented
+#      for `collections.deque`'s `set_maxlen`.
 #
 # ORDERING (the dossier's headline HAZARD, resolved): `nodes: list[T]` records
 # true first-seen order for every node touched by `.add()` (explicit or as an

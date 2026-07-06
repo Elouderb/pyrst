@@ -25,7 +25,11 @@ use crate::typeck::{Ty, TyCtx, MUTATING_METHODS};
 /// identical local arrays (EPIC-5 C2-2b-i Step 0).
 const DUNDER_TRAIT_NAMES: &[&str] = &[
     "__str__", "__repr__", "__add__", "__sub__", "__mul__",
-    "__eq__", "__neg__", "__bool__", "__lt__",
+    "__eq__", "__neg__", "__lt__",
+    // NOTE: `__bool__` is deliberately NOT here (card 18682938). It has no Rust
+    // trait counterpart for truthiness; instead it is emitted as an ordinary
+    // inherent method `fn __bool__(&self) -> bool` and CALLED at each bool-context
+    // site via `emit_truthy` (if/while/bool()/not/assert/and/or).
 ];
 
 pub struct Codegen<'a> {
@@ -168,6 +172,15 @@ pub struct Codegen<'a> {
     /// each `emit_func` / `emit_nested_def` body and saved/restored around a nested
     /// def, so emission is byte-stable across runs.
     shadow_counter: usize,
+    /// (card c34ac64a fix A) Param-type HINTS for an INLINE-INVOKED lambda
+    /// `(lambda a, b: ...)(x, y)`: `emit_callee_with_inline_lambda_types` pins each
+    /// bare param's type from the corresponding call ARGUMENT and stashes it here
+    /// just before emitting the lambda callee. The Lambda arm `.take()`s these and
+    /// applies them to its OWN params — so a bare `Str`-arg param routes `+`
+    /// through `format!` — instead of removing the param (its outer-bleed guard).
+    /// `None` everywhere except across that single inline-invoke emit; a nested
+    /// lambda inside the body sees `None` (the `.take()` consumed it).
+    pending_inline_lambda_params: Option<std::collections::HashMap<String, Ty>>,
 }
 
 
@@ -336,9 +349,20 @@ fn stmt_has_loopctl(s: &Stmt, want_break: bool) -> bool {
     }
 }
 
-/// upstream as the catch-all `true` arm). The builtin hierarchy is only two
-/// levels deep, so each base's transitive closure is written out directly.
+/// upstream as the catch-all `true` arm). Each base's FULL transitive closure
+/// (base + every subclass, any depth) is written out directly, against the real
+/// CPython builtin hierarchy — verified with `issubclass` (card c1fec2bf).
+/// `except <base>` OR-expands over this set so it catches every subclass pyrst
+/// (or an embedded stdlib module) can raise, exactly like CPython.
 fn exc_descendants(base: &str) -> Vec<&'static str> {
+    // (dedupe, phase2-fix2) The OSError -> ConnectionError subfamily, written
+    // ONCE and shared by both the `OSError` (full transitive closure) and the
+    // `ConnectionError` (its own subtree) arms below, so the five connection
+    // classes can never drift out of sync between the two tables.
+    const CONNECTION_FAMILY: [&str; 5] = [
+        "ConnectionError", "BrokenPipeError", "ConnectionAbortedError",
+        "ConnectionRefusedError", "ConnectionResetError",
+    ];
     match base {
         "ArithmeticError" => vec![
             "ArithmeticError", "ZeroDivisionError", "OverflowError", "FloatingPointError",
@@ -346,9 +370,34 @@ fn exc_descendants(base: &str) -> Vec<&'static str> {
         "LookupError" => vec!["LookupError", "IndexError", "KeyError"],
         "RuntimeError" => vec!["RuntimeError", "RecursionError", "NotImplementedError"],
         "NameError" => vec!["NameError", "UnboundLocalError"],
-        "OSError" => vec![
-            "OSError", "FileNotFoundError", "PermissionError", "IsADirectoryError",
-        ],
+        // OSError family (CPython `issubclass(X, OSError)` ground truth). The
+        // file-system subclasses `FileExistsError` / `NotADirectoryError` /
+        // `SameFileError` (the last being `shutil.SameFileError`, a real OSError
+        // subclass) were MISSING, so `except OSError:` silently skipped them and
+        // the panic propagated — a behavior divergence from CPython on a valid
+        // program (card c1fec2bf, found by the fs-trio hardener). The full real
+        // builtin OSError subclass set is listed for completeness (connection /
+        // process / timeout families included even though the current stdlib
+        // surface does not yet raise them), so the table matches CPython rather
+        // than only today's raise sites. Every entry is a VERIFIED OSError
+        // subclass — nothing here is wrongly widened.
+        "OSError" => {
+            let mut v = vec![
+                "OSError",
+                // filesystem
+                "FileNotFoundError", "FileExistsError", "IsADirectoryError",
+                "NotADirectoryError", "PermissionError", "SameFileError",
+                // process / io
+                "BlockingIOError", "ChildProcessError", "InterruptedError",
+                "ProcessLookupError", "TimeoutError",
+            ];
+            // connection family (OSError -> ConnectionError -> ...), shared source.
+            v.extend_from_slice(&CONNECTION_FAMILY);
+            v
+        }
+        // `ConnectionError` is itself an OSError subclass WITH its own children;
+        // `except ConnectionError:` catches those four (CPython-faithful).
+        "ConnectionError" => CONNECTION_FAMILY.to_vec(),
         // Leaves and unknown/custom types: caller uses an exact-match condition.
         _ => vec![],
     }
@@ -937,6 +986,21 @@ pub fn emit_program(modules: &[(Module, String)], ctx: &TyCtx) -> Result<String>
     cg.line("    let mut __i = __start;");
     cg.line("    if __step > 0 { while __i < __stop { __result.push(__chars[__i as usize]); __i += __step; } }");
     cg.line("    else { while __i > __stop { __result.push(__chars[__i as usize]); __i += __step; } }");
+    cg.line("    __result");
+    cg.line("}");
+    // (card 87bd8eb4) Direction-aware `range(start, stop, step)`. CPython's range
+    // is DESCENDING when step<0, but Rust's `a..b` is ascending-only and `.step_by`
+    // takes a `usize` — a negative step wrapped to a huge usize and the range
+    // silently yielded NOTHING (a silent divergence on valid programs). The 3-arg
+    // range materializes through this direction-aware builder (used uniformly by
+    // for-loops, `list(range(...))`, and comprehensions). A zero step is CPython's
+    // catchable `ValueError: range() arg 3 must not be zero`.
+    cg.line("fn __py_range_step(__start: i64, __stop: i64, __step: i64) -> Vec<i64> {");
+    cg.line("    if __step == 0 { panic!(\"ValueError\\0range() arg 3 must not be zero\"); }");
+    cg.line("    let mut __result: Vec<i64> = Vec::new();");
+    cg.line("    let mut __i = __start;");
+    cg.line("    if __step > 0 { while __i < __stop { __result.push(__i); __i += __step; } }");
+    cg.line("    else { while __i > __stop { __result.push(__i); __i += __step; } }");
     cg.line("    __result");
     cg.line("}");
     // (try/except control flow) Signal a try BODY's escaping control flow out of

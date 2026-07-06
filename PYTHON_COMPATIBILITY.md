@@ -48,7 +48,7 @@ This document clarifies which Python features are supported, partially supported
 | Recursion | ✅ Supported | Works as expected |
 | Positional arguments | ✅ Supported | Order matters |
 | Keyword arguments | ✅ Supported | (W1.5, kwargs v1 + review fix round) Full keyword→positional mapping for user functions, module functions (flat + qualified), methods, and constructors (constructor keywords bind the `__init__` **parameters**, CPython semantics); unknown / duplicate / missing keywords are check-time errors; builtins stay positional-only, like CPython. **Call-site evaluation order is CPython SOURCE order** — positionals first, then keywords as written — even when keyword slots invert AND even for by-reference (`Mut[T]`) arguments (their place side effects run in source position); pinned byte-for-byte by the dual-run goldens `parity_kwargs_evalorder` and `parity_ctor_method_kwargs` |
-| Default arguments | ✅ Supported | `def f(x: int = 5)` |
+| Default arguments | ✅ Supported | `def f(x: int = 5)`. **Eval-timing divergence (honest):** CPython evaluates a default expression **once**, at `def` time; pyrst **re-evaluates the default on every call that omits the argument** (the default is spliced into each call site). This is observable only with a *side-effecting* default. Silver lining: the classic CPython **mutable-default trap is avoided** — `def acc(x: int, xs: list[int] = []) -> list[int]` gets a **fresh** `[]` on every call (each call returns `[x]`), whereas CPython shares one list across all calls (`[x]`, then `[x1, x2]`, …). |
 | `*args` | ❌ Not Supported | Variadic arguments not supported |
 | `**kwargs` | ❌ Not Supported | Keyword unpacking not supported |
 | Lambda expressions | ✅ Supported | `lambda x: x + 1` |
@@ -72,6 +72,7 @@ This document clarifies which Python features are supported, partially supported
 | `super()` | ✅ Supported | Calls base-class methods |
 | Subtype polymorphism | ✅ Supported | Pass/assign/return a `Derived` where a `Base` is expected; heterogeneous `list[Base]`; virtual dispatch. See [Class Subtyping / Polymorphism](#class-subtyping--polymorphism). |
 | Operator overloading | ✅ Supported | `__add__`, `__eq__`, `__lt__`, `__str__`, etc. |
+| User truthiness (`__bool__`) | ✅ Supported | A class defining `__bool__(self) -> bool` is usable in every boolean context — `if`/`elif`/`while`/`assert`, `not`, `bool(x)`, `and`/`or`, and comprehension `if`-filters — each lowered to a `.__bool__()` call (CPython semantics; the method runs exactly once per evaluation). A class with **no** `__bool__` in a boolean context is an honest build error, never silently truthy. |
 | `@property` | ✅ Supported | Computed read-only attributes |
 | `@staticmethod` | ✅ Supported | No-`self` methods |
 | `@classmethod` | ⚠️ Limited | `cls` requires a type annotation pyrst cannot express cleanly |
@@ -79,7 +80,7 @@ This document clarifies which Python features are supported, partially supported
 | Unknown class decorator | ✅ Honest error | Any class decorator other than `@dataclass` is a check-time error (was silently swallowed before). |
 | Class-level constants (`RED: int = 1`) | ✅ Supported | A class-body binding with a literal default that is never reassigned via `self.` becomes an associated const — `Color.RED` / `self.RED` / `inst.RED`. Enum-member substrate. A field mutated in any method stays a normal instance field. |
 | Class instances as `dict` keys / `set` elements | ✅ Supported | A class whose fields are all hashable (`int`/`str`/`bool`/tuple/nested-such) derives `Eq + Hash + Ord`. Uses **structural** equality (value semantics) — diverges from CPython's reference identity for a class without `__eq__`/`__hash__`. A `float`/`list`/`dict`/`set`/`Callable` field, or a user `__eq__`/`__lt__`, is an honest error (unhashable). The derive is **usage-gated** and **transitive**: a key class's user-class fields (directly or in a tuple) derive too; an annotation-less dict/set literal keyed by constructor calls (`{Node(1): …}`) opts the class in. **Comparison is separately gated:** `<`/`<=`/`>`/`>=` and key-less `sorted`/`min`/`max` on a user class require a defined `__lt__` (independent of key status), so the derived `Ord` never silently makes an un-`__lt__` class orderable. A **polymorphic base** (a class with subclasses) can't be a key — it lowers to a companion enum with no uniform derive (honest error; key a concrete leaf). A user class reaching a key position **only through a generic type parameter** is an honest error — pyrst emits one generic fn (no monomorphization), so it can't thread the derive; key the class concretely somewhere to opt in. **Residual:** an annotation-less dict built by index-assigning a **variable** key still needs an annotation. |
-| Self-referential fields (`next: Optional[Node]`) | ✅ Supported | Inline self-reference is boxed (`Option<Box<Node>>`). Build TAIL-FIRST — `a.next = b` deep-clones `b` (value semantics), so head-first-then-mutate diverges from CPython's aliasing. A `list[Node]` (tree) needs no boxing. **Perf (value semantics):** reading a boxed recursive field (`node.next`) deep-clones the remaining chain, so a chain read/traversal is O(remaining) per step. This is inherent to value semantics (no shared borrow returns an owned Box-blind value); pyrst does not contort the read path to hide it. |
+| Self-referential fields (`next: Optional[Node]`) | ✅ Supported | Inline self-reference is boxed (`Option<Box<Node>>`). Build TAIL-FIRST — `a.next = b` deep-clones `b` (value semantics), so head-first-then-mutate diverges from CPython's aliasing. A `list[Node]` (tree) needs no boxing. **Perf (value semantics):** reading a boxed recursive field (`node.next`) deep-clones the remaining chain, so a chain read/traversal is O(remaining) per step. This is inherent to value semantics (no shared borrow returns an owned Box-blind value); pyrst does not contort the read path to hide it. Consequently a **`while cur is not None: … cur = cur.next` traversal of a boxed recursive chain is O(n²)** overall for an n-length list — each `cur.next` step clones the rest of the chain. Correct, but quadratic; for a hot linear walk prefer a `list[Node]` (contiguous, no per-step clone) over a boxed linked list. |
 | Inheritance (multiple) | ❌ Not Supported | Single inheritance only |
 | Monkey patching | ❌ Not Supported | Classes are immutable |
 | Dynamic attribute access | ❌ Not Supported | No runtime `getattr`/`setattr` |
@@ -171,7 +172,7 @@ Each of the following is reported as a clean pyrst error (typeck or codegen), no
 | `len()` | ✅ Supported | Sequences/mappings; char count for `str`. `len()` of a fixed-shape **tuple** is its constant arity (`len(s.partition("="))` → `3`). |
 | `repr()` | ✅ Supported | CPython `%r`: `repr(1.0)` → `1.0`; str quote-choice matrix (single quotes, switch to double when the string has `'` and no `"`); escapes backslash/quote/`\n\t\r`, ASCII controls, the C1 controls (`U+0080–U+009F`), and the common Cf invisibles (`U+00AD`, `U+200B–U+200F`, `U+2028–U+202E`, `U+FEFF`) as `\xXX`/`\uXXXX`. A class needs a `__repr__` (honest error otherwise). **Gap:** exotic Cf/Cn code points outside those ranges pass through (no full Unicode "printable" table). |
 | `ascii()` | ✅ Supported | `repr()`'s quote matrix, plus **every** non-ASCII code point escaped as `\xXX`/`\uXXXX`/`\UXXXXXXXX` (`ascii("héllo")` → `'h\xe9llo'`). String arg; other types use their `str`/Display form. |
-| `range()` | ✅ Supported | `range(n)`, `range(a, b)`, `range(a, b, step)` |
+| `range()` | ✅ Supported | `range(n)`, `range(a, b)`, `range(a, b, step)` — including **descending** ranges (a negative step, e.g. `range(5, 0, -1)`), lowered with a runtime-direction step so a `step < 0` yields the correct decreasing sequence rather than silently emptying. `list(range(...))` materializes any of these into a `list[int]`. |
 | `enumerate()` | ✅ Supported | Yields `(index, value)` tuples |
 | `zip()` | ✅ Supported | Zips two iterables |
 | `int()`, `float()`, `str()`, `bool()` | ✅ Supported | Type conversions; `str()` of a collection yields its repr |
@@ -483,8 +484,47 @@ def describe(x: Optional[int]) -> str:
 ```
 
 `if x is not None:` narrows in the *then* branch; `if x is None:` narrows in the
-*else* branch (when there is no intervening `elif`). The narrowing is scoped to
-that branch only and does not leak past the `if`.
+*else* branch (when there is no intervening `elif`). Beyond that in-branch
+narrowing, three CPython-idiomatic shapes are supported:
+
+- **Negative narrowing persists past the guard (early-return idiom).** When the
+  `then` block of `if x is None:` *terminates* — `return`, `raise`, `break`, or
+  `continue`, or a total nested `if`/`match`/`try` that does — the code AFTER the
+  `if` is reached only when `x is not None`, so `x` narrows to `T` for the rest of
+  the enclosing scope:
+
+  ```python
+  def first_or_zero(x: Optional[int]) -> int:
+      if x is None:
+          return 0
+      return x + 1        # x is `int` here — the guard already returned on None
+  ```
+
+- **A narrow dies at a loop boundary.** A narrow *born inside* a `for`/`while`
+  body does not leak past the loop — after the loop the name is `Optional[T]`
+  again (the loop may run zero times). Using the un-narrowed value after the loop
+  is an honest check error, never a leak.
+
+- **Reassignment re-widens.** Assigning a fresh `Optional[T]` (or `None`) to a
+  narrowed name kills the narrow; the name is `Optional[T]` again from that
+  assignment onward.
+
+- **`while`-traversal narrowing.** `while cur is not None:` narrows `cur` to `T`
+  inside the body; the loop-carried `cur = cur.next` reconverges to the outer
+  `Optional` slot that the loop header re-tests — the linked-list traversal idiom
+  (pairs with self-referential `Optional` fields).
+
+**Attribute/field chains are not narrowed.** `if o.slot is not None: o.slot.v` is
+an honest error, not a silent miscompile: an intervening call or assignment could
+invalidate the guard between the test and the use, so pyrst does not flow-narrow a
+*field place* (the soundness wall CPython's own type-checkers hit). Bind the
+Optional to a **local** first, then narrow the local:
+
+```python
+s = o.slot
+if s is not None:
+    use(s.v)            # narrow the local, which cannot be aliased away
+```
 
 **Honest rejection (chosen semantics).** Using an `Optional[T]` as a bare `T`
 **without narrowing** is a hard typeck error — it is never silently miscompiled.

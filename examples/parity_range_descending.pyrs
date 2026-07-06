@@ -1,0 +1,52 @@
+# parity: dual-run
+# DUAL-RUN CPython parity golden for card 87bd8eb4: DESCENDING ranges (negative
+# step) and the zero-step ValueError. Before the fix, pyrst lowered `range(a, b,
+# step)` to an ascending Rust `(a..b).step_by(step as usize)`, so a negative step
+# wrapped to a huge usize and the range silently yielded NOTHING — a silent
+# divergence on VALID CPython programs (the last known one). range now lowers
+# through a direction-aware runtime builder used uniformly by for-loops,
+# list(range), and comprehensions; a zero step raises a catchable
+# `ValueError: range() arg 3 must not be zero` exactly like CPython.
+#
+# Runs under the harness `from __future__ import annotations` + `main()` convention.
+
+
+def safe_count(start: int, stop: int, step: int) -> list[int]:
+    # zero step is a CATCHABLE runtime ValueError (CPython semantics)
+    try:
+        return list(range(start, stop, step))
+    except ValueError:
+        return [-999]
+
+
+def main() -> None:
+    # descending literal step in a for-loop
+    for i in range(10, 0, -1):
+        print(i)
+
+    # list(range(...)) descending
+    print(list(range(10, 0, -1)))
+    # descending with a step magnitude > 1
+    print(list(range(20, 0, -3)))
+    # start < stop with a negative step -> empty (matches CPython)
+    print(list(range(0, 10, -1)))
+    # start == stop -> empty
+    print(list(range(5, 5, -1)))
+    # ascending 3-arg still works (regression guard)
+    print(list(range(0, 10, 2)))
+
+    # comprehension over a descending range
+    print([x * x for x in range(5, 0, -1)])
+
+    # RUNTIME (non-literal) step — the shape that previously silently yielded []
+    neg: int = -2
+    print(list(range(8, 0, neg)))
+    pos: int = 3
+    print(list(range(1, 12, pos)))
+
+    # zero step -> catchable ValueError (both a literal and via a runtime var)
+    print(safe_count(1, 10, 0))
+    zero: int = 0
+    print(safe_count(10, 0, zero))
+    # a non-zero step through the same guarded path is unaffected
+    print(safe_count(10, 0, -1))

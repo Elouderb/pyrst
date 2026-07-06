@@ -1,0 +1,25 @@
+# HONEST REJECTION (card c34ac64a, shape 1b): narrowing an ATTRIBUTE/FIELD place
+# is not supported. `if o.slot is not None: o.slot.v` reads a field off an
+# Optional value — pyrst does NOT flow-narrow a field place, because an
+# intervening call or assignment (`o.mutate()`, `o.slot = None`) could invalidate
+# the guard between the test and the use (the soundness wall CPython's own
+# type-checkers hit). Without this gate the access fell through to Ty::Unknown and
+# leaked a rustc E0609. The fix — named in the error — is to bind the Optional to
+# a LOCAL first and narrow the local (a local narrows soundly; see
+# parity_optional_narrow.pyrs and examples using `dict.get` + `is None`).
+class Slot:
+    v: int
+
+
+class Outer:
+    slot: Optional[Slot]
+
+
+def use(o: Outer) -> int:
+    if o.slot is not None:
+        return o.slot.v          # rejected: attribute access on an Optional place
+    return 0
+
+
+def main() -> None:
+    print(use(Outer(Slot(5))))

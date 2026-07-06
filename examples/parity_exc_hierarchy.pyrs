@@ -1,0 +1,116 @@
+# parity: dual-run
+# Dual-run CPython parity golden for card c1fec2bf: except-clause subclass
+# widening across the full builtin exception hierarchy. Each exception type is
+# raised and then caught via its PARENT (OSError / LookupError / ArithmeticError
+# / RuntimeError) and via Exception (the universal catch-all). The classifier
+# returns a fixed marker per catch level (never the exception object, whose
+# str() differs between pyrst — the message — and CPython — the repr), so the
+# comparison is dual-run byte-identical. A non-parent control (e.g. ValueError
+# under OSError) must fall through to the Exception arm — verifying the table is
+# not WRONGLY widened.
+#
+# `SameFileError` is `shutil.SameFileError` (a real OSError subclass, not a
+# builtin), imported so both engines resolve it; every other name is a builtin.
+from shutil import SameFileError
+
+
+def raise_it(kind: str) -> None:
+    if kind == "OSError":
+        raise OSError("e")
+    elif kind == "FileNotFoundError":
+        raise FileNotFoundError("e")
+    elif kind == "FileExistsError":
+        raise FileExistsError("e")
+    elif kind == "IsADirectoryError":
+        raise IsADirectoryError("e")
+    elif kind == "NotADirectoryError":
+        raise NotADirectoryError("e")
+    elif kind == "SameFileError":
+        raise SameFileError("e")
+    elif kind == "KeyError":
+        raise KeyError("e")
+    elif kind == "IndexError":
+        raise IndexError("e")
+    elif kind == "ZeroDivisionError":
+        raise ZeroDivisionError("e")
+    elif kind == "OverflowError":
+        raise OverflowError("e")
+    elif kind == "NotImplementedError":
+        raise NotImplementedError("e")
+    elif kind == "ValueError":
+        raise ValueError("e")
+    elif kind == "TypeError":
+        raise TypeError("e")
+
+
+def via_oserror(kind: str) -> str:
+    try:
+        raise_it(kind)
+        return "none"
+    except OSError:
+        return "OSError"
+    except Exception:
+        return "other"
+
+
+def via_lookup(kind: str) -> str:
+    try:
+        raise_it(kind)
+        return "none"
+    except LookupError:
+        return "LookupError"
+    except Exception:
+        return "other"
+
+
+def via_arith(kind: str) -> str:
+    try:
+        raise_it(kind)
+        return "none"
+    except ArithmeticError:
+        return "ArithmeticError"
+    except Exception:
+        return "other"
+
+
+def via_runtime(kind: str) -> str:
+    try:
+        raise_it(kind)
+        return "none"
+    except RuntimeError:
+        return "RuntimeError"
+    except Exception:
+        return "other"
+
+
+def via_exception(kind: str) -> str:
+    try:
+        raise_it(kind)
+        return "none"
+    except Exception:
+        return "Exception"
+
+
+def main() -> None:
+    os_family = ["OSError", "FileNotFoundError", "FileExistsError",
+                 "IsADirectoryError", "NotADirectoryError", "SameFileError"]
+    print("-- OSError family via except OSError --")
+    for k in os_family:
+        print(k, via_oserror(k))
+    print("-- OSError family via except Exception --")
+    for k in os_family:
+        print(k, via_exception(k))
+    print("-- non-OSError controls via except OSError (must be 'other') --")
+    for k in ["ValueError", "TypeError", "KeyError", "ZeroDivisionError"]:
+        print(k, via_oserror(k))
+    print("-- LookupError family --")
+    for k in ["KeyError", "IndexError"]:
+        print(k, via_lookup(k))
+    print("-- ArithmeticError family --")
+    for k in ["ZeroDivisionError", "OverflowError"]:
+        print(k, via_arith(k))
+    print("-- RuntimeError family --")
+    for k in ["NotImplementedError"]:
+        print(k, via_runtime(k))
+    print("-- LookupError control: ValueError must be 'other' --")
+    print("ValueError", via_lookup("ValueError"))

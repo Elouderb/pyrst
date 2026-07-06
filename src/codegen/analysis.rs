@@ -19,7 +19,7 @@ fn read_after_reassign_codegen_error(name: &str, outer: &Ty, inner: &Ty) -> crat
 
 impl<'a> Codegen<'a> {
     pub fn new(ctx: &'a TyCtx) -> Self {
-        Self { ctx, out: String::new(), indent: 0, locals: HashMap::new(), declared: Default::default(), current_class: None, current_ret_ty: Ty::Unit, dead_funcs: Default::default(), mut_self: HashMap::new(), by_ref_locals: Default::default(), poly_map: HashMap::new(), concrete_struct_params: Default::default(), const_names: Default::default(), const_strs: Default::default(), in_generator: false, try_return_escape: false, try_loopctl_escape: false, current_class_type_params: Vec::new(), current_fn_type_params: Vec::new(), hoisted: Default::default(), shadow_map: Default::default(), shadow_counter: 0 }
+        Self { ctx, out: String::new(), indent: 0, locals: HashMap::new(), declared: Default::default(), current_class: None, current_ret_ty: Ty::Unit, dead_funcs: Default::default(), mut_self: HashMap::new(), by_ref_locals: Default::default(), poly_map: HashMap::new(), concrete_struct_params: Default::default(), const_names: Default::default(), const_strs: Default::default(), in_generator: false, try_return_escape: false, try_loopctl_escape: false, current_class_type_params: Vec::new(), current_fn_type_params: Vec::new(), hoisted: Default::default(), shadow_map: Default::default(), shadow_counter: 0, pending_inline_lambda_params: None }
     }
 
     pub fn with_dead_funcs(mut self, dead: std::collections::HashSet<String>) -> Self {
@@ -745,6 +745,20 @@ impl<'a> Codegen<'a> {
         // E0061 — free functions filled trailing defaults, methods never did).
         // typeck already validated the mapping; re-deriving it is deterministic.
         if let Some(sig) = &sig {
+            // Per-slot coercion targets from the method signature's param types.
+            // (card e10df981) For a GENERIC-CLASS receiver those types still carry
+            // the class's `Ty::TypeVar`s — `get_method` lowers the sig with the class
+            // type params in scope but does NOT substitute the instance's args (its
+            // doc defers that to the call site). Substitute them with the receiver's
+            // concrete args now, exactly as the free path does, so a lambda cast into
+            // a `Callable[[T], T]` slot lowers to `Rc<dyn Fn(i64) -> i64>` instead of
+            // leaking a bare `T` (E0425 at build). `subst_class_member` is a no-op for
+            // a non-generic receiver, so every existing method call is unchanged.
+            let param_tys: Vec<Ty> = sig
+                .params
+                .iter()
+                .map(|(_, t)| crate::typeck::subst_class_member(t, recv_ty, self.ctx))
+                .collect();
             // (card e10df981) A FULLY-APPLIED POSITIONAL call on a GENERIC-CLASS
             // receiver also needs the slotted path: its raw `parts` (the fall-through
             // below) are emitted with NO knowledge of the concrete slot type, so a
@@ -752,11 +766,26 @@ impl<'a> Codegen<'a> {
             // `T` (E0308/E0425 at build) exactly like the kwargs case. Force the
             // substituted-`param_tys` emission when the receiver is generic (its type
             // subst is non-empty) AND some param type still carries a class type var.
-            // Guarded on the receiver being generic, so every NON-generic method call
-            // keeps its byte-for-byte `parts` path untouched.
             let force_slotted = !crate::typeck::class_type_subst(recv_ty, self.ctx).is_empty()
                 && sig.params.iter().any(|(_, t)| crate::typeck::ty_contains_typevar(t));
-            if !kwargs.is_empty() || args.len() < sig.params.len() || force_slotted {
+            // (card 63870682) A FULLY-APPLIED POSITIONAL call whose positional arg
+            // lands in a param that needs COERCION — an `Optional[T]` (Some-wrap), a
+            // `Callable` (Rc cast), or a polymorphic base (variant wrap) — also needs
+            // the slotted path: the raw `parts` fall-through emits each arg via a bare
+            // `emit_consuming`, so a positional literal into a method's `Optional[T]`
+            // slot (difflib's `Optional[T]` method params) leaked rustc E0308. A
+            // plain-typed param triggers neither branch and keeps the byte-identical
+            // `parts` path (`emit_call_arg_value` reduces to the same `emit_consuming`
+            // for it, and `coerce_to_option` is a no-op off an `Optional` slot).
+            let needs_coercion = param_tys
+                .iter()
+                .take(args.len())
+                .any(|t| matches!(t, Ty::Func(..) | Ty::Option(_)) || self.ty_has_poly_base(t));
+            if !kwargs.is_empty()
+                || args.len() < sig.params.len()
+                || force_slotted
+                || needs_coercion
+            {
                 let site = format!("{}.{}", cls, method_name);
                 let slots =
                     crate::typeck::map_kwargs_to_slots(&site, sig, args.len(), kwargs, span)?;
@@ -765,22 +794,7 @@ impl<'a> Codegen<'a> {
                 // out-of-order argument, positionals included) and — with
                 // `coerced = true` — applies the SAME Optional-wrap / `Callable`
                 // cast the free-call path uses (the method path previously emitted
-                // a plain `emit_consuming`, silently dropping both). Per-slot
-                // coercion targets come from the method signature's param types.
-                // (card e10df981) For a GENERIC-CLASS receiver those types still
-                // carry the class's `Ty::TypeVar`s — `get_method` lowers the sig with
-                // the class type params in scope but does NOT substitute the
-                // instance's args (its doc defers that to the call site). Substitute
-                // them with the receiver's concrete args now, exactly as the free
-                // path does, so a lambda cast into a `Callable[[T], T]` slot lowers to
-                // `Rc<dyn Fn(i64) -> i64>` instead of leaking a bare `T` (E0425 at
-                // build). `subst_class_member` is a no-op for a non-generic receiver,
-                // so every existing method call is byte-for-byte unchanged.
-                let param_tys: Vec<Ty> = sig
-                    .params
-                    .iter()
-                    .map(|(_, t)| crate::typeck::subst_class_member(t, recv_ty, self.ctx))
-                    .collect();
+                // a plain `emit_consuming`, silently dropping both).
                 let (prelude, mparts) =
                     self.emit_slotted_args(&slots, args, kwargs, sig, &param_tys, /*coerced=*/ true)?;
                 return Ok(Self::hoist_wrap(
@@ -1312,7 +1326,21 @@ impl<'a> Codegen<'a> {
                         }
                     })
                     .collect();
+                // (card 97e02e09) Register each closure param with its slot arg type
+                // as a local BEFORE emitting the body, so `type_of_expr` inside the
+                // body sees the concrete param type. Without this a `Str` param's
+                // `a + b` fell through to the generic numeric `+` (`(a + b)`), which
+                // rustc rejects for `String + String` — the body must route str `+`
+                // through the SAME `format!("{}{}", ..)` lowering the statement path
+                // uses. Restored after the body so the params do not leak outward.
+                let __lam_saved = self.locals.clone();
+                for (i, (name, _)) in params.iter().enumerate() {
+                    if let Some(pty) = arg_tys.get(i) {
+                        self.locals.insert(name.clone(), pty.clone());
+                    }
+                }
                 let body_s = self.emit_expr(body)?;
+                self.locals = __lam_saved;
                 Ok(format!(
                     "::std::rc::Rc::new(move |{}| {}) as {}",
                     param_strs.join(", "),
@@ -1327,7 +1355,8 @@ impl<'a> Codegen<'a> {
             // `Ty::Func` by typeck's branch unification, so each is a valid
             // func-slot value.
             Expr::IfExp { test, body, orelse, .. } => {
-                let t = self.emit_expr(test)?;
+                // (card c34ac64a fix C) IfExp test is a truthiness context.
+                let t = self.emit_truthy(test)?;
                 let b = self.emit_into_func_slot(body, expected)?;
                 let o = self.emit_into_func_slot(orelse, expected)?;
                 Ok(format!("(if {} {{ {} }} else {{ {} }})", t, b, o))
@@ -1513,6 +1542,26 @@ impl<'a> Codegen<'a> {
         inline_self_ref(ty, cname)
     }
 
+    /// (efficiency/dedupe, phase2-fix2) Whether an `obj.name` FIELD read is a
+    /// boxed self-referential field — the case the `Expr::Attr` emit arm lowers
+    /// to `obj.name.clone().map(|__b| *__b)`, an already-OWNED `Option<T>` temp
+    /// (it deep-clones and unboxes the stored `Option<Box<T>>`). A caller in a
+    /// consuming position must NOT append a second `.clone()` to that (it is a
+    /// fresh owned rvalue, not a reusable place). Single source shared by the
+    /// `Expr::Attr` emit arm and `emit_consuming`.
+    pub(crate) fn attr_read_is_boxed_recursive(&self, obj: &Expr, name: &str) -> bool {
+        if let Ty::Class(cn, _) = self.type_of_expr(obj) {
+            self.ctx
+                .classes
+                .get(&cn)
+                .cloned()
+                .and_then(|cd| self.class_field_type(&cd, name))
+                .is_some_and(|ft| self.field_needs_box(&cn, &ft))
+        } else {
+            false
+        }
+    }
+
     /// (enabler-fix-1 #4a) Box a STRUCT-LITERAL field value for a self-referential
     /// (boxed) field: the struct stores `Option<Box<Self>>`, so a `Some(payload)`
     /// value is boxed via `.map(Box::new)` (None unchanged), matching the AttrAssign
@@ -1524,6 +1573,54 @@ impl<'a> Codegen<'a> {
             format!("({}).map(::std::boxed::Box::new)", v)
         } else {
             v
+        }
+    }
+
+    /// (dedupe, phase2-fix2) Coerce expression `val` into the STRUCT-LITERAL slot
+    /// for `field_name` of class `class_name` — the `class_field_type` +
+    /// `emit_arg_into_slot` + `box_recursive_field_value` sequence that every
+    /// struct-literal (dataclass / no-`__init__`) constructor field-emit performed
+    /// inline. Single source for the positional, keyword, and default-fill field
+    /// emits of the direct-construction path.
+    pub(crate) fn emit_struct_field_value(
+        &mut self,
+        class_name: &str,
+        class_def: &ClassDef,
+        field_name: &str,
+        val: &Expr,
+    ) -> Result<String> {
+        let fty = self.class_field_type(class_def, field_name);
+        let v = self.emit_arg_into_slot(val, fty.as_ref())?;
+        Ok(match &fty {
+            Some(ft) => self.box_recursive_field_value(class_name, ft, v),
+            None => v,
+        })
+    }
+
+    /// (dedupe, phase2-fix2) Emit the DECLARED default for an OMITTED struct-literal
+    /// field, located in `all_params` (`get_all_fields`, transitive). Single source
+    /// for the positional-only and mixed/keyword-uncovered default-fill sites,
+    /// which were verbatim copies. A field with NO declared default yields the
+    /// CPython "missing required argument" codegen error — typeck
+    /// (`map_kwargs_to_slots`) already rejected an omitted no-default field, so
+    /// this is a defensive codegen error only.
+    pub(crate) fn emit_omitted_field_default(
+        &mut self,
+        class_name: &str,
+        class_def: &ClassDef,
+        all_params: &[crate::ast::Param],
+        field_name: &str,
+    ) -> Result<String> {
+        match all_params
+            .iter()
+            .find(|p| p.name.as_str() == field_name)
+            .and_then(|p| p.default.as_ref())
+        {
+            Some(d) => self.emit_struct_field_value(class_name, class_def, field_name, d),
+            None => Err(crate::diag::Error::Codegen(format!(
+                "class `{}` missing a required argument: `{}`",
+                class_name, field_name
+            ))),
         }
     }
 

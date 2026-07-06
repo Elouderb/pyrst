@@ -940,6 +940,82 @@ pub(crate) fn branch_divergent(a: &Ty, b: &Ty) -> bool {
     std::mem::discriminant(a) != std::mem::discriminant(b)
 }
 
+/// (card c34ac64a fix B2b) Whether reassigning a `value`-typed rvalue into an
+/// Option `slot` (a hoisted / narrowed `Option<T>` binding) genuinely CONFLICTS
+/// with the slot — a FULL structural comparison that RECURSES into Option
+/// payloads, unlike `branch_divergent` (discriminant-only, which wrongly treated
+/// `Option<int>` and `Option<str>` as compatible and reconverged them into one
+/// slot -> a leaked rustc E0308). Used at codegen's shadow-reconverge site AND by
+/// typeck's reassignment re-widen (B2c) so the two layers agree.
+///   - `None` (`NoneVal`) is a valid value for ANY Option slot -> NOT a conflict
+///     (it reconverges; the slot stays `Option<T>` — pairs with prescan's B2a
+///     merge). This is why a bare `x = None` after a narrow keeps the Option slot.
+///   - Two Options reconverge only when their PAYLOADS reconcile
+///     (`Option<int>` vs `Option<str>` -> conflict).
+///   - Everything else falls back to the shared `branch_divergent` rule, so a
+///     non-Option slot behaves exactly as before (numeric/Unknown compatible).
+pub(crate) fn option_slot_conflict(slot: &Ty, value: &Ty) -> bool {
+    match (slot, value) {
+        (Ty::Option(_), Ty::NoneVal) => false,
+        (Ty::Option(a), Ty::Option(b)) => option_slot_conflict(a, b),
+        _ => branch_divergent(slot, value),
+    }
+}
+
+/// (card c34ac64a fix B1) Re-widen loop-body narrowing at the loop edge. A loop
+/// body runs 0..n times, so an Optional that the body (or the loop condition)
+/// narrowed to its payload `T` MUST be `Option<T>` again AFTER the loop —
+/// assuming the narrow persists is unsound (the leak was a rustc E0369 on a use
+/// of the var after the loop). For every name that was `Option<T>` in `pre_loop`
+/// and is now viewed as EXACTLY its inner `T` (i.e. the body narrowed it),
+/// restore the `Option<T>` type. A body reassignment to a DIFFERENT type is NOT a
+/// stale narrow and is left intact; loop targets and function-level narrows
+/// established before the loop persist.
+pub(crate) fn rewiden_loop_narrows(pre_loop: &HashMap<String, Ty>, env: &mut FuncEnv) {
+    for (name, pre_ty) in pre_loop {
+        if let Ty::Option(inner) = pre_ty {
+            if env.locals.get(name).is_some_and(|cur| cur == inner.as_ref()) {
+                env.locals.insert(name.clone(), pre_ty.clone());
+            }
+        }
+    }
+}
+
+/// (card c34ac64a fix B3) A `None`-guard (`x is None` / `x is not None`) whose
+/// LHS is a CONCRETE, non-Optional local is a STATICALLY-DECIDED test — `x` can
+/// never be None, so the guard is a constant. The common source is a SECOND guard
+/// on a name an earlier guard already narrowed to `T` (`env.narrowed` names it);
+/// a plain `y: int` mis-tested the same way reaches here too. Either way codegen
+/// leaked a raw rustc `.is_none()`/`.is_some()`-on-`T` (E0599) — reject it
+/// honestly at check instead. `Unknown`, `NoneVal` (the always-TRUE
+/// `x = None; if x is None:` shape, left for codegen's reconverge), and a genuine
+/// `Option<_>` are all left alone.
+fn reject_decided_none_guard(cond: &Expr, env: &FuncEnv) -> Result<()> {
+    if let Some((name, is_not_none)) = extract_none_guard(cond) {
+        if let Some(ty) = env.locals.get(name.as_str()) {
+            if !matches!(ty, Ty::Option(_) | Ty::Unknown | Ty::NoneVal) {
+                let sense = if is_not_none { "not " } else { "" };
+                let verdict = if is_not_none { "true" } else { "false" };
+                let msg = if env.narrowed.contains_key(name.as_str()) {
+                    format!(
+                        "`{name}` was already narrowed to `{ty}` by an earlier \
+                         guard, so `{name} is {sense}None` is always {verdict} \
+                         here. Reassign `{name}` before testing it against None again."
+                    )
+                } else {
+                    format!(
+                        "`{name}` has type `{ty}` here and can never be None, so \
+                         `{name} is {sense}None` is always {verdict}. A None-guard \
+                         applies only to an `Optional[...]` value."
+                    )
+                };
+                return Err(Error::Type { span: cond.span(), msg });
+            }
+        }
+    }
+    Ok(())
+}
+
 /// (LAZY-GEN V1-d BLOCKER) Detect a BARE (un-annotated) local assigned
 /// incompatible types across the SIBLING branches of a control-flow join — the
 /// silent miscompile the reviewer traced (comment 131): codegen hoists the name to
@@ -2137,74 +2213,86 @@ pub(crate) fn stmt_contains_yield(s: &Stmt) -> bool {
 ///   AND every arm body definitely returns; otherwise `false`.
 /// - anything else -> `false`.
 pub fn block_definitely_returns(stmts: &[Stmt]) -> bool {
+    block_transfers_flow(stmts, /*count_loopctl=*/ false)
+}
+
+/// (dedupe, phase2-fix2) The shared recursion core behind both
+/// [`block_definitely_returns`] and [`block_terminates_flow`], which were
+/// verbatim copies. Whether the LAST statement of `stmts` transfers control away
+/// from the fall-through that follows the enclosing statement. `count_loopctl`
+/// selects the variant:
+/// - `false` — only `return`/`raise` (and a total `if`/`match`/`try`/`while
+///   True`) count. This is the missing-return analysis: `break`/`continue` do
+///   NOT return, so they must not satisfy a non-unit function's value path.
+/// - `true` — ALSO counts `break`/`continue`. This is the None-guard negative
+///   narrowing analysis: they terminate a branch's fall-through even though they
+///   do not return.
+///
+/// Every other rule is identical between the two, which is why keeping the
+/// missing-return variant (its negatives prove) byte-identical requires only the
+/// `Stmt::Break`/`Stmt::Continue` arm to branch on `count_loopctl`.
+fn block_transfers_flow(stmts: &[Stmt], count_loopctl: bool) -> bool {
     match stmts.last() {
-        Some(s) => stmt_definitely_returns(s),
+        Some(s) => stmt_transfers_flow(s, count_loopctl),
         None => false,
     }
 }
 
-pub(crate) fn stmt_definitely_returns(s: &Stmt) -> bool {
+fn stmt_transfers_flow(s: &Stmt, count_loopctl: bool) -> bool {
     match s {
-        // An explicit `return` (with or without a value) terminates the path.
-        // A bare `return` in a non-unit function is itself a separate honest
-        // error (see the `Stmt::Return(None, _)` arm in `check_stmt`), but for
-        // control-flow purposes it still does not fall off the end.
-        Stmt::Return(..) => true,
-        // `raise` diverges — control never continues past it.
-        Stmt::Raise { .. } => true,
+        // An explicit `return` (with or without a value) terminates the path — a
+        // bare `return` in a non-unit function is a separate honest error (see
+        // the `Stmt::Return(None, _)` arm in `check_stmt`) but still does not
+        // fall off the end. `raise` diverges — control never continues past it.
+        Stmt::Return(..) | Stmt::Raise { .. } => true,
+        // `break`/`continue` jump to the loop end/head — they do not fall through
+        // to the next sibling statement, but they do NOT return a value. Only the
+        // terminates-flow variant (negative narrowing) counts them; the
+        // missing-return variant must not (a `break` cannot cover a value path),
+        // which is exactly the `false` here for `count_loopctl == false`.
+        Stmt::Break(_) | Stmt::Continue(_) => count_loopctl,
         // An `if` only covers all paths when there is an `else` and EVERY branch
-        // (then, each elif, else) definitely returns. No `else` -> the implicit
-        // empty else falls through, so the `if` cannot guarantee a return.
+        // (then, each elif, else) transfers. No `else` -> the implicit empty else
+        // falls through, so the `if` cannot guarantee it.
         Stmt::If { then, elifs, else_: Some(else_block), .. } => {
-            block_definitely_returns(then)
-                && elifs.iter().all(|(_, b)| block_definitely_returns(b))
-                && block_definitely_returns(else_block)
+            block_transfers_flow(then, count_loopctl)
+                && elifs.iter().all(|(_, b)| block_transfers_flow(b, count_loopctl))
+                && block_transfers_flow(else_block, count_loopctl)
         }
         Stmt::If { else_: None, .. } => false,
         // `while True:` with no reachable `break` is an infinite loop (codegen
         // lowers it to Rust `loop`, which diverges). Any other while/for may be
-        // skipped or exit, so it cannot guarantee a return.
+        // skipped or exit, so it cannot guarantee the transfer.
         Stmt::While { cond, body, .. } => {
             matches!(cond, Expr::Bool(true, _)) && !body_has_reachable_break(body)
         }
         // A `match` covers all paths only when it is exhaustive (a wildcard or
-        // bare-capture arm makes it total) AND every arm body definitely returns.
-        // When exhaustiveness is uncertain, treat as falling through.
+        // bare-capture arm makes it total) AND every arm body transfers. When
+        // exhaustiveness is uncertain, treat as falling through.
         Stmt::Match { arms, .. } => {
             arms.iter().any(|arm| {
                 matches!(arm.pattern, MatchPattern::Wildcard | MatchPattern::Capture(_))
                     && arm.guard.is_none()
-            }) && arms.iter().all(|arm| block_definitely_returns(&arm.body))
+            }) && arms.iter().all(|arm| block_transfers_flow(&arm.body, count_loopctl))
         }
-        // A `try` definitely returns on every path iff:
-        //   (a) there IS a `finally` that definitely returns (it runs on every
-        //       exit and itself diverges, so nothing after the try is reachable),
-        //   OR
-        //   (b) every `except` handler definitely returns AND the value path is
-        //       covered: the try BODY definitely returns, OR there is an `else`
-        //       that definitely returns (the `else` runs exactly when the body
-        //       completed normally, so a returning `else` covers the no-exception
-        //       path while the returning handlers cover the exception paths).
-        // This is now SOUND because the exception codegen threads a try-body
-        // `return`/`break`/`continue` out of the catch_unwind closure (see
-        // `Codegen::emit_try`): a returning try body really returns from the
-        // function, so no implicit `()` falls off the end (no rustc E0317/E0308).
-        //
-        // EMPTY handlers (a `try/finally` with no `except`): `handlers.all(..)`
-        // is VACUOUSLY true, so the rule reduces to `body_returns || else_returns`
-        // — which is exactly right. A `try: return v finally: ...` always runs the
-        // body's `return` (an exception in a handler-less body re-raises and
-        // diverges, never falling through), so it definitely returns; a
-        // `try: <falls through> finally: <no return>` (no handler, no returning
-        // finally, body does not return) still evaluates to `false` and stays an
-        // honest error.
+        // A `try` transfers on every path iff:
+        //   (a) there IS a `finally` that transfers (it runs on every exit and
+        //       itself diverges, so nothing after the try is reachable), OR
+        //   (b) every `except` handler transfers AND the value path is covered:
+        //       the try BODY transfers, OR there is an `else` that transfers (the
+        //       `else` runs exactly when the body completed normally).
+        // SOUND for the missing-return variant because the exception codegen
+        // threads a try-body `return`/`break`/`continue` out of the catch_unwind
+        // closure (see `Codegen::emit_try`), so no implicit `()` falls off the
+        // end. EMPTY handlers make `handlers.all(..)` VACUOUSLY true, reducing the
+        // rule to `body || else_` — exactly right for a handler-less `try/finally`.
         Stmt::Try { body, handlers, else_, finally_, .. } => {
-            if finally_.as_ref().is_some_and(|f| block_definitely_returns(f)) {
+            if finally_.as_ref().is_some_and(|f| block_transfers_flow(f, count_loopctl)) {
                 true
             } else {
-                handlers.iter().all(|h| block_definitely_returns(&h.body))
-                    && (block_definitely_returns(body)
-                        || else_.as_ref().is_some_and(|e| block_definitely_returns(e)))
+                handlers.iter().all(|h| block_transfers_flow(&h.body, count_loopctl))
+                    && (block_transfers_flow(body, count_loopctl)
+                        || else_.as_ref().is_some_and(|e| block_transfers_flow(e, count_loopctl)))
             }
         }
         _ => false,
@@ -2243,6 +2331,21 @@ pub(crate) fn stmt_has_reachable_break(s: &Stmt) -> bool {
         Stmt::Func(_) | Stmt::Class(_) => false,
         _ => false,
     }
+}
+
+/// (card c34ac64a, shape 1a) Whether `stmts` definitely transfers control AWAY
+/// from the fall-through that follows the enclosing statement — a `return`,
+/// `raise`, `break`, or `continue`, or a total `if`/`match`/`try`/`while True`
+/// whose every path does so. This is [`block_definitely_returns`] WIDENED with
+/// `break`/`continue` — the `count_loopctl` variant of the shared
+/// [`block_transfers_flow`] core: those do not *return* (so they must not count
+/// toward the missing-return analysis) but they DO terminate the branch's
+/// fall-through, which is exactly what None-guard negative narrowing needs. For
+/// `if x is None: <terminates>` the code AFTER the `if` is reached only when the
+/// guard was false (`x is not None`), so `x` narrows to its inner payload there —
+/// the early-return guard idiom.
+pub(crate) fn block_terminates_flow(stmts: &[Stmt]) -> bool {
+    block_transfers_flow(stmts, /*count_loopctl=*/ true)
 }
 
 /// Walk an expression and collect any top-level Ident that is a known param.
@@ -2410,7 +2513,19 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             if env.params.contains(target.as_str()) {
                 env.reassigned_params.insert(target.clone());
             }
-            env.locals.insert(target.clone(), declared);
+            // (card c34ac64a fix B2c) A reassignment KILLS an active persistent
+            // narrow on `target`. The post-assignment type must match what
+            // codegen's reconverge emits: if the value reconverges into the
+            // declared `Option<T>` (e.g. `x = None`, `cur = cur.next`) the var is
+            // `Option<T>` again; otherwise it is a genuine type-changing rebind to
+            // the value's type (e.g. narrowed `x = <Option[str]>`). Without this,
+            // a read/guard after the reassignment saw the stale narrowed `T`.
+            if let Some(opt) = env.narrowed.remove(target.as_str()) {
+                let post = if option_slot_conflict(&opt, &val_ty) { declared } else { opt };
+                env.locals.insert(target.clone(), post);
+            } else {
+                env.locals.insert(target.clone(), declared);
+            }
             Ok(())
         }
         Stmt::AugAssign { target, value, span, .. } => {
@@ -2497,6 +2612,10 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             // v1). A narrowing guard (`if x is not None:`) is a `BinOp` typed
             // Bool, so it is never a bare `TypeVar` and is unaffected.
             reject_typevar_op(&cond_ty, "use as a condition", cond.span())?;
+            // (card c34ac64a fix B3) A None-guard on a name already narrowed to a
+            // concrete `T` (or any concrete non-Optional local) is statically
+            // decided — honest error instead of a leaked `.is_none()`-on-`T`.
+            reject_decided_none_guard(cond, env)?;
             // (LAZY-GEN V1-d BLOCKER) Reject a bare local assigned incompatible
             // types across the sibling branches of this `if` — a silent miscompile
             // otherwise (codegen hoists one Rust slot and the divergent branch's
@@ -2545,6 +2664,31 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
                     match prev { Some(t) => { env.locals.insert(name, t); } None => { env.locals.remove(name.as_str()); } }
                 }
             }
+            // (card c34ac64a, shape 1a) NEGATIVE narrowing — the early-return guard
+            // idiom. For `if x is None: <terminates>` with NO elif and NO else, the
+            // only way control reaches the statements AFTER this `if` is the guard
+            // being false, i.e. `x is not None`. So persistently narrow `x` to its
+            // inner payload for the REST of the scope (unlike the branch narrowing
+            // above, this does NOT restore). Restricted to the else-less, elif-less
+            // shape: an `else`/`elif` that falls through (possibly reassigning `x`)
+            // would make the post-`if` type depend on that path, which is unsound to
+            // assume non-None. `is not None` + terminating-then leaves `x` as None
+            // afterward — no useful narrowing — so only the `is None` sense applies.
+            if let Some((name, is_not_none, inner)) = &guard {
+                if !*is_not_none
+                    && elifs.is_empty()
+                    && else_.is_none()
+                    && block_terminates_flow(then)
+                {
+                    // Record the DECLARED Option type so a later reassignment can
+                    // re-widen (B2c) and a second guard on the still-narrowed name
+                    // is caught (B3). `env.locals` holds the narrowed inner meanwhile.
+                    let declared = env.locals.get(name.as_str()).cloned()
+                        .unwrap_or_else(|| Ty::Option(Box::new(inner.clone())));
+                    env.narrowed.insert(name.clone(), declared);
+                    env.locals.insert(name.clone(), inner.clone());
+                }
+            }
             Ok(())
         }
         Stmt::While { cond, body, .. } => {
@@ -2552,7 +2696,35 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             // Generics v1: a bare type variable as a loop condition (`while t:`)
             // needs truthiness — rejected (see the `if` arm).
             reject_typevar_op(&cond_ty, "use as a condition", cond.span())?;
-            check_body(body, env)
+            // (card c34ac64a fix B3) A None-guard header on a name already narrowed
+            // to a concrete `T` (or any concrete non-Optional local) is statically
+            // decided — honest error instead of a leaked `.is_none()`-on-`T`.
+            reject_decided_none_guard(cond, env)?;
+            // (card c34ac64a fix B1) Snapshot the pre-loop type view. A loop body
+            // runs 0..n times, so NO narrowing the condition OR a body-nested
+            // `if v is None: continue` establishes may be assumed AFTER the loop
+            // (a leak was a rustc E0369 on a use of the var after the loop).
+            // Function-level narrows established before the loop are in this
+            // snapshot and thus preserved; `rewiden_loop_narrows` restores any
+            // body-narrowed Optional at the loop edge.
+            let pre_loop = env.locals.clone();
+            // (card c34ac64a, shape 1c) WHILE-loop narrowing — the linked-list
+            // traversal idiom `while cur is not None: ...; cur = cur.next`. The loop
+            // body runs only when the guard is true, so narrow `cur` to its inner
+            // payload (`T`) for the body. A loop-carried reassignment `cur = cur.next`
+            // (value type `Option<T>`) restores the Optional in `env.locals` via the
+            // normal `Stmt::Assign` path, so a read of `cur` AFTER the reassignment is
+            // correctly Optional again. Only the `is not None` sense narrows (a
+            // `while cur is None:` body would not deref `cur` as `T`).
+            if let Some((name, true)) = extract_none_guard(cond) {
+                if let Some(Ty::Option(inner)) = env.locals.get(name.as_str()) {
+                    let inner = (**inner).clone();
+                    env.locals.insert(name, inner);
+                }
+            }
+            check_body(body, env)?;
+            rewiden_loop_narrows(&pre_loop, env);
+            Ok(())
         }
         Stmt::For { targets, iter, body, span } => {
             let iter_ty = check_expr(iter, env)?;
@@ -2606,7 +2778,15 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
                     env.locals.insert(target.clone(), ty);
                 }
             }
+            // (card c34ac64a fix B1) Snapshot AFTER binding targets (so the loop
+            // targets persist, matching Python) but BEFORE the body: a body-nested
+            // `if v is None: continue` negative narrow must NOT leak past the loop
+            // (the leak was a rustc E0369 on `v + 1` after the loop). The body runs
+            // 0..n times, so `rewiden_loop_narrows` re-widens any Optional the body
+            // narrowed down to its payload back to `Option<T>` at the loop edge.
+            let pre_loop = env.locals.clone();
             check_body(body, env)?;
+            rewiden_loop_narrows(&pre_loop, env);
             Ok(())
         }
         Stmt::Import { .. } => Ok(()), // Ignored in v0

@@ -1,0 +1,19 @@
+# HONEST REJECTION (card 18682938): `__bool__` IS now a supported dunder, but it
+# must have the CPython-faithful signature — a `self` receiver only, returning
+# `bool`. A `__bool__` that returns a non-bool is rejected at check (codegen would
+# otherwise emit a `.__bool__()` call whose result is used as a Rust `bool` in
+# every truthiness context — a type mismatch). Return an explicit `bool`.
+class Counter:
+    n: int
+
+    def __init__(self) -> None:
+        self.n = 0
+
+    def __bool__(self) -> int:
+        return self.n
+
+
+def main() -> None:
+    c: Counter = Counter()
+    if c:
+        print("truthy")

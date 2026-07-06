@@ -1,0 +1,72 @@
+# DUAL-RUN parity (card 18682938): user-defined `__bool__` object truthiness.
+# A class that defines `__bool__(self) -> bool` is usable in every bool context —
+# `bool(obj)`, `if obj:` / `while obj:`, `not obj`, and `and`/`or` — and pyrst
+# lowers each to a `.__bool__()` call (CPython semantics). python3 is the oracle.
+class Stack:
+    items: list[int]
+
+    def __init__(self) -> None:
+        self.items = []
+
+    def push(self, x: int) -> None:
+        self.items.append(x)
+
+    def __bool__(self) -> bool:
+        return len(self.items) > 0
+
+
+def describe(s: Stack) -> str:
+    if s:
+        return "nonempty"
+    return "empty"
+
+
+def main() -> None:
+    s: Stack = Stack()
+    print(bool(s))           # False (empty)
+    print(describe(s))       # empty
+    if not s:
+        print("is empty")
+
+    s.push(1)
+    s.push(2)
+    print(bool(s))           # True
+    print(describe(s))       # nonempty
+    if s:
+        print("has items")
+
+    # while + __bool__ : drain the stack, truthiness re-checked each iteration
+    count: int = 0
+    while s:
+        s.items.pop()
+        count = count + 1
+    print(count)             # 2
+    print(bool(s))           # False
+
+    # and / or truthiness inside a condition
+    t: Stack = Stack()
+    t.push(9)
+    if s or t:
+        print("either")
+    if t and not s:
+        print("t nonempty, s empty")
+
+    # (card c34ac64a fix C) __bool__ must hold in EVERY condition context:
+    # elif, the ternary test, and comprehension if-filters — not just if/while.
+    if s:
+        print("elif: s")
+    elif t:
+        print("elif: t")          # s is empty, t is not -> this fires
+
+    label: str = "t-full" if t else "t-empty"
+    print(label)                  # t-full
+
+    a: Stack = Stack()            # empty (falsy)
+    b: Stack = Stack()
+    b.push(7)                     # truthy
+    group: list[Stack] = [a, b, t, s]   # falsy, truthy, truthy, falsy
+    # the `if st` filter runs BEFORE the element expr, so empty stacks are skipped
+    kept: list[int] = [st.items[0] for st in group if st]
+    print(kept)                   # [7, 9]  (list-comp filter via __bool__)
+    print(len({st.items[0] for st in group if st}))          # 2  (set-comp filter)
+    print(len({st.items[0]: len(st.items) for st in group if st}))  # 2  (dict-comp filter)

@@ -1,0 +1,15 @@
+False
+empty
+is empty
+True
+nonempty
+has items
+2
+False
+either
+t nonempty, s empty
+elif: t
+t-full
+[7, 9]
+2
+2

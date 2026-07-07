@@ -1,0 +1,47 @@
+# parity: dual-run vs python3 3.12 — the `file` handle's close() SEMANTICS after
+# the C8 LEAD DECISION. close() is now IDEMPOTENT (a 2nd close() is a silent no-op,
+# exactly like CPython), and a read/write on a CLOSED file is a catchable
+# `ValueError` whose message is CPython's exact "I/O operation on closed file."
+# (oracled against python3 3.12.9). Every line here runs UNMODIFIED under both
+# `pyrst` and `python3` and produces byte-identical stdout.
+#
+# This SUPERSEDES the original strict-double-close behavior (a 2nd close() used to
+# raise a pyrst-only `ValueError`), which the design mandated as a closed-flag
+# contract; the lead ratified CPython-faithful idempotency instead. See the
+# AS-BUILT note in docs/design/w5-bytes-handles.md §C/§E-7. The closed FLAG survives
+# as the read/write-after-close error (still CPython-exact), so the whole file-
+# handle runtime is now parity-clean. This file replaces the former pyrst-only
+# examples/handle_close_errors.pyrs.
+#
+# The handle flows through UNTYPED locals (no `: file` annotation, which is
+# pyrst-only) so the source is valid Python under both runtimes.
+
+def main() -> None:
+    path: str = "/tmp/pyrst_w5g_close.txt"
+
+    # DOUBLE-CLOSE is IDEMPOTENT: the second close() is a silent no-op in both
+    # pyrst and CPython (no error, nothing printed for it).
+    f = open(path, "w")
+    f.write("hello\n")
+    f.close()
+    f.close()
+    print("double-close ok")
+
+    # WRITE-AFTER-CLOSE: a catchable ValueError with CPython's exact message.
+    g = open(path, "w")
+    g.close()
+    try:
+        g.write("nope\n")
+        print("no error (wrong)")
+    except ValueError as e:
+        print(e)
+
+    # READ-AFTER-CLOSE: the same catchable ValueError (the old no-op close() used
+    # to let this silently succeed — that hole is closed).
+    h = open(path)
+    h.close()
+    try:
+        data: str = h.read()
+        print("no error (wrong)")
+    except ValueError as e:
+        print(e)

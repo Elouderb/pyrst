@@ -1,0 +1,10 @@
+# HONEST REJECTION (W5-g, H3 — use after del): `del f` on a bare handle CONSUMES it
+# — codegen emits `drop(f)`, which moves the handle out and closes the fd. The
+# move-checker now marks `del f` as a move site, so any later use of `f` is an
+# honest use-after-move error (naming the binding and the `del` site) instead of a
+# rustc E0382 "borrow of moved value" at build. (`del f` previously walked the
+# target as a BORROW and never marked the move, while codegen dropped it.)
+def main() -> None:
+    f = open("/tmp/pyrst_w5g_del.txt", "w")
+    del f
+    f.write("use after del\n")

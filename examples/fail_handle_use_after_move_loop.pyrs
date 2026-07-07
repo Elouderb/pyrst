@@ -1,0 +1,12 @@
+# HONEST REJECTION (W5-g, G1): moving a handle that was created BEFORE a loop,
+# from INSIDE the loop body, is a use-after-move on the second iteration. The move
+# checker rejects it conservatively and up front (naming the handle kind), rather
+# than letting it compile to a rustc E0382 "use of moved value" inside the loop.
+# (The fix is to create the handle INSIDE the loop, or move it once outside.)
+def sink(fh: file) -> None:
+    fh.close()
+
+def main() -> None:
+    f = open("/tmp/pyrst_w5g_fail.txt", "w")
+    for i in range(3):
+        sink(f)

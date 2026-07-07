@@ -1,0 +1,15 @@
+# HONEST REJECTION (W5-g, H4 — handle into a generic parameter): a move-only handle
+# cannot instantiate a generic type parameter. codegen emits every type var as
+# `<T: Clone>` and CLONES the value on use, but a handle is non-`Clone` — so
+# `identity(open(p))` against `def identity[T](x: T) -> T` unified `T=file`,
+# check-PASSED, and then died at rustc E0277 ("`PyFile: Clone` is not satisfied").
+# The call-site unification now rejects binding a type variable to a handle at
+# CHECK.
+def identity[T](x: T) -> T:
+    return x
+
+
+def main() -> None:
+    f = open("/tmp/pyrst_w5g_gen.txt", "w")
+    g = identity(f)
+    g.close()

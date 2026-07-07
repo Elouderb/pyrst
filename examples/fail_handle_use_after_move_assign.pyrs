@@ -1,0 +1,11 @@
+# HONEST REJECTION (W5-g, G1 — probe PF-A): reassigning a move-only handle MOVES
+# it. `g = f` consumes the `file` handle `f`; any later use of `f` is a use-after-
+# move. TODAY (before W5-g) this compiled to `let mut g = f.clone();` and died at
+# rustc with E0599 ("no method `clone` for `PyFile`") while `check` PASSED — a
+# check-passes/build-fails hole. It is now an honest CHECK-time error naming the
+# moved binding and the move site. (`g` is the live handle after the move; use it.)
+def main() -> None:
+    f = open("/tmp/pyrst_w5g_fail.txt", "w")
+    g = f
+    g.write("via g\n")
+    f.write("use after move\n")

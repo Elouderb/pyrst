@@ -777,12 +777,27 @@ const TITLECASE_PRELUDE: &str = r#"fn __py_titlecase(c: char) -> String {
 }
 "#;
 
-const FILE_PRELUDE: &str = r#"struct PyFile { inner: std::fs::File }
+// (W5-g) The `file` handle's runtime. PyFile is the built-in opaque move-only
+// handle (`Ty::Handle("file")`): non-`Clone`, non-`Copy`. The `inner: Option<File>`
+// IS the closed flag — `None` means closed. `close()` takes the fd (dropping it
+// closes the OS handle NOW, matching Python's eager close); a SECOND close() is an
+// IDEMPOTENT no-op and any read/write on a closed file is an honest, catchable
+// `ValueError` with CPython's exact message ("I/O operation on closed file."),
+// closing the old silent-no-op hole that let a read-after-close silently succeed.
+// Drop closes via the `Option<File>`'s own drop, so Drop AFTER an explicit close is
+// a no-op (the `with` block's RAII close never double-frees). (W5-g, C8 — LEAD
+// DECISION, oracled vs python3 3.12.9) close() is now CPython-faithful IDEMPOTENT
+// (a 2nd close is a silent no-op), superseding the design's strict-double-close-
+// `ValueError` mandate — see docs/design/w5-bytes-handles.md AS-BUILT note; the
+// closed FLAG survives as the read/write-after-close `ValueError` (which still
+// matches CPython exactly), so this whole runtime is now dual-run parity-clean.
+const FILE_PRELUDE: &str = r#"struct PyFile { inner: Option<std::fs::File> }
 impl PyFile {
     fn read(&mut self) -> String {
         use std::io::Read;
+        let f = self.inner.as_mut().unwrap_or_else(|| panic!("ValueError\0I/O operation on closed file."));
         let mut s = String::new();
-        self.inner.read_to_string(&mut s).unwrap_or_else(|e| panic!("OSError\0read failed: {}", e));
+        f.read_to_string(&mut s).unwrap_or_else(|e| panic!("OSError\0read failed: {}", e));
         s
     }
     fn readlines(&mut self) -> Vec<String> {
@@ -790,9 +805,12 @@ impl PyFile {
     }
     fn write(&mut self, s: &str) {
         use std::io::Write;
-        self.inner.write_all(s.as_bytes()).unwrap_or_else(|e| panic!("OSError\0write failed: {}", e));
+        let f = self.inner.as_mut().unwrap_or_else(|| panic!("ValueError\0I/O operation on closed file."));
+        f.write_all(s.as_bytes()).unwrap_or_else(|e| panic!("OSError\0write failed: {}", e));
     }
-    fn close(&mut self) {}
+    fn close(&mut self) {
+        self.inner = None;
+    }
 }
 fn __py_open(path: &str, mode: &str) -> PyFile {
     let f = match mode {
@@ -800,7 +818,7 @@ fn __py_open(path: &str, mode: &str) -> PyFile {
         "a" => std::fs::OpenOptions::new().create(true).append(true).open(path).unwrap_or_else(|e| panic!("OSError\0open failed: {}: {}", path, e)),
         _ => std::fs::File::open(path).unwrap_or_else(|e| panic!("OSError\0open failed: {}: {}", path, e)),
     };
-    PyFile { inner: f }
+    PyFile { inner: Some(f) }
 }
 "#;
 

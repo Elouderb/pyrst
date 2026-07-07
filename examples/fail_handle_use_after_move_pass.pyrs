@@ -1,0 +1,12 @@
+# HONEST REJECTION (W5-g, G1): passing a move-only handle to a function by value
+# MOVES it (the callee owns it and closes it via RAII on return). Reusing the
+# handle after the call is a use-after-move — an honest CHECK error naming the
+# binding and the move site, not a deferred rustc E0382.
+def sink(fh: file) -> None:
+    fh.write("owned by sink\n")
+    fh.close()
+
+def main() -> None:
+    f = open("/tmp/pyrst_w5g_fail.txt", "w")
+    sink(f)
+    f.write("use after move\n")

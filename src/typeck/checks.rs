@@ -65,6 +65,20 @@ pub(crate) struct FuncEnv<'a> {
     /// with the same owner scope. `None` on the LSP single-file / synthetic-ctx
     /// paths (the validator then falls back to the flat existence check).
     pub(crate) module_id: Option<String>,
+    /// (W5-g) MOVE-ONLY HANDLE liveness. A handle binding NAME -> the span of the
+    /// site that MOVED it (a bare-Ident consume: assign RHS, `return`, or a
+    /// function-call argument). A read of a name in this map is an honest
+    /// use-after-move error (surfaced by `check_handle_flow`) naming the binding
+    /// and the move site — never a rustc E0382/E0599 leak. Cleared for a name when
+    /// it is re-bound (a fresh handle). Cloned with the env for the branch-join
+    /// snapshot/union (possibly-moved = moved). Empty for every handle-free scope.
+    pub(crate) moved: HashMap<String, Span>,
+    /// (W5-g) The stack of "outer handle names" for each enclosing `for`/`while`
+    /// loop currently being checked — the handle bindings that were LIVE at each
+    /// loop's entry. Moving one of these INSIDE the loop body is an honest error
+    /// (it would be a use-after-move on the second iteration); a handle CREATED
+    /// inside the loop is not in any frame and moves freely. Empty outside loops.
+    pub(crate) loop_handles: Vec<std::collections::HashSet<String>>,
 }
 
 impl<'a> FuncEnv<'a> {
@@ -81,7 +95,7 @@ impl<'a> FuncEnv<'a> {
             param_set.insert(name.clone());
         }
         let by_ref_params = by_ref_names.iter().cloned().collect();
-        FuncEnv { ctx, locals, ret_ty, used_vars, params: param_set, reassigned_params: std::collections::HashSet::new(), returned_params: std::collections::HashSet::new(), by_ref_params, is_generator: false, type_params: std::collections::HashSet::new(), globals_declared: std::collections::HashSet::new(), narrowed: HashMap::new(), module_id: None }
+        FuncEnv { ctx, locals, ret_ty, used_vars, params: param_set, reassigned_params: std::collections::HashSet::new(), returned_params: std::collections::HashSet::new(), by_ref_params, is_generator: false, type_params: std::collections::HashSet::new(), globals_declared: std::collections::HashSet::new(), narrowed: HashMap::new(), module_id: None, moved: HashMap::new(), loop_handles: Vec::new() }
     }
 
     /// The enclosing generic function's declared type-parameter names as a
@@ -1256,6 +1270,11 @@ pub(crate) fn type_is_reprable(ctx: &TyCtx, ty: &Ty) -> bool {
         Ty::Tuple(ts) => ts.iter().all(|t| type_is_reprable(ctx, t)),
         Ty::Class(cn, _) => class_is_reprable(ctx, cn),
         Ty::Func(..) => false,
+        // (W5-g, H5) A move-only handle has NO `Display`/`PyRepr` — it is opaque.
+        // Defense in depth: the class-field gate below rejects a handle-typed field
+        // outright, but returning `false` here also keeps a handle out of any
+        // container/`Optional`/tuple reprability check that reaches this catch-all.
+        Ty::Handle(_) => false,
         _ => true,
     }
 }
@@ -1610,7 +1629,28 @@ pub(crate) fn check_class_prelude(c: &ClassDef, ctx: &TyCtx) -> Result<()> {
     // field type for a generic class) rather than the bogus `Ty::Class("T", [])`.
     // A non-generic class has empty `type_params`, identical to the legacy path.
     for field in &c.fields {
-        Ty::from_type_expr_scoped(&field.ty, field.span, &c.type_params)?;
+        let fty = Ty::from_type_expr_scoped(&field.ty, field.span, &c.type_params)?;
+        // (W5-g, H5) A move-only HANDLE cannot be a class / dataclass FIELD. A
+        // handle is an external resource (a `file`, later a `Pattern`/`Popen`):
+        // non-`Clone` and non-`Default`, so a `PyFile` field breaks the struct's
+        // value semantics (clone-on-assign, synthesized `__repr__`, `Default`
+        // construction) and died at rustc — a `f: file` field check-PASSED with the
+        // `type_is_reprable` catch-all. Reject it honestly (a nested `list[file]`
+        // field already fails at resolution; `contains_handle` also catches the
+        // bare `file` field). Deferred to the reference-handle v2 (design §C).
+        if let Some(kind) = Ty::contains_handle(&fty) {
+            return Err(Error::Type {
+                span: field.span,
+                msg: format!(
+                    "class `{}` field `{}` cannot hold a `{kind}` handle — a move-only \
+                     handle is an external resource that is non-clonable and has no default \
+                     (v1 handles are move-only), so it cannot be a struct field; open or \
+                     create the handle in the method that uses it, or pass it in by move / \
+                     `Mut[{kind}]`",
+                    c.name, field.name,
+                ),
+            });
+        }
     }
 
     // (enabler-fix-1 #4d) Self-referential field SHAPE gate. codegen boxes an inline
@@ -1941,6 +1981,23 @@ pub(crate) fn check_top_level_other(s: &Stmt, ctx: &TyCtx, module_id: Option<&st
         if !is_const_literal(value) && ctx.is_mutable_global(module_id, target) {
             reject_if_reserved(target, *span, "module global")?;
             let declared = Ty::from_type_expr(t, *span)?;
+            // (W5-g) A move-only HANDLE cannot back a module global: the W4 read path
+            // is `G.with(|c| c.borrow().clone())`, but a handle is non-`Clone`, so
+            // `f: file = open(...)` check-PASSED and then died at rustc E0599 (probe).
+            // Reject honestly (design §C W4-interaction) — open the handle inside the
+            // function that uses it; you mutate an external resource in place, never
+            // snapshot it as a global.
+            if let Some(kind) = Ty::contains_handle(&declared) {
+                return Err(Error::Type {
+                    span: *span,
+                    msg: format!(
+                        "a `{kind}` handle cannot be a module-level binding — a move-only \
+                         handle is non-clonable, so it cannot back a module global (a global \
+                         read would clone it, which a handle forbids); open or create the \
+                         handle inside the function that uses it",
+                    ),
+                });
+            }
             let mut env = FuncEnv::with_by_ref(ctx, &[], &[], Ty::Unit);
             let init_ty = crate::typeck::check_expr(value, &mut env)?;
             if !types_compatible(&init_ty, &declared, ctx) {
@@ -2022,6 +2079,24 @@ pub(crate) fn check_top_level_other(s: &Stmt, ctx: &TyCtx, module_id: Option<&st
                 });
             }
             let declared = Ty::from_type_expr(t, *span)?;
+            // (W5-g) A move-only HANDLE cannot be a module-level binding. A global
+            // READ lowers to the W4 clone-on-read path (`G.with(|c| c.borrow().clone())`),
+            // but a handle is non-`Clone`, so `f: file = open(...)` check-PASSED and
+            // then died at rustc with E0599 "no method `clone` for `Ref<PyFile>`" — a
+            // check-passes/build-fails hole. Reject it honestly (design §C, the W4
+            // interaction): a handle is an external resource you mutate in place from
+            // the function that owns it, never a snapshotted module global.
+            if let Some(kind) = Ty::contains_handle(&declared) {
+                return Err(Error::Type {
+                    span: *span,
+                    msg: format!(
+                        "a `{kind}` handle cannot be a module-level binding — a move-only \
+                         handle is non-clonable, so it cannot back a module global (a global \
+                         read would clone it, which a handle forbids); open or create the \
+                         handle inside the function that uses it",
+                    ),
+                });
+            }
             let lit_ty = const_literal_ty(value).unwrap_or(Ty::Unknown);
             if !types_compatible(&lit_ty, &declared, ctx) {
                 return Err(Error::Type {

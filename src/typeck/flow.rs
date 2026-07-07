@@ -1049,7 +1049,10 @@ pub fn is_copy(ty: &Ty) -> bool {
         | Ty::Class(_, _)
         | Ty::Func(_, _)
         | Ty::NoneVal
-        | Ty::File
+        // (W5-g) A handle is non-Copy AND non-Clone (move-only). `is_copy` is false
+        // so it is never passed by bare copy; the consuming-site codegen has a
+        // dedicated MOVE arm (never `.clone()`) so it never rides clone-on-use.
+        | Ty::Handle(_)
         // A bound type variable is non-Copy: codegen emits a `T: Clone` bound and
         // clones on use, so a type-var value behaves like any owned value.
         | Ty::TypeVar(_)
@@ -2585,6 +2588,189 @@ pub(crate) fn collect_returned_param_idents_expr(
     }
 }
 
+/// (W5-g) Walk `e` in EVALUATION ORDER tracking move-only handle liveness — the
+/// single dataflow pass that surfaces what Rust's borrow checker would flag
+/// (E0382) as an honest pyrst use-after-move error instead of a deferred rustc
+/// wall (probe PF-A).
+///
+/// `consumed` is true when `e` occupies a MOVE position — an assignment RHS, a
+/// `return` value, a by-value function-call ARGUMENT, or a container element —
+/// where a bare handle Ident is CONSUMED (moved). Every handle Ident READ, in any
+/// position, is first checked against `env.moved`: reading an already-moved handle
+/// is a use-after-move error naming the binding and the move site. A method-call
+/// RECEIVER and an attribute / index / slice BASE are BORROWS (`consumed = false`),
+/// never moves — so repeated method use (`p.match(a); p.findall(b)`) is fine, and
+/// only a cross-function pass, a `return`, or a reassignment consumes a handle.
+///
+/// Loop conservatism: moving a handle that was LIVE BEFORE an enclosing loop
+/// (tracked in `env.loop_handles`) is rejected outright — on the second iteration
+/// it would be a use-after-move. A handle CREATED inside the loop is not in any
+/// frame and moves freely.
+fn check_handle_flow(e: &Expr, env: &mut FuncEnv, consumed: bool) -> Result<()> {
+    match e {
+        Expr::Ident(name, span) => {
+            // A read of an already-moved handle — the use-after-move error.
+            if let Some(move_span) = env.moved.get(name).copied() {
+                let kind = env.locals.get(name).and_then(|t| t.handle_name())
+                    .unwrap_or("handle").to_string();
+                return Err(Error::Type {
+                    span: *span,
+                    msg: format!(
+                        "handle `{name}` (`{kind}`) was already moved (consumed) at line \
+                         {ln}:{col} and cannot be used again — a move-only handle is consumed \
+                         when it is passed to a function, returned, or reassigned; open or \
+                         create a fresh handle instead of reusing `{name}`",
+                        ln = move_span.line, col = move_span.col,
+                    ),
+                });
+            }
+            // A bare handle Ident in a consuming position is MOVED here.
+            if consumed {
+                if let Some(kind) = env.locals.get(name).and_then(|t| t.handle_name())
+                    .map(str::to_string)
+                {
+                    // Moving an OUTER handle (live before an enclosing loop) inside
+                    // the loop body would be a use-after-move on iteration 2.
+                    if env.loop_handles.iter().any(|frame| frame.contains(name)) {
+                        return Err(Error::Type {
+                            span: *span,
+                            msg: format!(
+                                "handle `{name}` (`{kind}`) cannot be moved inside a loop — it \
+                                 was created before the loop, so passing, returning, or \
+                                 reassigning it would use it after move on the next iteration; \
+                                 create the handle inside the loop, or move it once outside",
+                            ),
+                        });
+                    }
+                    env.moved.insert(name.clone(), *span);
+                }
+            }
+        }
+        Expr::Call { callee, args, kwargs, .. } => {
+            // A method call BORROWS its receiver (`&mut self`); a free call reads
+            // its callee. Neither consumes — only the ARGUMENTS do.
+            match callee.as_ref() {
+                Expr::Attr { obj, .. } => check_handle_flow(obj, env, false)?,
+                other => check_handle_flow(other, env, false)?,
+            }
+            // (W5-g, H6) An argument bound to a `Mut[T]` BY-REFERENCE parameter is a
+            // BORROW, not a move — codegen passes `&mut <place>`, so the handle stays
+            // LIVE for the caller. Consult the callee's declared `param_by_ref` for a
+            // NAMED free function; a `Mut[file]` arg is then NOT marked moved (closing
+            // the H6 over-reject that falsely rejected a `Mut[file]` param helper).
+            // For a method call, a lambda / callable local, or any unresolvable
+            // callee, be CONSERVATIVE — every argument stays a move (over-reject is
+            // honest; under-reject would leak a real use-after-move). `param_by_ref`
+            // is positional and `self`-exclusive, aligning 1:1 with a free fn's args.
+            // Cloned to an owned `Vec` so the immutable `env.ctx` borrow is released
+            // before the `&mut env` recursion below.
+            let by_ref: Vec<bool> = match callee.as_ref() {
+                Expr::Ident(name, _) => env.ctx.funcs.get(name.as_str())
+                    .map(|sig| sig.param_by_ref.clone())
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            };
+            for (i, a) in args.iter().enumerate() {
+                let is_by_ref = by_ref.get(i).copied().unwrap_or(false);
+                check_handle_flow(a, env, !is_by_ref)?;
+            }
+            // Keyword args are treated conservatively as moves (a by-ref kwarg is a
+            // rare edge; over-rejecting it is the safe direction).
+            for (_, v) in kwargs { check_handle_flow(v, env, true)?; }
+        }
+        Expr::Attr { obj, .. } => check_handle_flow(obj, env, false)?,
+        Expr::Index { obj, idx, .. } => {
+            check_handle_flow(obj, env, false)?;
+            check_handle_flow(idx, env, false)?;
+        }
+        Expr::Slice { obj, start, stop, step, .. } => {
+            check_handle_flow(obj, env, false)?;
+            for p in [start, stop, step].into_iter().flatten() {
+                check_handle_flow(p, env, false)?;
+            }
+        }
+        Expr::BinOp { lhs, rhs, .. } => {
+            check_handle_flow(lhs, env, false)?;
+            check_handle_flow(rhs, env, false)?;
+        }
+        Expr::UnOp { expr, .. } => check_handle_flow(expr, env, false)?,
+        // Container elements are CONSUMING stores (rejected separately for handles,
+        // but the walk keeps liveness honest for a moved handle read among them).
+        Expr::List(elems, _) | Expr::Set(elems, _) | Expr::Tuple(elems, _) => {
+            for el in elems { check_handle_flow(el, env, true)?; }
+        }
+        Expr::Dict(pairs, _) => {
+            for (k, v) in pairs {
+                check_handle_flow(k, env, true)?;
+                check_handle_flow(v, env, true)?;
+            }
+        }
+        Expr::IfExp { test, body, orelse, .. } => {
+            check_handle_flow(test, env, false)?;
+            // Alternative arms: propagate `consumed` into each (a handle-typed
+            // ternary is rejected separately, so in practice this only walks reads).
+            check_handle_flow(body, env, consumed)?;
+            check_handle_flow(orelse, env, consumed)?;
+        }
+        Expr::FStr(parts, _) => {
+            for p in parts {
+                if let FStrPart::Interp(x, _) = p { check_handle_flow(x, env, false)?; }
+            }
+        }
+        Expr::ListComp { elt, iter, cond, .. } | Expr::SetComp { elt, iter, cond, .. } => {
+            // The source iterable is evaluated ONCE; the elt/cond run PER ITERATION.
+            check_handle_flow(iter, env, false)?;
+            // (W5-g, H7) A comprehension body is a LOOP body — it runs N times, so
+            // CONSUMING an outer handle inside it (`[consume(f) for _ in range(2)]`)
+            // is a 2nd-iteration use-after-move (a raw rustc E0507 on the emitted
+            // FnMut closure). Push a loop frame so the outer-handle move guard fires;
+            // a BORROW like `f.read()` stays legal, and a handle created inside the
+            // comprehension is not in any frame and moves freely.
+            env.loop_handles.push(live_handle_names(env));
+            check_handle_flow(elt, env, false)?;
+            if let Some(c) = cond { check_handle_flow(c, env, false)?; }
+            env.loop_handles.pop();
+        }
+        Expr::DictComp { key, val, iter, cond, .. } => {
+            check_handle_flow(iter, env, false)?;
+            // (W5-g, H7) Same per-iteration loop-body guard as list/set above.
+            env.loop_handles.push(live_handle_names(env));
+            check_handle_flow(key, env, false)?;
+            check_handle_flow(val, env, false)?;
+            if let Some(c) = cond { check_handle_flow(c, env, false)?; }
+            env.loop_handles.pop();
+        }
+        Expr::Lambda { body, .. } => check_handle_flow(body, env, false)?,
+        Expr::Int(..) | Expr::Float(..) | Expr::Str(..) | Expr::Bytes(..)
+        | Expr::Bool(..) | Expr::None_(..) => {}
+    }
+    Ok(())
+}
+
+/// (W5-g) Merge per-branch handle move-states at a control-flow JOIN. A handle
+/// moved on ANY path is moved after the join (possibly-moved = moved) — the
+/// conservative rule the design mandates: a later read of a maybe-moved handle is
+/// an honest error, never a rustc leak. The retained span is the first path's
+/// move site (sufficient for the diagnostic).
+fn union_moved(paths: &[HashMap<String, Span>]) -> HashMap<String, Span> {
+    let mut out: HashMap<String, Span> = HashMap::new();
+    for p in paths {
+        for (k, v) in p {
+            out.entry(k.clone()).or_insert(*v);
+        }
+    }
+    out
+}
+
+/// (W5-g) The set of handle bindings LIVE at the entry to a loop — the "outer"
+/// handles that may not be moved inside the body (2nd-iteration use-after-move).
+fn live_handle_names(env: &FuncEnv) -> std::collections::HashSet<String> {
+    env.locals.iter()
+        .filter(|(n, t)| t.handle_name().is_some() && !env.moved.contains_key(n.as_str()))
+        .map(|(n, _)| n.clone())
+        .collect()
+}
+
 pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
     match s {
         Stmt::Pass(_) | Stmt::Break(_) | Stmt::Continue(_) => Ok(()),
@@ -2611,6 +2797,11 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             // Generics v1: `assert t` puts a bare type variable in a boolean
             // context (needs truthiness) — rejected like `if t:`.
             reject_typevar_op(&cond_ty, "use as a condition", cond.span())?;
+            // (W5-g) A handle has no truthiness; mark any handle passed to a call
+            // inside the condition/message as moved.
+            reject_handle_op(&cond_ty, "use as a condition", cond.span())?;
+            check_handle_flow(cond, env, false)?;
+            if let Some(m) = msg { check_handle_flow(m, env, false)?; }
             // (Z4, card 2b37b965) A bare `Optional` condition passes `check` but
             // leaks a rustc E0308 at `build`; reject it here so the two agree.
             reject_optional_truthiness(&cond_ty, cond.span())?;
@@ -2624,11 +2815,11 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             // only type-check the message arguments.
             match exc {
                 Some(Expr::Call { callee, args, .. }) if matches!(callee.as_ref(), Expr::Ident(..)) => {
-                    for a in args { check_expr(a, env)?; }
+                    for a in args { check_expr(a, env)?; check_handle_flow(a, env, true)?; }
                     Ok(())
                 }
                 Some(Expr::Ident(..)) => Ok(()),
-                Some(e) => { check_expr(e, env)?; Ok(()) }
+                Some(e) => { check_expr(e, env)?; check_handle_flow(e, env, false)?; Ok(()) }
                 None => Ok(()),
             }
         }
@@ -2667,6 +2858,8 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
                     msg: format!("return type mismatch: expected {}, found {}", env.ret_ty, ty),
                 });
             }
+            // (W5-g) `return h` MOVES a handle out of the function.
+            check_handle_flow(e, env, true)?;
             Ok(())
         }
         Stmt::Yield(e, span) => {
@@ -2677,6 +2870,7 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             // iterator (the signature check already errored) — but a defensive
             // honest error here covers any path that builds a `FuncEnv` directly.
             let yielded = check_expr(e, env)?;
+            check_handle_flow(e, env, false)?;
             if !env.is_generator {
                 return Err(Error::Type {
                     span: *span,
@@ -2703,6 +2897,10 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
         }
         Stmt::Expr(e) => {
             check_expr(e, env)?;
+            // (W5-g) The statement's result is discarded (not a move position), but
+            // any handle passed to a CALL inside it is consumed — `check_handle_flow`
+            // marks call arguments as moves via its Call arm.
+            check_handle_flow(e, env, false)?;
             Ok(())
         }
         Stmt::Assign { target, ty, value, span } => {
@@ -2787,6 +2985,11 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             } else {
                 env.locals.insert(target.clone(), declared);
             }
+            // (W5-g) `g = h` MOVES the handle `h` (bare-Ident RHS). The fresh binding
+            // `target` becomes live (a handle or any value), so clear any prior
+            // moved-state on its name — a rebind revives the name.
+            check_handle_flow(value, env, true)?;
+            env.moved.remove(target.as_str());
             Ok(())
         }
         Stmt::AugAssign { target, op, value, span } => {
@@ -2846,7 +3049,11 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
                         });
                     }
                 }
+                // (W5-g) A handle has no augmented-assignment (no operators).
+                reject_handle_op(&target_ty, "apply an operator to", *span)?;
             }
+            reject_handle_op(&val_ty, "apply an operator to", *span)?;
+            check_handle_flow(value, env, false)?;
             Ok(())
         }
         Stmt::Unpack { targets, value, span } => {
@@ -2856,6 +3063,10 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             // opaque, so this is an honest error (it would otherwise emit a
             // tuple-pattern bind against an opaque `T` and fail rustc).
             reject_typevar_op(&val_ty, "unpack", *span)?;
+            // (W5-g) A handle is not a tuple/sequence — unpacking it is an honest
+            // error (it would otherwise bind Unknowns and leak a rustc destructure).
+            reject_handle_op(&val_ty, "unpack", *span)?;
+            check_handle_flow(value, env, false)?;
             // (enabler-fix-2 #2) A statically-known tuple RHS whose ARITY differs
             // from the target count is a CHECK error — CPython raises a ValueError
             // at runtime, but pyrst knows the arity at compile time, so it leaked to
@@ -2931,6 +3142,16 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             // value is dropped at the join). Runs on the PRE-branch env (the helper
             // clones it), so it does not disturb the branch checks below.
             detect_branch_divergence(then, elifs, else_, env)?;
+            // (W5-g) The condition is a READ position (mark any handle passed to a
+            // call in it). Then snapshot the handle move-state: each branch is
+            // checked from this SAME pre-`if` snapshot, and the states are UNIONED at
+            // the join (possibly-moved = moved) so a handle moved on ANY path is an
+            // honest use-after-move afterward — never a rustc leak on the join slot.
+            check_handle_flow(cond, env, false)?;
+            // (W5-g) A handle has no truthiness — `if f:` is an honest error.
+            reject_handle_op(&cond_ty, "use as a condition", cond.span())?;
+            let moved_pre = env.moved.clone();
+            let mut moved_paths: Vec<HashMap<String, Span>> = Vec::new();
             // (EPIC-5) None-guard narrowing. For `if x is not None:` the THEN
             // branch sees `x: T` (the non-None payload); for `if x is None:` the
             // ELSE branch sees `x: T`. `x` must be a local typed `Option(T)`.
@@ -2948,7 +3169,9 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
                         let prev = env.locals.insert(name.clone(), inner.clone());
                         (name.clone(), prev)
                     });
+                env.moved = moved_pre.clone();
                 check_body(then, env)?;
+                moved_paths.push(env.moved.clone());
                 if let Some((name, prev)) = restore {
                     match prev { Some(t) => { env.locals.insert(name, t); } None => { env.locals.remove(name.as_str()); } }
                 }
@@ -2957,7 +3180,10 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
                 let c_ty = check_expr(c, env)?;
                 reject_typevar_op(&c_ty, "use as a condition", c.span())?;
                 reject_optional_truthiness(&c_ty, c.span())?;
+                check_handle_flow(c, env, false)?;
+                env.moved = moved_pre.clone();
                 check_body(b, env)?;
+                moved_paths.push(env.moved.clone());
             }
             // ELSE branch: narrowed iff the guard is `is None` (so the else is the
             // non-None case). Skipped when there are elifs, since the else then
@@ -2969,11 +3195,18 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
                         let prev = env.locals.insert(name.clone(), inner.clone());
                         (name.clone(), prev)
                     });
+                env.moved = moved_pre.clone();
                 check_body(b, env)?;
+                moved_paths.push(env.moved.clone());
                 if let Some((name, prev)) = restore {
                     match prev { Some(t) => { env.locals.insert(name, t); } None => { env.locals.remove(name.as_str()); } }
                 }
+            } else {
+                // No `else`: the fall-through path contributes the pre-`if` state.
+                moved_paths.push(moved_pre.clone());
             }
+            // (W5-g) Join: a handle moved on ANY path is moved afterward.
+            env.moved = union_moved(&moved_paths);
             // (card c34ac64a, shape 1a) NEGATIVE narrowing — the early-return guard
             // idiom. For `if x is None: <terminates>` with NO elif and NO else, the
             // only way control reaches the statements AFTER this `if` is the guard
@@ -3035,7 +3268,14 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
                     env.locals.insert(name, inner);
                 }
             }
+            // (W5-g) The header is a READ; then guard the body: a handle LIVE before
+            // this loop may not be moved inside it (2nd-iteration use-after-move).
+            check_handle_flow(cond, env, false)?;
+            // (W5-g) A handle has no truthiness — `while f:` is an honest error.
+            reject_handle_op(&cond_ty, "use as a condition", cond.span())?;
+            env.loop_handles.push(live_handle_names(env));
             check_body(body, env)?;
+            env.loop_handles.pop();
             rewiden_loop_narrows(&pre_loop, env);
             Ok(())
         }
@@ -3047,6 +3287,8 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             // `list[T]`/`dict[K, V]` whose ELEMENT is a type var is fine and
             // yields the element/key type below.
             reject_typevar_op(&iter_ty, "iterate over", *span)?;
+            // (W5-g) A handle is not iterable — honest error, not a rustc E0599.
+            reject_handle_op(&iter_ty, "iterate over", *span)?;
             // (enabler-fix-2 #2) Iterating a fixed-shape TUPLE is an honest CHECK
             // error. A pyrst tuple lowers to a Rust tuple, which is NOT iterable
             // (the old `.into_iter()`/`.iter()` emission was a rustc E0599). DESIGN
@@ -3099,7 +3341,12 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             // 0..n times, so `rewiden_loop_narrows` re-widens any Optional the body
             // narrowed down to its payload back to `Option<T>` at the loop edge.
             let pre_loop = env.locals.clone();
+            // (W5-g) The iterable is a READ; then guard the body against moving a
+            // handle that was live before the loop (2nd-iteration use-after-move).
+            check_handle_flow(iter, env, false)?;
+            env.loop_handles.push(live_handle_names(env));
             check_body(body, env)?;
+            env.loop_handles.pop();
             rewiden_loop_narrows(&pre_loop, env);
             Ok(())
         }
@@ -3114,14 +3361,25 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             let mut branches: Vec<&[Stmt]> = vec![body.as_slice()];
             for h in handlers { branches.push(&h.body); }
             detect_sibling_divergence(&branches, env, "the branches of this `try`/`except`")?;
+            // (W5-g) The try body and each handler are alternative paths for handle
+            // move-state (an exception may fire mid-body). Check each from the same
+            // pre-`try` snapshot and UNION (possibly-moved = moved); `else`/`finally`
+            // then run from that conservative join.
+            let moved_pre = env.moved.clone();
+            let mut moved_paths: Vec<HashMap<String, Span>> = Vec::new();
+            env.moved = moved_pre.clone();
             check_body(body, env)?;
+            moved_paths.push(env.moved.clone());
             for h in handlers {
                 if let Some(name) = &h.exc_name {
                     // The bound exception value is the panic message string.
                     env.locals.insert(name.clone(), Ty::Str);
                 }
+                env.moved = moved_pre.clone();
                 check_body(&h.body, env)?;
+                moved_paths.push(env.moved.clone());
             }
+            env.moved = union_moved(&moved_paths);
             if let Some(b) = else_ { check_body(b, env)?; }
             if let Some(b) = finally_ { check_body(b, env)?; }
             Ok(())
@@ -3143,7 +3401,10 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             // value/traceback, so `__exit__(self, exc_type, exc_value, traceback)` cannot
             // receive Python-correct arguments on the raise path, nor honor suppression.
             // Reject honestly instead of miscompiling; see the (a) follow-up card.
-            if !matches!(ctx_ty, Ty::File) {
+            // (W5-g) Only the `file` handle is a context manager (RAII-`Drop` close).
+            // Other handle kinds (re.Pattern, ...) are not context managers yet, so
+            // `matches!` is pinned to the `"file"` kind, not any `Ty::Handle`.
+            if !matches!(&ctx_ty, Ty::Handle(n) if n == "file") {
                 return Err(Error::Type {
                     span: ctx_expr.span(),
                     msg: "context-manager protocol (__enter__/__exit__) is not yet \
@@ -3153,14 +3414,25 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
                         .to_string(),
                 });
             }
+            // (W5-g) `with <ctx> as f:` MOVES the ctx value into the block-scoped `f`
+            // (codegen: `let mut f = <ctx>`). For `with open(...) as f` the ctx is a
+            // fresh temp (nothing to move); for `with h as f` the existing handle `h`
+            // is moved (using `h` after the `with` is then a use-after-move).
+            check_handle_flow(ctx_expr, env, true)?;
             // Bound name is block-scoped in codegen; save/restore so a stale type
             // does not leak past the block (mirrors the for-loop handling).
             let saved = as_name.as_ref().map(|n| (n.clone(), env.locals.get(n).cloned()));
             if let Some(name) = as_name {
                 env.locals.insert(name.clone(), ctx_ty);
+                // The freshly-bound handle is LIVE for the body (clear any prior
+                // moved-state a same-named handle left).
+                env.moved.remove(name.as_str());
             }
             check_body(body, env)?;
             if let Some((name, prev)) = saved {
+                // The `with`-bound handle leaves scope at the block end (RAII close);
+                // drop its move-state so it never leaks past the block.
+                env.moved.remove(name.as_str());
                 match prev {
                     Some(ty) => { env.locals.insert(name, ty); }
                     None => { env.locals.remove(name.as_str()); }
@@ -3172,6 +3444,13 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             // The target is type-checked first so an undefined base / bad index stays
             // a precise error rather than being masked by the rejection below.
             check_expr(target, env)?;
+            // (W5-g, H3) `del f` on a bare handle Ident CONSUMES it — codegen emits
+            // `drop(f)`, which MOVES the handle out. So it is a move site (a later
+            // read of `f` is an honest use-after-move, matching the `drop`). Passing
+            // `consumed = true` marks it; a `del xs[i]` / `del obj.attr` target
+            // recurses through the Index/Attr arms, which hardcode a BORROW (`false`)
+            // for their base, so only a bare `del f` is marked moved.
+            check_handle_flow(target, env, true)?;
             // (W4-b) `del <expr>[i]` on a list/dict is a SILENT NO-OP: codegen lowers
             // it to `drop(<clone of the element>)`, discarding a value-semantics COPY
             // and never touching the stored container (confirmed: `del xs[0]` leaves
@@ -3220,12 +3499,21 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             {
                 reject_typevar_op(&subject_ty, "match on a literal pattern against", *span)?;
             }
+            // (W5-g) A handle cannot be a match scrutinee — `match` clones the subject
+            // (a handle is non-Clone) and literal patterns need PartialEq (a handle has
+            // none). Honest error, not a rustc E0599/E0369. The subject is a READ.
+            reject_handle_op(&subject_ty, "match on", *span)?;
+            check_handle_flow(subject, env, false)?;
             // (LAZY-GEN V1-d BLOCKER) The arm bodies are SIBLING value-paths merged
             // into one hoisted slot — the same divergent-join hazard as `if`/`else`.
             // A bare local assigned divergent types across arms is an honest CHECK
             // error (a divergent case otherwise leaks a raw rustc E0425 at build).
             let arm_branches: Vec<&[Stmt]> = arms.iter().map(|a| a.body.as_slice()).collect();
             detect_sibling_divergence(&arm_branches, env, "the arms of this `match`")?;
+            // (W5-g) The arms are alternative paths for handle move-state: check each
+            // from the same pre-`match` snapshot and UNION at the join.
+            let moved_pre = env.moved.clone();
+            let mut moved_paths: Vec<HashMap<String, Span>> = Vec::new();
             for arm in arms {
                 // A `case <name>:` (capture) pattern BINDS `<name>` to the subject's
                 // value for the duration of this arm — its GUARD and its body (so
@@ -3245,10 +3533,13 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
                 // Check guard if present (may reference the capture binding).
                 if let Some(guard) = &arm.guard {
                     check_expr(guard, env)?;
+                    check_handle_flow(guard, env, false)?;
                 }
+                env.moved = moved_pre.clone();
                 for s in &arm.body {
                     check_stmt(s, env)?;
                 }
+                moved_paths.push(env.moved.clone());
                 if let Some((name, prev)) = saved_capture {
                     match prev {
                         Some(ty) => { env.locals.insert(name, ty); }
@@ -3256,6 +3547,11 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
                     }
                 }
             }
+            // A `match` with no wildcard arm may fall through (no arm taken); include
+            // the pre-match state as a path so a move on every arm is still only
+            // "possibly moved" when a fall-through exists. Conservative either way.
+            moved_paths.push(moved_pre.clone());
+            env.moved = union_moved(&moved_paths);
             Ok(())
         }
         Stmt::AttrAssign { obj, attr, value, span } => {
@@ -3316,6 +3612,11 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
                     }
                 }
             }
+            // (W5-g) The base is a BORROW; the assigned value is a STORE (move). A
+            // bare handle stored into a field is thus a move (and a handle field is
+            // itself unsupported, caught elsewhere) — the flow keeps liveness honest.
+            check_handle_flow(obj, env, false)?;
+            check_handle_flow(value, env, true)?;
             Ok(())
         }
         Stmt::IndexAssign { obj, idx, value, span } => {
@@ -3374,6 +3675,10 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
                     });
                 }
             }
+            // (W5-g) base + index are BORROWS; the stored value is a move.
+            check_handle_flow(obj, env, false)?;
+            check_handle_flow(idx, env, false)?;
+            check_handle_flow(value, env, true)?;
             Ok(())
         }
         // (first-class functions, Increment 2) A NESTED `def` lowers to a NAMED
@@ -3535,6 +3840,26 @@ pub(crate) fn check_nested_def(f: &Func, env: &mut FuncEnv) -> Result<()> {
                          captured by a nested function (a by-reference binding cannot \
                          be moved into a closure); copy it into a local first \
                          (`{name}_local = {name}`) and capture that",
+                    ),
+                });
+            }
+        }
+
+        // (W5-g, H2) CAPTURE-A-HANDLE gate. A move-only handle CAPTURED by a nested
+        // `def` is snapshotted by codegen's clone-on-capture — but a handle is
+        // non-`Clone`, so the emitted `f.clone()` fails rustc E0599 (the same hole as
+        // the old `Ty::File`). A handle is a unique external resource that v1 cannot
+        // alias into a closure at all. Reject honestly (mirroring the Iterator/by-ref
+        // gates above); pass the handle in as a `def` parameter instead.
+        for name in &captured {
+            if let Some(kind) = env.locals.get(name).and_then(|t| t.handle_name()) {
+                return Err(Error::Type {
+                    span: f.span,
+                    msg: format!(
+                        "the `{kind}` handle `{name}` cannot be captured by a nested \
+                         function — a move-only handle is non-clonable, so it cannot be \
+                         snapshotted into a closure (v1 handles are move-only); pass it in \
+                         as a parameter of the nested function instead",
                     ),
                 });
             }
@@ -3771,7 +4096,9 @@ pub(crate) fn builtin_method_table(ty: &Ty) -> Option<(&'static str, &'static [&
         Ty::List(_) => Some(("list", LIST_METHODS)),
         Ty::Set(_) => Some(("set", SET_METHODS)),
         Ty::Dict(_, _) => Some(("dict", DICT_METHODS)),
-        Ty::File => Some(("file", FILE_METHODS)),
+        // (W5-g) The `file` handle's method table. Other handle kinds get theirs
+        // from the `@extern class` decl form in W5-h.
+        Ty::Handle(n) if n == "file" => Some(("file", FILE_METHODS)),
         _ => None,
     }
 }
@@ -3856,7 +4183,8 @@ pub fn builtin_method_ret(recv: &Ty, method: &str) -> Ty {
             "update" | "clear" => Ty::Unit,
             _ => Ty::Unknown,
         },
-        Ty::File => match method {
+        // (W5-g) The `file` handle's method return types.
+        Ty::Handle(n) if n == "file" => match method {
             "read" => Ty::Str,
             "readlines" => Ty::List(Box::new(Ty::Str)),
             "write" | "close" => Ty::Unit,

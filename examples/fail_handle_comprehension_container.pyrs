@@ -1,0 +1,9 @@
+# HONEST REJECTION (W5-g, H1 — comprehension-built container): a comprehension that
+# BUILDS a container of handles (`[open(p) for p in paths]`) is the same
+# un-clonable-`Vec<PyFile>` hole as a container LITERAL of handles. The literal-List
+# gate rejected it; the comprehension arm now rejects it too, at CHECK, naming the
+# handle kind — instead of leaking a rustc E0277/E0599 at build.
+def main() -> None:
+    paths: list[str] = ["/tmp/pyrst_a", "/tmp/pyrst_b"]
+    handles = [open(p, "w") for p in paths]
+    print(len(handles))

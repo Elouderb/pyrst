@@ -1,0 +1,9 @@
+# HONEST REJECTION (W5-g, H1 — type-position gating): a move-only handle cannot be
+# NESTED in a container type ANNOTATION. `list[file]` resolves to `List(Handle)`,
+# which codegen would emit as an un-clonable `Vec<PyFile>` — it used to check-PASS
+# (the literal-site gates never covered annotations) and die at rustc. The handle
+# type-resolution gate now rejects any handle nested in a container / `Optional` /
+# tuple / `Callable` / generic type at CHECK. A bare `f: file` binding is fine.
+def main() -> None:
+    xs: list[file] = []
+    print(len(xs))

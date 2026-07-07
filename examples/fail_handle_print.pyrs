@@ -1,0 +1,7 @@
+# HONEST REJECTION (W5-g, G1): an opaque move-only handle has no `Display`/`PyRepr`,
+# so `print(f)` (and str/repr/f-string of a handle) is an honest CHECK error naming
+# the handle kind — not a rustc E0277 ("`PyFile` doesn't implement `Display`"). A
+# handle is an opaque external resource; there is nothing meaningful to print.
+def main() -> None:
+    f = open("/tmp/pyrst_w5g_fail.txt", "w")
+    print(f)

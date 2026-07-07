@@ -151,6 +151,22 @@ pub(crate) fn unify_typevar(
             if matches!(actual, Ty::Unknown) {
                 return Ok(());
             }
+            // (W5-g, H4) A move-only HANDLE cannot instantiate a generic type
+            // parameter. codegen emits every type var as `<T: Clone>` and CLONES the
+            // value on use (see `is_copy` / `emit_func`), but a handle is non-`Clone`
+            // — so `pick(open(p), ...)` against `def pick[T](x: T)` unified `T=file`,
+            // check-PASSED, then died at rustc E0277 "`PyFile: Clone` is not
+            // satisfied". Reject the unification honestly instead of leaking that
+            // wall. (`contains_handle` also covers the degenerate `T=list[file]`
+            // shapes, though those are already rejected at type resolution.)
+            if let Some(kind) = Ty::contains_handle(actual) {
+                return Err(format!(
+                    "a `{kind}` handle cannot instantiate the generic type parameter `{name}` \
+                     — a move-only handle is non-clonable, but a generic parameter is bound \
+                     `Clone` and cloned on use; pass the handle to a non-generic function, or \
+                     lend it by `Mut[{kind}]` reference",
+                ));
+            }
             match subst.get(name) {
                 None => {
                     subst.insert(name.clone(), actual.clone());
@@ -742,6 +758,31 @@ pub(crate) fn reject_typevar_op(ty: &Ty, op_desc: &str, span: Span) -> Result<()
                  generics v2 infers bounds only for comparison, equality, \
                  arithmetic, Display, and Hash)",
                 op_desc, name
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// (W5-g) Reject an operation that a move-only opaque HANDLE cannot support —
+/// display/repr, equality/ordering/arithmetic, hashing, indexing/slicing,
+/// iteration, truthiness, unpacking, or being stored in a container. A handle is
+/// an opaque external resource (a `file`, later a `Pattern`/`Popen`): it has no
+/// `Display`/`PyRepr`, no `PartialEq`/`Ord`, is not hashable, is not clonable, and
+/// (v1, move-only) cannot live in a `list`/`set`/`dict`/`tuple`. Each such use is
+/// an explicit honest `check` error NAMING the handle kind, never a rustc E0277/
+/// E0599 leak. Method calls and RAII-close are the only things a handle supports,
+/// so this is NOT called at the method-call / attribute sites. Mirrors
+/// `reject_typevar_op`.
+pub(crate) fn reject_handle_op(ty: &Ty, op_desc: &str, span: Span) -> Result<()> {
+    if let Some(kind) = ty.handle_name() {
+        return Err(Error::Type {
+            span,
+            msg: format!(
+                "cannot {op_desc} a `{kind}` handle — an opaque move-only handle has no \
+                 display/repr, no equality or ordering, is not hashable or clonable, and \
+                 cannot be stored in a container (v1 handles are move-only); use its methods \
+                 (e.g. read/write/close on a `file`) instead",
             ),
         });
     }

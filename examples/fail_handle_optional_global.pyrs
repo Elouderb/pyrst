@@ -1,0 +1,11 @@
+# HONEST REJECTION (W5-g, H1 — nested handle in a module global): a move-only
+# handle cannot back a module-level binding, and that includes an `Optional[file]`
+# global. The bare `f: file = ...` global was already rejected, but an
+# `Optional[file]` (or any container-wrapped handle) at module scope used to slip
+# past the global guard (which matched a BARE `Ty::Handle`) and die at rustc. The
+# handle type-resolution gate now rejects `Optional[file]` at CHECK — everywhere,
+# including a module global.
+current: Optional[file] = None
+
+def main() -> None:
+    print("unreached")

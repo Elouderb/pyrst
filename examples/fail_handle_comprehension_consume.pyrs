@@ -1,0 +1,15 @@
+# HONEST REJECTION (W5-g, H7 — per-iteration move inside a comprehension): a
+# comprehension body runs N times, so CONSUMING an outer handle inside it
+# (`[consume(f) for _ in range(2)]`) is a use-after-move on the 2nd iteration — a
+# raw rustc E0507 on the emitted FnMut closure. The move-checker now treats a
+# comprehension body like a LOOP body: moving an outer handle inside it is an honest
+# CHECK error. (A BORROW like `f.read()` inside a comprehension stays legal — it
+# lowers to a borrowing iterator adaptor.)
+def consume(f: file) -> None:
+    f.close()
+
+
+def main() -> None:
+    f = open("/tmp/pyrst_w5g_compc.txt", "w")
+    results = [consume(f) for _ in range(2)]
+    print(len(results))

@@ -887,9 +887,11 @@ impl<'a> Codegen<'a> {
                         }
                     }
 
-                    // File methods (PyFile; gated on a File receiver). write takes
-                    // &str, so borrow the argument.
-                    if let Ty::File = self.type_of_expr(obj) {
+                    // File methods (PyFile; gated on a `file` handle receiver).
+                    // write takes &str, so borrow the argument. (W5-g: the receiver
+                    // is now `Ty::Handle("file")`; a method call BORROWS `&mut self`,
+                    // it does not consume — the receiver is not a move site.)
+                    if matches!(self.type_of_expr(obj), Ty::Handle(ref n) if n == "file") {
                         match name.as_str() {
                             "write" if !parts.is_empty() => return Ok(Some(format!("{}.write(&{})", obj_s, parts[0]))),
                             "write" => return Err(crate::diag::Error::Codegen("file write() requires one argument".into())),
@@ -4224,7 +4226,15 @@ impl<'a> Codegen<'a> {
                     self.emit_class_name(n)
                 }
             }
-            Ty::File => "PyFile".into(),
+            // (W5-g) A handle lowers to its opaque Rust struct. The built-in `file`
+            // handle is `PyFile` (FILE_PRELUDE); lib-declared handle kinds map their
+            // name to the struct the `@extern class` decl emits (W5-h). An unknown
+            // handle kind here would be a compiler bug (the typeck only ever mints
+            // `Handle("file")` in W5-g), so fall back to a name that fails LOUDLY at
+            // rustc rather than silently — but `file` is the only reachable kind.
+            Ty::Handle(n) => {
+                if n == "file" { "PyFile".into() } else { format!("__PyHandle_{}", n) }
+            }
             // Generics v1: a bound type variable lowers to its bare Rust generic
             // parameter name (e.g. `T`). The enclosing `fn` declares it as
             // `<T: Clone>` (see `emit_func`), so the name is in scope wherever a

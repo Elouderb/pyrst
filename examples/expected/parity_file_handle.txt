@@ -1,0 +1,5 @@
+29
+3
+True
+True
+I/O operation on closed file.

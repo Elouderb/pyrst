@@ -1,0 +1,11 @@
+# HONEST REJECTION (W5-g, H2 — capture by a lambda): a lambda lowers to a `move`
+# closure whose non-Copy captures are snapshotted by CLONE. A move-only handle is
+# non-`Clone`, so a lambda capturing an outer handle emits `f.clone()` -> rustc
+# E0599. It used to check-PASS; it is now an honest CHECK error. (Unlike a
+# comprehension — which lowers to a borrowing iterator adaptor and may borrow a
+# handle via a method call — a lambda cannot alias a handle at all in v1.)
+def main() -> None:
+    f = open("/tmp/pyrst_w5g_lam.txt", "w")
+    write_it = lambda: f.write("captured\n")
+    write_it()
+    f.close()

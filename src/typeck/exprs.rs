@@ -1590,6 +1590,10 @@ pub(crate) fn lambda_ret_with_elem(
     env: &mut FuncEnv,
 ) -> Result<Option<Ty>> {
     if let Expr::Lambda { params, body, .. } = callable {
+        // (W5-g, H2) A lambda (map/filter/sorted-key or bare) cannot capture a
+        // move-only handle — clone-on-capture is non-`Clone`. Reject before the body
+        // check, covering the zero-param lambda that falls through below too.
+        reject_lambda_handle_capture(params, body, env)?;
         if !params.is_empty() {
             let mut lambda_env = FuncEnv {
                 ctx: env.ctx,
@@ -1615,6 +1619,12 @@ pub(crate) fn lambda_ret_with_elem(
                 narrowed: std::collections::HashMap::new(),
                 // (W4-a) Inherit the enclosing function's owning module.
                 module_id: env.module_id.clone(),
+                // (W5-g) Inherit handle liveness so a handle moved before this
+                // nested expression scope is still detected if read inside it. Move
+                // MARKING is a statement-position concern (never happens in an
+                // expression scope), so `loop_handles` is inherited but never pushed.
+                moved: env.moved.clone(),
+                loop_handles: env.loop_handles.clone(),
             };
             // Bind every param: the first to the iterable element type, the
             // rest to their declared type or Unknown (map/filter pass a single
@@ -1668,13 +1678,18 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                             "has no string form (it would show an opaque generator handle)",
                             "f\"{list(g)}\"", *fstr_span));
                     }
+                    // (W5-g) A handle has no `Display`/`PyRepr`, so it cannot be
+                    // interpolated into an f-string — honest error, not rustc E0277.
+                    reject_handle_op(&ity, "interpolate into an f-string", *fstr_span)?;
                 }
             }
             Ty::Str
         }
         Expr::Bool(_, _) => Ty::Bool,
-        Expr::Tuple(elems, _) => {
+        Expr::Tuple(elems, span) => {
             let tys = elems.iter().map(|e| check_expr(e, env)).collect::<Result<Vec<_>>>()?;
+            // (W5-g) A handle cannot be stored in a tuple (non-clonable, move-only).
+            for t in &tys { reject_handle_op(t, "store in a tuple", *span)?; }
             Ty::Tuple(tys)
         }
         Expr::IfExp { test, body, orelse, span } => {
@@ -1739,10 +1754,21 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 // (W4-a) A comprehension runs in the enclosing function scope —
                 // inherit its owning module so any global it reads resolves per-owner.
                 module_id: env.module_id.clone(),
+                // (W5-g) Inherit handle liveness so a handle moved before this
+                // nested expression scope is still detected if read inside it. Move
+                // MARKING is a statement-position concern (never happens in an
+                // expression scope), so `loop_handles` is inherited but never pushed.
+                moved: env.moved.clone(),
+                loop_handles: env.loop_handles.clone(),
             };
             bind_comp_targets(targets, elem_ty, &mut inner_env.locals);
             if let Some(c) = cond { let ct = check_expr(c, &mut inner_env)?; reject_optional_truthiness(&ct, c.span())?; }
             let elt_ty = check_expr(elt, &mut inner_env)?;
+            // (W5-g, H1) A comprehension-BUILT container of handles is the same
+            // hole as a container LITERAL of handles: `[open(p) for p in paths]`
+            // would emit an un-clonable `Vec<PyFile>`. The literal-List arm rejects
+            // this; the comprehension arm must too. Honest error naming the kind.
+            reject_handle_op(&elt_ty, "store in a list", elt.span())?;
             Ty::List(Box::new(elt_ty))
         }
         Expr::SetComp { elt, targets, iter, cond, span } => {
@@ -1789,10 +1815,19 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 // (W4-a) A comprehension runs in the enclosing function scope —
                 // inherit its owning module so any global it reads resolves per-owner.
                 module_id: env.module_id.clone(),
+                // (W5-g) Inherit handle liveness so a handle moved before this
+                // nested expression scope is still detected if read inside it. Move
+                // MARKING is a statement-position concern (never happens in an
+                // expression scope), so `loop_handles` is inherited but never pushed.
+                moved: env.moved.clone(),
+                loop_handles: env.loop_handles.clone(),
             };
             bind_comp_targets(targets, elem_ty, &mut inner_env.locals);
             if let Some(c) = cond { let ct = check_expr(c, &mut inner_env)?; reject_optional_truthiness(&ct, c.span())?; }
             let elt_ty = check_expr(elt, &mut inner_env)?;
+            // (W5-g, H1) A comprehension-built SET of handles (`{open(p) for ..}`)
+            // is the same un-clonable-container hole as the set literal — reject it.
+            reject_handle_op(&elt_ty, "store in a set", elt.span())?;
             // Same hashability rule as set literals: a Float element produces
             // the uncompilable `HashSet<f64>`, so reject it here too.
             require_hashable(&elt_ty, *span, "set element")?;
@@ -1842,11 +1877,22 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 // (W4-a) A comprehension runs in the enclosing function scope —
                 // inherit its owning module so any global it reads resolves per-owner.
                 module_id: env.module_id.clone(),
+                // (W5-g) Inherit handle liveness so a handle moved before this
+                // nested expression scope is still detected if read inside it. Move
+                // MARKING is a statement-position concern (never happens in an
+                // expression scope), so `loop_handles` is inherited but never pushed.
+                moved: env.moved.clone(),
+                loop_handles: env.loop_handles.clone(),
             };
             bind_comp_targets(targets, elem_ty, &mut inner_env.locals);
             if let Some(c) = cond { let ct = check_expr(c, &mut inner_env)?; reject_optional_truthiness(&ct, c.span())?; }
             let key_ty = check_expr(key, &mut inner_env)?;
             let val_ty = check_expr(val, &mut inner_env)?;
+            // (W5-g, H1) A comprehension-built DICT storing handles as keys or
+            // values (`{p: open(p) for ..}`) is the same un-clonable-container hole
+            // as the dict literal — reject either position.
+            reject_handle_op(&key_ty, "use as a dict key", key.span())?;
+            reject_handle_op(&val_ty, "store in a dict", val.span())?;
             // Same hashability rule as dict literals: a Float KEY produces the
             // uncompilable `HashMap<f64, _>`. Values may be Float.
             require_hashable(&key_ty, *span, "dict key")?;
@@ -1877,6 +1923,10 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 }
                 acc
             };
+            // (W5-g) A move-only handle cannot be stored in a container (a
+            // `Vec<PyFile>` is not clonable, breaking value semantics). Deferred to a
+            // later handle iteration; honest error now, naming the kind.
+            reject_handle_op(&elem_ty, "store in a list", *span)?;
             Ty::List(Box::new(elem_ty))
         }
         Expr::Set(elems, span) => {
@@ -1905,6 +1955,7 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
             // here so typeck and codegen agree. (`{1, 2.0}` is already rejected
             // by the widen_numeric=false fold above; this closes the all-float
             // case.) Unknown element types (`set()`) stay permissive.
+            reject_handle_op(&elem_ty, "store in a set", *span)?;
             require_hashable(&elem_ty, *span, "set element")?;
             Ty::Set(Box::new(elem_ty))
         }
@@ -1944,6 +1995,8 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 // which codegen would emit as the uncompilable `HashMap<f64, _>`.
                 // Reject the KEY only — float VALUES are fine (`HashMap<_, f64>`
                 // compiles), so v_ty is left untouched.
+                reject_handle_op(&k_ty, "use as a dict key", *span)?;
+                reject_handle_op(&v_ty, "store in a dict", *span)?;
                 require_hashable(&k_ty, *span, "dict key")?;
                 Ty::Dict(Box::new(k_ty), Box::new(v_ty))
             }
@@ -1952,6 +2005,25 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
             // Track variable usage for dead code detection
             if env.locals.contains_key(name.as_str()) {
                 env.used_vars.insert(name.clone());
+            }
+            // (W5-g) Backstop use-after-move check: reading a handle that a prior
+            // statement moved is an honest error. `check_handle_flow` is the primary
+            // (eval-order, per-statement) pass; this catches any CROSS-statement read
+            // that reaches `check_expr` first, so a moved handle can never slip
+            // through to a rustc E0382/E0599. Naming the binding + move site.
+            if let Some(move_span) = env.moved.get(name).copied() {
+                let kind = env.locals.get(name).and_then(|t| t.handle_name())
+                    .unwrap_or("handle").to_string();
+                return Err(Error::Type {
+                    span: *span,
+                    msg: format!(
+                        "handle `{name}` (`{kind}`) was already moved (consumed) at line \
+                         {ln}:{col} and cannot be used again — a move-only handle is consumed \
+                         when it is passed to a function, returned, or reassigned; open or \
+                         create a fresh handle instead of reusing `{name}`",
+                        ln = move_span.line, col = move_span.col,
+                    ),
+                });
             }
             // A bare STDLIB module name (used opaquely as the base of `os.x` before
             // the Attr/Call arm recurses here) types as `Ty::Unknown`. `dataclasses`
@@ -2696,6 +2768,21 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                                     _ => {}
                                 }
                             }
+                            // (W5-g) A move-only handle passed to a builtin that needs
+                            // display (`print`/`str`/`repr`/`ascii`), a length, or
+                            // iteration/collection is an honest error naming the kind —
+                            // a `PyFile` has no `Display`/`PyRepr` (probe: rustc E0277).
+                            // NOTE: passing a handle to a USER function is a legal MOVE
+                            // (checked elsewhere); only these capability-needing
+                            // builtins are rejected here.
+                            if matches!(name.as_str(),
+                                "print" | "str" | "repr" | "ascii" | "len" | "sum"
+                                | "sorted" | "reversed" | "any" | "all" | "list"
+                                | "tuple" | "set" | "dict" | "enumerate" | "zip"
+                                | "min" | "max")
+                            {
+                                reject_handle_op(&arg_ty, &format!("pass to `{}()`", name), *span)?;
+                            }
                             // `repr(instance)` of a user class routes through the
                             // class's __repr__ (per-class `impl PyRepr`). CPython's
                             // repr uses __repr__ ONLY — never __str__ — and falls
@@ -3358,6 +3445,8 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
             // (Indexing a `list[T]`/`dict[K, V]` whose ELEMENT is a type var is
             // fine — that yields the element type below.)
             reject_typevar_op(&obj_ty, "index", *span)?;
+            // (W5-g) A handle is not indexable.
+            reject_handle_op(&obj_ty, "index", *span)?;
             // (LAZY-GEN V1-d) A generator is single-pass with no random access —
             // `g[i]` is a `TypeError` in CPython too. Honest MATERIALIZE error
             // (closes the Index-vs-Slice asymmetry from review comment 123: Index
@@ -3411,6 +3500,8 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
             // Generics v1: a bare type variable is OPAQUE — slicing it (`t[a:b]`)
             // needs a slice/Index bound and is rejected (mirrors the Index arm).
             reject_typevar_op(&obj_ty, "slice", *span)?;
+            // (W5-g) A handle is not sliceable.
+            reject_handle_op(&obj_ty, "slice", *span)?;
             // (LAZY-GEN V1-d) Slicing a generator is a `TypeError` in CPython too.
             // Honest MATERIALIZE error at `check` time (previously only a codegen
             // error fired, so `pyrst check` leaked it — review comment 123).
@@ -3488,6 +3579,12 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 BinOp::In | BinOp::NotIn => "test membership of",
                 _ => "apply an operator to",
             };
+            // (W5-g) A handle has NO operators — no `==`/`!=` (probe: `PyFile` has no
+            // PartialEq -> rustc E0277), no ordering, no arithmetic, no membership.
+            // `bytes == str` etc. taught the lesson: reject explicitly here instead of
+            // riding the loose generic path into a rustc wall. Names the handle kind.
+            reject_handle_op(&l, op_desc, *span)?;
+            reject_handle_op(&r, op_desc, *span)?;
             // The single supported shape is `T op T` of the SAME variable with a
             // mapped bound. Recognise it first; anything else with a TypeVar
             // operand falls through to the v1 rejection.
@@ -3661,11 +3758,47 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
 /// `Unknown` (pyrst lambda params are unannotated), returning the body's type.
 /// Shared by the `Expr::Lambda` value arm (which wraps it in `Ty::Func`) and the
 /// inline-invocation call paths (which surface the body type as the call result).
+/// (W5-g, H2) Reject a lambda that CAPTURES an outer move-only handle. A lambda
+/// lowers to a `move` closure whose non-Copy captures are snapshotted by CLONE —
+/// but a handle is non-`Clone`, so the emitted `f.clone()` fails rustc E0599 (the
+/// same hole as the old `Ty::File`, and the nested-`def` capture gate). Unlike a
+/// comprehension (which lowers to a borrowing iterator adaptor), a lambda cannot
+/// alias a handle at all in v1. The lambda's OWN params are excluded (they shadow
+/// any enclosing name and are never handle-typed). Shared by every lambda-checking
+/// entry (`lambda_body_ty` and the map/filter `lambda_ret_with_elem`) so no lambda
+/// shape can smuggle a handle capture past `check` into a rustc wall.
+pub(crate) fn reject_lambda_handle_capture(
+    params: &[(String, TypeExpr)],
+    body: &Expr,
+    env: &FuncEnv,
+) -> Result<()> {
+    let mut reads: std::collections::HashSet<String> = std::collections::HashSet::new();
+    expr_reads(body, &mut reads);
+    for (p, _) in params { reads.remove(p); }
+    for name in &reads {
+        if let Some(kind) = env.locals.get(name).and_then(|t| t.handle_name()) {
+            return Err(Error::Type {
+                span: body.span(),
+                msg: format!(
+                    "the `{kind}` handle `{name}` cannot be captured by a lambda — a \
+                     move-only handle is non-clonable, so it cannot be snapshotted into a \
+                     closure (v1 handles are move-only); operate on the handle outside the \
+                     lambda, or use a named function that takes it as a parameter",
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn lambda_body_ty(
     params: &[(String, TypeExpr)],
     body: &Expr,
     env: &mut FuncEnv,
 ) -> Result<Ty> {
+    // (W5-g, H2) A lambda cannot capture a move-only handle (clone-on-capture is
+    // non-`Clone`); reject before checking the body.
+    reject_lambda_handle_capture(params, body, env)?;
     let mut lambda_env = FuncEnv {
         ctx: env.ctx,
         locals: env.locals.clone(),
@@ -3685,6 +3818,9 @@ pub(crate) fn lambda_body_ty(
         narrowed: std::collections::HashMap::new(),
         // (W4-a) Inherit the enclosing function's owning module.
         module_id: env.module_id.clone(),
+        // (W5-g) Inherit handle liveness (see the comprehension envs).
+        moved: env.moved.clone(),
+        loop_handles: env.loop_handles.clone(),
     };
     for (param_name, param_ty) in params {
         let ty = lambda_param_ty(param_ty);

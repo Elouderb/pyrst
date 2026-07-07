@@ -1,0 +1,11 @@
+# HONEST REJECTION (W5-g, G1): a move-only handle has no equality (nor ordering nor
+# any operator) — `PyFile` derives no `PartialEq`. `f == g` is an honest CHECK error
+# naming the handle kind, not a rustc E0277. (This is the same explicit-typing
+# discipline `bytes == str` uses: reject at check rather than ride the loose generic
+# operator path into a rustc wall.) NOTE: `g = f` would ALSO be a use-after-move of
+# `f`; here both operands are distinct handles so the equality is the reported error.
+def main() -> None:
+    f = open("/tmp/pyrst_w5g_a.txt", "w")
+    g = open("/tmp/pyrst_w5g_b.txt", "w")
+    same: bool = f == g
+    print(same)

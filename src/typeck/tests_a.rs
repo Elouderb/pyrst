@@ -846,20 +846,20 @@ use super::test_support::*;
 
     #[test]
     fn method_ret_file_read() {
-        assert_eq!(builtin_method_ret(&Ty::File, "read"), Ty::Str);
+        assert_eq!(builtin_method_ret(&Ty::Handle("file".into()), "read"), Ty::Str);
     }
 
     #[test]
     fn method_ret_file_readlines() {
         assert_eq!(
-            builtin_method_ret(&Ty::File, "readlines"),
+            builtin_method_ret(&Ty::Handle("file".into()), "readlines"),
             Ty::List(Box::new(Ty::Str))
         );
     }
 
     #[test]
     fn method_ret_file_write_is_unit() {
-        assert_eq!(builtin_method_ret(&Ty::File, "write"), Ty::Unit);
+        assert_eq!(builtin_method_ret(&Ty::Handle("file".into()), "write"), Ty::Unit);
     }
 
     // =========================================================================
@@ -2085,7 +2085,7 @@ use super::test_support::*;
     #[test]
     fn is_copy_conservative_non_copy_variants() {
         // Matches the legacy `is_copy_type`, which excluded these (=> non-Copy).
-        for t in [Ty::NoneVal, Ty::File, Ty::Unknown] {
+        for t in [Ty::NoneVal, Ty::Handle("file".into()), Ty::Unknown] {
             assert!(!is_copy(&t), "{t:?} must be conservatively non-Copy");
         }
     }

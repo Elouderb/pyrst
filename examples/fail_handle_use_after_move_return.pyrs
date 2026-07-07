@@ -1,0 +1,14 @@
+# HONEST REJECTION (W5-g, G1): `return h` MOVES the handle out of the function.
+# Using `h` after it has been returned (here it is first passed to `sink`, which
+# consumes it, and then returned) is a use-after-move — an honest CHECK error.
+def sink(fh: file) -> None:
+    fh.close()
+
+def take_then_return(h: file) -> file:
+    sink(h)
+    return h
+
+def main() -> None:
+    f = open("/tmp/pyrst_w5g_fail.txt", "w")
+    g = take_then_return(f)
+    g.close()

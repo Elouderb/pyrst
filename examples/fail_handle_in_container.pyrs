@@ -1,0 +1,10 @@
+# HONEST REJECTION (W5-g, G1): a move-only handle cannot be stored in a container.
+# A `Vec<PyFile>` is not clonable, which would break value semantics (and a handle
+# is non-`Clone` by construction). Storing a handle in a `list` (or set/dict/tuple)
+# is an honest CHECK error naming the handle kind — handle-in-container is a
+# documented v1 deferral, not a silent miscompile. (`sqlite3`'s connection pool and
+# similar collections wait on the v2 `Rc<RefCell>` reference-handle.)
+def main() -> None:
+    f = open("/tmp/pyrst_w5g_fail.txt", "w")
+    handles: list[file] = [f]
+    print(len(handles))

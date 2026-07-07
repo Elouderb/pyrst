@@ -1667,6 +1667,17 @@ impl<'a> Codegen<'a> {
         if self.is_copy_type(&self.type_of_expr(e)) {
             return self.emit_expr(e);
         }
+        // (W5-g, G1 — the PF-A fix) A move-only HANDLE is non-`Clone`, so a
+        // consuming site emits a BARE MOVE (the place, no `.clone()`) rather than
+        // the `<n>.clone()` the `Expr::Ident` arm below would emit. Cloning a
+        // handle is exactly the old `Ty::File` hole: `g = f` lowered to
+        // `let g = f.clone();` -> rustc E0599 "no method `clone` for `PyFile`"
+        // while `check` passed (probe PF-A). The typeck use-after-move check
+        // (`check_handle_flow`) guarantees the moved binding is never read again,
+        // so the bare move is sound — the single new consuming-site rule.
+        if self.type_of_expr(e).handle_name().is_some() {
+            return self.emit_expr(e);
+        }
         match e {
             Expr::Ident(..) => Ok(format!("{}.clone()", self.emit_expr(e)?)),
             Expr::Attr { obj, name, .. } => {

@@ -420,7 +420,7 @@ class Derived(Base):
         assert_eq!(format!("{}", Ty::Str),   "str");
         assert_eq!(format!("{}", Ty::Unit),  "None");
         assert_eq!(format!("{}", Ty::NoneVal), "None");
-        assert_eq!(format!("{}", Ty::File),    "file");
+        assert_eq!(format!("{}", Ty::Handle("file".into())),    "file");
         assert_eq!(format!("{}", Ty::Unknown), "unknown");
     }
 

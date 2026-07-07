@@ -1,0 +1,37 @@
+# parity: dual-run vs python3 3.12 — the migrated `file` handle's real FILE
+# OPERATIONS (open / write / read / the `with` context manager / close / and the
+# use-after-close ValueError). Every line here runs unmodified under both `pyrst`
+# and `python3` and produces byte-identical stdout.
+#
+# The handle flows through UNTYPED locals (no `: file` annotation, which is
+# pyrst-only) so the source is valid Python. `readlines()` is deliberately avoided
+# (pyrst strips line endings, CPython keeps them — a documented divergence covered
+# by the pyrst-only examples/handle_file_signature.pyrs); `read()` + `str` methods
+# are CPython-faithful. The use-after-close error text is CPython's exact
+# "I/O operation on closed file." (oracled against python3 3.12.9).
+
+def main() -> None:
+    path: str = "/tmp/pyrst_w5g_parity.txt"
+
+    with open(path, "w") as f:
+        f.write("line one\n")
+        f.write("line two\n")
+    with open(path, "a") as a:
+        a.write("line three\n")
+
+    with open(path) as g:
+        text: str = g.read()
+        print(len(text))
+        print(text.count("\n"))
+        print("line two" in text)
+        print(text.startswith("line one"))
+
+    # use-after-close: reading a closed file is a catchable ValueError whose message
+    # matches CPython byte-for-byte.
+    h = open(path)
+    h.close()
+    try:
+        data: str = h.read()
+        print("no error (wrong)")
+    except ValueError as e:
+        print(e)

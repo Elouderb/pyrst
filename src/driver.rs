@@ -92,13 +92,30 @@ pub fn build(path: &Path) -> Result<()> {
     let bin_path = cwd.join(&bin_name);
 
     if crates.is_empty() {
-        // ── NO external crates: the EXISTING single-file rustc path, UNCHANGED.
-        let rs_path = std::env::temp_dir().join(format!("pyrst-{}.rs", stem));
-        std::fs::write(&rs_path, rust)?;
+        // ── NO external crates: the single-file rustc path.
+        //
+        // (W5-g, review Concern 2 — the temp-path COLLISION fix) The emitted Rust
+        // goes to a temp path that is UNIQUE PER INVOCATION (pid + a process-local
+        // counter) and self-DELETES on drop. The old path was `pyrst-<stem>.rs`,
+        // keyed on the source BASENAME only — so two concurrent `pyrst build`s of a
+        // same-named source (e.g. two overlapping test-harness gate runs both
+        // building `parity_file_handle.pyrs`, or a stress loop) RACED on one shared
+        // /tmp file: one process could invoke rustc on the other's half-written
+        // emission, producing a NONDETERMINISTIC build failure — or a MISCOMPILED
+        // binary — on an otherwise-deterministic program (reproduced: 2/12 spurious
+        // failures under a 12-way same-stem concurrent build). That is the whole
+        // "honest guarantee evaporates under load" class the review flagged. The
+        // Cargo build path (per-pid `proj_dir`) and `maybe_rustfmt` (per-pid scratch)
+        // already disambiguate by pid; this brings the last shared intermediate in
+        // line. The OUTPUT BINARY path (`cwd/<stem>`) is deliberately UNCHANGED — it
+        // is user-facing (`built: ./<stem>`), and each `build` still overwrites its
+        // OWN prior binary, exactly as before.
+        let rs_tmp = TempArtifact { path: unique_temp_path("pyrst", "rs") };
+        std::fs::write(&rs_tmp.path, rust)?;
 
         let rustc_path = rustc_path();
         let status = Command::new(&rustc_path)
-            .arg(&rs_path)
+            .arg(&rs_tmp.path)
             .arg("-o")
             .arg(&bin_path)
             .arg("--edition")

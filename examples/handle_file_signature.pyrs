@@ -1,0 +1,51 @@
+# W5-g (G1): the move-only opaque HANDLE keystone, demonstrated on the migrated
+# `file` handle (`Ty::Handle("file")`, formerly the `Ty::File` proto-handle).
+#
+# PYRST-ONLY (not a parity dual-run): the `fh: file` parameter and `-> file`
+# return spell pyrst's HANDLE type name, which has no CPython equivalent (a CPython
+# file is an `io.TextIOWrapper`). Every FILE OPERATION here — open/write/read/
+# readlines/close and the `with` context manager — is real and CPython-faithful;
+# only the type-NAME spelling is pyrst-specific. See examples/parity_file_handle.pyrs
+# for the CPython-dual-run of the operations themselves.
+#
+# Closes probe PF-B: a `file`-typed parameter/return used to lower to a phantom
+# `Class("file")` and fail with "expected file, found file"; it is now a real
+# `Ty::Handle("file")` that is NAMEABLE in a signature.
+
+def write_and_close(fh: file, first: str, second: str) -> None:
+    # A handle passed BY VALUE is MOVED into this parameter — the caller gives it
+    # away (a move-only handle cannot be aliased). The handle mutates through
+    # `&mut self` method calls with no clone-on-read, and is closed here.
+    fh.write(first)
+    fh.write(second)
+    fh.close()
+
+
+def make_writer(path: str) -> file:
+    # A fresh handle is MOVED out of the function on `return`.
+    return open(path, "w")
+
+
+def main() -> None:
+    path: str = "/tmp/pyrst_w5g_sig.txt"
+
+    # `-> file` return (a move out) bound to a fresh live handle, then passed BY
+    # VALUE into a `fh: file` parameter (probe PF-B: this is now legal, and it
+    # MOVES the handle — reusing `f` afterward is a use-after-move, see the
+    # fail_handle_use_after_move_* negatives).
+    f = make_writer(path)
+    write_and_close(f, "alpha\n", "beta\n")
+
+    # The `with` statement still works through the migration (RAII `Drop` close).
+    with open(path, "a") as a:
+        a.write("gamma\n")
+
+    # Read the file back: method calls BORROW the receiver, so the same handle is
+    # used repeatedly (only a pass / return / reassignment moves it).
+    g = open(path)
+    lines: list[str] = g.readlines()
+    g.close()
+    print(len(lines))
+    print(lines[0])
+    print(lines[1])
+    print(lines[2])

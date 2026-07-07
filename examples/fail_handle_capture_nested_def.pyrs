@@ -1,0 +1,14 @@
+# HONEST REJECTION (W5-g, H2 — capture by a nested def): a move-only handle CAPTURED
+# by a nested `def` is snapshotted by codegen's clone-on-capture — but a handle is
+# non-`Clone`, so the emitted `f.clone()` fails rustc E0599. It used to check-PASS
+# (the nested-def gate covered Iterator + by-ref captures, but not handles). It is
+# now an honest CHECK error: pass the handle in as a parameter of the nested
+# function instead of capturing it.
+def main() -> None:
+    f = open("/tmp/pyrst_w5g_cap.txt", "w")
+
+    def helper() -> None:
+        f.write("captured\n")
+
+    helper()
+    f.close()

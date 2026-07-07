@@ -46,7 +46,22 @@ pub enum Ty {
     /// `Rc<dyn Fn(Arg, ...) -> Ret>` by codegen. Covers both named function
     /// references used as values and (capturing) lambdas.
     Func(Vec<Ty>, Box<Ty>),
-    File,            // an open file handle (open() / `with open(...) as f`)
+    /// (W5-g, G1) An opaque, NON-`Clone`, MOVE-ONLY external handle — a foreign
+    /// Rust struct (like `PyFile`) produced only by a lib/built-in constructor,
+    /// never user-constructible. The `String` is the handle KIND name (e.g.
+    /// `"file"`), which is nameable in a signature (`def f(fh: file)`), Displays
+    /// as itself, and selects the emitted Rust struct in `rust_ty`. Generalizes
+    /// AND fixes the old `Ty::File` proto-handle: consuming sites MOVE (never
+    /// `.clone()` — `emit_consuming`'s handle arm), a typeck use-after-move check
+    /// surfaces reuse as an honest pyrst error (not a rustc E0382/E0599 leak,
+    /// probe PF-A), and the kind is nameable in signatures (probe PF-B). It has
+    /// NO Display/PyRepr, NO equality/ordering, is NOT hashable, NOT clonable,
+    /// and cannot be stored in a container (v1 move-only) — each an explicit
+    /// honest `check` error. `is_copy` is false; unlike other non-Copy types it is
+    /// ALSO non-`Clone`, so it never rides the clone-on-use pipeline. See
+    /// docs/design/w5-bytes-handles.md §C (move-only v1; the `Rc<RefCell>`
+    /// reference-handle is the deferred v2).
+    Handle(String),
     /// Generics v1: a BOUND type variable inside a parametric generic function,
     /// e.g. the `T` in `def f[T](x: T) -> T`. It is produced ONLY by the scoped
     /// annotation lowering (`from_type_expr_scoped`) when a name matches one of
@@ -105,7 +120,9 @@ impl std::fmt::Display for Ty {
                 }
                 write!(f, "], {}]", ret)
             }
-            Ty::File      => write!(f, "file"),
+            // (W5-g) A handle Displays as its kind name (`file`, later `Pattern`),
+            // so `def f(fh: file)` round-trips and a mismatch reads naturally.
+            Ty::Handle(n) => write!(f, "{}", n),
             Ty::TypeVar(n) => write!(f, "{}", n),
             Ty::Unknown   => write!(f, "unknown"),
         }
@@ -130,6 +147,40 @@ impl Ty {
         Ty::from_type_expr_scoped(t, span, &[])
     }
 
+    /// (W5-g) The KIND name of an opaque move-only handle (`Some("file")`), or
+    /// `None` for every other type. The single predicate the move-checker, the
+    /// consuming-site codegen, and the honest-error gates share so "is this a
+    /// handle?" lives in exactly one place.
+    pub fn handle_name(&self) -> Option<&str> {
+        match self {
+            Ty::Handle(n) => Some(n.as_str()),
+            _ => None,
+        }
+    }
+
+    /// (W5-g, H1) Recursively: does `ty` CONTAIN a move-only handle anywhere —
+    /// bare, or nested inside a container / `Optional` / tuple / `Callable` /
+    /// generic-class arg? Returns the first handle KIND found (for the diagnostic),
+    /// or `None`. The single recursive predicate shared by the type-resolution gate
+    /// (`from_type_expr_scoped`), the module-global guards, the class-field gate,
+    /// and the generic-unification gate — so "does this type smuggle a handle into
+    /// a position a move-only value cannot survive?" lives in exactly one place. A
+    /// handle is non-`Clone`, so it cannot be stored in / wrapped by / aggregated
+    /// into any of these (v1 move-only); each such shape is an honest resolution- or
+    /// check-time error instead of a leaked rustc E0277/E0599.
+    pub fn contains_handle(ty: &Ty) -> Option<&str> {
+        match ty {
+            Ty::Handle(n) => Some(n.as_str()),
+            Ty::List(e) | Ty::Set(e) | Ty::Iterator(e) | Ty::Option(e) => Ty::contains_handle(e),
+            Ty::Dict(k, v) => Ty::contains_handle(k).or_else(|| Ty::contains_handle(v)),
+            Ty::Tuple(ts) => ts.iter().find_map(|t| Ty::contains_handle(t)),
+            Ty::Func(args, ret) => args.iter().find_map(|t| Ty::contains_handle(t))
+                .or_else(|| Ty::contains_handle(ret)),
+            Ty::Class(_, args) => args.iter().find_map(|t| Ty::contains_handle(t)),
+            _ => None,
+        }
+    }
+
     /// Generics v1: like [`from_type_expr`], but a bare type NAME that matches one
     /// of `type_params` lowers to `Ty::TypeVar(name)` instead of `Ty::Class(name, _)`.
     /// `type_params` is the enclosing generic function's declared type-variable
@@ -139,6 +190,39 @@ impl Ty {
     /// `Callable[[T], T]` all resolve their type-var components. A name NOT in
     /// `type_params` is unaffected (stays a builtin / `Ty::Class`).
     pub fn from_type_expr_scoped(t: &TypeExpr, span: Span, type_params: &[String]) -> Result<Ty> {
+        let ty = Ty::from_type_expr_scoped_inner(t, span, type_params)?;
+        // (W5-g, H1) TYPE-POSITION GATE: a move-only handle may appear ONLY as a
+        // bare, top-level type (a `file` parameter / return / local binding). Nested
+        // inside a container / `Optional` / tuple / `Callable` / generic-class arg it
+        // is non-clonable and cannot be stored, wrapped, or aggregated (v1 handles
+        // are move-only), so it is an honest RESOLUTION-time error — closing H1:
+        // `xs: list[file]`, `Optional[file]`, `tuple[file, int]`, `Callable[[file],..]`
+        // all previously check-PASSED (the literal-site gates never covered
+        // annotations) and then died at rustc. A bare `Ty::Handle` result is fine.
+        // (A `Mut[file]` PARAM is peeled to bare `file` by the parser before it
+        // reaches here, so by-reference handle lending is unaffected.)
+        if !matches!(ty, Ty::Handle(_)) {
+            if let Some(kind) = Ty::contains_handle(&ty) {
+                return Err(Error::Type {
+                    span,
+                    msg: format!(
+                        "a `{kind}` handle cannot appear inside a container, `Optional`, \
+                         tuple, `Callable`, or generic type — a move-only handle is \
+                         non-clonable, so it cannot be stored, wrapped, or aggregated (v1 \
+                         handles are move-only); use a bare `{kind}` binding and pass it by \
+                         move, or lend it with `Mut[{kind}]`",
+                    ),
+                });
+            }
+        }
+        Ok(ty)
+    }
+
+    /// (W5-g) The recursion behind [`from_type_expr_scoped`]; the public wrapper adds
+    /// the H1 nested-handle gate on top of this. Recursive element calls inside the
+    /// body go through the WRAPPER (`Ty::from_type_expr_scoped`), so a handle nested
+    /// at any depth is caught at its enclosing container — never this inner directly.
+    fn from_type_expr_scoped_inner(t: &TypeExpr, span: Span, type_params: &[String]) -> Result<Ty> {
         Ok(match t {
             TypeExpr::None_ => Ty::Unit,
             TypeExpr::Named(n) => {
@@ -164,6 +248,14 @@ impl Ty {
                             msg: "`bytearray` is not yet supported (only immutable `bytes`); \
                                   this is a documented deferral".to_string(),
                         }),
+                        // (W5-g) `file` names the built-in file HANDLE kind, so a
+                        // signature `def f(fh: file)` / `-> file` resolves to the real
+                        // `Ty::Handle("file")` instead of the phantom `Class("file")`
+                        // that passed `check` and then failed `rustc` with "expected
+                        // file, found file" (probe PF-B). Lib-declared handle names
+                        // (re.Pattern, ...) become nameable via the `@extern class`
+                        // decl form in W5-h; `file` is the built-in that funds the kind.
+                        "file" => Ty::Handle("file".to_string()),
                         other => Ty::Class(other.to_string(), vec![]),
                     }
                 }
@@ -547,7 +639,7 @@ impl TyCtx {
         funcs.insert("round".into(), FuncSig { params: vec![("x".into(), Ty::Unknown)], ret: Ty::Int, param_defaults: vec![], param_by_ref: vec![] });
         // open(path) / open(path, mode) -> file handle. Arity is not checked
         // (added to the variadic skip list) so the optional mode arg works.
-        funcs.insert("open".into(), FuncSig { params: vec![("path".into(), Ty::Str), ("mode".into(), Ty::Str)], ret: Ty::File, param_defaults: vec![], param_by_ref: vec![] });
+        funcs.insert("open".into(), FuncSig { params: vec![("path".into(), Ty::Str), ("mode".into(), Ty::Str)], ret: Ty::Handle("file".into()), param_defaults: vec![], param_by_ref: vec![] });
         funcs.insert("pow".into(), FuncSig { params: vec![("base".into(), Ty::Unknown), ("exp".into(), Ty::Unknown)], ret: Ty::Int, param_defaults: vec![], param_by_ref: vec![] });
         funcs.insert("chr".into(), FuncSig { params: vec![("x".into(), Ty::Int)], ret: Ty::Str, param_defaults: vec![], param_by_ref: vec![] });
         funcs.insert("ord".into(), FuncSig { params: vec![("x".into(), Ty::Str)], ret: Ty::Int, param_defaults: vec![], param_by_ref: vec![] });

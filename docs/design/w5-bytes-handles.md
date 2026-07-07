@@ -208,6 +208,22 @@ impl Drop for Hasher { fn drop(&mut self) { /* release */ } }   // RAII close
   (rust-probe 2A: double-close panics honestly). **Double-close honesty is a `closed`
   flag, not UB.**
 
+  > **AS-BUILT SUPERSESSION (W5-g, C8 — LEAD DECISION, 2026-07-07).** The
+  > strict-double-close rule above (a *second* `close()` raises) is **superseded**: the
+  > lead ratified **CPython-faithful IDEMPOTENT `close()`** — a 2nd `close()` is a silent
+  > no-op, oracled against python3 3.12.9. The `closed` flag (`inner: Option<File>`, `None`
+  > == closed) is **retained**, and a **read/write AFTER close** is still an honest,
+  > catchable `ValueError` with CPython's exact message `"I/O operation on closed file."`.
+  > Rationale: the double-close divergence was the *only* file-handle behavior that
+  > diverged from CPython, blocking a dual-run parity golden; idempotency removes it with
+  > no loss of safety (the still-loud read/write-after-close is what actually catches the
+  > bug of using a dead handle). Built in `FILE_PRELUDE::close`; dual-run proof in
+  > `examples/parity_handle_close.pyrs` (which replaces the former pyrst-only
+  > `examples/handle_close_errors.pyrs`). The §E-7 wildcard row and every "double-close =
+  > `ValueError`" mention elsewhere in this doc are read through this note. NOTE: this
+  > applies to the built-in **`file`** handle; a *lib-declared* handle (W5-h) MAY still
+  > choose a strict `closed`-flag close where that matches its resource's real semantics.
+
 **The lib decl form.** A handle type + its methods are declared in `lib/*.pyrs` via a
 new **`@extern class`** form (the natural extension of the existing `@extern def` +
 `@crate`): the class body holds `@extern`-templated methods (Rust expression/stmt

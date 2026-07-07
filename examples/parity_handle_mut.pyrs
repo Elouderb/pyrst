@@ -1,0 +1,36 @@
+# parity: dual-run vs python3 3.12 — a `Mut[file]` BY-REFERENCE handle parameter
+# (W5-g, H6). A handle passed to a `Mut[T]` parameter is LENT, not consumed:
+# codegen passes `&mut <place>`, so the caller's handle stays LIVE after the call
+# and can be passed again, mutated directly, and closed. This is the fix for the
+# H6 over-reject — the move-checker used to mark EVERY call argument moved, falsely
+# rejecting a `Mut[file]` helper that codegen actually compiles as a borrow.
+#
+# Dual-run: with `from __future__ import annotations` the `Mut[file]` annotation is
+# stringized and never evaluated by CPython, and passing a file object to a
+# function that writes through it mutates the SAME object (Python is by-reference),
+# so the observable stdout is byte-identical under both `pyrst` and `python3`.
+
+def append_line(f: Mut[file], s: str) -> None:
+    # Mutating METHOD CALLS through the by-reference handle. `f.write(...)` borrows
+    # `&mut self`; the handle is neither moved nor cloned here.
+    f.write(s)
+
+
+def main() -> None:
+    path: str = "/tmp/pyrst_w5g_mut.txt"
+
+    f = open(path, "w")
+    # `f` is LENT to a Mut[file] parameter TWICE — each call is a borrow, so `f`
+    # remains live for the caller (no use-after-move).
+    append_line(f, "one\n")
+    append_line(f, "two\n")
+    # ...and is still usable DIRECTLY after the by-reference calls, then closed.
+    f.write("three\n")
+    f.close()
+
+    with open(path) as g:
+        text: str = g.read()
+        print(len(text))
+        print(text.count("\n"))
+        print(text.startswith("one"))
+        print("three" in text)

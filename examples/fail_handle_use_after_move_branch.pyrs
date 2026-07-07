@@ -1,0 +1,13 @@
+# HONEST REJECTION (W5-g, G1): a handle moved in only ONE branch of an `if` is
+# POSSIBLY-MOVED after the join. The move checker is conservative — possibly-moved
+# is treated as moved — so a use after the `if` is an honest CHECK error, never a
+# rustc E0382 on the hoisted join slot. (To use the handle after, move it on EVERY
+# path, or restructure so the use is inside the branch that still owns it.)
+def sink(fh: file) -> None:
+    fh.close()
+
+def main() -> None:
+    f = open("/tmp/pyrst_w5g_fail.txt", "w")
+    if len("x") > 0:
+        sink(f)
+    f.write("after the if — possibly moved\n")

@@ -36,6 +36,7 @@ This document clarifies which Python features are supported, partially supported
 | `set[T]` | ✅ Supported | `HashSet<T>` | Literals, comprehensions, membership, iteration — but **not** the mutation/algebra methods (see Set Methods) |
 | `frozenset` | ❌ Not Supported | N/A | No immutable set |
 | `bytes` | ✅ Supported | `Vec<u8>` | Immutable byte strings — literals, index→`int`, slice→`bytes`, iteration→`int`s, `+`/`*`/comparisons, `bytes()`/`bytes(n)`/`bytes(list[int])` constructors, CPython-exact `b'...'` repr. (W5-b) BYTE-offset methods: `hex`/`fromhex`, utf-8 `encode`/`decode` (strict, catchable `UnicodeDecodeError`), `find`/`rfind`/`index`/`rindex`/`count`, `startswith`/`endswith`, `replace`/`split`/`rsplit`/`join`/`strip`/`lstrip`/`rstrip`, `upper`/`lower` (ASCII-only), `ljust`/`rjust`/`center`/`zfill`, `isdigit`/`isalpha`/`isalnum`/`isspace`; membership `int in b` / `bytes in b`. Non-utf8 codecs, method `maxsplit`/`count`/start-end params, and `bytearray` are deferred — see **The `bytes` type** below. |
+| `file` (handle) | ✅ Supported | opaque `PyFile` (non-`Clone`) | (W5-g) The `open()` result is a move-only **opaque handle** (`Ty::Handle`): nameable in signatures (`def f(fh: file) -> file`), `read`/`readlines`/`write`/`close`, and the `with` context manager (RAII close). **MOVE-ONLY**, diverging from Python's reference semantics *honestly* (a compile error, never silent-wrong): `g = f` / passing / returning a handle MOVES it, and reusing the source is a use-after-move `check` error. A handle has no display/repr, equality, hashing, or container storage (each an honest error). See **Opaque handles (`file`)** below. |
 
 ---
 
@@ -128,6 +129,67 @@ semantics unchanged.
   correction). A raw non-ASCII source byte in `b'...'` is a `SyntaxError` in both.
   **Triple-quoted bytes** (`b'''...'''`) and **raw-bytes prefixes** (`rb'...'` /
   `br'...'`, any case) are deferred — both honest lexer errors, never miscompiles.
+
+---
+
+## Opaque handles (`file`)
+
+(W5-g, G1) An **opaque handle** is a non-user-constructible foreign resource
+produced by a library/built-in constructor. `open()` returns the first one, the
+`file` handle (Rust `PyFile`); `re.Pattern`/`subprocess` join later. A handle is a
+**reference** to an external resource, *not* a value — so, unlike every other
+pyrst type, it does **not** ride clone-on-use.
+
+### What works
+
+- **Nameable in signatures.** `def f(fh: file) -> file:` type-checks and lowers
+  cleanly (closing the old phantom-`Class("file")` "expected file, found file"
+  hole). The surface name is `file`.
+- **`&mut self` methods.** `read` / `readlines` / `write` / `close` mutate through
+  the receiver with no clone-on-read. Repeated method calls on one handle are fine
+  (a method call *borrows*; it does not consume).
+- **The `with` context manager.** `with open(...) as f:` closes via RAII `Drop` at
+  block end, unchanged through the migration.
+- **`close()` + a `closed` flag.** An explicit `close()` releases the OS handle
+  immediately; `Drop` after an explicit close is a no-op (no double-free).
+
+### Honest divergences (compile/runtime errors, never miscompiles)
+
+- **MOVE-ONLY (v1).** Python files are *references* — you can pass a file and keep
+  using it. pyrst v1 handles **move**: `g = f`, passing a handle to a function, or
+  `return f` all **consume** it, and reusing the source binding is an honest
+  **use-after-move** `check` error naming the moved binding and the move site.
+  (This is what fixed probe PF-A: `g = f` used to emit `f.clone()` and die at rustc
+  E0599 while `check` passed.) The move checker is **conservative**: a handle moved
+  in one branch of an `if` is *possibly-moved* (treated as moved) after the join;
+  moving a handle that was live **before** a loop, from inside the loop body, is
+  rejected up front (it would be a 2nd-iteration use-after-move). The aliasing,
+  Python-faithful `Rc<RefCell>` **reference-handle is the analyzed v2**, deferred
+  until `sqlite3`'s connection↔cursor sharing funds it.
+- **No display/repr, equality, ordering, hashing, or container storage.** A handle
+  is opaque: `print(f)` / `str`/`repr` / an f-string, `f == g` (or any operator),
+  using a handle as a `dict`/`set` key, and storing a handle in a
+  `list`/`set`/`dict`/`tuple` are each an **honest `check` error** naming the kind
+  (never a rustc `Display`/`PartialEq`/`Clone` wall). Handle-in-container is a
+  documented v1 deferral (it needs the v2 reference-handle).
+- **Not a module global.** A module-level `f: file = open(...)` is rejected: a
+  global read lowers to W4's clone-on-read path, which a non-`Clone` handle cannot
+  satisfy. Open the handle inside the function that uses it (you mutate an external
+  resource in place, you never snapshot it as a global).
+- **Use-after-close raises (catchable).** Reading/writing a closed file raises
+  `ValueError: I/O operation on closed file.` — **byte-identical to CPython**
+  (this closes a real hole: the old no-op `close()` let a read-after-close silently
+  succeed). Catchable via `except ValueError`.
+- **Double-close is idempotent — CPython-faithful.** A second `close()` is a silent
+  no-op, exactly like CPython (oracled vs python3 3.12.9). *(W5-g, C8 — lead
+  decision: this supersedes the earlier stricter-than-CPython behavior, where a 2nd
+  `close()` raised; the closed-flag is retained purely for the read/write-after-close
+  error above, which remains loud and CPython-exact. The whole `file` runtime is now
+  dual-run parity-clean — see `examples/parity_handle_close.pyrs`.)*
+- **A `with`-bound handle does not outlive the block.** `with open(...) as f:`
+  scopes `f` to the block (RAII close at the end); using `f` after the `with` is an
+  undefined-name error — a divergence from CPython (where `f` exists-but-closed
+  afterward), honest rather than silent.
 
 ---
 

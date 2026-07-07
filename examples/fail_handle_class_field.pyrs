@@ -1,0 +1,12 @@
+# HONEST REJECTION (W5-g, H5 — handle-typed class field): a move-only handle cannot
+# be a class / dataclass FIELD. A handle is an external resource — non-`Clone` and
+# with no `Default` — so a `file` field breaks the struct's value semantics
+# (clone-on-assign, synthesized `__repr__`, `Default` construction) and died at
+# rustc. It used to check-PASS via the `type_is_reprable` catch-all. The class
+# prelude now rejects a handle-typed field at CHECK. Open the handle in the method
+# that uses it, or pass it in by move / `Mut[file]`.
+class LogWriter:
+    fh: file
+
+def main() -> None:
+    print("unreached")

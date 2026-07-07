@@ -6,8 +6,8 @@
 # unmodified run raises `AttributeError: 'Fraction' object has no attribute
 # 'div'`) — the shared, dual-run-safe surface lives in
 # examples/parity_fractions.pyrs, mirroring the `random` module's
-# `parity_random.pyrs` / `random_freefns.pyrs` split for the same kind of
-# pyrst-only call shape.
+# `parity_random.pyrs` / `stdlib_random.pyrs` split (a dual-run golden plus a
+# separate pyrst-only-divergence golden).
 #
 # Every value and error message pinned here was ORACLE-VERIFIED against real
 # CPython 3.12 using the equivalent `/` spelling during authoring (e.g.

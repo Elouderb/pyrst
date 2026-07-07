@@ -14,7 +14,7 @@
 #   - `getrandbits(k)`: the TOP k bits (`genrand() >> (32 - k)`), multi-word
 #     little-endian for k > 32 (CPython `random_getrandbits`);
 #   - `_randbelow(n)`: `getrandbits(bit_length(n))` rejection sampling;
-#   - `randint`/`randrange`/`choice`/`shuffle`/`sample`/`choices`/`uniform`/
+#   - `randint`/`randrange`/`choice`/`sample`/`choices`/`uniform`/
 #     `gauss`/`normalvariate`/`triangular`/`gammavariate`/`betavariate` built
 #     exactly on those primitives with CPython's formulas.
 #
@@ -33,28 +33,58 @@
 #     negative, and pyrst's Python-style `%` folds it back into [0, 2^32).)
 #   - getrandbits k>32: lo + hi * 2^32 with hi < 2^(k-32), k <= 62 → < 2^62 ✓
 #
-# WHY A CLASS (not module functions): pyrst has NO mutable module-level state,
-# so the generator state (the 624-word `mt` vector + index) lives in an
-# instance. The module-level convenience API (`random.random()`,
-# `random.randint(...)` backed by a hidden global generator) is DEFERRED until
-# pyrst grows mutable globals (G2 — docs/design/stdlib-full.md §D "random").
-# Construct a `Random(seed)` explicitly instead. `Random()` with NO seed
-# (CPython: OS entropy / time) is likewise unavailable — pyrst has no entropy
-# source binding; pass a seed.
+# WHY A CLASS + a MODULE-LEVEL LAYER: the generator STATE (the 624-word `mt`
+# vector + the extraction index) lives in a `Random` INSTANCE. On top of it,
+# pyrst ships CPython's module-level convenience API (W4-c) — bare
+# `random.random()`, `random.choice(xs)`, ... backed by a HIDDEN module-global
+# generator `_inst = Random(0)` (mutable module globals landed in W4-a). This is
+# structurally what CPython's `random` module IS: a hidden global generator plus
+# bare functions delegating to it. See the "MODULE-LEVEL CONVENIENCE API"
+# section at the BOTTOM of this file.
+#   - SCALAR draws — `seed random randint randrange uniform getrandbits` — and
+#     GENERIC draws — `choice sample choices` — are ALL available module-level and
+#     CPython-BYTE-IDENTICAL after `seed(n)`, INTERLEAVED draws included (one
+#     shared hidden generator advances across every call, exactly like CPython):
+#     examples/parity_random_moduleapi.pyrs (scalar) and
+#     examples/parity_random_moduleapi_draws.pyrs (generic + interleaving) dual-run
+#     them vs python3. Each state-advancing one uses the clone-out / mutate-local /
+#     rebind-back idiom (see that section's note) — a naive `return _inst.random()`
+#     would advance a CLONE and discard it (value semantics), returning the SAME
+#     number forever.
+#   - `random.shuffle(xs)` is the ONE module draw NOT offered: CPython's shuffle
+#     mutates the caller's list IN PLACE and returns None, which pyrst value
+#     semantics cannot express across a module boundary (a callee cannot mutate the
+#     caller's list until EPIC-4 `Mut[T]`). Rather than ship a module `shuffle`
+#     that silently diverges from that in-place contract, pyrst does NOT define one:
+#     `random.shuffle(xs)` is an HONEST typeck error ("module `random` has no
+#     function `shuffle`"). For a shuffled COPY use the CPython-official idiom
+#     `random.sample(xs, len(xs))` — a NEW shuffled list, original untouched (NOT a
+#     claim that it reproduces shuffle's specific permutation/consumption; simply a
+#     faithful shuffled-copy). See the negative examples/random_shuffle_fail.pyrs.
+#   - PER-INSTANCE generic draws (`Random(seed).choice(xs)` etc.) are DEFERRED:
+#     pyrst gates generic METHODS inside a class (only free functions carry type
+#     parameters), so a generic `.choice` METHOD is not expressible — `r.choice(xs)`
+#     is the honest error "class `Random` has no attribute `choice`". Seed the
+#     module generator and use the module draws instead.
+#   - DETERMINISM divergence (documented, HONEST): CPython seeds its module
+#     generator from OS ENTROPY at import, so an UNSEEDED CPython `random.random()`
+#     differs every run. pyrst has no entropy source: the module generator is a
+#     FIXED default `Random(0)`, so the UNSEEDED pyrst module API is DETERMINISTIC
+#     across runs. Call `random.seed(n)` FIRST for a chosen stream — seeded module
+#     sequences are then byte-identical to CPython. (Any parity golden `seed(N)`s
+#     first.) `Random()` with NO seed is likewise unavailable — pass a seed.
 #
 # `randbytes` is DEFERRED: pyrst has no `bytes` type (G7).
 #
-# Generic draws (`choice`, `shuffle`, `sample`, `choices`) are FREE FUNCTIONS,
-# not methods: pyrst gates generic METHODS inside a class (only free functions
-# may carry type parameters), and a class instance is passed by VALUE unless
-# declared `Mut[...]`. So they take `rng: Mut[Random]` to (a) carry the generic
-# element type `T` and (b) advance the CALLER's generator state in place. They
-# implement CPython's exact algorithms on `_randbelow`/`random`, so their
-# outputs match CPython's METHOD forms (`rng.choice(xs)` etc.) draw for draw —
-# python3-verified; the call SHAPE (`choice(rng, xs)` vs `rng.choice(xs)`) is
-# the one documented divergence, so their coverage lives in the pyrst-side
-# golden examples/stdlib_random.pyrs (values oracle-pinned), while the shared
-# method surface is dual-run in examples/parity_random.pyrs.
+# The module-level generic draws (`choice`, `sample`, `choices`) implement
+# CPython's exact algorithms on `_randbelow`/`random`, carrying the generic
+# element type `T` as free functions (pyrst gates generic METHODS inside a class,
+# so these cannot be `Random` methods — hence no per-instance `r.choice(xs)`).
+# They delegate to the hidden `_inst` via the clone-out / mutate-local /
+# rebind-back idiom, so a seeded module stream is CPython-identical draw-for-draw
+# AND advances in lock-step with the scalar draws on the same shared generator —
+# dual-run vs python3 in examples/parity_random_moduleapi_draws.pyrs. The shared
+# `Random` METHOD surface is dual-run in examples/parity_random.pyrs.
 #
 # Public API:
 #   class Random(seed):
@@ -87,17 +117,33 @@
 #                                 (Kinderman-Monahan, no cache)
 #     - gammavariate(alpha, beta) -> float            CPython-identical
 #     - betavariate(alpha, beta) -> float             CPython-identical
-#   free functions (CPython algorithms; call shape `f(rng, ...)` — see above):
-#     - choice(rng, xs)             -> T
-#     - shuffle(rng, xs)            -> None  (in-place Fisher-Yates)
-#     - sample(rng, population, k)  -> list[T]  (CPython's dual-branch
-#                                      algorithm: pool-swap for small n,
-#                                      selection-set for large n, with the
-#                                      exact `setsize` cutoff formula)
-#     - choices(rng, population, weights=None, k=1) -> list[T]  (CPython's
-#                                      floor(random()*n) uniform form and the
-#                                      cumulative-weights form; `cum_weights=`
-#                                      is not offered — pass `weights`)
+#   module-level convenience API (W4-c; over a hidden global `_inst=Random(0)` —
+#   CPython-byte-identical AFTER `random.seed(n)`, INTERLEAVED draws included;
+#   unseeded is a fixed, deterministic `Random(0)`, see the header divergence
+#   note):
+#     - seed(n)                -> None   re-home the hidden generator (= Random(n))
+#     - random()               -> float in [0, 1)
+#     - randint(a, b)          -> int in [a, b]
+#     - randrange(n)           -> int in [0, n)   (1-arg form)
+#     - uniform(a, b)          -> float
+#     - getrandbits(k)         -> int, k in [0, 62]
+#     - choice(xs)             -> T        one uniform pick (empty -> IndexError)
+#     - sample(population, k)  -> list[T]  k DISTINCT picks; CPython's dual-branch
+#                                 algorithm (pool-swap for small n, selection-set
+#                                 for large n) with the exact `setsize` cutoff
+#     - choices(population, weights=None, k=1) -> list[T]  k picks WITH replacement;
+#                                 CPython's floor(random()*n) uniform form and the
+#                                 cumulative-weights form. ADVISORY: CPython 3.12
+#                                 makes `k` KEYWORD-ONLY, but pyrst does NOT yet
+#                                 enforce keyword-only parameters (a tracked
+#                                 language item), so it ACCEPTS a positional `k`
+#                                 here — a call CPython would reject. Pass `k` BY
+#                                 KEYWORD for CPython compatibility. `cum_weights=`
+#                                 not offered — pass `weights`.
+#   (`random.shuffle` is NOT offered — CPython's in-place contract is inexpressible
+#   under value semantics; it is an honest typeck error. For a shuffled copy use
+#   `random.sample(xs, len(xs))`. Per-instance generic draws `Random(s).choice(xs)`
+#   are deferred — generic methods are gated; use the module draws.)
 #
 # *** REMAINING COMPILER LIMITATION (narrowed by kwargs v1) ***
 # Methods now support call-site default fill and keyword arguments (kwargs v1,
@@ -108,7 +154,16 @@
 # `None`-defaulted signatures and stay REQUIRED / unoffered respectively.
 #
 # Deferred (documented, not silently dropped):
-#   - module-level `random.random()`/`random.randint(...)` convenience API: G2.
+#   - `random.shuffle(xs)`: CPython mutates the caller's list IN PLACE and returns
+#     None — inexpressible under pyrst value semantics across a module boundary
+#     (EPIC-4 `Mut[T]` territory). NOT defined: `random.shuffle(...)` is an honest
+#     typeck error. Shuffled COPY: `random.sample(xs, len(xs))` (a NEW list; not a
+#     shuffle-sequence-equivalence claim). PER-INSTANCE generic draws
+#     (`Random(s).choice(xs)`/`.sample`/`.choices`) are likewise deferred — generic
+#     METHODS are gated (only free functions carry type params). The full
+#     module-level generic surface `random.choice/sample/choices` DID land in W4-c
+#     (this reshape) — no longer a pyrst-only `f(rng, xs)` free-fn wart, and the
+#     SCALAR module API is no longer G2-deferred either.
 #   - `randbytes`: G7 (no `bytes` type).
 #   - `getstate`/`setstate`: no tuple-of-625 state surface; re-seed with
 #     `seed(n)` instead.
@@ -462,68 +517,158 @@ def _random_cos(x: float) -> float:
     "({x}).cos()"
 
 
-def choice[T](rng: Mut[Random], xs: list[T]) -> T:
-    # CPython Random.choice: guard the empty sequence (python3-verified
-    # message), then one _randbelow index draw.
+# ── MODULE-LEVEL CONVENIENCE API (W4-c) ──────────────────────────────────────
+# CPython's `random` module IS exactly this: a hidden module-global generator
+# plus bare functions (`random.random()`, `random.choice(xs)`, …) that delegate
+# to it. pyrst reproduces both the SCALAR and the GENERIC (`choice`/`sample`/
+# `choices`) surface over `_inst` (mutable module globals landed in W4-a);
+# `random.shuffle` is the one honest omission (in-place mutation vs value
+# semantics). See the header for the shuffle and determinism divergences.
+#
+# THE STATE-ADVANCE IDIOM (load-bearing — a naive form SILENTLY MISCOMPILES).
+# pyrst reads of a module global CLONE it (uniform value semantics). So a naive
+# `def random() -> float: return _inst.random()` advances a CLONE's MT19937
+# state and DISCARDS it — every call returns the SAME number, a divergence
+# CPython can never produce. The owning module MAY rebind its OWN global under
+# `global`, so every state-advancing function uses clone-out / mutate-local /
+# rebind-back, which advances the state EXACTLY once per call and persists it:
+#     tmp = _inst          # read → clone the generator OUT of the global
+#     v = tmp.<draw>()     # mutate the LOCAL clone (advances MT19937 once)
+#     _inst = tmp          # rebind → persist the advanced state back
+# Seeded module sequences are thereby byte-identical to CPython (the W1.5
+# MT19937 work makes `Random(n)` seed-exact) — proven in
+# examples/parity_random_moduleapi.pyrs.
+#
+# `_inst` is module-PRIVATE by convention (leading underscore). W3 per-module
+# namespacing mangles it to a random-owned static, so a user's own `_inst` in
+# another module cannot collide with, shadow, or (cross-module writes are a W4
+# honest error) rebind it. `_inst = Random(0)` is a NON-literal initializer, so
+# W4-a auto-promotes it to a `thread_local!` RefCell static, initialized eagerly
+# at startup in `__pyrst_init_globals()`.
+_inst: Random = Random(0)
+
+
+def seed(n: int) -> None:
+    # CPython `random.seed(n)` for an int seed is sequence-EQUIVALENT to
+    # `Random(n)` over the shared surface (python3-verified), so re-home the
+    # hidden generator on a fresh `Random(n)`. A plain owner-module rebind.
+    global _inst
+    _inst = Random(n)
+
+
+def random() -> float:
+    # CPython `random.random()` — a 53-bit float in [0, 1). clone/mutate/rebind.
+    global _inst
+    tmp: Random = _inst
+    v: float = tmp.random()
+    _inst = tmp
+    return v
+
+
+def randint(a: int, b: int) -> int:
+    # CPython `random.randint(a, b)` — inclusive both ends. clone/mutate/rebind.
+    global _inst
+    tmp: Random = _inst
+    v: int = tmp.randint(a, b)
+    _inst = tmp
+    return v
+
+
+def randrange(n: int) -> int:
+    # CPython `random.randrange(stop)` (1-arg form) — an int in [0, n). The
+    # (start, stop, step) forms are not offered (see the Random.randrange note).
+    global _inst
+    tmp: Random = _inst
+    v: int = tmp.randrange(n)
+    _inst = tmp
+    return v
+
+
+def uniform(a: float, b: float) -> float:
+    # CPython `random.uniform(a, b)` — a float in [a, b] (order a > b allowed).
+    global _inst
+    tmp: Random = _inst
+    v: float = tmp.uniform(a, b)
+    _inst = tmp
+    return v
+
+
+def getrandbits(k: int) -> int:
+    # CPython `random.getrandbits(k)` — the top k bits; k in [0, 62] (pyrst i64
+    # cap, see Random.getrandbits). k == 0 returns 0 without drawing.
+    global _inst
+    tmp: Random = _inst
+    v: int = tmp.getrandbits(k)
+    _inst = tmp
+    return v
+
+
+def choice[T](xs: list[T]) -> T:
+    # CPython `random.choice(xs)` over the hidden module generator. Guard the
+    # empty sequence FIRST (python3-verified message) — like CPython, the empty
+    # error does NOT draw. clone/mutate/rebind (see the idiom note above).
+    global _inst
     if len(xs) == 0:
         raise IndexError("Cannot choose from an empty sequence")
-    idx: int = rng._randbelow(len(xs))
+    tmp: Random = _inst
+    idx: int = tmp._randbelow(len(xs))
+    _inst = tmp
     return xs[idx]
 
 
-def shuffle[T](rng: Mut[Random], xs: Mut[list[T]]) -> None:
-    # CPython Random.shuffle: Fisher–Yates from the top, j = _randbelow(i + 1).
-    i: int = len(xs) - 1
-    while i > 0:
-        j: int = rng._randbelow(i + 1)
-        tmp: T = xs[i]
-        xs[i] = xs[j]
-        xs[j] = tmp
-        i = i - 1
-
-
-def sample[T](rng: Mut[Random], population: list[T], k: int) -> list[T]:
-    # CPython Random.sample: k DISTINCT elements without replacement, using
-    # CPython's exact dual-branch algorithm — pool-swap when the population is
-    # small relative to the setsize cutoff, selection-set otherwise — so the
-    # draw sequence matches CPython on BOTH branches.
+def sample[T](population: list[T], k: int) -> list[T]:
+    # CPython `random.sample(population, k)` — k DISTINCT elements without
+    # replacement, over the hidden module generator, using CPython's exact
+    # dual-branch algorithm (pool-swap when n <= setsize, selection-set
+    # otherwise) so the seeded draw sequence matches CPython on BOTH branches.
+    # The size guard precedes any draw (CPython does not advance on that error).
+    # clone/mutate/rebind.
+    global _inst
     n: int = len(population)
     if k < 0 or k > n:
         raise ValueError("Sample larger than population or is negative")
     setsize: int = 21
     if k > 5:
         setsize = setsize + _random_pow4_ceil_log(k * 3)
+    tmp: Random = _inst
+    result: list[T] = []
     if n <= setsize:
         pool: list[T] = list(population)
-        result: list[T] = []
         i: int = 0
         while i < k:
-            j: int = rng._randbelow(n - i)
+            j: int = tmp._randbelow(n - i)
             result.append(pool[j])
             pool[j] = pool[n - i - 1]
             i = i + 1
+        _inst = tmp
         return result
     selected: set[int] = set()
-    result2: list[T] = []
     i2: int = 0
     while i2 < k:
-        j2: int = rng._randbelow(n)
+        j2: int = tmp._randbelow(n)
         while j2 in selected:
-            j2 = rng._randbelow(n)
+            j2 = tmp._randbelow(n)
         selected.add(j2)
-        result2.append(population[j2])
+        result.append(population[j2])
         i2 = i2 + 1
-    return result2
+    _inst = tmp
+    return result
 
 
-def choices[T](rng: Mut[Random], population: list[T], weights: list[float] | None = None, k: int = 1) -> list[T]:
-    # CPython Random.choices: k elements WITH replacement. Uniform form:
-    # population[floor(random() * n)] per draw (NOT _randbelow — CPython uses
-    # the float construction here, and the draw sequences differ). Weighted
-    # form: cumulative weights, target = random() * total, first index whose
-    # cumulative weight exceeds the target (bisect_right capped at n - 1).
-    # Validation order mirrors CPython: weights length, then the empty
-    # cum_weights[-1] IndexError, then the non-positive total.
+def choices[T](population: list[T], weights: list[float] | None = None, k: int = 1) -> list[T]:
+    # CPython `random.choices(population, weights=None, k=1)` — k elements WITH
+    # replacement, over the hidden module generator. Uniform form: floor(random()
+    # * n); weighted form: cumulative weights + bisect_right. WEIGHTED-branch
+    # validation (weights length, empty cum_weights IndexError, non-positive
+    # total) precedes any draw, like CPython; the UNIFORM branch with an EMPTY
+    # population draws random() ONCE then raises IndexError (CPython advances on
+    # that failing call — the loop persists that one advance BEFORE the index
+    # error, see the `if n == 0` note below).
+    # ADVISORY: `k` is keyword-only under CPython 3.12, but pyrst does NOT yet
+    # enforce keyword-only params (a tracked language item), so it accepts a
+    # positional `k` here — pass `k` by keyword for CPython compatibility.
+    # clone/mutate/rebind.
+    global _inst
     n: int = len(population)
     if weights is not None:
         ws: list[float] = weights
@@ -539,17 +684,12 @@ def choices[T](rng: Mut[Random], population: list[T], weights: list[float] | Non
         total: float = cum[len(cum) - 1] + 0.0
         if total <= 0.0:
             raise ValueError("Total of weights must be greater than zero")
+        tmp: Random = _inst
         result: list[T] = []
         hi: int = n - 1
         i: int = 0
         while i < k:
-            target: float = rng.random() * total
-            # (W1.5 fix F2) Inlined bisect_right(cum, target, 0, hi) — CPython's
-            # exact choices() index selection — replacing the O(n)-per-draw linear
-            # scan (population may be large). Same cumulative array, same random()
-            # draw per pick, same <=/< boundary (a target equal to a cumulative
-            # weight inserts to the RIGHT), same n-1 cap, so seeded sequences stay
-            # bit-identical to CPython.
+            target: float = tmp.random() * total
             lo: int = 0
             hj: int = hi
             mid: int = 0
@@ -561,12 +701,24 @@ def choices[T](rng: Mut[Random], population: list[T], weights: list[float] | Non
                     lo = mid + 1
             result.append(population[lo])
             i = i + 1
+        _inst = tmp
         return result
     nf: float = float(n)
+    tmp2: Random = _inst
     result2: list[T] = []
     i2: int = 0
     while i2 < k:
-        idx: int = int(rng.random() * nf)
+        idx: int = int(tmp2.random() * nf)
+        if n == 0:
+            # Empty population: CPython's uniform comprehension calls random()
+            # ONCE (the draw just above) and THEN raises IndexError indexing
+            # population[0]. Persist that single advance to the hidden generator
+            # BEFORE the index error, so a CAUGHT choices([], k>=1) leaves the
+            # shared stream exactly where CPython leaves it (no silent post-error
+            # divergence). k == 0 never enters this loop, so an empty population
+            # with k == 0 draws nothing and returns [] — matching CPython.
+            _inst = tmp2
         result2.append(population[idx])
         i2 = i2 + 1
+    _inst = tmp2
     return result2

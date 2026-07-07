@@ -1,0 +1,17 @@
+# random_shuffle_fail.pyrs — NEGATIVE: pyrst does NOT offer a module-level
+# `random.shuffle`. CPython's shuffle mutates the caller's list IN PLACE and
+# returns None, which pyrst value semantics cannot express across a module
+# boundary (EPIC-4 `Mut[T]` territory). Rather than ship a module `shuffle` that
+# silently diverges from that in-place contract, pyrst leaves it undefined — so
+# `random.shuffle(xs)` is an HONEST typeck error ("module `random` has no function
+# `shuffle`"), rejected at BOTH `pyrst check` and `pyrst build`. For a shuffled
+# COPY use `random.sample(xs, len(xs))` (see examples/parity_random_moduleapi_draws
+# and lib/random.pyrs).
+import random
+
+
+def main() -> None:
+    xs: list[int] = [1, 2, 3, 4, 5]
+    random.seed(1)
+    random.shuffle(xs)
+    print(xs)

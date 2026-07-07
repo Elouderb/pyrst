@@ -41,7 +41,8 @@
 #     golden `examples/fractions_div.pyrs` (oracle-pinned expected output,
 #     python3-verified during authoring, not diffed against a live python3
 #     run) — mirroring the `random` module's `parity_random.pyrs` /
-#     `random_freefns.pyrs` split for the same kind of pyrst-only call shape.
+#     `stdlib_random.pyrs` split (a dual-run golden plus a separate
+#     pyrst-only-divergence golden).
 #
 # `limit_denominator()` IS included (unlike the dossier's own conservative
 # exclusion) because this module ports CPython's exact continued-fraction

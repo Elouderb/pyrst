@@ -11,12 +11,13 @@
 # byte-identical across the two runtimes — including SEEDED draw sequences,
 # which the old LCG could not match.
 #
-# Scope: the shared METHOD surface. The generic draws (`choice`, `shuffle`,
-# `sample`, `choices`) are FREE FUNCTIONS in pyrst (`choice(rng, xs)` — pyrst
-# classes cannot carry generic methods), so their CALL SHAPE cannot run under
-# python3 unmodified; they implement CPython's exact algorithms on the same
-# primitives (python3-verified draw-for-draw during development) and are
-# covered by the pinned golden examples/random_freefns.pyrs.
+# Scope: the shared METHOD surface (per-instance draws on a user `Random(seed)`).
+# The GENERIC draws (`choice`, `sample`, `choices`) are MODULE-LEVEL over a hidden
+# global generator (`random.choice(xs)` — CPython's shape; pyrst classes cannot
+# carry generic methods, so there is no per-instance `r.choice(xs)`), and are
+# dual-run vs python3 in examples/parity_random_moduleapi_draws.pyrs.
+# `random.shuffle` is honestly absent (in-place mutation vs value semantics — see
+# the negative examples/random_shuffle_fail.pyrs).
 #
 # Error-message parity is exercised via except-as bindings (`print(e)`), which
 # both runtimes render identically.

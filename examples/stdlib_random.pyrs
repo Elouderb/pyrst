@@ -1,53 +1,79 @@
-# Stdlib `random`: the embedded pure-pyrst SEEDABLE generator. Because pyrst has
-# no mutable module-level state, `random` is a `Random` CLASS holding the
-# generator state — since the W1.5 pass a full MERSENNE TWISTER (MT19937) with
-# CPython's exact derivation chain, so seeded sequences are BIT-IDENTICAL to
-# CPython's `random.Random` (see examples/parity_random.pyrs for the dual-run
-# proof). `random` is embedded (lib/random.pyrs -> include_str! ->
-# src/stdlib.rs); it was never in the resolver skip-list, so the import
-# resolves; no local `random.pyrs` next to this file.
+# stdlib_random.pyrs — PYRST-ONLY golden: the two `random` import forms coexisting
+# + the pyrst-ONLY getrandbits i64-cap divergence (which cannot dual-run).
+#
+# `random` is embedded (lib/random.pyrs -> include_str! -> src/stdlib.rs); it was
+# never in the resolver skip-list, so the import resolves; no local `random.pyrs`
+# next to this file.
 #
 # Exercises BOTH import forms:
-#   - FLAT `from random import Random` for construction — a qualified
-#     `random.Random(42)` constructor / `r: random.Random` annotation do NOT
-#     parse (only module FUNCTIONS resolve qualified, and a qualified type
-#     annotation is unsupported), exactly as `collections.deque` documents.
-#   - QUALIFIED `import random; random.choice(...)` / `random.shuffle(...)` for
-#     the free generic draws.
-# `choice[T]` / `shuffle[T]` are FREE generic functions taking `rng: Mut[Random]`
-# (generic METHODS inside a class are gated, and a class instance is passed by
-# value unless `Mut`), so they advance the SAME generator and stay reproducible.
+#   - FLAT `from random import Random` for construction + the per-instance METHOD
+#     surface — a qualified `random.Random(42)` constructor / `r: random.Random`
+#     annotation do NOT parse (only module FUNCTIONS resolve qualified, and a
+#     qualified type annotation is unsupported), exactly as `collections.deque`
+#     documents.
+#   - QUALIFIED `import random; random.seed(...)/random.choice(...)/...` for the
+#     module-level convenience API over the hidden global generator (W4-c). Note
+#     the GENERIC draws are module-level (`random.choice(xs)`), CPython's shape —
+#     there is no per-instance `r.choice(xs)` (generic methods are gated).
 #
-# DETERMINISTIC by construction: a fixed seed (42) makes the entire draw sequence
-# reproducible — that is the whole point. The golden pins MT19937's actual
-# output (oracle-checked: `Random(42).randint(1,6)` x5 -> [6, 1, 1, 6, 3] under
-# python3 too), in call order:
-#   five r.randint(1, 6)        — a dice roll sequence
-#   choice(r, ["rock","paper","scissors"])
-#   r.randrange(100)            — an int in [0, 100)
-#   r.random()                  — a float in [0, 1)
-#   r.uniform(10.0, 20.0)       — a float in [10, 20]
-# Then a SEPARATE Random(7) drives `shuffle([1,2,3,4,5])` -> [5, 1, 4, 2, 3]
-# (python3-identical), a visibly non-trivial Fisher–Yates permutation.
-# Re-running yields the IDENTICAL lines every time (no wall-clock / OS entropy).
+# WHY PYRST-ONLY (not a parity_ dual-run): the getrandbits(63) case below is a
+# DOCUMENTED pyrst divergence — pyrst int is i64, so getrandbits(k > 62) raises a
+# ValueError, whereas CPython returns an arbitrary-width bignum. That single line
+# cannot dual-run, so this golden is pinned against expected/. The CPython-faithful
+# surface it also exercises is dual-run in examples/parity_random_moduleapi*.pyrs.
+#
+# DETERMINISTIC by construction: fixed seeds make every draw reproducible; no
+# wall-clock / OS entropy is consulted.
 import random
 from random import Random
 
 
 def main() -> None:
+    # FLAT import: a user-constructed Random + its per-instance METHOD surface.
     r: Random = Random(42)
     print(r.randint(1, 6))
     print(r.randint(1, 6))
-    print(r.randint(1, 6))
-    print(r.randint(1, 6))
-    print(r.randint(1, 6))
-    print(random.choice(r, ["rock", "paper", "scissors"]))
     print(r.randrange(100))
     print(r.random())
     print(r.uniform(10.0, 20.0))
-    # A fresh generator for shuffle, seeded so the permutation is clearly
-    # non-identity (Random(42)'s state at this point happens to self-swap).
-    s: Random = Random(7)
-    deck: list[int] = [1, 2, 3, 4, 5]
-    random.shuffle(s, deck)
-    print(deck)
+
+    # QUALIFIED import: the module-level convenience API over the hidden global
+    # generator. seed(7) pins the shared stream; scalar + generic draws advance it.
+    random.seed(7)
+    print(random.choice(["rock", "paper", "scissors"]))
+    print(random.randint(1, 6))
+    print(random.sample([1, 2, 3, 4, 5], 3))
+    print(random.choices([1, 2, 3], [0.2, 0.5, 0.3], k=4))
+
+    # pyrst-ONLY divergence: getrandbits(k) is capped at k <= 62 (pyrst int is
+    # i64); CPython would return a bignum. Honest ValueError, python3-shaped.
+    try:
+        print(r.getrandbits(63))
+    except ValueError as e:
+        print(f"getrandbits(63) error: {e}")
+
+    # gammavariate domain guard (per-instance METHOD): alpha and beta must both
+    # be > 0.0 — CPython-identical ValueError. Restored here after the free-fn
+    # golden that used to carry it (random_freefns) was reshaped into the module
+    # API; the guard raises BEFORE any draw, so `r`'s state is untouched.
+    try:
+        print(r.gammavariate(0.0, 1.0))
+    except ValueError as e:
+        print(f"gammavariate error: {e}")
+
+    # getrandbits(k > 32) overflow regression (a review finding on the old
+    # module): a seeded loop of large-k draws runs clean, every value in [0, 2**62).
+    r3: Random = Random(682)
+    grb: list[int] = []
+    i3: int = 0
+    while i3 < 10:
+        grb.append(r3.getrandbits(62))
+        grb.append(r3.getrandbits(40))
+        i3 = i3 + 1
+    print(grb)
+    cap62: int = 4611686018427387904
+    all_in_range: bool = True
+    for g in grb:
+        if g < 0 or g >= cap62:
+            all_in_range = False
+    print(all_in_range)

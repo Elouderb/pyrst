@@ -1,0 +1,103 @@
+# parity_random_moduleapi_draws.pyrs — DUAL-RUN CPython parity golden for the
+# W4-c MODULE-LEVEL GENERIC draws: random.choice / random.sample / random.choices,
+# backed by the SAME hidden module-global generator as the scalar API, plus their
+# INTERLEAVING with the scalar draws on one shared stream.
+#
+# (Renamed + reshaped from the former pyrst-only random_freefns.pyrs: the generic
+# draws used to be pyrst-only FREE functions `choice(rng, xs)` whose CALL SHAPE
+# could not run under python3. They are now CPython's module-level shape
+# `random.choice(xs)` over a hidden `_inst`, so this file DUAL-RUNS — CPython is
+# the oracle, not a hand-pinned twin.)
+#
+# CPython's `random.choices` takes `k` KEYWORD-ONLY (choices(pop, weights=None, *,
+# cum_weights=None, k=1)), so every `choices` call below passes `k=` as a keyword;
+# a positional third arg would be a python3 TypeError.
+#
+# SEED FIRST (load-bearing): the unseeded pyrst module generator is a fixed
+# Random(0) (deterministic — no OS entropy), which diverges from CPython's
+# entropy-seeded default. Every block below `random.seed(N)`s first.
+import random
+
+
+def main() -> None:
+    # ── choice: several picks off the seeded module stream ────────────────────
+    random.seed(42)
+    picks: list[int] = []
+    i: int = 0
+    while i < 6:
+        picks.append(random.choice([10, 20, 30, 40, 50, 60]))
+        i = i + 1
+    print(picks)
+
+    # ── sample: pool-swap branch (n <= setsize), the k == n permutation, k == 0 ─
+    random.seed(42)
+    print(random.sample([0, 1, 2, 3, 4, 5, 6, 7, 8, 9], 5))
+    print(random.sample([0, 1, 2, 3, 4, 5, 6, 7, 8, 9], 10))
+    print(random.sample([0, 1, 2, 3, 4, 5, 6, 7, 8, 9], 0))
+
+    # ── sample: selection-set branch (n = 100 > setsize = 21 for k = 5) ───────
+    random.seed(42)
+    big: list[int] = [x for x in range(100)]
+    print(random.sample(big, 5))
+    print(random.sample(big, 30))
+
+    # ── choices: uniform (floor(random()*n)), cumulative-weights, k default ───
+    random.seed(42)
+    print(random.choices([1, 2, 3], None, k=5))
+    print(random.choices([1, 2, 3], [0.1, 0.8, 0.1], k=5))
+    print(random.choices([1, 2, 3]))
+    print(random.choices([1, 2, 3], k=4))
+    print(random.choices([4, 5, 6], None, k=0))
+
+    # ── unicode elements through choice/sample (element ops; width irrelevant) ─
+    random.seed(7)
+    words: list[str] = ["café", "naïve", "日本語", "a", "😀"]
+    print(random.choice(words))
+    print(random.sample(words, len(words)))
+
+    # ── INTERLEAVING: scalar + generic draws off ONE shared seeded stream.
+    #    Proves the hidden generator advances across ALL surfaces exactly as
+    #    CPython — a divergence in shared-state threading would surface here. ───
+    random.seed(2024)
+    print(random.random())
+    print(random.choice([10, 20, 30, 40, 50]))
+    print(random.randint(1, 100))
+    print(random.sample([0, 1, 2, 3, 4, 5, 6, 7, 8, 9], 4))
+    print(random.uniform(0.0, 1.0))
+    print(random.choices([1, 2, 3], [0.2, 0.5, 0.3], k=6))
+    print(random.randrange(1000))
+    print(random.getrandbits(20))
+    print(random.choice(["a", "b", "c"]))
+    print(random.random())
+
+    # ── error-path parity (CPython messages). The first four raise BEFORE any
+    #    draw (no state divergence). The empty-uniform-choices case draws once
+    #    THEN IndexErrors (CPython advances its module generator), so re-seed
+    #    right after so no post-error module state is observed across runtimes. ─
+    ys: list[int] = [1, 2, 3]
+    random.seed(5)
+    try:
+        print(random.sample(ys, 99))
+    except ValueError as e:
+        print(f"sample error: {e}")
+    try:
+        print(random.choices(ys, [1.0, 2.0], k=3))
+    except ValueError as e:
+        print(f"choices len error: {e}")
+    empty_ints: list[int] = []
+    try:
+        print(random.choice(empty_ints))
+    except IndexError as e:
+        print(f"choice empty error: {e}")
+    try:
+        print(random.choices(ys, [0.0, 0.0, 0.0], k=2))
+    except ValueError as e:
+        print(f"choices zero-weight error: {e}")
+    try:
+        print(random.choices(empty_ints, None, k=1))
+    except IndexError as e:
+        print(f"choices empty error: {e}")
+    random.seed(5)
+
+    # draws continue undisturbed after the pre-draw errors above
+    print(random.random())

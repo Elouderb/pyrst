@@ -1,0 +1,71 @@
+# parity_random_moduleapi.pyrs — DUAL-RUN CPython parity golden for the W4-c
+# MODULE-LEVEL random API: seed / random / randint / randrange / uniform /
+# getrandbits, backed by a hidden module-global generator.
+#
+# CPython's `random` module IS a hidden global generator plus bare convenience
+# functions; pyrst now ships the same SCALAR surface over a hidden module-global
+# `_inst = Random(0)` (W4-a mutable module globals). Under python3 this file runs
+# against CPython's REAL module-level API; under pyrst against lib/random.pyrs's.
+# Both are MT19937 with CPython's exact derivation, and CPython's `random.seed(n)`
+# is sequence-equivalent to `Random(n)` (python3-verified) — so every line below
+# is byte-identical across the two runtimes.
+#
+# SEED FIRST (load-bearing): the unseeded pyrst module generator is a FIXED
+# `Random(0)` (deterministic — pyrst has no OS entropy), which DIVERGES from
+# CPython's entropy-seeded default. This golden calls `random.seed(N)` first,
+# pinning the shared seeded stream. Several calls per function prove the hidden
+# state ADVANCES once per call — a naive delegate would repeat the SAME value
+# (see the state-advance note in lib/random.pyrs).
+import random
+
+
+def main() -> None:
+    # ── the headline: a seeded module stream is CPython-identical AND advances
+    # once per call (three DISTINCT floats, not one repeated) ──────────────────
+    random.seed(42)
+    print(random.random())
+    print(random.random())
+    print(random.random())
+
+    # ── randint: inclusive draws off the SAME advancing global stream ─────────
+    random.seed(42)
+    rolls: list[int] = []
+    i: int = 0
+    while i < 8:
+        rolls.append(random.randint(1, 100))
+        i = i + 1
+    print(rolls)
+
+    # ── randrange (1-arg) several times ───────────────────────────────────────
+    random.seed(42)
+    print(random.randrange(10))
+    print(random.randrange(10))
+    print(random.randrange(1000000))
+
+    # ── uniform several times ─────────────────────────────────────────────────
+    random.seed(42)
+    print(random.uniform(-5.0, 5.0))
+    print(random.uniform(0.0, 1.0))
+    print(random.uniform(100.0, 200.0))
+
+    # ── getrandbits: top-k bits, k==0 draws nothing, multi-word for k > 32 ────
+    random.seed(42)
+    print(random.getrandbits(1))
+    print(random.getrandbits(16))
+    print(random.getrandbits(32))
+    print(random.getrandbits(62))
+    print(random.getrandbits(0))
+    print(random.getrandbits(16))
+
+    # ── interleaved draws across functions all advance ONE shared generator ───
+    random.seed(123)
+    print(random.random())
+    print(random.randint(1, 6))
+    print(random.uniform(0.0, 10.0))
+    print(random.randrange(100))
+    print(random.getrandbits(8))
+    print(random.random())
+
+    # ── re-seed resets the stream: seed(42) again reproduces the headline ─────
+    random.seed(42)
+    print(random.random())

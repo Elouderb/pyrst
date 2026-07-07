@@ -1,0 +1,42 @@
+# parity_random_moduleapi_seeds.pyrs — DUAL-RUN parity: DISTINCT seeds yield
+# DISTINCT, CPython-identical module-level streams.
+#
+# The W4-c module API is deterministic per seed (no OS entropy — the hidden
+# generator is re-homed by `random.seed(n)`). Here seed(1), seed(2), and a large
+# multi-chunk seed each drive the hidden global generator; the three 5-draw
+# sequences differ from one another and each matches python3's own
+# `random.seed(N)` byte-for-byte (CPython's `random.seed(n)` is sequence-
+# equivalent to `Random(n)`, which pyrst's MT19937 reproduces exactly). Re-seeding
+# to 1 reproduces seed(1)'s stream — a documented, deterministic reset.
+import random
+
+
+def draw5() -> list[float]:
+    out: list[float] = []
+    i: int = 0
+    while i < 5:
+        out.append(random.random())
+        i = i + 1
+    return out
+
+
+def main() -> None:
+    random.seed(1)
+    s1: list[float] = draw5()
+    random.seed(2)
+    s2: list[float] = draw5()
+    random.seed(1099511627781)
+    s3: list[float] = draw5()
+    print(s1)
+    print(s2)
+    print(s3)
+
+    # distinct seeds → distinct streams (first-draw compare; float == is exact)
+    print(s1[0] == s2[0])
+    print(s1[0] == s3[0])
+    print(s2[0] == s3[0])
+
+    # re-seeding to 1 reproduces seed(1)'s stream exactly (deterministic reset)
+    random.seed(1)
+    print(random.random() == s1[0])
+    print(random.random() == s1[1])

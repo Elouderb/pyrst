@@ -262,6 +262,19 @@ for ~80% of the stdlib").
 
 ### D.2 `random` module-level API over a hidden global generator — W4-c
 
+> **AS BUILT (supersedes the sketch below).** The shipped W4-c differs from this
+> plan in three ways. (1) The naive `return _inst.random()` shown below is a
+> **silent miscompile** under clone-on-read (it advances a discarded clone) —
+> every state-advancing module fn instead uses clone-out / mutate-local /
+> rebind-back under `global`; no `Mut[Random]` machinery was needed or built.
+> (2) The 2-arg free draws (`choice(rng, xs)`, …) were **removed from the public
+> surface** (lead decision, card 25bd85d0): `choice(xs)`/`sample(xs,k)`/
+> `choices(...)` are module fns over `_inst` in the CPython shape;
+> `random.shuffle` is an honest absence (in-place contract inexpressible under
+> value semantics until EPIC-4 `Mut[T]`). (3) Seed-first goldens **dual-run**
+> byte-identical against python3 (not pyrst-only as predicted) — only the
+> unseeded default (`Random(0)` vs OS entropy) is a documented divergence.
+
 - **Shape.** CPython's `random` module *is* exactly this pattern: a hidden module
   global `_inst = Random()` plus free functions `random()`, `randint(a,b)`,
   `seed(n)`, `choice(xs)`, … that delegate to `_inst`. pyrst already ships a
@@ -270,23 +283,24 @@ for ~80% of the stdlib").
   ```
   _inst: Random = Random(0)                 # mutable-static path (b): constructor init
   def seed(n: int) -> None:   global _inst; _inst = Random(n)
-  def random() -> float:      return _inst.random()      # MUTATE _inst in place → Mut[Random]
+  def random() -> float:      return _inst.random()      # MUTATE _inst in place → Mut[Random]  (superseded — see AS BUILT note)
   def randint(a: int, b: int) -> int:  return randint_m(_inst, a, b)
   ```
   Drawing advances the generator, i.e. *mutates* `_inst`; the free draws already take
   `rng: Mut[Random]` (`lib/random.pyrs` "Generic draws"), so the module fns pass the
   global as `Mut`. This needs the mutable-global place to be usable as a `Mut[T]`
   argument — spell that out in W4-c (a `borrow_mut()` place threaded to `&mut`).
+  *(superseded — see AS BUILT note)*
 - **The seed question (a real divergence to document).** CPython seeds `_inst` from
   OS entropy at import; pyrst has **no entropy source** (`lib/random.pyrs` header:
   "pass a seed"). So the module-level generator is seeded to a **fixed default
   (`Random(0)`)** and the header documents: call `random.seed(n)` for a chosen stream;
   the unseeded module API is **deterministic** across runs (a documented divergence,
-  not silent). Its parity golden is therefore **pyrst-only** with an explicit
+  not silent). Its parity golden is therefore **pyrst-only** *(superseded — see AS BUILT note)* with an explicit
   `random.seed(42)` first, asserting the same draw sequence `Random(42)` gives (which
   is already python3-verified bit-identical).
 - **Beyond W4-a it needs:** only the constructor-init mutable-static (path (b)) and
-  the `Mut[global]` argument. Effort **S** (the hard part — MT19937 — is done).
+  the `Mut[global]` argument *(superseded — see AS BUILT note)*. Effort **S** (the hard part — MT19937 — is done).
 
 ### D.3 `logging` root logger (print-backed) + `warnings` filters — W4-d
 
@@ -506,10 +520,14 @@ just honestly rejected).
 
 ### W4-c — `random` module-level API over a hidden global generator · implementer, S
 
+> **AS BUILT:** see the D.2 supersession note — rebind-back pattern (no `Mut`),
+> reshaped public draws (free fns removed), dual-run seed-first goldens.
+
 - **Do:** add the module layer to `lib/random.pyrs` — `_inst: Random = Random(0)`
   (static path (b)) + `seed`/`random`/`randint`/`randrange`/`choice`/… delegating to
-  `_inst` (draws pass `Mut[_inst]`); header documents fixed-default-seed determinism
-  (no entropy) and the seed-first idiom. `parity_random_moduleapi.pyrs` (pyrst-only)
+  `_inst` (draws pass `Mut[_inst]` *(superseded — see AS BUILT note)*); header documents
+  fixed-default-seed determinism (no entropy) and the seed-first idiom.
+  `parity_random_moduleapi.pyrs` (pyrst-only *(superseded — see AS BUILT note)*)
   seeds then asserts the `Random(seed)`-identical sequence.
 - **Files:** `lib/random.pyrs`, `examples/parity_random_moduleapi.pyrs` + expected.
   **Depends:** W4-a. **Risk:** low (MT19937 is done). **Gate:** module API draws ==

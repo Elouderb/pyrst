@@ -1,0 +1,18 @@
+choices([], k=1): list index out of range
+0.7417869892607294
+0.7951935655656966
+95
+choices([], k=3): list index out of range
+0.7417869892607294
+[]
+0.6229016948897019
+choice([]): Cannot choose from an empty sequence
+0.6229016948897019
+sample too-large: Sample larger than population or is negative
+0.6229016948897019
+choices weights-len: The number of weights does not match the population
+0.6229016948897019
+choices zero-total: Total of weights must be greater than zero
+0.6229016948897019
+choices weighted-empty: list index out of range
+0.6229016948897019

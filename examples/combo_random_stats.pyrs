@@ -1,5 +1,6 @@
 # combo_random_stats.pyrs
-# Combines: Random(seed) + randint/random/uniform + shuffle + statistics.mean/median +
+# Combines: Random(seed) + randint/random/uniform + module random.sample (shuffled
+# copy) + statistics.mean/median +
 # list comprehensions + sorted() + f-strings. A realistic "simulate draws, compute
 # sample statistics" pattern. Fully deterministic via fixed seeds.
 
@@ -44,11 +45,13 @@ def main() -> None:
     print(sorted_rolls[0])                  # min
     print(sorted_rolls[11])                 # max
 
-    # Shuffle with a different seed
-    rng2: Random = Random(99)
+    # Shuffled deck via the module shuffled-copy idiom: random.sample(xs, len(xs))
+    # returns a NEW shuffled list (pyrst has no in-place random.shuffle — CPython's
+    # in-place contract is inexpressible under value semantics; see lib/random.pyrs).
+    random.seed(99)
     deck: list[int] = [10, 20, 30, 40, 50]
-    random.shuffle(rng2, deck)
-    print(deck)                             # shuffled deterministically
+    shuffled_deck: list[int] = random.sample(deck, len(deck))
+    print(shuffled_deck)                    # shuffled deterministically
 
     # Sample uniform floats and compute their mean
     rng3: Random = Random(7)

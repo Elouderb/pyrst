@@ -1,0 +1,95 @@
+# parity_random_moduleapi_errstate.pyrs — DUAL-RUN regression golden for the
+# W4-c module generator's POST-ERROR state (card 25bd85d0, fix round R1).
+#
+# CPython's random.choices(population, weights=None, *, k=1) UNIFORM branch calls
+# random() ONCE per requested element; with an EMPTY population it draws that ONE
+# value and THEN raises IndexError indexing population[0] — so the shared module
+# generator HAS advanced by the time the error propagates. pyrst must persist that
+# single advance to the hidden _inst BEFORE the index error, or a CAUGHT
+# choices([], k>=1) would silently leave the module stream one draw behind CPython.
+#
+# This golden SEEDS ONCE per block and NEVER re-seeds across the caught error, so
+# the draws AFTER the error observe the real post-error state — byte-identical
+# pyrst-vs-python3 here proves it matches CPython. (The sibling
+# parity_random_moduleapi_draws re-seeds immediately after its empty-choices probe,
+# which MASKS this class of divergence; this file is the unmasked companion.)
+#
+# It also PINS the rest of the error-path state-advance audit: k == 0 on an empty
+# population draws NOTHING, and choice-empty / sample-too-large / choices
+# weights-length / choices zero-total / choices weighted-empty all validate BEFORE
+# drawing (post-error draw == the fresh-seed baseline on BOTH runtimes).
+#
+# k is passed by keyword on every choices() call (CPython 3.12 makes it
+# keyword-only); pyrst does not yet enforce that, but the goldens honor it.
+import random
+
+
+def main() -> None:
+    empty: list[int] = []
+    ys: list[int] = [1, 2, 3]
+
+    # ── R1: empty-population uniform choices draws ONCE, then IndexError. NO
+    #    re-seed after — the next draws must land on CPython's advanced stream. ──
+    random.seed(5)
+    try:
+        print(random.choices(empty, k=1))
+    except IndexError as e:
+        print(f"choices([], k=1): {e}")
+    print(random.random())
+    print(random.random())
+    print(random.randint(1, 100))
+
+    # ── still exactly ONE draw for k > 1: CPython's comprehension errors on its
+    #    FIRST element, so only one random() runs before the IndexError. ─────────
+    random.seed(5)
+    try:
+        print(random.choices(empty, k=3))
+    except IndexError as e:
+        print(f"choices([], k=3): {e}")
+    print(random.random())
+
+    # ── k == 0 on an empty population: NO draw, returns []. The following draw
+    #    must equal the fresh-seed baseline (choices([], k=0) never drew). ───────
+    random.seed(5)
+    print(random.choices(empty, k=0))
+    print(random.random())
+
+    # ── every OTHER error path validates BEFORE drawing: seed, trigger the caught
+    #    error, then draw — the draw lands on the UNADVANCED baseline stream on
+    #    BOTH runtimes. A divergence here would mean a path silently advanced (or
+    #    failed to advance) the module generator. ──────────────────────────────
+    random.seed(5)
+    try:
+        print(random.choice(empty))
+    except IndexError as e:
+        print(f"choice([]): {e}")
+    print(random.random())
+
+    random.seed(5)
+    try:
+        print(random.sample(ys, 99))
+    except ValueError as e:
+        print(f"sample too-large: {e}")
+    print(random.random())
+
+    random.seed(5)
+    try:
+        print(random.choices(ys, [1.0, 2.0], k=3))
+    except ValueError as e:
+        print(f"choices weights-len: {e}")
+    print(random.random())
+
+    random.seed(5)
+    try:
+        print(random.choices(ys, [0.0, 0.0, 0.0], k=2))
+    except ValueError as e:
+        print(f"choices zero-total: {e}")
+    print(random.random())
+
+    empty_w: list[float] = []
+    random.seed(5)
+    try:
+        print(random.choices(empty, empty_w, k=1))
+    except IndexError as e:
+        print(f"choices weighted-empty: {e}")
+    print(random.random())

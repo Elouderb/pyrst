@@ -1,0 +1,23 @@
+# W4-d warnings — the "error" action is CATCHABLE (DUAL-RUN vs python3 3.12,
+# NOT pyrst-only). simplefilter("error") makes the next warn() raise the warning
+# as an exception; pyrst raises the actual category as a real, panic-backed
+# exception that `except UserWarning` catches — matching CPython's catchable
+# warning-as-exception (probe D3b). This uses the DEFAULT category (no string-
+# category arg), so the source is valid CPython too and runs byte-identically on
+# BOTH sides: stdout `caught-UserWarning`.
+#
+# (Uncaught, the two diverge only on EXIT CODE — pyrst panics exit 101, CPython
+# exits 1, the globally-documented panic-exit divergence; CAUGHT, they are
+# identical, which is what this dual-run asserts. The golden is self-checking: if
+# the "error" raise ever regresses, `warnings.warn` returns, `NOT-RAISED` prints,
+# and the dual-run breaks loudly.)
+import warnings
+
+
+def main() -> None:
+    warnings.simplefilter("error")
+    try:
+        warnings.warn("boom")
+        print("NOT-RAISED")
+    except UserWarning:
+        print("caught-UserWarning")

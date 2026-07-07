@@ -1,0 +1,12 @@
+# W4-d negative (companion to fail_warnings_filterwarnings): the kwarg-FREE
+# filterwarnings call. `filterwarnings` is honest-deferred, so this is an HONEST
+# typeck error — "module `warnings` has no function `filterwarnings`". Pinned
+# alongside the kwarg-bearing form (card 0a70d607) so BOTH the qualified-call arm
+# and the kwargs gate keep reporting the identical, correct diagnostic — the
+# kwarg path must not regress to the old "undefined name warnings" misreport.
+import warnings
+
+
+def main() -> None:
+    warnings.filterwarnings("ignore")
+    warnings.warn("x")

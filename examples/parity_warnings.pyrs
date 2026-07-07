@@ -1,0 +1,34 @@
+# parity: pyrst-only
+#
+# W4-d warnings — the default warn line + the DeprecationWarning category name +
+# the "ignore" action. PYRST-ONLY: warnings emit to STDERR (like CPython) and the
+# harness captures the pyrst binary's STDOUT only; additionally pyrst's warn
+# takes the category NAME as a string (pyrst has no Warning class objects), so
+# the DeprecationWarning call below is not valid CPython source — the oracle
+# evidence uses CPython's class form.
+#
+# ORACLE (python3 3.12) — the CLASS-form equivalent
+#     warnings.warn("default user warning")
+#     warnings.warn("dep warning", DeprecationWarning)
+#     warnings.simplefilter("ignore"); warnings.warn("ignored")
+#   emits on STDERR (default filter shows the first two, "ignore" drops the last):
+#     <file>:<lineno>: UserWarning: default user warning
+#       <source line echo>
+#     <file>:<lineno>: DeprecationWarning: dep warning
+#       <source line echo>
+#   pyrst emits ONLY the faithful category+message tail (the `<file>:<lineno>:`
+#   prefix and source-line echo require a Python call frame + linecache pyrst has
+#   no equivalent of — and are themselves corrupted under the harness exec-
+#   prepend, probe W1b). So pyrst STDERR is:
+#     UserWarning: default user warning
+#     DeprecationWarning: dep warning
+#   STDOUT: warnings-default-done
+import warnings
+
+
+def main() -> None:
+    warnings.warn("default user warning")                   # stderr: UserWarning: default user warning
+    warnings.warn("dep warning", "DeprecationWarning")      # stderr: DeprecationWarning: dep warning
+    warnings.simplefilter("ignore")                          # drop everything after this
+    warnings.warn("ignored")                                 # stderr: (nothing)
+    print("warnings-default-done")                           # stdout

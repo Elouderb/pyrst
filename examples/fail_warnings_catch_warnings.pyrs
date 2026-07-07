@@ -1,0 +1,12 @@
+# W4-d negative: the catch_warnings() context manager (record/restore of the
+# filter state) is honest-deferred — it needs a context-manager protocol pyrst
+# does not provide for this surface. pyrst does not define `catch_warnings`, so
+# the call is an HONEST typeck error ("module warnings has no function
+# catch_warnings"), NOT a silent no-op.
+import warnings
+
+
+def main() -> None:
+    with warnings.catch_warnings():
+        warnings.simplefilter("always")
+        warnings.warn("x")

@@ -1,0 +1,18 @@
+# W4-d logging — level CONSTANTS + getLevelName. This is the one logging surface
+# with NO stderr output (pure stdout), so it DUAL-RUNS byte-identical against
+# live python3 (no `# parity: pyrst-only` marker): the harness builds+runs the
+# pyrst binary and exec's the SAME source under python3, comparing stdout. This
+# machine-verifies the numeric level values and the getLevelName name table
+# against CPython on every run.
+import logging
+
+
+def main() -> None:
+    print(logging.getLevelName(logging.DEBUG))      # DEBUG
+    print(logging.getLevelName(logging.INFO))        # INFO
+    print(logging.getLevelName(logging.WARNING))     # WARNING
+    print(logging.getLevelName(logging.ERROR))       # ERROR
+    print(logging.getLevelName(logging.CRITICAL))    # CRITICAL
+    print(logging.getLevelName(logging.NOTSET))      # NOTSET
+    print(logging.getLevelName(25))                  # Level 25  (unregistered value)
+    print(logging.DEBUG, logging.INFO, logging.WARNING, logging.ERROR, logging.CRITICAL, logging.NOTSET)

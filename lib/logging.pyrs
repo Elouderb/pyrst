@@ -1,0 +1,204 @@
+# pyrst standard library — logging (root-logger LEVEL state + level-gated emit)
+#
+# FIDELITY: 3/5. The ROOT logger's LEVEL behaviour is faithful and CPython-
+# oracled (the format string, the five level functions, the WARNING default, the
+# basicConfig(level=) threshold, and basicConfig's repeat-call no-op). Handlers,
+# formatters, named-logger hierarchies (getLogger), propagation, and %-style
+# lazy message interpolation are OUT of scope — they need object/protocol
+# machinery beyond W4 module-level state. Every one of those is an HONEST error
+# (an undefined module function or an arity error), never a silent no-op.
+#
+# W4-d (docs/design/w4-globals.md §D.3): a print-backed root logger over two
+# module-level MUTABLE globals — `_root_level` (the effective threshold) and
+# `_configured` (whether the root has been configured). Both are rebound under
+# `global` from module functions, so W4-a promotes them to `thread_local!`
+# statics (rule (a): global + rebind), eagerly initialized at startup in
+# `__pyrst_init_globals()`.
+#
+# ── STREAM: TRUE STDERR, exactly like CPython ────────────────────────────────
+# CPython's root handler (installed by basicConfig) writes to sys.stderr. pyrst
+# does the SAME: the five level functions emit through `_log_emit`, an @extern
+# `eprintln!` shim to std::io::stderr() (precedent: lib/getpass.pyrs's eprint!).
+# So redirection behaves like CPython byte-for-byte: `prog 2>/dev/null` silences
+# the log lines; `prog >out` leaves them on the terminal. This is deliberately
+# NOT stdout: routing log output to stdout would diverge from CPython under any
+# stream redirection (an accepted program producing different output than
+# python3 — the one thing pyrst must never do).
+#   CONSEQUENCE FOR PARITY: the dual-run harness captures the pyrst binary's
+#   STDOUT only (test_all.sh runs `./bin 2>/dev/null`) while it captures
+#   python3's STDOUT+STDERR (`python3 -c ... 2>&1`). A byte-comparison of
+#   stderr-borne output is therefore impossible symmetrically, and emitting to
+#   stdout merely to "win" that comparison would mask the real stream
+#   divergence. So the logging OUTPUT goldens are PYRST-ONLY
+#   (examples/parity_logging*.pyrs carry `# parity: pyrst-only`) with the exact
+#   python3 STDERR bytes pinned in-comment as oracle evidence. The one surface
+#   with NO stderr — the level constants and getLevelName — IS dual-run
+#   byte-identical to live python3 (examples/parity_logging_levels.pyrs).
+#
+# ── ROOT LEVEL + basicConfig (CPython-oracled, python3 3.12) ─────────────────
+# The module-level debug/info/warning/error/critical each call basicConfig()
+# when the root has no handlers, attaching the default StreamHandler; that
+# implicit config is OBSERVABLE and pyrst reproduces it via `_ensure_configured`:
+#   - bare `logging.warning("hi")` (nothing configured) prints
+#     `WARNING:root:hi` on stderr; `logging.info("hi")` prints NOTHING (INFO=20
+#     is below the WARNING=30 default). [probe P1/P2]
+#   - `logging.basicConfig(level=logging.DEBUG)` FIRST, then all five, prints all
+#     five as `LEVEL:root:msg`. [probe P3]
+#   - basicConfig REPEAT calls are a NO-OP: `basicConfig(level=DEBUG)` then
+#     `basicConfig(level=ERROR)` leaves the level at DEBUG. [probe P4]
+#   - the implicit config counts: `warning(...)` (which configures) THEN
+#     `basicConfig(level=DEBUG)` is a no-op, so a following `debug(...)` stays
+#     suppressed. [probe P5 — faithfully reproduced by _ensure_configured
+#     setting _configured before the threshold test]
+# basicConfig's handlers=/format=/stream=/filename=/force= keyword surface is
+# NOT supported (no handler/formatter objects): pyrst basicConfig takes only
+# `level`. A no-arg basicConfig() leaves the level at the WARNING default, which
+# is exactly what the `level: int = 30` default yields here.
+#
+# ── MESSAGE FORMATTING: msg-only; %-interpolation is an HONEST arity error ────
+# CPython's level functions take `*args` and do LAZY %-interpolation of the
+# message. When the placeholders MATCH the args this interpolates CLEANLY:
+# `logging.warning("x %s", "y")` -> `WARNING:root:x y`, exit 0 — the canonical
+# CPython lazy-logging idiom (probe P9b). pyrst has no varargs, so the level
+# functions take a single `msg: str`, and ANY second positional argument is a hard
+# ARITY error at typeck — NEVER silently dropped (examples/fail_logging_extra_arg
+# .pyrs). That rejection covers the ENTIRE multi-arg shape, INCLUDING the matched
+# idiom CPython interpolates correctly, so pyrst is honest-STRICTER here: it
+# refuses a valid, idiomatic CPython call rather than accept a shape it cannot
+# faithfully lower. Pre-format the string yourself: `logging.warning(f"x {y}")`.
+#   The MISMATCH shape — placeholders that do NOT match the args — is where
+#   CPython ITSELF degrades: `logging.warning("x", "y")` (a format string with no
+#   `%` spec plus a spurious extra arg) logs an internal "--- Logging error ---"
+#   and a TypeError traceback to stderr, emits nothing interpolated, and still
+#   exits 0 (probe P9b). pyrst rejects that shape too, via the SAME arity error.
+#   So for BOTH the matched idiom (CPython: clean) and the mismatch (CPython:
+#   degraded), pyrst gives one honest answer: no varargs — pre-format.
+#
+# ── DEFERRED (calling any of these is an HONEST error, not a silent no-op) ────
+#   - getLogger / named loggers / logger hierarchy / propagation — undefined
+#     module function → typeck error (examples/fail_logging_getlogger.pyrs).
+#   - Handler / Formatter / StreamHandler / FileHandler / addHandler — no object
+#     protocol under W4; undefined → typeck error.
+#   - a module-level setLevel — CPython has none either (setLevel is a Logger
+#     METHOD); undefined here → typeck error. Set the root threshold via
+#     basicConfig(level=).
+#   - getLevelName's REVERSE direction (str -> int) — CPython's getLevelName is
+#     bidirectional (getLevelName("WARNING") == 30). pyrst cannot overload a
+#     return type (int vs str), so only the forward int -> str direction ships;
+#     passing a str is a type error.
+#
+# PUBLIC-NAME COLLISION SWEEP: the public names (basicConfig, debug, info,
+# warning, error, critical, getLevelName, and the consts DEBUG/INFO/WARNING/
+# ERROR/CRITICAL/NOTSET) are owner-qualified by W3 per-module namespacing, so
+# they cannot collide with another module's surface on co-import; the CPython
+# canonical names are preserved for `logging.<name>` access.
+
+# Level name constants (CPython values). Scalar-literal, never-rebound bindings —
+# they stay the immutable Rust `const` path (zero mutable-global cost).
+DEBUG: int = 10
+INFO: int = 20
+WARNING: int = 30
+ERROR: int = 40
+CRITICAL: int = 50
+NOTSET: int = 0
+
+
+# The root-logger LEVEL threshold. A scalar-literal binding REBOUND (under
+# `global`) by basicConfig → W4-a promotes it to a thread_local Cell<i64> static
+# (mutable-static rule (a)). Default WARNING=30 (CPython's root default).
+_root_level: int = 30
+
+# Whether the root has been configured (a handler attached). Rebound under
+# `global` → a thread_local Cell<bool> static. Models CPython's
+# `len(root.handlers) == 0` gate that makes basicConfig idempotent.
+_configured: bool = False
+
+
+# @extern stderr sink — CPython's default handler writes to sys.stderr, and so
+# does pyrst. `eprintln!` locks stderr, writes the line + '\n', matching the
+# per-record newline the StreamHandler emits. (Same @extern-to-stderr technique
+# as lib/getpass.pyrs:eprint!.)
+@extern
+def _log_emit(line: str) -> None:
+    "eprintln!(\"{}\", {line})"
+
+
+def _ensure_configured() -> None:
+    # CPython's module-level log functions call basicConfig() when the root has
+    # no handlers, attaching the default StreamHandler. That implicit config is
+    # observable: it flips the "configured" gate WITHOUT changing the level (the
+    # implicit basicConfig() passes no level), so a subsequent basicConfig(level=)
+    # becomes a no-op (probe P5). Runs on EVERY level call, even a filtered one.
+    global _configured
+    if not _configured:
+        _configured = True
+
+
+def basicConfig(level: int = 30) -> None:
+    # CPython basicConfig(level=L): on an UNCONFIGURED root, attach a handler and
+    # set the root threshold to L; on an ALREADY-configured root, a NO-OP (repeat
+    # calls do not reconfigure — probe P4). A no-arg basicConfig() leaves the
+    # level at the WARNING default, which is what level=30 (the default) yields.
+    # handlers=/format=/stream=/filename=/force= are unsupported (see header).
+    global _root_level, _configured
+    if not _configured:
+        _root_level = level
+        _configured = True
+
+
+def debug(msg: str) -> None:
+    # CPython logging.debug(msg) — emits `DEBUG:root:<msg>` on stderr iff the root
+    # threshold admits DEBUG (10). Implicit-config runs first (even when filtered).
+    _ensure_configured()
+    if _root_level <= 10:
+        _log_emit("DEBUG:root:" + msg)
+
+
+def info(msg: str) -> None:
+    # CPython logging.info(msg) — emits `INFO:root:<msg>` iff threshold <= INFO (20).
+    _ensure_configured()
+    if _root_level <= 20:
+        _log_emit("INFO:root:" + msg)
+
+
+def warning(msg: str) -> None:
+    # CPython logging.warning(msg) — emits `WARNING:root:<msg>` iff threshold <=
+    # WARNING (30). Shown at the default level. [probe P1]
+    _ensure_configured()
+    if _root_level <= 30:
+        _log_emit("WARNING:root:" + msg)
+
+
+def error(msg: str) -> None:
+    # CPython logging.error(msg) — emits `ERROR:root:<msg>` iff threshold <= ERROR (40).
+    _ensure_configured()
+    if _root_level <= 40:
+        _log_emit("ERROR:root:" + msg)
+
+
+def critical(msg: str) -> None:
+    # CPython logging.critical(msg) — emits `CRITICAL:root:<msg>` iff threshold <=
+    # CRITICAL (50). Always shown (nothing outranks CRITICAL at the default level).
+    _ensure_configured()
+    if _root_level <= 50:
+        _log_emit("CRITICAL:root:" + msg)
+
+
+def getLevelName(level: int) -> str:
+    # CPython logging.getLevelName(level) — the canonical name for a numeric level,
+    # or "Level N" for an unregistered value (probe P10: getLevelName(25) ==
+    # "Level 25"). The REVERSE (str -> int) direction is deferred (return-type
+    # union inexpressible — see header).
+    if level == 10:
+        return "DEBUG"
+    if level == 20:
+        return "INFO"
+    if level == 30:
+        return "WARNING"
+    if level == 40:
+        return "ERROR"
+    if level == 50:
+        return "CRITICAL"
+    if level == 0:
+        return "NOTSET"
+    return "Level " + str(level)

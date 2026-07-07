@@ -1,0 +1,14 @@
+# W4-d negative: the regex filter stack (filterwarnings) is honest-deferred.
+# pyrst does not define `filterwarnings`, so the call is an HONEST typeck error —
+# "module `warnings` has no function `filterwarnings`", NOT a silent no-op. The
+# call below carries a KEYWORD arg (message=…); the kwargs gate now resolves the
+# module base via the real module registry (module_funcs), so it reports the SAME
+# "no function" diagnostic as the kwarg-free form (card 0a70d607) instead of
+# misattributing it to an "undefined name warnings". Use the supported
+# simplefilter(action) surface (ignore/always/once/default/error/module).
+import warnings
+
+
+def main() -> None:
+    warnings.filterwarnings("ignore", message="deprecated")
+    warnings.warn("x")

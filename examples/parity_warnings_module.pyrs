@@ -1,0 +1,30 @@
+# parity: pyrst-only
+#
+# W4-d warnings — the "module" action. CPython dedups per (module, message);
+# pyrst warn() has no module identity, so it collapses to per-MESSAGE dedup —
+# EXACT for a single-module program (the common case). PYRST-ONLY (stderr; see
+# parity_warnings.pyrs's header for the stream + str-category rationale).
+#
+# ORACLE (python3 3.12, the CLASS-form equivalent — pyrst's str-category call
+# below is not valid CPython source):
+#     warnings.simplefilter("module")
+#     warnings.warn("M repeated")   # shown
+#     warnings.warn("M repeated")   # deduped (same module + message)
+#     warnings.warn("N distinct")   # shown
+#   emits on STDERR (probe D3e — category+message tail; CPython also prefixes
+#   <file>:<lineno>: and a source-line echo pyrst omits, see parity_warnings.pyrs):
+#     UserWarning: M repeated
+#     UserWarning: N distinct
+#   STDOUT: module-dedup-done
+#
+# expected/parity_warnings_module.txt pins the pyrst STDOUT (the print marker);
+# the warning lines land on stderr and are the pinned oracle above.
+import warnings
+
+
+def main() -> None:
+    warnings.simplefilter("module")
+    warnings.warn("M repeated")     # stderr: UserWarning: M repeated
+    warnings.warn("M repeated")     # deduped (per-message == per-module here)
+    warnings.warn("N distinct")     # stderr: UserWarning: N distinct
+    print("module-dedup-done")      # stdout

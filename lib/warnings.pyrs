@@ -1,0 +1,177 @@
+# pyrst standard library — warnings (simplefilter state + warn emit)
+#
+# FIDELITY: 3/5. The FILTER-ACTION state machine — CPython's full action set
+# ignore / always / once / default / error / module — and the category-name +
+# message tail of CPython's warning line are faithful and python3-oracled,
+# including warning-as-exception ("error") raised as a real, catchable Warning.
+# The `path:lineno:` location prefix, the source-line echo, per-category default
+# filter chains, the `filterwarnings` regex stack, and `catch_warnings` are OUT
+# of scope. Every deferred surface is an HONEST error (an undefined module
+# function, an arity error, or an explicit raise), never a silent no-op.
+#
+# W4-d (docs/design/w4-globals.md §D.3): a print-backed warnings surface over two
+# module-level MUTABLE globals — `_action` (the active simplefilter action) and
+# `_seen` (the once/default dedup set). Both are rebound under `global`, so W4-a
+# promotes them to `thread_local!` statics (`_action`: rule (a) global+rebind;
+# `_seen`: rule (b) non-scalar-literal initializer `set()`), eagerly initialized
+# at startup in `__pyrst_init_globals()`.
+#
+# ── STREAM: TRUE STDERR, exactly like CPython ────────────────────────────────
+# CPython's default showwarning writes to sys.stderr; pyrst emits through
+# `_warn_emit`, an @extern `eprintln!` shim to std::io::stderr(). Redirection is
+# therefore CPython-faithful (`prog 2>/dev/null` silences warnings). As with
+# lib/logging.pyrs, the harness captures the pyrst binary's STDOUT only, so the
+# warnings goldens are PYRST-ONLY (examples/parity_warnings*.pyrs carry
+# `# parity: pyrst-only`) with the exact python3 STDERR bytes pinned in-comment
+# as oracle evidence.
+#
+# ── WARNING LINE FORMAT: the faithful, expressible SUBSET ────────────────────
+# CPython (python3 3.12, default formatwarning) emits, per shown warning:
+#     <filename>:<lineno>: <Category>: <message>
+#       <the source line, stripped>
+# The `<filename>:<lineno>:` prefix and the source-line echo require a Python
+# CALL FRAME and linecache — pyrst has NEITHER (no interpreter frame, no
+# per-call-site lineno). Worse, those very fields are UNSTABLE under the parity
+# harness itself: run via `exec(compile(src, file, 'exec'))` with a prepended
+# `from __future__ import annotations`, CPython reports an OFF-BY-ONE lineno and
+# echoes the WRONG source line (probe W1b). So pyrst does NOT fabricate a
+# location it cannot compute correctly; it emits ONLY the faithful tail:
+#     <Category>: <message>
+# The location prefix + source echo are a documented, honest omission. What pyrst
+# DOES emit is byte-exact for the parts it claims (the category name + message).
+#
+# ── FILTER ACTIONS (python3 3.12 oracled) ────────────────────────────────────
+#   - "ignore"  — drop every warning (probe W5: nothing on stderr).
+#   - "always"  — emit on EVERY call, duplicates included (probe W3).
+#   - "once"    — emit only the FIRST time a given (category, message) is seen,
+#                 across all call sites (probe W4). Backed by the `_seen` set.
+#   - "default" — CPython: once PER LOCATION (category, message, module, lineno).
+#                 pyrst has no call-site lineno, so it approximates "default" as
+#                 once PER MESSAGE — identical to "once" here. The two DIVERGE
+#                 only when the SAME message text is warned from TWO different
+#                 source lines: CPython prints both; pyrst prints one. Documented.
+#   - "module"  — CPython: once PER (module, message). pyrst warn() has no module
+#                 identity, so it too collapses to once PER MESSAGE — EXACT for a
+#                 single-module program (probe D3e: warn("a"),warn("a"),warn("b")
+#                 -> a,b once each). It diverges only when the SAME message is
+#                 warned from TWO different modules: CPython emits once per module,
+#                 pyrst once total. The common single-module case is byte-faithful.
+#   - "error"   — CPython turns the warning into a RAISED exception (the Warning
+#                 subclass), BEFORE dedup (probe D3a). pyrst raises the same
+#                 category as a real, catchable exception (see warn()); uncaught
+#                 it panics (exit 101) vs CPython's exit 1 — the documented
+#                 panic-exit divergence. NO LONGER an at-call rejection:
+#                 simplefilter STORES "error"; the next warn() raises.
+# The initial action is "default" (CPython's baseline for a shown UserWarning in
+# __main__). simplefilter(action) RESETS the dedup state (`_seen`), matching that
+# simplefilter installs a fresh filter (CPython invalidates the registry on any
+# filter mutation — probe D3d).
+#
+# ── CATEGORY: a NAME STRING, not a Warning class ─────────────────────────────
+# CPython warn(message, category=UserWarning) takes a Warning SUBCLASS; pyrst has
+# no Warning class objects, so `warn` takes the category NAME as a string
+# (default "UserWarning"). Supported names: "UserWarning", "DeprecationWarning"
+# (their name appears in the output, probe W8). Any other name is an HONEST raise
+# — the classes beyond those two are deferred. This str-vs-class calling
+# convention is a documented divergence; the emitted category NAME still matches
+# CPython's `<Category>:` field exactly for the two supported categories. pyrst
+# also does NOT reproduce CPython's per-category default filter chain (e.g.
+# DeprecationWarning being ignored by default in library code) — the single
+# `_action` applies uniformly.
+#
+# ── DEFERRED (calling any of these is an HONEST error, not a silent no-op) ────
+#   - filterwarnings(action, message=, category=, module=, lineno=, append=) —
+#     the regex filter stack; undefined module function → typeck error
+#     (examples/fail_warnings_filterwarnings.pyrs).
+#   - catch_warnings() (the context-manager record/restore) — no context-manager
+#     protocol here; undefined → typeck error
+#     (examples/fail_warnings_catch_warnings.pyrs).
+#   - an UNKNOWN simplefilter action (anything outside CPython's full
+#     ignore/always/once/default/error/module set) — an honest raise AT THE CALL,
+#     matching CPython's `AssertionError: invalid action: '<action>'` (probe D3f).
+#   - warning categories beyond UserWarning/DeprecationWarning — honest raise.
+#
+# PUBLIC-NAME COLLISION SWEEP: `warn` and `simplefilter` are owner-qualified by
+# W3 per-module namespacing; no co-import collision. The canonical CPython names
+# are preserved for `warnings.<name>` access.
+
+# The active simplefilter action. A scalar-literal binding REBOUND under `global`
+# by simplefilter → W4-a promotes it to a thread_local RefCell<String> static
+# (mutable-static rule (a)). "default" is CPython's baseline for a shown warning.
+_action: str = "default"
+
+# The once/default dedup set. A NON-scalar-literal initializer (`set()`) → W4-a
+# promotes it to a thread_local RefCell<HashSet<String>> static (rule (b)),
+# eagerly initialized empty at startup.
+_seen: set[str] = set()
+
+
+# @extern stderr sink — CPython's showwarning writes to sys.stderr; so does
+# pyrst. `eprintln!` locks stderr and appends the trailing newline the default
+# formatter emits.
+@extern
+def _warn_emit(line: str) -> None:
+    "eprintln!(\"{}\", {line})"
+
+
+def simplefilter(action: str) -> None:
+    # CPython warnings.simplefilter(action): install a single filter for `action`
+    # and reset the dedup registry. pyrst honors CPython's FULL action set —
+    # ignore / always / once / default / error / module. Any OTHER action is an
+    # honest rejection AT THE CALL, exactly like CPython: python3 3.12 asserts
+    # `action in (...)` and raises `AssertionError: invalid action: '<action>'`
+    # (probe D3f), so pyrst raises the same exception type + message (uncaught ->
+    # panic exit 101; CPython exit 1 — the globally-documented panic-exit
+    # divergence). Resetting `_seen` mirrors CPython invalidating the per-module
+    # registry on ANY filter mutation (probe D3d).
+    global _action, _seen
+    if action != "ignore" and action != "always" and action != "once" and action != "default" and action != "error" and action != "module":
+        raise AssertionError("invalid action: '" + action + "'")
+    _action = action
+    _seen = set()
+
+
+def warn(message: str, category: str = "UserWarning") -> None:
+    # CPython warnings.warn(message, category=UserWarning). pyrst takes the
+    # category NAME (str), emits `<Category>: <message>` on stderr subject to the
+    # active filter action. once/default/module dedup uses the `_seen` global via
+    # the clone-out / mutate-local / rebind-back idiom (a bare mutate could advance
+    # a discarded clone under value semantics — see lib/random.pyrs's note), so the
+    # dedup state PERSISTS across calls.
+    global _seen
+    if category != "UserWarning" and category != "DeprecationWarning":
+        raise ValueError("pyrst warnings.warn supports category names 'UserWarning' and 'DeprecationWarning'; got: " + category)
+    if _action == "ignore":
+        return
+    if _action == "error":
+        # CPython's "error" filter turns the warning into a RAISED exception (the
+        # actual Warning subclass), evaluated BEFORE any dedup — it raises on the
+        # very first matching warn (probe D3a). pyrst raises the SAME category as a
+        # real, catchable exception: `except UserWarning` / `except
+        # DeprecationWarning` catch it, matching CPython's catchable warning-as-
+        # exception (probe D3b, exercised by parity_warnings_error_caught.pyrs).
+        # Uncaught, it is pyrst's honest runtime error — a panic, exit 101 (CPython
+        # exits 1; the panic-exit divergence is documented globally, cf.
+        # lib/sys.pyrs's absent-BaseException note). The raise names the category
+        # CLASS and carries the message, so the shape stays faithful.
+        if category == "UserWarning":
+            raise UserWarning(message)
+        raise DeprecationWarning(message)
+    line: str = category + ": " + message
+    if _action == "always":
+        _warn_emit(line)
+        return
+    # once / default / module: emit the FIRST time this (category, message) is
+    # seen. "module" is CPython's per-(module, message) dedup; pyrst warn() has no
+    # module identity, so it collapses to per-MESSAGE dedup — EXACT for a single-
+    # module program (the common case, probe D3e), diverging only when the SAME
+    # message is warned from TWO different modules (CPython: once per module;
+    # pyrst: once total). "default" is likewise per-message here (CPython:
+    # per-location — pyrst has no call-site lineno).
+    key: str = category + "\t" + message
+    tmp: set[str] = _seen
+    if key in tmp:
+        return
+    tmp.add(key)
+    _seen = tmp
+    _warn_emit(line)

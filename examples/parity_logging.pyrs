@@ -1,0 +1,35 @@
+# parity: pyrst-only
+#
+# W4-d logging — the ROOT-LEVEL THRESHOLD at the default level (WARNING=30).
+# PYRST-ONLY because logging emits to STDERR (like CPython), and the dual-run
+# harness captures the pyrst binary's STDOUT only (`./bin 2>/dev/null`) while it
+# captures python3's STDOUT+STDERR (`python3 -c ... 2>&1`) — an asymmetric
+# capture that cannot byte-compare stderr output. Emitting to stdout to force a
+# green dual-run would mask the real stream, so this stays pyrst-only with the
+# python3 STDERR pinned below as oracle evidence.
+#
+# ORACLE (python3 3.12, harness invocation
+#   python3 -c "src='from __future__ import annotations\n'+open(F).read(); \
+#               g={}; exec(compile(src,F,'exec'),g); g['main']()"):
+#   STDOUT: logging-default-done
+#   STDERR:
+#     WARNING:root:warn shown
+#     ERROR:root:error shown
+#     CRITICAL:root:critical shown
+#   (debug + info are BELOW the WARNING default and print nothing; the very first
+#    log call implicitly configures the root — probes P1/P2. pyrst reproduces
+#    this STDERR byte-for-byte via _log_emit; only the STREAM the harness reads
+#    differs, hence pyrst-only.)
+#
+# expected/parity_logging.txt pins the pyrst STDOUT (the print marker); the log
+# lines land on stderr and are the pinned oracle above.
+import logging
+
+
+def main() -> None:
+    logging.debug("dbg suppressed at default")     # stderr: (nothing — DEBUG<WARNING)
+    logging.info("info suppressed at default")      # stderr: (nothing — INFO<WARNING)
+    logging.warning("warn shown")                   # stderr: WARNING:root:warn shown
+    logging.error("error shown")                    # stderr: ERROR:root:error shown
+    logging.critical("critical shown")              # stderr: CRITICAL:root:critical shown
+    print("logging-default-done")                   # stdout

@@ -1,0 +1,20 @@
+# W4-d negative: lazy %-interpolation needs varargs, which pyrst does not have.
+# The level functions take a single `msg: str`, so the second positional argument
+# below is a hard ARITY error at typeck — NEVER silently dropped. Pre-format
+# instead: logging.info(f"x {y}").
+#
+# What CPython does with BOTH shapes (probe P9b, python3 3.12):
+#   - MATCHED (the call below), logging.info("x %s", "y"): CPython interpolates
+#     it CLEANLY — logging.warning("x %s", "y") -> WARNING:root:x y, exit 0 (the
+#     info form is merely suppressed at the default WARNING level). This is the
+#     canonical CPython lazy-logging idiom, yet pyrst rejects it anyway (no
+#     varargs) — so pyrst is honest-STRICTER than CPython on this exact call.
+#   - MISMATCH, logging.warning("x", "y") (no %-spec, extra arg): CPython ITSELF
+#     degrades — an internal "--- Logging error ---" + TypeError traceback to
+#     stderr, nothing interpolated, still exit 0. pyrst rejects that shape too,
+#     via the same arity error.
+import logging
+
+
+def main() -> None:
+    logging.info("x %s", "y")

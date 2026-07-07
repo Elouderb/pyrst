@@ -1,0 +1,34 @@
+# parity: pyrst-only
+#
+# W4-d logging — the LEVEL-THRESHOLD golden: debug is suppressed at the default
+# level but becomes VISIBLE after basicConfig(level=DEBUG); plus basicConfig's
+# repeat-call NO-OP. PYRST-ONLY (stderr output; see parity_logging.pyrs header).
+#
+# basicConfig(level=DEBUG) must be the FIRST logging call for debug to show:
+# CPython attaches the handler on the first log call OR the first basicConfig,
+# whichever comes first, and once configured a second basicConfig is a no-op.
+#
+# ORACLE (python3 3.12, harness invocation):
+#   STDOUT: logging-basicconfig-done
+#   STDERR:
+#     DEBUG:root:dbg visible
+#     INFO:root:info visible
+#     WARNING:root:warn visible
+#     ERROR:root:error visible
+#     CRITICAL:root:critical visible
+#     DEBUG:root:still visible after no-op basicConfig
+#   The SECOND basicConfig(level=ERROR) is a NO-OP (root already configured —
+#   probe P4), so the level stays DEBUG and the trailing debug still prints.
+import logging
+
+
+def main() -> None:
+    logging.basicConfig(level=logging.DEBUG)                 # configure FIRST → threshold DEBUG
+    logging.debug("dbg visible")                             # stderr: DEBUG:root:dbg visible
+    logging.info("info visible")                              # stderr: INFO:root:info visible
+    logging.warning("warn visible")                           # stderr: WARNING:root:warn visible
+    logging.error("error visible")                            # stderr: ERROR:root:error visible
+    logging.critical("critical visible")                      # stderr: CRITICAL:root:critical visible
+    logging.basicConfig(level=logging.ERROR)                  # NO-OP (already configured)
+    logging.debug("still visible after no-op basicConfig")    # stderr: DEBUG:root:... (level still DEBUG)
+    print("logging-basicconfig-done")                         # stdout

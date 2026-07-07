@@ -227,6 +227,24 @@ fn reject_unmodeled_kwargs(
                 {
                     return Ok(());
                 }
+                // (card 0a70d607) `base` is a tracked module (it HAS a function
+                // table) that does NOT define `name`: emit the SAME "module X has
+                // no function Y" diagnostic the kwarg-FREE qualified-call arm
+                // produces (the `_ =>` call arm's `module_funcs` lookup, below),
+                // instead of falling through to `check_expr(obj)` at the end of
+                // this fn — which type-checks the bare module ident and misreports
+                // the MODULE NAME ITSELF as an "undefined name". Resolved via the
+                // real module registry (`module_funcs`, the exact key the
+                // kwarg-free path keys off), NOT a hardcoded stdlib name list, so
+                // a kwarg-bearing call to a nonexistent module function (e.g.
+                // `warnings.filterwarnings("ignore", message=...)`) yields the
+                // identical, correct diagnostic as its kwarg-free form.
+                if env.ctx.module_funcs.contains_key(base.as_str()) {
+                    return Err(Error::Type {
+                        span,
+                        msg: format!("module `{}` has no function `{}`", base, name),
+                    });
+                }
                 // `ClassName.method(kw=..)` (static-style call): stays
                 // positional-only in v1 — fall through to the rejection below
                 // WITHOUT type-checking the class name as a value expression.
@@ -1546,7 +1564,7 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
             // is the decorator-only skip-list module (never a real loaded module), so
             // it stays unconditionally opaque as before.
             //
-            // (W3-3) IMPORT-AWARENESS: the other stdlib names are opaque ONLY when
+            // (W3-3) IMPORT-AWARENESS: the listed stdlib names are opaque ONLY when
             // the module is actually IMPORTED. An UNIMPORTED stdlib name used
             // qualified — `os.getcwd()` / `os.sep` with only `import os.path` (or no
             // `os` import at all) — is an honest "not imported" CHECK error, not a
@@ -1558,9 +1576,23 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
             // variable that happens to share a stdlib name (`string = "hi"`) is a
             // normal local and resolves via `env.lookup` below (the `!locals` guard),
             // so no real program regresses.
+            //
+            // (card 0a70d607) This is an EXPLICIT, curated list — NOT the full
+            // embedded-stdlib registry (`crate::stdlib::lookup`). Generalizing to
+            // every embedded module name was tried and REVERTED: several module
+            // names are legitimately used as an imported CLASS
+            // (`from datetime import time`) or a plain local (`platform =
+            // sys.platform`) in real programs, and intercepting those bare names
+            // here wrongly rejected working goldens (parity_datetime via `time`,
+            // parity_sys via `platform`). `warnings`/`logging` are added to the
+            // list — they ship a module surface and are never used as class/local
+            // names — so a bare unimported `warnings`/`logging` gets the honest
+            // "not imported" message like `os`/`math`. The kwarg-bearing "module X
+            // has no function Y" diagnostic these modules actually needed is handled
+            // structurally in `reject_unmodeled_kwargs`, independent of this list.
             if name == "dataclasses" {
                 Ty::Unknown
-            } else if matches!(name.as_str(), "math" | "sys" | "os" | "json" | "re" | "collections" | "itertools")
+            } else if matches!(name.as_str(), "math" | "sys" | "os" | "json" | "re" | "collections" | "itertools" | "warnings" | "logging")
                 && !env.locals.contains_key(name.as_str())
             {
                 let imported = env.ctx.module_funcs.contains_key(name.as_str())

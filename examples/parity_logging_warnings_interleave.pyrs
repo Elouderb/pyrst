@@ -1,0 +1,36 @@
+# parity: pyrst-only
+#
+# W4-d — INTERLEAVING logging + warnings + print in one program. pyrst routes log
+# and warning lines to STDERR and print to STDOUT, exactly like CPython, and the
+# per-stream ORDER matches CPython program order. PYRST-ONLY because (a) stderr
+# output is not harness-comparable (see parity_logging.pyrs), and (b) the merged
+# 2>&1 order is NOT reproducible: CPython block-buffers stdout (flushed at exit)
+# but leaves stderr unbuffered, so under `2>&1` the stderr lines appear BEFORE the
+# stdout lines regardless of program order (probe P8). pyrst line-buffers stdout
+# and flushes stderr per line, giving program order. `python3 -u` (unbuffered
+# stdout) restores CPython to program order too (probe P8b) — proving the merge
+# reorder is a CPython buffering artifact, not a pyrst divergence.
+#
+# ORACLE (python3 3.12):
+#   pyrst-equivalent per stream (program order):
+#     STDOUT:  step-1-before / step-2-mid / step-3-after
+#     STDERR:  WARNING:root:log at step 1  /  UserWarning: warn at step 2
+#   Merged `2>&1` (buffering):
+#     python3        -> stderr lines first, then stdout lines
+#     python3 -u     -> program order:
+#                         step-1-before
+#                         WARNING:root:log at step 1
+#                         step-2-mid
+#                         UserWarning: warn at step 2
+#                         step-3-after
+#   STDOUT (what the harness reads from pyrst): step-1-before / step-2-mid / step-3-after
+import logging
+import warnings
+
+
+def main() -> None:
+    print("step-1-before")                       # stdout
+    logging.warning("log at step 1")             # stderr: WARNING:root:log at step 1
+    print("step-2-mid")                          # stdout
+    warnings.warn("warn at step 2")              # stderr: UserWarning: warn at step 2
+    print("step-3-after")                        # stdout

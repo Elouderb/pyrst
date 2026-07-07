@@ -1,0 +1,34 @@
+# parity: pyrst-only
+#
+# W4-d warnings — the ONCE-vs-ALWAYS golden. "always" emits every call;
+# "once" emits only the first time a given message is seen (the `_seen` global
+# dedup, mutated via clone-out/rebind-back so it persists). PYRST-ONLY (stderr;
+# see parity_warnings.pyrs header).
+#
+# ORACLE (python3 3.12):
+#     warnings.simplefilter("always")
+#     for _ in range(3): warnings.warn("A repeated")   # -> 3 lines
+#     warnings.simplefilter("once")
+#     for _ in range(3): warnings.warn("B repeated")   # -> 1 line
+#   STDERR (category+message tail; CPython also prefixes <file>:<lineno>: and a
+#   source echo pyrst omits — see parity_warnings.pyrs):
+#     UserWarning: A repeated
+#     UserWarning: A repeated
+#     UserWarning: A repeated
+#     UserWarning: B repeated
+#   STDOUT: once-always-done
+import warnings
+
+
+def main() -> None:
+    warnings.simplefilter("always")
+    i: int = 0
+    while i < 3:
+        warnings.warn("A repeated")     # stderr x3 (always emits every call)
+        i = i + 1
+    warnings.simplefilter("once")        # resets the dedup registry
+    j: int = 0
+    while j < 3:
+        warnings.warn("B repeated")     # stderr x1 (once: only the first)
+        j = j + 1
+    print("once-always-done")           # stdout

@@ -1,0 +1,11 @@
+# W4-d negative: named loggers / the logger hierarchy are honest-deferred. pyrst
+# does not define `getLogger`, so `logging.getLogger(...)` is an HONEST typeck
+# error ("module logging has no function getLogger"), NOT a silent no-op that
+# hands back a fake logger. Use the module-level root functions (logging.warning
+# etc.) instead.
+import logging
+
+
+def main() -> None:
+    log = logging.getLogger("myapp")
+    log.warning("hello")

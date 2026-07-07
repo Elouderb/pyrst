@@ -279,6 +279,19 @@ pub const EMBEDDED_STDLIB: &[(&str, &str)] = &[
     // `platform` module's top-level functions of the same names on co-import
     // (flat namespace) — a program cannot import both `sys` and `platform`.
     ("sys", include_str!("../lib/sys.pyrs")),
+    // W4-d (card 0a70d607): `logging` + `warnings` — print-backed convenience
+    // surfaces over module-level MUTABLE state (docs/design/w4-globals.md §D.3).
+    // `logging` carries a root-logger LEVEL global (`_root_level`) + a
+    // `_configured` gate (basicConfig / debug / info / warning / error /
+    // critical, level-gated, emitting `LEVEL:root:msg` to STDERR like CPython);
+    // `warnings` carries a simplefilter `_action` + a `_seen` dedup set (warn /
+    // simplefilter, emitting `Category: message` to STDERR). Both emit via an
+    // @extern `eprintln!` shim, need only Rust std (no @crate), and stay on the
+    // single-file build path. Handlers/formatters/named loggers (logging) and
+    // filterwarnings/catch_warnings/warning-classes (warnings) are honest-
+    // deferred — see each module's header for the fidelity score + divergences.
+    ("logging", include_str!("../lib/logging.pyrs")),
+    ("warnings", include_str!("../lib/warnings.pyrs")),
 ];
 
 /// Look up an embedded stdlib module's source by NAME (e.g. `"os"`).

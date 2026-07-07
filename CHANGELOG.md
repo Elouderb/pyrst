@@ -2,6 +2,36 @@
 
 All notable changes to pyrst are documented here. This project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.4.0] — 2026-07-07
+
+The CLI release: pyrst programs now have module-level mutable state (`global`), read `sys.argv`, use `random`'s module-level API, and log through `logging`/`warnings` — the four unlocks of the W4 (G2) epic. Every behavior is python3-verified; the stdlib grows from 44 to 46 modules.
+
+### Module-level mutable state (`global`)
+
+- **The `global` keyword works end-to-end.** A module binding rebound under `global` (or holding a non-scalar-literal initializer) lowers to a `thread_local!` `Cell`/`RefCell` mutable static — zero `unsafe`, zero locking. Reads clone (pyrst's uniform value semantics); rebinds and in-place mutations (`items.append(x)` needs no `global`; `items = …` does — CPython-faithful) write the static. A scalar-literal, never-rebound binding keeps the immutable `const` path **byte-identically**.
+- **CPython import-time init order.** Module-level initializers run eagerly before `main()`, interleaved around `import` statements in source order (DFS, first-import-once) — a root-level initializer that textually precedes an import runs before the imported module's, exactly like python3.
+- **Rebinds work everywhere**: inside methods, operator dunders (`__eq__`/`__add__`/…), nested defs, and tuple-unpack targets (`global a, b; a, b = b, a`) — each shape golden-proven against python3. Closures read globals live at call time.
+- **The honest-error surface** rejects, with messages citing the CPython equivalent: forward-referencing initializers (`x: int = y + 1` before `y` — CPython `NameError`), `global x` colliding with a parameter or appearing after a use of `x` (CPython `SyntaxError`s), `global` names that live in another module or are builtin stubs, type-changing global rebinds (including inside nested defs), plus `nonlocal` and cross-module writes (v1 deferrals). `del xs[i]` — which silently no-opped on locals, dicts, and globals alike — is now an honest error naming `pop()`.
+
+### `sys.argv` — pyrst is a CLI language
+
+- `sys.argv: list[str]` is real (initialized from `std::env::args_os()`, lossy-decoded so non-UTF-8 arguments can never crash startup where CPython would run). Index it, slice it, iterate it, `len()` it, branch on flags — dual-run byte-identical to python3 for `argv[1:]` (`argv[0]` differs by construction and is documented).
+- The test harness threads a `# argv: a b c` directive to **both** runtimes with documented token semantics (whitespace-split, no quoting, no globbing), so CLI-shaped goldens dual-run under identical arguments.
+
+### `random` module-level API
+
+- `random.seed/random/randint/randrange/uniform/getrandbits/choice/sample/choices` over a hidden module-global generator — **MT19937 byte-identical to CPython after `seed(n)`**, including interleaved draws across the shared state and even post-error state (an empty-population `choices` advances the generator exactly once before its `IndexError`, like CPython). The old pyrst-only 2-arg free draws (`choice(rng, xs)`) are gone; the module API takes CPython's call shapes and its goldens dual-run. `random.shuffle` is an honest absence (CPython's in-place contract needs `Mut[T]`; `random.sample(xs, len(xs))` is the documented shuffled-copy idiom). Unseeded default is a deterministic `Random(0)` — a documented divergence from CPython's OS entropy; seed first for identical streams.
+
+### `logging` + `warnings` — new modules (stdlib 44 → 46)
+
+- **`logging`**: root-logger level state, `basicConfig(level=)` with CPython's first-call/repeat-no-op/implicit-configure semantics, `debug`/`info`/`warning`/`error`/`critical` emitting CPython's exact `LEVEL:root:message` format to **true stderr** — so `2>/dev/null` and friends behave byte-for-byte like python3. Level constants + `getLevelName`. Handlers/`getLogger` honest-deferred; the varargs `%`-interpolation shape is an honest arity error (pre-format with f-strings).
+- **`warnings`**: `warn(message, category)` to stderr with the full `simplefilter` action set — `ignore`/`always`/`once`/`default`/`module`, and `error`, which raises a **catchable** `UserWarning` at warn time (dual-run golden). Unknown actions raise CPython's `AssertionError` shape. Dedup is per-message (CPython dedups per source location — a precisely documented divergence).
+
+### Quality
+
+- A typechecker fix along the way: a keyword-argument-bearing call to a nonexistent module function now gets the correct ``module `X` has no function `Y` `` diagnostic instead of a misleading ``undefined name `X` ``.
+- `./test_all.sh`: **458/458 positive examples**, **227/227 negative fixtures** rejected at both `check` and `build`; **577 `cargo test` cases**; 0 compiler warnings. The dual-run parity harness runs 112 parity programs — **87 byte-identical against `python3`**, 25 documented `# parity: pyrst-only` (the stderr-output and bignum shapes, each with pinned python3 oracle evidence). Roughly 30 review-confirmed defects — including two silent-miscompile blockers (a `global` rebind inside an operator dunder lowering to a dead local; tuple-unpack rebinds writing fresh locals) — were found by the per-stage adversarial review stacks and fixed before any of this shipped. As of this release there remain **no known cases where an accepted program produces wrong output**.
+
 ## [0.3.0] — 2026-07-06
 
 The module-system release: dotted submodules are real, every module gets its own namespace, and the flat-namespace co-import restriction that shipped in 0.2.0 is gone. Every fixed behavior is python3-verified; the stdlib grows from 41 to 44 modules.

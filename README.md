@@ -37,9 +37,9 @@ def main() -> None:
 
 ## Status
 
-**v0.3.0.** Full compiler pipeline (lexer → parser → resolver → type checker → Rust codegen → `rustc`), end-to-end.
+**v0.4.0.** Full compiler pipeline (lexer → parser → resolver → type checker → Rust codegen → `rustc`), end-to-end. Programs have module-level mutable state (`global`), read `sys.argv`, and use `random`'s seeded module API and `logging`/`warnings` — pyrst is a real CLI language.
 
-`./test_all.sh`: **436/436 positive examples** build + run with matching output, **206/206 negative fixtures** correctly rejected (at both `check` and `build`), plus multi-file import demos. A dual-run parity harness runs 70 programs byte-identical against CPython 3.12 on every suite pass (89 parity files total; 19 documented pyrst-only). **572 in-crate `cargo test` cases**, 0 compiler warnings, CI green. Generators are **lazy** (infinite generators are safe); slice semantics are CPython-exact (verified against python3 on a 5,700+-case oracle); builtin runtime errors are catchable by their Python exception type; emitted Rust is rustfmt-formatted and deterministic. There are **no known cases where an accepted program produces wrong output** — every such bug found by this release's adversarial reviews (including a bare-lambda parameter shadowing an outer local, and a cross-module default-argument helper resolving in the wrong module) was fixed or is honestly rejected at `check`.
+`./test_all.sh`: **458/458 positive examples** build + run with matching output, **227/227 negative fixtures** correctly rejected (at both `check` and `build`), plus multi-file import demos. A dual-run parity harness runs 87 programs byte-identical against CPython 3.12 on every suite pass (112 parity files total; 25 documented pyrst-only, each with pinned python3 oracle evidence). **577 in-crate `cargo test` cases**, 0 compiler warnings, CI green. Generators are **lazy** (infinite generators are safe); slice semantics are CPython-exact (verified against python3 on a 5,700+-case oracle); builtin runtime errors are catchable by their Python exception type; emitted Rust is rustfmt-formatted and deterministic. There are **no known cases where an accepted program produces wrong output** — every such bug found by this release's adversarial reviews (including a `global` rebind inside an operator dunder that lowered to a dead local, and tuple-unpack rebinds writing fresh locals) was fixed or is honestly rejected at `check`.
 
 pyrst is **not** a Python-compatible subset or a Python runtime — it's its own statically typed language with Python-flavored syntax.
 
@@ -101,11 +101,12 @@ Both `import math; math.sqrt(x)` and `from math import sqrt` forms work, includi
 
 By design (see [SPEC.md](SPEC.md) / [PYTHON_COMPATIBILITY.md](PYTHON_COMPATIBILITY.md)): not Python-compatible; multiple inheritance, metaclasses, dynamic attribute access, `eval`/`exec`, and shared-mutable aliasing (`Rc`/`RefCell`) are out.
 
-Current v0.3.0 gaps (tracked, with workarounds):
+Current v0.4.0 gaps (tracked, with workarounds):
 - **Generators (`yield`) are lazy**, but a few shapes are deferred: `Iterator[T]` as a *parameter* type, generator **methods** (`yield` in a class method), `yield` inside `try`/`except`/`finally`, nested generator `def`s, generator expressions (`(x for x in ...)`), and explicit `next(g)`. Every non-lazy consumption (`len`/`gen[i]`/slicing/`reversed`/`str`/binops/`x in gen`/passing a generator where `list[T]` is required) is an honest `pyrst check` error suggesting `list(gen)` to materialize — see [PYTHON_COMPATIBILITY.md](PYTHON_COMPATIBILITY.md#generators-yield).
 - **Generic classes** can't be instantiated via a *qualified* name (`collections.deque[int]()`); use a flat import (`from collections import deque; d: deque[int] = deque()`).
 - **Generic methods inside a class** (`def m[U](self)`) are not yet supported (top-level generic functions are).
-- **No module-level mutable state**, so `random`'s module-level convenience API and `sys.argv` are not available (use the `Random` class; pass args explicitly).
+- **`nonlocal` and cross-module global writes** are honest errors (module-level mutable state is owner-module-only; closures capture by value). `random.shuffle` is absent for the same reason — use `random.sample(xs, len(xs))`.
+- **Keyword-only parameters (`*`) are not enforced** — e.g. `random.choices` accepts positional `k`, which CPython rejects (pass `k=` by keyword; enforcement is tracked).
 - A generic `Callable[[T], R]` with **two distinct** type variables (where `R` comes from a lambda's return) is an honest error; same-type-var forms (`Callable[[T], T]`, `Callable[[T, T], T]`) work.
 - The type checker leans on `rustc` for a few residual ownership/edge cases; the honest-errors invariant (no silent miscompiles) is the priority and is enforced by an extensive negative-test suite.
 

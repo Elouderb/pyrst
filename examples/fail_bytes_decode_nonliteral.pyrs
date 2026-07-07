@@ -1,0 +1,8 @@
+# W5-b HONEST DEFERRAL: the codec name must be the string LITERAL 'utf-8' so it can
+# be verified at CHECK (only utf-8 is supported). A runtime encoding variable cannot
+# be verified statically, so it is an honest CHECK error rather than a possible
+# silent non-utf-8 decode.
+def main() -> None:
+    enc: str = 'utf-8'
+    x: str = b'abc'.decode(enc)
+    print(x)

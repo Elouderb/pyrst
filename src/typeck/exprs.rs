@@ -406,19 +406,273 @@ pub(crate) fn bytes_binop_ty(op: BinOp, l: &Ty, r: &Ty, span: Span) -> Result<Ty
                 other
             )),
         },
-        // Membership on a `bytes` container (`x in b`) is a documented W5-b
-        // deferral. Rejecting it honestly here also closes the mismatched-`in`
-        // hole (`'A' in b'ABC'` — CPython TypeError) without a silent-wrong.
-        BinOp::In | BinOp::NotIn => err(
-            "membership tests on `bytes` (`x in b`) are not yet supported \
-             (deferred to the bytes-method wave)".to_string()
-        ),
+        // (W5-b) Membership on a `bytes` container (`x in b`). `is_bytes_binop`
+        // guarantees `r == Bytes`; the LHS decides the shape (python3-oracled §G):
+        //   int in bytes    -> byte-value test (RANGE-CHECKED: 256/-1 raise a
+        //                      catchable ValueError at runtime, CPython-faithful);
+        //   bytes in bytes  -> subsequence search (`b'' in b` is True).
+        // `str in bytes` stays an HONEST type error (CPython raises TypeError; the
+        // old loose path would silently mis-handle it) — decode/encode to bridge.
+        BinOp::In | BinOp::NotIn => match (l, r) {
+            (Ty::Int, Ty::Bytes) | (Ty::Bytes, Ty::Bytes) => Ok(Ty::Bool),
+            _ => err(format!(
+                "unsupported membership `{} in bytes`: only `int in bytes` (byte-value \
+                 test) and `bytes in bytes` (subsequence) are supported — `str in bytes` \
+                 is a type error (decode/encode to bridge `str` and `bytes`)",
+                other
+            )),
+        },
         _ => err(format!(
             "unsupported operand type(s) for `{}`: `bytes` (immutable bytes support \
              only `+ * == != < <= > >=` in W5-a)",
             binop_symbol(op)
         )),
     }
+}
+
+/// (W5-b) Whether `enc` is a string LITERAL naming utf-8 (case/`-`/`_`-insensitive):
+/// `Some(true)` = utf-8 literal, `Some(false)` = a literal naming a DIFFERENT
+/// (deferred) encoding, `None` = not a string literal (a variable / expression).
+fn utf8_encoding_literal(enc: &Expr) -> Option<bool> {
+    if let Expr::Str(s, _) = enc {
+        let norm = s.trim().to_ascii_lowercase().replace('_', "-");
+        Some(norm == "utf-8" || norm == "utf8")
+    } else {
+        None
+    }
+}
+
+/// (W5-b) The literal-encoding name for an error message (`'ascii'`), or a generic
+/// phrase when the encoding is not a string literal.
+fn encoding_display(enc: &Expr) -> String {
+    if let Expr::Str(s, _) = enc {
+        format!("'{}'", s)
+    } else {
+        "that encoding".to_string()
+    }
+}
+
+/// (W5-b) CHECK-level validation of a `bytes` method call's arity + argument types.
+/// The iron rule (design §E): every parameter shape pyrst does NOT support is an
+/// HONEST typeck error here — never a silent miscompile or a deferred `rustc` leak.
+/// pyrst's method machinery exposes no optional/kwargs surface for these, so the
+/// expressible subset ships and every extra-arg shape is a documented arity error,
+/// matching str's existing pyrst ceiling (no start/end, no maxsplit, no count). A
+/// KNOWN wrong-typed argument is rejected; `Unknown` stays permissive (codebase-
+/// wide policy). Runs at `check` so each `fail_*` negative rejects before `rustc`.
+fn check_bytes_method_call(
+    name: &str,
+    args: &[Expr],
+    kwargs: &[(String, Expr)],
+    env: &FuncEnv<'_>,
+    span: Span,
+) -> Result<()> {
+    let err = |msg: String| Err(Error::Type { span, msg });
+    if !kwargs.is_empty() {
+        return err(format!("bytes.{}() does not take keyword arguments", name));
+    }
+    let argc = args.len();
+    let ty = |i: usize| infer_expr_ty(&args[i], &env.locals, env.ctx);
+    let want_bytes = |i: usize, label: &str| -> Result<()> {
+        match ty(i) {
+            Ty::Bytes | Ty::Unknown => Ok(()),
+            Ty::Int => err(format!(
+                "bytes.{}(): an int argument (byte value) is not supported — pass a \
+                 `bytes` for {}",
+                name, label
+            )),
+            other => err(format!(
+                "bytes.{}(): {} must be `bytes`, found `{}`",
+                name, label, other
+            )),
+        }
+    };
+    let want_int = |i: usize, label: &str| -> Result<()> {
+        match ty(i) {
+            Ty::Int | Ty::Unknown => Ok(()),
+            other => err(format!(
+                "bytes.{}(): {} must be an `int`, found `{}`",
+                name, label, other
+            )),
+        }
+    };
+    match name {
+        "hex" | "upper" | "lower" | "isdigit" | "isalpha" | "isalnum" | "isspace" => {
+            if argc != 0 {
+                return err(format!("bytes.{}() takes no arguments", name));
+            }
+        }
+        "decode" => {
+            if argc >= 2 {
+                return err(
+                    "bytes.decode(): the `errors=` argument is not supported — only \
+                     strict utf-8 decoding is available (an invalid byte raises a \
+                     catchable UnicodeDecodeError)"
+                        .to_string(),
+                );
+            }
+            if argc == 1 {
+                match utf8_encoding_literal(&args[0]) {
+                    Some(true) => {}
+                    Some(false) => {
+                        return err(format!(
+                            "bytes.decode(): only 'utf-8' is supported ({} is deferred)",
+                            encoding_display(&args[0])
+                        ))
+                    }
+                    None => {
+                        return err(
+                            "bytes.decode(): the encoding must be the string literal \
+                             'utf-8' (only utf-8 is supported)"
+                                .to_string(),
+                        )
+                    }
+                }
+            }
+        }
+        "find" | "rfind" | "index" | "rindex" | "count" => {
+            if argc != 1 {
+                return err(format!(
+                    "bytes.{}(sub) takes exactly one bytes argument — the optional \
+                     start/end arguments are not supported",
+                    name
+                ));
+            }
+            want_bytes(0, "the search argument")?;
+        }
+        "startswith" | "endswith" => {
+            if argc != 1 {
+                return err(format!(
+                    "bytes.{}(prefix) takes exactly one bytes argument — a tuple of \
+                     prefixes and the optional start/end arguments are not supported",
+                    name
+                ));
+            }
+            if matches!(&args[0], Expr::Tuple(..)) || matches!(ty(0), Ty::Tuple(_)) {
+                return err(format!(
+                    "bytes.{}(): a tuple of prefixes is not supported — pass a single \
+                     `bytes`",
+                    name
+                ));
+            }
+            want_bytes(0, "the prefix")?;
+        }
+        "replace" => {
+            if argc != 2 {
+                return err(
+                    "bytes.replace(old, new) takes exactly two bytes arguments — the \
+                     optional count is not supported"
+                        .to_string(),
+                );
+            }
+            want_bytes(0, "the search argument")?;
+            want_bytes(1, "the replacement")?;
+        }
+        "split" | "rsplit" => {
+            if argc >= 2 {
+                return err(format!(
+                    "bytes.{}(): the maxsplit argument is not supported — pass only a \
+                     separator, or no argument for whitespace splitting",
+                    name
+                ));
+            }
+            if argc == 1 {
+                want_bytes(0, "the separator")?;
+            }
+        }
+        "join" => {
+            if argc != 1 {
+                return err(
+                    "bytes.join(iterable) takes exactly one argument (a list of bytes)"
+                        .to_string(),
+                );
+            }
+            match ty(0) {
+                Ty::Unknown => {}
+                Ty::List(inner) if matches!(inner.as_ref(), Ty::Bytes | Ty::Unknown) => {}
+                other => {
+                    return err(format!(
+                        "bytes.join(): the argument must be a `list[bytes]`, found `{}`",
+                        other
+                    ))
+                }
+            }
+        }
+        "strip" | "lstrip" | "rstrip" => {
+            if argc >= 2 {
+                return err(format!(
+                    "bytes.{}() takes at most one argument (a set of bytes to strip)",
+                    name
+                ));
+            }
+            if argc == 1 {
+                want_bytes(0, "the strip set")?;
+            }
+        }
+        "ljust" | "rjust" | "center" => {
+            if argc < 1 || argc > 2 {
+                return err(format!(
+                    "bytes.{}(width[, fillbyte]) takes one or two arguments",
+                    name
+                ));
+            }
+            want_int(0, "the width")?;
+            if argc == 2 {
+                want_bytes(1, "the fill byte")?;
+            }
+        }
+        "zfill" => {
+            if argc != 1 {
+                return err(
+                    "bytes.zfill(width) takes exactly one int argument".to_string(),
+                );
+            }
+            want_int(0, "the width")?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// (W5-b) CHECK-level validation of `str.encode(...)`. utf-8 only (a `String`'s
+/// bytes ARE UTF-8, so `encode` is `as_bytes().to_vec()`); a non-utf-8 / non-literal
+/// encoding or an `errors=` arg is an honest error (design defers ascii/latin-1/
+/// utf-16 to a follow-on).
+fn check_str_encode_call(
+    args: &[Expr],
+    kwargs: &[(String, Expr)],
+    span: Span,
+) -> Result<()> {
+    let err = |msg: String| Err(Error::Type { span, msg });
+    if !kwargs.is_empty() {
+        return err("str.encode() does not take keyword arguments".to_string());
+    }
+    if args.len() >= 2 {
+        return err(
+            "str.encode(): the `errors=` argument is not supported — only utf-8 \
+             encoding is available"
+                .to_string(),
+        );
+    }
+    if args.len() == 1 {
+        match utf8_encoding_literal(&args[0]) {
+            Some(true) => {}
+            Some(false) => {
+                return err(format!(
+                    "str.encode(): only 'utf-8' is supported ({} is deferred)",
+                    encoding_display(&args[0])
+                ))
+            }
+            None => {
+                return err(
+                    "str.encode(): the encoding must be the string literal 'utf-8' \
+                     (only utf-8 is supported)"
+                        .to_string(),
+                )
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Pure inference oracle — the single source of truth for expression types.
@@ -606,6 +860,14 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
                     && matches!(obj.as_ref(), Expr::Ident(sn, _) if sn == "str")
                 {
                     return Ty::Dict(Box::new(Ty::Int), Box::new(Ty::Int));
+                }
+                // (W5-b) `bytes.fromhex(s)` STATIC constructor -> bytes. Recognized
+                // structurally (mirrors str.maketrans) so it never depends on how
+                // the bare name `bytes` types.
+                if name == "fromhex"
+                    && matches!(obj.as_ref(), Expr::Ident(bn, _) if bn == "bytes")
+                {
+                    return Ty::Bytes;
                 }
             }
             if let Expr::Ident(n, _) = callee.as_ref() {
@@ -869,9 +1131,40 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
                     // Generics v2: substitute the receiver instance's type args
                     // into the method's (type-var-bearing) return, so a generic
                     // method call types concretely for codegen (`b.get(): int`).
-                    ctx.get_method(cls, name)
-                        .map(|s| subst_class_member(&s.ret, &recv, ctx))
-                        .unwrap_or(Ty::Unknown)
+                    if let Some(s) = ctx.get_method(cls, name) {
+                        subst_class_member(&s.ret, &recv, ctx)
+                    } else {
+                        // Not a real method: a CALLABLE FIELD invoked as `obj.f(args)`
+                        // (`self.op(x)` where `op: Callable[[int], int]`). Its call type
+                        // is the field-`Ty::Func`'s RETURN — the SAME resolution
+                        // `check_expr` does for this shape (its value-call fallback,
+                        // ~exprs.rs:3197) and codegen's `(obj.f)(args)` lowering. Without
+                        // this the oracle returned `Unknown`, so codegen's receiver-typed
+                        // dispatch gate was bypassed: a `bytes`-returning field-call
+                        // chained with a shared method name (`box.transform(b).strip()`)
+                        // fell through to str's name-matched arm -> rustc E0599 (check
+                        // passed, build died). Inheritance-aware via `get_all_fields`, and
+                        // the same `subst_class_member` the method path uses (a generic
+                        // field `f: Callable[[T], T]` resolves `T`). Mirrors the bare-attr
+                        // field resolution above (Expr::Attr arm).
+                        ctx.get_all_fields(cls.as_str())
+                            .iter()
+                            .find(|f| f.name == *name)
+                            .and_then(|f| {
+                                let tps = ctx
+                                    .classes
+                                    .get(cls.as_str())
+                                    .map(|c| c.type_params.as_slice())
+                                    .unwrap_or(&[]);
+                                let field_ty = Ty::from_type_expr_scoped(&f.ty, f.span, tps)
+                                    .unwrap_or(Ty::Unknown);
+                                match subst_class_member(&field_ty, &recv, ctx) {
+                                    Ty::Func(_, ret) => Some(*ret),
+                                    _ => None,
+                                }
+                            })
+                            .unwrap_or(Ty::Unknown)
+                    }
                 } else if let Some(t) = dict_get_ret(&recv, name, args.len()) {
                     // dict.get is arg-count-aware: get(k) -> Optional[V],
                     // get(k, default) -> V (see dict_get_ret).
@@ -1745,6 +2038,34 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                         }
                     }
                     return Ok(Ty::Dict(Box::new(Ty::Int), Box::new(Ty::Int)));
+                }
+                // (W5-b) `bytes.fromhex(s)` STATIC constructor -> bytes. Takes exactly
+                // one `str` (hex digits, ASCII whitespace between pairs ignored); an
+                // odd length / bad digit is a catchable runtime ValueError, so only
+                // the arity + arg-type are checked here.
+                if name == "fromhex"
+                    && matches!(obj.as_ref(), Expr::Ident(bn, _) if bn == "bytes")
+                {
+                    if !kwargs.is_empty() {
+                        return Err(Error::Type {
+                            span: *span,
+                            msg: "bytes.fromhex(s) does not take keyword arguments".into(),
+                        });
+                    }
+                    if args.len() != 1 {
+                        return Err(Error::Type {
+                            span: *span,
+                            msg: "bytes.fromhex(s) takes exactly one str argument".into(),
+                        });
+                    }
+                    let at = check_expr(&args[0], env)?;
+                    if !matches!(at, Ty::Str | Ty::Unknown) {
+                        return Err(Error::Type {
+                            span: *span,
+                            msg: format!("bytes.fromhex(s) requires a `str` argument, found `{}`", at),
+                        });
+                    }
+                    return Ok(Ty::Bytes);
                 }
             }
             // (W5-a) `bytes(...)` constructor. Validate the argument TYPE up front so
@@ -2859,6 +3180,16 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                                 }
                             }
                             for a in args { check_expr(a, env)?; }
+                            // (W5-b) bytes-method + str.encode arg/arity validation —
+                            // honest CHECK errors for every deferred parameter shape
+                            // (design §E iron rule) so no `rustc` leak and each
+                            // fail_* negative rejects at `check`. Args are already
+                            // checked above, so this reads types via infer_expr_ty.
+                            if matches!(obj_ty, Ty::Bytes) {
+                                check_bytes_method_call(name.as_str(), args, kwargs, env, *span)?;
+                            } else if matches!(obj_ty, Ty::Str) && name == "encode" {
+                                check_str_encode_call(args, kwargs, *span)?;
+                            }
                             // dict.get is arg-count-aware: get(k) -> Optional[V],
                             // get(k, default) -> V. Route through the shared helper
                             // so the checker and the inference oracle agree; fall

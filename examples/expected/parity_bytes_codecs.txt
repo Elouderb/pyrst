@@ -1,0 +1,11 @@
+b'hello'
+b'h\xc3\xa9llo'
+b'h\xc3\xa9llo'
+b'caf\xc3\xa9 \xf0\x9f\x98\x80'
+héllo
+héllo
+True
+True
+True
+b'\xe6\x97\xa5'
+3

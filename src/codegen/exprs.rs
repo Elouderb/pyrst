@@ -273,6 +273,19 @@ impl<'a> Codegen<'a> {
                             from, to
                         )));
                     }
+                    // (W5-b) `bytes.fromhex(s)` STATIC constructor -> Vec<u8>. Matched
+                    // structurally (like str.maketrans) because the receiver `bytes` is
+                    // a type name, not a bytes value, so it never reaches the bytes-
+                    // receiver dispatch. Whitespace between pairs is ignored; an odd
+                    // length / bad digit is a catchable ValueError with CPython's exact
+                    // position/message (validated in the prelude helper).
+                    if name == "fromhex"
+                        && matches!(obj.as_ref(), Expr::Ident(bn, _) if bn == "bytes")
+                        && args.len() == 1
+                    {
+                        let s = self.emit_expr(&args[0])?;
+                        return Ok(Some(format!("__py_bytes_fromhex(&({}))", s)));
+                    }
                     // Qualified module call `X.f(args)` for a REAL imported module
                     // (card 81db88e0). When X is a tracked module name and f is one
                     // of its functions, lower the call to the FLAT function `f(args)`
@@ -479,6 +492,26 @@ impl<'a> Codegen<'a> {
                                 )));
                             }
                         }
+                    }
+
+                    // (W5-b) bytes methods — gated on a bytes receiver and dispatched
+                    // BEFORE every str/list arm below. Those arms match on `name`
+                    // ALONE (no receiver guard) — `find`/`split`/`replace`/`count`/
+                    // `index`/`strip`/`upper`/`lower`/`join`/`startswith` all overlap
+                    // bytes' surface — so a bytes receiver reaching them would emit
+                    // `.as_str()`/`.chars()`/`__py_str_find` (a rustc leak or a
+                    // silent char-offset miscompile). This wins the overlap, mirroring
+                    // the set-method receiver-gating below. typeck already proved the
+                    // method exists and its args/arity are valid (check_bytes_method_call).
+                    if matches!(self.type_of_expr(obj.as_ref()), Ty::Bytes) {
+                        return self.emit_bytes_method_call(&obj_s, name, &parts).map(Some);
+                    }
+                    // (W5-b) `str.encode()` / `encode('utf-8')` -> bytes. A String's
+                    // bytes ARE UTF-8, so this is a borrow-and-copy (never consumes the
+                    // receiver). utf-8 only; the encoding/errors args were validated at
+                    // check (`check_str_encode_call`).
+                    if name == "encode" && matches!(self.type_of_expr(obj.as_ref()), Ty::Str) {
+                        return Ok(Some(format!("{}.as_bytes().to_vec()", obj_s)));
                     }
 
                     // Special handling for string methods that return &str and need to be converted to String
@@ -1078,6 +1111,96 @@ impl<'a> Codegen<'a> {
                     return Ok(Some(format!("{}.{}({})", obj_s, method, parts.join(", "))));
                 }
         Ok(None)
+    }
+
+    /// (W5-b) Lower a `bytes` method call to the BYTE-offset `__py_bytes_*` prelude
+    /// helper (mod.rs BYTES_PRELUDE), all python3-oracle-validated. `obj_s` is the
+    /// receiver value expression; `parts` are the emit_consuming'd arguments (a
+    /// `bytes` arg is a `Vec<u8>` value, an int arg an `i64`). typeck
+    /// (`check_bytes_method_call`) already validated the method exists and its
+    /// arity/arg-types, so every arm here is reachable only with valid inputs.
+    pub(crate) fn emit_bytes_method_call(
+        &mut self,
+        obj_s: &str,
+        name: &str,
+        parts: &[String],
+    ) -> Result<String> {
+        // `&(recv)` / `&(arg)` are `&[u8]` views (a `&Vec<u8>` derefs to `&[u8]`).
+        let recv = format!("&({})", obj_s);
+        let a0 = || format!("&({})", parts[0]);
+        match name {
+            "hex" => Ok(format!("__py_bytes_hex({})", recv)),
+            // decode consumes its Vec<u8>; clone so the receiver survives (Python
+            // `b.decode()` does not consume `b`).
+            "decode" => Ok(format!("__py_bytes_decode_utf8(({}).clone())", obj_s)),
+            "find" => Ok(format!("__py_bytes_find({}, {})", recv, a0())),
+            "rfind" => Ok(format!("__py_bytes_rfind({}, {})", recv, a0())),
+            "index" => Ok(format!("__py_bytes_index_of({}, {})", recv, a0())),
+            "rindex" => Ok(format!("__py_bytes_rindex_of({}, {})", recv, a0())),
+            "count" => Ok(format!("__py_bytes_count({}, {})", recv, a0())),
+            // starts_with/ends_with are slice methods; `&Vec<u8>` derefs to `&[u8]`.
+            "startswith" => Ok(format!("({}).starts_with(&({}))", obj_s, parts[0])),
+            "endswith" => Ok(format!("({}).ends_with(&({}))", obj_s, parts[0])),
+            "replace" => Ok(format!(
+                "__py_bytes_replace({}, {}, &({}))",
+                recv, a0(), parts[1]
+            )),
+            // No maxsplit supported, so rsplit == split (order preserved) — both the
+            // separator form and the no-arg whitespace form.
+            "split" | "rsplit" => {
+                if parts.is_empty() {
+                    Ok(format!("__py_bytes_split_ws({})", recv))
+                } else {
+                    Ok(format!("__py_bytes_split({}, {})", recv, a0()))
+                }
+            }
+            // sep.join(list[bytes]); parts[0] is a `Vec<Vec<u8>>` (-> `&[Vec<u8>]`).
+            "join" => Ok(format!("__py_bytes_join({}, &({}))", recv, parts[0])),
+            "strip" => Ok(self.emit_bytes_strip(obj_s, parts, true, true)),
+            "lstrip" => Ok(self.emit_bytes_strip(obj_s, parts, true, false)),
+            "rstrip" => Ok(self.emit_bytes_strip(obj_s, parts, false, true)),
+            "upper" => Ok(format!("__py_bytes_upper({})", recv)),
+            "lower" => Ok(format!("__py_bytes_lower({})", recv)),
+            "ljust" => Ok(self.emit_bytes_pad(obj_s, parts, "ljust", false, true)),
+            "rjust" => Ok(self.emit_bytes_pad(obj_s, parts, "rjust", true, false)),
+            "center" => Ok(self.emit_bytes_pad(obj_s, parts, "center", true, true)),
+            "zfill" => Ok(format!("__py_bytes_zfill({}, {})", recv, parts[0])),
+            "isdigit" => Ok(format!("__py_bytes_all({}, __py_byte_is_digit)", recv)),
+            "isalpha" => Ok(format!("__py_bytes_all({}, __py_byte_is_alpha)", recv)),
+            "isalnum" => Ok(format!("__py_bytes_all({}, __py_byte_is_alnum)", recv)),
+            "isspace" => Ok(format!("__py_bytes_all({}, __py_byte_is_space)", recv)),
+            other => Err(crate::diag::Error::Codegen(format!(
+                "bytes method `{}` is not supported (W5-b)",
+                other
+            ))),
+        }
+    }
+
+    /// (W5-b) `b.strip()/lstrip()/rstrip()` — default strips the ASCII whitespace
+    /// SET [9,10,11,12,13,32] (0x0b included, unlike Rust's `is_ascii_whitespace`);
+    /// with an argument the arg is a SET of bytes to strip (CPython semantics).
+    fn emit_bytes_strip(&self, obj_s: &str, parts: &[String], left: bool, right: bool) -> String {
+        let set = if parts.is_empty() {
+            "&[9u8, 10, 11, 12, 13, 32]".to_string()
+        } else {
+            format!("&({})", parts[0])
+        };
+        format!("__py_bytes_strip(&({}), {}, {}, {})", obj_s, set, left, right)
+    }
+
+    /// (W5-b) `b.ljust/rjust/center(width[, fillbyte])` — default fill is a space
+    /// (0x20); a fillbyte that is not exactly one byte is a catchable runtime
+    /// TypeError (CPython). center's left margin is `marg/2 + (marg & width & 1)`.
+    fn emit_bytes_pad(&self, obj_s: &str, parts: &[String], meth: &str, left_pad: bool, right_pad: bool) -> String {
+        let fill = if parts.len() >= 2 {
+            format!("&({})", parts[1])
+        } else {
+            "b\" \"".to_string()
+        };
+        format!(
+            "__py_bytes_pad(&({}), {}, {}, \"{}\", {}, {})",
+            obj_s, parts[0], fill, meth, left_pad, right_pad
+        )
     }
 
     #[allow(clippy::borrowed_box)]
@@ -3595,6 +3718,14 @@ impl<'a> Codegen<'a> {
                             Ty::Dict(_, _) => format!("{}.contains_key(&{})", r, l),
                             Ty::List(_) => format!("{}.iter().any(|__x| __x == &{})", r, l),
                             Ty::Set(_) => format!("{}.contains(&{})", r, l),
+                            // (W5-b) `x in b` — `int in bytes` is a RANGE-CHECKED
+                            // byte-value test (256/-1 raise a catchable ValueError);
+                            // `bytes in bytes` is a subsequence search. typeck
+                            // rejected `str in bytes`, so only Int/Bytes lhs reach here.
+                            Ty::Bytes => match lt {
+                                Ty::Int => format!("__py_int_in_bytes({}, &({}))", l, r),
+                                _ => format!("__py_bytes_contains(&({}), &({}))", l, r),
+                            },
                             _ => format!("{}.contains(&{})", r, l),
                         };
                         return Ok(contains_method);
@@ -3605,6 +3736,11 @@ impl<'a> Codegen<'a> {
                             Ty::Dict(_, _) => format!("!{}.contains_key(&{})", r, l),
                             Ty::List(_) => format!("!{}.iter().any(|__x| __x == &{})", r, l),
                             Ty::Set(_) => format!("!{}.contains(&{})", r, l),
+                            // (W5-b) negated bytes membership (see BinOp::In).
+                            Ty::Bytes => match lt {
+                                Ty::Int => format!("!__py_int_in_bytes({}, &({}))", l, r),
+                                _ => format!("!__py_bytes_contains(&({}), &({}))", l, r),
+                            },
                             _ => format!("!{}.contains(&{})", r, l),
                         };
                         return Ok(contains_method);

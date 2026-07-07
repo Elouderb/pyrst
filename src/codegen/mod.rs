@@ -821,6 +821,16 @@ fn __py_open(path: &str, mode: &str) -> PyFile {
 /// free. It coexists with the blanket `impl<T: PyRepr> PyRepr for Vec<T>`
 /// because rustc proves `u8: PyRepr` is unsatisfiable (no such impl), so the two
 /// never overlap (rustc-1.95 coherence-probe-verified).
+///
+/// (W5-b) The remaining `__py_bytes_*` fns are the method + codec surface, all
+/// BYTE-offset and python3-oracle-validated (scratchpad probes): `fromhex`
+/// (CPython position/message), strict `decode_utf8` (byte-identical
+/// UnicodeDecodeError shape), `find`/`rfind`/`index_of`/`rindex_of`/`count`
+/// (subsequence; index_of/rindex_of raise `ValueError: subsection not found`),
+/// `replace`/`split`/`split_ws`/`join`/`strip`/`pad`/`zfill`/`hex`/`upper`/
+/// `lower`, the `int in bytes` range-checked membership + `bytes in bytes`
+/// subsequence, and the ASCII-only predicate helpers. All under the crate
+/// `#![allow(dead_code)]`, emitted once like the repr engine.
 const BYTES_PRELUDE: &str = r#"fn __py_bytes_repr(b: &[u8]) -> String {
     let has_single = b.contains(&b'\'');
     let has_double = b.contains(&b'"');
@@ -846,6 +856,173 @@ fn __py_bytes_index(b: &[u8], i: i64) -> i64 {
     b[j as usize] as i64
 }
 impl PyRepr for Vec<u8> { fn py_repr(&self) -> String { __py_bytes_repr(self) } }
+fn __py_bytes_fromhex(s: &str) -> Vec<u8> {
+    let raw = s.as_bytes();
+    let n = raw.len();
+    let mut out: Vec<u8> = Vec::new();
+    let mut i = 0usize;
+    let hexval = |c: u8| -> i32 { match c { b'0'..=b'9' => (c - b'0') as i32, b'a'..=b'f' => (c - b'a' + 10) as i32, b'A'..=b'F' => (c - b'A' + 10) as i32, _ => -1 } };
+    while i < n {
+        if matches!(raw[i], 9 | 10 | 11 | 12 | 13 | 32) { i += 1; continue; }
+        let top = hexval(raw[i]);
+        if top < 0 { panic!("ValueError\0non-hexadecimal number found in fromhex() arg at position {}", i); }
+        if i + 1 >= n { panic!("ValueError\0non-hexadecimal number found in fromhex() arg at position {}", i + 1); }
+        let bot = hexval(raw[i + 1]);
+        if bot < 0 { panic!("ValueError\0non-hexadecimal number found in fromhex() arg at position {}", i + 1); }
+        out.push(((top << 4) | bot) as u8);
+        i += 2;
+    }
+    out
+}
+fn __py_bytes_decode_utf8(b: Vec<u8>) -> String {
+    match String::from_utf8(b) {
+        Ok(s) => s,
+        Err(e) => {
+            let ue = e.utf8_error();
+            let p = ue.valid_up_to();
+            let raw = e.as_bytes();
+            match ue.error_len() {
+                None => {
+                    if raw.len() - p <= 1 {
+                        panic!("UnicodeDecodeError\0'utf-8' codec can't decode byte 0x{:02x} in position {}: unexpected end of data", raw[p], p);
+                    } else {
+                        panic!("UnicodeDecodeError\0'utf-8' codec can't decode bytes in position {}-{}: unexpected end of data", p, raw.len() - 1);
+                    }
+                }
+                Some(n) => {
+                    if n > 1 {
+                        // A valid lead byte plus >=1 valid continuation byte was
+                        // consumed before an INVALID continuation byte: CPython
+                        // reports the RANGE form `bytes in position P-Q` (Q = P+n-1).
+                        // For error_len n>1 the reason is ALWAYS "invalid continuation
+                        // byte" (an invalid START byte is always error_len==1) — verified
+                        // against python3 3.12 + a Rust `Utf8Error::error_len` probe
+                        // (b'\xe2\x82\x28'->0-1 n=2, b'\xf0\x90\x8d\x28'->0-2 n=3).
+                        panic!("UnicodeDecodeError\0'utf-8' codec can't decode bytes in position {}-{}: invalid continuation byte", p, p + n - 1);
+                    } else {
+                        let bad = raw[p];
+                        let reason = if (0xc2..=0xf4).contains(&bad) { "invalid continuation byte" } else { "invalid start byte" };
+                        panic!("UnicodeDecodeError\0'utf-8' codec can't decode byte 0x{:02x} in position {}: {}", bad, p, reason);
+                    }
+                }
+            }
+        }
+    }
+}
+fn __py_bytes_find(hay: &[u8], needle: &[u8]) -> i64 {
+    if needle.is_empty() { return 0; }
+    if needle.len() > hay.len() { return -1; }
+    for start in 0..=(hay.len() - needle.len()) { if &hay[start..start + needle.len()] == needle { return start as i64; } }
+    -1
+}
+fn __py_bytes_rfind(hay: &[u8], needle: &[u8]) -> i64 {
+    if needle.is_empty() { return hay.len() as i64; }
+    if needle.len() > hay.len() { return -1; }
+    for start in (0..=(hay.len() - needle.len())).rev() { if &hay[start..start + needle.len()] == needle { return start as i64; } }
+    -1
+}
+fn __py_bytes_index_of(hay: &[u8], needle: &[u8]) -> i64 {
+    let r = __py_bytes_find(hay, needle);
+    if r < 0 { panic!("ValueError\0subsection not found"); }
+    r
+}
+fn __py_bytes_rindex_of(hay: &[u8], needle: &[u8]) -> i64 {
+    let r = __py_bytes_rfind(hay, needle);
+    if r < 0 { panic!("ValueError\0subsection not found"); }
+    r
+}
+fn __py_bytes_count(hay: &[u8], needle: &[u8]) -> i64 {
+    if needle.is_empty() { return hay.len() as i64 + 1; }
+    if needle.len() > hay.len() { return 0; }
+    let mut count = 0i64;
+    let mut start = 0usize;
+    while start + needle.len() <= hay.len() {
+        if &hay[start..start + needle.len()] == needle { count += 1; start += needle.len(); } else { start += 1; }
+    }
+    count
+}
+fn __py_bytes_replace(hay: &[u8], old: &[u8], new: &[u8]) -> Vec<u8> {
+    if old.is_empty() {
+        let mut out = Vec::new();
+        out.extend_from_slice(new);
+        for &b in hay { out.push(b); out.extend_from_slice(new); }
+        return out;
+    }
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < hay.len() {
+        if i + old.len() <= hay.len() && &hay[i..i + old.len()] == old { out.extend_from_slice(new); i += old.len(); }
+        else { out.push(hay[i]); i += 1; }
+    }
+    out
+}
+fn __py_bytes_split(hay: &[u8], sep: &[u8]) -> Vec<Vec<u8>> {
+    if sep.is_empty() { panic!("ValueError\0empty separator"); }
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    let mut cur: Vec<u8> = Vec::new();
+    let mut i = 0usize;
+    while i < hay.len() {
+        if i + sep.len() <= hay.len() && &hay[i..i + sep.len()] == sep { out.push(std::mem::take(&mut cur)); i += sep.len(); }
+        else { cur.push(hay[i]); i += 1; }
+    }
+    out.push(cur);
+    out
+}
+fn __py_bytes_split_ws(hay: &[u8]) -> Vec<Vec<u8>> {
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    let mut cur: Vec<u8> = Vec::new();
+    for &b in hay {
+        if matches!(b, 9 | 10 | 11 | 12 | 13 | 32) { if !cur.is_empty() { out.push(std::mem::take(&mut cur)); } }
+        else { cur.push(b); }
+    }
+    if !cur.is_empty() { out.push(cur); }
+    out
+}
+fn __py_bytes_join(sep: &[u8], parts: &[Vec<u8>]) -> Vec<u8> { parts.join(sep) }
+fn __py_bytes_strip(b: &[u8], set: &[u8], left: bool, right: bool) -> Vec<u8> {
+    let mut lo = 0usize;
+    let mut hi = b.len();
+    if left { while lo < hi && set.contains(&b[lo]) { lo += 1; } }
+    if right { while hi > lo && set.contains(&b[hi - 1]) { hi -= 1; } }
+    b[lo..hi].to_vec()
+}
+fn __py_int_in_bytes(v: i64, b: &[u8]) -> bool {
+    if !(0..=255).contains(&v) { panic!("ValueError\0byte must be in range(0, 256)"); }
+    b.contains(&(v as u8))
+}
+fn __py_bytes_contains(needle: &[u8], hay: &[u8]) -> bool { __py_bytes_find(hay, needle) >= 0 }
+fn __py_bytes_pad(b: &[u8], width: i64, fill: &[u8], meth: &str, left_pad: bool, right_pad: bool) -> Vec<u8> {
+    if fill.len() != 1 { panic!("TypeError\0{}() argument 2 must be a byte string of length 1, not bytes", meth); }
+    let w = if width < 0 { 0usize } else { width as usize };
+    if b.len() >= w { return b.to_vec(); }
+    let total = w - b.len();
+    let lpad = if left_pad && right_pad { total / 2 + (total & w & 1) } else if left_pad { total } else { 0 };
+    let rpad = total - lpad;
+    let mut out: Vec<u8> = Vec::with_capacity(w);
+    out.extend(std::iter::repeat(fill[0]).take(lpad));
+    out.extend_from_slice(b);
+    out.extend(std::iter::repeat(fill[0]).take(rpad));
+    out
+}
+fn __py_bytes_zfill(b: &[u8], width: i64) -> Vec<u8> {
+    let w = if width < 0 { 0usize } else { width as usize };
+    if b.len() >= w { return b.to_vec(); }
+    let pad = w - b.len();
+    let mut out: Vec<u8> = Vec::with_capacity(w);
+    let mut body_start = 0usize;
+    if !b.is_empty() && (b[0] == b'+' || b[0] == b'-') { out.push(b[0]); body_start = 1; }
+    out.extend(std::iter::repeat(b'0').take(pad));
+    out.extend_from_slice(&b[body_start..]);
+    out
+}
+fn __py_bytes_hex(b: &[u8]) -> String { b.iter().map(|x| format!("{:02x}", x)).collect() }
+fn __py_bytes_upper(b: &[u8]) -> Vec<u8> { b.iter().map(|x| x.to_ascii_uppercase()).collect() }
+fn __py_bytes_lower(b: &[u8]) -> Vec<u8> { b.iter().map(|x| x.to_ascii_lowercase()).collect() }
+fn __py_bytes_all(b: &[u8], f: fn(u8) -> bool) -> bool { !b.is_empty() && b.iter().all(|&c| f(c)) }
+fn __py_byte_is_digit(c: u8) -> bool { c.is_ascii_digit() }
+fn __py_byte_is_alpha(c: u8) -> bool { c.is_ascii_alphabetic() }
+fn __py_byte_is_alnum(c: u8) -> bool { c.is_ascii_alphanumeric() }
+fn __py_byte_is_space(c: u8) -> bool { matches!(c, 9 | 10 | 11 | 12 | 13 | 32) }
 "#;
 
 /// (LAZY-GEN V1-b) The lazy-generator runtime. A pyrst generator — a `def` whose

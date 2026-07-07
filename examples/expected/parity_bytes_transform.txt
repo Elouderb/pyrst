@@ -1,0 +1,26 @@
+b'aXYaXY'
+b'aa'
+b'abc'
+[b'a', b'b', b'c']
+[b'a', b'', b'b']
+[b'', b'a', b'']
+[b'a', b'b', b'c']
+[b'a', b'b', b'c']
+[]
+[b'a', b'b', b'c']
+[b'a', b'b', b'c']
+True
+b'a-b-c'
+b'ab'
+b'solo'
+b'abc'
+b'abc'
+b'abc'
+b'abc  '
+b'  abc'
+b'abc'
+b'abc'
+b'ABC123'
+b'\xff\xe9AB'
+b'abc123'
+b'\xff\xc9ab'

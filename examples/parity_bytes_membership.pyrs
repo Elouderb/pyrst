@@ -1,0 +1,23 @@
+# W5-b: bytes membership — `int in bytes` (byte-value test) and `bytes in bytes`
+# (subsequence). `b'' in b` is True. Out-of-range int raises ValueError (see
+# parity_bytes_decode_error). `str in bytes` is a type error (rejected at check).
+def main() -> None:
+    # int in bytes -> byte-value test
+    print(65 in b'ABC')
+    print(99 in b'ABC')
+    print(0 in b'\x00A')
+    print(255 in b'\xff')
+    print(99 not in b'ABC')
+    # bytes in bytes -> subsequence
+    print(b'AB' in b'ABC')
+    print(b'BC' in b'ABC')
+    print(b'x' in b'ABC')
+    print(b'' in b'ABC')
+    print(b'ABC' in b'ABC')
+    print(b'AC' not in b'ABC')
+    # membership drives control flow
+    data: bytes = b'GET /index HTTP/1.1'
+    if b'GET' in data:
+        print('is-get')
+    if 47 in data:
+        print('has-slash')

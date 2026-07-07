@@ -1,0 +1,18 @@
+# W5-b: bytes justification — ljust / rjust / center / zfill. Default fill is a
+# space (0x20); an explicit fill byte is honored. zfill keeps a leading +/- sign
+# first. center's odd space goes RIGHT (CPython's margin rule). Dual-run vs python3.
+def main() -> None:
+    print(b'abc'.ljust(5))
+    print(b'abc'.ljust(5, b'*'))
+    print(b'abc'.ljust(2))
+    print(b'abc'.rjust(5))
+    print(b'abc'.rjust(5, b'*'))
+    print(b'abc'.center(5))
+    print(b'abc'.center(6))
+    print(b'abc'.center(5, b'*'))
+    print(b'abc'.center(2))
+    print(b'42'.zfill(5))
+    print(b'-42'.zfill(5))
+    print(b'+42'.zfill(5))
+    print(b'12345'.zfill(3))
+    print(b''.zfill(3))

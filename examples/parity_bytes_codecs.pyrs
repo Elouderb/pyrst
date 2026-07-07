@@ -1,0 +1,19 @@
+# W5-b: str.encode() / bytes.decode() — utf-8 codecs, dual-run vs python3.
+# A String's bytes ARE UTF-8, so encode is a pure byte view; decode is strict
+# (an invalid byte raises UnicodeDecodeError — see parity_bytes_decode_error).
+# Round-trip s.encode().decode() == s holds, including multibyte code points.
+def main() -> None:
+    print('hello'.encode())
+    print('héllo'.encode('utf-8'))
+    print('héllo'.encode('UTF-8'))
+    print('café 😀'.encode())
+    print(b'h\xc3\xa9llo'.decode())
+    print(b'h\xc3\xa9llo'.decode('utf-8'))
+    # round-trips (ASCII, accented, emoji)
+    print('plain ascii'.encode().decode() == 'plain ascii')
+    print('héllo wörld'.encode().decode() == 'héllo wörld')
+    print('🎯 mixed 日本語'.encode().decode() == '🎯 mixed 日本語')
+    # a str's bytes are its utf-8 encoding
+    e: bytes = '日'.encode()
+    print(e)
+    print(len(e))

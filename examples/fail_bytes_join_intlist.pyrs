@@ -1,0 +1,6 @@
+# W5-b HONEST REJECTION (arg type): bytes.join requires a list[bytes]. A list[int]
+# is a CPython TypeError ("sequence item 0: expected a bytes-like object, int
+# found") — pyrst rejects it at CHECK rather than leaking a rustc `&[Vec<u8>]` error.
+def main() -> None:
+    x: bytes = b'-'.join([1, 2, 3])
+    print(x)

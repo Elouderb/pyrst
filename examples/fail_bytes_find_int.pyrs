@@ -1,0 +1,6 @@
+# W5-b HONEST DEFERRAL (arg type): bytes.find/index/count take a `bytes` argument in
+# pyrst. CPython also accepts an int (a single byte value to locate); that form is
+# deferred and is an honest CHECK error, never a silent rustc leak on `&Vec<i64>`.
+def main() -> None:
+    x: int = b'abc'.find(97)
+    print(x)

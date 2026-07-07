@@ -1,6 +1,6 @@
-# W5-a HONEST REJECTION: membership over a `bytes` container is deferred to the
-# bytes-method wave. This also closes the mismatched-`in` hole — `"A" in b"ABC"`
-# is a CPython TypeError ("a bytes-like object is required, not 'str'") — without
-# letting the loose generic membership path leak a rustc error.
+# W5-b HONEST REJECTION: `int in bytes` and `bytes in bytes` are now supported, but
+# `str in bytes` stays a type error — CPython raises TypeError ("a bytes-like object
+# is required, not 'str'"). pyrst rejects it at CHECK (decode/encode to bridge str
+# and bytes) rather than letting the loose generic membership path leak a rustc error.
 def main() -> None:
     print("A" in b"ABC")

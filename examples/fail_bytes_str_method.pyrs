@@ -1,7 +1,8 @@
-# W5-a HONEST REJECTION: a `str` method called on `bytes` (`b.upper()`) is an
-# honest "type `bytes` has no method" CHECK error, not a stub and not a rustc
-# E0599 leak. The whole bytes method surface (hex/decode/find/split/...) is the
-# W5-b wave; until then every `b.method()` is an honest unknown-method error.
+# W5-b HONEST REJECTION: a str-ONLY method called on `bytes` is an honest "type
+# `bytes` has no method" CHECK error, never a stub or a rustc E0599 leak. `encode`
+# lives on `str` (you *encode* a str, *decode* bytes) and is NOT in the bytes method
+# surface, so `b.encode()` rejects. (W5-a used b.upper() here, which is now a REAL
+# bytes method, so this was repurposed to keep guarding the str/bytes surface boundary.)
 def main() -> None:
     b: bytes = b"abc"
-    print(b.upper())
+    print(b.encode())

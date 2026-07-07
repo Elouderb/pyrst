@@ -1,0 +1,16 @@
+# W5-b: bytes.hex() / bytes.fromhex(s) — dual-run vs python3 (CPython golden).
+# hex() is lowercase, no separator; fromhex ignores ASCII whitespace BETWEEN pairs
+# (not within one); round-trip `bytes.fromhex(b.hex()) == b` holds for every byte.
+def main() -> None:
+    print(b'\x00\xff\x10'.hex())
+    print(b''.hex())
+    print(b'abc'.hex())
+    # fromhex: plain, whitespace between pairs, leading/trailing, uppercase
+    print(bytes.fromhex('00ff10'))
+    print(bytes.fromhex('00 ff 10'))
+    print(bytes.fromhex('  00ff  '))
+    print(bytes.fromhex('00FF10'))
+    # round-trip across the full byte range
+    orig: bytes = b'\x00\x01\x7f\x80\xfeA b'
+    print(bytes.fromhex(orig.hex()) == orig)
+    print(orig.hex())

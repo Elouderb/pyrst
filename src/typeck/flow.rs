@@ -3705,8 +3705,13 @@ pub(crate) const STR_METHODS: &[&str] = &[
     // str.casefold for ASCII / İ / Σ but NOT for full-fold chars (ß stays ß, not
     // "ss"; ﬁ stays ﬁ, not "fi") — see PYTHON_COMPATIBILITY.md.
     "casefold", "rsplit", "translate",
-    // NOTE: encode/isdecimal/format stay removed — codegen cannot emit them
-    // (card 36f66dd2).
+    // (W5-b) `encode` is now emittable — `str.encode()`/`encode('utf-8')` lowers to
+    // `s.as_bytes().to_vec()` (a String's bytes ARE UTF-8) and returns `bytes`. Only
+    // utf-8 is supported; a non-utf-8 / non-literal encoding or an `errors=` arg is
+    // an honest CHECK error (`check_str_encode_call`). Was removed under card
+    // 36f66dd2 when codegen could not emit it.
+    "encode",
+    // NOTE: isdecimal/format stay removed — codegen cannot emit them (card 36f66dd2).
 ];
 pub(crate) const LIST_METHODS: &[&str] = &[
     "append", "extend", "insert", "remove", "pop", "index", "count",
@@ -3724,12 +3729,28 @@ pub(crate) const DICT_METHODS: &[&str] = &[
     // absent from the example corpus (card 36f66dd2).
 ];
 pub(crate) const FILE_METHODS: &[&str] = &["read", "readlines", "write", "close"];
-/// (W5-a) `bytes` ships NO methods yet — the whole method surface (`hex`/`decode`/
-/// `find`/`split`/…) is the W5-b wave. An EMPTY table (rather than `None`) makes
-/// EVERY `b.method()` an honest "type `bytes` has no method" error instead of the
-/// permissive `None` path that would let a str method (`b.upper()`) slip through
-/// `check` and leak a `rustc` E0599.
-pub(crate) const BYTES_METHODS: &[&str] = &[];
+/// (W5-b) `bytes` method surface — BYTE-offset throughout (never str's char-offset
+/// path). Every name here has a return type in `builtin_method_ret` (guarded by
+/// `bytes_methods_have_concrete_return_types` in tests_a.rs) AND a codegen arm in
+/// `emit_bytes_method_call` (codegen/exprs.rs). A name present here but UNWIRED in
+/// codegen is an HONEST pyrst error, NOT a `rustc` E0599 leak: `emit_bytes_method_call`
+/// ends in a catch-all that returns `Error::Codegen("bytes method `X` is not
+/// supported (W5-b)")`. It is still a coverage gap, so the codegen lockstep is
+/// guarded by `every_bytes_method_has_a_codegen_arm` (codegen/tests.rs), which
+/// compiles a minimal call of every name here and asserts none reaches that
+/// catch-all. Args/arity are
+/// validated at CHECK level (`check_bytes_method_call`) so a deferred parameter
+/// shape (tuple-startswith, maxsplit, replace-count, int-arg-find, non-utf8 codec)
+/// is an honest typeck error, never a silent miscompile. `fromhex` is NOT here —
+/// it is the STATIC `bytes.fromhex(s)` constructor, dispatched structurally like
+/// `str.maketrans`. Python `bytes` has no `.len()`/`.contains()` (use `len(b)` /
+/// `x in b`), so neither is included.
+pub(crate) const BYTES_METHODS: &[&str] = &[
+    "hex", "decode", "find", "rfind", "index", "rindex", "count",
+    "startswith", "endswith", "replace", "split", "rsplit", "join",
+    "strip", "lstrip", "rstrip", "upper", "lower", "ljust", "rjust",
+    "center", "zfill", "isdigit", "isalpha", "isalnum", "isspace",
+];
 
 /// Returns (type-name, method-table) for a concrete builtin receiver, or None
 /// for Unknown/Class/numeric receivers (the check must not run on those).
@@ -3771,8 +3792,10 @@ pub fn builtin_method_ret(recv: &Ty, method: &str) -> Ty {
             // (card 49170944) casefold -> str (simple-casefold, see STR_METHODS
             // note); translate -> str (applies an int->int code-point map).
             | "casefold" | "translate" => Ty::Str,
-            // NOTE: encode/format removed from str arms — codegen cannot emit
-            // them (card 36f66dd2 stopgap).
+            // (W5-b) `str.encode(enc='utf-8')` -> bytes.
+            "encode" => Ty::Bytes,
+            // NOTE: format removed from str arms — codegen cannot emit it
+            // (card 36f66dd2 stopgap).
             // (card 49170944) rsplit joins split/splitlines as list[str]; but
             // partition/rpartition return a 3-TUPLE (str, str, str) — CPython's
             // real shape — so `head, sep, tail = s.partition("=")` unpacks (and
@@ -3827,6 +3850,22 @@ pub fn builtin_method_ret(recv: &Ty, method: &str) -> Ty {
             "read" => Ty::Str,
             "readlines" => Ty::List(Box::new(Ty::Str)),
             "write" | "close" => Ty::Unit,
+            _ => Ty::Unknown,
+        },
+        // (W5-b) bytes methods — all BYTE-offset. `hex`/`decode` -> str;
+        // `find`/`rfind`/`index`/`rindex`/`count` -> int (byte offsets, IndexError-
+        // free find returns -1, index raises ValueError); the predicates and
+        // `startswith`/`endswith` -> bool; `split`/`rsplit` -> list[bytes]; every
+        // transform (`replace`/`upper`/`lower`/`strip*`/`ljust`/`rjust`/`center`/
+        // `zfill`/`join`) -> bytes.
+        Ty::Bytes => match method {
+            "hex" | "decode" => Ty::Str,
+            "find" | "rfind" | "index" | "rindex" | "count" => Ty::Int,
+            "startswith" | "endswith" | "isdigit" | "isalpha" | "isalnum"
+            | "isspace" => Ty::Bool,
+            "split" | "rsplit" => Ty::List(Box::new(Ty::Bytes)),
+            "replace" | "upper" | "lower" | "strip" | "lstrip" | "rstrip"
+            | "ljust" | "rjust" | "center" | "zfill" | "join" => Ty::Bytes,
             _ => Ty::Unknown,
         },
         _ => Ty::Unknown,

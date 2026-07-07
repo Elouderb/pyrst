@@ -1,0 +1,6 @@
+# W5-b HONEST DEFERRAL (arity): bytes.split takes only a separator (or nothing, for
+# whitespace splitting) — matching str's pyrst ceiling. CPython's `maxsplit` second
+# argument is deferred; passing it is an honest CHECK error, not a silent drop.
+def main() -> None:
+    x: list[bytes] = b'a,b,c'.split(b',', 1)
+    print(x)

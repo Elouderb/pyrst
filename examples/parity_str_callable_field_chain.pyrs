@@ -1,0 +1,29 @@
+# (W5-b, G1 non-regression witness) The str sibling of the bytes field-call chain:
+# a str method chained on a CALLABLE-FIELD invocation returning `str`. str is
+# codegen's DEFAULT receiver for the shared name-matched method arms, so the
+# default-arm methods (strip/replace/split/upper) already built before the oracle
+# fix even when the field-call inferred `Unknown`; this golden pins that they STILL
+# work after the fix (the oracle now types the field-call `str` explicitly, so the
+# whole chain is receiver-correct rather than accidentally-correct). Dual-run.
+
+
+def shout(s: str) -> str:
+    return s.upper()
+
+
+class Formatter:
+    transform: Callable[[str], str]
+
+    def __init__(self, f: Callable[[str], str]) -> None:
+        self.transform = f
+
+
+def main() -> None:
+    fm: Formatter = Formatter(shout)
+    print(fm.transform('  hi ').strip())            # HI
+    print(fm.transform('hello').replace('L', 'z'))  # HEzzO
+    print(fm.transform('a-b-c').split('-'))         # ['A', 'B', 'C']
+    print(fm.transform('mix').upper())              # MIX
+    print(len(fm.transform('abcd')))                # 4
+    t: str = fm.transform('raw')
+    print(t.lower())                                # raw

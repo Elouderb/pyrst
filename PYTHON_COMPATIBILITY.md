@@ -35,7 +35,7 @@ This document clarifies which Python features are supported, partially supported
 | `tuple[T, ...]` | ✅ Supported | Rust tuple `(T, ...)` | Fixed-size, heterogeneous |
 | `set[T]` | ✅ Supported | `HashSet<T>` | Literals, comprehensions, membership, iteration — but **not** the mutation/algebra methods (see Set Methods) |
 | `frozenset` | ❌ Not Supported | N/A | No immutable set |
-| `bytes` | ✅ Supported | `Vec<u8>` | Immutable byte strings — literals, index→`int`, slice→`bytes`, iteration→`int`s, `+`/`*`/comparisons, `bytes()`/`bytes(n)`/`bytes(list[int])` constructors, CPython-exact `b'...'` repr. Methods (`hex`/`decode`/`split`/…) and `bytearray` are deferred — see **The `bytes` type** below. |
+| `bytes` | ✅ Supported | `Vec<u8>` | Immutable byte strings — literals, index→`int`, slice→`bytes`, iteration→`int`s, `+`/`*`/comparisons, `bytes()`/`bytes(n)`/`bytes(list[int])` constructors, CPython-exact `b'...'` repr. (W5-b) BYTE-offset methods: `hex`/`fromhex`, utf-8 `encode`/`decode` (strict, catchable `UnicodeDecodeError`), `find`/`rfind`/`index`/`rindex`/`count`, `startswith`/`endswith`, `replace`/`split`/`rsplit`/`join`/`strip`/`lstrip`/`rstrip`, `upper`/`lower` (ASCII-only), `ljust`/`rjust`/`center`/`zfill`, `isdigit`/`isalpha`/`isalnum`/`isspace`; membership `int in b` / `bytes in b`. Non-utf8 codecs, method `maxsplit`/`count`/start-end params, and `bytearray` are deferred — see **The `bytes` type** below. |
 
 ---
 
@@ -70,12 +70,48 @@ semantics unchanged.
   a mixed `bytes`/`str` `==` as almost certainly a bug and rejects it at check time
   (decode/encode to bridge). `bytes + str` / `str + bytes` are likewise rejected
   (CPython `TypeError`).
-- **Methods are deferred to the bytes-method wave (W5-b).** Any `b.method()`
-  (`hex`, `decode`, `find`, `split`, `startswith`, …) is an honest
-  "type `bytes` has no method" error — never a stub. `str.encode` / `bytes.decode`
-  codecs arrive with that wave (utf-8 first).
-- **Membership `x in b` is deferred.** This also rejects the mismatched
-  `'A' in b'ABC'` (CPython `TypeError`).
+- **Methods (W5-b) — all BYTE-offset, python3-oracle-validated.** Supported:
+  `hex()` / `bytes.fromhex(s)`; the codecs `str.encode()` / `bytes.decode()`
+  (utf-8 only — a String's bytes *are* UTF-8); the search family `find` / `rfind`
+  / `index` / `rindex` / `count` (byte offsets — never str's char offsets; `index`
+  / `rindex` raise a catchable `ValueError: subsection not found`); `startswith` /
+  `endswith`; the transforms `replace` / `split` / `rsplit` / `join` / `strip` /
+  `lstrip` / `rstrip` / `upper` / `lower` / `ljust` / `rjust` / `center` / `zfill`;
+  and the ASCII-only predicates `isdigit` / `isalpha` / `isalnum` / `isspace`.
+  `upper`/`lower`/predicates are ASCII-only (a non-ASCII byte passes through / is
+  never "alpha" — unlike `str`, where `'²'.isdigit()` is `True`). `strip`'s
+  argument is a **set of bytes**, not a substring.
+- **`bytes.decode` is STRICT.** Invalid UTF-8 raises a catchable
+  `UnicodeDecodeError` whose message matches CPython. CPython uses **two**
+  message templates and pyrst reproduces both (dual-run pinned by
+  `parity_bytes_decode_error`, which covers each form incl. mid-buffer offsets):
+  - a **single-byte** form when exactly one byte is at fault —
+    `'utf-8' codec can't decode byte 0xNN in position P: {invalid start byte |
+    invalid continuation byte | unexpected end of data}` (a bad start byte, a
+    lead byte followed immediately by a bad continuation, or a 1-byte
+    truncation);
+  - a **range** form when a multi-byte run is at fault —
+    `'utf-8' codec can't decode bytes in position P-Q: {invalid continuation
+    byte | unexpected end of data}` (a valid lead + one or more valid
+    continuations before an invalid continuation byte, or a multi-byte
+    truncation). `Q = P + error_len − 1`.
+
+  The `errors=` argument (`replace`/`ignore`) is **deferred** (an honest check
+  error).
+- **Codecs are utf-8 only in W5.** `encode`/`decode` accept no encoding, or the
+  literal `'utf-8'` (case/`-`/`_`-insensitive). A different encoding
+  (`'ascii'`/`'latin-1'`/…) or a **non-literal** encoding is an honest check error;
+  `ascii`/`latin-1`/`utf-16` are a documented follow-on (design §B).
+- **Method parameter shapes matched to str's pyrst ceiling (honest arity errors).**
+  Deferred, each a check error (never a silent drop): `startswith`/`endswith`
+  tuple-of-prefixes and start/end offsets; `split`/`rsplit` `maxsplit`; `replace`
+  `count`; the int-argument form of `find`/`index`/`count` (CPython's single
+  byte-value search). `join` requires a `list[bytes]` (a `list[int]` is a check
+  error, not a rustc leak).
+- **Membership `x in b` (W5-b).** `int in bytes` is a byte-value test — an
+  out-of-range int raises a catchable `ValueError: byte must be in range(0, 256)`;
+  `bytes in bytes` is a subsequence test (`b'' in b` is `True`). `str in bytes`
+  stays a type error (CPython `TypeError`) — decode/encode to bridge.
 - **Item assignment `b[i] = x` is rejected** — `bytes` is immutable (CPython
   `TypeError`). The mutable sibling **`bytearray` is deferred** (its annotation is a
   clean error, not a silent phantom class).

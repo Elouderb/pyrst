@@ -1,0 +1,36 @@
+# W5-b: bytes transforms — replace / split / rsplit / join / strip family /
+# upper / lower. All byte-level. split() with no arg splits on ASCII-whitespace
+# runs (dropping empties); with a separator it keeps empty fields. strip's arg is
+# a SET of bytes. upper/lower are ASCII-only (non-ASCII passes through). Dual-run.
+def main() -> None:
+    print(b'abcabc'.replace(b'bc', b'XY'))
+    print(b'abcabc'.replace(b'bc', b''))
+    print(b'abc'.replace(b'x', b'y'))
+    # split with separator (keeps empty fields) vs whitespace (drops empties)
+    print(b'a,b,c'.split(b','))
+    print(b'a,,b'.split(b','))
+    print(b',a,'.split(b','))
+    print(b'a b  c'.split())
+    print(b'  a\tb\n c '.split())
+    print(b''.split())
+    print(b'a,b,c'.rsplit(b','))
+    print(b'a b  c'.rsplit())
+    # join round-trips a split
+    parts: list[bytes] = b'a,b,c'.split(b',')
+    print(b','.join(parts) == b'a,b,c')
+    print(b'-'.join([b'a', b'b', b'c']))
+    print(b''.join([b'a', b'b']))
+    print(b'-'.join([b'solo']))
+    # strip: default whitespace, then explicit byte-set
+    print(b'  abc  '.strip())
+    print(b' \t\r\n\x0b\x0cabc\t '.strip())
+    print(b'xyabcyx'.strip(b'xy'))
+    print(b'  abc  '.lstrip())
+    print(b'  abc  '.rstrip())
+    print(b'xxabc'.lstrip(b'x'))
+    print(b'abcxx'.rstrip(b'x'))
+    # upper/lower ASCII-only; non-ASCII bytes pass through unchanged
+    print(b'Abc123'.upper())
+    print(b'\xff\xe9Ab'.upper())
+    print(b'AbC123'.lower())
+    print(b'\xff\xc9Ab'.lower())

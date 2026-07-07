@@ -1,0 +1,14 @@
+decode: 'utf-8' codec can't decode byte 0xff in position 0: invalid start byte
+decode: 'utf-8' codec can't decode byte 0xc3 in position 1: invalid continuation byte
+decode: 'utf-8' codec can't decode bytes in position 0-1: unexpected end of data
+decode: 'utf-8' codec can't decode bytes in position 0-1: invalid continuation byte
+decode: 'utf-8' codec can't decode bytes in position 0-2: invalid continuation byte
+decode: 'utf-8' codec can't decode bytes in position 5-6: invalid continuation byte
+decode: 'utf-8' codec can't decode bytes in position 0-2: unexpected end of data
+index: subsection not found
+rindex: subsection not found
+fromhex: non-hexadecimal number found in fromhex() arg at position 1
+fromhex: non-hexadecimal number found in fromhex() arg at position 3
+member: byte must be in range(0, 256)
+héllo
+done

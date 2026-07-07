@@ -1,0 +1,6 @@
+# W5-b HONEST DEFERRAL (arity): bytes.startswith takes exactly one bytes prefix in
+# pyrst — matching str's ceiling. CPython also accepts a tuple of prefixes and
+# optional start/end offsets; those extra shapes are honest CHECK errors here.
+def main() -> None:
+    x: bool = b'abcabc'.startswith(b'bc', 1)
+    print(x)

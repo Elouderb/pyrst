@@ -1,0 +1,6 @@
+# W5-b HONEST DEFERRAL: bytes.decode is STRICT-only in W5 — the `errors=` argument
+# ('replace'/'ignore') is deferred. An invalid byte raises a catchable
+# UnicodeDecodeError instead. The 2-arg form is an honest CHECK error.
+def main() -> None:
+    x: str = b'\xff'.decode('utf-8', 'replace')
+    print(x)

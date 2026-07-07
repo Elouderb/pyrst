@@ -1,0 +1,21 @@
+# W5-b: bytes predicates — isdigit / isalpha / isalnum / isspace. ASCII-ONLY
+# (unlike str, where '\xb2'.isdigit() is True). Empty bytes are always False.
+# Whitespace set = [tab, nl, vtab, ff, cr, space]. Dual-run vs python3.
+def main() -> None:
+    print(b'123'.isdigit())
+    print(b'12a'.isdigit())
+    print(b''.isdigit())
+    print(b'\xb2'.isdigit())
+    print(b'abcABC'.isalpha())
+    print(b'ab1'.isalpha())
+    print(b''.isalpha())
+    print(b'ab1'.isalnum())
+    print(b'ab '.isalnum())
+    print(b'abc123'.isalnum())
+    print(b' \t\n\r\x0b\x0c'.isspace())
+    print(b'a b'.isspace())
+    print(b''.isspace())
+    # a realistic use: classify a token
+    tok: bytes = b'42'
+    if tok.isdigit():
+        print('numeric')

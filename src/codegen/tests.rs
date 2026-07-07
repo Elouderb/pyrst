@@ -1133,3 +1133,69 @@ def main() -> None:
         assert!(out.contains("__py_bytes_index(&(b),"), "b[0] -> __py_bytes_index, got:\n{}", out);
         assert!(out.contains("(b).py_repr()"), "print(b) -> (b).py_repr(), got:\n{}", out);
     }
+
+    /// (W5-b, G3) LOCKSTEP GUARD: every name in `BYTES_METHODS` must dispatch to a
+    /// REAL arm in `emit_bytes_method_call` — never its `other =>` catch-all. That
+    /// catch-all is an HONEST `Error::Codegen("bytes method `X` is not supported
+    /// (W5-b)")` (not a rustc E0599 leak), but a name listed in the table yet
+    /// unwired in codegen is still a gap. For each name we emit a minimal program
+    /// calling it on a bytes literal (which self-types as `Ty::Bytes`, so the
+    /// receiver gate fires) and assert codegen succeeds; an unwired name surfaces
+    /// exactly that Codegen error here. A NEW method with no call shape below also
+    /// fails loudly, forcing the table, the codegen arm, and this guard to move
+    /// together. (Argument arity/type validation is the separate check-layer
+    /// concern, covered by the `fail_bytes_*` negatives — this guard is
+    /// codegen-only, hence the fresh `TyCtx`.)
+    #[test]
+    fn every_bytes_method_has_a_codegen_arm() {
+        let call_shape = |m: &str| -> Option<&'static str> {
+            Some(match m {
+                "hex" => "b'AB'.hex()",
+                "decode" => "b'AB'.decode()",
+                "find" => "b'AB'.find(b'A')",
+                "rfind" => "b'AB'.rfind(b'A')",
+                "index" => "b'AB'.index(b'A')",
+                "rindex" => "b'AB'.rindex(b'A')",
+                "count" => "b'AB'.count(b'A')",
+                "startswith" => "b'AB'.startswith(b'A')",
+                "endswith" => "b'AB'.endswith(b'B')",
+                "replace" => "b'AB'.replace(b'A', b'C')",
+                "split" => "b'A B'.split(b' ')",
+                "rsplit" => "b'A B'.rsplit(b' ')",
+                "join" => "b'-'.join([b'x', b'y'])",
+                "strip" => "b'AB'.strip()",
+                "lstrip" => "b'AB'.lstrip()",
+                "rstrip" => "b'AB'.rstrip()",
+                "upper" => "b'ab'.upper()",
+                "lower" => "b'AB'.lower()",
+                "ljust" => "b'AB'.ljust(5)",
+                "rjust" => "b'AB'.rjust(5)",
+                "center" => "b'AB'.center(5)",
+                "zfill" => "b'AB'.zfill(5)",
+                "isdigit" => "b'12'.isdigit()",
+                "isalpha" => "b'ab'.isalpha()",
+                "isalnum" => "b'a1'.isalnum()",
+                "isspace" => "b' '.isspace()",
+                _ => return None,
+            })
+        };
+        for m in crate::typeck::BYTES_METHODS {
+            let call = call_shape(m).unwrap_or_else(|| {
+                panic!(
+                    "BYTES_METHODS lists `{m}` but this lockstep guard has no call \
+                     shape for it — add one (and a codegen arm + a builtin_method_ret \
+                     entry) so the three stay in step"
+                )
+            });
+            let src = format!("def main() -> None:\n    print({})\n", call);
+            let module = crate::parser::parse(&src).expect("lockstep snippet must parse");
+            let ctx = TyCtx::new();
+            let res = emit_program(&[(module, src.clone())], &ctx);
+            assert!(
+                res.is_ok(),
+                "bytes method `{m}` is in BYTES_METHODS but codegen failed to emit it \
+                 (reached the emit_bytes_method_call catch-all?): {:?}",
+                res.err()
+            );
+        }
+    }

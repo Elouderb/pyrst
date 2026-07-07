@@ -1,0 +1,6 @@
+# W5-b HONEST DEFERRAL: only utf-8 is supported for str.encode / bytes.decode in
+# W5 (design §B: ascii/latin-1/utf-16 are a documented follow-on). `encode('ascii')`
+# is an honest CHECK error naming the deferred encoding, never a silent miscompile.
+def main() -> None:
+    x: bytes = 'hi'.encode('ascii')
+    print(x)

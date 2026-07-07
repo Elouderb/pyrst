@@ -1,0 +1,6 @@
+# W5-b HONEST DEFERRAL: bytes.hex() takes no arguments in W5 — CPython's optional
+# `sep` / `bytes_per_sep` grouping arguments are deferred. Passing one is an honest
+# CHECK error (bytes.hex() takes no arguments), never a silently ignored separator.
+def main() -> None:
+    x: str = b'\xff\x10'.hex(':')
+    print(x)

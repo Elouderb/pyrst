@@ -1,0 +1,6 @@
+# W5-b HONEST DEFERRAL (arity): bytes.replace(old, new) replaces ALL occurrences —
+# matching str's pyrst ceiling. CPython's optional `count` third argument is
+# deferred; passing it is an honest CHECK error rather than a silently ignored arg.
+def main() -> None:
+    x: bytes = b'aaa'.replace(b'a', b'b', 1)
+    print(x)

@@ -1968,7 +1968,9 @@ use super::test_support::*;
     /// them back here without wiring codegen they will hit this test first.
     #[test]
     fn removed_unemittable_methods_absent_from_str_table() {
-        let unemittable = ["encode", "isdecimal", "format"];
+        // (W5-b) `encode` is now emittable (str.encode -> bytes) and intentionally
+        // PRESENT; only isdecimal/format remain unemittable.
+        let unemittable = ["isdecimal", "format"];
         for m in &unemittable {
             assert!(
                 !STR_METHODS.contains(m),
@@ -1976,6 +1978,10 @@ use super::test_support::*;
                  (card 36f66dd2 drift guard)"
             );
         }
+        assert!(
+            STR_METHODS.contains(&"encode"),
+            "STR_METHODS must contain `encode` (W5-b wired str.encode -> bytes)"
+        );
     }
 
     #[test]
@@ -1995,7 +2001,7 @@ use super::test_support::*;
     /// check runs before builtin_method_ret, so Unknown is the right sentinel.
     #[test]
     fn removed_str_methods_return_unknown_from_builtin_method_ret() {
-        let unemittable = ["encode", "isdecimal", "format"];
+        let unemittable = ["isdecimal", "format"];
         for m in &unemittable {
             assert_eq!(
                 builtin_method_ret(&Ty::Str, m),
@@ -2004,6 +2010,34 @@ use super::test_support::*;
                  (card 36f66dd2 drift guard)"
             );
         }
+        // (W5-b) encode is now a concrete str method -> bytes.
+        assert_eq!(builtin_method_ret(&Ty::Str, "encode"), Ty::Bytes);
+    }
+
+    /// (W5-b) Every method in BYTES_METHODS must have a concrete (non-Unknown)
+    /// return type in `builtin_method_ret`. A table entry without a matching
+    /// return-type arm would type as Unknown and silently drift from its codegen
+    /// arm — this keeps the two in lockstep (the bytes analogue of the str guard).
+    #[test]
+    fn bytes_methods_have_concrete_return_types() {
+        for m in BYTES_METHODS {
+            assert_ne!(
+                builtin_method_ret(&Ty::Bytes, m),
+                Ty::Unknown,
+                "BYTES_METHODS contains `{m}` but builtin_method_ret returns Unknown \
+                 for it (table/return-type drift — add its arm)"
+            );
+        }
+        // Spot-check the representative return shapes (byte-offset throughout).
+        assert_eq!(builtin_method_ret(&Ty::Bytes, "hex"), Ty::Str);
+        assert_eq!(builtin_method_ret(&Ty::Bytes, "decode"), Ty::Str);
+        assert_eq!(builtin_method_ret(&Ty::Bytes, "find"), Ty::Int);
+        assert_eq!(builtin_method_ret(&Ty::Bytes, "isdigit"), Ty::Bool);
+        assert_eq!(builtin_method_ret(&Ty::Bytes, "upper"), Ty::Bytes);
+        assert_eq!(
+            builtin_method_ret(&Ty::Bytes, "split"),
+            Ty::List(Box::new(Ty::Bytes))
+        );
     }
 
     #[test]

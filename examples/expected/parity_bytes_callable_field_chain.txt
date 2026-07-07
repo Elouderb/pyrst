@@ -1,0 +1,9 @@
+b'HI'
+414243
+HELLO
+[b'A', b'B', b'C']
+2
+2
+True
+b'PAD   '
+524157

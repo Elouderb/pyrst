@@ -1,0 +1,25 @@
+# W5-b: bytes search family — BYTE offsets (natural Vec index, NOT str char-offset).
+# find/rfind return -1 on a miss; index/rindex raise ValueError; count is
+# non-overlapping (and count(b'') == len+1). Dual-run vs python3.
+def main() -> None:
+    h: bytes = b'abcabc'
+    print(h.find(b'bc'))
+    print(h.find(b'x'))
+    print(h.find(b''))
+    print(h.rfind(b'bc'))
+    print(h.rfind(b'x'))
+    print(h.index(b'bc'))
+    print(h.rindex(b'bc'))
+    print(h.count(b'a'))
+    print(b'aaa'.count(b'aa'))
+    print(b'abc'.count(b''))
+    print(b'abc'.count(b'x'))
+    # startswith / endswith
+    print(b'abc'.startswith(b'ab'))
+    print(b'abc'.startswith(b'bc'))
+    print(b'abc'.startswith(b''))
+    print(b'abc'.endswith(b'bc'))
+    print(b'abc'.endswith(b'ab'))
+    # a high byte is one byte — offsets are byte offsets, not char offsets
+    m: bytes = b'\xc3\xa9.txt'
+    print(m.find(b'.'))

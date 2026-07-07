@@ -1,0 +1,12 @@
+# NEGATIVE (card 2b37b965): W5-f changed `re.search` from returning `bool` to
+# returning `Optional[Match]` (a real re.Match, or None). Binding it to a `bool`
+# is now an honest assignment type error ("declared bool, got Match | None") —
+# the guard against accidentally treating the old bool stand-in as if unchanged.
+# The correct spelling is `if re.search(...) is not None:` (or bind the Match and
+# use it: `m = re.search(...); if m is not None: m.group(0)`).
+import re
+
+
+def main() -> None:
+    hit: bool = re.search("a", "abc")
+    print(hit)

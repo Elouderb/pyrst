@@ -1,0 +1,15 @@
+# NEGATIVE (card 2b37b965): a CALLABLE replacement for re.sub (CPython allows
+# `re.sub(pattern, func, string)` where func(m) -> str) is an HONEST type error
+# here — `sub`'s `repl` is typed `str`, and pyrst has no Match-callback
+# machinery in the @extern template. Documents the function-replacement deferral
+# in lib/re.pyrs's header. (String templates `\1`/`\g<name>` are also not
+# expanded — repl is inserted literally.)
+import re
+
+
+def repl(m: str) -> str:
+    return "X"
+
+
+def main() -> None:
+    print(re.sub("a", repl, "aaa"))

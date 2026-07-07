@@ -1,0 +1,11 @@
+# NEGATIVE (card 2b37b965): CPython's `re.match` is UNSPELLABLE in pyrst —
+# `match` is a statement keyword, so `re.match(...)` is a parse error ("expected
+# identifier (attribute), found Match"). The faithful spelling is `re.match_(...)`
+# (same start-anchored semantics; returns Optional[Match]). Documents the naming
+# divergence in lib/re.pyrs's header.
+import re
+
+
+def main() -> None:
+    m = re.match("a", "abc")
+    print(m is not None)

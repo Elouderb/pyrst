@@ -1,19 +1,22 @@
 # parity: pyrst-only
 #
-# Reason: `re` is @crate("regex")-backed (see lib/re.pyrs header) and, per the
-# W1 fidelity audit (docs/design/stdlib-full.md §D "re" row), a real
-# `Match`/`Pattern` object is G1-deferred — every wrapper here returns a plain
-# bool/str/list[str]/tuple[str,int] instead. Three names in the surface below
-# (`is_match`, `find_all`, `match_`) have NO equivalent attribute on CPython's
-# real `re` module (`is_match`/`find_all` predate this upgrade and are kept for
-# backward compatibility; `match_` is `re.match` renamed because `match` is a
-# pyrst statement keyword) — under the harness's `import re`, Python resolves
-# to its OWN stdlib `re`, which does not define those names, so a literal
-# whole-file dual run is not executable. Every function's BEHAVIOR was instead
-# verified individually against `python3 -c "import re; ..."` as the semantic
-# oracle (see card 275bfe47 comment); `search`, `fullmatch`, `sub`, `subn`,
-# `split`, `escape`, `findall` share CPython's exact names, positional shapes,
-# and default-count/maxsplit semantics.
+# Reason: three names in the surface below (`is_match`, `find_all`, `match_`)
+# have NO equivalent attribute on CPython's real `re` module (`is_match`/
+# `find_all` are pyrst-only, kept for backward compatibility; `match_` is
+# `re.match` renamed because `match` is a pyrst statement keyword) — under the
+# harness's `import re`, Python resolves to its OWN stdlib `re`, which does not
+# define those names, so a literal whole-file dual run is not executable. Each
+# function's BEHAVIOR is verified against `python3 -c "import re; ..."` as the
+# semantic oracle; `search`, `fullmatch`, `sub`, `subn`, `split`, `escape`,
+# `findall` share CPython's exact names, positional shapes, and default
+# semantics.
+#
+# W5-f (card 2b37b965): `search`/`match_`/`fullmatch` now return `Optional[Match]`
+# (a real re.Match, or None) instead of `bool`, so the boolean tests below became
+# `... is not None` (same True/False output). The REAL Match object surface
+# (group/groups/start/end/span/groupdict/finditer, multibyte spans) is dual-run
+# against CPython in the companion `examples/parity_re_match.pyrs`, which uses
+# only CPython-spellable spellings.
 import re
 
 
@@ -25,12 +28,13 @@ def main() -> None:
     print(re.replace_all("[0-9]", "#", "a1b2c3"))
 
     # --- match_ / search / fullmatch (anchoring deltas) ---
-    print(re.match_("ab", "abc"))
-    print(re.match_("bc", "abc"))
-    print(re.search("bc", "abc"))
-    print(re.search("zz", "abc"))
-    print(re.fullmatch("a.c", "abc"))
-    print(re.fullmatch("a.c", "abcd"))
+    # W5-f: these return Optional[Match] now, so test "did it match" via is-not-None.
+    print(re.match_("ab", "abc") is not None)
+    print(re.match_("bc", "abc") is not None)
+    print(re.search("bc", "abc") is not None)
+    print(re.search("zz", "abc") is not None)
+    print(re.fullmatch("a.c", "abc") is not None)
+    print(re.fullmatch("a.c", "abcd") is not None)
 
     # --- findall (CPython-named alias of find_all) ---
     print(re.findall("[0-9]+", "a1b22c333"))
@@ -60,4 +64,17 @@ def main() -> None:
     print(re.subn("a", "$5", "a"))           # CPython: ("$5", 1)
     print(re.findall("", "abc"))             # CPython: ['', '', '', '']
     print(re.split("", "abc"))               # CPython: ['', 'a', 'b', 'c', '']
-    print(re.fullmatch("a*", ""))            # CPython: truthy (bool True)
+    print(re.fullmatch("a*", "") is not None)  # CPython: matches -> True
+
+    # --- Z3 (pyrst-only): honest refusal when a `$` end-anchor meets a
+    # newline-terminated subject. CPython's `$` also matches just before a single
+    # trailing `\n` (so `re.search("a$", "a\n")` MATCHES there); the regex crate's
+    # `$` needs the true end of the haystack and has no look-around to emulate
+    # that zero-width assertion soundly, so pyrst RAISES rather than diverge
+    # silently. (CPython would not raise -> this line is pyrst-only.) ---
+    try:
+        rr = re.search("a$", "a\n")
+        if rr is not None:
+            print("Z3 no error")
+    except ValueError as e:
+        print("Z3 refused (nonempty msg:", len(e) > 0, "kind ValueError)")

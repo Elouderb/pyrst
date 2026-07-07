@@ -1,0 +1,14 @@
+# NEGATIVE (card 2b37b965, Z4): a bare `if m:` truthiness test over an
+# `Optional[Match]` is now an HONEST check-time error. Before this fix it PASSED
+# `pyrst check` and then died at `rustc` (E0308: `if <Option>` — a check/build
+# DISAGREEMENT that produced no binary). pyrst now rejects it at check so the two
+# phases agree. The sound idiom is `if m is not None:` (narrows `m` to `Match`).
+# Real Optional truthiness (`if x:` == `x is not None` for an always-truthy
+# payload) is a tracked compiler follow-on (card 6a554b41) — NOT implemented here.
+import re
+
+
+def main() -> None:
+    m = re.search("a", "abc")
+    if m:
+        print("matched")

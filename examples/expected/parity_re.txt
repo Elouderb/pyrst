@@ -27,3 +27,4 @@ $5
 ['', '', '', '']
 ['', 'a', 'b', 'c', '']
 True
+Z3 refused (nonempty msg: True kind ValueError)

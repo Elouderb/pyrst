@@ -1,0 +1,19 @@
+# NEGATIVE (card 2b37b965, Z2): W5-f gave `re` a real `class Match`, which now
+# COLLIDES with `difflib`'s pre-existing `class Match` under pyrst v1's globally
+# UNIQUE class names (a class type is carried as a bare `Ty::Class(name)` with no
+# owner, so two same-named classes cannot be told apart at a type reference).
+# Co-importing `re` and `difflib` is therefore an HONEST check-time error that
+# NAMES BOTH modules — never a silent overwrite. Lead decision: do NOT rename
+# either class (both `Match` names are CPython-canonical; renaming hurts drop-in
+# fidelity more than the collision does). The real fix is the v2 class-owner
+# threading work; this negative PINS the honest rejection until then.
+import re
+import difflib
+
+
+def main() -> None:
+    m = re.search("a", "abc")
+    if m is not None:
+        print(m.group(0))
+    sm = difflib.SequenceMatcher(None, "abc", "abd", True)
+    print(sm.ratio())

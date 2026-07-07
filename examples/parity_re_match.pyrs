@@ -1,0 +1,118 @@
+# parity: dual-run
+#
+# DUAL-RUN CPython parity golden for card 2b37b965 (W5-f: real re.Match via eager
+# extraction). Every surface below is CPython-spellable, so the SAME source runs
+# byte-identically under the pyrst binary AND python3 `re` (the harness prepends
+# `from __future__ import annotations` and calls `main()`).
+#
+# WHY these spellings (see lib/re.pyrs's header for the full divergence list):
+#   - `re.match` (CPython) is unspellable (`match` is a pyrst keyword) -> this
+#     golden uses `re.search`/`re.fullmatch`/`re.finditer`, which ARE spellable
+#     and dual-run; `re.match_` is exercised in the pyrst-only `parity_re.pyrs`.
+#   - `groups()` is a LIST in pyrst but a TUPLE in CPython, so it is ITERATED /
+#     `len`'d here, never whole-printed (a whole print would show `[..]` vs `(..)`).
+#   - named groups are read via `groupdict()[key]` (`m.group('name')` is
+#     unspellable — `group` takes an int); dict is read by KEY (pyrst dict repr
+#     order is project-wide non-CPython).
+#   - the truthiness idiom is `if m is not None:` (pyrst narrows `m` to `Match`);
+#     `bool(m)` on a narrowed Match is also faithful (always True).
+import re
+
+
+def main() -> None:
+    # --- search: group / span matrix, group 0 default ---
+    m = re.search("(\\d+)-(\\d+)", "call 12-34 now")
+    if m is not None:
+        print(m.group())          # group 0 default -> whole match
+        print(m.group(0))
+        print(m.group(1))
+        print(m.group(2))
+        print(m.start())          # start 0 default
+        print(m.end(0))
+        print(m.start(2))
+        print(m.end(2))
+        print(m.span())           # span 0 default
+        print(m.span(1))
+        print(len(m.groups()))
+        for g in m.groups():
+            print(g)
+        print(bool(m))            # a Match is always truthy
+
+    # --- unmatched optional group -> None / -1 / (-1, -1) ---
+    mo = re.search("(a)(b)?", "a")
+    if mo is not None:
+        print(mo.group(1))
+        print(mo.group(2))        # optional group did not participate -> None
+        print(mo.start(2))        # -> -1
+        print(mo.end(2))          # -> -1
+        print(mo.span(2))         # -> (-1, -1)
+        for g in mo.groups():
+            print(g)              # a  then  None
+
+    # --- multibyte subject: spans are CHAR offsets, not bytes ---
+    mb = re.search("l+", "héllo")
+    if mb is not None:
+        print(mb.group(0))        # ll
+        print(mb.span(0))         # (2, 4)  -- char offsets over 'héllo'
+        print(mb.start(0))
+
+    # --- named groups via groupdict() ---
+    nm = re.search("(?P<year>\\d{4})-(?P<mon>\\d{2})", "date 2026-07 ok")
+    if nm is not None:
+        print(nm.groupdict()["year"])
+        print(nm.groupdict()["mon"])
+        print(nm.group(1))
+        print(nm.start(1))
+
+    # --- no match -> None ---
+    print(re.search("zzz", "abcdef") is not None)
+
+    # --- fullmatch (both-ends anchored) ---
+    print(re.fullmatch("a.c", "abc") is not None)
+    print(re.fullmatch("a.c", "abcd") is not None)
+    fm = re.fullmatch("(a+)(b+)", "aaabb")
+    if fm is not None:
+        print(fm.group(1))
+        print(fm.group(2))
+        print(fm.span(2))
+
+    # --- finditer -> iterate Match objects in order ---
+    for it in re.finditer("(\\d)", "a1b2c3"):
+        print(it.group(1))
+        print(it.start(0))
+
+    # --- findall CPython shape: 0 groups -> whole; 1 group -> that group ---
+    print(re.findall("[0-9]+", "a1b22c333"))
+    print(re.findall("(a)b", "ab cb ab"))
+    print(re.findall("(z)?b", "b ab"))
+
+    # --- out-of-range group -> catchable IndexError (CPython message) ---
+    g = re.search("(a)", "a")
+    if g is not None:
+        try:
+            print(g.group(5))
+        except IndexError as e:
+            print("caught:", e)
+
+    # --- Z1: zero-width matches ADJACENT to a non-empty one ARE emitted
+    # (CPython 3.7+ must_advance) — the regex crate drops them; pyrst hand-rolls
+    # the iteration so finditer/findall match python3 byte-for-byte. ---
+    for zm in re.finditer("a*", "aabaa"):
+        print(zm.span())                  # (0,2) (2,2) (3,5) (5,5)
+    print(re.findall("a*", "aabaa"))      # ['aa', '', 'aa', '']
+    print(re.findall("", "abc"))          # ['', '', '', '']
+    print(re.findall("b*", "aabaa"))      # ['', '', 'b', '', '', '']
+    print(re.findall("a*", "aaa"))        # ['aaa', '']
+    # zero-width iteration on a MULTIBYTE subject -> CHAR-offset spans
+    for zb in re.finditer("a*", "aéaba"):
+        print(zb.span())                  # (0,1)(1,1)(2,3)(3,3)(4,5)(5,5)
+
+    # --- Z3: `$` end-anchor SUPPORTED shapes (subject NOT ending in a newline —
+    # these agree with CPython; the newline-terminated case is refused, shown in
+    # the pyrst-only parity_re.pyrs) ---
+    print(re.search("a$", "xa") is not None)      # True (a at the true end)
+    print(re.search("a$", "xa b") is not None)    # False
+    de = re.search("(\\w+)$", "hello world")
+    if de is not None:
+        print(de.group(1))                        # world
+        print(de.span(1))                         # (6, 11)

@@ -748,6 +748,35 @@ pub(crate) fn reject_typevar_op(ty: &Ty, op_desc: &str, span: Span) -> Result<()
     Ok(())
 }
 
+/// (card 2b37b965, Z4) Reject a bare `Optional[T]` used for its TRUTHINESS —
+/// `if m:` / `while m:` / `not m` / `x if m else y` / `[.. for .. if m]` /
+/// `assert m`. CPython tests such a value's truthiness (an `Optional` is falsy
+/// only when `None`), but pyrst does not yet lower Optional truthiness, so
+/// codegen would emit Rust `if <Option>` and leak a raw `rustc` E0308 at BUILD —
+/// a check-passes / build-fails DISAGREEMENT. Rejecting it here (at `check`)
+/// keeps check and build in agreement and points at the sound idiom. Real
+/// Optional truthiness (`if m:` == `m is not None` for an always-truthy payload,
+/// plus the general falsy-payload semantics) is a tracked follow-on (card
+/// 6a554b41); do NOT implement it here. `and`/`or` operands are already rejected
+/// by the EPIC-5 BinOp-Optional gate, so this covers the remaining sites.
+///
+/// A narrowing guard (`m is not None`) is a `BinOp` typed `Bool`, never an
+/// `Option`, so it is unaffected — only a RAW Optional value trips this.
+pub(crate) fn reject_optional_truthiness(ty: &Ty, span: Span) -> Result<()> {
+    if let Ty::Option(_) = ty {
+        return Err(Error::Type {
+            span,
+            msg: "bare truthiness on an Optional value is not supported: narrow it \
+                  first with `if x is not None:` (or `x is None`) to obtain the inner \
+                  value. CPython's `if x:` truthiness over an Optional is a tracked \
+                  follow-on (card 6a554b41); pyrst rejects it here so `check` and \
+                  `build` agree instead of leaking a rustc type error."
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Generics v2: a Rust trait bound INFERRED from an operation performed on a
 /// bare type variable inside a generic function body. The SUPPORTED subset of
 /// ops on a `T` no longer rejects (v1) but instead records the trait the

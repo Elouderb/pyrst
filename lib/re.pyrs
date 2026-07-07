@@ -10,90 +10,359 @@
 #
 # --- W1 fidelity upgrade (card 275bfe47) ---------------------------------
 # Fidelity score: 2 -> 3 (design doc §D "re" row). Closed every NON-GATED
-# delta from the audit:
-#   - `escape(pattern)`               — CPython's exact special-char set.
-#   - `fullmatch(pattern, text)`      — anchored both ends (`^(?:...)$`).
-#   - `match_(pattern, text)`         — anchored at the START only (`^(?:...)`).
-#     Named `match_` (trailing underscore) because `match` is a pyrst keyword
-#     (the `match`/`case` statement) — CPython's `re.match` cannot be spelled
-#     `match` here. Documented pyrst-only divergence.
-#   - `search(pattern, text)`         — CPython-named alias of the pre-existing
-#     `is_match` (unanchored search-test). Both are kept: `is_match` for
-#     backward compatibility with existing programs, `search` for parity.
-#   - `findall(pattern, text)`        — CPython-named alias of `find_all`
-#     (kept for backward compatibility).
-#   - `sub(pattern, repl, string, count=0)` — CPython-named upgrade of
-#     `replace_all` (kept) with the `count` limit; `count=0` means "replace
-#     all", matching CPython's `re.sub` default exactly (and matching Rust
-#     regex's `Regex::replacen` `limit=0` semantics one-for-one).
-#   - `subn(pattern, repl, string, count=0)` — returns `(new_string, n)`,
-#     the number of substitutions actually made, exactly like CPython's
-#     `re.subn`.
-#   - `split(pattern, string, maxsplit=0)` — the pre-existing `split` gained a
-#     `maxsplit` default arg (`0` = no limit, matching CPython).
+# delta from the audit: `escape`, `fullmatch`, `match_`, `search`, `findall`,
+# `sub`/`subn` (with `count`), `split` (with `maxsplit`). See per-function
+# notes below.
 #
-# STILL GATED — G1 (opaque handles): a real `Match`/`Pattern` object (with
-# `.group()`, `.start()`, `.end()`, capture groups, `finditer`) needs a
-# stateful handle wrapping a compiled `regex::Regex` / `regex::Captures`
-# across calls; pyrst has no opaque-handle story yet, so every wrapper here
-# still recompiles a fresh `regex::Regex` per call and returns only bool /
-# str / list[str] / tuple[str, int] — never a `Match` object. `finditer` and
-# capturing-group access remain deferred behind G1.
+# --- W5-f upgrade (card 2b37b965) — REAL `re.Match` via eager extraction ---
+# Design: docs/design/w5-bytes-handles.md §C/§D/§F. The unlock-map finding:
+# `re.Match` is a PURE STRUCT with eagerly-extracted state, needing NEITHER the
+# `bytes` gate (G7) NOR the opaque-handle gate (G1) — it holds only owned
+# `str`/`int`, and its accessors are pure reads. So the old "STILL GATED — G1"
+# deferral (a real Match needs a stateful `regex::Captures` handle across calls)
+# is RESOLVED here by a different shape: the match function runs the regex ONCE,
+# extracts every group's CHAR span + the subject slice eagerly, and returns a
+# plain value `Match` object. No live `regex::Captures<'h>` (which borrows the
+# haystack) is ever held across a call — so no handle, and value-semantics
+# clone-on-use applies unchanged.
 #
-# Divergences (all documented, none silent):
-#   - `match_`/`fullmatch`/`search`/`is_match` return `bool`, not a `Match`
-#     object or `None` — callers get "did it match", not "what/where matched".
-#   - `escape()` covers every CPython-escaped character EXCEPT the vertical
-#     tab (`\v`, `\x0b`): pyrst's lexer supports `\n \t \r \\ \' \" \0 \b \f`
-#     but has no `\x`/hex escape (src/lexer.rs), so `\x0b` cannot be spelled
-#     as a pyrst string literal. All 21 other CPython-escaped characters
-#     (`()[]{}?*+-|^$\.&~#` plus space/`\t`/`\n`/`\r`/`\f`) are covered and
-#     verified against `python3 -c "import re; re.escape(...)"` byte-for-byte.
-#   - A malformed pattern still unwraps to a panic (a pyrst exception) —
-#     mirroring the `os` module's `.unwrap()` error contract.
+#   - `search`/`match_`/`fullmatch` now return `Optional[Match]` (was `bool`) —
+#     a real Match object, or `None` on no-match, exactly like CPython (whose
+#     `re.search`/`re.match`/`re.fullmatch` return `Match | None`). The idiomatic
+#     guard is `m = re.search(...); if m is not None: m.group(0)` (pyrst narrows
+#     `m` to `Match` inside the guard). This is semantically CPython's `if m:` —
+#     a Match is always truthy, so `if m:` == `m is not None` there (`__bool__`
+#     on Match returns True). BARE `if m:` (truthiness over the `Optional[Match]`
+#     itself, no `is not None`) is NOT yet supported — see the DIVERGENCES note.
+#   - `finditer(pattern, text)` returns `list[Match]` (CPython returns a lazy
+#     iterator; pyrst materialises it — iterate with `for m in re.finditer(..)`).
+#   - The `Match` object: `group(n=0)` (unmatched group -> None; out-of-range ->
+#     `IndexError("no such group")`, CPython's exact message), `groups()`,
+#     `start(n=0)`/`end(n=0)`/`span(n=0)` (unmatched -> -1 / -1 / (-1,-1) per
+#     CPython), `groupdict()`, `__bool__` (always True). Named groups
+#     `(?P<name>...)` are supported by the `regex` crate; `groupdict()` keys them.
+#
+# CHAR-OFFSET FIDELITY (the W2 find-family lesson). The `regex` crate reports
+# BYTE offsets into the UTF-8 haystack; CPython reports CHAR (code-point) offsets.
+# The `_re_caps*` extractors convert each byte offset to a char offset in Rust
+# (`s[..byte].chars().count()`) BEFORE handing spans to pyrst, so `start`/`end`/
+# `span` and the derived group slices are code-point-correct on multibyte
+# subjects (verified: `re.search("l+", "héllo").span() == (2, 4)` == python3, and
+# CJK). A silent byte-offset span on a multibyte subject would be exactly the W2
+# find-family miscompile class; it is killed here.
+#
+# STAND-IN MIGRATION (W4-c pattern). `search`/`match_`/`fullmatch` changed from
+# `bool` to `Optional[Match]`. The only golden exercising those as bool was
+# `examples/parity_re.pyrs` — migrated to `... is not None` (same True/False
+# output; `examples/expected/parity_re.txt` unchanged). `is_match` KEEPS the
+# pure `bool` predicate contract (unanchored "did it match"). `stdlib_re.pyrs`
+# and the three `parity_coimport_*_re` goldens use only is_match/find_all/escape/
+# sub/split — UNAFFECTED.
+#
+# DIVERGENCES (all documented, none silent):
+#   - Named-group ACCESS is via `m.groupdict()['name']`, NOT `m.group('name')`:
+#     pyrst methods are statically single-typed, so `group` takes `n: int` and
+#     cannot ALSO accept a `str` name (no overloading / int|str union). CPython's
+#     `m.group('name')` is therefore unspellable here; `m.groupdict()` is the
+#     faithful path. (`m.group("x")` is a type error / build error.)
+#   - `groups()` returns a `list[Optional[str]]`, NOT a `tuple` — a variable-arity
+#     tuple-with-None-holes is inexpressible in pyrst's fixed-arity heterogeneous
+#     tuple. Iterate it (`for g in m.groups()`) or index it; a WHOLE-value print
+#     shows `['a', None]` where CPython shows `('a', None)`. `groupdict()` returns
+#     a `dict[str, Optional[str]]`; its whole-dict repr follows pyrst's dict
+#     ordering (project-wide, not re-specific), so compare it by KEY.
+#   - `re.match` (CPython's name) is unspellable — `match` is a pyrst statement
+#     keyword — so `re.match(...)` is a parse error; use `re.match_(...)` (the
+#     same start-anchored semantics). Documented pyrst-only divergence.
+#   - `re.findall` matches CPython's notorious shape shift for 0/1 capture groups
+#     (0 groups -> the whole matches; 1 group -> that group's captures, `''` when
+#     the group is optional-and-absent). A pattern with 2+ capture groups makes
+#     CPython return a list of TUPLES, which pyrst's return typing cannot express
+#     (a single fn is either `list[str]` or `list[tuple]`, not both), so `findall`
+#     raises an HONEST `NotImplementedError` at runtime rather than silently
+#     returning a different shape — use `re.finditer(...)` + `m.group(i)`.
+#     `find_all` is a pyrst-ONLY legacy alias that ALWAYS returns the whole
+#     matches (never group captures) regardless of group count — kept unchanged.
+#   - `finditer`/`findall` reproduce CPython 3.7+ ZERO-WIDTH iteration exactly
+#     (Z1): an empty match adjacent to a preceding non-empty one IS emitted
+#     (`re.finditer("a*", "aabaa")` -> 4 matches, `re.findall("", "abc")` ->
+#     `['', '', '', '']`) — hand-rolled over `captures_at`, since the `regex`
+#     crate's iterators drop those empties. The one shape refused: a TOP-LEVEL
+#     LAZY quantifier (`*?`/`+?`/`??`) that yields a zero-width match raises an
+#     honest `NotImplementedError` — CPython's `must_advance` re-matches the
+#     non-empty alternative at the same position, which the crate's
+#     leftmost-first API cannot express (a greedy quantifier / an anchor works).
+#   - `$` end-anchor vs a trailing newline (Z3): CPython's default `$` matches at
+#     the end OR just before a SINGLE trailing `\n`; the `regex` crate's `$`
+#     needs the true end of the haystack, and the crate has no look-around to
+#     emulate the zero-width "before final newline" assertion soundly (`(?m)`
+#     over-matches interior newlines; subject-stripping breaks mixed patterns
+#     like `(\n)|(a$)`). So `search`/`match_`/`fullmatch`/`finditer`/`findall`
+#     RAISE an honest `ValueError` when the pattern has a real `$` end-anchor and
+#     the subject ends in `\n`, rather than diverge silently — strip the newline
+#     or match it explicitly (`\n?$`). (`is_match`/`find_all`/`sub`/`subn`/`split`
+#     keep their pre-existing `regex`-crate `$` semantics — documented, unchanged.)
+#   - `sub`/`subn` insert `repl` LITERALLY (no `\1`/`\g<name>` backreference
+#     expansion, and no `$`-style Rust expansion either — see the closure note
+#     on `replace_all`); a callable `repl` is NOT supported (type error). CPython
+#     DOES expand `\1` in `sub` repl — a documented divergence pyrst keeps at its
+#     pre-existing level rather than silently half-implementing.
+#   - `escape()` covers every CPython-escaped character EXCEPT the vertical tab
+#     (`\v`, `\x0b`): pyrst's lexer has no `\x`/hex escape, so `\x0b` cannot be
+#     spelled as a pyrst string literal. All 21 other characters are covered and
+#     byte-verified against `python3`.
+#   - A malformed pattern (or a pattern using `regex`-crate-unsupported syntax
+#     such as backreferences/look-around) still unwraps to a panic (a pyrst
+#     exception) — mirroring the `os` module's `.unwrap()` error contract.
 #
 # Only the `from re import f; f(...)` flat form is exercised by the golden.
 
 
+# ── W5-f eager-extraction @extern helpers (private) ───────────────────────────
+# Each runs the compiled regex ONCE and returns pyrst-native, fully-owned data
+# (no borrow of the haystack survives the call). Byte offsets from the `regex`
+# crate are converted to CHAR offsets here so every span pyrst sees is a
+# code-point offset (CPython-faithful on multibyte subjects). Spans are a flat
+# `list[int]` = `[start0, end0, start1, end1, ...]` over groups `0..=N`; an
+# UNMATCHED group contributes `(-1, -1)` (CPython's sentinel).
+
+
+# Unanchored single-match capture (the `search` engine). Returns the flat char
+# spans over all groups, or `None` when the pattern does not match anywhere.
+@crate("regex", "1")
+@extern
+def _re_caps(pattern: str, text: str) -> Optional[list[int]]:
+    "{ let re = regex::Regex::new(&{pattern}).unwrap(); let s: &str = &{text}; match re.captures(s) { None => None, Some(caps) => { let mut out: Vec<i64> = Vec::new(); for i in 0..caps.len() { match caps.get(i) { Some(mm) => { out.push(s[..mm.start()].chars().count() as i64); out.push(s[..mm.end()].chars().count() as i64); }, None => { out.push(-1i64); out.push(-1i64); } } } Some(out) } } }"
+
+
+# Every non-overlapping match (the `finditer` engine). Returns one flat-span
+# `list[int]` per match, left-to-right. HAND-ROLLED CPython-3.7+ iteration (Z1,
+# card 2b37b965): the `regex` crate's `captures_iter` OMITS a zero-width match
+# adjacent to a preceding non-empty one, but CPython EMITS it — `re.finditer(
+# "a*", "aabaa")` is 4 matches (0,2)(2,2)(3,5)(5,5), not 2. So we drive
+# `captures_at(s, pos)` (leftmost match with start ≥ `pos`, anchors relative to
+# the real haystack) ourselves: on a match [a,b) advance `pos = b` when it is
+# non-empty, else by exactly ONE CHAR past `b` (`len_utf8`, so multibyte-correct).
+# A TOP-LEVEL LAZY quantifier that yields a zero-width match is refused honestly
+# (CPython's must_advance re-matches the non-empty alternative at the SAME
+# position — inexpressible over the crate's leftmost-first API; never silently
+# dropped). Proven byte-for-byte against python3 3.12 over the greedy/normal
+# universe (spans are CHAR offsets, incl. astral). See PYTHON_COMPATIBILITY.md.
+@crate("regex", "1")
+@extern
+def _re_caps_all(pattern: str, text: str) -> list[list[int]]:
+    "{ let p: &str = &{pattern}; let s: &str = &{text}; let re = regex::Regex::new(p).unwrap(); let lazy = p.contains(\"*?\") || p.contains(\"+?\") || p.contains(\"??\") || p.contains(\"}?\"); let mut res: Vec<Vec<i64>> = Vec::new(); let mut pos: usize = 0; loop { match re.captures_at(s, pos) { None => break, Some(caps) => { let m0 = caps.get(0).unwrap(); let a = m0.start(); let b = m0.end(); if a == b && lazy { panic!(\"NotImplementedError\\0re.finditer/re.findall: a top-level lazy quantifier (*?/+?/??) that yields a zero-width match diverges from CPython (its must_advance re-matches the non-empty alternative at the same position); use a greedy quantifier or anchor the pattern\"); } let mut out: Vec<i64> = Vec::new(); for i in 0..caps.len() { match caps.get(i) { Some(mm) => { out.push(s[..mm.start()].chars().count() as i64); out.push(s[..mm.end()].chars().count() as i64); }, None => { out.push(-1i64); out.push(-1i64); } } } res.push(out); if b > a { pos = b; } else { match s[b..].chars().next() { Some(c) => { pos = b + c.len_utf8(); }, None => break } } } } } res }"
+
+
+# The capture-group NAMES in group-index order: `names[i]` is group `i`'s name,
+# or `""` when group `i` is unnamed (group 0, the whole match, is always `""`).
+# A property of the PATTERN, so it is independent of the subject.
+@crate("regex", "1")
+@extern
+def _re_group_names(pattern: str) -> list[str]:
+    "regex::Regex::new(&{pattern}).unwrap().capture_names().map(|o| o.unwrap_or(\"\").to_string()).collect::<Vec<String>>()"
+
+
+# ── The Match object (a pure value struct — W5-f) ─────────────────────────────
+# Holds only eagerly-extracted, owned state: the subject text, the flat CHAR
+# spans (group 0..=N, `-1` for unmatched), and the group names. Every accessor
+# is a pure read; group STRINGS are derived by slicing `subject[start:end]`
+# (pyrst str slicing is char-based, so this is multibyte-correct).
+class Match:
+    subject: str
+    spans: list[int]
+    names: list[str]
+
+    def __init__(self, subject: str, spans: list[int], names: list[str]) -> None:
+        self.subject = subject
+        self.spans = spans
+        self.names = names
+
+    # Number of capture groups EXCLUDING group 0 (the whole match).
+    def _ng(self) -> int:
+        return len(self.spans) // 2 - 1
+
+    # `group(0)` (default) is the whole match; `group(n)` the n-th capture.
+    # An unmatched (optional) group returns `None`; an out-of-range index raises
+    # `IndexError("no such group")` (CPython's exact message).
+    def group(self, n: int = 0) -> Optional[str]:
+        if n < 0 or n > self._ng():
+            raise IndexError("no such group")
+        s: int = self.spans[2 * n]
+        e: int = self.spans[2 * n + 1]
+        if s == -1:
+            return None
+        return self.subject[s:e]
+
+    # Groups 1..N as a `list[Optional[str]]` (see the DIVERGENCES note re: list
+    # vs CPython's tuple). Unmatched groups are `None`.
+    def groups(self) -> list[Optional[str]]:
+        out: list[Optional[str]] = []
+        for i in range(1, self._ng() + 1):
+            out.append(self.group(i))
+        return out
+
+    # Char offset of the start of group `n` (default 0); `-1` if unmatched.
+    def start(self, n: int = 0) -> int:
+        if n < 0 or n > self._ng():
+            raise IndexError("no such group")
+        return self.spans[2 * n]
+
+    # Char offset of the end of group `n` (default 0); `-1` if unmatched.
+    def end(self, n: int = 0) -> int:
+        if n < 0 or n > self._ng():
+            raise IndexError("no such group")
+        return self.spans[2 * n + 1]
+
+    # `(start(n), end(n))`; `(-1, -1)` for an unmatched group (CPython-exact).
+    def span(self, n: int = 0) -> tuple[int, int]:
+        return (self.start(n), self.end(n))
+
+    # `{name: group(name)}` for every NAMED group. Values are `Optional[str]`
+    # (None for a named-but-unmatched group). Access by key (see DIVERGENCES).
+    def groupdict(self) -> dict[str, Optional[str]]:
+        d: dict[str, Optional[str]] = {}
+        for i in range(1, self._ng() + 1):
+            if self.names[i] != "":
+                d[self.names[i]] = self.group(i)
+        return d
+
+    # A Match object is ALWAYS truthy in CPython (it has no __len__/__bool__ of
+    # its own that could be falsy). Defining it here makes `bool(m)` and any
+    # truthiness test on an already-narrowed Match faithful.
+    def __bool__(self) -> bool:
+        return True
+
+
+# Build a Match from a (possibly anchor-wrapped) pattern over `text`, or None.
+# `pat` is the pattern actually run; `text` is the ORIGINAL subject the spans
+# index into (anchoring wraps the pattern, never the text).
+def _re_build(pat: str, text: str) -> Optional[Match]:
+    spans: Optional[list[int]] = _re_caps(pat, text)
+    if spans is None:
+        return None
+    names: list[str] = _re_group_names(pat)
+    return Match(text, spans, names)
+
+
+# ── Z3: `$` end-anchor vs a trailing newline (honest refusal) ─────────────────
+# CPython's DEFAULT `$` matches at the end of the string OR just before a SINGLE
+# trailing `\n` — a zero-width assertion (`re.search("a$", "a\n")` matches "a").
+# The `regex` crate's `$` requires the TRUE end of the haystack, so it silently
+# DIVERGES on a newline-terminated subject. The crate supports no look-around, so
+# the "before the final newline" assertion cannot be emulated soundly: `(?m)`
+# over-matches every interior newline, and stripping the trailing `\n` from the
+# subject breaks mixed patterns that themselves match the newline (e.g.
+# `(\n)|(a$)`). So — per the iron rule (honest error over silent miscompile) —
+# when a pattern carries a real `$` end-anchor AND the subject ends in `\n`, the
+# public functions raise instead of returning a divergent result.
+
+# True iff `pattern` contains an UNESCAPED `$` OUTSIDE a character class — i.e. a
+# real end-anchor (a `\$` or a `$` inside `[...]` is a literal, not an anchor).
+# Conservative on class boundaries: any mis-read errs toward flagging (never
+# toward missing a real anchor, which would let a silent divergence through).
+def _re_has_end_anchor(pattern: str) -> bool:
+    escaped: bool = False
+    in_class: bool = False
+    for ch in pattern:
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\":
+            escaped = True
+            continue
+        if in_class:
+            if ch == "]":
+                in_class = False
+            continue
+        if ch == "[":
+            in_class = True
+            continue
+        if ch == "$":
+            return True
+    return False
+
+
+# Raise an honest error when `pattern`'s `$` end-anchor would diverge from
+# CPython against a newline-terminated `text` (see the note above).
+def _re_guard_newline_dollar(pattern: str, text: str) -> None:
+    if _re_has_end_anchor(pattern) and text.endswith("\n"):
+        raise ValueError("re: a `$` end-anchor against a subject ending in a newline diverges from CPython (CPython's `$` also matches just before a single trailing `\\n`; the regex crate requires the true end of the haystack and has no look-around to emulate that zero-width assertion soundly). Strip the trailing newline (e.g. text[:-1]) or match the newline explicitly (e.g. `\\n?$`).")
+
+
+# CPython's `re.search`: scan the whole string for the first match. Returns a
+# `Match` or `None`.
+def search(pattern: str, text: str) -> Optional[Match]:
+    _re_guard_newline_dollar(pattern, text)
+    return _re_build(pattern, text)
+
+
+# CPython's `re.match` anchors the match at the START of the string (not the
+# end). Named `match_` because `match` is a pyrst statement keyword; the
+# non-capturing `^(?:...)` wrapper preserves capture-group indices.
+def match_(pattern: str, text: str) -> Optional[Match]:
+    _re_guard_newline_dollar(pattern, text)
+    return _re_build("^(?:" + pattern + ")", text)
+
+
+# CPython's `re.fullmatch` anchors at BOTH ends: the whole string must match.
+def fullmatch(pattern: str, text: str) -> Optional[Match]:
+    _re_guard_newline_dollar(pattern, text)
+    return _re_build("^(?:" + pattern + ")$", text)
+
+
+# CPython's `re.finditer`, materialised: a `list[Match]` of every non-overlapping
+# match (CPython yields a lazy iterator; iterate this list the same way).
+def finditer(pattern: str, text: str) -> list[Match]:
+    _re_guard_newline_dollar(pattern, text)
+    out: list[Match] = []
+    names: list[str] = _re_group_names(pattern)
+    for sp in _re_caps_all(pattern, text):
+        out.append(Match(text, sp, names))
+    return out
+
+
+# ── bool / str / list predicates and transforms (unchanged surfaces) ──────────
+
+# Pyrst-only legacy predicate (card 275bfe47): unanchored "did it match" as a
+# plain `bool`. KEPT as the pure boolean test (CPython has no `re.is_match`;
+# `re.search(...) is not None` is the CPython spelling of the same question).
 @crate("regex", "1")
 @extern
 def is_match(pattern: str, text: str) -> bool:
     "regex::Regex::new(&{pattern}).unwrap().is_match(&{text})"
 
 
-# CPython-named alias of `is_match` (unanchored search-test).
-@crate("regex", "1")
-@extern
-def search(pattern: str, text: str) -> bool:
-    "regex::Regex::new(&{pattern}).unwrap().is_match(&{text})"
-
-
-# CPython's `re.match` anchors at the START of the string only (not the end).
-# Named `match_` because `match` is a pyrst statement keyword.
-@crate("regex", "1")
-@extern
-def match_(pattern: str, text: str) -> bool:
-    "regex::Regex::new(&format!(\"^(?:{})\", {pattern})).unwrap().is_match(&{text})"
-
-
-# CPython's `re.fullmatch` anchors at BOTH the start and the end.
-@crate("regex", "1")
-@extern
-def fullmatch(pattern: str, text: str) -> bool:
-    "regex::Regex::new(&format!(\"^(?:{})$\", {pattern})).unwrap().is_match(&{text})"
-
-
+# Pyrst-only legacy alias (card 275bfe47): the WHOLE matches as `list[str]`,
+# ALWAYS (never group captures), regardless of capture-group count. Kept for
+# backward compatibility; use `findall` (below) for CPython-faithful semantics.
 @crate("regex", "1")
 @extern
 def find_all(pattern: str, text: str) -> list[str]:
     "regex::Regex::new(&{pattern}).unwrap().find_iter(&{text}).map(|m| m.as_str().to_string()).collect::<Vec<String>>()"
 
 
-# CPython-named alias of `find_all`.
+# CPython's `re.findall`, with its notorious shape shift: 0 capture groups ->
+# the whole matches; 1 capture group -> that group's captures (`''` when the
+# group is present-but-unmatched). 2+ capture groups would return a list of
+# TUPLES in CPython — inexpressible in pyrst's return typing — so this raises an
+# HONEST `NotImplementedError` rather than silently returning a different shape
+# (use `re.finditer(...)` + `m.group(i)`). Zero-width matches follow the SAME
+# hand-rolled CPython-3.7+ iteration as `finditer` (Z1, card 2b37b965) —
+# `re.findall("a*", "aabaa")` is `["aa", "", "aa", ""]`, not `["aa", "aa"]`, and
+# `re.findall("", "abc")` is `["", "", "", ""]`. The pyrst `findall` wrapper
+# below adds the `$`/newline honest guard (Z3) before delegating here.
 @crate("regex", "1")
 @extern
+def _re_findall_ext(pattern: str, text: str) -> list[str]:
+    "{ let p: &str = &{pattern}; let s: &str = &{text}; let re = regex::Regex::new(p).unwrap(); let ng = re.captures_len() - 1; if ng >= 2 { panic!(\"NotImplementedError\\0re.findall on a pattern with 2+ capture groups returns a list of tuples, which pyrst cannot express; use re.finditer(...) and m.group(i)\"); } let lazy = p.contains(\"*?\") || p.contains(\"+?\") || p.contains(\"??\") || p.contains(\"}?\"); let mut out: Vec<String> = Vec::new(); let mut pos: usize = 0; loop { match re.captures_at(s, pos) { None => break, Some(caps) => { let m0 = caps.get(0).unwrap(); let a = m0.start(); let b = m0.end(); if a == b && lazy { panic!(\"NotImplementedError\\0re.finditer/re.findall: a top-level lazy quantifier (*?/+?/??) that yields a zero-width match diverges from CPython (its must_advance re-matches the non-empty alternative at the same position); use a greedy quantifier or anchor the pattern\"); } if ng == 0 { out.push(s[a..b].to_string()); } else { out.push(caps.get(1).map(|m| m.as_str().to_string()).unwrap_or_default()); } if b > a { pos = b; } else { match s[b..].chars().next() { Some(c) => { pos = b + c.len_utf8(); }, None => break } } } } } out }"
+
+
+# CPython-faithful `re.findall`: the `$`/newline honest guard (Z3) then the
+# eager extractor (Z1). `find_all` (legacy, whole-matches-only) is unchanged.
 def findall(pattern: str, text: str) -> list[str]:
-    "regex::Regex::new(&{pattern}).unwrap().find_iter(&{text}).map(|m| m.as_str().to_string()).collect::<Vec<String>>()"
+    _re_guard_newline_dollar(pattern, text)
+    return _re_findall_ext(pattern, text)
 
 
 # NOTE: passes `repl` through a closure (not a `&str`/`Replacer` template)

@@ -1678,7 +1678,10 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
             Ty::Tuple(tys)
         }
         Expr::IfExp { test, body, orelse, span } => {
-            check_expr(test, env)?;
+            // (Z4, card 2b37b965) A bare `Optional` ternary condition leaks a
+            // rustc error at build; reject it at check for parity with `if`.
+            let test_ty = check_expr(test, env)?;
+            reject_optional_truthiness(&test_ty, test.span())?;
             let bt = check_expr(body, env)?;
             let ot = check_expr(orelse, env)?;
             // Both arms must agree; the more concrete side wins so a branch like
@@ -1738,7 +1741,7 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 module_id: env.module_id.clone(),
             };
             bind_comp_targets(targets, elem_ty, &mut inner_env.locals);
-            if let Some(c) = cond { check_expr(c, &mut inner_env)?; }
+            if let Some(c) = cond { let ct = check_expr(c, &mut inner_env)?; reject_optional_truthiness(&ct, c.span())?; }
             let elt_ty = check_expr(elt, &mut inner_env)?;
             Ty::List(Box::new(elt_ty))
         }
@@ -1788,7 +1791,7 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 module_id: env.module_id.clone(),
             };
             bind_comp_targets(targets, elem_ty, &mut inner_env.locals);
-            if let Some(c) = cond { check_expr(c, &mut inner_env)?; }
+            if let Some(c) = cond { let ct = check_expr(c, &mut inner_env)?; reject_optional_truthiness(&ct, c.span())?; }
             let elt_ty = check_expr(elt, &mut inner_env)?;
             // Same hashability rule as set literals: a Float element produces
             // the uncompilable `HashSet<f64>`, so reject it here too.
@@ -1841,7 +1844,7 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 module_id: env.module_id.clone(),
             };
             bind_comp_targets(targets, elem_ty, &mut inner_env.locals);
-            if let Some(c) = cond { check_expr(c, &mut inner_env)?; }
+            if let Some(c) = cond { let ct = check_expr(c, &mut inner_env)?; reject_optional_truthiness(&ct, c.span())?; }
             let key_ty = check_expr(key, &mut inner_env)?;
             let val_ty = check_expr(val, &mut inner_env)?;
             // Same hashability rule as dict literals: a Float KEY produces the
@@ -3630,7 +3633,10 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
             // (needs `Neg`/`Not` bounds, out of v1 scope).
             reject_typevar_op(&t, "apply a unary operator to", *span)?;
             match op {
-                UnOp::Not => Ty::Bool,
+                // (Z4, card 2b37b965) `not <Optional>` is a truthiness use —
+                // reject a bare Optional here (check/build agreement). Neg/BitNot
+                // are arithmetic, not truthiness, so they are untouched.
+                UnOp::Not => { reject_optional_truthiness(&t, *span)?; Ty::Bool }
                 UnOp::Neg => t,
                 UnOp::BitNot => Ty::Int,
             }

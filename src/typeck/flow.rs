@@ -2611,6 +2611,9 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             // Generics v1: `assert t` puts a bare type variable in a boolean
             // context (needs truthiness) — rejected like `if t:`.
             reject_typevar_op(&cond_ty, "use as a condition", cond.span())?;
+            // (Z4, card 2b37b965) A bare `Optional` condition passes `check` but
+            // leaks a rustc E0308 at `build`; reject it here so the two agree.
+            reject_optional_truthiness(&cond_ty, cond.span())?;
             if let Some(m) = msg { check_expr(m, env)?; }
             Ok(())
         }
@@ -2915,6 +2918,9 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             // v1). A narrowing guard (`if x is not None:`) is a `BinOp` typed
             // Bool, so it is never a bare `TypeVar` and is unaffected.
             reject_typevar_op(&cond_ty, "use as a condition", cond.span())?;
+            // (Z4, card 2b37b965) A bare `Optional` condition passes `check` but
+            // leaks a rustc E0308 at `build`; reject it here so the two agree.
+            reject_optional_truthiness(&cond_ty, cond.span())?;
             // (card c34ac64a fix B3) A None-guard on a name already narrowed to a
             // concrete `T` (or any concrete non-Optional local) is statically
             // decided — honest error instead of a leaked `.is_none()`-on-`T`.
@@ -2950,6 +2956,7 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             for (c, b) in elifs {
                 let c_ty = check_expr(c, env)?;
                 reject_typevar_op(&c_ty, "use as a condition", c.span())?;
+                reject_optional_truthiness(&c_ty, c.span())?;
                 check_body(b, env)?;
             }
             // ELSE branch: narrowed iff the guard is `is None` (so the else is the
@@ -2999,6 +3006,9 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             // Generics v1: a bare type variable as a loop condition (`while t:`)
             // needs truthiness — rejected (see the `if` arm).
             reject_typevar_op(&cond_ty, "use as a condition", cond.span())?;
+            // (Z4, card 2b37b965) A bare `Optional` condition passes `check` but
+            // leaks a rustc E0308 at `build`; reject it here so the two agree.
+            reject_optional_truthiness(&cond_ty, cond.span())?;
             // (card c34ac64a fix B3) A None-guard header on a name already narrowed
             // to a concrete `T` (or any concrete non-Optional local) is statically
             // decided — honest error instead of a leaked `.is_none()`-on-`T`.

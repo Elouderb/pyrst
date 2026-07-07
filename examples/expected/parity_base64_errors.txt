@@ -1,0 +1,16 @@
+Incorrect padding
+Incorrect padding
+Invalid base64-encoded string: number of data characters (1) cannot be 1 more than a multiple of 4
+Incorrect padding
+Incorrect padding
+Incorrect padding
+Incorrect padding
+Invalid base64-encoded string: number of data characters (5) cannot be 1 more than a multiple of 4
+Non-base32 digit found
+Non-base32 digit found
+Incorrect padding
+Incorrect padding
+Incorrect padding
+b'A'
+b'ABC'
+b'A\x04'

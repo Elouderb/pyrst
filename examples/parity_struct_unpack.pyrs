@@ -1,0 +1,32 @@
+# W5-d struct: unpack round-trips, INDEXED like the CPython tuple.
+# DUAL-RUN vs python3. pyrst's unpack returns a list (not a variable-arity
+# heterogeneous tuple — inexpressible; the re.groups() limitation), but
+# INDEX-ACCESS `unpack(...)[i]` is byte-identical to indexing CPython's tuple, so
+# this dual-runs. Integer formats only (floats use unpack_float — see struct_float).
+from struct import unpack
+
+def main() -> None:
+    print(unpack('<i', b'\xd2\x04\x00\x00')[0])
+    print(unpack('>i', b'\x00\x00\x04\xd2')[0])
+    print(unpack('<h', b'\x02\x01')[0])
+    print(unpack('>H', b'\xff\xff')[0])
+    print(unpack('<b', b'\xff')[0])
+    print(unpack('<B', b'\x80')[0])
+    print(unpack('>q', b'\xff\xff\xff\xff\xff\xff\xff\xfb')[0])
+    print(unpack('<q', b'\xfb\xff\xff\xff\xff\xff\xff\xff')[0])
+    print(unpack('<Q', b'\xff\x00\x00\x00\x00\x00\x00\x00')[0])
+    print(unpack('>I', b'\x00\x00\x04\xd2')[0])
+    r = unpack('<3i', b'\x01\x00\x00\x00\x02\x00\x00\x00\x03\x00\x00\x00')
+    print(r[0], r[1], r[2])
+    print(len(unpack('<2h', b'\x01\x00\x02\x00')))
+    # skip a pad byte with 'x'
+    print(unpack('<xh', b'\x00\x05\x00')[0])
+    # length mismatch DUAL-RUNS (struct.error / ValueError both Exception; msg matches)
+    try:
+        unpack('>i', b'abc')
+    except Exception as e:
+        print(str(e))
+    try:
+        unpack('>i', b'abcde')
+    except Exception as e:
+        print(str(e))

@@ -1,0 +1,21 @@
+# W5-d struct: calcsize across byte orders, widths, repeat counts, and 's'/'x'.
+# DUAL-RUN vs python3 (CPython's `struct.calcsize` is the golden). calcsize takes
+# only the format string (no *args), so it is byte-identical under both runtimes.
+# Explicit prefixes only ('<'/'>'/'!'/'=') — the native '@'/no-prefix mode is a
+# documented pyrst deferral (see struct_pack.py for that honest-error path).
+from struct import calcsize
+
+def main() -> None:
+    print(calcsize('<i'), calcsize('>i'), calcsize('=i'), calcsize('!i'))
+    print(calcsize('<b'), calcsize('<h'), calcsize('<l'), calcsize('<q'))
+    print(calcsize('<B'), calcsize('<H'), calcsize('<L'), calcsize('<Q'))
+    print(calcsize('<f'), calcsize('<d'), calcsize('<10s'), calcsize('<3i2h'))
+    print(calcsize('>4b'), calcsize('<2i3x'), calcsize('='), calcsize('<'))
+    print(calcsize('!hhl'), calcsize('>2q'), calcsize('<5s3b'))
+    # bad-char rejection DUAL-RUNS: CPython's struct.error and pyrst's ValueError
+    # both subclass Exception, and the message text matches. A byte-order PREFIX is
+    # used so pyrst validates the char (not its native-mode deferral) first.
+    try:
+        calcsize('<z')
+    except Exception as e:
+        print(str(e))

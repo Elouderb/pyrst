@@ -1,0 +1,53 @@
+# W5-c base64: b64/urlsafe/b32/b16 encode+decode over bytes, RFC 4648.
+# DUAL-RUN vs python3 (CPython's own `base64` is the golden). Every transform is
+# bytes->bytes; round-trips hold across binary edges (\x00/\xff) and the full
+# 0..255 byte range. Discard-default (validate=False) is exercised too.
+from base64 import b64encode, b64decode, urlsafe_b64encode, urlsafe_b64decode, b32encode, b32decode, b16encode, b16decode
+
+def main() -> None:
+    # standard base64 encode across the four remainder shapes (0/1/2 tail bytes)
+    print(b64encode(b'\x00\x01\x02hello\xff'))
+    print(b64encode(b''))
+    print(b64encode(b'a'))
+    print(b64encode(b'ab'))
+    print(b64encode(b'abc'))
+    print(b64decode(b'AAECaGVsbG//'))
+    # urlsafe (- and _ replace + and /)
+    print(urlsafe_b64encode(b'\xfb\xff\xfe'))
+    print(urlsafe_b64decode(b'-__-'))
+    # base32 / base16
+    print(b32encode(b'hello'))
+    print(b32decode(b'NBSWY3DP'))
+    print(b16encode(b'\x00\xffAB'))
+    print(b16decode(b'00FF4142'))
+    print(b16decode(b'00ff41', True))
+    print(b32decode(b'nbswy3dp'.upper()))
+    # discard default: non-alphabet bytes are dropped before decoding
+    print(b64decode(b'aGVs bG8='))
+    print(b64decode(b'QQ==extra'))
+    print(b64decode(b'aGVsbG8==='))
+    # B2: a2b_base64 is a per-quad machine (NOT a leading-run scan) — data both
+    # before and after an ignored '=' decodes, and a completing pad stops decoding.
+    print(b64decode(b'=QQ=='))          # b'A' (a leading-run scan wrongly gave b'')
+    print(b64decode(b'QQ==QQ=='))       # b'A' (stops at the completed pad)
+    print(b64decode(b'QUE=QUE='))       # b'AA'
+    print(urlsafe_b64decode(b'+/+/'))   # urlsafe accepts +/ too (translate-then-a2b)
+    # interior-'=' that does NOT complete a quad is skipped, decoding CONTINUES over
+    # the following data (these two were SILENT WRONG-BYTES miscompiles before the fix)
+    print(b64decode(b'YWJj=QQ=='))      # b'abcA' (old leading-run scan gave b'abc')
+    print(b64decode(b'QUJD=EFGH'))      # b'ABC\x10Q\x87' (old gave b'ABC')
+    print(b64decode(b'ab=cd'))          # b'i\xb7\x1d' (old over-rejected)
+    # b32decode ports _b32decode: every valid trailing-pad shape decodes exactly
+    print(b32decode(b'AAAA===='))       # b'\x00\x00'
+    print(b32decode(b'ME======'))       # b'a'
+    # round-trips across binary edges and the whole byte range
+    edge: bytes = b'\x00\x01\x7f\x80\xfe\xff'
+    print(b64decode(b64encode(edge)) == edge)
+    print(urlsafe_b64decode(urlsafe_b64encode(edge)) == edge)
+    print(b32decode(b32encode(edge)) == edge)
+    print(b16decode(b16encode(edge)) == edge)
+    allb: bytes = bytes(list(range(256)))
+    print(b64decode(b64encode(allb)) == allb)
+    print(b32decode(b32encode(allb)) == allb)
+    print(b16decode(b16encode(allb)) == allb)
+    print(len(b64encode(allb)))

@@ -16,7 +16,8 @@
 #   - ALIASING IMPOSSIBLE: pyrst's value semantics forbid aliasing.
 #   - NO CUSTOM COPY PROTOCOL: __copy__/__deepcopy__ dunders unsupported.
 #   - NO CIRCULAR REFERENCES: value semantics forbid cycles.
-#   - NO BYTES/BYTEARRAY: pyrst has no bytes type.
+#   - NO BYTEARRAY: pyrst has no `bytearray` type (the W5 `bytes` value type copies
+#     trivially under value semantics, so it needs no special handling here).
 #   - `copy(None)`/`deepcopy(None)` with a BARE `None` literal argument (no
 #     other call in scope to pin the type) cannot be called: pyrst cannot
 #     infer the generic type parameter `T` from a bare `None` (it type-checks

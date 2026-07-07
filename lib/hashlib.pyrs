@@ -1,0 +1,172 @@
+# pyrst standard library — hashlib (sha256 / sha1 / md5 / sha512)
+#
+# W5-e (card 3dde6421), design docs/design/w5-bytes-handles.md §D/§F. The design's
+# unlock-map finding: hashlib is a PURE VALUE CLASS needing only the `bytes` gate
+# (G7) — NO opaque-handle gate (G1). This module realizes that finding while ALSO
+# guaranteeing digest exactness by delegating the actual hashing to the RustCrypto
+# crates (`sha2`/`sha1`/`md-5`) via `@extern`/`@crate` — the same exactness-critical
+# external-crate precedent `re` uses (`@crate("regex", ...)`).
+#
+# ── WHY THIS IS STILL A "PURE VALUE CLASS, NO G1" (the key design point) ──────
+# A `Hash` object holds only pyrst VALUES: the algorithm name and the ACCUMULATED
+# input `bytes`. It does NOT hold a live foreign hasher struct across calls (which
+# WOULD need a G1 handle). `update(data)` simply appends to the buffer; the digest
+# is computed LAZILY at `digest()`/`hexdigest()` time by a pure one-shot @extern
+# (`bytes -> bytes`) over the whole accumulated buffer. Consequences:
+#   - incremental == oneshot is TRIVIALLY true: `h.update(a); h.update(b)` hashes
+#     `a + b`, exactly what a one-shot `sha256(a + b)` hashes (design py-probe 2).
+#   - `.copy()` is a plain value reconstruction; pyrst's value-semantics clone-on-
+#     use then makes the copy diverge from the original under later `update`s.
+#   - There is NO module-global hasher, so the W4-c clone-on-read hazard cannot
+#     arise (design §E kill #6) — every constructor makes a fresh local `Hash`.
+# Because the @extern is a pure function (no held state), no handle machinery, no
+# compiler change, and no `Mut[self]`-beyond-what-the-class-already-supports is
+# needed (update() mutates `self._buffer` in place exactly like io.StringIO.write).
+#
+# ── SHAPE: constructors are FREE FUNCTIONS over ONE `Hash` value class ────────
+# `sha256`/`sha1`/`md5`/`sha512`/`new` are module-level FUNCTIONS (not classes)
+# that each return a `Hash` tagged with its algorithm name; `digest()` dispatches
+# on that name. A single static return type (`Hash`) is what lets `new(name, data)`
+# exist at all (a per-name class-returning `new` would need a union return type,
+# which pyrst cannot express). It also means the CPython-canonical forms all work
+# and DUAL-RUN against CPython's own `hashlib`:
+#   from hashlib import sha256, sha1, md5, sha512, new
+#   sha256(b'abc').hexdigest()        # -> 'ba7816bf...'
+#   new('sha256', b'abc').hexdigest() # same
+#   h = sha256(b''); h.update(b'a'); h.update(b'bc'); h.hexdigest()  # incremental
+#   h.digest()  # -> bytes   ;   h.copy()  # -> an independent Hash
+#   h.name / h.digest_size / h.block_size   # attributes, CPython-matching
+#
+# ── FIDELITY: 5/5 for the shipped algorithms ──────────────────────────────────
+# Every digest is byte-for-byte CPython-identical (validated against python3's
+# hashlib known-answer vectors: empty / 'abc' / long / multi-block / \x00\xff, plus
+# sha512's full 64-bit output — computed in Rust, so pyrst's i64 never touches the
+# hash arithmetic and the design's sha512-overflow concern does not arise).
+#
+# DEFERRALS (honest, documented):
+#   - Algorithm set is sha256/sha1/md5/sha512 (the design scope). sha224/sha384,
+#     the SHA-3 family, blake2, and shake_* are not shipped this wave.
+#   - `usedforsecurity=`, `hashlib.algorithms_available/_guaranteed`, and the
+#     `file_digest` helper are out of scope.
+#   - `digestmod` (here `new`'s `name`) is a STRING only — CPython also accepts a
+#     constructor/module object, which pyrst's single-typed parameter cannot; the
+#     string form is CPython-supported, so goldens dual-run. The name is matched
+#     CASE-INSENSITIVELY (`new('SHA256')` works), exactly like CPython.
+
+
+# ── RustCrypto one-shot @extern shims (pure bytes -> bytes) ───────────────────
+
+@crate("sha2", "0.10")
+@extern
+def _h_sha256(data: bytes) -> bytes:
+    "{ use sha2::Digest; let mut h = sha2::Sha256::new(); h.update(&{data}); h.finalize().to_vec() }"
+
+@crate("sha2", "0.10")
+@extern
+def _h_sha512(data: bytes) -> bytes:
+    "{ use sha2::Digest; let mut h = sha2::Sha512::new(); h.update(&{data}); h.finalize().to_vec() }"
+
+@crate("sha1", "0.10")
+@extern
+def _h_sha1(data: bytes) -> bytes:
+    "{ use sha1::Digest; let mut h = sha1::Sha1::new(); h.update(&{data}); h.finalize().to_vec() }"
+
+@crate("md-5", "0.10")
+@extern
+def _h_md5(data: bytes) -> bytes:
+    "{ use md5::Digest; let mut h = md5::Md5::new(); h.update(&{data}); h.finalize().to_vec() }"
+
+
+# Output size (bytes) of a digest, or 0 for an unknown algorithm name. The name is
+# matched CASE-INSENSITIVELY (CPython's hashlib.new('SHA256') works) via one lower().
+def _digest_size(name: str) -> int:
+    n: str = name.lower()
+    if n == "sha256":
+        return 32
+    if n == "sha1":
+        return 20
+    if n == "md5":
+        return 16
+    if n == "sha512":
+        return 64
+    return 0
+
+
+# Internal block size (bytes) — 128 for sha512, 64 for the others. Case-insensitive.
+def _block_size(name: str) -> int:
+    if name.lower() == "sha512":
+        return 128
+    return 64
+
+
+# ── The Hash value class ───────────────────────────────────────────────────────
+
+class Hash:
+    name: str
+    digest_size: int
+    block_size: int
+    _buffer: bytes
+
+    def __init__(self, name: str, data: bytes) -> None:
+        # CPython's `.name` is always LOWERCASE (`hashlib.new('SHA256').name ==
+        # 'sha256'`); digest() dispatches on self.name, so lowercasing here also lets
+        # a mixed-case constructor name hash correctly. _digest_size / _block_size
+        # are themselves case-insensitive.
+        self.name = name.lower()
+        self.digest_size = _digest_size(name)
+        self.block_size = _block_size(name)
+        self._buffer = data
+
+    # Feed more bytes in; mutates the accumulated buffer in place (a field write,
+    # exactly like io.StringIO.write — no Mut[self] annotation needed).
+    def update(self, data: bytes) -> None:
+        self._buffer = self._buffer + data
+
+    # The raw digest bytes — computed one-shot over the whole accumulated buffer.
+    def digest(self) -> bytes:
+        if self.name == "sha256":
+            return _h_sha256(self._buffer)
+        elif self.name == "sha1":
+            return _h_sha1(self._buffer)
+        elif self.name == "md5":
+            return _h_md5(self._buffer)
+        elif self.name == "sha512":
+            return _h_sha512(self._buffer)
+        raise ValueError("unsupported hash type " + self.name)
+
+    # The digest as a lowercase hex string.
+    def hexdigest(self) -> str:
+        return self.digest().hex()
+
+    # An INDEPENDENT copy of the current state (value-semantics clone-on-use makes
+    # later update()s on the copy diverge from the original — design's copy-fork).
+    def copy(self) -> Hash:
+        return Hash(self.name, self._buffer)
+
+
+# ── CPython-named constructors (free functions returning Hash) ────────────────
+
+def sha256(data: bytes = b"") -> Hash:
+    return Hash("sha256", data)
+
+
+def sha1(data: bytes = b"") -> Hash:
+    return Hash("sha1", data)
+
+
+def md5(data: bytes = b"") -> Hash:
+    return Hash("md5", data)
+
+
+def sha512(data: bytes = b"") -> Hash:
+    return Hash("sha512", data)
+
+
+# CPython's `hashlib.new(name, data=b'')` — the generic constructor. The name is
+# CASE-INSENSITIVE (`new('SHA256')` works, matching CPython); an unknown algorithm
+# raises CPython's exact "unsupported hash type <name>" (echoing the ORIGINAL case,
+# as CPython does — the guard is case-insensitive, only the message keeps the case).
+def new(name: str, data: bytes = b"") -> Hash:
+    if _digest_size(name) == 0:
+        raise ValueError("unsupported hash type " + name)
+    return Hash(name, data)

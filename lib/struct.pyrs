@@ -1,0 +1,417 @@
+# pyrst standard library — struct (pack/unpack/calcsize over bytes)
+#
+# W5-d (card 97e74935), design docs/design/w5-bytes-handles.md §D/§F. Built on the
+# W5-a/b `bytes` machinery (byte-offset indexing, bytes([ints]), integer bit
+# operators) plus a handful of tiny Rust-STD `@extern` shims for exact IEEE-754
+# float<->bits conversion and 8-byte int assembly (f32/f64 to_bits/from_bits,
+# i64::from_le_bytes). There is NO `@crate` — every shim is Rust std — so importing
+# `struct` stays on the single-file build path.
+#
+# ── THE TWO pyrst EXPRESSIBILITY DIVERGENCES (honest, forced, documented) ──────
+# CPython's `struct.pack(fmt, v1, v2, ...)` is VARIADIC and its `struct.unpack`
+# returns a variable-arity, HETEROGENEOUS TUPLE. pyrst has neither `*args` nor a
+# variable-arity heterogeneous tuple/list, so the faithful CPython call/return
+# shapes are inexpressible. This module ships the honest equivalents:
+#
+#   1. VALUES PASS AS A LIST, not `*args`.  `pack(fmt, values: list[int])` — write
+#      `pack('<3i', [1, 2, 3])` where CPython writes `struct.pack('<3i', 1, 2, 3)`.
+#   2. unpack RETURNS A LIST, not a tuple.  `unpack(fmt, data) -> list[int]` — the
+#      same limitation `re.groups()` documents. INDEX it exactly as you'd index the
+#      tuple: `unpack('<i', data)[0]`. (A whole-value print shows `[1, 2]` where
+#      CPython shows `(1, 2)`; index-access is byte-identical, so an unpack golden
+#      DUAL-RUNS against CPython via `unpack(...)[i]`.)
+#   3. INT and FLOAT VALUE CHANNELS ARE SEPARATE.  A pyrst `list` is homogeneous
+#      and cannot hold ints and floats together, so integer formats go through
+#      `pack`/`unpack` (list[int]) and float formats (`f`/`d`) through
+#      `pack_float`/`unpack_float` (list[float]). A single mixed-type record
+#      (e.g. `'<if'`) is therefore split across the two calls — documented, honest.
+#
+# ── BYTE ORDER / SIZE MODE ─────────────────────────────────────────────────────
+# SUPPORTED (all standard sizes, NO alignment padding — the portable modes):
+#   '<'  little-endian        '>'  big-endian
+#   '!'  network (== '>')     '='  native byte order, standard sizes (LE here)
+# On this platform (x86-64 Linux, little-endian) '=' resolves to little-endian.
+# Standard sizes: b/B=1, h/H=2, i/I/l/L=4, q/Q=8, f=4, d=8, s=1/char, x=1 pad.
+#
+# DEFERRED — native '@' AND the no-prefix default (which CPython treats as '@'):
+# native mode uses native C sizes (probed on this platform: '@l'=8 vs '='l'=4) AND
+# alignment padding (probed: '@bi'=8 vs '=bi'=5), matching the design's explicit
+# "native @-align deferred" (§D). A format with no byte-order prefix, or a '@'
+# prefix, raises an honest ValueError directing you to add '<'/'>'/'!'/'='. (This
+# is the iron rule: CPython's `pack('i', 1)` is native `@`; rather than silently
+# substitute a byte order/size, pyrst rejects it and tells you which prefix to add.)
+#
+# ── FLOATS — EXACT, including the 32-bit precision loss ────────────────────────
+# 'f' packs via Rust `(x as f32).to_bits()` and 'd' via `f64::to_bits()`, so
+# `pack_float('<f', [0.1])` loses precision byte-for-byte EXACTLY as CPython does
+# (the packed bytes AND the `unpack_float` round-trip value both match python3:
+# `unpack_float('<f', pack_float('<f', [0.1]))[0] == 0.10000000149011612`).
+#
+# ── q / Q AND THE i64 CEILING (honest, never a silent wrap) ───────────────────
+# pyrst `int` is i64. 'q' therefore covers its full range natively. For 'Q':
+#   - pack: 0 <= value <= i64::MAX is packable; a negative raises struct's
+#     "'Q' format requires 0 <= number <= 18446744073709551615". Values in
+#     2^63..2^64-1 are simply UNREACHABLE as a pyrst int literal (they overflow
+#     i64 at lex time), so they cannot be mis-packed.
+#   - unpack: 8 bytes whose value has bit 63 set exceed i64::MAX — pyrst CANNOT
+#     represent them, so `unpack('<Q', ...)` raises an HONEST ValueError rather
+#     than silently WRAPPING to a negative (the prompt's required honest error).
+#
+# ── ERRORS ─────────────────────────────────────────────────────────────────────
+# Range / length / bad-char errors carry CPython's EXACT message text
+# ("'B' format requires 0 <= number <= 255", "unpack requires a buffer of N bytes",
+# "bad char in struct format"). They are raised as ValueError (CPython's
+# `struct.error` is a direct Exception subclass, NOT a ValueError, so a dual-run
+# error golden catches with `except Exception`, under which both runtimes agree).
+#
+# ── FIDELITY: 4/5 ─ full '<>!=' × (b B h H i I l L q Q f d) + x pad + repeat
+# counts, byte-exact incl. float precision and the q/Q i64 boundary. Points off:
+# the *args/tuple/int-vs-float-channel shapes above, native '@' + alignment
+# deferred, and 's'/'p' pack/unpack deferred (below).
+#
+# DEFERRALS (honest): native '@' + alignment; 's' (fixed-length bytes) and 'p'
+# (Pascal string) in pack/unpack — 's' is a bytes VALUE that cannot share the
+# int/float list channel, so it is calcsize-supported only (matching the design's
+# §D "s/p deferred"); the boolean '?', native-only 'n'/'N'/'P', and half-float 'e'.
+
+
+# ── Rust-std @extern shims (IEEE-754 bits + 8-byte int assembly; NO @crate) ────
+
+# f32 bit pattern of a float (as a non-negative i64 — a u32 always fits).
+@extern
+def _f32_bits(x: float) -> int:
+    "((({x} as f32).to_bits()) as i64)"
+
+# True iff casting a FINITE `x` to f32 overflows to infinity — i.e. `x` is finite
+# but its magnitude exceeds f32::MAX. This is EXACTLY CPython's `_PyFloat_Pack4`
+# guard `isinf((float)x) && !isinf(x)`: the `(x as f32)` cast SATURATES a finite
+# overflow to inf, so pack_float must reject it (OverflowError) BEFORE calling
+# `_f32_bits` — otherwise a 1e300 would silently emit the f32 inf pattern. A
+# GENUINE inf/nan input is NOT flagged (cast-of-inf is inf but x IS inf -> false;
+# cast-of-nan is nan, not inf -> false), so those pack the way CPython packs them.
+@extern
+def _f32_overflows(x: float) -> bool:
+    "(({x} as f32).is_infinite() && !({x}).is_infinite())"
+
+# f64 bit pattern of a float (as an i64 — the sign bit may make it negative).
+@extern
+def _f64_bits(x: float) -> int:
+    "(({x}.to_bits()) as i64)"
+
+# float from a 32-bit pattern (low 32 bits of `bits`).
+@extern
+def _f32_from_bits(bits: int) -> float:
+    "(f32::from_bits(({bits} as u32)) as f64)"
+
+# float from a 64-bit pattern.
+@extern
+def _f64_from_bits(bits: int) -> float:
+    "(f64::from_bits(({bits} as u64)))"
+
+# Assemble 8 little-endian bytes (each 0..255) into an i64 bit pattern — used for
+# the 8-byte 'q'/'d' unpack, where accumulating via `<<` in pyrst could overflow.
+@extern
+def _i64_from_le_bytes(b0: int, b1: int, b2: int, b3: int, b4: int, b5: int, b6: int, b7: int) -> int:
+    "(i64::from_le_bytes([({b0} as u8), ({b1} as u8), ({b2} as u8), ({b3} as u8), ({b4} as u8), ({b5} as u8), ({b6} as u8), ({b7} as u8)]))"
+
+
+# ── Format parsing ─────────────────────────────────────────────────────────────
+
+# The normalized byte order for a format: '<' or '>'. Native '@' / no-prefix are
+# an honest deferral error (see the module header). Also rejects an empty format.
+def _fmt_order(fmt: str) -> str:
+    if len(fmt) == 0:
+        raise ValueError("struct: native byte-order/size mode (format prefix '@', or NO prefix) is deferred in pyrst — it uses native C sizes and alignment padding. Prefix the format with '<' (little-endian), '>' (big-endian), '!' (network/big-endian), or '=' (native order, standard sizes): e.g. '<i' not 'i'.")
+    p: str = fmt[0]
+    if p == "<" or p == "=":
+        return "<"
+    if p == ">" or p == "!":
+        return ">"
+    raise ValueError("struct: native byte-order/size mode (format prefix '@', or NO prefix) is deferred in pyrst — it uses native C sizes and alignment padding. Prefix the format with '<' (little-endian), '>' (big-endian), '!' (network/big-endian), or '=' (native order, standard sizes): e.g. '<i' not 'i'.")
+
+
+# The format body with any byte-order prefix stripped.
+def _fmt_body(fmt: str) -> str:
+    p: str = fmt[0]
+    if p == "<" or p == ">" or p == "!" or p == "=" or p == "@":
+        return fmt[1:]
+    return fmt
+
+
+# Standard-size of one format char (bytes). Raises on an unknown char. ('s' is
+# reported as 1 here; its real width is the repeat count, handled by the caller.)
+def _char_size(ch: str) -> int:
+    if ch == "x" or ch == "b" or ch == "B" or ch == "s":
+        return 1
+    if ch == "h" or ch == "H":
+        return 2
+    if ch == "i" or ch == "I" or ch == "l" or ch == "L" or ch == "f":
+        return 4
+    if ch == "q" or ch == "Q" or ch == "d":
+        return 8
+    raise ValueError("bad char in struct format")
+
+
+# Expand a format body into a flat token list: a normal char with repeat count N
+# becomes N single-char tokens; 'x' likewise (N pad tokens); 's' with count N
+# becomes ONE token "s<N>" carrying its byte length. Whitespace is ignored.
+def _expand(body: str) -> list[str]:
+    tokens: list[str] = []
+    i: int = 0
+    n: int = len(body)
+    cs: int = 0
+    count: int = 1
+    fc: str = ""
+    j: int = 0
+    while i < n:
+        if body[i] == " ":
+            i = i + 1
+            continue
+        count = 1
+        cs = i
+        while i < n and body[i] >= "0" and body[i] <= "9":
+            i = i + 1
+        if i > cs:
+            count = int(body[cs:i])
+        if i >= n:
+            raise ValueError("bad char in struct format")
+        fc = body[i]
+        i = i + 1
+        # validate the char (raises "bad char in struct format" on unknown)
+        _char_size(fc)
+        if fc == "s":
+            tokens.append("s" + str(count))
+        else:
+            j = 0
+            while j < count:
+                tokens.append(fc)
+                j = j + 1
+    return tokens
+
+
+# Range-check one integer value for format char `ch`, with CPython's exact text.
+def _check_int_range(ch: str, value: int) -> None:
+    if ch == "b":
+        if value < -128 or value > 127:
+            raise ValueError("'b' format requires -128 <= number <= 127")
+    elif ch == "B":
+        if value < 0 or value > 255:
+            raise ValueError("'B' format requires 0 <= number <= 255")
+    elif ch == "h":
+        if value < -32768 or value > 32767:
+            raise ValueError("'h' format requires -32768 <= number <= 32767")
+    elif ch == "H":
+        if value < 0 or value > 65535:
+            raise ValueError("'H' format requires 0 <= number <= 65535")
+    elif ch == "i" or ch == "l":
+        if value < -2147483648 or value > 2147483647:
+            raise ValueError("'" + ch + "' format requires -2147483648 <= number <= 2147483647")
+    elif ch == "I" or ch == "L":
+        if value < 0 or value > 4294967295:
+            raise ValueError("'" + ch + "' format requires 0 <= number <= 4294967295")
+    elif ch == "Q":
+        if value < 0:
+            raise ValueError("'Q' format requires 0 <= number <= 18446744073709551615")
+    # 'q': every pyrst int (i64) is in range — no check.
+
+
+# ── Public API ─────────────────────────────────────────────────────────────────
+
+# CPython's `struct.calcsize(fmt)` — the byte size of the format. Supports every
+# scoped char INCLUDING 's' (its repeat count is the byte length). Dual-runs.
+def calcsize(fmt: str) -> int:
+    _fmt_order(fmt)
+    body: str = _fmt_body(fmt)
+    tokens: list[str] = _expand(body)
+    total: int = 0
+    for t in tokens:
+        if t.startswith("s"):
+            total = total + int(t[1:])
+        else:
+            total = total + _char_size(t)
+    return total
+
+
+# CPython's `struct.pack(fmt, *values)`, pyrst shape `pack(fmt, values: list[int])`
+# — INTEGER formats (b B h H i I l L q Q) + 'x' pad. See the header re: list-not-
+# *args, and use `pack_float` for 'f'/'d'.
+def pack(fmt: str, values: list[int]) -> bytes:
+    order: str = _fmt_order(fmt)
+    body: str = _fmt_body(fmt)
+    tokens: list[str] = _expand(body)
+    # 's' (fixed-length bytes) is calcsize-only — reject it BEFORE the arity count so
+    # that even a NON-EMPTY value list gets the documented s-deferral message rather
+    # than a misleading "expected 0 items" (an 's' token is never counted). See the
+    # module header re: the 's'/'p' deferral.
+    for t in tokens:
+        if t.startswith("s"):
+            raise ValueError("struct: the 's' (fixed-length bytes) format is calcsize-only in pyrst — a bytes value cannot share the integer list channel (design §D defers 's'/'p'); pack the bytes directly with the bytes machinery")
+    expected: int = 0
+    for t in tokens:
+        if t != "x" and not t.startswith("s"):
+            expected = expected + 1
+    if len(values) != expected:
+        raise ValueError("pack expected " + str(expected) + " items for packing (got " + str(len(values)) + ")")
+    out: list[int] = []
+    vi: int = 0
+    size: int = 0
+    k: int = 0
+    for t in tokens:
+        if t == "x":
+            out.append(0)
+        elif t == "f" or t == "d":
+            raise ValueError("struct: float formats 'f'/'d' use pack_float(fmt, list[float]) in pyrst (a homogeneous list cannot mix ints and floats); pack() is integer-only")
+        else:
+            _check_int_range(t, values[vi])
+            size = _char_size(t)
+            k = 0
+            while k < size:
+                if order == "<":
+                    out.append((values[vi] >> (8 * k)) & 0xFF)
+                else:
+                    out.append((values[vi] >> (8 * (size - 1 - k))) & 0xFF)
+                k = k + 1
+            vi = vi + 1
+    return bytes(out)
+
+
+# CPython's `struct.unpack(fmt, data)`, pyrst shape returning `list[int]` — INTEGER
+# formats + 'x'. Index the result like the CPython tuple (`unpack(...)[0]`); this
+# dual-runs. 'Q' with bit 63 set raises (exceeds pyrst's i64 — see the header).
+def unpack(fmt: str, data: bytes) -> list[int]:
+    order: str = _fmt_order(fmt)
+    body: str = _fmt_body(fmt)
+    tokens: list[str] = _expand(body)
+    need: int = calcsize(fmt)
+    if len(data) != need:
+        raise ValueError("unpack requires a buffer of " + str(need) + " bytes")
+    out: list[int] = []
+    off: int = 0
+    size: int = 0
+    signed: bool = False
+    val: int = 0
+    m: int = 0
+    le: list[int] = []
+    k: int = 0
+    for t in tokens:
+        if t == "x":
+            off = off + 1
+        elif t.startswith("s"):
+            raise ValueError("struct: the 's' format is calcsize-only in pyrst (design §D defers 's'/'p'); slice the bytes buffer directly")
+        elif t == "f" or t == "d":
+            raise ValueError("struct: float formats use unpack_float(fmt, data) in pyrst; unpack() is integer-only")
+        else:
+            size = _char_size(t)
+            # gather little-endian bytes for this field
+            le = []
+            k = 0
+            while k < size:
+                if order == "<":
+                    le.append(data[off + k])
+                else:
+                    le.append(data[off + size - 1 - k])
+                k = k + 1
+            if size == 8:
+                if t == "Q" and (le[7] & 0x80) != 0:
+                    raise ValueError("struct: unpacked unsigned 'Q' value exceeds pyrst's signed i64 int range (bit 63 is set; pyrst int is i64 and cannot represent 2^63..2^64-1) — use 'q' if the value is known to fit, or decode the 8 bytes yourself")
+                out.append(_i64_from_le_bytes(le[0], le[1], le[2], le[3], le[4], le[5], le[6], le[7]))
+            else:
+                signed = t == "b" or t == "h" or t == "i" or t == "l"
+                val = 0
+                m = size - 1
+                while m >= 0:
+                    val = (val << 8) | le[m]
+                    m = m - 1
+                if signed and (le[size - 1] & 0x80) != 0:
+                    val = val - (1 << (8 * size))
+                out.append(val)
+            off = off + size
+    return out
+
+
+# pyrst float channel: `pack_float(fmt, values: list[float])` — 'f'/'d' + 'x' pad.
+def pack_float(fmt: str, values: list[float]) -> bytes:
+    order: str = _fmt_order(fmt)
+    body: str = _fmt_body(fmt)
+    tokens: list[str] = _expand(body)
+    expected: int = 0
+    for t in tokens:
+        if t == "f" or t == "d":
+            expected = expected + 1
+    if len(values) != expected:
+        raise ValueError("pack_float expected " + str(expected) + " items for packing (got " + str(len(values)) + ")")
+    out: list[int] = []
+    vi: int = 0
+    bits: int = 0
+    size: int = 0
+    k: int = 0
+    for t in tokens:
+        if t == "x":
+            out.append(0)
+        elif t == "f" or t == "d":
+            if t == "f":
+                # A FINITE double whose magnitude overflows f32 raises OverflowError
+                # (CPython's exact type + message) instead of silently packing the
+                # saturated f32 inf pattern; genuine inf/nan pass through unflagged
+                # (see _f32_overflows). 'd'/f64 cannot overflow from a pyrst float.
+                if _f32_overflows(values[vi]):
+                    raise OverflowError("float too large to pack with f format")
+                bits = _f32_bits(values[vi])
+                size = 4
+            else:
+                bits = _f64_bits(values[vi])
+                size = 8
+            k = 0
+            while k < size:
+                if order == "<":
+                    out.append((bits >> (8 * k)) & 0xFF)
+                else:
+                    out.append((bits >> (8 * (size - 1 - k))) & 0xFF)
+                k = k + 1
+            vi = vi + 1
+        else:
+            raise ValueError("struct: pack_float handles only 'f'/'d' (and 'x' pad); use pack(...) for integer formats")
+    return bytes(out)
+
+
+# pyrst float channel: `unpack_float(fmt, data) -> list[float]` — 'f'/'d' + 'x'.
+def unpack_float(fmt: str, data: bytes) -> list[float]:
+    order: str = _fmt_order(fmt)
+    body: str = _fmt_body(fmt)
+    tokens: list[str] = _expand(body)
+    need: int = calcsize(fmt)
+    if len(data) != need:
+        raise ValueError("unpack requires a buffer of " + str(need) + " bytes")
+    out: list[float] = []
+    off: int = 0
+    u: int = 0
+    k: int = 0
+    le: list[int] = []
+    for t in tokens:
+        if t == "x":
+            off = off + 1
+        elif t == "f":
+            u = 0
+            k = 0
+            while k < 4:
+                if order == "<":
+                    u = u | (data[off + k] << (8 * k))
+                else:
+                    u = u | (data[off + k] << (8 * (3 - k)))
+                k = k + 1
+            out.append(_f32_from_bits(u))
+            off = off + 4
+        elif t == "d":
+            le = []
+            k = 0
+            while k < 8:
+                if order == "<":
+                    le.append(data[off + k])
+                else:
+                    le.append(data[off + 7 - k])
+                k = k + 1
+            out.append(_f64_from_bits(_i64_from_le_bytes(le[0], le[1], le[2], le[3], le[4], le[5], le[6], le[7])))
+            off = off + 8
+        else:
+            raise ValueError("struct: unpack_float handles only 'f'/'d'; use unpack(...) for integer formats")
+    return out

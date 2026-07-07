@@ -35,8 +35,8 @@
 #     how real code constructs one anyway — CPython code essentially never
 #     spells `ParseResult(...)` directly either).
 #   - `quote`/`quote_plus`/`unquote`/`unquote_plus` drop the `encoding=`/
-#     `errors=` parameters (always UTF-8; pyrst has no `bytes` type so there
-#     is no bytes-vs-str overload to begin with) — always-utf8/strict-encode,
+#     `errors=` parameters (always UTF-8; these operate on `str` only, with no
+#     bytes-vs-str overload to select an encoding) — always-utf8/strict-encode,
 #     replace-decode (matching CPython's own defaults, just not overridable).
 #   - `unquote` malformed/truncated percent-byte sequences: WELL-FORMED
 #     percent-encoded UTF-8 (every `quote()`/`unquote()` round trip, which is
@@ -325,8 +325,8 @@ def urljoin(base: str, url: str) -> str:
 
 # --- percent-encoding: quote / quote_plus / unquote / unquote_plus ---------
 #
-# pyrst has NO `bytes` type, so "byte-level percent-encoding" is done via
-# Unicode code point -> manual UTF-8 byte sequence (encode side) and manual
+# This module predates pyrst's `bytes` type, so "byte-level percent-encoding" is
+# done via Unicode code point -> manual UTF-8 byte sequence (encode side) and manual
 # UTF-8 byte sequence -> Unicode code point (decode side), both hand-rolled
 # with bit ops (`&`, `|`, `>>`, `<<` all work — verified, `src/ast.rs` BinOp).
 # This is exactly what CPython's `str.encode('utf-8')`/`bytes.decode('utf-8')`

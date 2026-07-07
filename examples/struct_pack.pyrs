@@ -1,0 +1,89 @@
+# W5-d struct: pack hex matrices + the pyrst-specific honest errors.
+# pyrst-ONLY golden (Section-1, hand-expected from the python3 struct oracle): pyrst
+# `pack(fmt, values: list[int])` is LIST-based (CPython's `pack` is *args-variadic),
+# so this cannot dual-run the identical source — but every hex below was cross-
+# checked against `struct.pack(fmt, *values).hex()` in python3 3.12. The range-error,
+# native-'@'-deferral and 'Q'-above-i64 paths are pyrst-specific honest errors.
+from struct import pack, unpack
+
+def main() -> None:
+    # byte orders x widths (hex compared to CPython)
+    print(pack('<i', [1]).hex())
+    print(pack('>i', [1]).hex())
+    print(pack('<I', [1234]).hex())
+    print(pack('>I', [1234]).hex())
+    print(pack('<h', [258]).hex())
+    print(pack('>h', [258]).hex())
+    print(pack('<q', [-5]).hex())
+    print(pack('>q', [1]).hex())
+    print(pack('<Q', [255]).hex())
+    print(pack('<b', [-128]).hex())
+    print(pack('<B', [255]).hex())
+    print(pack('<L', [4294967295]).hex())
+    print(pack('<3i', [1, 2, 3]).hex())
+    print(pack('>2h', [1, 2]).hex())
+    print(pack('<2xi', [7]).hex())
+    print(pack('=i', [1]).hex())
+    # unpack(pack(x)) == x round-trip across the integer widths
+    print(unpack('<q', pack('<q', [-9223372036854775807]))[0])
+    print(unpack('<Q', pack('<Q', [9223372036854775807]))[0])
+    # range errors (CPython's exact message text)
+    try:
+        pack('>B', [256])
+    except ValueError as e:
+        print(str(e))
+    try:
+        pack('>b', [128])
+    except ValueError as e:
+        print(str(e))
+    try:
+        pack('>H', [70000])
+    except ValueError as e:
+        print(str(e))
+    try:
+        pack('>i', [2147483648])
+    except ValueError as e:
+        print(str(e))
+    try:
+        pack('>I', [-1])
+    except ValueError as e:
+        print(str(e))
+    try:
+        pack('>Q', [-1])
+    except ValueError as e:
+        print(str(e))
+    # wrong number of values
+    try:
+        pack('<2i', [1])
+    except ValueError as e:
+        print(str(e))
+    # native '@' / no-prefix is an honest deferral in pyrst
+    try:
+        pack('i', [1])
+    except ValueError as e:
+        print(str(e)[:31])
+    # 'Q' unpack whose value exceeds i64 is an honest error (never a silent wrap)
+    try:
+        unpack('>Q', b'\xff\xff\xff\xff\xff\xff\xff\xff')
+    except ValueError as e:
+        print(str(e)[:34])
+    # 's' (fixed-length bytes) is calcsize-only — an honest deferral in pack/unpack
+    try:
+        pack('<3s', [])
+    except ValueError as e:
+        print(str(e)[:34])
+    try:
+        unpack('<3s', b'abc')
+    except ValueError as e:
+        print(str(e)[:34])
+    # a float format in the integer pack() is an honest channel error
+    try:
+        pack('<f', [1])
+    except ValueError as e:
+        print(str(e)[:34])
+    # B4: an 's' format with a NON-EMPTY value list yields the s-deferral message,
+    # NOT a misleading "expected 0 items" arity error (the s-check runs first).
+    try:
+        pack('<4s', [65, 66, 67, 68])
+    except ValueError as e:
+        print(str(e)[:34])

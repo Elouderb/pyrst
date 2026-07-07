@@ -53,8 +53,9 @@
 #     actually reads. CPython's full `st_mode`/`st_ino`/`st_dev`/... bitfield
 #     surface is NOT modeled (no bit-level `stat.S_IS*` module either); this
 #     is a documented partial-fidelity divergence, not a bug.
-#   - `urandom(n)` returns `list[int]` (each 0..=255), NOT a `bytes` object —
-#     pyrst has no `bytes` type. The VALUES are inherently non-deterministic
+#   - `urandom(n)` returns `list[int]` (each 0..=255), NOT a `bytes` object (a
+#     pre-`bytes`-type interface this module was not reworked onto). The VALUES are
+#     inherently non-deterministic
 #     (real CSPRNG output via the `getrandom` crate), so `urandom` is
 #     necessarily a **pyrst-only** parity case: the golden test asserts
 #     `len(...)` and the 0..=255 range only, never exact bytes.

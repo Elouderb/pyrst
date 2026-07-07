@@ -1,0 +1,48 @@
+# W5-d struct: IEEE-754 float pack/unpack — the 32-bit 'f' precision loss is EXACT.
+# pyrst-ONLY golden (Section-1, hand-expected): pyrst splits the float value channel
+# into pack_float/unpack_float (a homogeneous list can't mix ints and floats), names
+# CPython's `struct` has no equivalent of — so it can't dual-run the identical source.
+# But every value below equals `struct.pack(fmt, *v).hex()` / `struct.unpack(fmt, ..)`
+# in python3 3.12 (the packed 'f' bytes AND the round-trip value both match, proving
+# the 32-bit rounding is byte-for-byte CPython's).
+from struct import pack_float, unpack_float
+
+def main() -> None:
+    # packed bytes: 'f' is 4 bytes (lossy), 'd' is 8 bytes (exact)
+    print(pack_float('<f', [0.1]).hex())
+    print(pack_float('>f', [1.5]).hex())
+    print(pack_float('<d', [0.1]).hex())
+    print(pack_float('>d', [1.5]).hex())
+    print(pack_float('<2f', [1.0, 2.0]).hex())
+    print(pack_float('<d', [-1.5]).hex())
+    # round-trip VALUES: 'f' loses precision EXACTLY as CPython does; 'd' is exact
+    print(unpack_float('<f', pack_float('<f', [0.1]))[0])
+    print(unpack_float('<f', pack_float('<f', [1.5]))[0])
+    print(unpack_float('<d', pack_float('<d', [0.1]))[0])
+    print(unpack_float('>d', pack_float('>d', [3.141592653589793]))[0])
+    print(unpack_float('<d', pack_float('<d', [-1.5]))[0])
+    print(unpack_float('<f', pack_float('<f', [0.1]))[0] == 0.10000000149011612)
+    print(unpack_float('<d', pack_float('<d', [0.1]))[0] == 0.1)
+    # a two-field float record via one call
+    r = unpack_float('<2d', pack_float('<2d', [1.25, -2.5]))
+    print(r[0], r[1])
+    # B1 (iron rule): a FINITE double whose magnitude overflows f32 raises
+    # OverflowError with CPython's exact message (struct.pack('<f', 1e300) raises the
+    # same) — NEVER a silent f32 inf pattern. Both signs + a value just over f32::MAX.
+    for x in [1e300, -1e300, 3.5e38]:
+        try:
+            pack_float('<f', [x])
+            print("NOERR")
+        except OverflowError as e:
+            print(str(e))
+    # f32::MAX itself packs fine (just below the round-to-inf boundary)
+    print(pack_float('<f', [3.4028234663852886e38]).hex())
+    # genuine inf / -inf / nan PASS THROUGH the way CPython packs them (only a FINITE
+    # overflow raises — struct.pack('<f', float('inf')).hex() == '0000807f' in python3)
+    print(pack_float('<f', [float("inf")]).hex())
+    print(pack_float('<f', [float("-inf")]).hex())
+    print(pack_float('>f', [float("inf")]).hex())
+    print(pack_float('<f', [float("nan")]).hex())
+    # underflow flushes to zero without error; 'd'/f64 cannot overflow from a float
+    print(pack_float('<f', [1e-46]).hex())
+    print(pack_float('<d', [1e300]).hex())

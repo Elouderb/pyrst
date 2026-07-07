@@ -1,0 +1,44 @@
+# W5-e hmac: RFC 4231 / RFC 2202 test vectors + incremental + compare_digest.
+# DUAL-RUN vs python3 (CPython's `hmac` is the golden). digestmod is a string name
+# (CPython-supported). Locals are inferred so the same source is valid python3.
+from hmac import new, compare_digest
+
+def main() -> None:
+    # RFC 4231 Test Case 2 (key 'Jefe') across sha256/sha1/sha512
+    print(new(b'Jefe', b'what do ya want for nothing?', 'sha256').hexdigest())
+    print(new(b'Jefe', b'what do ya want for nothing?', 'sha1').hexdigest())
+    print(new(b'Jefe', b'what do ya want for nothing?', 'sha512').hexdigest())
+    # RFC 4231 Test Case 1 (0x0b*20 key, 'Hi There')
+    print(new(b'\x0b' * 20, b'Hi There', 'sha256').hexdigest())
+    print(new(b'\x0b' * 20, b'Hi There', 'sha512').hexdigest())
+    # md5 (RFC 2202)
+    print(new(b'\x0b' * 16, b'Hi There', 'md5').hexdigest())
+    print(new(b'key', b'', 'md5').hexdigest())
+    # raw digest bytes (hex-printed, NUL-safe)
+    print(new(b'Jefe', b'what do ya want for nothing?', 'sha256').digest().hex())
+    # incremental update() == one-shot over the whole message
+    h = new(b'key', b'', 'sha256')
+    h.update(b'The quick brown ')
+    h.update(b'fox')
+    print(h.hexdigest() == new(b'key', b'The quick brown fox', 'sha256').hexdigest())
+    # copy() divergence
+    a = new(b'k', b'pre', 'sha256')
+    b = a.copy()
+    a.update(b'-A')
+    b.update(b'-B')
+    print(a.hexdigest() == new(b'k', b'pre-A', 'sha256').hexdigest())
+    print(b.hexdigest() == new(b'k', b'pre-B', 'sha256').hexdigest())
+    # attributes
+    print(new(b'k', b'', 'sha256').name, new(b'k', b'', 'sha256').digest_size, new(b'k', b'', 'sha256').block_size)
+    print(new(b'k', b'', 'sha512').name, new(b'k', b'', 'sha512').digest_size, new(b'k', b'', 'sha512').block_size)
+    # compare_digest
+    print(compare_digest(b'abcdef', b'abcdef'))
+    print(compare_digest(b'abcdef', b'abcdeX'))
+    print(compare_digest(b'abc', b'abcd'))
+    print(compare_digest(new(b'k', b'm', 'sha256').digest(), new(b'k', b'm', 'sha256').digest()))
+    # B3: digestmod is CASE-INSENSITIVE (matches CPython); HMAC.name is the lowercase
+    # 'hmac-<algo>' form regardless of the case passed in.
+    print(new(b'key', b'msg', 'SHA256').hexdigest() == new(b'key', b'msg', 'sha256').hexdigest())
+    print(new(b'key', b'msg', 'Sha256').name)
+    print(new(b'key', b'msg', 'MD5').name, new(b'key', b'msg', 'SHA512').name)
+    print(new(b'key', b'msg', 'SHA1').digest_size, new(b'key', b'msg', 'SHA512').block_size)

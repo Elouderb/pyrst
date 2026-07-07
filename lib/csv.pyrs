@@ -173,7 +173,7 @@
 #     `writer(f, lineterminator=123)` (parameter is `str`-typed; `123` is a
 #     compile error), `csv.field_size_limit("string")` (parameter is
 #     `Optional[int]`; a `str` argument is a compile error), `writer(io.
-#     BytesIO())` (no bytes type / no file objects at all — G7), `reader(f);
+#     BytesIO())` (no file objects at all — G7), `reader(f);
 #     f.close(); next(reader)` (no file handle / no lazy iterator to close —
 #     moot by the eager-list design above).
 

@@ -1,0 +1,31 @@
+01000000
+00000001
+d2040000
+000004d2
+0201
+0102
+fbffffffffffffff
+0000000000000001
+ff00000000000000
+80
+ff
+ffffffff
+010000000200000003000000
+00010002
+000007000000
+01000000
+-9223372036854775807
+9223372036854775807
+'B' format requires 0 <= number <= 255
+'b' format requires -128 <= number <= 127
+'H' format requires 0 <= number <= 65535
+'i' format requires -2147483648 <= number <= 2147483647
+'I' format requires 0 <= number <= 4294967295
+'Q' format requires 0 <= number <= 18446744073709551615
+pack expected 2 items for packing (got 1)
+struct: native byte-order/size 
+struct: unpacked unsigned 'Q' valu
+struct: the 's' (fixed-length byte
+struct: the 's' format is calcsize
+struct: float formats 'f'/'d' use 
+struct: the 's' (fixed-length byte

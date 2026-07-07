@@ -292,6 +292,19 @@ pub const EMBEDDED_STDLIB: &[(&str, &str)] = &[
     // deferred — see each module's header for the fidelity score + divergences.
     ("logging", include_str!("../lib/logging.pyrs")),
     ("warnings", include_str!("../lib/warnings.pyrs")),
+    // ── W5-c/d/e lib wave (cards 94df6871 / 97e74935 / 3dde6421) ───────────
+    // Three G7 stdlib unlocks over the W5-a/b `bytes` machinery
+    // (docs/design/w5-bytes-handles.md §D/§F). `base64` and `struct` are pure
+    // pyrst (struct adds a tiny Rust-std @extern for IEEE-754 float bits — NO
+    // @crate — so both stay on the single-file build path). `hashlib`/`hmac`
+    // are pure VALUE CLASSES (design finding: no G1 handle) that accumulate the
+    // input `bytes` and compute the digest lazily via a one-shot @extern into
+    // the RustCrypto `sha2`/`sha1`/`md-5`/`hmac` crates (`@crate`, like `re`),
+    // so importing either routes `build` through the Cargo-project path.
+    ("base64", include_str!("../lib/base64.pyrs")),
+    ("struct", include_str!("../lib/struct.pyrs")),
+    ("hashlib", include_str!("../lib/hashlib.pyrs")),
+    ("hmac", include_str!("../lib/hmac.pyrs")),
 ];
 
 /// Look up an embedded stdlib module's source by NAME (e.g. `"os"`).

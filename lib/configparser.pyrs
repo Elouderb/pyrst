@@ -105,8 +105,8 @@
 #     marker; every parameter here is positional-or-keyword, a documented
 #     superset (both `cp.get('s','k',fallback='x')` and the equivalent
 #     positional call work).
-#   - `read_file(fp)` / `write(fp)` (G7: no bytes type, no spellable
-#     file-typed parameter) — `read_file` is NOT provided at all; `write()`'s
+#   - `read_file(fp)` / `write(fp)` (G7: no spellable file-typed parameter)
+#     — `read_file` is NOT provided at all; `write()`'s
 #     SIGNATURE diverges to `write(space_around_delimiters=True) -> str`
 #     (returns the composed text instead of writing to a file object). Callers
 #     round-trip via `os.write_file(path, cp.write())` / `os.read_file(path)`

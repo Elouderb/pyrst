@@ -1,0 +1,151 @@
+# pyrst standard library — hmac (keyed-hash message authentication, RFC 2104)
+#
+# W5-e (card 3dde6421), design docs/design/w5-bytes-handles.md §D/§F. Companion to
+# `hashlib`, and — like it — a PURE VALUE CLASS (design finding: no G1 handle).
+# An `HMAC` object holds only pyrst VALUES: the key, the accumulated message
+# `bytes`, and the digest algorithm name. The HMAC is computed LAZILY at
+# `digest()`/`hexdigest()` time by a pure one-shot `@extern` over the RustCrypto
+# `hmac` crate parameterized by the RustCrypto hash (`sha2`/`sha1`/`md-5`) — the
+# same `@crate` exactness-critical external precedent `hashlib`/`re` use. No held
+# foreign state across calls, so no handle, no compiler change (see hashlib's
+# header for the full "why this is still a pure value class" argument).
+#
+# ── SURFACE (flat import; CPython-named, dual-runs against CPython's `hmac`) ───
+#   from hmac import new, compare_digest
+#   new(key: bytes, msg: bytes, digestmod: str) -> HMAC
+#       h = new(b'key', b'', 'sha256'); h.update(b'msg'); h.hexdigest()
+#       h.digest() -> bytes ; h.copy() -> independent HMAC
+#       h.name ('hmac-sha256') / h.digest_size / h.block_size
+#   compare_digest(a: bytes, b: bytes) -> bool   # constant-time-shaped equality
+#
+# `digestmod` is a STRING name ('sha256'/'sha1'/'md5'/'sha512') — CPython also
+# accepts a callable/module, which a single-typed pyrst parameter cannot express;
+# the string form is CPython-supported (since 3.4), so the goldens dual-run. The
+# name is matched CASE-INSENSITIVELY (`new(k, m, 'SHA256')` works), like CPython.
+# incremental update() == a single new(key, whole_msg, algo) (the accumulate-then-
+# one-shot property), and copy() forks under value-semantics clone-on-use.
+#
+# ── FIDELITY: 5/5 for the shipped algorithms ── every MAC is byte-for-byte
+# CPython-identical (validated against the RFC 4231 test vectors and python3's
+# `hmac`). DEFERRALS (honest): the `msg=None`/callable-`digestmod` C-signature
+# forms (pyrst is statically typed); `HMAC.name` is 'hmac-<algo>' per CPython.
+
+
+# ── RustCrypto one-shot @extern shims (pure (key, msg) -> mac bytes) ──────────
+
+@crate("hmac", "0.12")
+@crate("sha2", "0.10")
+@extern
+def _hmac_sha256(key: bytes, msg: bytes) -> bytes:
+    "{ use hmac::Mac; let mut m = <hmac::Hmac<sha2::Sha256> as hmac::Mac>::new_from_slice(&{key}).unwrap(); m.update(&{msg}); m.finalize().into_bytes().to_vec() }"
+
+@crate("hmac", "0.12")
+@crate("sha2", "0.10")
+@extern
+def _hmac_sha512(key: bytes, msg: bytes) -> bytes:
+    "{ use hmac::Mac; let mut m = <hmac::Hmac<sha2::Sha512> as hmac::Mac>::new_from_slice(&{key}).unwrap(); m.update(&{msg}); m.finalize().into_bytes().to_vec() }"
+
+@crate("hmac", "0.12")
+@crate("sha1", "0.10")
+@extern
+def _hmac_sha1(key: bytes, msg: bytes) -> bytes:
+    "{ use hmac::Mac; let mut m = <hmac::Hmac<sha1::Sha1> as hmac::Mac>::new_from_slice(&{key}).unwrap(); m.update(&{msg}); m.finalize().into_bytes().to_vec() }"
+
+@crate("hmac", "0.12")
+@crate("md-5", "0.10")
+@extern
+def _hmac_md5(key: bytes, msg: bytes) -> bytes:
+    "{ use hmac::Mac; let mut m = <hmac::Hmac<md5::Md5> as hmac::Mac>::new_from_slice(&{key}).unwrap(); m.update(&{msg}); m.finalize().into_bytes().to_vec() }"
+
+
+# Output size (bytes) of the underlying digest, 0 for an unknown name. Matched
+# CASE-INSENSITIVELY (CPython's hmac.new(...,'SHA256') works) via one lower().
+def _hmac_digest_size(name: str) -> int:
+    n: str = name.lower()
+    if n == "sha256":
+        return 32
+    if n == "sha1":
+        return 20
+    if n == "md5":
+        return 16
+    if n == "sha512":
+        return 64
+    return 0
+
+
+# Underlying-hash block size (bytes) — 128 for sha512, 64 for the others. Case-insensitive.
+def _hmac_block_size(name: str) -> int:
+    if name.lower() == "sha512":
+        return 128
+    return 64
+
+
+# ── The HMAC value class ───────────────────────────────────────────────────────
+
+class HMAC:
+    name: str
+    digest_size: int
+    block_size: int
+    _algo: str
+    _key: bytes
+    _msg: bytes
+
+    def __init__(self, key: bytes, msg: bytes, digestmod: str) -> None:
+        # digestmod is CASE-INSENSITIVE (CPython's hmac.new(...,'SHA256') works).
+        # digest() dispatches on self._algo, and CPython's HMAC.name is the LOWERCASE
+        # 'hmac-<algo>' (`hmac.new(...,'SHA256').name == 'hmac-sha256'`), so normalize
+        # both here. _hmac_digest_size / _hmac_block_size are case-insensitive too.
+        self._algo = digestmod.lower()
+        self.name = "hmac-" + digestmod.lower()
+        self.digest_size = _hmac_digest_size(digestmod)
+        self.block_size = _hmac_block_size(digestmod)
+        self._key = key
+        self._msg = msg
+
+    # Feed more message bytes in (mutates the accumulated message in place).
+    def update(self, data: bytes) -> None:
+        self._msg = self._msg + data
+
+    # The raw MAC bytes — computed one-shot over the whole accumulated message.
+    def digest(self) -> bytes:
+        if self._algo == "sha256":
+            return _hmac_sha256(self._key, self._msg)
+        elif self._algo == "sha1":
+            return _hmac_sha1(self._key, self._msg)
+        elif self._algo == "md5":
+            return _hmac_md5(self._key, self._msg)
+        elif self._algo == "sha512":
+            return _hmac_sha512(self._key, self._msg)
+        raise ValueError("unsupported hash type " + self._algo)
+
+    # The MAC as a lowercase hex string.
+    def hexdigest(self) -> str:
+        return self.digest().hex()
+
+    # An INDEPENDENT copy (later update()s on the copy diverge from the original).
+    def copy(self) -> HMAC:
+        return HMAC(self._key, self._msg, self._algo)
+
+
+# CPython's `hmac.new(key, msg, digestmod)`. digestmod is CASE-INSENSITIVE; an
+# unknown algorithm raises "unsupported hash type <digestmod>" echoing the ORIGINAL
+# case (the guard is case-insensitive, only the message keeps the case) — like CPython.
+def new(key: bytes, msg: bytes, digestmod: str) -> HMAC:
+    if _hmac_digest_size(digestmod) == 0:
+        raise ValueError("unsupported hash type " + digestmod)
+    return HMAC(key, msg, digestmod)
+
+
+# CPython's `hmac.compare_digest(a, b)` — length-then-XOR-accumulate equality that
+# does not short-circuit on the first differing byte (constant-time-SHAPED; pyrst
+# cannot guarantee the timing invariant CPython's C routine does, but the RESULT
+# is identical). Returns True iff a and b are equal byte strings.
+def compare_digest(a: bytes, b: bytes) -> bool:
+    if len(a) != len(b):
+        return False
+    result: int = 0
+    i: int = 0
+    while i < len(a):
+        result = result | (a[i] ^ b[i])
+        i = i + 1
+    return result == 0

@@ -1,0 +1,33 @@
+# W5-c base64: invalid-padding decode errors are CPython-oracled and catchable.
+# CPython's binascii.Error IS a subclass of ValueError, so `except ValueError`
+# catches the failure byte-identically under both runtimes — this DUAL-RUNs, and
+# the message text matches CPython exactly.
+from base64 import b64decode, b32decode
+
+def main() -> None:
+    for bad in [b'QQ', b'QUJ', b'Q', b'QQ=', b'QQQ']:
+        try:
+            b64decode(bad)
+            print("NOERR")
+        except ValueError as e:
+            print(str(e))
+    # B2: these previously miscompiled (silently decoded) or raised the WRONG error;
+    # now byte-identical to CPython's binascii.Error (a ValueError subclass).
+    for bad2 in [b'Q=QQ', b'Q==Q', b'QUJDR']:
+        try:
+            b64decode(bad2)
+            print("NOERR")
+        except ValueError as e:
+            print(str(e))
+    # b32: an interior '=' or an invalid trailing-pad count is an error (each was a
+    # SILENT wrong-bytes decode before — iron-rule violations, now honest errors).
+    for bad3 in [b'AA======AA======', b'AA=AAAAA', b'AAAAAA==', b'AAA=====', b'========']:
+        try:
+            b32decode(bad3)
+            print("NOERR")
+        except ValueError as e:
+            print(str(e))
+    # valid ones still decode (the discard/padding rules accept these)
+    print(b64decode(b'QQ=='))
+    print(b64decode(b'QUJD'))
+    print(b64decode(b'QQQ='))

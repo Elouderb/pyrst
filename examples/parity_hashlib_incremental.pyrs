@@ -1,0 +1,33 @@
+# W5-e hashlib: incremental update() == one-shot, and copy() divergence-after-copy.
+# DUAL-RUN vs python3. The design's py-probe 2 (update twice equals hashing the
+# concatenation once) and the copy-fork property (mutating a .copy() leaves the
+# original untouched — value-semantics clone-on-use). Locals are inferred (`h = ...`)
+# so the same source is valid python3 (CPython's hashlib has no `Hash` name to import).
+from hashlib import sha256, sha512, md5
+
+def main() -> None:
+    # incremental == oneshot (sha256)
+    h = sha256(b'')
+    h.update(b'hello ')
+    h.update(b'world')
+    print(h.hexdigest() == sha256(b'hello world').hexdigest())
+    print(h.hexdigest())
+    # incremental across three chunks (sha512), and constructing with initial data
+    g = sha512(b'The ')
+    g.update(b'quick brown ')
+    g.update(b'fox')
+    print(g.hexdigest() == sha512(b'The quick brown fox').hexdigest())
+    # copy() divergence: fork after some common prefix, then feed each differently
+    a = md5(b'common')
+    b = a.copy()
+    a.update(b'-A')
+    b.update(b'-BB')
+    print(a.hexdigest() == md5(b'common-A').hexdigest())
+    print(b.hexdigest() == md5(b'common-BB').hexdigest())
+    print(a.hexdigest() == b.hexdigest())
+    # the original is unchanged by a later copy's updates
+    c = sha256(b'root')
+    d = c.copy()
+    d.update(b'-child')
+    print(c.hexdigest() == sha256(b'root').hexdigest())
+    print(d.hexdigest() == sha256(b'root-child').hexdigest())

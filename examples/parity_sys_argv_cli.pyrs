@@ -1,0 +1,28 @@
+# argv: --verbose 3 4 5
+# W4-b (card 427925ef): a real CLI-shaped dual-run parity golden. Reads the
+# process argument vector via `sys.argv`, slices off `argv[0]` (which DIVERGES
+# by construction — a pyrst binary path vs python3's `-c` — so ONLY argv[1:] and
+# len() are observed), branches on a `--verbose` flag, and sums the numeric
+# args. The harness `# argv:` directive above (anchored at line start) passes the
+# SAME args to the pyrst binary and to python3, so the two runs are byte-identical.
+import sys
+
+
+def main() -> None:
+    args: list[str] = sys.argv[1:]
+    verbose: bool = False
+    total: int = 0
+    count: int = 0
+    for a in args:
+        if a == "--verbose":
+            verbose = True
+        elif a == "--quiet":
+            verbose = False
+        else:
+            total = total + int(a)
+            count = count + 1
+    print("argc:", len(sys.argv))
+    print("count:", count)
+    print("total:", total)
+    if verbose:
+        print("mean:", total // count)

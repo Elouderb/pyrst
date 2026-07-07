@@ -1,10 +1,12 @@
-# pyrst standard library — sys (PARTIAL scope, card cd3aa7b7)
+# pyrst standard library — sys (PARTIAL scope, card cd3aa7b7; argv added W4-b, card 427925ef)
 #
-# Fidelity score: ~2.5/5 against the dossier's own 4/5 target
+# Fidelity score: ~3/5 against the dossier's own 4/5 target
 # (docs/design/w2-dossiers/sys-partial.md) — see "WHY BELOW THE DOSSIER
 # ESTIMATE" below. Surface: `maxsize`, `platform`, `version`, `version_info`,
-# `exit`. `argv`/`stdin`/`stdout`/`stderr` are G2-deferred per the dossier
-# (module-level mutable state — not implemented; use no workaround).
+# `exit`, and (W4-b) `argv`. `stdin`/`stdout`/`stderr` remain deferred — NOT for
+# the module-level-mutable-state reason `argv` needed (that machinery shipped in
+# W4), but because a stream is a stateful opaque foreign handle (the G1/W5 `Ty`),
+# not a value — see the "sys.argv" note below.
 #
 # WHY BELOW THE DOSSIER ESTIMATE — two load-bearing pyrst constraints the
 # dossier's 4/5 assumed away, discovered during THIS implementation pass by
@@ -89,9 +91,44 @@
 # so `maxsize = 2**63 - 1 = 9223372036854775807` is EXACTLY CPython's value
 # on any 64-bit CPython build. No hardware/identity caveat needed here.
 #
-# G2-DEFERRED (per dossier §5, unchanged): `argv`, `stdin`, `stdout`,
-# `stderr` are NOT exposed — each is module-level MUTABLE state, which pyrst
-# prohibits outright (no workaround exists; do not attempt one).
+# `argv` — SUPPORTED (W4-b, card 427925ef). The process argument vector, a
+# module-level MUTABLE `list[str]` (see the binding + `_sys_argv` @extern near
+# the top of this file). It is the canonical use-case the W4 mutable-global
+# machinery (docs/design/w4-globals.md) was built for: its non-literal call
+# initializer AUTO-promotes it to a `thread_local!` RefCell static, eagerly
+# initialized at startup in `__pyrst_init_globals()`. Divergences, all
+# documented (honest, never silent):
+#   - `argv[0]` DIFFERS BY CONSTRUCTION. Rust's `std::env::args()` puts the
+#     running binary's path at index 0; CPython puts the script path (or `-c`
+#     under `python3 -c`). So a pyrst program must observe `argv[1:]` (the real
+#     arguments, which ARE byte-identical to CPython) and `len()`, never
+#     `argv[0]`. The parity harness enforces this (examples/parity_sys_argv_*.pyrs;
+#     PYTHON_COMPATIBILITY.md's sys row).
+#   - WRITES are owner-only (w4-globals.md §C). Rebinding it from user code
+#     (`sys.argv = [...]`) or mutating it in place (`sys.argv.append(x)`) is a
+#     cross-module write — a v1 honest error (a global is rebindable only from a
+#     function inside its OWN module). Qualified READS work everywhere.
+#   - Reads CLONE (EPIC-4 value semantics). A local bound to `sys.argv` is an
+#     independent copy; mutating the copy does not write back to the process
+#     vector (`x = sys.argv; x.append(y)` leaves `sys.argv` unchanged) — the
+#     same uniform clone-on-use every pyrst list obeys, not an argv special case.
+#     This DIVERGES from CPython, where `sys.argv` is a shared list and that
+#     `x.append(y)` WOULD mutate it. A qualified in-place mutator
+#     (`sys.argv.append(x)`, `sys.argv[0] = x`, `del sys.argv[0]`) is likewise a
+#     cross-module / indexed-`del` honest error; a NON-mutating qualified method
+#     (`sys.argv.count(x)`) is a READ and works (on the clone).
+#   - NON-UTF-8 args → U+FFFD. `argv` is built from `std::env::args_os()` +
+#     `to_string_lossy`, NOT `args()` — `args()` PANICS on a non-UTF-8 OS argument,
+#     and because `argv` initializes EAGERLY at startup that would make ANY program
+#     merely importing `sys` abort 101 on such an invocation (CPython runs fine). A
+#     genuinely invalid-UTF-8 byte therefore becomes the replacement char U+FFFD in
+#     pyrst vs CPython's surrogateescape round-trip — observable only for such
+#     invalid args (the arg's char length still matches).
+#
+# STILL DEFERRED — `stdin`, `stdout`, `stderr` (G1/W5, NOT G2). A stream is a
+# stateful opaque foreign handle (needs the G1/W5 `Ty`), not a value; `print()`
+# already covers stdout and `input()` reads a line from stdin. Honest defer — do
+# not half-build a stream object here.
 #
 # HARDENING PASS additions (w2-hardener, card cd3aa7b7) — two NEW divergences
 # found by adversarial CPython-diffing beyond the writer's own list, neither
@@ -144,6 +181,24 @@
 # surface. No co-import restriction needed for this module.
 
 from dataclasses import dataclass
+
+
+# `argv` — the process argument vector (W4-b, card 427925ef). A module-level
+# MUTABLE global (`list[str]`): its NON-literal (call) initializer makes the
+# W4-a machinery promote it AUTOMATICALLY to a `thread_local!` RefCell static
+# (the mutable-static "path (b)": a non-scalar-literal initializer — see
+# docs/design/w4-globals.md §C), initialized eagerly at startup in
+# `__pyrst_init_globals()`. `_sys_argv` MUST be defined ABOVE `argv`: module
+# initializers run top-down at import, so a binding that calls a later-defined
+# name is a CPython NameError (pyrst rejects it honestly via
+# reject_forward_referencing_global_inits). See the "sys.argv" note in the
+# header for the `argv[0]` divergence and the owner-only-write contract.
+@extern
+def _sys_argv() -> list[str]:
+    "std::env::args_os().map(|__a| __a.to_string_lossy().into_owned()).collect::<Vec<String>>()"
+
+
+argv: list[str] = _sys_argv()
 
 
 maxsize: int = 9223372036854775807

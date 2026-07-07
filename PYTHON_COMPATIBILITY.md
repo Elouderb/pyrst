@@ -407,7 +407,7 @@ pyrst embeds 44 standard-library modules directly in the compiler binary (`inclu
 | `shlex` | 5/5 | `split(s, comments=, posix=)`/`join(parts)`/`quote(s)` — the 3 module-level functions | No `shlex.shlex` lexer class (Rust-std pure port of the functions) | ✅ dual-run |
 | `shutil` | 3.5/5 | `copyfile copy copy2 copytree move rmtree which disk_usage` core file/tree ops | `copytree` now creates missing intermediate `dst` parents (`os.makedirs`); uncatchable Rust panics hardened to CPython errors (`SameFileError`→`ValueError`); `move` directory-into-subdir is a message-only divergence | ⚠️ pyrst-only |
 | `stat` | 4/5 | `S_IS*` predicates + file-mode constants (`S_IMODE`/`S_IFMT`/`filemode` + `S_IF*`/`S_IR*`/`S_IW*`/`S_IX*`) | Constant VALUES verified host-exact | ✅ dual-run |
-| `sys` | 2.5/5 | `maxsize platform version version_info exit` (PARTIAL scope) | `argv`/`stdin`/`stdout`/`stderr` deferred (G2, module-level mutable state); `version` is a pyrst identity string (documented) | ✅ dual-run (`maxsize`/`platform`/`exit`) |
+| `sys` | 3/5 | `maxsize platform version version_info exit argv` | **`argv`** (W4-b) is the process argument vector, a module-level mutable `list[str]` — the first W4 mutable-global unlock. **`argv[0]` diverges by construction** (a pyrst binary path vs python3's `-c`), so a program must observe `argv[1:]`/`len(sys.argv)`, never `argv[0]`; the parity harness threads identical args to both sides via an anchored `# argv:` directive and asserts `argv[1:]`/`len` only (`examples/parity_sys_argv_cli`, `parity_sys_argv_noargs`). Writes are owner-only: `sys.argv = …` / `sys.argv.append(…)` from user code is a cross-module honest error, qualified reads work; reads clone (value semantics). `stdin`/`stdout`/`stderr` remain deferred — NOT for module-level-mutable-state (that shipped in W4) but as opaque stream handles (G1/W5); `print()`/`input()` cover the common cases. `version` is a pyrst identity string (documented) | ✅ dual-run (`argv` incl.; `maxsize`/`platform`/`exit`) |
 | `tempfile` | 3.5/5 | `gettempdir`/`mkdtemp`/`mkstemp`/`NamedTemporaryFile`-ish surface | `mkdtemp`/`mkstemp` create owner-only `0o700`/`0o600` objects (security-hardened to match CPython, not the umask default); stream/opaque-handle shapes limited | ⚠️ pyrst-only |
 | `urllib.parse` | 3/5 | First non-`os` DOTTED stdlib package (W3, `lib/urllib/parse.pyrs`), pure pyrst: `urlparse` (→ `@dataclass ParseResult` with `.scheme`/`.netloc`/… + `geturl()`), `urlunparse`, full RFC 3986 `urljoin`, `quote`/`quote_plus`/`unquote`/`unquote_plus` (hand-rolled bit-level UTF-8 percent-encoding — pyrst has no `bytes`), `urlencode`, `parse_qs`/`parse_qsl` | `ParseResult` is a `@dataclass`, not a NamedTuple — attribute access only, no tuple-unpacking; qualified `urllib.parse.ParseResult(...)` construction is the documented qualified-class-ctor gap (use `from urllib.parse import ParseResult` or the `urlparse()` factory); `quote`/`unquote` family drops `encoding=`/`errors=` (fixed at CPython's UTF-8 defaults); `urlencode` takes `dict[str,str]` only and iterates in SORTED-key order, not insertion order; `parse_qs`/`parse_qsl` drop the option kwargs; no WHATWG control-char stripping or IPv6-bracket validation on malformed input | ✅ dual-run (incl. the RFC 3986 §5.4 normal + abnormal resolution matrices, astral-plane quote/unquote round trips; core algorithms fuzz-verified against CPython across ~600k cases) |
 
@@ -458,11 +458,14 @@ call time inside closures.
   then `g.append(4)` leaves `xs == [1, 2, 3]` in pyrst where CPython **aliases** it
   (`xs == [1, 2, 3, 4]`). This is pyrst's uniform value-semantics contract (no
   `Rc<RefCell>` aliasing); full alias fidelity is the EPIC-4 `Mut[T]` surface.
-- **`del items[0]` on a global silently no-ops.** `del` on an indexed place is
-  unimplemented for locals too (a pre-existing gap, not W4-specific): today it lowers
-  to a discarded clone-and-drop rather than removing the element. Use
-  `items.pop(i)` / a rebind under `global` instead. (An honest guard is a candidate
-  follow-up; the limitation predates module globals.)
+- **`del items[i]` on an indexed element is an honest error (W4-b).** `del` on a
+  subscript — a list index (`del xs[0]`), a dict key (`del d[k]`), or a qualified
+  module global (`del sys.argv[0]`) — is a **check-time typeck error**. It previously
+  lowered to a discarded clone-and-drop that silently removed *nothing* (a
+  byte-divergence from CPython, which removes the element); the guard converts that
+  silent no-op into a loud rejection naming the remedy — `items.pop(i)` to remove a
+  list element, `d.pop(k)` to remove a dict entry, or a whole-container rebind under
+  `global`. (Bare `del name` and `del obj.attr` are unaffected.)
 - **Forward-reference detection is DIRECT-only.** A module global whose initializer
   *directly* references a name defined later in the module (`x: int = y + 1` before
   `y`, or `a: int = helper()` before `def helper`) is an honest check error (CPython
@@ -474,8 +477,19 @@ call time inside closures.
 - **`nonlocal` and cross-module writes are deferred.** `nonlocal` is an honest
   typeck error (closures capture by value). A `global NAME` that names a binding
   living only in an *imported* module (or a builtin stub like `int`) is an honest
-  error — owner-module rebinds only; cross-module writes (`import m; m.x = 5`) are a
-  v1 deferral (qualified *reads* `m.x` work).
+  error — owner-module rebinds only; cross-module writes (`import m; m.x = 5`, or an
+  in-place `m.items.append(x)`) are a v1 deferral (qualified *reads* `m.x` work).
+  **`sys.argv` (W4-b) is the first worked example:** reads (`sys.argv[i]`,
+  `sys.argv[1:]`, `len(sys.argv)`) work everywhere, but `sys.argv = […]`, an
+  in-place mutator (`sys.argv.append(…)`), and an element/`del` write
+  (`sys.argv[0] = …`, `del sys.argv[0]`) from user code are honest
+  cross-module-write / indexed-`del` errors — while a **non-mutating** qualified
+  method (`sys.argv.count(x)`) is a read and works (on the clone). `argv[0]` differs
+  from CPython by construction (binary path vs `-c`) — observe `argv[1:]` only.
+  Binding it to a local **clones** it: `x = sys.argv; x.append(y)` mutates the copy
+  and leaves `sys.argv` unchanged — a deliberate **divergence from CPython**, where
+  `sys.argv` is a shared list and that `append` *would* mutate it (the universal
+  EPIC-4 value-semantics model, not an argv special case).
 
 ---
 
@@ -686,7 +700,7 @@ compiler (which would otherwise reject the emitted `Some(sink())` as `Option<()>
   - **`Mut[<primitive>]` has a known deref limitation:** `Mut[int]`/`Mut[float]`/`Mut[bool]` emit `&mut i64` etc., but the codegen does not auto-dereference the reference in expression position, so arithmetic on the parameter (`n + 1`) fails to compile, and reassigning the parameter would not write back anyway. Use a `Mut[T]` of a collection or class, or the return idiom, for primitives.
 - **Block scope follows Python:** a variable first assigned inside an `if`/`elif`/`else`/`for`/`while`/`with`/`try` body is visible after the block (it is hoisted to function scope). Edge case: a name is not hoisted — and so stays block-local — if its type cannot be statically inferred, or is a tuple or an all-numeric-field class (which has no `Default`). Also: a hoisted name is initialized to a default (`0`/`""`/empty), so reading it on a path where it was never assigned yields that default rather than raising Python's `UnboundLocalError`.
 - **Subtype polymorphism is supported (with documented edges):** a base class with subclasses compiles to a closed-set companion enum, so a `list[Base]` *can* hold `Derived` instances, a `Base`-typed slot *can* take a `Derived`, and method calls dispatch to the subclass override. See [Class Subtyping / Polymorphism](#class-subtyping--polymorphism) for the full what-works / honest-limitations table (the edges still rejected with a clear error: upcasting an intermediate base, field-write through a base var, `list`+`list` concat, dict-literal subtype values, and exception subtyping).
-- **Builtin runtime errors ARE catchable by their Python exception type:** an out-of-bounds subscript or `pop()` from an empty list raises `IndexError`; a missing dict key raises `KeyError`; `list.remove`/`list.index`/`str.index` misses, a zero slice step, a negative integer `**=` exponent, and failed `int()`/`float()` parses raise `ValueError`; division/modulo by zero raises `ZeroDivisionError`; file I/O failures raise `OSError` (exact-name match). The builtin hierarchy applies (`except LookupError:` catches `IndexError`/`KeyError`). Uncaught, they abort with the message on stderr and a non-zero exit.
+- **Builtin runtime errors ARE catchable by their Python exception type:** an out-of-bounds subscript or `pop()` from an empty list raises `IndexError`; a missing dict key raises `KeyError`; `list.remove`/`list.index`/`str.index` misses, a zero slice step, a negative integer `**=` exponent, and failed `int()`/`float()` parses raise `ValueError`; division/modulo by zero raises `ZeroDivisionError`; file I/O failures raise `OSError` (exact-name match). The builtin hierarchy applies (`except LookupError:` catches `IndexError`/`KeyError`). Uncaught, they abort via a Rust panic: the exception type name and message print on stderr and the process exits **101** — whereas CPython prints a multi-line traceback and exits **1**. The exception type name and message match; the traceback format and the exit code are the documented divergence (e.g. an uncaught `int(sys.argv[1])` on non-numeric input aborts 101 in pyrst, tracebacks-and-exits-1 in CPython).
 
 ---
 

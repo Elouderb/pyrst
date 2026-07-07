@@ -1,0 +1,13 @@
+# W4-b (card 427925ef) negative: writing an ELEMENT of another module's global
+# from user code — `sys.argv[0] = "x"` — is a cross-module mutation, a v1 honest
+# error (mirrors `sys.argv = [...]`). Before this guard it passed `pyrst check`
+# and died at BUILD with a raw rustc E0425 naming a `sys` identifier the user
+# never wrote — a leak the typeck pass must catch. The augmented form
+# `sys.argv[0] += "x"` desugars to the same IndexAssign shape and is rejected
+# identically. Rejected by `pyrst check`.
+import sys
+
+
+def main() -> None:
+    sys.argv[0] = "replaced"
+    print(sys.argv[1:])

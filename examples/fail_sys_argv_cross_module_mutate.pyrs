@@ -1,0 +1,15 @@
+# W4-b (card 427925ef) negative: mutating another module's global IN PLACE from
+# user code — `sys.argv.append(x)` — is a CROSS-MODULE WRITE, a v1 honest error.
+# It now gets the DEDICATED "cross-module mutation of `sys.argv` is not supported;
+# mutate it from a function inside `sys` …" diagnostic — the SAME message as
+# `sys.argv = [...]` and `sys.argv += [...]` — NOT the old misleading "module `sys`
+# has no attribute `argv` / submodule" message (argv IS a real attribute; plain
+# reads two lines down work). CPython would append to the real argv; pyrst's
+# value-semantics read clones, so accepting it would SILENTLY DIVERGE (the append
+# would hit a discarded copy). Rejected by `pyrst check`.
+import sys
+
+
+def main() -> None:
+    sys.argv.append("injected")
+    print(sys.argv[1:])

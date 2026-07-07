@@ -1,0 +1,4 @@
+argc: 5
+count: 3
+total: 12
+mean: 4

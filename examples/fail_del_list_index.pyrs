@@ -1,0 +1,9 @@
+# W4-b (card 427925ef) negative: `del` on an indexed list element — `del xs[0]` —
+# is not supported. Codegen would lower it to `drop(<clone of xs[0]>)`, dropping a
+# value-semantics COPY and leaving the stored list UNCHANGED (a silent no-op that
+# byte-diverges from CPython, which removes the element). It is an honest typeck
+# error instead, naming the working idiom `xs.pop(i)`. Rejected by `pyrst check`.
+def main() -> None:
+    xs: list[int] = [1, 2, 3]
+    del xs[0]
+    print(xs)

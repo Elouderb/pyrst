@@ -1,0 +1,13 @@
+# W4-b (card 427925ef) negative: `del sys.argv[0]` — `del` on an indexed element
+# of another module's global — is not supported (the same silent-no-op hazard as
+# `del xs[0]`: codegen would drop a clone and leave argv unchanged, byte-diverging
+# from CPython which removes argv[0]). Honest typeck error naming the list/dict
+# `.pop()` idiom. (For argv specifically even `sys.argv.pop(0)` is a cross-module
+# mutation and separately rejected — the real remedy is to slice/read a copy.)
+# Rejected by `pyrst check`.
+import sys
+
+
+def main() -> None:
+    del sys.argv[0]
+    print(sys.argv[1:])

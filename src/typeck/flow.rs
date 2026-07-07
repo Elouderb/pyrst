@@ -3129,8 +3129,29 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             }
             Ok(())
         }
-        Stmt::Del { target, .. } => {
+        Stmt::Del { target, span } => {
+            // The target is type-checked first so an undefined base / bad index stays
+            // a precise error rather than being masked by the rejection below.
             check_expr(target, env)?;
+            // (W4-b) `del <expr>[i]` on a list/dict is a SILENT NO-OP: codegen lowers
+            // it to `drop(<clone of the element>)`, discarding a value-semantics COPY
+            // and never touching the stored container (confirmed: `del xs[0]` leaves
+            // the list unchanged, `del d[k]` leaves the dict unchanged, `del
+            // sys.argv[0]` leaves argv unchanged — each byte-diverges from CPython).
+            // An iron-rule violation. Reject an indexed `del` honestly, naming the
+            // working idiom; this covers a local, a dict key, and a qualified module
+            // global. Bare `del name` and `del obj.attr` are left unchanged (no
+            // example relies on `del`, and those shapes are a separate concern).
+            if let Expr::Index { .. } = target {
+                return Err(Error::Type {
+                    span: *span,
+                    msg: "`del` on an indexed element is not supported — it would \
+                          silently drop a value-semantics copy of the element instead \
+                          of removing it from the stored container; use `xs.pop(i)` to \
+                          remove a list element or `d.pop(k)` to remove a dict entry"
+                        .to_string(),
+                });
+            }
             Ok(())
         }
         Stmt::Match { subject, arms, span } => {
@@ -3259,6 +3280,30 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             Ok(())
         }
         Stmt::IndexAssign { obj, idx, value, span } => {
+            // (W4-b) Cross-module ELEMENT write `m.g[i] = v` (and `m.g[i] += v`,
+            // which the parser desugars to this same shape) rebinds an element of
+            // another module's global — a v1 honest error, mirroring the
+            // `AttrAssign` cross-module guard above. Without it, `sys.argv[0] = "x"`
+            // passed `check` and died at build with a raw rustc E0425 naming a `sys`
+            // identifier the user never wrote. The receiver is the qualified read
+            // `m.g` = `Attr{Ident(m), g}`; guard on `m` not being a shadowing local.
+            if let Expr::Attr { obj: base, name: attr, .. } = obj.as_ref() {
+                if let Expr::Ident(modname, _) = base.as_ref() {
+                    if !env.locals.contains_key(modname)
+                        && env.ctx.is_mutable_global(Some(modname), attr)
+                    {
+                        return Err(Error::Type {
+                            span: *span,
+                            msg: format!(
+                                "cross-module mutation of `{0}.{1}` is not supported; \
+                                 mutate it from a function inside `{0}` (a `def` in `{0}` \
+                                 that declares `global {1}` and assigns it)",
+                                modname, attr
+                            ),
+                        });
+                    }
+                }
+            }
             // Validate the target base chain, the subscript, and the value.
             let obj_ty = check_expr(obj, env)?;
             check_expr(idx, env)?;

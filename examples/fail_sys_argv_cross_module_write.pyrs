@@ -1,0 +1,13 @@
+# W4-b (card 427925ef) negative: REBINDING another module's global from user
+# code — `sys.argv = [...]` — is a CROSS-MODULE WRITE, a v1 honest error
+# (docs/design/w4-globals.md §C: owner-only writes; a global is rebindable only
+# from a function inside its own module). Qualified READS of `sys.argv` work;
+# only writes are owner-local. CPython would replace argv here — accepting it
+# silently would DIVERGE — so pyrst rejects it at `pyrst check` with the
+# dedicated cross-module-mutation diagnostic.
+import sys
+
+
+def main() -> None:
+    sys.argv = ["replaced"]
+    print(sys.argv[1:])

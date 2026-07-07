@@ -1,0 +1,16 @@
+# argv: alpha beta alpha
+# W4-b (card 427925ef): a NON-mutating qualified method read on a module global —
+# `sys.argv.count(x)` — now WORKS. It reads the value-semantics clone of argv and
+# counts, behaviorally identical to `tmp = sys.argv; tmp.count(x)`, rather than
+# being wrongly rejected with a bogus "sys has no attribute argv / submodule"
+# message. Counting over the FULL argv is dual-run-safe: argv[0] (a pyrst binary
+# path vs python3's `-c`) is never one of these needles, so both sides see the
+# same counts. The `# argv:` directive threads identical args to both runs.
+# Byte-identical to python3.
+import sys
+
+
+def main() -> None:
+    print("alpha:", sys.argv.count("alpha"))
+    print("beta:", sys.argv.count("beta"))
+    print("zeta:", sys.argv.count("zeta"))

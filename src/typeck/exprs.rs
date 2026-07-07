@@ -2469,6 +2469,46 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                                     });
                                 }
                             } else if let Some((parent, sub)) = modname.split_once('.') {
+                                // (W4-b) A qualified MUTABLE-GLOBAL method call
+                                // `m.g.method(...)` — `m.g` reads another module's
+                                // module-level global (e.g. `sys.argv`), NOT a
+                                // submodule. `module_owner_of` flattened the two-hop
+                                // receiver to `m.g`, which has no `module_funcs`
+                                // entry, so it lands here; disambiguate it from the
+                                // genuine submodule case with a mutable-global lookup
+                                // on (owner=`parent`, name=`sub`), guarded on `parent`
+                                // not being a shadowing local.
+                                if !env.locals.contains_key(parent)
+                                    && env.ctx.is_mutable_global(Some(parent), sub)
+                                {
+                                    // An in-place MUTATING method (`append`/`extend`/
+                                    // …) on another module's global is a cross-module
+                                    // WRITE — a v1 honest error mirroring the
+                                    // `AttrAssign` cross-module-mutation diagnostic.
+                                    // Accepting it would SILENTLY mutate the
+                                    // value-semantics read CLONE and drop it (the
+                                    // CPython append never reaches the real vector).
+                                    // This REPLACES the misleading "has no attribute /
+                                    // submodule" message the flattening accidentally
+                                    // produced for `sys.argv.append(...)`.
+                                    if MUTATING_METHODS.contains(&name.as_str()) {
+                                        return Err(Error::Type {
+                                            span: *span,
+                                            msg: format!(
+                                                "cross-module mutation of `{0}.{1}` is not supported; \
+                                                 mutate it from a function inside `{0}` (a `def` in `{0}` \
+                                                 that declares `global {1}` and assigns it)",
+                                                parent, sub
+                                            ),
+                                        });
+                                    }
+                                    // A NON-mutating method (`sys.argv.count(x)`) is a
+                                    // READ: fall through to the ordinary value-method
+                                    // path below, which types the receiver as the
+                                    // qualified-read CLONE (`list[str]`) and dispatches
+                                    // the builtin method — behaviorally identical to
+                                    // `tmp = sys.argv; tmp.count(x)`.
+                                }
                                 // (W3-3, item 3) `a.b.f()` where the dotted module
                                 // `a.b` is NOT imported, but its PARENT `a` IS a known
                                 // module. pyrst does not auto-expose submodules on
@@ -2478,7 +2518,7 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                                 // that then dies at rustc, and never a truncation to
                                 // the parent (`os.path.join(...)` must not run
                                 // `os.join`).
-                                if env.ctx.module_funcs.contains_key(parent)
+                                else if env.ctx.module_funcs.contains_key(parent)
                                     || env.ctx.module_consts.contains_key(parent)
                                     || env.ctx.module_symbols.contains_key(parent)
                                 {

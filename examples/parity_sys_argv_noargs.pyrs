@@ -1,0 +1,19 @@
+# W4-b (card 427925ef): the no-arguments guard. With no `# argv:` directive the
+# harness runs both sides with an empty argument vector, so this proves
+# `len(sys.argv) >= 1` (argv[0] is always present) and that `argv[1:]` is the
+# empty list — no index panic, no off-by-one. Uses `len(...) == 0` (not `== []`,
+# which pyrst cannot yet type-infer for a bare empty-list literal). Dual-run vs
+# python3, byte-identical.
+import sys
+
+
+def main() -> None:
+    print("argc:", len(sys.argv))
+    print("argc>=1:", len(sys.argv) >= 1)
+    rest: list[str] = sys.argv[1:]
+    print("rest_len:", len(rest))
+    print("rest_empty:", len(rest) == 0)
+    total: int = 0
+    for a in rest:
+        total = total + int(a)
+    print("total:", total)

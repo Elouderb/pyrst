@@ -56,6 +56,43 @@ is_sibling_exclusion() {
     return 1
 }
 
+# ── argv directive (W4-b, card 427925ef) ─────────────────────────────────────
+# A golden may declare a command-line for its RUN(S) with a directive comment
+# ANCHORED AT LINE START:  `# argv: a b c`.  The trailing text is passed as
+# arguments to EVERY execution of that program — the pyrst binary in the positive
+# loop (§1) AND both the pyrst binary and the python3 process in the parity loop
+# (§4c) — so a dual-run observes an IDENTICAL argv on both sides.  (`argv[0]`
+# itself still differs by construction — a pyrst binary path vs python3's `-c` —
+# so parity goldens observe `argv[1:]`/`len()` only; see PYTHON_COMPATIBILITY.md.)
+#
+# The grep is ANCHORED (`-E '^# argv:'`): a PROSE mention of the marker inside a
+# sentence, in backticks, or in an indented comment explaining the convention is
+# NOT at column 0, so it can never be mistaken for the directive and silently
+# alter a run (the same anchoring discipline the `# parity: pyrst-only` opt-out
+# uses — this repo has been bitten by an unanchored marker match before).  `-a`
+# treats the file as text even if a stray binary byte sneaks in.
+#
+# TOKEN SEMANTICS — the directive text becomes argv tokens by the caller's
+# UNQUOTED `$argv_args` expansion, with EXACTLY these three rules:
+#   1. WHITESPACE-SPLIT — tokens are separated by runs of whitespace (bash IFS).
+#   2. NO QUOTING — quotes are NOT honored; an argument cannot itself contain a
+#      space (there is deliberately no quoting support). Pass multi-word shells as
+#      separate whitespace-split tokens.
+#   3. NO GLOBBING — every call site wraps the unquoted expansion in `set -f` /
+#      `set +f`, so a token is threaded LITERALLY. A metacharacter directive like
+#      `# argv: *.pyrs` passes the literal token `*.pyrs`, NOT a CWD-dependent
+#      pathname expansion. (Without the `set -f`, an unquoted `*` WOULD glob
+#      against the run directory — CWD-dependent and non-deterministic; the
+#      `set +f` immediately re-enables globbing so the `*.pyrs` / `*fail*.pyrs`
+#      file-selection loops are unaffected.) The three run sites — §1 (~128),
+#      §4c pyrst (~366), §4c python3 (~381) — all use this same bracketing so the
+#      two parity sides split identically and stay byte-for-byte comparable.
+# A file with no directive yields the empty string, which unquoted expands to ZERO
+# words — so every existing golden runs with no args, byte-identically to before.
+argv_for() {
+    grep -m1 -aE '^# argv:' "$1" | sed -E 's/^# argv:[[:space:]]*//'
+}
+
 # ── 1. POSITIVE LOOP ─────────────────────────────────────────────────────────
 
 pos_count=0
@@ -92,9 +129,18 @@ for f in "$EXAMPLES"/*.pyrs; do
         continue
     fi
 
-    # Run and capture stdout
-    got=$(timeout 5 ./"$base" 2>/dev/null)
+    # Run and capture stdout (threading any `# argv:` directive into argv — the
+    # SAME args the parity loop passes python3, so §1 and §4c agree; see argv_for).
+    # `set -f` disables pathname expansion for JUST this unquoted `$argv_args`
+    # expansion, so a directive token like `*` is threaded LITERALLY instead of
+    # being glob-expanded against the run CWD; `set +f` restores globbing for the
+    # `*.pyrs` file-selection loop immediately after (`$?` captured before `set +f`,
+    # which resets it).
+    argv_args=$(argv_for "$f")
+    set -f
+    got=$(timeout 5 ./"$base" $argv_args 2>/dev/null)
     run_exit=$?
+    set +f
     rm -f "$base" "$base.rs"
 
     if [[ $run_exit -eq 124 ]]; then
@@ -303,6 +349,11 @@ else
         base=$(basename "$f" .pyrs)
         parity_count=$((parity_count + 1))
 
+        # (W4-b) Any `# argv:` directive is threaded IDENTICALLY into BOTH sides
+        # below (pyrst binary + python3 `-c`), so a CLI-shaped golden sees the same
+        # argv[1:] on each. Empty (no directive) → zero args, unchanged behavior.
+        argv_args=$(argv_for "$f")
+
         # The opt-out marker must be a STANDALONE directive at the START of a line
         # (`^# parity: pyrst-only`) — anchoring it (`-E` + `^`) is what keeps a PROSE
         # mention of the marker (in a sentence, in backticks, or in an indented
@@ -327,8 +378,14 @@ else
             continue
         fi
 
-        pyrst_out=$(timeout 5 ./"$base" 2>/dev/null)
+        # `set -f` for JUST this unquoted `$argv_args` expansion so a directive
+        # token is threaded LITERALLY (no CWD globbing); `set +f` restores it. Same
+        # discipline as §1, and applied IDENTICALLY to both parity sides below so
+        # the two runs can never diverge on argv (`$?` captured before `set +f`).
+        set -f
+        pyrst_out=$(timeout 5 ./"$base" $argv_args 2>/dev/null)
         run_exit=$?
+        set +f
         rm -f "$base" "$base.rs"
         if [[ $run_exit -ne 0 ]]; then
             echo "FAIL [parity run exit $run_exit]: $base"
@@ -340,8 +397,14 @@ else
         # prepended, exec'd, then main() called explicitly — replicates the
         # proven scratchpad/probes2 prototype invocation exactly, just with
         # the literal filename swapped for $f.
-        py_out=$(timeout 10 python3 -c "src='from __future__ import annotations\n'+open('$f').read(); g={}; exec(compile(src,'$f','exec'),g); g['main']()" 2>&1)
+        # `$argv_args` AFTER the `-c` script becomes sys.argv[1:] (python3 sets
+        # sys.argv[0]='-c'); the SAME tokens the pyrst binary received above.
+        # `set -f`/`set +f` again so this side splits argv into the SAME literal
+        # tokens the pyrst side got (no CWD globbing) — the two stay byte-identical.
+        set -f
+        py_out=$(timeout 10 python3 -c "src='from __future__ import annotations\n'+open('$f').read(); g={}; exec(compile(src,'$f','exec'),g); g['main']()" $argv_args 2>&1)
         py_exit=$?
+        set +f
         if [[ $py_exit -ne 0 ]]; then
             echo "FAIL [parity python3 exit $py_exit]: $base"
             printf '%s\n' "$py_out" | head -20

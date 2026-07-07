@@ -1,0 +1,5 @@
+argc: 1
+argc>=1: True
+rest_len: 0
+rest_empty: True
+total: 0

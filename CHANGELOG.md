@@ -2,6 +2,39 @@
 
 All notable changes to pyrst are documented here. This project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.5.0] — 2026-07-07
+
+The binary-data release: pyrst gets a real `bytes` type, a move-only handle kind, and the modules they unlock — `base64`, `struct`, `hashlib`, `hmac`, and a real `re.Match`. The stdlib grows from 46 to 50 modules. Every behavior is python3-verified.
+
+### The `bytes` type (new builtin)
+
+- **`b'...'` literals** with byte-valued escapes (`\xNN` and the named set; `\u`/`\N` and octal are honest-stricter rejections, truthfully documented against CPython's warn-and-keep-literal behavior). `bytes()`/`bytes(n)`/`bytes(list)` constructors with range checks.
+- **The opposite-of-str shapes, everywhere:** `b[i]` → `int`, `b[i:j]` → `bytes`, iteration/comprehensions/`sorted`/`reversed` all yield ints — byte offsets, never char offsets. `repr` is byte-identical to CPython across all 256 values and both quote-selection cases; equality/ordering/dict-keys are lexicographic byte order.
+- **26 methods**, oracle-first: `hex`/`fromhex`, the find family (`index` raises `ValueError`; CPython's empty-needle semantics), `count`, `replace`, `split`/`rsplit`/`join`, the strip family (the argument is a byte *set*), `upper`/`lower` (ASCII-only passthrough), the justify family (CPython's centering bias), sign-aware `zfill`, predicates, membership (`int in b` with CPython's out-of-range `ValueError`).
+- **Codecs:** `str.encode()` / `bytes.decode()` (utf-8 strict) with a catchable `UnicodeDecodeError` whose message matches CPython across a 27-case battery, including the multi-byte range form. `bytes * -1` clamps to `b''` like CPython — and the identical pre-existing `str * -1` crash was fixed along the way.
+
+### Opaque handles (move-only) + the File fix
+
+- A new **move-only handle kind**: consuming a handle (assignment, argument, return, `del`) *moves* it, enforced by a use-after-move check with conservative branch/loop analysis. Everything a non-clonable value can't do — containers, class fields, generic parameters, closure captures, printing, equality — is an honest check-time error.
+- **`file` is now a real handle**: nameable in signatures (`fh: file`), reassignable as a move, borrowable via `Mut[file]`. Two long-standing holes died: a reassigned file previously *passed check and failed rustc*, and `file` couldn't be named in a signature at all. `close()` is idempotent like CPython; operations after close raise CPython's exact `ValueError`.
+- The compiler now emits to **pid-unique self-deleting temp paths** — concurrent builds of same-named files can no longer corrupt each other (previously ~1-in-6 spurious failures under concurrency).
+
+### New stdlib: 46 → 50 modules
+
+- **`base64`** — b64/urlsafe/b32/b16, with the decoder a faithful port of CPython's `binascii.a2b_base64` per-quad machine (verified against a 90+-row adversarial matrix).
+- **`struct`** — `pack`/`unpack`/`calcsize` over `< > ! =` with byte-exact output including 32-bit float precision loss; finite f32 overflow raises CPython's `OverflowError`; documented pyrst API shape (list-based, int/float channels).
+- **`hashlib` + `hmac`** — sha256/sha1/md5/sha512 via battle-tested RustCrypto crates; byte-identical through known-answer and RFC vectors, block-boundary and megabyte fuzz batteries; case-insensitive names.
+- **`re.Match` is real** — `re.search`/`match_`/`fullmatch` return `Optional[Match]` with eagerly-extracted groups and char-offset spans (verified down to astral-plane subjects); `groupdict`, named groups, CPython-faithful `findall` shapes, and hand-rolled zero-width match semantics the underlying regex crate doesn't provide. The `$`-anchor-before-trailing-newline case is a catchable honest refusal (provably inexpressible without lookarounds).
+
+### Language honesty
+
+- Bare truthiness on `Optional` (`if m:`) is now rejected at check time (it previously passed check and failed at build); `is not None` narrows as before.
+- `del xs[i]`-style silent no-ops died in the prior release; this release adds the reserved-name guard for `bytes` and truthful docs for every deferral.
+
+### Quality
+
+- `./test_all.sh`: **492/492 positive examples**, **275/275 negative fixtures** rejected at both `check` and `build`; **586 `cargo test` cases**; 0 compiler warnings. The dual-run parity harness runs 143 parity programs — **118 byte-identical against `python3`**, 25 documented `# parity: pyrst-only` with pinned oracle evidence. Roughly 35 review-confirmed defects — including silent-wrong-bytes base64 decodes, a struct float that silently saturated to infinity, and six check-passes-rustc-fails escapes through the new move checker — were found by the per-stage adversarial reviews and fixed before this release. As of this release there remain **no known cases where an accepted program produces wrong output**.
+
 ## [0.4.0] — 2026-07-07
 
 The CLI release: pyrst programs now have module-level mutable state (`global`), read `sys.argv`, use `random`'s module-level API, and log through `logging`/`warnings` — the four unlocks of the W4 (G2) epic. Every behavior is python3-verified; the stdlib grows from 44 to 46 modules.

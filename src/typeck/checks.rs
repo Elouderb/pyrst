@@ -311,6 +311,25 @@ pub(crate) fn reject_if_reserved(name: &str, span: Span, role: &str) -> Result<(
             ),
         });
     }
+    // (W5-a) `bytes` is a builtin TYPE name. pyrst's `bytes(...)` constructor and
+    // `x: bytes` annotations bind it UNCONDITIONALLY, so a user definition named
+    // `bytes` (a `def`, a `class`, a parameter, a field, a local) would be silently
+    // HIJACKED — probed: `def bytes(x); bytes(5)` emits the ctor `vec![0u8; 5]`, not
+    // the user function (a miscompile) — or a `class bytes` fails rustc. Refuse it
+    // honestly. The identical hijack of the OTHER builtin type names (`int`, `str`,
+    // `list`, …) is a PRE-EXISTING general gap (they type-check silently today) that
+    // is reported for a dedicated follow-up card; W5-a makes only `bytes` — the type
+    // this wave introduces — honest, rather than widening scope to a policy change.
+    if name == "bytes" {
+        return Err(Error::Type {
+            span,
+            msg: format!(
+                "`bytes` cannot be used as a {} name: it is a builtin type name bound by \
+                 pyrst's `bytes(...)` constructor and `bytes` annotations. Rename it.",
+                role
+            ),
+        });
+    }
     for prefix in RESERVED_CODEGEN_PREFIXES {
         if name.starts_with(prefix) {
             return Err(Error::Type {

@@ -1,0 +1,27 @@
+# W5-a: `bytes` runtime errors are CATCHABLE and CPython-faithful. An
+# out-of-range `b[i]` raises IndexError (negative indices normalise first);
+# bytes(negative) and an out-of-range byte in bytes(list) raise ValueError.
+# Dual-run vs python3 (CPython golden) — the harness compares the caught-branch
+# stdout, so both runtimes must agree on WHICH exception fires.
+def main() -> None:
+    b: bytes = b'ABC'
+    try:
+        print(b[10])
+    except IndexError:
+        print("caught IndexError high")
+    try:
+        print(b[-10])
+    except IndexError:
+        print("caught IndexError low")
+    try:
+        z: bytes = bytes(-1)
+        print(z)
+    except ValueError:
+        print("caught ValueError negative")
+    try:
+        m: bytes = bytes([256])
+        print(m)
+    except ValueError:
+        print("caught ValueError range")
+    # a valid access after the caught errors still works
+    print(b[1])

@@ -1,0 +1,29 @@
+# W5-a: `bytes` LITERALS + repr fidelity. Dual-run vs python3 (CPython golden).
+# Exercises every escape class the byte-valued lexer path decodes (\n \t \r \\
+# \' \" \0 \b \f and \xNN hex, including 0x00/0x7f/0x80/0xff) and BOTH repr
+# quote-selection cases: default single quotes, switching to double iff the
+# payload has a `'` and no `"`. `bytes` is displayed as its `b'...'` repr in
+# EVERY context — print / str() / f-string / repr() — never as raw text.
+def main() -> None:
+    empty: bytes = b''
+    print(empty)
+    nul: bytes = b'\x00abc'
+    print(nul)
+    # quote selection: has ' and no " -> repr uses double quotes
+    sq: bytes = b"a'b"
+    print(sq)
+    # has " and no ' -> stays single-quoted
+    dq: bytes = b'a"b'
+    print(dq)
+    # has BOTH -> single quotes, escape the '
+    both: bytes = b'a\'b"c'
+    print(both)
+    # the full escape edge set: control + high bytes
+    edges: bytes = b'\x00A\x7f\x80\xff'
+    print(edges)
+    named: bytes = b'\t\n\r\\\b\f\0'
+    print(named)
+    # str() and repr() of bytes both yield the repr; f-string interpolates it
+    print(str(nul))
+    print(repr(sq))
+    print(f"val={edges} end")

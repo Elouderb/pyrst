@@ -804,6 +804,50 @@ fn __py_open(path: &str, mode: &str) -> PyFile {
 }
 "#;
 
+/// (W5-a) The `bytes` runtime. Emitted once per program like FILE_PRELUDE/
+/// REPR_PRELUDE (unconditionally, under the crate `#![allow(dead_code)]` when a
+/// program uses no bytes — matching the existing prelude policy).
+///
+/// `__py_bytes_repr` is the SINGLE display engine — `print`/`str`/`repr`/
+/// f-string all route here — and its escaping table is python3-oracle-validated
+/// byte-for-byte (design §G): default single quotes, switch to double iff the
+/// payload contains a `'` and no `"`; escape `\\`, the active quote, and
+/// `\t`/`\n`/`\r`; a printable byte 0x20–0x7e is literal; every other byte
+/// (0x00–0x1f, 0x7f–0xff) is a lowercase `\xNN`. `__py_bytes_index` is the
+/// byte-offset index (negative-normalised, catchable `IndexError`, u8 -> i64).
+///
+/// `impl PyRepr for Vec<u8>` routes the trait dispatch here too, so a
+/// `list[bytes]` / `dict[bytes, _]` reprs its bytes elements as `b'...'` for
+/// free. It coexists with the blanket `impl<T: PyRepr> PyRepr for Vec<T>`
+/// because rustc proves `u8: PyRepr` is unsatisfiable (no such impl), so the two
+/// never overlap (rustc-1.95 coherence-probe-verified).
+const BYTES_PRELUDE: &str = r#"fn __py_bytes_repr(b: &[u8]) -> String {
+    let has_single = b.contains(&b'\'');
+    let has_double = b.contains(&b'"');
+    let quote: u8 = if has_single && !has_double { b'"' } else { b'\'' };
+    let mut out = String::from("b");
+    out.push(quote as char);
+    for &c in b {
+        if c == quote { out.push('\\'); out.push(c as char); }
+        else if c == b'\\' { out.push_str("\\\\"); }
+        else if c == b'\t' { out.push_str("\\t"); }
+        else if c == b'\n' { out.push_str("\\n"); }
+        else if c == b'\r' { out.push_str("\\r"); }
+        else if (0x20..=0x7e).contains(&c) { out.push(c as char); }
+        else { out.push_str(&format!("\\x{:02x}", c)); }
+    }
+    out.push(quote as char);
+    out
+}
+fn __py_bytes_index(b: &[u8], i: i64) -> i64 {
+    let n = b.len() as i64;
+    let j = if i < 0 { i + n } else { i };
+    if j < 0 || j >= n { panic!("IndexError\0index out of range"); }
+    b[j as usize] as i64
+}
+impl PyRepr for Vec<u8> { fn py_repr(&self) -> String { __py_bytes_repr(self) } }
+"#;
+
 /// (LAZY-GEN V1-b) The lazy-generator runtime. A pyrst generator — a `def` whose
 /// body `yield`s, declared `-> Iterator[T]` — lowers to a `Gen<T>`: its body
 /// becomes an `async move { .. }` coroutine, `yield x` becomes
@@ -1131,6 +1175,9 @@ pub fn emit_program(modules: &[(Module, String)], ctx: &TyCtx) -> Result<String>
     cg.line(REPR_PRELUDE);
     cg.line(TITLECASE_PRELUDE);
     cg.line(FILE_PRELUDE);
+    // (W5-a) The `bytes` runtime (repr engine + bounds-checked index + the
+    // `PyRepr for Vec<u8>` impl). AFTER REPR_PRELUDE, which declares `PyRepr`.
+    cg.line(BYTES_PRELUDE);
     // (LAZY-GEN V1-b) The lazy-generator runtime (Gen<T>/Co<T>/YieldNow).
     // Emitted unconditionally like the preludes above; dead when a program has
     // no generator (covered by the crate-level `#![allow(dead_code)]`).

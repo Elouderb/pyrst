@@ -1,0 +1,9 @@
+# NEGATIVE (W5-a F6): a user function named `bytes` shadows the builtin type name.
+# pyrst's `bytes(...)` constructor binds the name unconditionally, so `def bytes`
+# would be SILENTLY HIJACKED (`bytes(5)` emits the ctor, not this function). It is
+# now an honest check-time error rather than a silent miscompile.
+def bytes(x: int) -> int:
+    return x + 1
+
+def main() -> None:
+    print(bytes(5))

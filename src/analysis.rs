@@ -480,6 +480,7 @@ fn walk_expr<'a>(
         Expr::Int(..)
         | Expr::Float(..)
         | Expr::Str(..)
+        | Expr::Bytes(..)
         | Expr::Bool(..)
         | Expr::None_(_)
         | Expr::Ident(..) => {}
@@ -2028,7 +2029,7 @@ fn collect_expr_tokens<'a>(
             collect_expr_tokens(body, ctx, src, func, class, out);
             collect_expr_tokens(orelse, ctx, src, func, class, out);
         }
-        Expr::Int(..) | Expr::Float(..) | Expr::Str(..) | Expr::Bool(..) | Expr::None_(_) => {}
+        Expr::Int(..) | Expr::Float(..) | Expr::Str(..) | Expr::Bytes(..) | Expr::Bool(..) | Expr::None_(_) => {}
     }
 }
 

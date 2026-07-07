@@ -74,7 +74,8 @@
 #     sequences are then byte-identical to CPython. (Any parity golden `seed(N)`s
 #     first.) `Random()` with NO seed is likewise unavailable — pass a seed.
 #
-# `randbytes` is DEFERRED: pyrst has no `bytes` type (G7).
+# `randbytes` is DEFERRED: not implemented in this module (a `bytes` type landed
+# in W5-a, but seeded `randbytes` parity is a later wave).
 #
 # The module-level generic draws (`choice`, `sample`, `choices`) implement
 # CPython's exact algorithms on `_randbelow`/`random`, carrying the generic
@@ -164,7 +165,8 @@
 #     module-level generic surface `random.choice/sample/choices` DID land in W4-c
 #     (this reshape) — no longer a pyrst-only `f(rng, xs)` free-fn wart, and the
 #     SCALAR module API is no longer G2-deferred either.
-#   - `randbytes`: G7 (no `bytes` type).
+#   - `randbytes`: not implemented here (the `bytes` type exists as of W5-a;
+#     seeded `randbytes` parity is deferred).
 #   - `getstate`/`setstate`: no tuple-of-625 state surface; re-seed with
 #     `seed(n)` instead.
 #   - `choices(..., cum_weights=...)`: pass `weights` instead. `choices` also

@@ -108,8 +108,9 @@
 #     `statistics.pyrs`). CPython's `s is None` guard in real `split()` is
 #     likewise unreachable (`s: str` cannot be `None`).
 #   - No bytes support (G7 in the dossier): `quote`/`join`/`split` operate
-#     on `str` only, matching pyrst's lack of a `bytes` type — the dossier
-#     marks this "no deferral needed".
+#     on `str` only. (pyrst gained a `bytes` type in W5-a, but this module is a
+#     str-only port — bytes shlex is out of scope; the dossier marks this "no
+#     deferral needed".)
 #
 # --- Name collisions — LIFTED by W3-2 per-module namespacing ---
 #   - `split` is also defined by `re` (`re.split(pattern, text, maxsplit=0)`).

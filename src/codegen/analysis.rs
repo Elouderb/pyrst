@@ -254,7 +254,8 @@ impl<'a> Codegen<'a> {
             Ty::Int | Ty::Float | Ty::Bool | Ty::Str | Ty::Unit => true,
             // LAZY-GEN V1-a: a generator local is a `Vec<T>` (eager) — has `Default`
             // exactly like a list, so hoisting stays byte-identical.
-            Ty::List(_) | Ty::Iterator(_) | Ty::Set(_) | Ty::Dict(_, _) | Ty::Option(_) => true,
+            // (W5-a) `bytes` is a `Vec<u8>` — `Default` (empty) like a list.
+            Ty::Bytes | Ty::List(_) | Ty::Iterator(_) | Ty::Set(_) | Ty::Dict(_, _) | Ty::Option(_) => true,
             Ty::Class(n, _) => {
                 // (EPIC-5 C2-3) A polymorphic base lowers (via `rust_ty`) to its
                 // companion enum `n__`, a data-variant enum that CANNOT derive
@@ -303,6 +304,8 @@ impl<'a> Codegen<'a> {
             Ty::Float => "0.0f64".to_string(),
             Ty::Bool => "false".to_string(),
             Ty::Str => "String::new()".to_string(),
+            // (W5-a) `bytes` zero-value is the empty byte vector.
+            Ty::Bytes => "Vec::<u8>::new()".to_string(),
             Ty::Class(n, _) => {
                 let all_copy = self.ctx.get_all_fields(n).iter().all(|f| {
                     Ty::from_type_expr(&f.ty, f.span).map(|t| self.is_copy_type(&t)).unwrap_or(false)
@@ -359,6 +362,8 @@ impl<'a> Codegen<'a> {
             Ty::Float => "0.0f64".to_string(),
             Ty::Bool => "false".to_string(),
             Ty::Str => "String::new()".to_string(),
+            // (W5-a) `bytes` default is the empty byte vector (like a list).
+            Ty::Bytes => "Vec::new()".to_string(),
             Ty::List(_) => "Vec::new()".to_string(),
             // LAZY-GEN V1-b (review fix): a hoisted generator local is a
             // `__PyrstGen<T>` since rust_ty flipped — `Vec::new()` was the

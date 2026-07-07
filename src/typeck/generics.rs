@@ -1332,7 +1332,7 @@ pub(crate) fn map_typevar_edges(
 /// local and total so `collect_prop_edges_expr` recurses without missing a nest.
 pub(crate) fn expr_children(e: &Expr) -> Vec<&Expr> {
     match e {
-        Expr::Int(..) | Expr::Float(..) | Expr::Str(..) | Expr::Bool(..)
+        Expr::Int(..) | Expr::Float(..) | Expr::Str(..) | Expr::Bytes(..) | Expr::Bool(..)
         | Expr::None_(_) | Expr::Ident(..) => vec![],
         Expr::FStr(parts, _) => parts.iter().filter_map(|p| match p {
             FStrPart::Interp(e, _) => Some(e),
@@ -1719,7 +1719,7 @@ pub(crate) fn infer_bounds_expr(
         }
         Expr::Lambda { body, .. } => infer_bounds_expr(body, locals, ctx, bounds),
         // Leaves carry no nested op.
-        Expr::Int(..) | Expr::Float(..) | Expr::Str(..) | Expr::Bool(..)
+        Expr::Int(..) | Expr::Float(..) | Expr::Str(..) | Expr::Bytes(..) | Expr::Bool(..)
         | Expr::None_(_) | Expr::Ident(..) => {}
     }
 }

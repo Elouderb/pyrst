@@ -1,0 +1,7 @@
+# NEGATIVE (W5-a F7b): raw-bytes prefixes `rb'...'` / `br'...'` are a documented
+# deferral. They used to mis-lex as the identifier `rb` plus a `str` whose `\x`
+# then failed with a MISLEADING "unknown escape" error; the lexer now rejects the
+# raw-bytes prefix itself with an honest message.
+def main() -> None:
+    x: bytes = rb'\x41'
+    print(x)

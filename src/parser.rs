@@ -1422,6 +1422,7 @@ impl Parser {
             Tok::Int(n) => Ok(Expr::Int(n, span)),
             Tok::Float(f) => Ok(Expr::Float(f, span)),
             Tok::Str(s) => Ok(Expr::Str(s, span)),
+            Tok::Bytes(v) => Ok(Expr::Bytes(v, span)),
             Tok::FStr(raw_parts) => {
                 let mut parts = Vec::with_capacity(raw_parts.len());
                 for rp in raw_parts {

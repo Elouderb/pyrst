@@ -1,0 +1,10 @@
+# NEGATIVE (W5-a F6): a user class named `bytes` collides with the builtin type
+# name. It used to pass `check` and fail rustc; it is now an honest check-time error.
+class bytes:
+    v: int
+    def __init__(self, x: int) -> None:
+        self.v = x
+
+def main() -> None:
+    obj: bytes = bytes(3)
+    print(obj.v)

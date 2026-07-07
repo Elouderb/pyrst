@@ -6,6 +6,13 @@ pub enum Ty {
     Float,
     Bool,
     Str,
+    /// The `bytes` type (W5-a, G7). An IMMUTABLE byte string -> Rust `Vec<u8>`.
+    /// Value semantics identical to `list` (`Vec<T>` is `Clone` + non-`Copy`), so
+    /// it rides the existing clone-on-use pipeline unchanged. Access shapes are
+    /// OPPOSITE to `str`: `b[i]` -> `int` (a `u8` as `i64`), `b[i:j]` -> `bytes`,
+    /// and iteration yields `int`s — byte-offset over the natural `Vec`, never
+    /// `str`'s char path. `bytearray` (the mutable sibling) is deferred.
+    Bytes,
     Unit,            // a void function's `-> None` return; maps to Rust ()
     NoneVal,         // the type of the `None` LITERAL only (distinct from Unit)
     List(Box<Ty>),
@@ -62,6 +69,7 @@ impl std::fmt::Display for Ty {
             Ty::Float   => write!(f, "float"),
             Ty::Bool    => write!(f, "bool"),
             Ty::Str     => write!(f, "str"),
+            Ty::Bytes   => write!(f, "bytes"),
             Ty::Unit    => write!(f, "None"),
             Ty::NoneVal => write!(f, "None"),
             Ty::List(t) => write!(f, "list[{}]", t),
@@ -143,6 +151,19 @@ impl Ty {
                         "float" => Ty::Float,
                         "bool" => Ty::Bool,
                         "str" => Ty::Str,
+                        // (W5-a) `bytes` now claims its name: an `x: bytes` /
+                        // `def f(b: bytes)` annotation resolves to the REAL
+                        // `Ty::Bytes`, closing the phantom-`Class("bytes")` hole
+                        // (probes PT6/PT7) that let it pass `check` and fail `rustc`.
+                        "bytes" => Ty::Bytes,
+                        // `bytearray` (the mutable sibling) is honestly deferred:
+                        // reject the annotation rather than let it become a silent
+                        // phantom class (the same hole `bytes` just closed).
+                        "bytearray" => return Err(Error::Type {
+                            span,
+                            msg: "`bytearray` is not yet supported (only immutable `bytes`); \
+                                  this is a documented deferral".to_string(),
+                        }),
                         other => Ty::Class(other.to_string(), vec![]),
                     }
                 }
@@ -548,6 +569,11 @@ impl TyCtx {
         funcs.insert("setattr".into(), FuncSig { params: vec![("obj".into(), Ty::Unknown), ("name".into(), Ty::Str), ("value".into(), Ty::Unknown)], ret: Ty::Unit, param_defaults: vec![], param_by_ref: vec![] });
         funcs.insert("hasattr".into(), FuncSig { params: vec![("obj".into(), Ty::Unknown), ("name".into(), Ty::Str)], ret: Ty::Bool, param_defaults: vec![], param_by_ref: vec![] });
         funcs.insert("set".into(), FuncSig { params: vec![("x".into(), Ty::Unknown)], ret: Ty::Set(Box::new(Ty::Unknown)), param_defaults: vec![], param_by_ref: vec![] });
+        // (W5-a) bytes() / bytes(n) / bytes(list[int]) / bytes(b). Variadic (0 or 1
+        // args); the single arg's TYPE drives construction (codegen) and its
+        // validity (`bytes(str)`/`bytes(float)` -> honest error) is checked in
+        // `check_expr`'s bytes special-case.
+        funcs.insert("bytes".into(), FuncSig { params: vec![("x".into(), Ty::Unknown)], ret: Ty::Bytes, param_defaults: vec![], param_by_ref: vec![] });
 
         // Builtin type names for isinstance checks
         let mut vars = HashMap::new();
@@ -558,6 +584,7 @@ impl TyCtx {
         vars.insert("list".into(), Ty::List(Box::new(Ty::Unknown)));
         vars.insert("dict".into(), Ty::Dict(Box::new(Ty::Str), Box::new(Ty::Unknown)));
         vars.insert("set".into(), Ty::Set(Box::new(Ty::Unknown)));
+        vars.insert("bytes".into(), Ty::Bytes);
 
         // (kwargs v1) Snapshot the seeded builtin names BEFORE any user/module
         // function is merged in, so the keyword→positional mapper can tell a

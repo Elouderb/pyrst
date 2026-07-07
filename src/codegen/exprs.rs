@@ -145,7 +145,7 @@ impl<'a> Codegen<'a> {
         let inner_form = match inner {
             Ty::Float => format!("__py_fmt_float(*{})", v),
             Ty::Bool => format!("__py_fmt_bool(*{})", v),
-            Ty::List(_) | Ty::Set(_) | Ty::Dict(_, _) | Ty::Tuple(_) => format!("({}).py_repr()", v),
+            Ty::Bytes | Ty::List(_) | Ty::Set(_) | Ty::Dict(_, _) | Ty::Tuple(_) => format!("({}).py_repr()", v),
             Ty::Option(i2) => self.emit_str_option(&v, i2, depth + 1),
             _ => format!("format!(\"{{}}\", {})", v),
         };
@@ -1443,7 +1443,7 @@ impl<'a> Codegen<'a> {
                             let formatted = match self.type_of_expr(arg) {
                                 Ty::Float => format!("__py_fmt_float({})", raw),
                                 Ty::Bool => format!("__py_fmt_bool({})", raw),
-                                Ty::List(_) | Ty::Set(_) | Ty::Dict(_, _) | Ty::Tuple(_) =>
+                                Ty::Bytes | Ty::List(_) | Ty::Set(_) | Ty::Dict(_, _) | Ty::Tuple(_) =>
                                     format!("({}).py_repr()", raw),
                                 // (enabler-fix-2 #3) print(opt) -> payload-or-None.
                                 Ty::Option(inner) => self.emit_str_option(&raw, inner.as_ref(), 0),
@@ -1635,11 +1635,48 @@ impl<'a> Codegen<'a> {
                                 // "True"/"False" (not Rust's "true"/"false").
                                 Ty::Float => return Ok(Some(format!("__py_fmt_float({})", a))),
                                 Ty::Bool => return Ok(Some(format!("__py_fmt_bool({})", a))),
-                                Ty::List(_) | Ty::Set(_) | Ty::Dict(_, _) | Ty::Tuple(_) =>
+                                Ty::Bytes | Ty::List(_) | Ty::Set(_) | Ty::Dict(_, _) | Ty::Tuple(_) =>
                                     return Ok(Some(format!("({}).py_repr()", a))),
                                 // (enabler-fix-2 #3) str(opt) -> payload-or-None.
                                 Ty::Option(inner) => return Ok(Some(self.emit_str_option(&a, inner.as_ref(), 0))),
                                 _ => return Ok(Some(format!("format!(\"{{}}\" , {})", a))),
+                            }
+                        }
+                        "bytes" => {
+                            // (W5-a) The `bytes(...)` constructor, dispatched on the
+                            // (check-validated) argument type:
+                            //   bytes()          -> empty `Vec<u8>`
+                            //   bytes(n: int)    -> n zero bytes (negative -> ValueError)
+                            //   bytes(list[int]) -> each in range(0, 256) (else ValueError)
+                            //   bytes(b: bytes)  -> a copy
+                            if args.is_empty() {
+                                return Ok(Some("Vec::<u8>::new()".to_string()));
+                            }
+                            match self.type_of_expr(&args[0]) {
+                                Ty::Int => {
+                                    let n = self.emit_expr(&args[0])?;
+                                    return Ok(Some(format!(
+                                        "{{ let __n: i64 = {}; if __n < 0 {{ panic!(\"ValueError\\0negative count\") }}; vec![0u8; __n as usize] }}",
+                                        n
+                                    )));
+                                }
+                                // A copy of the source bytes (value-semantics clone).
+                                Ty::Bytes => return Ok(Some(self.emit_consuming(&args[0])?)),
+                                // list[int]: build a byte vector, range-checking each
+                                // element to 0..=255 (CPython ValueError otherwise).
+                                _ => {
+                                    // Value-semantic: `emit_consuming` clones a place
+                                    // (leaving the caller's list usable) and passes an
+                                    // rvalue bare. Annotate `__src: Vec<i64>` (list[int]
+                                    // is always Vec<i64>) so an EMPTY-list arg
+                                    // (`bytes([])` -> an untyped `vec![]`) still infers
+                                    // instead of leaking a rustc E0282.
+                                    let src = self.emit_consuming(&args[0])?;
+                                    return Ok(Some(format!(
+                                        "{{ let __src: Vec<i64> = {}; __src.iter().map(|&__x| {{ if __x < 0 || __x > 255 {{ panic!(\"ValueError\\0bytes must be in range(0, 256)\") }} __x as u8 }}).collect::<Vec<u8>>() }}",
+                                        src
+                                    )));
+                                }
                             }
                         }
                         "open" => {
@@ -2019,6 +2056,13 @@ impl<'a> Codegen<'a> {
                             // generator when sorting it).
                             let list_src = if matches!(list_ty, Ty::Iterator(_)) {
                                 format!("{}.collect::<Vec<_>>()", Self::iter_arg_source(&args[0], &a))
+                            } else if matches!(list_ty, Ty::Bytes) {
+                                // (W5-a) `sorted(bytes)` yields `list[int]`: widen
+                                // each byte to i64 into an owned `Vec<i64>` so the
+                                // sorted result prints as ints (CPython), not as a
+                                // `Vec<u8>` the bytes `PyRepr` impl would render
+                                // `b'...'`. Agrees with the `list[int]` oracle type.
+                                format!("{}.iter().map(|&__b| __b as i64).collect::<Vec<i64>>()", a)
                             } else {
                                 format!("{}.clone()", a)
                             };
@@ -2188,6 +2232,10 @@ impl<'a> Codegen<'a> {
                                 let elem_ty = match &list_ty {
                                     Ty::List(inner) | Ty::Iterator(inner) | Ty::Set(inner) => (**inner).clone(),
                                     Ty::Dict(k, _) => (**k).clone(),
+                                    // (W5-a) `sorted(bytes)` sorts the widened
+                                    // `Vec<i64>` (list_src above) — its element is
+                                    // `int`, so pick the plain `.sort()` comparator.
+                                    Ty::Bytes => Ty::Int,
                                     _ => Ty::Unknown,
                                 };
                                 let sort_code = self.sort_suffix_for_elem(&elem_ty);
@@ -2251,7 +2299,11 @@ impl<'a> Codegen<'a> {
                             // `Iterator` yielding OWNED `T` — consume it directly (no
                             // `.iter()`/deref, `Gen` has none); a list/set is borrowed
                             // via `.iter()` yielding `&T` (deref before the `as f64`).
-                            let body = if matches!(arg_ty, Ty::Iterator(_)) {
+                            let body = if matches!(arg_ty, Ty::Bytes) {
+                                // (W5-a) sum(bytes): widen each byte to i64 before
+                                // summing (`i64: Sum<&u8>` does not exist).
+                                format!("{}.iter().map(|&__b| __b as i64).sum::<i64>()", a)
+                            } else if matches!(arg_ty, Ty::Iterator(_)) {
                                 let src = Self::iter_arg_source(&args[0], &a);
                                 if result_is_float && !elem_is_float {
                                     format!("{}.map(|__x| __x as f64).sum::<f64>()", src)
@@ -2325,6 +2377,19 @@ impl<'a> Codegen<'a> {
                         }
                         "reversed" => {
                             let a = self.emit_expr(&args[0])?;
+                            // (W5-a) `reversed(bytes)` yields `list[int]` (oracle
+                            // type `list[int]`): widen each byte to i64 into an owned
+                            // `Vec<i64>` BEFORE reversing, so the result prints as
+                            // ints (CPython), not as a `Vec<u8>` the bytes `PyRepr`
+                            // impl would render `b'...'`. This also feeds
+                            // `list(reversed(b))` — whose `_` list arm returns this
+                            // already-`Vec<i64>` expression verbatim.
+                            if matches!(self.type_of_expr(&args[0]), Ty::Bytes) {
+                                return Ok(Some(format!(
+                                    "{{ let mut __r = {}.iter().map(|&__b| __b as i64).collect::<Vec<i64>>(); __r.reverse(); __r }}",
+                                    a
+                                )));
+                            }
                             return Ok(Some(format!("{{ let mut __r = {}.clone(); __r.reverse(); __r }}", a)));
                         }
                         "map" => {
@@ -2352,6 +2417,15 @@ impl<'a> Codegen<'a> {
                                     "list" => matches!(&obj_type, Ty::List(_)),
                                     "dict" => matches!(&obj_type, Ty::Dict(_, _)),
                                     "set" => matches!(&obj_type, Ty::Set(_)),
+                                    // (W5-a) `isinstance(x, bytes)` is a REAL static
+                                    // test now — the pyrst type system knows `bytes`.
+                                    // Without this arm it fell to the `_` placeholder
+                                    // below and returned constant `true` for EVERY x
+                                    // (so `isinstance(5, bytes)` printed True). NOTE:
+                                    // the `_ => true` placeholder is a PRE-EXISTING
+                                    // silent-miscompile for tuple / every user class
+                                    // (out of W5-a scope; reported for a follow-up card).
+                                    "bytes" => matches!(&obj_type, Ty::Bytes),
                                     _ => {
                                         // For custom classes, emit runtime check
                                         let _obj = self.emit_expr(&args[0])?;
@@ -2377,6 +2451,9 @@ impl<'a> Codegen<'a> {
                                 Ty::List(_) => "<class 'list'>",
                                 Ty::Dict(_, _) => "<class 'dict'>",
                                 Ty::Set(_) => "<class 'set'>",
+                                // (W5-a) `type(b)` now reports the real builtin name
+                                // (was `<class 'object'>` via the `_` fallback).
+                                Ty::Bytes => "<class 'bytes'>",
                                 // Both the `None` literal (NoneVal) and a void
                                 // result (Unit) report Python's NoneType, matching
                                 // the pre-NoneVal behavior of `type(None)`.
@@ -2526,6 +2603,11 @@ impl<'a> Codegen<'a> {
                                     Ty::Dict(_, _) => {
                                         return Ok(Some(format!("{}.keys().cloned().collect::<Vec<_>>()", a)));
                                     }
+                                    // (W5-a) list(bytes) -> list[int]: each byte widened
+                                    // to i64 (Python's `list(b'AB') == [65, 66]`).
+                                    Ty::Bytes => {
+                                        return Ok(Some(format!("{}.iter().map(|&__x| __x as i64).collect::<Vec<i64>>()", a)));
+                                    }
                                     _ => {
                                         // Check if the expression looks like it returns a Vec (contains reverse, sort, etc.)
                                         if a.contains("reverse") || a.contains("sort") || a.contains("clone()") {
@@ -2657,6 +2739,17 @@ impl<'a> Codegen<'a> {
             Expr::Bool(b, _) => b.to_string(),
             Expr::None_(_) => "None".to_string(),
             Expr::Str(s, _) => format!("String::from({:?})", s),
+            // (W5-a) A `bytes` literal lowers to an owned `Vec<u8>`, byte-exact.
+            // Each byte is spelled `NNu8`; an empty literal uses a turbofish so its
+            // element type is unambiguous in an inference-free position.
+            Expr::Bytes(v, _) => {
+                if v.is_empty() {
+                    "Vec::<u8>::new()".to_string()
+                } else {
+                    let elems = v.iter().map(|b| format!("{}u8", b)).collect::<Vec<_>>().join(", ");
+                    format!("vec![{}]", elems)
+                }
+            }
             Expr::FStr(parts, _) => {
                 let mut fmt_str = String::new();
                 let mut args = Vec::new();
@@ -2676,7 +2769,7 @@ impl<'a> Codegen<'a> {
                                     let arg = match self.type_of_expr(expr) {
                                         Ty::Float => format!("__py_fmt_float({})", raw),
                                         Ty::Bool => format!("__py_fmt_bool({})", raw),
-                                        Ty::List(_) | Ty::Set(_) | Ty::Dict(_, _) | Ty::Tuple(_) =>
+                                        Ty::Bytes | Ty::List(_) | Ty::Set(_) | Ty::Dict(_, _) | Ty::Tuple(_) =>
                                             format!("({}).py_repr()", raw),
                                         // (enabler-fix-2 #3) f"{opt}" -> payload-or-None.
                                         Ty::Option(inner) => self.emit_str_option(&raw, inner.as_ref(), 0),
@@ -2768,6 +2861,16 @@ impl<'a> Codegen<'a> {
                     } else {
                         iter_s.clone()
                     }
+                } else if matches!(self.type_of_expr(iter), Ty::Bytes) {
+                    // (W5-a, blocker B1) Iterating bytes yields INTS (u8 as i64):
+                    // the comprehension target is typed `int` by typeck, so widen
+                    // each `&u8` element instead of `.cloned()`-ing a `u8`. Mirrors
+                    // the `Stmt::For` bytes arm (codegen/stmts.rs). Without it a
+                    // bytes source PASSED `check` (typeck promised `int`) and FAILED
+                    // rustc (E0308 / "cannot multiply u8 by i64") inside every
+                    // list/set/dict comprehension — the exact check/build divergence
+                    // the keystone exists to close.
+                    format!("{}.iter().map(|&__b| __b as i64)", iter_s)
                 } else {
                     format!("{}.iter().cloned()", iter_s)
                 };
@@ -2819,6 +2922,16 @@ impl<'a> Codegen<'a> {
                     } else {
                         iter_s.clone()
                     }
+                } else if matches!(self.type_of_expr(iter), Ty::Bytes) {
+                    // (W5-a, blocker B1) Iterating bytes yields INTS (u8 as i64):
+                    // the comprehension target is typed `int` by typeck, so widen
+                    // each `&u8` element instead of `.cloned()`-ing a `u8`. Mirrors
+                    // the `Stmt::For` bytes arm (codegen/stmts.rs). Without it a
+                    // bytes source PASSED `check` (typeck promised `int`) and FAILED
+                    // rustc (E0308 / "cannot multiply u8 by i64") inside every
+                    // list/set/dict comprehension — the exact check/build divergence
+                    // the keystone exists to close.
+                    format!("{}.iter().map(|&__b| __b as i64)", iter_s)
                 } else {
                     format!("{}.iter().cloned()", iter_s)
                 };
@@ -2860,6 +2973,16 @@ impl<'a> Codegen<'a> {
                     } else {
                         iter_s.clone()
                     }
+                } else if matches!(self.type_of_expr(iter), Ty::Bytes) {
+                    // (W5-a, blocker B1) Iterating bytes yields INTS (u8 as i64):
+                    // the comprehension target is typed `int` by typeck, so widen
+                    // each `&u8` element instead of `.cloned()`-ing a `u8`. Mirrors
+                    // the `Stmt::For` bytes arm (codegen/stmts.rs). Without it a
+                    // bytes source PASSED `check` (typeck promised `int`) and FAILED
+                    // rustc (E0308 / "cannot multiply u8 by i64") inside every
+                    // list/set/dict comprehension — the exact check/build divergence
+                    // the keystone exists to close.
+                    format!("{}.iter().map(|&__b| __b as i64)", iter_s)
                 } else {
                     format!("{}.iter().cloned()", iter_s)
                 };
@@ -3165,6 +3288,12 @@ impl<'a> Codegen<'a> {
                             o, i
                         )
                     }
+                    // (W5-a) `b[i]` -> int: byte-offset index over the natural
+                    // `Vec<u8>` (neg-norm + catchable IndexError), the u8 widened
+                    // to i64. OPPOSITE to the `Str` arm's char path above.
+                    Ty::Bytes => {
+                        format!("__py_bytes_index(&({}), {})", o, i)
+                    }
                     _ => {
                         // List indexing with negative index support.
                         // Explicit bounds check emits "IndexError\0..." so the
@@ -3222,7 +3351,11 @@ impl<'a> Codegen<'a> {
                         }
                         return Ok(format!("{{ let __s = {}.clone(); __py_str_slice_step(&__s, {}, {}, {}) }}", o, start_arg, stop_arg, step_arg));
                     }
-                    Ty::List(_) => {
+                    // (W5-a) `b[i:j]` -> bytes. A `bytes` is a `Vec<u8>`, so it
+                    // reuses the SAME generic `__py_list_slice`/`__py_list_slice_step`
+                    // helpers (both `<T: Clone>`) — a sub-`Vec<u8>`, never `str`'s
+                    // char-offset path.
+                    Ty::List(_) | Ty::Bytes => {
                         // List slicing with step support and negative index handling
                         match (start, stop, step) {
                             (Some(s), Some(e), None) => {
@@ -3298,7 +3431,12 @@ impl<'a> Codegen<'a> {
                         let (str_e, num_e) = if lt == Ty::Str { (lhs, rhs) } else { (rhs, lhs) };
                         let s = self.emit_expr(str_e)?;
                         let n = self.emit_expr(num_e)?;
-                        return Ok(format!("{}.repeat({} as usize)", s, n));
+                        // (W5-a fix) CLAMP a negative count to 0 — CPython `"ab" * -1
+                        // == ""`. A bare `n as usize` wraps a negative i64 to a huge
+                        // usize and `<str>::repeat` then panics "capacity overflow"
+                        // (a crash on VALID Python). `(n as i64).max(0)` keeps a
+                        // legitimate positive count untouched.
+                        return Ok(format!("{}.repeat(({} as i64).max(0) as usize)", s, n));
                     }
                     if matches!(&lt, Ty::List(_)) || matches!(&rt, Ty::List(_)) {
                         let (lst_e, num_e) = if matches!(&lt, Ty::List(_)) { (lhs, rhs) } else { (rhs, lhs) };
@@ -3308,6 +3446,18 @@ impl<'a> Codegen<'a> {
                             "{{ let mut __rep: Vec<_> = Vec::new(); for _ in 0..({} as usize) {{ __rep.extend({}.clone().into_iter()); }} __rep }}",
                             n, v
                         ));
+                    }
+                    // (W5-a) bytes * int / int * bytes -> repeat the byte sequence.
+                    // `<[u8]>::repeat` (u8 is Copy) yields a fresh owned Vec<u8>.
+                    if matches!(&lt, Ty::Bytes) || matches!(&rt, Ty::Bytes) {
+                        let (b_e, num_e) = if matches!(&lt, Ty::Bytes) { (lhs, rhs) } else { (rhs, lhs) };
+                        let b = self.emit_expr(b_e)?;
+                        let n = self.emit_expr(num_e)?;
+                        // (W5-a fix) CLAMP a negative count to 0 — CPython `b'ab' *
+                        // -1 == b''`. `<[u8]>::repeat(n as usize)` on a negative i64
+                        // wraps to a huge usize and panics "capacity overflow" (a
+                        // crash on VALID Python), same idiom as the str repeat above.
+                        return Ok(format!("({}).repeat(({} as i64).max(0) as usize)", b, n));
                     }
                 }
 
@@ -3359,6 +3509,14 @@ impl<'a> Codegen<'a> {
                         let r = self.emit_expr(rhs)?;
                         // Use format! for robust string concatenation
                         return Ok(format!(r#"format!("{{}}{{}}", {}, {})"#, l, r));
+                    }
+                    // (W5-a) bytes + bytes -> concatenation into a fresh Vec<u8>.
+                    // `[&a[..], &b[..]].concat()` borrows both (no clone) and owns
+                    // the result. typeck has already rejected every mixed `+`.
+                    if matches!(lt, Ty::Bytes) && matches!(rt, Ty::Bytes) {
+                        let l = self.emit_expr(lhs)?;
+                        let r = self.emit_expr(rhs)?;
+                        return Ok(format!("[&({})[..], &({})[..]].concat()", l, r));
                     }
                     // (EPIC-5 C2-3) `list + list` concatenation is a PRE-EXISTING
                     // gap: typeck accepts it, but the generic numeric `+` lowering
@@ -3860,6 +4018,8 @@ impl<'a> Codegen<'a> {
             Ty::Float => "f64".into(),
             Ty::Bool => "bool".into(),
             Ty::Str => "String".into(),
+            // (W5-a) `bytes` -> `Vec<u8>` — the same ownership shape as `list`.
+            Ty::Bytes => "Vec<u8>".into(),
             Ty::Unit => "()".into(),
             // The `None` literal's type. It never appears as a real binding
             // annotation (annotations come from `from_type_expr`, which yields

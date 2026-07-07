@@ -1,0 +1,9 @@
+True
+True
+False
+False
+False
+True
+True
+<class 'bytes'>
+<class 'bytes'>

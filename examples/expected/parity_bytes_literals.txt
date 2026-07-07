@@ -1,0 +1,10 @@
+b''
+b'\x00abc'
+b"a'b"
+b'a"b'
+b'a\'b"c'
+b'\x00A\x7f\x80\xff'
+b'\t\n\r\\\x08\x0c\x00'
+b'\x00abc'
+b"a'b"
+val=b'\x00A\x7f\x80\xff' end

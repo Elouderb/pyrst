@@ -54,10 +54,11 @@
 #
 # GATES / DIVERGENCES (every one that survived to this file):
 #
-#   G1 (bytes — DEFERRED): pyrst has no `bytes` type/literal at all, so
-#      `pformat(b'...')`/`saferepr(b'...')` cannot even be called; the
-#      CPython probes using `b'hello'` in the dossier are inapplicable, not
-#      silently wrong. No stub needed since no caller can construct the arg.
+#   G1 (bytes — DEFERRED): this module does not model `bytes` pretty-printing.
+#      pyrst gained a `bytes` type/literal in W5-a, but `pprint` here has no
+#      `bytes`-aware `pformat`/`saferepr` path (its recursion is str / number /
+#      container only), so the CPython probes using `b'hello'` are out of scope
+#      for this port — a documented gap, not a silent miscompile.
 #
 #   G2 (`PrettyPrinter` must be A GENERIC CLASS, not a plain one — REQUIRED
 #      ADAPTATION): pyrst's parser explicitly REJECTS generic methods

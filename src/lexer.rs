@@ -48,6 +48,10 @@ pub enum Tok {
     Float(f64),
     Str(String),
     FStr(Vec<RawFStrPart>),
+    /// A `bytes` literal `b'...'` / `b"..."` (W5-a). Carries the DECODED raw
+    /// bytes (escapes already applied), mirroring `Str(String)` but at the
+    /// byte level: a `bytes` holds arbitrary 0x00–0xff values (not UTF-8).
+    Bytes(Vec<u8>),
     True,
     False,
     None_,
@@ -164,6 +168,80 @@ fn fmt_byte(b: u8) -> String {
     } else {
         format!("\\x{:02x}", b)
     }
+}
+
+/// Decode ONE backslash escape sequence starting at `bytes[i]` (the backslash),
+/// shared by the four literal lexers (single-line `str`, triple-quoted `str`,
+/// f-string, and the `bytes` literal) so the escape table can never drift.
+///
+/// Returns the decoded BYTE value and the index just PAST the whole escape (2
+/// for a simple escape like `\n`, 4 for a `\xNN` hex escape). The nine common
+/// escapes `\n \t \r \\ \' \" \0 \b \f` decode identically in both modes and all
+/// yield an ASCII byte < 0x80, so a `str`/f-string caller losslessly re-widens
+/// the result with `as char`.
+///
+/// `byte_mode` selects BYTES-literal semantics (W5): it ENABLES the `\xNN` hex
+/// escape (one raw 0x00–0xff byte) and honestly REJECTS a multi-digit octal
+/// escape (`\012`), which pyrst does not implement — silently lowering it to
+/// `NUL` + literal digits would diverge from CPython's `\012 == 0x0a`. In
+/// `str`/f-string mode `\x` stays an honest "unknown escape" (a Unicode `\x`
+/// for `str` is a separate, deferred lexer item) and a bare `\0` keeps its
+/// legacy NUL-then-literal behaviour untouched.
+///
+/// The caller guarantees `bytes[i] == b'\\'` and `i + 1 < bytes.len()`. A
+/// backslash-newline line continuation is caller-specific (only triple-quoted
+/// strings honour it) and is handled BEFORE this helper is reached.
+fn lex_escape(bytes: &[u8], i: usize, line: u32, col: u32, byte_mode: bool) -> Result<(u8, usize)> {
+    let esc = bytes[i + 1];
+    let val: u8 = match esc {
+        b'n' => b'\n',
+        b't' => b'\t',
+        b'r' => b'\r',
+        b'\\' => b'\\',
+        b'\'' => b'\'',
+        b'"' => b'"',
+        b'0' => {
+            // A `\0` followed by another octal digit (`\012`) is a multi-digit
+            // OCTAL escape, which pyrst does not support. In BYTES mode reject it
+            // honestly (octal is a documented deferral) rather than emit NUL +
+            // literal digits — CPython reads `\012` as the single byte 0x0a, so
+            // the silent lowering would be a miscompile. `str`/f-string mode keeps
+            // its existing NUL-then-literal behaviour (out of scope here).
+            if byte_mode && i + 2 < bytes.len() && (b'0'..=b'7').contains(&bytes[i + 2]) {
+                return Err(Error::Lex {
+                    span: Span::new(i, i + 3, line, col),
+                    msg: "octal escapes (\\ooo) are not supported in bytes literals; use \\xNN".into(),
+                });
+            }
+            0
+        }
+        b'b' => 0x08,
+        b'f' => 0x0C,
+        b'x' if byte_mode => {
+            // `\xNN`: EXACTLY two hex digits -> one raw byte (CPython rejects
+            // `\x`/`\x4` with "invalid \x escape").
+            match (bytes.get(i + 2).copied(), bytes.get(i + 3).copied()) {
+                (Some(a), Some(b)) if a.is_ascii_hexdigit() && b.is_ascii_hexdigit() => {
+                    let hi = (a as char).to_digit(16).unwrap() as u8;
+                    let lo = (b as char).to_digit(16).unwrap() as u8;
+                    return Ok((hi * 16 + lo, i + 4));
+                }
+                _ => {
+                    return Err(Error::Lex {
+                        span: Span::new(i, (i + 4).min(bytes.len()), line, col),
+                        msg: "invalid \\x escape: expected two hex digits (e.g. \\x1f)".into(),
+                    });
+                }
+            }
+        }
+        other => {
+            return Err(Error::Lex {
+                span: Span::new(i, i + 2, line, col),
+                msg: format!("unknown escape '\\{}'", fmt_byte(other)),
+            });
+        }
+    };
+    Ok((val, i + 2))
 }
 
 /// Lex a numeric literal starting at `bytes[i]` — a decimal digit, or a `.`
@@ -464,26 +542,12 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
                         });
                     }
                 } else if bytes[i] == b'\\' && i + 1 < bytes.len() {
-                    let esc = bytes[i + 1];
-                    let ch = match esc {
-                        b'n' => '\n',
-                        b't' => '\t',
-                        b'r' => '\r',
-                        b'\\' => '\\',
-                        b'\'' => '\'',
-                        b'"' => '"',
-                        b'0' => '\0',
-                        b'b' => '\u{0008}',
-                        b'f' => '\u{000C}',
-                        other => {
-                            return Err(Error::Lex {
-                                span: Span::new(i, i + 2, line, col),
-                                msg: format!("unknown escape '\\{}'", fmt_byte(other)),
-                            });
-                        }
-                    };
-                    current_lit.push(ch);
-                    i += 2;
+                    // Shared escape table (`str`/f-string mode: `\x` stays an
+                    // honest "unknown escape"). A common escape yields an ASCII
+                    // byte < 0x80, so `as char` is lossless.
+                    let (val, next) = lex_escape(bytes, i, line, col, false)?;
+                    current_lit.push(val as char);
+                    i = next;
                 } else if bytes[i] == b'\n' {
                     return Err(Error::Lex {
                         span: Span::new(start, i, line, col),
@@ -516,6 +580,82 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
             continue;
         }
 
+        // (W5-a) Raw-bytes prefixes `rb'...'` / `br'...'` (ANY case: rB/Rb/RB/bR/…)
+        // are a documented deferral — reject them HONESTLY here, BEFORE the bytes
+        // and identifier scans. Otherwise `rb'\x41'` lexes as the identifier `rb`
+        // plus a `str` `'\x41'`, whose `\x` then fails with a MISLEADING "unknown
+        // escape" error — pointing at the escape when it is the raw-bytes PREFIX
+        // that is unsupported. `c | 0x20` lowercases an ASCII letter, so a single
+        // match covers all eight case combinations; a non-letter never maps onto
+        // `r`/`b`, so only genuine `rb`/`br` prefixes are caught. CPython accepts
+        // rb/br; pyrst defers them (raw-bytes decoding is a later wave).
+        if i + 2 < bytes.len()
+            && (bytes[i + 2] == b'"' || bytes[i + 2] == b'\'')
+            && matches!((c | 0x20, bytes[i + 1] | 0x20), (b'r', b'b') | (b'b', b'r'))
+        {
+            return Err(Error::Lex {
+                span: Span::new(start, i + 2, line, col),
+                msg: "raw bytes literals (rb'...' / br'...') are not supported".into(),
+            });
+        }
+
+        // Bytes literal `b'...'` / `b"..."` (W5-a). A `b`/`B` IMMEDIATELY followed
+        // by a quote is the bytes prefix (mirroring the `f` prefix above); a bare
+        // `b`, `banana`, or `bytes(` is an ordinary identifier handled below. The
+        // decoded token holds raw bytes (arbitrary 0x00–0xff), never a UTF-8
+        // `String`. Single-line only in W5-a: triple-quoted bytes are rejected
+        // honestly (deferred), and a raw non-ASCII source byte is a CPython
+        // SyntaxError ("bytes can only contain ASCII literal characters").
+        if (c == b'b' || c == b'B') && i + 1 < bytes.len() && (bytes[i + 1] == b'"' || bytes[i + 1] == b'\'') {
+            i += 1; // consume the b/B prefix
+            let quote = bytes[i];
+            // Triple-quoted bytes (`b'''...'''`) are a documented W5 deferral —
+            // reject honestly rather than mis-lex the first two quotes as `b''`.
+            if i + 2 < bytes.len() && bytes[i + 1] == quote && bytes[i + 2] == quote {
+                return Err(Error::Lex {
+                    span: Span::new(start, i + 3, line, col),
+                    msg: "triple-quoted bytes literals are not yet supported".into(),
+                });
+            }
+            i += 1; // consume opening quote
+            let mut buf: Vec<u8> = Vec::new();
+            while i < bytes.len() && bytes[i] != quote {
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    // Byte-valued escape path: the shared table PLUS `\xNN`.
+                    let (val, next) = lex_escape(bytes, i, line, col, true)?;
+                    buf.push(val);
+                    i = next;
+                } else if bytes[i] == b'\n' {
+                    return Err(Error::Lex {
+                        span: Span::new(start, i, line, col),
+                        msg: "unterminated bytes literal".into(),
+                    });
+                } else if bytes[i] >= 0x80 {
+                    // A raw non-ASCII source byte cannot appear in a bytes literal
+                    // (CPython SyntaxError). Use `\xNN` to encode a high byte.
+                    return Err(Error::Lex {
+                        span: Span::new(i, i + 1, line, col),
+                        msg: "bytes can only contain ASCII literal characters (use \\xNN for a byte >= 0x80)".into(),
+                    });
+                } else {
+                    buf.push(bytes[i]);
+                    i += 1;
+                }
+            }
+            if i >= bytes.len() {
+                return Err(Error::Lex {
+                    span: Span::new(start, i, line, col),
+                    msg: "unterminated bytes literal".into(),
+                });
+            }
+            i += 1; // consume closing quote
+            tokens.push(Token {
+                tok: Tok::Bytes(buf),
+                span: Span::new(start, i, line, col),
+            });
+            continue;
+        }
+
         // String literal (single-line or triple-quoted)
         if c == b'"' || c == b'\'' {
             let quote = c;
@@ -540,33 +680,18 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
                         break;
                     }
                     if bytes[i] == b'\\' && i + 1 < bytes.len() {
-                        let esc = bytes[i + 1];
-                        let ch = match esc {
-                            b'n' => '\n',
-                            b't' => '\t',
-                            b'r' => '\r',
-                            b'\\' => '\\',
-                            b'\'' => '\'',
-                            b'"' => '"',
-                            b'0' => '\0',
-                            b'b' => '\u{0008}',
-                            b'f' => '\u{000C}',
-                            b'\n' => {
-                                // Backslash-newline: line continuation inside triple string
-                                i += 2;
-                                line += 1;
-                                line_start = i;
-                                continue;
-                            }
-                            other => {
-                                return Err(Error::Lex {
-                                    span: Span::new(i, i + 2, line, col),
-                                    msg: format!("unknown escape '\\{}'", fmt_byte(other)),
-                                });
-                            }
-                        };
-                        s.push(ch);
-                        i += 2;
+                        // Backslash-newline is a line continuation inside a triple
+                        // string (caller-specific — not part of the shared escape
+                        // table), so handle it BEFORE delegating to `lex_escape`.
+                        if bytes[i + 1] == b'\n' {
+                            i += 2;
+                            line += 1;
+                            line_start = i;
+                            continue;
+                        }
+                        let (val, next) = lex_escape(bytes, i, line, col, false)?;
+                        s.push(val as char);
+                        i = next;
                     } else if bytes[i] == b'\n' {
                         // Embedded newline: include it verbatim and track line/col
                         s.push('\n');
@@ -587,26 +712,10 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
                 i += 1; // consume opening single quote
                 while i < bytes.len() && bytes[i] != quote {
                     if bytes[i] == b'\\' && i + 1 < bytes.len() {
-                        let esc = bytes[i + 1];
-                        let ch = match esc {
-                            b'n' => '\n',
-                            b't' => '\t',
-                            b'r' => '\r',
-                            b'\\' => '\\',
-                            b'\'' => '\'',
-                            b'"' => '"',
-                            b'0' => '\0',
-                            b'b' => '\u{0008}',
-                            b'f' => '\u{000C}',
-                            other => {
-                                return Err(Error::Lex {
-                                    span: Span::new(i, i + 2, line, col),
-                                    msg: format!("unknown escape '\\{}'", fmt_byte(other)),
-                                });
-                            }
-                        };
-                        s.push(ch);
-                        i += 2;
+                        // Shared escape table (`str` mode).
+                        let (val, next) = lex_escape(bytes, i, line, col, false)?;
+                        s.push(val as char);
+                        i = next;
                     } else if bytes[i] == b'\n' {
                         return Err(Error::Lex {
                             span: Span::new(start, i, line, col),
@@ -1015,5 +1124,54 @@ mod tests {
         // And bare `<<` / `>>` still lex as the 2-char shift tokens.
         assert_eq!(kinds("x << 2\n")[1], Tok::LShift);
         assert_eq!(kinds("x >> 2\n")[1], Tok::RShift);
+    }
+
+    // ───────── W5-a: bytes literals + the shared escape helper ─────────
+
+    /// `b'...'` / `b"..."` (and the `B` prefix) lex to `Tok::Bytes` with the
+    /// escapes already decoded; a bare `b`/`bytes` stays an identifier.
+    #[test]
+    fn bytes_literal_lexes_to_tok_bytes() {
+        assert_eq!(kinds("x = b'ABC'\n")[2], Tok::Bytes(vec![65, 66, 67]));
+        assert_eq!(kinds("x = b\"ABC\"\n")[2], Tok::Bytes(vec![65, 66, 67]));
+        assert_eq!(kinds("x = B'AB'\n")[2], Tok::Bytes(vec![65, 66]));
+        assert_eq!(kinds("x = b''\n")[2], Tok::Bytes(vec![]));
+        // A `b`/`B` NOT followed by a quote is an ordinary identifier.
+        assert_eq!(kinds("b = 5\n")[0], Tok::Ident("b".to_string()));
+        assert_eq!(kinds("x = bytes(3)\n")[2], Tok::Ident("bytes".to_string()));
+    }
+
+    /// The byte-valued escape path: the nine shared escapes plus the new `\xNN`
+    /// hex, producing raw bytes (including 0x80–0xff, which no `str` can hold).
+    #[test]
+    fn bytes_escape_table_and_hex() {
+        assert_eq!(kinds("x = b'\\x00A\\x7f\\x80\\xff'\n")[2],
+                   Tok::Bytes(vec![0x00, 0x41, 0x7f, 0x80, 0xff]));
+        assert_eq!(kinds("x = b'\\n\\t\\r'\n")[2], Tok::Bytes(vec![0x0a, 0x09, 0x0d]));
+        assert_eq!(kinds("x = b'\\\\'\n")[2], Tok::Bytes(vec![0x5c]));
+        assert_eq!(kinds("x = b'\\0\\b\\f'\n")[2], Tok::Bytes(vec![0x00, 0x08, 0x0c]));
+        assert_eq!(kinds("x = b'\\''\n")[2], Tok::Bytes(vec![0x27]));
+    }
+
+    /// Honest rejects (iron rule: an error beats a silent miscompile).
+    #[test]
+    fn bytes_literal_honest_rejects() {
+        assert!(lex("x = b'\\x4'\n").is_err(), "\\x needs two hex digits");
+        assert!(lex("x = b'\\xGG'\n").is_err(), "\\x needs HEX digits");
+        assert!(lex("x = b'\\012'\n").is_err(), "octal escapes are deferred");
+        assert!(lex("x = b'\\q'\n").is_err(), "unknown escape rejected");
+        assert!(lex("x = b'\u{e9}'\n").is_err(), "raw non-ASCII byte rejected");
+        assert!(lex("x = b'''ab'''\n").is_err(), "triple-quoted bytes deferred");
+        assert!(lex("x = b'ab\n").is_err(), "unterminated bytes literal");
+        // `\x` remains a bytes-ONLY escape: a `str` `\x` is still an error.
+        assert!(lex("x = \"\\x41\"\n").is_err(), "str \\x stays unknown-escape");
+    }
+
+    /// The escape-helper refactor must keep `str`/f-string decoding byte-identical.
+    #[test]
+    fn str_escape_unchanged_after_refactor() {
+        assert_eq!(kinds("x = \"a\\nb\\t\\\\\"\n")[2], Tok::Str("a\nb\t\\".to_string()));
+        assert_eq!(kinds("x = \"\\0\"\n")[2], Tok::Str("\0".to_string()));
+        assert_eq!(kinds("x = '\\'q'\n")[2], Tok::Str("'q".to_string()));
     }
 }

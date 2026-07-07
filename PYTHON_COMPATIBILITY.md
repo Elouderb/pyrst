@@ -35,7 +35,63 @@ This document clarifies which Python features are supported, partially supported
 | `tuple[T, ...]` | ✅ Supported | Rust tuple `(T, ...)` | Fixed-size, heterogeneous |
 | `set[T]` | ✅ Supported | `HashSet<T>` | Literals, comprehensions, membership, iteration — but **not** the mutation/algebra methods (see Set Methods) |
 | `frozenset` | ❌ Not Supported | N/A | No immutable set |
-| `bytes` | ❌ Not Supported | N/A | No byte strings |
+| `bytes` | ✅ Supported | `Vec<u8>` | Immutable byte strings — literals, index→`int`, slice→`bytes`, iteration→`int`s, `+`/`*`/comparisons, `bytes()`/`bytes(n)`/`bytes(list[int])` constructors, CPython-exact `b'...'` repr. Methods (`hex`/`decode`/`split`/…) and `bytearray` are deferred — see **The `bytes` type** below. |
+
+---
+
+## The `bytes` type
+
+`bytes` is an **immutable** byte string backing to Rust `Vec<u8>`. It is a *value*
+(the same ownership shape as `list`), so it rides the existing clone-on-use value
+semantics unchanged.
+
+### What works
+
+- **Literals** `b'...'` / `b"..."` (single/double quoted). Escape table: `\n \t \r
+  \\ \' \" \0 \b \f` plus `\xNN` hex (a raw 0x00–0xff byte). `b'\x80'` is the single
+  byte 0x80 — not a UTF-8 scalar, which is exactly why `bytes` is not a `str`.
+- **Access shapes — the OPPOSITE of `str`.** `b[i]` → `int` (the byte value, a `u8`
+  widened to `i64`; negative indices and a catchable `IndexError` like a list).
+  `b[i:j]` / `b[i:j:k]` → `bytes`. Iteration (`for x in b`, comprehensions) yields
+  `int`s. `len(b)` is the byte count. `list(b)` → `list[int]`; `sum(b)` → `int`.
+- **Operators** `b1 + b2` (concat), `b * n` / `n * b` (repeat), `==` `!=` `<` `<=`
+  `>` `>=` (lexicographic), plus hashing — so `bytes` is a valid `dict`/`set` key.
+- **Constructors** `bytes()` / `bytes(0)` → empty; `bytes(n)` → `n` zero bytes;
+  `bytes(list[int])` → each element range-checked to 0–255; `bytes(b)` → a copy.
+- **Display** `print(b)`, `str(b)`, `repr(b)`, `f"{b}"`, and container reprs
+  (`list[bytes]`, `dict[bytes, _]`) all emit the **CPython-exact** `b'...'` repr:
+  single quotes by default, double iff the payload has a `'` and no `"`; escape
+  `\\`, the active quote, and `\t`/`\n`/`\r`; a printable byte 0x20–0x7e is literal;
+  every other byte is a lowercase `\xNN`.
+
+### Honest divergences and deferrals (errors, never miscompiles)
+
+- **`bytes == str` is rejected**, not `False`. CPython answers `False`; pyrst treats
+  a mixed `bytes`/`str` `==` as almost certainly a bug and rejects it at check time
+  (decode/encode to bridge). `bytes + str` / `str + bytes` are likewise rejected
+  (CPython `TypeError`).
+- **Methods are deferred to the bytes-method wave (W5-b).** Any `b.method()`
+  (`hex`, `decode`, `find`, `split`, `startswith`, …) is an honest
+  "type `bytes` has no method" error — never a stub. `str.encode` / `bytes.decode`
+  codecs arrive with that wave (utf-8 first).
+- **Membership `x in b` is deferred.** This also rejects the mismatched
+  `'A' in b'ABC'` (CPython `TypeError`).
+- **Item assignment `b[i] = x` is rejected** — `bytes` is immutable (CPython
+  `TypeError`). The mutable sibling **`bytearray` is deferred** (its annotation is a
+  clean error, not a silent phantom class).
+- **Escapes pyrst rejects that CPython accepts (all honest-STRICTER, documented):**
+  octal `\ooo` (e.g. `\012`; use `\xNN`), and `\a`/`\v` and other non-table escapes
+  — consistent with pyrst's `str` escape set. `\u`/`\N` inside a bytes literal are
+  rejected too. This is pyrst being **stricter than CPython, not matching it**:
+  CPython 3.12 *accepts* `b'\u0041'`, emits a `SyntaxWarning: invalid escape
+  sequence '\u'`, and keeps the backslash **literally** — `b'\u0041'` is the 6
+  bytes `\ u 0 0 4 1` (`[92, 117, 48, 48, 52, 49]`, python3-verified), NOT the
+  character `A`. pyrst refuses it rather than silently emit six bytes where a `\u`
+  escape was almost certainly intended — exactly the confusion CPython's own
+  warning exists to flag (the same honest-stricter framing as the W4-d P9b
+  correction). A raw non-ASCII source byte in `b'...'` is a `SyntaxError` in both.
+  **Triple-quoted bytes** (`b'''...'''`) and **raw-bytes prefixes** (`rb'...'` /
+  `br'...'`, any case) are deferred — both honest lexer errors, never miscompiles.
 
 ---
 

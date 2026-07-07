@@ -1037,6 +1037,9 @@ pub fn is_copy(ty: &Ty) -> bool {
         Ty::Tuple(elems) => elems.iter().all(is_copy),
         Ty::Option(inner) => is_copy(inner),
         Ty::Str
+        // (W5-a) `bytes` -> `Vec<u8>`: non-Copy, exactly like `List` (`Vec<T>`),
+        // so it rides the existing clone-on-use pipeline with no new rule.
+        | Ty::Bytes
         | Ty::List(_)
         // LAZY-GEN V1-a: a generator result is move-only (a `Vec<T>` in the eager
         // pipeline, a `Gen<T>` later) — non-Copy, exactly like `List`.
@@ -1444,7 +1447,7 @@ pub(crate) fn branch_divergence_error(name: &str, a: &Ty, b: &Ty, span: Span, jo
 /// comprehension/`for` sources, subscripts, slices, ternary arms — is a read.
 pub(crate) fn expr_reads(e: &Expr, out: &mut HashSet<String>) {
     match e {
-        Expr::Int(..) | Expr::Float(..) | Expr::Str(..) | Expr::Bool(..) | Expr::None_(..) => {}
+        Expr::Int(..) | Expr::Float(..) | Expr::Str(..) | Expr::Bytes(..) | Expr::Bool(..) | Expr::None_(..) => {}
         Expr::Ident(n, _) => { out.insert(n.clone()); }
         Expr::FStr(parts, _) => {
             for p in parts {
@@ -2783,7 +2786,7 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             }
             Ok(())
         }
-        Stmt::AugAssign { target, value, span, .. } => {
+        Stmt::AugAssign { target, op, value, span } => {
             if env.locals.get(target.as_str()).is_none() && !env.ctx.funcs.contains_key(target.as_str()) {
                 return Err(Error::Type {
                     span: *span,
@@ -2814,6 +2817,31 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
                         "materialize it into a `list` local first",
                         *span,
                     ));
+                }
+            }
+            // (W5-a) `x op= y` desugars to `x = x <op> y`, so a `bytes` operand must
+            // obey the SAME explicit bytes-operator typing (`bytes_binop_ty`) as
+            // binary `+`/`*` — the loose generic aug path never consulted it, so
+            // `str += bytes` leaked a raw rustc E0308 at build and `bytes += str`
+            // fell to a late codegen error instead of the polished check message
+            // ordinary `+` gives. This ACCEPTS `bytes += bytes` (codegen concats it)
+            // and gives every mismatched pair the identical honest error. A bytes
+            // RESULT that cannot land in the target's fixed type (e.g. `int *= bytes`)
+            // is rejected too. (The GENERAL loose-aug hole — `str += int`, etc. — is
+            // pre-existing and out of scope; this arm only covers bytes-involving ops.)
+            if let Some(target_ty) = env.locals.get(target.as_str()).cloned() {
+                if is_bytes_binop(*op, &target_ty, &val_ty) {
+                    let res = bytes_binop_ty(*op, &target_ty, &val_ty, *span)?;
+                    if !types_compatible(&res, &target_ty, env.ctx) {
+                        return Err(Error::Type {
+                            span: *span,
+                            msg: format!(
+                                "augmented assignment `{}=` would change `{}` from `{}` to `{}`; \
+                                 a binding's type is fixed in pyrst (rebind with `=` if intended)",
+                                binop_symbol(*op), target, target_ty, res
+                            ),
+                        });
+                    }
                 }
             }
             Ok(())
@@ -3033,6 +3061,7 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
                 // Iterating a dict yields its KEYS (Python semantics).
                 Ty::Dict(key, _) => *key.clone(),
                 Ty::Str => Ty::Str, // iterating a string yields 1-char strings
+                Ty::Bytes => Ty::Int, // (W5-a) iterating bytes yields ints (u8 as i64)
                 _ => Ty::Unknown,
             };
             // Bind all targets
@@ -3308,6 +3337,17 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             let obj_ty = check_expr(obj, env)?;
             check_expr(idx, env)?;
             check_expr(value, env)?;
+            // (W5-a) `bytes` is IMMUTABLE — `b[i] = x` is a CPython TypeError
+            // ("'bytes' object does not support item assignment"). Reject it
+            // honestly rather than leak a `rustc` mismatch (`Vec<u8>[i] = i64`);
+            // `bytearray` (the mutable sibling) is a documented deferral.
+            if matches!(obj_ty, Ty::Bytes) {
+                return Err(Error::Type {
+                    span: *span,
+                    msg: "`bytes` does not support item assignment (it is immutable); \
+                          build a new bytes value instead — `bytearray` is deferred".to_string(),
+                });
+            }
             // Detect mutation of a by-value non-Copy parameter via index assignment.
             // Exception: if the param is returned by the function, the mutation is valid.
             if let Some(root) = root_ident(obj) {
@@ -3684,12 +3724,19 @@ pub(crate) const DICT_METHODS: &[&str] = &[
     // absent from the example corpus (card 36f66dd2).
 ];
 pub(crate) const FILE_METHODS: &[&str] = &["read", "readlines", "write", "close"];
+/// (W5-a) `bytes` ships NO methods yet — the whole method surface (`hex`/`decode`/
+/// `find`/`split`/…) is the W5-b wave. An EMPTY table (rather than `None`) makes
+/// EVERY `b.method()` an honest "type `bytes` has no method" error instead of the
+/// permissive `None` path that would let a str method (`b.upper()`) slip through
+/// `check` and leak a `rustc` E0599.
+pub(crate) const BYTES_METHODS: &[&str] = &[];
 
 /// Returns (type-name, method-table) for a concrete builtin receiver, or None
 /// for Unknown/Class/numeric receivers (the check must not run on those).
 pub(crate) fn builtin_method_table(ty: &Ty) -> Option<(&'static str, &'static [&'static str])> {
     match ty {
         Ty::Str => Some(("str", STR_METHODS)),
+        Ty::Bytes => Some(("bytes", BYTES_METHODS)),
         Ty::List(_) => Some(("list", LIST_METHODS)),
         Ty::Set(_) => Some(("set", SET_METHODS)),
         Ty::Dict(_, _) => Some(("dict", DICT_METHODS)),

@@ -1,0 +1,8 @@
+# W5-a HONEST REJECTION (design §E kill #2): `bytes + str` is a CPython TypeError
+# ("can't concat str to bytes"). pyrst rejects it at CHECK with an EXPLICIT
+# bytes-operator error rather than letting it ride the loose generic `+` path to
+# a raw rustc failure (the pre-existing PN1 hole `list + str`). decode/encode to
+# bridge the two.
+def main() -> None:
+    x: bytes = b"a" + "b"
+    print(x)

@@ -1,0 +1,26 @@
+# W5-a: `bytes` ACCESS SHAPES — the W2 find-family lesson, OPPOSITE to `str`.
+# `b[i]` is an INT (u8 as i64), `b[i:j]` / `b[i:j:k]` are BYTES, iteration yields
+# INTS, and len() is the byte count. Dual-run vs python3 (CPython golden).
+def main() -> None:
+    b: bytes = b'ABCDE'
+    # index -> int (arithmetic on the result proves it is a real int)
+    print(b[0])
+    print(b[0] + 1)
+    print(b[-1])
+    # slice -> bytes, and a re-slice of a slice
+    print(b[1:3])
+    print(b[1:3][0])
+    print(b[1:4:2])
+    print(b[:2])
+    print(b[-2:])
+    # iterate -> ints; sum them with a for-loop
+    total: int = 0
+    for x in b:
+        total = total + x
+    print(total)
+    # len -> byte count (a high byte counts as one byte)
+    hi: bytes = b'\x00\xff\x10'
+    print(len(hi))
+    # list(bytes) -> list[int]; sum(bytes) -> int
+    print(list(b))
+    print(sum(b))

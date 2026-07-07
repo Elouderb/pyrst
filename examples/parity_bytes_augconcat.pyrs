@@ -1,0 +1,25 @@
+# W5-a fix (F5): `bytes += bytes` is VALID Python (rebinds via __add__ = concat) and
+# is now SUPPORTED (codegen extends in place), where it used to be an honest codegen
+# reject. The RHS is cloned when it is a bare binding, so a self-append (`c += c`) is
+# safe and the source binding stays usable afterward. Dual-run vs python3.
+def main() -> None:
+    b: bytes = b'ab'
+    b += b'cd'
+    print(b)             # b'abcd'
+    other: bytes = b'XY'
+    b += other
+    print(b)             # b'abcdXY'
+    print(other)         # b'XY'   (NOT consumed by the +=)
+    # self-append must not alias-crash and must double the value
+    c: bytes = b'zz'
+    c += c
+    print(c)             # b'zzzz'
+    # RHS is a concat EXPRESSION (owned temp, emitted bare)
+    d: bytes = b'1'
+    d += b'2' + b'3'
+    print(d)             # b'123'
+    # accumulate single bytes drawn from iterating another bytes value
+    acc: bytes = b''
+    for x in b'AB':
+        acc += bytes([x])
+    print(acc)           # b'AB'

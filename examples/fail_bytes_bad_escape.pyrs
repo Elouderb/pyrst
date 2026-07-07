@@ -1,0 +1,7 @@
+# W5-a HONEST REJECTION: a non-table escape in a bytes literal (`\q`) is rejected
+# at LEX time ("unknown escape"). CPython treats `\q` as an invalid escape
+# sequence too (SyntaxWarning -> error); \u/\N are likewise NOT bytes escapes.
+# The bytes escape table is exactly \n \t \r \\ \' \" \0 \b \f plus \xNN.
+def main() -> None:
+    x: bytes = b"\q"
+    print(x)

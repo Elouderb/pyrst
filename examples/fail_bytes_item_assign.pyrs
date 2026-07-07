@@ -1,0 +1,8 @@
+# W5-a HONEST REJECTION: `bytes` is IMMUTABLE — item assignment `b[0] = 65` is a
+# CPython TypeError ("'bytes' object does not support item assignment"). pyrst
+# rejects it at CHECK rather than leak a rustc mismatch (Vec<u8>[i] = i64). The
+# mutable sibling `bytearray` is a documented deferral.
+def main() -> None:
+    b: bytes = b"abc"
+    b[0] = 65
+    print(b)

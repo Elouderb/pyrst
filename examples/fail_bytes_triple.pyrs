@@ -1,0 +1,7 @@
+# W5-a HONEST REJECTION: triple-quoted bytes literals (b'''...''') are a
+# documented deferral — rejected at LEX rather than mis-lexed as an empty b''
+# followed by a stray string. Single- and double-quoted bytes literals are
+# supported; the triple form can arrive later without changing their meaning.
+def main() -> None:
+    x: bytes = b'''ab'''
+    print(x)

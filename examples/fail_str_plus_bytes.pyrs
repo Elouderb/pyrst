@@ -1,0 +1,5 @@
+# W5-a HONEST REJECTION: `str + bytes` (the reverse of fail_bytes_plus_str) is
+# also a CPython TypeError; pyrst rejects it at CHECK, not rustc.
+def main() -> None:
+    x: str = "a" + b"b"
+    print(x)

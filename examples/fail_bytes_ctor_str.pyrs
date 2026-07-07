@@ -1,0 +1,7 @@
+# W5-a HONEST REJECTION: `bytes("abc")` is a CPython TypeError ("string argument
+# without an encoding"). pyrst rejects a str argument to bytes(...) at CHECK; the
+# constructor accepts only an int count, a list[int], or another bytes. To turn a
+# str into bytes, use `s.encode()` (the codec surface arrives in W5-b).
+def main() -> None:
+    x: bytes = bytes("abc")
+    print(x)

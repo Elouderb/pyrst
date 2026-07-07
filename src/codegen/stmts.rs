@@ -590,7 +590,7 @@ impl<'a> Codegen<'a> {
                 // AugAssign shape keeps the plain `emit_expr` it always used
                 // (byte-identical; a str/list literal RHS still emits bare because
                 // `emit_consuming` only clones a bare place, not an owned temp).
-                let v = if matches!(op, BinOp::Add) && matches!(target_ty, Ty::Str | Ty::List(_)) {
+                let v = if matches!(op, BinOp::Add) && matches!(target_ty, Ty::Str | Ty::List(_) | Ty::Bytes) {
                     self.emit_consuming(value)?
                 } else {
                     self.emit_expr(value)?
@@ -683,8 +683,15 @@ impl<'a> Codegen<'a> {
                         if matches!(target_ty, Ty::Str) && matches!(op, BinOp::Add) {
                             // `String` has no `AddAssign<String>` — borrow as `&str`.
                             self.line(&format!("{} += &({});", target, v));
-                        } else if matches!(target_ty, Ty::List(_)) && matches!(op, BinOp::Add) {
-                            // `v` was already built via `emit_consuming` above.
+                        } else if matches!(target_ty, Ty::List(_) | Ty::Bytes) && matches!(op, BinOp::Add) {
+                            // (W5-a) `bytes += bytes` rebinds via `__add__` (concat),
+                            // like `list += list` (extend): `Vec<u8>` has no
+                            // `AddAssign`. `v` was built via `emit_consuming` above,
+                            // so a bare-ident RHS is cloned (`b += b` self-append is
+                            // safe, no aliasing E0502). typeck (`bytes_binop_ty` in
+                            // the aug path) has already rejected every mixed
+                            // `bytes`/`str` `+=`, so `v` here is always another
+                            // `Vec<u8>` — never a `String` that would fail `.extend`.
                             self.line(&format!("{}.extend({});", target, v));
                         } else if !self.is_copy_type(&target_ty) {
                             return Err(crate::diag::Error::Codegen(format!(
@@ -956,6 +963,11 @@ impl<'a> Codegen<'a> {
                         "{{ let mut __keys: Vec<_> = {}.keys().cloned().collect(); __keys.sort(); __keys }}.into_iter()",
                         i
                     )
+                } else if matches!(for_iter_ty, Ty::Bytes) {
+                    // (W5-a) Iterating bytes yields INTS (u8 as i64) — the loop var
+                    // is typed `int`, so map each `&u8` element rather than cloning
+                    // a `u8` (which would be the wrong element type).
+                    format!("{}.iter().map(|&__b| __b as i64)", i)
                 } else if is_copy_elem {
                     format!("{}.iter().copied()", i)
                 } else {

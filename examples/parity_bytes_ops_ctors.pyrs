@@ -1,0 +1,33 @@
+# W5-a: `bytes` OPERATORS, CONSTRUCTORS, equality/ordering, and dict keys.
+# `bytes+bytes`->bytes, `bytes*int`->bytes; ==/< are lexicographic (free from
+# Vec<u8> derives); `bytes` is a valid dict key. Constructors: bytes() empty,
+# bytes(n) zero-filled, bytes(list[int]) range-checked, bytes(b) a copy.
+# Dual-run vs python3 (CPython golden).
+def main() -> None:
+    a: bytes = b'ab'
+    c: bytes = b'cd'
+    print(a + c)
+    print(a * 3)
+    print(3 * a)
+    # equality / ordering (lexicographic)
+    print(a == b'ab')
+    print(a == c)
+    print(a != c)
+    print(a < c)
+    print(b'abc' < b'abd')
+    # constructors (incl. the empty-list edge, which must infer its type)
+    print(bytes())
+    print(bytes(4))
+    print(bytes([104, 105, 33]))
+    print(bytes([0, 255]))
+    print(bytes([]))
+    print(bytes(b'copy'))
+    # bytes as a dict key (hashing is free from the Vec<u8> derives)
+    d: dict[bytes, int] = {}
+    d[b'k'] = 1
+    d[b'\xff\x00'] = 2
+    d[a] = 3
+    print(d[b'k'])
+    print(d[b'\xff\x00'])
+    print(d[b'ab'])
+    print(len(d))

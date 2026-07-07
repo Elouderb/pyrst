@@ -347,6 +347,80 @@ pub(crate) fn is_set_algebra_op(op: BinOp) -> bool {
     matches!(op, BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Sub)
 }
 
+/// (W5-a) Whether a binary op should route through the EXPLICIT bytes-operator
+/// typing (`bytes_binop_ty`) instead of the loose generic path. `bytes` is a new
+/// type and MUST NOT ride the generic `+`/`==` path that lets `list + str` /
+/// `1 == "x"` pass `check` and fail `rustc` (probes PN1/PN2). For membership,
+/// only `_ in bytes` (the container IS bytes) is bytes-specific; `bytes in
+/// list/set/dict` is ordinary element membership handled by the normal path.
+pub(crate) fn is_bytes_binop(op: BinOp, l: &Ty, r: &Ty) -> bool {
+    if matches!(op, BinOp::In | BinOp::NotIn) {
+        matches!(r, Ty::Bytes)
+    } else {
+        matches!(l, Ty::Bytes) || matches!(r, Ty::Bytes)
+    }
+}
+
+/// (W5-a) Result type of a binary operator with a `bytes` operand — decided
+/// EXPLICITLY, never via the loose generic path (design §E kills #2/#3). CPython
+/// verdicts (python3-oracled, §G): `bytes+bytes`->bytes; `bytes*int` /
+/// `int*bytes`->bytes; `bytes <cmp> bytes`->bool. Every mismatched pair is an
+/// HONEST check error rather than a silent-wrong or a deferred `rustc` leak —
+/// notably `bytes == str`, which CPython answers `False` but pyrst REJECTS (a
+/// documented divergence: silently answering False is the trap). Membership on
+/// `bytes` and all other operators are honest deferrals.
+pub(crate) fn bytes_binop_ty(op: BinOp, l: &Ty, r: &Ty, span: Span) -> Result<Ty> {
+    let err = |msg: String| Err(Error::Type { span, msg });
+    // The non-bytes operand, for a natural error message.
+    let other = if matches!(l, Ty::Bytes) { r } else { l };
+    match op {
+        BinOp::Add => match (l, r) {
+            (Ty::Bytes, Ty::Bytes) => Ok(Ty::Bytes),
+            _ => err(format!(
+                "cannot concatenate `bytes` and `{}`: `bytes` joins only with `bytes` \
+                 (decode/encode to bridge `str` and `bytes`)",
+                other
+            )),
+        },
+        BinOp::Mul => match (l, r) {
+            (Ty::Bytes, Ty::Int) | (Ty::Int, Ty::Bytes) => Ok(Ty::Bytes),
+            _ => err(format!(
+                "cannot multiply `bytes` by `{}`: `bytes` repeats only by an `int`",
+                other
+            )),
+        },
+        BinOp::Eq | BinOp::Ne => match (l, r) {
+            (Ty::Bytes, Ty::Bytes) => Ok(Ty::Bool),
+            _ => err(format!(
+                "`bytes` and `{}` are never equal in Python; decode/encode first. \
+                 (CPython answers `False` here — pyrst rejects the comparison rather \
+                 than silently returning False.)",
+                other
+            )),
+        },
+        BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => match (l, r) {
+            (Ty::Bytes, Ty::Bytes) => Ok(Ty::Bool),
+            _ => err(format!(
+                "cannot order `bytes` and `{}`: `<`/`<=`/`>`/`>=` compare `bytes` only \
+                 with `bytes`",
+                other
+            )),
+        },
+        // Membership on a `bytes` container (`x in b`) is a documented W5-b
+        // deferral. Rejecting it honestly here also closes the mismatched-`in`
+        // hole (`'A' in b'ABC'` — CPython TypeError) without a silent-wrong.
+        BinOp::In | BinOp::NotIn => err(
+            "membership tests on `bytes` (`x in b`) are not yet supported \
+             (deferred to the bytes-method wave)".to_string()
+        ),
+        _ => err(format!(
+            "unsupported operand type(s) for `{}`: `bytes` (immutable bytes support \
+             only `+ * == != < <= > >=` in W5-a)",
+            binop_symbol(op)
+        )),
+    }
+}
+
 /// Pure inference oracle — the single source of truth for expression types.
 ///
 /// A side-effect-free port of codegen's `type_of_expr` (codegen.rs:264-548) with
@@ -366,6 +440,7 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
         Expr::Int(..) => Ty::Int,
         Expr::Bool(..) => Ty::Bool,
         Expr::Str(..) | Expr::FStr(..) => Ty::Str,
+        Expr::Bytes(..) => Ty::Bytes,
         Expr::None_(_) => Ty::NoneVal,
         Expr::IfExp { body, orelse, .. } => {
             // Both branches unify in typeck; prefer the concrete one.
@@ -401,6 +476,14 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
                 if let Some(elem) = set_binop_result_elem(&l, &r) {
                     return Ty::Set(Box::new(elem));
                 }
+            }
+            // (W5-a) bytes operators: `bytes+bytes` / `bytes*int` -> bytes.
+            // `check_expr` has already rejected every mismatched form, so only
+            // valid shapes reach this oracle; comparisons fall through to the Bool
+            // arm below. Without this, `b1 + b2` would take the `else Int` fallback
+            // and mis-drive codegen's display/type decisions.
+            if (l == Ty::Bytes || r == Ty::Bytes) && matches!(op, BinOp::Add | BinOp::Mul) {
+                return Ty::Bytes;
             }
             match op {
                 // D5: Python `**` always yields a float (split out of the
@@ -570,6 +653,8 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
                     "int" | "len" | "ord" | "round" | "pow" => Ty::Int,
                     "bool" | "any" | "all" => Ty::Bool,
                     "str" | "chr" | "input" => Ty::Str,
+                    // (W5-a) `bytes()` / `bytes(n)` / `bytes(list[int])` / `bytes(b)`.
+                    "bytes" => Ty::Bytes,
                     "map" if args.len() == 2 => {
                         // map(f, iterable) -> List(applied return type of f).
                         // Only a List iterable yields a concrete List result;
@@ -650,6 +735,13 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
                                 Ty::List(e) | Ty::Set(e) | Ty::Iterator(e) => Ty::List(e),
                                 Ty::Dict(k, _) => Ty::List(k),
                                 Ty::Str => Ty::List(Box::new(Ty::Str)),
+                                // (W5-a) `sorted`/`list`/`reversed` over `bytes`
+                                // yield a `list[int]` — each byte widens to an int
+                                // (CPython: `list(b'AB') == [65, 66]`). This must
+                                // agree with codegen widening the value to `Vec<i64>`;
+                                // otherwise the emitted `Vec<u8>` renders via the
+                                // bytes `PyRepr` impl as `b'...'` (silent-wrong).
+                                Ty::Bytes => Ty::List(Box::new(Ty::Int)),
                                 _ => Ty::List(Box::new(Ty::Unknown)),
                             }
                         } else {
@@ -928,6 +1020,9 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
                 Ty::Dict(_, val_ty) => *val_ty,
                 Ty::List(elem_ty) => *elem_ty,
                 Ty::Str => Ty::Str,
+                // (W5-a) `b[i]` -> int (a `u8` widened to `i64`) — OPPOSITE to
+                // `str`, whose index yields a 1-char `str`.
+                Ty::Bytes => Ty::Int,
                 // (CARD a40d603e) A Tuple receiver with a LITERAL integer index
                 // selects that field's type — mirrors codegen's `emit_expr` Index
                 // arm, which lowers `t[N]` (N a literal) to Rust field access
@@ -956,6 +1051,8 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
             match infer_expr_ty(obj, locals, ctx) {
                 Ty::Str => Ty::Str,
                 list_ty @ Ty::List(_) => list_ty,
+                // (W5-a) `b[i:j]` -> bytes (a sub-`Vec<u8>`), like a list slice.
+                Ty::Bytes => Ty::Bytes,
                 _ => Ty::Unknown,
             }
         }
@@ -1257,6 +1354,7 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
         Expr::Int(_, _) => Ty::Int,
         Expr::Float(_, _) => Ty::Float,
         Expr::Str(_, _) => Ty::Str,
+        Expr::Bytes(_, _) => Ty::Bytes,
         Expr::FStr(parts, fstr_span) => {
             // Visit each interpolation: an f-string FORMATS each `{expr}` via the
             // value's `Display`. Generics v2: a bare type variable (`f"{x}"` where
@@ -1648,6 +1746,43 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                     }
                     return Ok(Ty::Dict(Box::new(Ty::Int), Box::new(Ty::Int)));
                 }
+            }
+            // (W5-a) `bytes(...)` constructor. Validate the argument TYPE up front so
+            // an unsupported form is an honest CHECK error, never a `rustc` leak:
+            //   bytes()          -> empty            bytes(n: int)     -> n zero bytes
+            //   bytes(list[int]) -> range-checked    bytes(b: bytes)   -> a copy
+            // `bytes(str)` (CPython "string argument without an encoding"),
+            // `bytes(float)`, and the 2-arg `(source, encoding)` form are rejected.
+            if matches!(callee.as_ref(), Expr::Ident(n, _) if n == "bytes") {
+                if !kwargs.is_empty() {
+                    return Err(Error::Type {
+                        span: *span,
+                        msg: "bytes() does not take keyword arguments".into(),
+                    });
+                }
+                if args.len() > 1 {
+                    return Err(Error::Type {
+                        span: *span,
+                        msg: "bytes(...) takes at most one argument in W5-a (an int count, a \
+                              list[int], or another bytes); the (source, encoding) form is deferred".into(),
+                    });
+                }
+                if let Some(a) = args.first() {
+                    let at = check_expr(a, env)?;
+                    let ok = matches!(at, Ty::Int | Ty::Bytes)
+                        || matches!(&at, Ty::List(inner) if matches!(inner.as_ref(), Ty::Int | Ty::Unknown));
+                    if !ok {
+                        return Err(Error::Type {
+                            span: *span,
+                            msg: format!(
+                                "bytes(...) accepts an int count, a list[int], or another bytes, \
+                                 not `{}` (to convert a `str`, use `s.encode()`)",
+                                at
+                            ),
+                        });
+                    }
+                }
+                return Ok(Ty::Bytes);
             }
             // Generics v2 (generic CLASSES): an EXPLICIT type-argument constructor
             // `Box[int](5)` parses as a CALL whose callee is `Box[int]` — an
@@ -2111,6 +2246,8 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                         let variadic = matches!(name.as_str(),
                             "print" | "range" | "len" | "str" | "int" | "float" | "bool" | "enumerate" | "zip"
                             | "abs" | "min" | "max" | "sorted" | "sum" | "input" | "list" | "dict" | "tuple" | "set"
+                            // (W5-a) bytes() takes 0 args, bytes(x) takes 1 — variadic.
+                            | "bytes"
                             | "getattr" | "setattr" | "hasattr" | "open");
                         // (kwargs v1) A keyword-bearing call to a USER or MODULE
                         // function runs the keyword→positional mapping, which
@@ -2930,6 +3067,8 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 Ty::List(inner) => *inner,
                 Ty::Dict(_, v) => *v,
                 Ty::Str => Ty::Str,
+                // (W5-a) `b[i]` -> int (u8 as i64) — see the oracle Index arm.
+                Ty::Bytes => Ty::Int,
                 _ => Ty::Unknown,
             }
         }
@@ -2961,6 +3100,8 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
             match obj_ty {
                 Ty::List(inner) => Ty::List(inner),
                 Ty::Str => Ty::Str,
+                // (W5-a) `b[i:j]` -> bytes (a sub-`Vec<u8>`).
+                Ty::Bytes => Ty::Bytes,
                 _ => Ty::Unknown,
             }
         }
@@ -3109,6 +3250,12 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                         }
                     }
                 }
+            }
+            // (W5-a) EXPLICIT bytes-operator typing — MUST precede the generic
+            // arms below so `bytes + str` / `bytes == str` are honest CHECK errors
+            // instead of riding the loose path to a `rustc` failure (PN1/PN2).
+            if is_bytes_binop(*op, &l, &r) {
+                return bytes_binop_ty(*op, &l, &r, *span);
             }
             match op {
                 BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le

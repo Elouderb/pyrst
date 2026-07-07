@@ -196,8 +196,9 @@
 #     statically typed, so these calls are REJECTED AT COMPILE TIME instead
 #     (a stronger, earlier failure than CPython's runtime TypeError). No
 #     valid, type-correct call is affected.
-#   - `bytes` initial_value (`StringIO(b"...")`) is out of scope — pyrst has
-#     no `bytes` type (G7).
+#   - `bytes` initial_value (`StringIO(b"...")`) is out of scope — `StringIO`
+#     is a str stream (a bytes stream is `BytesIO`, not modeled). pyrst gained a
+#     `bytes` type in W5-a; this deferral is about the stream kind, not the type.
 #   - `StringIO.__init__(*args, **kwargs)`'s real C signature is variadic
 #     (G4); modeled here as the one real parameter `initial_value: str`
 #     (REQUIRED — see "COMPILER GAP 1" above). Pass `""` for CPython's

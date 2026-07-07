@@ -1,0 +1,20 @@
+# W5-a fix (F4): a NEGATIVE or zero repeat count no longer crashes. `bytes * -1`
+# (and `str * -1`, the same pre-existing idiom) used to wrap `-1 as usize` to a huge
+# value and panic "capacity overflow" on VALID Python; both now clamp to 0, matching
+# CPython (`b'ab' * -1 == b''`, `"ab" * -1 == ""`). Dual-run vs python3.
+def main() -> None:
+    b: bytes = b'ab'
+    print(b * -1)    # b''      (was: capacity-overflow panic)
+    print(b * 0)     # b''
+    print(b * 3)     # b'ababab'
+    print(-2 * b)    # b''      (int * bytes, negative)
+    print(2 * b)     # b'abab'
+    s: str = "xy"
+    print(s * -1)    # ''       (was: capacity-overflow panic)
+    print(s * 0)     # ''
+    print(s * 3)     # xyxyxy
+    print(-5 * s)    # ''
+    # a variable-held negative count (not a literal) clamps too
+    k: int = -4
+    print(b * k)     # b''
+    print(s * k)     # ''

@@ -232,6 +232,10 @@ pub enum Expr {
     Float(f64, Span),
     Str(String, Span),
     FStr(Vec<FStrPart>, Span),
+    /// A `bytes` literal `b'...'` (W5-a). Carries the decoded raw bytes
+    /// (`Ty::Bytes` -> Rust `Vec<u8>`); distinct from `Str` because a `bytes`
+    /// holds arbitrary 0x00–0xff values, indexes to `int`, and reprs as `b'...'`.
+    Bytes(Vec<u8>, Span),
     Bool(bool, Span),
     None_(Span),
     Ident(String, Span),
@@ -260,6 +264,7 @@ impl Expr {
     pub fn span(&self) -> Span {
         match self {
             Expr::Int(_, s) | Expr::Float(_, s) | Expr::Str(_, s) | Expr::FStr(_, s)
+            | Expr::Bytes(_, s)
             | Expr::Bool(_, s) | Expr::None_(s) | Expr::Ident(_, s) | Expr::List(_, s) | Expr::Tuple(_, s) | Expr::Dict(_, s) | Expr::Set(_, s) => *s,
             Expr::Call { span, .. } | Expr::Attr { span, .. }
             | Expr::Index { span, .. } | Expr::Slice { span, .. } | Expr::BinOp { span, .. }

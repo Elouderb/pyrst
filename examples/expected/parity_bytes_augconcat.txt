@@ -1,0 +1,6 @@
+b'abcd'
+b'abcdXY'
+b'XY'
+b'zzzz'
+b'123'
+b'AB'

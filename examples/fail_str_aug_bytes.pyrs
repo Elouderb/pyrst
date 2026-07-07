@@ -1,0 +1,7 @@
+# NEGATIVE (W5-a F5): `str += bytes` is invalid Python (TypeError). Before the fix
+# this PASSED `check` and leaked a raw rustc E0308 at build (`String += &Vec<u8>`);
+# the aug path now rejects it honestly at check with the same bytes-aware message.
+def main() -> None:
+    s: str = "ab"
+    s += b"cd"
+    print(s)

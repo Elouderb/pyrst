@@ -1,0 +1,6 @@
+b'\xde\xad'
+222
+b'abcd'
+[b'a', b'\x00', b'\xff']
+b'\x00'
+3

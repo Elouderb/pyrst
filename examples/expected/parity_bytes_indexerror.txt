@@ -1,0 +1,5 @@
+caught IndexError high
+caught IndexError low
+caught ValueError negative
+caught ValueError range
+66

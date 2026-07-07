@@ -1,0 +1,7 @@
+# W5-a HONEST REJECTION: an octal escape in a bytes literal (`\012`) is rejected
+# at LEX time. CPython reads `\012` as the single byte 0x0a, but pyrst has no
+# octal escape — silently lowering it to NUL + literal "12" would be a
+# miscompile, so honesty wins (octal is a documented deferral; use \xNN).
+def main() -> None:
+    x: bytes = b"\012"
+    print(x)

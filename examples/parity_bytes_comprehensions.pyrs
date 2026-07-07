@@ -1,0 +1,26 @@
+# W5-a fix (blocker B1): list/set/dict COMPREHENSIONS iterating a `bytes` source
+# widen each byte (u8) to `int` (i64), exactly like the `for`-statement path. The
+# three comprehension `chain` builders previously fell through to `.iter().cloned()`
+# (yielding `u8`) while typeck promised `int`, so a bytes source PASSED `check` and
+# FAILED rustc (E0308 / "cannot multiply u8 by i64"). Dual-run vs python3: every
+# comprehension element is an int.
+def main() -> None:
+    b: bytes = b'AB'
+    # list comprehension over a bytes local (the reviewer's exact repro)
+    lc: list[int] = [x * 2 for x in b]
+    print(lc)
+    # list comp over a bytes LITERAL, with a truthiness filter
+    lf: list[int] = [x for x in b'ABCDE' if x % 2 == 1]
+    print(lf)
+    # set comprehension — print sorted() for a deterministic order
+    sc: set[int] = {x for x in b'AAB'}
+    print(sorted(sc))
+    # dict comprehension keyed by byte value (ascending source: repr order stable)
+    dc: dict[int, int] = {x: x + 1 for x in b'AB'}
+    print(dc)
+    # comprehension over an EMPTY bytes literal -> empty result, no iterations
+    empty: list[int] = [x for x in b'']
+    print(empty)
+    # a comprehension feeding an int context (sum) — proves the elements are ints
+    total: int = sum([x for x in b'AB'])
+    print(total)

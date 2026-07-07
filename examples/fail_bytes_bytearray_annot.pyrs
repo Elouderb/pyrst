@@ -1,0 +1,6 @@
+# W5-a HONEST REJECTION: `bytearray` (the mutable sibling of bytes) is not yet
+# supported. The annotation is rejected at CHECK rather than becoming a silent
+# phantom `Class("bytearray")` (the very hole `bytes` itself just closed).
+def main() -> None:
+    x: bytearray = b"ab"
+    print(x)

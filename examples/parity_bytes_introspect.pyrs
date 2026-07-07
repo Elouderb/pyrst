@@ -1,0 +1,18 @@
+# W5-a fix (F3): isinstance(x, bytes) is a REAL static test (was a hardcoded `true`
+# for every x via the isinstance placeholder arm), and type(b) reports the real
+# builtin name `<class 'bytes'>` (was `<class 'object'>`). Dual-run vs python3.
+def main() -> None:
+    b: bytes = b'AB'
+    e: bytes = b''
+    n: int = 5
+    s: str = "x"
+    xs: list[int] = [1, 2]
+    print(isinstance(b, bytes))   # True
+    print(isinstance(e, bytes))   # True
+    print(isinstance(n, bytes))   # False  (was wrongly True)
+    print(isinstance(s, bytes))   # False  (was wrongly True)
+    print(isinstance(xs, bytes))  # False
+    print(isinstance(n, int))     # True   (unchanged, sanity)
+    print(isinstance(s, str))     # True
+    print(type(b))                # <class 'bytes'>  (was <class 'object'>)
+    print(type(e))                # <class 'bytes'>

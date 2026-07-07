@@ -1093,3 +1093,43 @@ def main() -> None:
             rust
         );
     }
+
+    // ───────── W5-a: bytes prelude + lowering (repr / index helpers) ─────────
+
+    /// The BYTES_PRELUDE is emitted unconditionally (like FILE_PRELUDE), defining
+    /// the whole bytes runtime: the repr engine, the bounds-checked index, and the
+    /// `PyRepr for Vec<u8>` dispatch impl (so containers-of-bytes repr for free).
+    #[test]
+    fn bytes_prelude_always_emitted() {
+        let out = emit_src("def f() -> None:\n    pass\n");
+        assert!(out.contains("fn __py_bytes_repr("), "prelude must define __py_bytes_repr");
+        assert!(out.contains("fn __py_bytes_index("), "prelude must define __py_bytes_index");
+        assert!(out.contains("impl PyRepr for Vec<u8>"), "prelude must impl PyRepr for Vec<u8>");
+    }
+
+    /// The repr engine encodes the python3-oracle-validated escaping SPEC (design
+    /// §G), asserted on the REAL emitted engine: quote = single by default, double
+    /// iff the payload has `'` and not `"`; a printable 0x20..=0x7e byte is
+    /// literal; every other byte is a lowercase two-digit hex escape.
+    #[test]
+    fn bytes_repr_engine_encodes_the_escaping_spec() {
+        let out = emit_src("def f() -> None:\n    pass\n");
+        assert!(out.contains("if has_single && !has_double"),
+            "repr must select the quote CPython-style (single unless ' present and \" absent)");
+        assert!(out.contains("(0x20..=0x7e).contains(&c)"),
+            "a printable byte 0x20..=0x7e must be emitted literally");
+        assert!(out.contains("{:02x}"),
+            "non-printable bytes must escape as a lowercase two-digit hex \\xNN");
+    }
+
+    /// A bytes literal lowers to an owned `Vec<u8>` (byte-exact, `NNu8` elements);
+    /// `b[i]` to the int-returning `__py_bytes_index`; a printed bytes routes
+    /// through `.py_repr()` (the `b'...'` display), never a raw Display of Vec<u8>.
+    #[test]
+    fn bytes_literal_index_and_display_lowering() {
+        let src = "def main() -> None:\n    b: bytes = b'\\x00A'\n    print(b[0])\n    print(b)\n";
+        let out = emit_src(src);
+        assert!(out.contains("vec![0u8, 65u8]"), "literal -> vec![0u8, 65u8], got:\n{}", out);
+        assert!(out.contains("__py_bytes_index(&(b),"), "b[0] -> __py_bytes_index, got:\n{}", out);
+        assert!(out.contains("(b).py_repr()"), "print(b) -> (b).py_repr(), got:\n{}", out);
+    }

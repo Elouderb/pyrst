@@ -40,9 +40,9 @@
 #    `__truediv__` dunder). Use `.joinpath(...)` exclusively; there is no
 #    `path / 'segment'` spelling in pyrst. Documented, not implemented.
 #
-# 4. No bytes-path support (dossier: "No bytes" — pyrst has no `bytes`
-#    type). `PurePosixPath` here is str-only, matching every other pyrst
-#    stdlib module.
+# 4. No bytes-path support (dossier: "No bytes"). `PurePosixPath` here is
+#    str-only; bytes paths are out of scope for this port. (pyrst does have a
+#    `bytes` type as of W5-a — this is a path-API scope limit, not a missing type.)
 #
 # 5. `match` is spelled `match_` (trailing underscore). `match` is a pyrst
 #    STATEMENT keyword (the `match`/`case` construct — see `src/lexer.rs`,

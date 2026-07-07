@@ -1,0 +1,6 @@
+# W5-a HONEST REJECTION (design §E kill #2, the documented divergence): CPython
+# `b"a" == "a"` returns False, but pyrst REJECTS the comparison at CHECK rather
+# than silently answering False — a mixed bytes/str `==` is almost always a bug,
+# and the loose generic `==` path would otherwise leak a rustc error.
+def main() -> None:
+    print(b"a" == "a")

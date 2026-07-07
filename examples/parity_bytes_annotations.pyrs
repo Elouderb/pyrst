@@ -1,0 +1,24 @@
+# W5-a: `bytes` is a REAL type in every annotation position — closing the
+# phantom-`Class("bytes")` hole (probes PT6/PT7) where `x: bytes` / `def f(b:
+# bytes)` used to pass `check` and fail `rustc`. A `bytes` parameter, a `bytes`
+# return, a `bytes` local, and a `list[bytes]` all typecheck and run.
+# Dual-run vs python3 (CPython golden).
+def head(b: bytes, n: int) -> bytes:
+    return b[:n]
+
+def first_byte(b: bytes) -> int:
+    return b[0]
+
+def join_pair(x: bytes, y: bytes) -> bytes:
+    return x + y
+
+def main() -> None:
+    data: bytes = b'\xDE\xAD\xBE\xEF'
+    print(head(data, 2))
+    print(first_byte(data))
+    print(join_pair(b'ab', b'cd'))
+    # a container of bytes: storage AND repr both work (Vec<u8> reprs as b'...')
+    parts: list[bytes] = [b'a', b'\x00', b'\xff']
+    print(parts)
+    print(parts[1])
+    print(len(parts))

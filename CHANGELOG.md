@@ -2,6 +2,27 @@
 
 All notable changes to pyrst are documented here. This project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.6.0] — 2026-07-09
+
+The epic-completion release: compiled regex patterns, subprocess, and the `@extern class` handle declaration form — closing the W5 epic and, with it, the entire planned W0–W5 stdlib roadmap. The stdlib grows from 50 to 51 modules.
+
+### `re.compile` — compiled patterns as handles
+
+- `re.compile(pattern)` returns a **`Pattern` handle** that pre-compiles its automata once (including the anchored variants `fullmatch` needs for backtracking cases like `a|ab` against `ab`) and is reused across calls — every method (`search`/`match_`/`fullmatch`/`findall`/`finditer`/`sub`/`subn`/`split`) is content-identical to the module functions, including the zero-width match semantics, multibyte spans, and the `$`-anchor guard.
+- The `$`-guard now also covers the five legacy surfaces (`is_match`/`find_all`/`sub`/`subn`/`split`) that previously carried raw regex-crate semantics on trailing-newline subjects.
+
+### `subprocess` — new module (stdlib 50 → 51)
+
+- `run(args, capture_output=False)` → a `CompletedProcess` value with CPython-faithful shapes: inherited stdio by default (`stdout is None`), captured `bytes` on request, real exit codes, and error mapping through the exception hierarchy — `FileNotFoundError` and `PermissionError` (`[Errno 13] Permission denied: '…'`) with byte-exact messages. `shell=False`, list-of-str argv only; `Popen`'s async surface is an honest named deferral.
+
+### The `@extern class` declaration form
+
+- Library modules can now declare their own opaque handle types (an `@extern class` with a reserved Rust-body field and `@extern`-template methods) — inheriting the entire move-checker machinery from the handle keystone: use-after-move diagnostics, capture/container/field/generic rejections, and `Mut[T]` borrows. The review cycle closed the one missed annotation chokepoint (class fields, including `__init__`-inferred fields that were previously invisible to the checker while codegen emitted them).
+
+### Quality
+
+- `./test_all.sh`: **496/496 positive examples**, **282/282 negative fixtures** rejected at both `check` and `build`; **586 `cargo test` cases**; 0 compiler warnings. The dual-run parity harness runs 145 parity programs — **120 byte-identical against `python3`**, 25 documented `# parity: pyrst-only` with pinned oracle evidence. As of this release there remain **no known cases where an accepted program produces wrong output**.
+
 ## [0.5.0] — 2026-07-07
 
 The binary-data release: pyrst gets a real `bytes` type, a move-only handle kind, and the modules they unlock — `base64`, `struct`, `hashlib`, `hmac`, and a real `re.Match`. The stdlib grows from 46 to 50 modules. Every behavior is python3-verified.

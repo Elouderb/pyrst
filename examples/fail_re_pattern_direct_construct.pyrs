@@ -1,0 +1,8 @@
+# NEGATIVE (W5-h): a `re.Pattern` handle is an opaque, non-user-constructible external
+# resource — build it with `re.compile(...)`, never by calling `Pattern(...)` directly.
+from re import Pattern
+
+
+def main() -> None:
+    p: Pattern = Pattern("x")
+    print(p.findall("x"))

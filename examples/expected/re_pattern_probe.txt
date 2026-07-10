@@ -1,0 +1,14 @@
+True
+False
+pattern.search guarded
+pattern.findall guarded
+is_match guarded
+find_all guarded
+sub guarded
+subn guarded
+split guarded
+True
+['1', '22']
+bX
+['a', 'b', 'c']
+4

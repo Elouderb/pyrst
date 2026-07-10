@@ -311,13 +311,13 @@ pub(crate) fn merge_ctx_from_module(m: &Module, ctx: &mut TyCtx, is_root: bool) 
                 // or return resolves to `Ty::TypeVar` in the stored signature.
                 // Empty `type_params` => identical to the non-generic path.
                 let params: Vec<(String, crate::typeck::Ty)> = f.params.iter()
-                    .map(|p| crate::typeck::Ty::from_type_expr_scoped(&p.ty, p.span, &f.type_params).map(|ty| (p.name.clone(), ty)))
+                    .map(|p| ctx.resolve_annot(&p.ty, p.span, &f.type_params).map(|ty| (p.name.clone(), ty)))
                     .collect::<crate::diag::Result<Vec<_>>>()?;
                 let sig = crate::typeck::FuncSig {
                     params,
                     // A return annotation carries no span of its own; point at the
                     // function definition so a bad `-> ...` still gets a real caret.
-                    ret: crate::typeck::Ty::from_type_expr_scoped(&f.ret, f.span, &f.type_params)?,
+                    ret: ctx.resolve_annot(&f.ret, f.span, &f.type_params)?,
                     param_defaults: f.params.iter()
                         .filter(|p| p.name != "self")
                         .map(|p| p.default.clone())
@@ -402,11 +402,15 @@ pub(crate) fn merge_ctx_from_module(m: &Module, ctx: &mut TyCtx, is_root: bool) 
                     // instance substitutes the args back in (see typeck).
                     let method_params: Vec<(String, crate::typeck::Ty)> = m_fn.params.iter()
                         .filter(|p| p.name != "self")
-                        .map(|p| crate::typeck::Ty::from_type_expr_scoped(&p.ty, p.span, &c.type_params).map(|ty| (p.name.clone(), ty)))
+                        .map(|p| ctx.resolve_annot(&p.ty, p.span, &c.type_params).map(|ty| (p.name.clone(), ty)))
                         .collect::<crate::diag::Result<Vec<_>>>()?;
+                    // Hoist the return resolution to a local: `resolve_annot` borrows
+                    // `&ctx` immutably, so it cannot be evaluated inside the
+                    // `ctx.funcs.insert(...)` call (which borrows `ctx.funcs` mutably).
+                    let method_ret = ctx.resolve_annot(&m_fn.ret, m_fn.span, &c.type_params)?;
                     ctx.funcs.insert(method_name, crate::typeck::FuncSig {
                         params: method_params,
-                        ret: crate::typeck::Ty::from_type_expr_scoped(&m_fn.ret, m_fn.span, &c.type_params)?,
+                        ret: method_ret,
                         param_defaults: m_fn.params.iter()
                             .filter(|p| p.name != "self")
                             .map(|p| p.default.clone())
@@ -573,6 +577,22 @@ pub fn resolve(root_path: &Path) -> Result<ResolvedProgram> {
     // Build merged context from all modules in dependency order
     let mut ctx = TyCtx::new();
     let total_modules = resolver.order.len();
+    // (W5-h) PRE-SCAN every module's top-level classes for the `@extern class` decl
+    // form (an opaque move-only HANDLE kind, e.g. `re.Pattern`) BEFORE any signature
+    // is lowered below. A handle class's NAME must resolve to `Ty::Handle` in every
+    // signature that mentions it — including a constructor defined ABOVE its class or
+    // in an IMPORTING module — so the set has to be complete before the first
+    // `resolve_annot`. Empty for programs importing no handle lib.
+    for path in &resolver.order {
+        let (m, _src) = &resolver.cache[path];
+        for s in &m.stmts {
+            if let Stmt::Class(c) = s {
+                if c.decorators.iter().any(|d| d == "extern") {
+                    ctx.handle_classes.insert(c.name.clone());
+                }
+            }
+        }
+    }
     for (idx, path) in resolver.order.iter().enumerate() {
         let (m, src) = &resolver.cache[path];
         let is_root = idx == total_modules - 1;

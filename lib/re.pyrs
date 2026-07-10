@@ -97,11 +97,14 @@
 #     needs the true end of the haystack, and the crate has no look-around to
 #     emulate the zero-width "before final newline" assertion soundly (`(?m)`
 #     over-matches interior newlines; subject-stripping breaks mixed patterns
-#     like `(\n)|(a$)`). So `search`/`match_`/`fullmatch`/`finditer`/`findall`
-#     RAISE an honest `ValueError` when the pattern has a real `$` end-anchor and
-#     the subject ends in `\n`, rather than diverge silently — strip the newline
-#     or match it explicitly (`\n?$`). (`is_match`/`find_all`/`sub`/`subn`/`split`
-#     keep their pre-existing `regex`-crate `$` semantics — documented, unchanged.)
+#     like `(\n)|(a$)`). So EVERY public surface — `search`/`match_`/`fullmatch`/
+#     `finditer`/`findall` AND (W5-h, epic 6f6acdf1) the legacy `is_match`/
+#     `find_all`/`sub`/`subn`/`split`, PLUS every `re.Pattern` method — RAISES an
+#     honest `ValueError` when the pattern has a real `$` end-anchor and the
+#     subject ends in `\n`, rather than diverge silently — strip the newline or
+#     match it explicitly (`\n?$`). (Before W5-h the legacy surfaces bypassed the
+#     guard and kept the raw regex-crate `$` semantics, a silent divergence now
+#     closed.)
 #   - `sub`/`subn` insert `repl` LITERALLY (no `\1`/`\g<name>` backreference
 #     expansion, and no `$`-style Rust expansion either — see the closure note
 #     on `replace_all`); a callable `repl` is NOT supported (type error). CPython
@@ -325,21 +328,43 @@ def finditer(pattern: str, text: str) -> list[Match]:
 # ── bool / str / list predicates and transforms (unchanged surfaces) ──────────
 
 # Pyrst-only legacy predicate (card 275bfe47): unanchored "did it match" as a
-# plain `bool`. KEPT as the pure boolean test (CPython has no `re.is_match`;
-# `re.search(...) is not None` is the CPython spelling of the same question).
+# plain `bool`. CPython has no `re.is_match`; `re.search(...) is not None` is the
+# CPython spelling of the same question. The raw regex-crate `is_match` is the
+# private `@extern` binding; the PUBLIC `is_match` wraps it with the Z3 `$`/newline
+# guard (below).
 @crate("regex", "1")
 @extern
-def is_match(pattern: str, text: str) -> bool:
+def _re_is_match_ext(pattern: str, text: str) -> bool:
     "regex::Regex::new(&{pattern}).unwrap().is_match(&{text})"
+
+
+# CPython-faithful `is_match`: the Z3 `$`/newline honest guard (W5-h residual, epic
+# 6f6acdf1) then the raw predicate. Before W5-h this legacy surface bypassed the
+# guard and kept the raw regex-crate `$` semantics — a SILENT divergence on a
+# trailing-newline subject (`is_match("a$", "a\n")` is True in CPython, False in the
+# regex crate). The guard now RAISES honestly instead, matching search/match_/etc.
+def is_match(pattern: str, text: str) -> bool:
+    _re_guard_newline_dollar(pattern, text)
+    return _re_is_match_ext(pattern, text)
 
 
 # Pyrst-only legacy alias (card 275bfe47): the WHOLE matches as `list[str]`,
 # ALWAYS (never group captures), regardless of capture-group count. Kept for
 # backward compatibility; use `findall` (below) for CPython-faithful semantics.
+# The raw regex-crate binding is private; the public `find_all` (below) adds the Z3
+# `$`/newline guard.
 @crate("regex", "1")
 @extern
-def find_all(pattern: str, text: str) -> list[str]:
+def _re_find_all_ext(pattern: str, text: str) -> list[str]:
     "regex::Regex::new(&{pattern}).unwrap().find_iter(&{text}).map(|m| m.as_str().to_string()).collect::<Vec<String>>()"
+
+
+# CPython-faithful `find_all`: the Z3 `$`/newline honest guard (W5-h residual, epic
+# 6f6acdf1) then the raw whole-matches extractor. Closes the same silent-`$`
+# divergence the other legacy surfaces had.
+def find_all(pattern: str, text: str) -> list[str]:
+    _re_guard_newline_dollar(pattern, text)
+    return _re_find_all_ext(pattern, text)
 
 
 # CPython's `re.findall`, with its notorious shape shift: 0 capture groups ->
@@ -389,8 +414,17 @@ def replace_all(pattern: str, repl: str, text: str) -> str:
 # backreference-expansion is never triggered (`repl` is always literal).
 @crate("regex", "1")
 @extern
-def sub(pattern: str, repl: str, string: str, count: int = 0) -> str:
+def _re_sub_ext(pattern: str, repl: str, string: str, count: int) -> str:
     "{ if {count} < 0 { {string}.clone() } else { let re = regex::Regex::new(&{pattern}).unwrap(); if {count} == 0 { re.replace_all(&{string}, |_c: &regex::Captures| { {repl}.to_string() }).into_owned() } else { re.replacen(&{string}, {count} as usize, |_c: &regex::Captures| { {repl}.to_string() }).into_owned() } } }"
+
+
+# CPython-faithful `re.sub`: the Z3 `$`/newline honest guard over the SUBJECT
+# (`string`) — W5-h residual (epic 6f6acdf1), closing this legacy surface's silent
+# `$`-on-trailing-newline divergence — then the raw substitution at its documented
+# fidelity (literal `repl`, `count=0` = replace-all, negative `count` = no-op).
+def sub(pattern: str, repl: str, string: str, count: int = 0) -> str:
+    _re_guard_newline_dollar(pattern, string)
+    return _re_sub_ext(pattern, repl, string, count)
 
 
 # CPython's `re.subn`: same as `sub` but also returns the number of
@@ -400,8 +434,15 @@ def sub(pattern: str, repl: str, string: str, count: int = 0) -> str:
 # no `$`-expansion landmine here (see the `sub`/`replace_all` note above).
 @crate("regex", "1")
 @extern
-def subn(pattern: str, repl: str, string: str, count: int = 0) -> tuple[str, int]:
+def _re_subn_ext(pattern: str, repl: str, string: str, count: int) -> tuple[str, int]:
     "{ if {count} < 0 { ({string}.clone(), 0i64) } else { let re = regex::Regex::new(&{pattern}).unwrap(); let n = std::cell::Cell::new(0i64); let result = if {count} == 0 { re.replace_all(&{string}, |_c: &regex::Captures| { n.set(n.get() + 1); {repl}.to_string() }) } else { re.replacen(&{string}, {count} as usize, |_c: &regex::Captures| { n.set(n.get() + 1); {repl}.to_string() }) }; (result.into_owned(), n.get()) } }"
+
+
+# CPython-faithful `re.subn`: the Z3 `$`/newline honest guard over `string`
+# (W5-h residual, epic 6f6acdf1) then the raw substitution+count.
+def subn(pattern: str, repl: str, string: str, count: int = 0) -> tuple[str, int]:
+    _re_guard_newline_dollar(pattern, string)
+    return _re_subn_ext(pattern, repl, string, count)
 
 
 # `maxsplit=0` means "no limit" (matching CPython's `re.split` default). A
@@ -411,8 +452,16 @@ def subn(pattern: str, repl: str, string: str, count: int = 0) -> tuple[str, int
 # -> `['a,b,c,d']`).
 @crate("regex", "1")
 @extern
-def split(pattern: str, text: str, maxsplit: int = 0) -> list[str]:
+def _re_split_ext(pattern: str, text: str, maxsplit: int) -> list[str]:
     "{ if {maxsplit} < 0 { vec![{text}.clone()] } else { let re = regex::Regex::new(&{pattern}).unwrap(); if {maxsplit} == 0 { re.split(&{text}).map(|s| s.to_string()).collect::<Vec<String>>() } else { re.splitn(&{text}, ({maxsplit} as usize) + 1).map(|s| s.to_string()).collect::<Vec<String>>() } } }"
+
+
+# CPython-faithful `re.split`: the Z3 `$`/newline honest guard (W5-h residual, epic
+# 6f6acdf1) then the raw split at its documented fidelity (`maxsplit=0` = no limit,
+# negative `maxsplit` = no split).
+def split(pattern: str, text: str, maxsplit: int = 0) -> list[str]:
+    _re_guard_newline_dollar(pattern, text)
+    return _re_split_ext(pattern, text, maxsplit)
 
 
 # Pure pyrst: escape every regex-metacharacter in `pattern` exactly as
@@ -438,3 +487,174 @@ def escape(pattern: str) -> str:
         else:
             out += ch
     return out
+
+
+# ── W5-h: re.Pattern — the compiled-regex HANDLE (compile once, reuse) ─────────
+# Design: docs/design/w5-bytes-handles.md §C/§D/§F, card 27aeeb3e (epic 6f6acdf1).
+#
+# THE POINT: `re.compile(pattern)` compiles the `regex` crate `Regex` ONCE and
+# returns an opaque MOVE-ONLY handle (`Ty::Handle("Pattern")`, the W5-h `@extern
+# class` decl form) that REUSES the compiled automaton across every method call —
+# where the module functions (`re.search(pat, text)`, …) recompile a fresh `Regex`
+# on EVERY call. A `Pattern` is non-`Clone`, non-user-constructible, and consumed
+# (moved) when passed / returned / reassigned (W5-g move semantics); method calls
+# only BORROW it, so `p.search(a); p.findall(b)` reuses the one compiled regex.
+#
+# COMPILE-ONCE IS COMPLETE: the handle pre-compiles THREE variants at construction —
+# the unanchored `re` (search/finditer/findall/sub/subn/split), the start-anchored
+# `re_start = ^(?:pat)` (match_), and the fully-anchored `re_full = ^(?:pat)$`
+# (fullmatch) — so NO method recompiles. (`match_`/`fullmatch` genuinely need the
+# anchored automaton: CPython `re.compile("a|ab").fullmatch("ab")` BACKTRACKS to the
+# longer alternative — `'ab'` — which the crate's leftmost-first `captures` on the
+# UNanchored regex cannot reproduce; oracle-verified against python3 3.12.9.)
+#
+# FIDELITY = the module-function path, BY CONSTRUCTION: each extractor below is the
+# byte-for-byte body of the matching `_re_*` module helper, changed ONLY to read the
+# pre-compiled `self.re*` instead of recompiling — so span extraction, the CHAR-
+# offset conversion (W2 lesson), the CPython-3.7+ zero-width iteration (Z1), the
+# top-level-lazy-quantifier refusal, and `findall`'s 2+-group `NotImplementedError`
+# are all identical. The public methods reuse the W5-f `Match` value class and apply
+# the SAME Z3 `$`/newline honest guard (`_re_guard_newline_dollar`) the module
+# functions do. Named-group access, `groups()`-as-list, and every DIVERGENCE in the
+# module header apply UNCHANGED (a `Pattern` method is the same engine).
+#
+# The opaque struct (declared by the reserved `__rust__` metadata field) holds the
+# three compiled `Regex`es plus the original pattern string (for the guard and for
+# `re.Pattern.pattern`-style needs). A malformed pattern still `.unwrap()`-panics —
+# now at `compile()` (fail-fast) rather than at first use.
+#
+# CODE-SIZE NOTE (not a correctness issue): a program that merely `import re` and
+# never touches `re.Pattern` STILL emits the `__PyHandle_Pattern` struct + inherent
+# `impl` into the generated Rust. Unused STRUCTS are not dead-code-eliminated the way
+# unused FUNCTIONS are (an `@extern class` decl is always materialized when its module
+# is imported), so this is a few hundred bytes of unreferenced code, compiled out by
+# rustc's own dead-code pass — it costs generated-source size only, never behavior.
+# (The `regex` crate dependency is declared by the `@extern` FUNCTIONS — `compile`
+# and the legacy `_re_*_ext` bindings carry `@crate("regex", "1")`; a handle CLASS
+# carries no `crate_deps`, so `@crate` belongs on the constructor, not here.)
+@extern
+class Pattern:
+    __rust__: str = "re: regex::Regex, re_start: regex::Regex, re_full: regex::Regex, pat: String"
+
+    # Unanchored single-match capture (the `search` engine) over the PRE-COMPILED
+    # regex — the body of `_re_caps` with `self.re` in place of the recompile.
+    @extern
+    def _caps(self, text: str) -> Optional[list[int]]:
+        "{ let re = &{self}.re; let s: &str = &{text}; match re.captures(s) { None => None, Some(caps) => { let mut out: Vec<i64> = Vec::new(); for i in 0..caps.len() { match caps.get(i) { Some(mm) => { out.push(s[..mm.start()].chars().count() as i64); out.push(s[..mm.end()].chars().count() as i64); }, None => { out.push(-1i64); out.push(-1i64); } } } Some(out) } } }"
+
+    # Start-anchored capture (the `match_` engine): the pre-compiled `^(?:pat)`.
+    @extern
+    def _caps_start(self, text: str) -> Optional[list[int]]:
+        "{ let re = &{self}.re_start; let s: &str = &{text}; match re.captures(s) { None => None, Some(caps) => { let mut out: Vec<i64> = Vec::new(); for i in 0..caps.len() { match caps.get(i) { Some(mm) => { out.push(s[..mm.start()].chars().count() as i64); out.push(s[..mm.end()].chars().count() as i64); }, None => { out.push(-1i64); out.push(-1i64); } } } Some(out) } } }"
+
+    # Both-ends-anchored capture (the `fullmatch` engine): pre-compiled `^(?:pat)$`.
+    @extern
+    def _caps_full(self, text: str) -> Optional[list[int]]:
+        "{ let re = &{self}.re_full; let s: &str = &{text}; match re.captures(s) { None => None, Some(caps) => { let mut out: Vec<i64> = Vec::new(); for i in 0..caps.len() { match caps.get(i) { Some(mm) => { out.push(s[..mm.start()].chars().count() as i64); out.push(s[..mm.end()].chars().count() as i64); }, None => { out.push(-1i64); out.push(-1i64); } } } Some(out) } } }"
+
+    # Every non-overlapping match (the `finditer`/`findall` engine): the body of
+    # `_re_caps_all`, hand-rolled CPython-3.7+ zero-width iteration (Z1), over
+    # `self.re`. `self.pat` supplies the top-level-lazy-quantifier detection.
+    @extern
+    def _caps_all(self, text: str) -> list[list[int]]:
+        "{ let p: &str = &{self}.pat; let s: &str = &{text}; let re = &{self}.re; let lazy = p.contains(\"*?\") || p.contains(\"+?\") || p.contains(\"??\") || p.contains(\"}?\"); let mut res: Vec<Vec<i64>> = Vec::new(); let mut pos: usize = 0; loop { match re.captures_at(s, pos) { None => break, Some(caps) => { let m0 = caps.get(0).unwrap(); let a = m0.start(); let b = m0.end(); if a == b && lazy { panic!(\"NotImplementedError\\0re.finditer/re.findall: a top-level lazy quantifier (*?/+?/??) that yields a zero-width match diverges from CPython (its must_advance re-matches the non-empty alternative at the same position); use a greedy quantifier or anchor the pattern\"); } let mut out: Vec<i64> = Vec::new(); for i in 0..caps.len() { match caps.get(i) { Some(mm) => { out.push(s[..mm.start()].chars().count() as i64); out.push(s[..mm.end()].chars().count() as i64); }, None => { out.push(-1i64); out.push(-1i64); } } } res.push(out); if b > a { pos = b; } else { match s[b..].chars().next() { Some(c) => { pos = b + c.len_utf8(); }, None => break } } } } } res }"
+
+    # CPython-faithful `findall` (0/1-group shape shift; 2+ groups -> honest
+    # NotImplementedError): the body of `_re_findall_ext` over `self.re`.
+    @extern
+    def _findall_ext(self, text: str) -> list[str]:
+        "{ let p: &str = &{self}.pat; let s: &str = &{text}; let re = &{self}.re; let ng = re.captures_len() - 1; if ng >= 2 { panic!(\"NotImplementedError\\0re.findall on a pattern with 2+ capture groups returns a list of tuples, which pyrst cannot express; use re.finditer(...) and m.group(i)\"); } let lazy = p.contains(\"*?\") || p.contains(\"+?\") || p.contains(\"??\") || p.contains(\"}?\"); let mut out: Vec<String> = Vec::new(); let mut pos: usize = 0; loop { match re.captures_at(s, pos) { None => break, Some(caps) => { let m0 = caps.get(0).unwrap(); let a = m0.start(); let b = m0.end(); if a == b && lazy { panic!(\"NotImplementedError\\0re.finditer/re.findall: a top-level lazy quantifier (*?/+?/??) that yields a zero-width match diverges from CPython (its must_advance re-matches the non-empty alternative at the same position); use a greedy quantifier or anchor the pattern\"); } if ng == 0 { out.push(s[a..b].to_string()); } else { out.push(caps.get(1).map(|m| m.as_str().to_string()).unwrap_or_default()); } if b > a { pos = b; } else { match s[b..].chars().next() { Some(c) => { pos = b + c.len_utf8(); }, None => break } } } } } out }"
+
+    # The capture-group NAMES in group-index order (`""` when unnamed) — over the
+    # pre-compiled regex; body of `_re_group_names`.
+    @extern
+    def _group_names(self) -> list[str]:
+        "{self}.re.capture_names().map(|o| o.unwrap_or(\"\").to_string()).collect::<Vec<String>>()"
+
+    # The original pattern string (for the Z3 `$`/newline guard).
+    @extern
+    def _pattern(self) -> str:
+        "{self}.pat.clone()"
+
+    # `re.sub` over the pre-compiled regex (literal repl, count=0=all, neg=no-op).
+    @extern
+    def _sub_ext(self, repl: str, string: str, count: int) -> str:
+        "{ if {count} < 0 { {string}.clone() } else { let re = &{self}.re; if {count} == 0 { re.replace_all(&{string}, |_c: &regex::Captures| { {repl}.to_string() }).into_owned() } else { re.replacen(&{string}, {count} as usize, |_c: &regex::Captures| { {repl}.to_string() }).into_owned() } } }"
+
+    # `re.subn` over the pre-compiled regex.
+    @extern
+    def _subn_ext(self, repl: str, string: str, count: int) -> tuple[str, int]:
+        "{ if {count} < 0 { ({string}.clone(), 0i64) } else { let re = &{self}.re; let n = std::cell::Cell::new(0i64); let result = if {count} == 0 { re.replace_all(&{string}, |_c: &regex::Captures| { n.set(n.get() + 1); {repl}.to_string() }) } else { re.replacen(&{string}, {count} as usize, |_c: &regex::Captures| { n.set(n.get() + 1); {repl}.to_string() }) }; (result.into_owned(), n.get()) } }"
+
+    # `re.split` over the pre-compiled regex (maxsplit=0=no limit, neg=no split).
+    @extern
+    def _split_ext(self, text: str, maxsplit: int) -> list[str]:
+        "{ if {maxsplit} < 0 { vec![{text}.clone()] } else { let re = &{self}.re; if {maxsplit} == 0 { re.split(&{text}).map(|s| s.to_string()).collect::<Vec<String>>() } else { re.splitn(&{text}, ({maxsplit} as usize) + 1).map(|s| s.to_string()).collect::<Vec<String>>() } } }"
+
+    # ── Public API (plain pyrst): build `Match`, apply the Z3 `$`/newline guard ──
+
+    # `p.search(text)` — scan for the first match anywhere. Returns `Match | None`.
+    def search(self, text: str) -> Optional[Match]:
+        _re_guard_newline_dollar(self._pattern(), text)
+        spans: Optional[list[int]] = self._caps(text)
+        if spans is None:
+            return None
+        return Match(text, spans, self._group_names())
+
+    # `p.match_(text)` — anchored at the START of the string (CPython `Pattern.match`;
+    # `match_` because `match` is a pyrst keyword). Uses the pre-compiled `^(?:pat)`.
+    def match_(self, text: str) -> Optional[Match]:
+        _re_guard_newline_dollar(self._pattern(), text)
+        spans: Optional[list[int]] = self._caps_start(text)
+        if spans is None:
+            return None
+        return Match(text, spans, self._group_names())
+
+    # `p.fullmatch(text)` — the WHOLE string must match. Uses pre-compiled `^(?:pat)$`.
+    def fullmatch(self, text: str) -> Optional[Match]:
+        _re_guard_newline_dollar(self._pattern(), text)
+        spans: Optional[list[int]] = self._caps_full(text)
+        if spans is None:
+            return None
+        return Match(text, spans, self._group_names())
+
+    # `p.finditer(text)` — a materialised `list[Match]` of every non-overlapping
+    # match (CPython yields a lazy iterator; iterate this list the same way).
+    def finditer(self, text: str) -> list[Match]:
+        _re_guard_newline_dollar(self._pattern(), text)
+        out: list[Match] = []
+        names: list[str] = self._group_names()
+        for sp in self._caps_all(text):
+            out.append(Match(text, sp, names))
+        return out
+
+    # `p.findall(text)` — CPython's shape-shifting findall (0/1 groups; 2+ groups
+    # honest NotImplementedError). See the module `findall`.
+    def findall(self, text: str) -> list[str]:
+        _re_guard_newline_dollar(self._pattern(), text)
+        return self._findall_ext(text)
+
+    # `p.sub(repl, string, count=0)` — literal replacement at the module fidelity.
+    def sub(self, repl: str, string: str, count: int = 0) -> str:
+        _re_guard_newline_dollar(self._pattern(), string)
+        return self._sub_ext(repl, string, count)
+
+    # `p.subn(repl, string, count=0)` — `(new_string, n_substitutions)`.
+    def subn(self, repl: str, string: str, count: int = 0) -> tuple[str, int]:
+        _re_guard_newline_dollar(self._pattern(), string)
+        return self._subn_ext(repl, string, count)
+
+    # `p.split(text, maxsplit=0)` — split on the pattern at the module fidelity.
+    def split(self, text: str, maxsplit: int = 0) -> list[str]:
+        _re_guard_newline_dollar(self._pattern(), text)
+        return self._split_ext(text, maxsplit)
+
+
+# `re.compile(pattern)` — compile ONCE, return the reusable `Pattern` handle. The
+# `@extern` template builds the opaque `__PyHandle_Pattern` struct, pre-compiling the
+# unanchored + start-anchored + fully-anchored automata. A malformed pattern
+# `.unwrap()`-panics here (fail-fast), mirroring the module functions' error contract.
+@crate("regex", "1")
+@extern
+def compile(pattern: str) -> Pattern:
+    "{ let p: String = {pattern}.clone(); let start = [\"^(?:\", p.as_str(), \")\"].concat(); let full = [\"^(?:\", p.as_str(), \")$\"].concat(); __PyHandle_Pattern { re: regex::Regex::new(&p).unwrap(), re_start: regex::Regex::new(&start).unwrap(), re_full: regex::Regex::new(&full).unwrap(), pat: p } }"

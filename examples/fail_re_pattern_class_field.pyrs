@@ -1,0 +1,16 @@
+# NEGATIVE (W5-h, H5 — lib-handle class FIELD): a move-only `re.Pattern` handle
+# cannot be a struct field. It is non-`Clone`/non-`Default` (an external compiled
+# automaton), so a `p: Pattern` field breaks the struct's value semantics and died at
+# rustc E0277 (`__PyHandle_Pattern: Clone` not satisfied) on the synthesized derive.
+# Before the fix this BARE lib-handle field check-PASSED (the H5 gate matched only
+# `Ty::Handle`, and a lib handle was spelled `Ty::Class("Pattern")` until the field
+# was resolved handle-aware). Now rejected at CHECK. Open/pass the handle in a method.
+from re import compile, Pattern
+
+
+class Holder:
+    p: Pattern
+
+
+def main() -> None:
+    print("unreached")

@@ -1,0 +1,15 @@
+# NEGATIVE (W5-h, H5 — lib-handle inside a CONTAINER field): a `list[Pattern]` field
+# is rejected at CHECK. A move-only handle is non-`Clone`, so it cannot be stored in /
+# wrapped by / aggregated into any container, `Optional`, tuple, or `Callable` (v1
+# handles are move-only) — the nested-handle resolution gate fires when the field type
+# is resolved handle-aware. Before the fix the handle-blind field lowering left the
+# nested `Pattern` invisible: check-PASS then rustc-fail on the emitted struct.
+from re import compile, Pattern
+
+
+class Holder:
+    ps: list[Pattern]
+
+
+def main() -> None:
+    print("unreached")

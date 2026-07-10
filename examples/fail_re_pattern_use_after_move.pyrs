@@ -1,0 +1,9 @@
+# NEGATIVE (W5-h): a move-only `re.Pattern` handle cannot be used after it is moved
+# (reassigned) — it inherits the W5-g move-only + use-after-move checker for free.
+from re import compile, Pattern
+
+
+def main() -> None:
+    p: Pattern = compile("x")
+    q: Pattern = p
+    print(p.findall("xxx"))

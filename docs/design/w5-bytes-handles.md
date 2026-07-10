@@ -233,6 +233,49 @@ templates. This reuses the entire `@extern` template + `@crate` dependency machi
 (`items.rs:167`) — the only new codegen is "emit an opaque struct with a `Drop`", which
 `FILE_PRELUDE` already prototypes.
 
+> **AS-BUILT (W5-h, card 27aeeb3e).** The sketch above left three things unspecified;
+> the as-built decl form (validated end-to-end, `re.Pattern` + a Counter probe):
+> - **Opaque struct body** — declared by a reserved metadata field `__rust__: str =
+>   "<rust field decls>"` (e.g. `"re: regex::Regex, pat: String"`). This needs ZERO
+>   parser work (a `name: str = "lit"` field already parses); typeck's
+>   `validate_extern_class` treats it as the struct body (and rejects any OTHER pyrst
+>   field — a handle's state is opaque foreign Rust only), and `emit_extern_class`
+>   emits `struct __PyHandle_<Name> { <__rust__> }` (no derives — non-`Clone`).
+> - **Method receiver** — an `@extern` method's template uses a `{self}` hole
+>   (substituted to the Rust receiver); receivers are `&self` (v1 handles here are
+>   read-only — a `&mut self` @extern method is a follow-on). A handle class holds
+>   BOTH `@extern`-template methods AND PLAIN pyrst methods in one inherent `impl`, so
+>   the public API (which builds `Match`, applies the `$`-guard) stays pyrst while the
+>   extractors stay Rust templates.
+> - **Constructor** — a module-level `@extern def` returning the handle, whose template
+>   writes the `__PyHandle_<Name>` struct literal (the mangled name is stable/global).
+>   `@crate(...)` lives on that constructor (and the other `@extern` fns), NOT on the
+>   class (a `ClassDef` carries no `crate_deps`), so `validate_extern_class` rejects
+>   `@crate` on the class.
+> - **Name→`Ty::Handle` resolution** — a `TyCtx.handle_classes` set (a resolver
+>   pre-scan of `@extern` classes) + `TyCtx::resolve_annot` (rewrites `Class(n)`→
+>   `Handle(n)` at every signature/annotation chokepoint) bridges "the class lives in
+>   `ctx.classes` (so its methods resolve via `get_method`)" with "its NAME is a
+>   handle (so it inherits the entire W5-g move-only machinery)", WITHOUT threading a
+>   handle set through `from_type_expr`'s ~90 static call sites. Method calls route
+>   `Ty::Handle(n)`→`get_method` via `method_lookup_class`; codegen dispatches them via
+>   the existing user-class method arm (default-fill included) by treating a
+>   handle-class receiver as `Ty::Class`. Direct construction (`Pattern(...)`) is an
+>   honest check error (non-user-constructible).
+> - **`Drop`** — NOT emitted (deferred): `re.Pattern` holds only auto-dropping Rust
+>   values (`Regex`/`String`) and `subprocess.Popen` is deferred, so no handle here
+>   needs RAII resource release. A future resource-owning handle would add an optional
+>   `@extern` drop hook.
+> - **`re.Pattern`** pre-compiles THREE `Regex` variants at `compile()` (unanchored +
+>   `^(?:pat)` + `^(?:pat)$`) so ALL methods reuse — `match_`/`fullmatch` genuinely
+>   need the anchored automaton (oracle: `re.compile("a|ab").fullmatch("ab")`→`'ab'`
+>   backtracks, which the crate's leftmost-first unanchored `captures` cannot
+>   reproduce). **`subprocess`** builds `run()` fully and defers `Popen` (named
+>   `NotImplementedError`) — `run()` returns a `CompletedProcess` VALUE, so subprocess
+>   needs NO handle machinery. The legacy `re` `$`-guard residual (`is_match`/
+>   `find_all`/`sub`/`subn`/`split`) is closed by wrapping each in a pyrst fn that
+>   calls `_re_guard_newline_dollar` first (the `findall` precedent).
+
 **Interaction with W4 globals.** A handle living in a module global (e.g. a
 process-wide DB connection) uses the W4 **mutate-in-place** path
 (`G.with(|c| c.borrow_mut().method())`), **never the clone-out read path** — a

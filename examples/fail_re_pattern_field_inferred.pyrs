@@ -1,0 +1,19 @@
+# NEGATIVE (W5-h, H5 — __init__-INFERRED lib-handle field): a field discovered from
+# `self.p = p` (where `p: Pattern`) is a move-only handle field just as much as an
+# explicit `p: Pattern`, and is rejected at CHECK. This shape is the subtle one: the
+# inferred field lives only in the resolver's field set (the one codegen emits), NOT
+# in the raw parse the checker walks — so before the fix it was INVISIBLE to `check`
+# (check-PASS) yet emitted by codegen (rustc E0277 `Clone`/`Debug`/`Default` +
+# E0369 on the synthesized `#[derive(...)]` struct). The H5 gate now validates the
+# same authoritative field set codegen uses, so the inferred handle field rejects.
+from re import compile, Pattern
+
+
+class Holder:
+    def __init__(self, p: Pattern) -> None:
+        self.p = p
+
+
+def main() -> None:
+    h: Holder = Holder(compile("x"))
+    print("unreached")

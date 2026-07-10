@@ -445,7 +445,21 @@ impl<'a> Codegen<'a> {
                     // the base's signature, and `obj_s.name(..)` resolves to the
                     // companion enum `cls__`'s dispatch method — identical to the
                     // pre-existing EPIC-5 lowering.
-                    if let Ty::Class(cls, cls_args) = self.type_of_expr(obj.as_ref()) {
+                    // (W5-h) A lib HANDLE receiver (`Ty::Handle(n)`, n a handle class,
+                    // e.g. `re.Pattern`) dispatches its methods through this SAME
+                    // user-class arm: its methods live in `ctx.classes` and are emitted
+                    // by `emit_extern_class`, so `emit_user_method_call` resolves them and
+                    // — crucially — fills their trailing DEFAULT args (`p.split(text)` ->
+                    // `.split(text, 0)`). Treat it as `Ty::Class(n, [])`. The built-in
+                    // `file` handle is NOT a handle class (its methods are the hardcoded
+                    // FILE_METHODS), so it is excluded here and keeps its dispatch below.
+                    let __method_recv = self.type_of_expr(obj.as_ref());
+                    let __class_recv: Option<(String, Vec<Ty>)> = match &__method_recv {
+                        Ty::Class(cls, cls_args) => Some((cls.clone(), cls_args.clone())),
+                        Ty::Handle(n) if self.ctx.is_handle_class(n) => Some((n.clone(), Vec::new())),
+                        _ => None,
+                    };
+                    if let Some((cls, cls_args)) = __class_recv {
                         // `x.__str__()` / `x.__repr__()` are Python's stringify
                         // dunders. pyrst lowers __str__/__repr__ to the Display impl
                         // and the `PyRepr` trait — NOT inherent methods (they are
@@ -4196,6 +4210,16 @@ impl<'a> Codegen<'a> {
                 format!("::std::rc::Rc<dyn Fn({}) -> {}>", arg_strs, self.rust_ty(ret))
             }
             Ty::Class(n, args) => {
+                // (W5-h) A lib HANDLE class may reach `rust_ty` spelled `Ty::Class(n)`
+                // (when re-resolved from an annotation by the handle-blind
+                // `from_type_expr` in `emit_func`, rather than flowing as `Ty::Handle`
+                // from a `FuncSig`). Lower it to the SAME `__PyHandle_<n>` opaque
+                // struct the `Ty::Handle` arm produces, so the two spellings agree and
+                // a `p: Pattern` param types as its handle struct, not a phantom
+                // `Pattern` value type. Bare (non-generic) handle classes only.
+                if args.is_empty() && self.ctx.is_handle_class(n) {
+                    return format!("__PyHandle_{}", n);
+                }
                 // Generics v2 (generic CLASSES): a parametrized instance type
                 // `Ty::Class("Box", [Int])` lowers to `Box<i64>` — the class's
                 // Rust struct/impl carry a `<T, ..>` clause (see `emit_class`), and

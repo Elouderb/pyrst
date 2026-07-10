@@ -188,6 +188,13 @@ impl<'a> Codegen<'a> {
             // surfaces as a rustc error (E0425) at build — intentional for the FFI
             // escape hatch: the template is opaque Rust, validated by rustc.
             let mut emitted = template;
+            // (W5-h) An `@extern` METHOD of an `@extern class` handle receives its
+            // opaque struct as `self`; substitute the `{self}` hole with the Rust
+            // receiver so a template can touch its foreign fields (`{self}.re`). A
+            // free `@extern` function has no `self` and never writes `{self}`.
+            if method_of.is_some() {
+                emitted = emitted.replace("{self}", "self");
+            }
             for p in f.params.iter().filter(|p| p.name != "self") {
                 let hole = format!("{{{}}}", p.name);
                 emitted = emitted.replace(&hole, &escape_ident(&p.name));
@@ -504,7 +511,59 @@ impl<'a> Codegen<'a> {
         }
     }
 
+    /// (W5-h) Emit an `@extern class` — the opaque move-only HANDLE decl form (an
+    /// external Rust-backed struct produced only by a lib constructor, e.g.
+    /// `re.Pattern`). Unlike a value class this emits NO derives (a handle is
+    /// non-`Clone`/non-`Copy`, exactly like the built-in `PyFile`), NO `Default`, NO
+    /// auto-constructor (the handle is built by the constructor's `@extern` template),
+    /// and NO dunder trait impls — just the opaque `struct __PyHandle_<name>` from the
+    /// reserved `__rust__` field, plus one inherent `impl` holding the class's methods
+    /// (both `@extern`-template methods, whose `{self}` hole receives the receiver,
+    /// and PLAIN pyrst methods, emitted through the ordinary method path). The
+    /// non-`Clone`-ness is what makes the move-only + use-after-move guarantees hold
+    /// at rustc, matching what `check_handle_flow` verifies at check time.
+    pub(crate) fn emit_extern_class(&mut self, c: &ClassDef) -> Result<()> {
+        let struct_name = format!("__PyHandle_{}", c.name);
+        // The opaque Rust struct body is the reserved `__rust__` field's string
+        // literal (validated at check by `validate_extern_class`).
+        let rust_body = c.fields.iter()
+            .find(|f| f.name == "__rust__")
+            .and_then(|f| match &f.default {
+                Some(Expr::Str(s, _)) => Some(s.clone()),
+                _ => None,
+            })
+            .ok_or_else(|| crate::diag::Error::Codegen(format!(
+                "`@extern class {}` is missing its `__rust__` opaque struct body",
+                c.name
+            )))?;
+        // Opaque, non-`Clone`, non-`Copy` handle struct — no derives (mirrors PyFile).
+        self.line(&format!("struct {} {{ {} }}", struct_name, rust_body));
+        self.line("");
+        // Methods (both `@extern`-template and plain pyrst) in one inherent impl.
+        // Set the class context so a plain method's `self`-typing and self-method
+        // dispatch resolve; a handle class is never generic (checked), so the
+        // type-param scope is empty.
+        self.current_class = Some(c.name.clone());
+        let saved_class_tps = std::mem::replace(&mut self.current_class_type_params, Vec::new());
+        self.line(&format!("impl {} {{", struct_name));
+        self.indent += 1;
+        for m in &c.methods {
+            self.emit_func(m, Some(&c.name))?;
+        }
+        self.indent -= 1;
+        self.line("}");
+        self.line("");
+        self.current_class = None;
+        self.current_class_type_params = saved_class_tps;
+        Ok(())
+    }
+
     pub(crate) fn emit_class(&mut self, c: &ClassDef) -> Result<()> {
+        // (W5-h) An `@extern class` is the opaque move-only HANDLE decl form — route
+        // it to its dedicated emitter (no derives / Default / ctor / dunders).
+        if c.decorators.iter().any(|d| d == "extern") {
+            return self.emit_extern_class(c);
+        }
         // Full transitive field set (ancestors first, then own; deduped by name),
         // sourced from typeck's get_all_fields so the struct layout, Copy/Default
         // derivation, and default_val agree even for multi-level inheritance
@@ -1663,6 +1722,21 @@ impl<'a> Codegen<'a> {
     ///   *places* clone, not the whole owned if-temp.
     /// - everything else (Call/constructor result, BinOp, literal, comprehension,
     ///   slice, …) -> a fresh owned rvalue temp -> bare, nothing to clone.
+    /// (W5-h) The opaque-handle KIND of a type, treating BOTH `Ty::Handle(n)` and a
+    /// lib handle-class spelled `Ty::Class(n)` (n in `ctx.handle_classes`) as a
+    /// handle. Codegen may see a lib handle under either spelling — `Ty::Handle` when
+    /// the type flows from a handle-returning call's `FuncSig`, `Ty::Class` when it is
+    /// re-resolved from an annotation via the handle-blind `from_type_expr` — and both
+    /// must lower to the same non-`Clone` `__PyHandle_<n>` struct and MOVE (never
+    /// clone) at a consuming site. Built-in `file` is `Ty::Handle("file")` only.
+    pub(crate) fn handle_kind_of<'t>(&self, ty: &'t Ty) -> Option<&'t str> {
+        match ty {
+            Ty::Handle(n) => Some(n.as_str()),
+            Ty::Class(n, args) if args.is_empty() && self.ctx.is_handle_class(n) => Some(n.as_str()),
+            _ => None,
+        }
+    }
+
     pub(crate) fn emit_consuming(&mut self, e: &Expr) -> Result<String> {
         if self.is_copy_type(&self.type_of_expr(e)) {
             return self.emit_expr(e);
@@ -1675,7 +1749,7 @@ impl<'a> Codegen<'a> {
         // while `check` passed (probe PF-A). The typeck use-after-move check
         // (`check_handle_flow`) guarantees the moved binding is never read again,
         // so the bare move is sound — the single new consuming-site rule.
-        if self.type_of_expr(e).handle_name().is_some() {
+        if self.handle_kind_of(&self.type_of_expr(e)).is_some() {
             return self.emit_expr(e);
         }
         match e {

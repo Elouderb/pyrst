@@ -1,0 +1,22 @@
+# NEGATIVE (W5-h, H5 — lib-handle @dataclass FIELD, WITH a user __str__): a
+# `re.Pattern` field on a @dataclass is rejected at CHECK by the DEDICATED handle-field
+# gate — NOT by the reprability catch-all. The `__str__` here defeats the
+# synthesized-repr path (that reprability check only runs for a dataclass with no
+# user `__str__`/`__repr__`), so this proves the H5 handle gate itself fires and the
+# rejection message is the honest "cannot hold a `Pattern` handle", not a misleading
+# "no repr". Before the fix a @dataclass handle field was caught only INCIDENTALLY by
+# reprability (and a `__str__` would have let it leak to rustc).
+from dataclasses import dataclass
+from re import compile, Pattern
+
+
+@dataclass
+class Holder:
+    p: Pattern
+
+    def __str__(self) -> str:
+        return "holder"
+
+
+def main() -> None:
+    print("unreached")

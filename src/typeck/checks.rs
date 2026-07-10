@@ -1101,7 +1101,7 @@ pub(crate) fn check_one_func(f: &Func, ctx: &TyCtx, module_id: Option<&str>) -> 
     // to the non-generic path.
     let params: Vec<(String, Ty)> = f.params.iter()
         .filter(|p| p.name != "self")
-        .map(|p| Ty::from_type_expr_scoped(&p.ty, p.span, &f.type_params).map(|ty| (p.name.clone(), ty)))
+        .map(|p| ctx.resolve_annot(&p.ty, p.span, &f.type_params).map(|ty| (p.name.clone(), ty)))
         .collect::<Result<Vec<_>>>()?;
     let by_ref_names: Vec<String> = f.params.iter()
         .filter(|p| p.name != "self" && p.by_ref)
@@ -1110,7 +1110,7 @@ pub(crate) fn check_one_func(f: &Func, ctx: &TyCtx, module_id: Option<&str>) -> 
     // (LAZY-GEN V1-d) An `Iterator[T]` parameter is a V2 feature — reject at the
     // def site (honest error, not an accidental codegen success for fresh-call args).
     reject_iterator_params(&f.params)?;
-    let ret = Ty::from_type_expr_scoped(&f.ret, f.span, &f.type_params)?;
+    let ret = ctx.resolve_annot(&f.ret, f.span, &f.type_params)?;
     let mut env = FuncEnv::with_by_ref(ctx, &params, &by_ref_names, ret);
     env.module_id = module_id.map(|s| s.to_string());
     env.type_params = f.type_params.iter().cloned().collect();
@@ -1507,7 +1507,99 @@ pub(crate) fn is_iterator_type_expr(t: &TypeExpr) -> bool {
 
 /// Per-CLASS checks that run before (and gate) the method checks: multiple
 /// inheritance and explicit field-annotation validation. Fail-fast.
+/// (W5-h) Validate an `@extern class` — the opaque move-only HANDLE decl form (an
+/// external Rust-backed struct produced only by a lib constructor, e.g. `re.Pattern`).
+/// The class body is `@extern`-template methods + PLAIN pyrst methods over an opaque
+/// Rust struct declared by the reserved `__rust__: str = "<rust field decls>"`
+/// metadata field. This shell validation runs INSTEAD OF the value-class prelude
+/// (`check_class_prelude` early-outs to it): a handle is non-`Clone`/non-`Default`
+/// and un-instantiable via `__init__`, so the dataclass / field-repr / self-ref /
+/// derive checks below do not apply. The class NAME is registered in
+/// `ctx.handle_classes` by the resolver so it resolves to `Ty::Handle` everywhere.
+pub(crate) fn validate_extern_class(c: &ClassDef, _ctx: &TyCtx) -> Result<()> {
+    // Exactly the `@extern` decorator — no `@dataclass` (a handle is not a value
+    // record) and no `@crate` on the CLASS (a class carries no `crate_deps`; declare
+    // the regex/… dependency with `@crate` on the constructor / an `@extern` free fn).
+    for d in &c.decorators {
+        if d != "extern" {
+            return Err(Error::Type {
+                span: c.span,
+                msg: format!(
+                    "`@{}` is not supported on an `@extern class` handle — the only \
+                     decorator a handle class carries is `@extern`; put `@crate(...)` on \
+                     the constructor (an `@extern def` returning the handle)",
+                    d
+                ),
+            });
+        }
+    }
+    // A handle is opaque and non-`Clone`: it cannot participate in inheritance or
+    // generics (both need a value-struct with derives).
+    if !c.bases.is_empty() {
+        return Err(Error::Type {
+            span: c.span,
+            msg: "an `@extern class` handle cannot have a base class (a move-only \
+                  opaque handle does not participate in inheritance)"
+                .to_string(),
+        });
+    }
+    if !c.type_params.is_empty() {
+        return Err(Error::Type {
+            span: c.span,
+            msg: "an `@extern class` handle cannot be generic".to_string(),
+        });
+    }
+    // The opaque Rust struct body is declared by the reserved `__rust__: str =
+    // "<field decls>"` metadata field, and that is the ONLY field a handle may have
+    // — its state is opaque foreign Rust, never a pyrst-typed field (a pyrst field
+    // would be non-opaque and break the handle's value semantics). Exactly one
+    // `__rust__` field, string-typed, with a string-literal default.
+    let mut saw_rust = false;
+    for f in &c.fields {
+        if f.name == "__rust__" {
+            saw_rust = true;
+            let is_str_lit_default = matches!(&f.default, Some(Expr::Str(_, _)));
+            if !matches!(&f.ty, TypeExpr::Named(n) if n == "str") || !is_str_lit_default {
+                return Err(Error::Type {
+                    span: f.span,
+                    msg: "an `@extern class` handle's `__rust__` field must be \
+                          `__rust__: str = \"<rust field declarations>\"` (the opaque \
+                          struct body)"
+                        .to_string(),
+                });
+            }
+        } else {
+            return Err(Error::Type {
+                span: f.span,
+                msg: format!(
+                    "an `@extern class` handle cannot declare the pyrst field `{}` — a \
+                     handle's state is opaque foreign Rust, declared only by the reserved \
+                     `__rust__` metadata field",
+                    f.name
+                ),
+            });
+        }
+    }
+    if !saw_rust {
+        return Err(Error::Type {
+            span: c.span,
+            msg: "an `@extern class` handle must declare its opaque Rust struct body \
+                  via a `__rust__: str = \"<rust field declarations>\"` field"
+                .to_string(),
+        });
+    }
+    // The methods (`@extern`-template and plain) are validated per-method by
+    // `check_one_method` (the caller iterates them), so nothing more here.
+    Ok(())
+}
+
 pub(crate) fn check_class_prelude(c: &ClassDef, ctx: &TyCtx) -> Result<()> {
+    // (W5-h) An `@extern class` is the opaque move-only HANDLE decl form, not a value
+    // class — validate its distinct shell and STOP (the value-class dataclass / field
+    // / inheritance / derive checks below do not apply to a non-`Clone` opaque handle).
+    if c.decorators.iter().any(|d| d == "extern") {
+        return validate_extern_class(c, ctx);
+    }
     // (card 6f69d4a3) HONESTY: only `@dataclass` is a recognized CLASS decorator.
     // Every other class decorator (even `@totally_made_up`) was silently swallowed
     // before this card — make it a check error, mirroring `validate_decorators` for
@@ -1570,7 +1662,15 @@ pub(crate) fn check_class_prelude(c: &ClassDef, ctx: &TyCtx) -> Result<()> {
             && !c.methods.iter().any(|m| m.name == "__str__" || m.name == "__repr__")
         {
             for f in &c.fields {
-                let fty = Ty::from_type_expr(&f.ty, f.span)?;
+                // (W5-h fix) Resolve handle-AWARE. A lib-handle field (`re.Pattern`)
+                // has no repr, but the honest cause is "a handle cannot be a field"
+                // — the dedicated H5 gate below owns that message, so skip it here
+                // rather than preempt with the misleading no-repr error. A NESTED
+                // handle (`list[Pattern]`) is a resolution error via `?`.
+                let fty = ctx.resolve_annot(&f.ty, f.span, &c.type_params)?;
+                if Ty::contains_handle(&fty).is_some() {
+                    continue;
+                }
                 if !type_is_reprable(ctx, &fty) {
                     return Err(Error::Type {
                         span: f.span,
@@ -1628,19 +1728,39 @@ pub(crate) fn check_class_prelude(c: &ClassDef, ctx: &TyCtx) -> Result<()> {
     // scope, so a generic field `value: T` lowers to `Ty::TypeVar("T")` (a valid
     // field type for a generic class) rather than the bogus `Ty::Class("T", [])`.
     // A non-generic class has empty `type_params`, identical to the legacy path.
-    for field in &c.fields {
-        let fty = Ty::from_type_expr_scoped(&field.ty, field.span, &c.type_params)?;
+    // (W5-h fix) Iterate the AUTHORITATIVE per-class field set — the SAME one
+    // codegen emits — sourced from `ctx.classes` (explicit fields PLUS the
+    // `__init__`-inferred fields `extract_init_fields` discovered). The `c` handed
+    // to us is the raw-parse `ClassDef` (from `prog.modules`), which does NOT carry
+    // the inferred fields; iterating `c.fields` would leave an inferred handle field
+    // (`def __init__(self, p: Pattern): self.p = p`) invisible to `check` yet emitted
+    // by codegen — a silent check-pass / rustc-fail. Falling back to `c.fields` is
+    // defensive (every class is registered in `ctx.classes`). Inherited fields are
+    // the base class's own gate, so this stays per-class.
+    let prelude_fields = ctx
+        .classes
+        .get(&c.name)
+        .map(|cd| cd.fields.as_slice())
+        .unwrap_or(c.fields.as_slice());
+    for field in prelude_fields {
+        // Resolve handle-AWARE so a lib handle spelled `Pattern` becomes a
+        // `Ty::Handle` (the rewrite) and a NESTED handle (`list[Pattern]`,
+        // `Optional[Pattern]`, ...) is an honest resolution error here via `?`.
+        let fty = ctx.resolve_annot(&field.ty, field.span, &c.type_params)?;
         // (W5-g, H5) A move-only HANDLE cannot be a class / dataclass FIELD. A
-        // handle is an external resource (a `file`, later a `Pattern`/`Popen`):
-        // non-`Clone` and non-`Default`, so a `PyFile` field breaks the struct's
-        // value semantics (clone-on-assign, synthesized `__repr__`, `Default`
-        // construction) and died at rustc — a `f: file` field check-PASSED with the
-        // `type_is_reprable` catch-all. Reject it honestly (a nested `list[file]`
-        // field already fails at resolution; `contains_handle` also catches the
-        // bare `file` field). Deferred to the reference-handle v2 (design §C).
+        // handle is an external resource (a `file`/`Pattern`/`Popen`): non-`Clone`
+        // and non-`Default`, so a handle field breaks the struct's value semantics
+        // (clone-on-assign, synthesized `__repr__`, `Default` construction) and died
+        // at rustc. Before this it check-PASSED — via the `type_is_reprable`
+        // catch-all (built-in `file`), or INVISIBLY (a lib handle spelled as a class,
+        // or an `__init__`-inferred field). Reject it honestly at check. Deferred to
+        // the reference-handle v2 (design §C).
         if let Some(kind) = Ty::contains_handle(&fty) {
+            // An `__init__`-inferred field carries a DUMMY span; point the caret at
+            // the class definition so the diagnostic still renders a real location.
+            let span = if field.span == Span::DUMMY { c.span } else { field.span };
             return Err(Error::Type {
-                span: field.span,
+                span,
                 msg: format!(
                     "class `{}` field `{}` cannot hold a `{kind}` handle — a move-only \
                      handle is an external resource that is non-clonable and has no default \
@@ -1741,7 +1861,10 @@ pub(crate) fn check_class_prelude(c: &ClassDef, ctx: &TyCtx) -> Result<()> {
     let init_fn = c.methods.iter().find(|m| m.name == "__init__");
     let seeded = init_fn.map(init_field_param_map).unwrap_or_default();
     for field in &c.fields {
-        let ty = Ty::from_type_expr_scoped(&field.ty, field.span, &c.type_params)?;
+        // (W5-h fix) Resolve handle-AWARE for consistency with the other field
+        // chokepoints (a nested handle inside a `Callable` field is an honest
+        // resolution error via `?`; a bare handle field is already rejected above).
+        let ty = ctx.resolve_annot(&field.ty, field.span, &c.type_params)?;
         if matches!(ty, Ty::Func(..)) && !seeded.contains_key(&field.name) {
             return Err(Error::Type {
                 span: field.span,
@@ -1775,15 +1898,23 @@ pub(crate) fn check_one_method(c: &ClassDef, method: &Func, ctx: &TyCtx, module_
         });
     }
 
-    // `@extern` is a Phase-1 binding for TOP-LEVEL std functions only. On a
-    // method it would interact with the `self` receiver and by-reference mode
-    // decisions, which are out of scope; reject it honestly here so it is caught
-    // at both `check` and `build` rather than silently mis-emitted.
+    // `@extern` on a method: allowed ONLY inside an `@extern class` (the W5-h
+    // handle decl form), where a `@extern def` is a Rust-template method of the
+    // opaque handle struct (a `{self}`-receiving expression template, e.g.
+    // `re.Pattern._caps`). Its body is opaque Rust, not pyrst — validate the
+    // binding shape (single string body + fully-typed signature, `self` excluded by
+    // `validate_extern_func`) and STOP, exactly like the free-function `@extern`
+    // path. Outside a handle class it stays unsupported: a plain value class has no
+    // opaque struct for a template method to touch.
     if method.decorators.iter().any(|d| d == "extern") {
+        if c.decorators.iter().any(|d| d == "extern") {
+            return validate_extern_func(method, ctx);
+        }
         return Err(Error::Type {
             span: method.span,
             msg: "`@extern` is not supported on a method (it is for top-level \
-                  functions only); declare it as a free function"
+                  functions and `@extern class` handle methods only); declare it as \
+                  a free function"
                 .to_string(),
         });
     }
@@ -1839,7 +1970,7 @@ pub(crate) fn check_one_method(c: &ClassDef, method: &Func, ctx: &TyCtx, module_
     // class has empty `type_params` => identical to the legacy unscoped path.
     let mut params: Vec<(String, Ty)> = method.params.iter()
         .filter(|p| p.name != "self")
-        .map(|p| Ty::from_type_expr_scoped(&p.ty, p.span, &c.type_params).map(|ty| (p.name.clone(), ty)))
+        .map(|p| ctx.resolve_annot(&p.ty, p.span, &c.type_params).map(|ty| (p.name.clone(), ty)))
         .collect::<Result<Vec<_>>>()?;
     let self_args: Vec<Ty> = c.type_params.iter().map(|tp| Ty::TypeVar(tp.clone())).collect();
     params.insert(0, ("self".into(), Ty::Class(c.name.clone(), self_args)));
@@ -1850,7 +1981,7 @@ pub(crate) fn check_one_method(c: &ClassDef, method: &Func, ctx: &TyCtx, module_
     // (LAZY-GEN V1-d) An `Iterator[T]` parameter is a V2 feature — reject it on a
     // method too (`self` carries no annotation and is skipped).
     reject_iterator_params(&method.params)?;
-    let ret = Ty::from_type_expr_scoped(&method.ret, method.span, &c.type_params)?;
+    let ret = ctx.resolve_annot(&method.ret, method.span, &c.type_params)?;
     let mut env = FuncEnv::with_by_ref(ctx, &params, &by_ref_names, ret);
     env.module_id = module_id.map(|s| s.to_string());
     env.type_params = c.type_params.iter().cloned().collect();
@@ -1980,7 +2111,7 @@ pub(crate) fn check_top_level_other(s: &Stmt, ctx: &TyCtx, module_id: Option<&st
     if let Stmt::Assign { target, ty: Some(t), value, span } = s {
         if !is_const_literal(value) && ctx.is_mutable_global(module_id, target) {
             reject_if_reserved(target, *span, "module global")?;
-            let declared = Ty::from_type_expr(t, *span)?;
+            let declared = ctx.resolve_annot(t, *span, &[])?;
             // (W5-g) A move-only HANDLE cannot back a module global: the W4 read path
             // is `G.with(|c| c.borrow().clone())`, but a handle is non-`Clone`, so
             // `f: file = open(...)` check-PASSED and then died at rustc E0599 (probe).
@@ -2078,7 +2209,7 @@ pub(crate) fn check_top_level_other(s: &Stmt, ctx: &TyCtx, module_id: Option<&st
                     ),
                 });
             }
-            let declared = Ty::from_type_expr(t, *span)?;
+            let declared = ctx.resolve_annot(t, *span, &[])?;
             // (W5-g) A move-only HANDLE cannot be a module-level binding. A global
             // READ lowers to the W4 clone-on-read path (`G.with(|c| c.borrow().clone())`),
             // but a handle is non-`Clone`, so `f: file = open(...)` check-PASSED and

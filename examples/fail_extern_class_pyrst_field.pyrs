@@ -1,0 +1,16 @@
+# NEGATIVE (W5-h decl form): an `@extern class` handle's state is opaque foreign Rust
+# (declared only via the reserved `__rust__` field); it cannot have a pyrst-typed field.
+@extern
+class Bad:
+    __rust__: str = "n: i64"
+    extra: int
+
+
+@extern
+def mk() -> Bad:
+    "__PyHandle_Bad { n: 0 }"
+
+
+def main() -> None:
+    b: Bad = mk()
+    print("x")

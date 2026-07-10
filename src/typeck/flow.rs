@@ -2947,11 +2947,11 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             // the enclosing function's type params (empty everywhere else).
             let tp = env.type_param_list();
             let declared = match ty {
-                Some(t) => Ty::from_type_expr_scoped(t, *span, &tp)?,
+                Some(t) => env.ctx.resolve_annot(t, *span, &tp)?,
                 None => val_ty.clone(),
             };
             if let Some(t) = ty {
-                let explicit = Ty::from_type_expr_scoped(t, *span, &tp)?;
+                let explicit = env.ctx.resolve_annot(t, *span, &tp)?;
                 // (LAZY-GEN V1-d) A generator assigned into a `list[T]` slot:
                 // honest MATERIALIZE error (`list(g)`) before the bare mismatch.
                 reject_iterator_into_list(&val_ty, &explicit, *span)?;
@@ -3762,9 +3762,9 @@ pub(crate) fn check_nested_def(f: &Func, env: &mut FuncEnv) -> Result<()> {
     // — they are opaque type variables there, never bound by the nested def).
     let tp = env.type_param_list();
     let params: Vec<(String, Ty)> = f.params.iter()
-        .map(|p| Ty::from_type_expr_scoped(&p.ty, p.span, &tp).map(|ty| (p.name.clone(), ty)))
+        .map(|p| env.ctx.resolve_annot(&p.ty, p.span, &tp).map(|ty| (p.name.clone(), ty)))
         .collect::<Result<Vec<_>>>()?;
-    let ret = Ty::from_type_expr_scoped(&f.ret, f.span, &tp)?;
+    let ret = env.ctx.resolve_annot(&f.ret, f.span, &tp)?;
 
     // The nested def's PARAM names: assignments to these inside the body are the
     // closure's own bindings (fine), NOT captured-variable mutations.
@@ -4086,6 +4086,22 @@ pub(crate) const BYTES_METHODS: &[&str] = &[
     "strip", "lstrip", "rstrip", "upper", "lower", "ljust", "rjust",
     "center", "zfill", "isdigit", "isalpha", "isalnum", "isspace",
 ];
+
+/// (W5-h) The class NAME to use for method-signature lookup (`ctx.get_method`) on a
+/// receiver: a value class `Ty::Class(n, _)` OR a lib-declared handle `Ty::Handle(n)`
+/// whose methods come from the `@extern class` decl form and live in `ctx.classes`.
+/// Returns None for the built-in `file` handle (its methods are the hardcoded
+/// `FILE_METHODS` table, not a `ctx.classes` entry — routed by `builtin_method_ret`)
+/// and for every non-object receiver. This bridges the two representations of a lib
+/// handle: `Ty::Handle(n)` (for the W5-g move machinery) resolves its methods through
+/// the same class path a `Ty::Class(n)` value would.
+pub(crate) fn method_lookup_class<'a>(ty: &'a Ty, ctx: &TyCtx) -> Option<&'a str> {
+    match ty {
+        Ty::Class(n, _) => Some(n.as_str()),
+        Ty::Handle(n) if ctx.is_handle_class(n) => Some(n.as_str()),
+        _ => None,
+    }
+}
 
 /// Returns (type-name, method-table) for a concrete builtin receiver, or None
 /// for Unknown/Class/numeric receivers (the check must not run on those).

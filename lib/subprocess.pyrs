@@ -1,0 +1,101 @@
+# pyrst standard library — subprocess (W5-h, card 27aeeb3e; epic 6f6acdf1)
+#
+# Design: docs/design/w5-bytes-handles.md §D (the unlock map) + §F/W5-h. Built on
+# the W5-a `bytes` value type (captured stdout/stderr are `bytes`, CPython-exact).
+#
+# SCOPE (lead-ratifiable, oracle-first against python3 3.12.9):
+#   * `run(args, capture_output=False)` — the SYNCHRONOUS convenience, fully built.
+#     Returns a `CompletedProcess` VALUE (not a handle): `args`, `returncode:int`,
+#     and `stdout`/`stderr` as `Optional[bytes]` (None when not captured — CPython-
+#     exact — else the child's raw output bytes). shell=False, a list-of-str argv
+#     ONLY (no shell string, no `shell=True`).
+#   * `Popen` — HONESTLY DEFERRED (raises `NotImplementedError`). Its async surface
+#     (poll/wait/communicate/stdin streaming) is a move-only HANDLE with a real
+#     lifecycle that `run()` does not need; building it here would rush it. `run()`
+#     covers the card's acceptance criteria; `Popen` is a documented follow-on.
+#
+# CPython FIDELITY (python3 3.12.9 oracle):
+#   * no capture:            `run(["echo","hi"]).stdout is None`  (stdio inherited)
+#   * capture_output=True:   `.stdout == b"hi\n"` (BYTES, not str — `text=`/`encoding=`
+#                            are deferred, so pyrst always yields bytes when capturing)
+#   * exit codes:            `run(["true"]).returncode == 0`, `["false"] -> 1`,
+#                            `["sh","-c","exit 3"] -> 3`
+#   * missing program:       a catchable `FileNotFoundError` with CPython's exact
+#                            payload `[Errno 2] No such file or directory: '<cmd>'`
+#   * not executable:        a non-executable file (or a directory) is `EACCES`, a
+#                            catchable `PermissionError` (an `OSError` SUBCLASS — a
+#                            bare `except OSError` catches it too, via the W2 exception
+#                            hierarchy) with CPython's exact `[Errno 13] Permission
+#                            denied: '<cmd>'`
+#   * empty argv:            `run([])` is a catchable `IndexError('list index out of
+#                            range')` — CPython-exact type AND message
+#
+# DIVERGENCES (all documented, none silent):
+#   * `Popen` deferred (named `NotImplementedError`); `check=`, `input=`, `text=`,
+#     `encoding=`, `env=`, `cwd=`, `timeout=`, `shell=True`, and a bare-string command
+#     are NOT supported (a bare-string command would need shell parsing).
+#   * SPAWN-ERROR errno mapping: `ENOENT`->`FileNotFoundError` and `EACCES`->
+#     `PermissionError` are CPython-exact (type AND `[Errno N] ...` message). Any
+#     OTHER spawn errno (`EMFILE`, `ENOMEM`, `E2BIG`, ...) collapses to a bare
+#     `OSError` whose message is Rust's `io::Error` text carrying the errno as
+#     "(os error N)" rather than CPython's `[Errno N] <strerror>: '<cmd>'` shape —
+#     the exact strerror text is the only divergence. These errnos are not
+#     hermetically reproducible, so this path is untested-by-design, not fudged.
+#   * a SIGNAL-terminated child yields `returncode == -1` here (CPython yields the
+#     negative signal number, e.g. -9); the deterministic goldens never spawn a
+#     signalling child, so this path is untested-by-design, not fudged.
+#   * `CompletedProcess.check_returncode()` and the repr shape are not modelled.
+
+
+# The result VALUE of `run()` — a plain value struct (not a handle). `stdout`/`stderr`
+# are `Optional[bytes]`: `None` when the child's output was NOT captured (CPython's
+# default), else the raw output bytes captured from the pipe.
+class CompletedProcess:
+    args: list[str]
+    returncode: int
+    stdout: Optional[bytes]
+    stderr: Optional[bytes]
+
+    def __init__(self, args: list[str], returncode: int, stdout: Optional[bytes], stderr: Optional[bytes]) -> None:
+        self.args = args
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+# Spawn `argv` (list-of-str, shell=False), CAPTURE stdout+stderr, wait, and return
+# `(returncode, stdout_bytes, stderr_bytes)`. Spawn-error mapping (CPython-faithful):
+# ENOENT -> `FileNotFoundError [Errno 2] ...`; EACCES (a non-executable file / a
+# directory) -> `PermissionError [Errno 13] ...` (an `OSError` subclass a bare
+# `except OSError` also catches); any OTHER errno -> `OSError` (the errno rides in
+# the message via Rust's "(os error N)"). Empty argv -> `IndexError` (CPython-exact).
+@extern
+def _spawn_capture(args: list[str]) -> tuple[int, bytes, bytes]:
+    "{ let argv: &Vec<String> = &{args}; if argv.is_empty() { panic!(\"IndexError\\0list index out of range\"); } match std::process::Command::new(&argv[0]).args(&argv[1..]).output() { Ok(o) => { let code: i64 = o.status.code().map(|c| c as i64).unwrap_or(-1i64); (code, o.stdout, o.stderr) }, Err(e) => match e.kind() { std::io::ErrorKind::NotFound => panic!(\"FileNotFoundError\\0[Errno 2] No such file or directory: '{}'\", argv[0]), std::io::ErrorKind::PermissionDenied => panic!(\"PermissionError\\0[Errno 13] Permission denied: '{}'\", argv[0]), _ => panic!(\"OSError\\0{}\", e), } } }"
+
+
+# Spawn `argv` (shell=False) INHERITING stdio (no capture), wait, and return the
+# exit code. Same missing-program / spawn-error contract as `_spawn_capture`.
+@extern
+def _spawn_nocapture(args: list[str]) -> int:
+    "{ let argv: &Vec<String> = &{args}; if argv.is_empty() { panic!(\"IndexError\\0list index out of range\"); } match std::process::Command::new(&argv[0]).args(&argv[1..]).status() { Ok(s) => s.code().map(|c| c as i64).unwrap_or(-1i64), Err(e) => match e.kind() { std::io::ErrorKind::NotFound => panic!(\"FileNotFoundError\\0[Errno 2] No such file or directory: '{}'\", argv[0]), std::io::ErrorKind::PermissionDenied => panic!(\"PermissionError\\0[Errno 13] Permission denied: '{}'\", argv[0]), _ => panic!(\"OSError\\0{}\", e), } } }"
+
+
+# `subprocess.run(args, capture_output=False)` — run `args` to completion and return
+# a `CompletedProcess`. With `capture_output=True` the child's stdout/stderr are
+# captured as `bytes`; otherwise they are inherited and `.stdout`/`.stderr` are `None`
+# (CPython-exact). shell=False, list-of-str argv only.
+def run(args: list[str], capture_output: bool = False) -> CompletedProcess:
+    if capture_output:
+        rc, out, err = _spawn_capture(args)
+        return CompletedProcess(args, rc, out, err)
+    code: int = _spawn_nocapture(args)
+    return CompletedProcess(args, code, None, None)
+
+
+# `subprocess.Popen` — HONESTLY DEFERRED. The asynchronous process-handle surface
+# (poll/wait/communicate/stdin) is a documented follow-on (card 27aeeb3e); use
+# `subprocess.run(...)` for the synchronous case. Calling this raises a NAMED,
+# catchable error rather than silently doing the wrong thing.
+def Popen(args: list[str]) -> None:
+    raise NotImplementedError("subprocess.Popen is not yet supported in pyrst (its async surface — poll/wait/communicate/stdin — is a documented deferral, card 27aeeb3e); use subprocess.run(...) for the synchronous case")

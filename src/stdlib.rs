@@ -305,6 +305,16 @@ pub const EMBEDDED_STDLIB: &[(&str, &str)] = &[
     ("struct", include_str!("../lib/struct.pyrs")),
     ("hashlib", include_str!("../lib/hashlib.pyrs")),
     ("hmac", include_str!("../lib/hmac.pyrs")),
+    // ── W5-h lib wave (card 27aeeb3e) ─────────────────────────────────────
+    // `subprocess` — the synchronous `run(args, capture_output=False)` over
+    // `std::process::Command` (shell=False, list-of-str argv), returning a
+    // `CompletedProcess` VALUE whose captured stdout/stderr are `bytes` (W5-a).
+    // Rust std only (no @crate), so it stays on the single-file build path. `Popen`
+    // (the async process-handle surface) is an honest `NotImplementedError` deferral
+    // — see the module header. (W5-h also ships `re.Pattern`, the compiled-regex
+    // move-only handle, inside the existing `re` module via the `@extern class` decl
+    // form — no new registration.)
+    ("subprocess", include_str!("../lib/subprocess.pyrs")),
 ];
 
 /// Look up an embedded stdlib module's source by NAME (e.g. `"os"`).

@@ -1,0 +1,14 @@
+0
+b'hello world\n'
+b''
+0
+1
+3
+True
+b''
+b'oops\n'
+b'a\nb\nc'
+FileNotFoundError
+list index out of range
+[Errno 13] Permission denied: '/'
+OSError-hierarchy

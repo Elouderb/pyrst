@@ -562,6 +562,21 @@ pub struct TyCtx {
     /// [`collect_mutable_globals`]. EMPTY on the LSP single-file / hand-built ctx
     /// paths (the validator then falls back to the flat `vars` existence check).
     pub module_level_bindings: std::collections::HashMap<Option<String>, std::collections::HashSet<String>>,
+    /// (W5-h) The bare NAMES of lib-declared opaque move-only HANDLE classes — every
+    /// class carrying the `@extern` decorator (the `@extern class` decl form: an
+    /// opaque foreign-Rust-backed struct produced only by a lib constructor, e.g.
+    /// `re.Pattern`). A name in this set makes an annotation / signature / call-return
+    /// referencing it resolve to `Ty::Handle(name)` instead of `Ty::Class(name, [])`
+    /// (via [`TyCtx::resolve_annot`]), so the class inherits the ENTIRE W5-g
+    /// move-only machinery for free — move-on-consume + use-after-move, the
+    /// capture/container/global gates, `contains_handle`, and signature nameability.
+    /// The built-in `file` handle is NOT in this set (it is minted directly by
+    /// `Ty::from_type_expr` + `open`'s hardcoded sig); this is exclusively the
+    /// lib-declared kinds. Populated by the resolver's pre-scan over every module's
+    /// top-level classes BEFORE any signature is lowered (so a constructor defined
+    /// above its handle class still resolves). EMPTY for programs importing no handle
+    /// lib, so their resolution is byte-for-byte unchanged.
+    pub handle_classes: std::collections::HashSet<String>,
 }
 
 impl TyCtx {
@@ -682,7 +697,7 @@ impl TyCtx {
         // function is merged in, so the keyword→positional mapper can tell a
         // real user signature from a builtin stub (see `builtin_funcs` docs).
         let builtin_funcs: std::collections::HashSet<String> = funcs.keys().cloned().collect();
-        Self { funcs, classes: HashMap::new(), vars, module_symbols: HashMap::new(), func_owner: HashMap::new(), class_owner: HashMap::new(), const_owner: HashMap::new(), import_bindings: HashMap::new(), module_funcs: HashMap::new(), module_consts: HashMap::new(), generic_funcs: HashMap::new(), generic_func_bodies: HashMap::new(), generic_classes: HashMap::new(), builtin_funcs, hash_key_classes: std::collections::HashSet::new(), promoted_consts: std::collections::HashMap::new(), root_defined: std::collections::HashSet::new(), mutable_globals: std::collections::HashMap::new(), module_level_bindings: std::collections::HashMap::new() }
+        Self { funcs, classes: HashMap::new(), vars, module_symbols: HashMap::new(), func_owner: HashMap::new(), class_owner: HashMap::new(), const_owner: HashMap::new(), import_bindings: HashMap::new(), module_funcs: HashMap::new(), module_consts: HashMap::new(), generic_funcs: HashMap::new(), generic_func_bodies: HashMap::new(), generic_classes: HashMap::new(), builtin_funcs, hash_key_classes: std::collections::HashSet::new(), promoted_consts: std::collections::HashMap::new(), root_defined: std::collections::HashSet::new(), mutable_globals: std::collections::HashMap::new(), module_level_bindings: std::collections::HashMap::new(), handle_classes: std::collections::HashSet::new() }
     }
 
     /// (W4-a) Whether module `owner` (`None` = root) has a promoted mutable global
@@ -906,13 +921,13 @@ impl TyCtx {
                 // concrete `Ty::Class(name, args)` substitute the args afterwards.
                 let params: Vec<(String, Ty)> = match method.params.iter()
                     .filter(|p| p.name != "self")
-                    .map(|p| Ty::from_type_expr_scoped(&p.ty, p.span, &class_def.type_params).map(|ty| (p.name.clone(), ty)))
+                    .map(|p| self.resolve_annot(&p.ty, p.span, &class_def.type_params).map(|ty| (p.name.clone(), ty)))
                     .collect::<Result<Vec<_>>>()
                 {
                     Ok(ps) => ps,
                     Err(_) => return None,
                 };
-                let ret = match Ty::from_type_expr_scoped(&method.ret, method.span, &class_def.type_params) {
+                let ret = match self.resolve_annot(&method.ret, method.span, &class_def.type_params) {
                     Ok(ty) => ty,
                     Err(_) => return None,
                 };
@@ -934,6 +949,84 @@ impl TyCtx {
             }
         }
         None
+    }
+
+    /// (W5-h) Is `name` a lib-declared opaque handle class (an `@extern class`)?
+    /// The single predicate the annotation resolver, the method-call router, and
+    /// codegen share. The built-in `file` handle is deliberately excluded here (it
+    /// is minted directly by `Ty::from_type_expr`, never through a handle class).
+    pub fn is_handle_class(&self, name: &str) -> bool {
+        self.handle_classes.contains(name)
+    }
+
+    /// (W5-h) Recursively rewrite a resolved `Ty` so that every `Ty::Class(n, [])`
+    /// naming a lib handle class (`self.handle_classes`) becomes `Ty::Handle(n)`.
+    /// This is what promotes a lib type name (`re.Pattern`) from a plain value
+    /// class to the opaque move-only handle kind, WITHOUT threading a handle set
+    /// through `Ty::from_type_expr`'s ~90 static call sites. A handle class is
+    /// registered in `ctx.classes` (so its methods resolve via `get_method`) AND in
+    /// `handle_classes` (so its NAME resolves to a handle) — this bridges the two.
+    /// Non-handle types and the built-in `file` handle pass through unchanged.
+    pub fn rewrite_handles(&self, ty: &Ty) -> Ty {
+        if self.handle_classes.is_empty() {
+            return ty.clone();
+        }
+        match ty {
+            Ty::Class(n, args) if args.is_empty() && self.is_handle_class(n) => {
+                Ty::Handle(n.clone())
+            }
+            Ty::List(e) => Ty::List(Box::new(self.rewrite_handles(e))),
+            Ty::Set(e) => Ty::Set(Box::new(self.rewrite_handles(e))),
+            Ty::Iterator(e) => Ty::Iterator(Box::new(self.rewrite_handles(e))),
+            Ty::Option(e) => Ty::Option(Box::new(self.rewrite_handles(e))),
+            Ty::Dict(k, v) => Ty::Dict(
+                Box::new(self.rewrite_handles(k)),
+                Box::new(self.rewrite_handles(v)),
+            ),
+            Ty::Tuple(ts) => Ty::Tuple(ts.iter().map(|t| self.rewrite_handles(t)).collect()),
+            Ty::Func(args, ret) => Ty::Func(
+                args.iter().map(|t| self.rewrite_handles(t)).collect(),
+                Box::new(self.rewrite_handles(ret)),
+            ),
+            Ty::Class(n, args) => {
+                Ty::Class(n.clone(), args.iter().map(|t| self.rewrite_handles(t)).collect())
+            }
+            other => other.clone(),
+        }
+    }
+
+    /// (W5-h) HANDLE-AWARE annotation lowering: `Ty::from_type_expr_scoped` PLUS the
+    /// lib-handle rewrite (`rewrite_handles`) PLUS the same nested-handle gate the
+    /// built-in `file` handle enforces (`from_type_expr_scoped`'s H1 gate). Used at
+    /// every SIGNATURE / ANNOTATION chokepoint that feeds the checker's type
+    /// environment (resolver sig lowering, `get_method`, `check_func`/`check_method`
+    /// params+return, annotated-assign), so a lib handle name resolves to
+    /// `Ty::Handle` consistently and a NESTED lib handle (`list[Pattern]`,
+    /// `Optional[Pattern]`, `tuple[Pattern, int]`, `Callable[[Pattern], ..]`) is an
+    /// honest resolution error — a move-only handle is non-clonable and cannot be
+    /// stored, wrapped, or aggregated (v1 move-only), exactly as for `file`.
+    pub fn resolve_annot(&self, t: &TypeExpr, span: Span, type_params: &[String]) -> Result<Ty> {
+        let base = Ty::from_type_expr_scoped(t, span, type_params)?;
+        let ty = self.rewrite_handles(&base);
+        // Re-run the nested-handle gate for LIB handles (the file handle was already
+        // gated inside `from_type_expr_scoped`; a lib handle only becomes a `Handle`
+        // after the rewrite above, so it is gated here). A bare top-level handle is
+        // fine; a handle nested anywhere else is rejected.
+        if !matches!(ty, Ty::Handle(_)) {
+            if let Some(kind) = Ty::contains_handle(&ty) {
+                return Err(Error::Type {
+                    span,
+                    msg: format!(
+                        "a `{kind}` handle cannot appear inside a container, `Optional`, \
+                         tuple, `Callable`, or generic type — a move-only handle is \
+                         non-clonable, so it cannot be stored, wrapped, or aggregated (v1 \
+                         handles are move-only); use a bare `{kind}` binding and pass it by \
+                         move, or lend it with `Mut[{kind}]`",
+                    ),
+                });
+            }
+        }
+        Ok(ty)
     }
 }
 

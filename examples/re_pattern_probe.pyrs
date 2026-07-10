@@ -1,0 +1,70 @@
+# parity: pyrst-only
+#
+# W5-h re.Pattern pyrst-only surfaces + the Z3 `$`/newline residual guard (card
+# 27aeeb3e, epic 6f6acdf1). pyrst-only because: (1) `match_` is pyrst's spelling of
+# CPython `.match` (`match` is a keyword); (2) `is_match`/`find_all` are pyrst-only
+# legacy names; (3) the `$`-guard RAISES ValueError where CPython silently diverges
+# (oracle, python3 3.12.9: re.sub('a$','X','a\n')=='X\n', re.search('a$','a\n')
+# matches, re.findall('a$','a\n')==['a'] — the regex crate cannot emulate CPython's
+# "match just before a single trailing \n", so pyrst refuses rather than miscompile).
+from re import compile, is_match, find_all, sub, subn, split, Pattern, Match
+
+
+def main() -> None:
+    # --- match_ (start-anchored) over the PRE-COMPILED ^(?:pat), reused ---
+    ap: Pattern = compile("a")
+    print(ap.match_("abc") is not None)     # True  (matches at the start)
+    print(ap.match_("bca") is not None)     # False (leftmost match not at 0)
+
+    # --- the Z3 `$`/newline guard fires on a re.Pattern METHOD ---
+    gp: Pattern = compile("x$")
+    try:
+        r1: Optional[Match] = gp.search("x\n")
+        print("no")
+    except ValueError:
+        print("pattern.search guarded")
+    try:
+        r2: list[str] = gp.findall("x\n")
+        print("no")
+    except ValueError:
+        print("pattern.findall guarded")
+
+    # --- and on every LEGACY module surface (THE W5-h RESIDUAL) ---
+    try:
+        is_match("a$", "a\n")
+        print("no")
+    except ValueError:
+        print("is_match guarded")
+    try:
+        find_all("a$", "a\n")
+        print("no")
+    except ValueError:
+        print("find_all guarded")
+    try:
+        sub("a$", "X", "a\n")
+        print("no")
+    except ValueError:
+        print("sub guarded")
+    try:
+        subn("a$", "X", "a\n")
+        print("no")
+    except ValueError:
+        print("subn guarded")
+    try:
+        split("a$", "a\n")
+        print("no")
+    except ValueError:
+        print("split guarded")
+
+    # --- the guard does NOT over-fire (no trailing newline -> the surface works) ---
+    print(is_match("a$", "ba"))             # True  (a at the true end)
+    print(find_all("[0-9]+", "a1b22"))      # ['1', '22']
+    print(sub("a$", "X", "ba"))             # "bX"
+    print(split(",", "a,b,c"))              # ['a', 'b', 'c']
+
+    # --- reuse: one compiled Pattern, many matches; CPython-3.7+ zero-width (Z1) ---
+    zp: Pattern = compile("a*")
+    total: int = 0
+    for mm in zp.finditer("aabaa"):
+        total += 1
+    print(total)                            # 4  (0,2)(2,2)(3,5)(5,5)

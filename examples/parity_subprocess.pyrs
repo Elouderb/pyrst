@@ -1,0 +1,75 @@
+# parity: dual-run
+#
+# DUAL-RUN CPython parity golden — W5-h `subprocess.run` (card 27aeeb3e). Every
+# surface is CPython-spellable, so the SAME source runs byte-identically under the
+# pyrst binary AND python3 (the harness prepends `from __future__ import annotations`
+# and calls `main()`).
+#
+# ENVIRONMENT DISCIPLINE (card): only DETERMINISTIC coreutils present in the harness
+# are spawned — `echo`/`true`/`false`/`sh -c <exit-code>`. Captured stdout/stderr are
+# `bytes` (W5-a), printed via the byte-identical bytes repr. The FileNotFoundError
+# message is NOT printed (its text is not part of the contract); the catch prints a
+# FIXED marker so both runtimes agree. No-capture runs use only silent commands
+# (`true`/`false`/`sh -c exit N`) so nothing leaks onto the inherited stdout.
+#
+# ERROR-PATH DISCIPLINE (W5-h fix — hermetic): the three failure blocks below spawn
+# NOTHING (they fail at exec before any child runs), so there is no inherited-stdio
+# leak. `empty argv` and the permission-denied target print `str(e)` because those
+# messages ARE the CPython contract now. The permission target is `"/"` — a directory
+# is universally present and non-executable (`EACCES`), so this needs no created
+# fixture and is byte-identical to CPython on any Unix harness.
+import subprocess
+
+
+def main() -> None:
+    # capture: echo round-trip -> bytes (stdout), empty stderr
+    r = subprocess.run(["echo", "hello world"], capture_output=True)
+    print(r.returncode)
+    print(r.stdout)
+    print(r.stderr)
+
+    # exit codes (no capture -> silent commands, stdout/stderr are None)
+    print(subprocess.run(["true"]).returncode)
+    print(subprocess.run(["false"]).returncode)
+    print(subprocess.run(["sh", "-c", "exit 3"]).returncode)
+    print(subprocess.run(["true"]).stdout is None)
+
+    # stderr capture (stdout empty, stderr has the message)
+    e = subprocess.run(["sh", "-c", "echo oops 1>&2"], capture_output=True)
+    print(e.stdout)
+    print(e.stderr)
+
+    # capture a multi-line stdout
+    m = subprocess.run(["printf", "a\\nb\\nc"], capture_output=True)
+    print(m.stdout)
+
+    # a non-existent program is a catchable FileNotFoundError (message NOT printed)
+    try:
+        subprocess.run(["this_command_does_not_exist_pyrst_xyz"])
+        print("no error (wrong)")
+    except FileNotFoundError:
+        print("FileNotFoundError")
+
+    # empty argv -> a catchable IndexError whose message is CPython-exact (W5-h fix)
+    try:
+        subprocess.run([])
+        print("no error (wrong)")
+    except IndexError as ie:
+        print(str(ie))
+
+    # a non-executable target (a directory is universally EACCES) -> a catchable
+    # PermissionError with CPython's exact [Errno 13] payload (W5-h fix)
+    try:
+        subprocess.run(["/"])
+        print("no error (wrong)")
+    except PermissionError as pe:
+        print(str(pe))
+
+    # ...and PermissionError IS an OSError subclass (the W2 hierarchy), so a broad
+    # `except OSError` catches the same failure — proving a real subclass, not a
+    # coincidentally-worded bare OSError
+    try:
+        subprocess.run(["/"])
+        print("no error (wrong)")
+    except OSError:
+        print("OSError-hierarchy")

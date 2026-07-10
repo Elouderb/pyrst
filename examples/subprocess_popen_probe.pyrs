@@ -1,0 +1,19 @@
+# parity: pyrst-only
+#
+# W5-h subprocess scope choice (card 27aeeb3e): `run()` is fully built; `Popen`'s
+# async surface is HONESTLY DEFERRED with a NAMED, catchable error. pyrst-only:
+# CPython's `subprocess.Popen` actually spawns (would not raise), so this cannot
+# dual-run. Proves the deferral is honest (a NotImplementedError, not a miscompile).
+from subprocess import run, Popen, CompletedProcess
+
+
+def main() -> None:
+    # run() works (the synchronous case the AC covers)
+    r: CompletedProcess = run(["echo", "ok"], capture_output=True)
+    print(r.stdout)
+    # Popen is deferred -> a catchable, NAMED NotImplementedError
+    try:
+        Popen(["echo", "hi"])
+        print("no error (wrong)")
+    except NotImplementedError:
+        print("Popen deferred")

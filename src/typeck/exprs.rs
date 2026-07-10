@@ -1127,7 +1127,10 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
                 // `builtin_method_ret` so the two never drift and chained calls
                 // resolve.
                 let recv = infer_expr_ty(obj, locals, ctx);
-                if let Ty::Class(cls, _) = &recv {
+                // (W5-h) A lib handle (`Ty::Handle(n)`) resolves its methods via the
+                // same `ctx.classes` path as a value class (`method_lookup_class`), so
+                // `p.search(text)` on a `re.Pattern` handle types like a class method.
+                if let Some(cls) = method_lookup_class(&recv, ctx) {
                     // Generics v2: substitute the receiver instance's type args
                     // into the method's (type-var-bearing) return, so a generic
                     // method call types concretely for codegen (`b.get(): int`).
@@ -1147,13 +1150,13 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
                         // the same `subst_class_member` the method path uses (a generic
                         // field `f: Callable[[T], T]` resolves `T`). Mirrors the bare-attr
                         // field resolution above (Expr::Attr arm).
-                        ctx.get_all_fields(cls.as_str())
+                        ctx.get_all_fields(cls)
                             .iter()
                             .find(|f| f.name == *name)
                             .and_then(|f| {
                                 let tps = ctx
                                     .classes
-                                    .get(cls.as_str())
+                                    .get(cls)
                                     .map(|c| c.type_params.as_slice())
                                     .unwrap_or(&[]);
                                 let field_ty = Ty::from_type_expr_scoped(&f.ty, f.span, tps)
@@ -2397,6 +2400,25 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
             // Check if this is a class constructor or function call.
             match callee.as_ref() {
                 Expr::Ident(name, _) => {
+                    // (W5-h) An `@extern class` handle is NON-USER-CONSTRUCTIBLE: it is
+                    // an opaque external resource produced ONLY by its lib constructor
+                    // (e.g. `re.compile(...)` for `re.Pattern`), whose `@extern`
+                    // template builds the private `__PyHandle_<name>` struct. A direct
+                    // `Pattern()` has no `new()` and no value-struct to build — it
+                    // check-passed and then died at rustc (E0422) — so reject it
+                    // honestly here, pointing at the real constructor.
+                    if env.ctx.is_handle_class(name.as_str()) {
+                        return Err(Error::Type {
+                            span: *span,
+                            msg: format!(
+                                "`{}` is an opaque handle and cannot be constructed directly — \
+                                 it is produced only by its library constructor (an `@extern` \
+                                 function that returns a `{}`, e.g. `re.compile(...)` for a \
+                                 `Pattern`), never by calling `{}(...)`",
+                                name, name, name
+                            ),
+                        });
+                    }
                     if env.ctx.classes.contains_key(name.as_str()) {
                         // (W1.5 fix B) CPython binds constructor arguments to the
                         // class's __init__ PARAMETERS. When __init__ exists, map
@@ -3122,7 +3144,11 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                         // (`t.foo()` where `t: T`) needs a trait bound and is
                         // rejected — `T` is opaque, with no known methods.
                         reject_typevar_op(&obj_ty, "call a method on", *span)?;
-                        if let Ty::Class(class_name, _) = &obj_ty {
+                        // (W5-h) A lib handle (`Ty::Handle(n)`) routes its method call
+                        // through the same class path as a value class, so
+                        // `p.search(text)` on a `re.Pattern` handle checks (arity /
+                        // kwargs / by-ref / return) like a class method.
+                        if let Some(class_name) = method_lookup_class(&obj_ty, env.ctx) {
                             let key = format!("{}.{}", class_name, name);
                             // (kwargs v1) Fall back to the inheritance-aware
                             // `get_method` so an INHERITED method call resolves

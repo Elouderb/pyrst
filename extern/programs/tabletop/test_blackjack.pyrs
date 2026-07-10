@@ -1,0 +1,77 @@
+# test_blackjack.pyrs — pure-logic unit tests for blackjack rules.
+# Sibling of blackjack.pyrs (imports only resolve between siblings; a program
+# in tests/ cannot import the game modules). Run:
+#   pyrst build test_blackjack.pyrs && ./test_blackjack   (exit 0 = PASS)
+
+from blackjack import hand_total, is_soft, is_blackjack, settle, cpu_should_hit, upcard_value
+from cards import Card
+
+FAILS: int = 0
+
+
+def check(cond: bool, msg: str) -> None:
+    global FAILS
+    if cond:
+        print(f"PASS: {msg}")
+    else:
+        print(f"FAIL: {msg}")
+        FAILS = FAILS + 1
+
+
+def h2(r1: int, r2: int) -> list[Card]:
+    return [Card(r1, "S"), Card(r2, "H")]
+
+
+def main() -> None:
+    # --- hand_total / soft aces ---
+    check(hand_total(h2(14, 13)) == 21, "A+K = 21 (soft, blackjack)")
+    check(hand_total(h2(14, 14)) == 12, "A+A = 12 (one ace hard)")
+    check(hand_total([Card(14, "S"), Card(6, "H"), Card(10, "D")]) == 17, "A+6+10 = 17 hard")
+    check(hand_total([Card(14, "S"), Card(6, "H")]) == 17, "A+6 = 17 soft")
+    check(hand_total([Card(13, "S"), Card(12, "H"), Card(11, "D")]) == 30, "K+Q+J = 30 bust")
+    check(hand_total([Card(2, "S"), Card(3, "H"), Card(4, "D")]) == 9, "2+3+4 = 9")
+
+    # --- softness ---
+    check(is_soft(h2(14, 6)), "A+6 is soft")
+    check(not is_soft([Card(14, "S"), Card(6, "H"), Card(10, "D")]), "A+6+10 is hard")
+    check(not is_soft(h2(10, 7)), "10+7 is hard")
+
+    # --- naturals ---
+    check(is_blackjack(h2(14, 10)), "A+10 is blackjack")
+    check(not is_blackjack([Card(14, "S"), Card(6, "H"), Card(4, "D")]), "3-card 21 not blackjack")
+
+    # --- upcard value ---
+    check(upcard_value(Card(14, "S")) == 11, "Ace upcard = 11")
+    check(upcard_value(Card(13, "S")) == 10, "King upcard = 10")
+    check(upcard_value(Card(7, "S")) == 7, "7 upcard = 7")
+
+    # --- settlement ---
+    # player natural vs non-natural dealer -> +15 (3:2)
+    check(settle(h2(14, 10), [Card(9, "S"), Card(8, "H")]) == 15, "natural pays 3:2 (+15)")
+    # natural vs natural -> push
+    check(settle(h2(14, 10), h2(14, 13)) == 0, "natural vs natural pushes")
+    # player 20 beats dealer 18 -> +10
+    check(settle(h2(10, 10), [Card(10, "S"), Card(8, "H")]) == 10, "20 beats 18 (+10)")
+    # player busts -> -10 even if dealer also busts (player resolves first)
+    check(settle([Card(10, "S"), Card(10, "H"), Card(5, "D")], [Card(10, "C"), Card(10, "D"), Card(6, "S")]) == -10, "player bust loses even vs dealer bust")
+    # dealer busts, player stands -> +10
+    check(settle(h2(10, 8), [Card(10, "S"), Card(6, "H"), Card(9, "D")]) == 10, "dealer bust pays player")
+    # equal totals -> push
+    check(settle(h2(10, 9), [Card(10, "S"), Card(9, "H")]) == 0, "equal totals push")
+
+    # --- basic strategy (hit=True) ---
+    check(not cpu_should_hit(h2(10, 7), 6), "hard 17 stands")
+    check(cpu_should_hit(h2(10, 6), 7), "hard 16 vs 7 hits")
+    check(not cpu_should_hit(h2(10, 6), 6), "hard 16 vs 6 stands")
+    check(cpu_should_hit(h2(10, 2), 3), "hard 12 vs 3 hits")
+    check(not cpu_should_hit(h2(10, 2), 5), "hard 12 vs 5 stands")
+    check(cpu_should_hit(h2(14, 7), 9), "soft 18 vs 9 hits")
+    check(not cpu_should_hit(h2(14, 7), 6), "soft 18 vs 6 stands")
+    check(not cpu_should_hit(h2(14, 8), 6), "soft 19 stands")
+    check(cpu_should_hit(h2(14, 4), 6), "soft 15 always hits")
+
+    if FAILS == 0:
+        print("ALL BLACKJACK TESTS PASSED")
+    else:
+        print(f"{FAILS} BLACKJACK TEST(S) FAILED")
+        assert False

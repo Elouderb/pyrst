@@ -1,0 +1,26 @@
+# e2e_blackjack.pyrs — scripted-stdin end-to-end run of the blackjack game
+# through the real menu (main), one full round: stand, decline replay, quit.
+#
+# USAGE (from extern/programs/tabletop/):
+#   pyrst build main.pyrs
+#   pyrst build tests/e2e_blackjack.pyrs
+#   printf "1\nn\nn\n5\n" | ./e2e_blackjack
+#
+# Script: "1" picks Blackjack, "n" stands (Hit? y/n), "n" declines another
+# round, "5" quits the menu. Manually verified this produces a full round
+# (soft-ace/blackjack/dealer-draw/settlement all printed correctly) and a
+# clean return to the menu before quitting.
+#
+# Same subprocess stdio-inheritance workaround as tests/smoke_main.pyrs
+# (GAP: subprocess.run has no input= piping) — only the exit code is
+# asserted here; correctness of the printed round was verified manually.
+import subprocess
+
+
+def main() -> None:
+    result = subprocess.run(["./main"], capture_output=False)
+    if result.returncode == 0:
+        print("PASS: blackjack scripted round ran to completion (exit 0)")
+    else:
+        print(f"FAIL: main exited with code {result.returncode}")
+        assert False

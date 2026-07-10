@@ -1,0 +1,256 @@
+# rasterizer.pyrs — renders one or more sampled functions to a character
+# grid, plus a plain-text sample table.
+#
+# Rendering default (the card asks for one honest, fixed choice rather than
+# a runtime toggle): plain ASCII glyphs on a fixed 76x30 grid, NOT the
+# unicode braille/block density mode — ASCII is legible in any terminal/CI
+# log and keeps column<->x, row<->y mapping exactly 1 sample per column,
+# which is what makes `render`/`sample` trivially testable against a golden
+# string. Axes are drawn as a row of "-" (y == 0, if in range) and a column
+# of "|" (x == 0, if in range), with the origin as "+"; tick labels for
+# xmin/xmax/ymin/ymax printed on a header/footer line rather than inline (to
+# keep the grid strictly `width` columns wide, char-for-char, for goldens).
+#
+# Multi-function glyphs: distinct single-char glyphs assigned round-robin
+# from GLYPH_CYCLE (see `glyph_for_index`), e.g. '*', '#', 'o', '.', 'x' —
+# so up to 5 simultaneous functions are visually distinguishable; a 6th+
+# function wraps the cycle (an honest, documented limitation, not a crash).
+#
+# NaN/inf/discontinuity policy (per the card + evaluator.pyrs's contract):
+# a `nan` sample is skipped (no glyph plotted in that column); an `inf`/
+# `-inf` sample is clipped to the nearest plot-area edge row rather than
+# plotted literally (so `1/x` renders as a function that visibly "runs off"
+# the top/bottom near its asymptote instead of vanishing or crashing).
+
+import math
+
+from expr_parser import Expr
+from evaluator import eval_expr
+
+DEFAULT_WIDTH: int = 76
+DEFAULT_HEIGHT: int = 30
+
+# Distinct single-char glyphs for simultaneous functions, round-robined.
+GLYPHS: str = "*#o.x@"
+
+
+class Window:
+    xmin: float
+    xmax: float
+    ymin: float
+    ymax: float
+
+    def __init__(self, xmin: float, xmax: float, ymin: float, ymax: float) -> None:
+        self.xmin = xmin
+        self.xmax = xmax
+        self.ymin = ymin
+        self.ymax = ymax
+
+
+class PlotSpec:
+    source: str
+    expr: Expr
+    glyph: str
+
+    def __init__(self, source: str, expr: Expr, glyph: str) -> None:
+        self.source = source
+        self.expr = expr
+        self.glyph = glyph
+
+
+def default_window() -> Window:
+    # Card default: x in [-10, 10], y auto-scaled at render time from the
+    # sampled values. This symmetric fallback is only used when nothing is
+    # plotted yet (resolve_window keeps it as-is when there are no finite
+    # samples to scale to).
+    return Window(-10.0, 10.0, -10.0, 10.0)
+
+
+def glyph_for_index(i: int) -> str:
+    # Round-robin over GLYPHS by `i % len(GLYPHS)` (6+ functions wrap — an
+    # honest, documented limit, not a crash).
+    return GLYPHS[i % len(GLYPHS)]
+
+
+def xs_for_window(window: Window, width: int) -> list[float]:
+    # `width` evenly spaced x-samples across [xmin, xmax] inclusive — one per
+    # grid column, so column j always maps to xs[j].
+    xs: list[float] = []
+    if width <= 1:
+        xs.append(window.xmin)
+        return xs
+    span: float = window.xmax - window.xmin
+    step: float = span / float(width - 1)
+    j: int = 0
+    while j < width:
+        xs.append(window.xmin + step * float(j))
+        j += 1
+    return xs
+
+
+def _fmt(v: float) -> str:
+    # Compact label formatting that keeps non-finite values honest.
+    if math.isnan(v):
+        return "nan"
+    if math.isinf(v):
+        if v > 0.0:
+            return "inf"
+        return "-inf"
+    return f"{v:.2f}"
+
+
+def resolve_window(specs: list[PlotSpec], base: Window, y_auto: bool, width: int) -> Window:
+    # Return a Window whose y-range is auto-scaled to the finite sampled
+    # y-values of `specs` (with 5% padding) when `y_auto`; otherwise return
+    # `base` unchanged. Falls back to `base`'s y-range when there is nothing
+    # finite to scale to (no plots, or every sample nan/inf). Pure.
+    if not y_auto:
+        return base
+    xs: list[float] = xs_for_window(base, width)
+    have: bool = False
+    lo: float = 0.0
+    hi: float = 0.0
+    for spec in specs:
+        for x in xs:
+            y: float = eval_expr(spec.expr, x)
+            if math.isfinite(y):
+                if not have:
+                    lo = y
+                    hi = y
+                    have = True
+                else:
+                    if y < lo:
+                        lo = y
+                    if y > hi:
+                        hi = y
+    if not have:
+        return base
+    if hi - lo < 1e-9:
+        # Constant (or near-constant) function: give it a unit band so the
+        # line lands mid-grid instead of on a degenerate zero-height axis.
+        return Window(base.xmin, base.xmax, lo - 1.0, hi + 1.0)
+    pad: float = (hi - lo) * 0.05
+    return Window(base.xmin, base.xmax, lo - pad, hi + pad)
+
+
+def _row_for(y: float, window: Window, height: int) -> int:
+    # Map a finite y to a 0-based grid row (0 = top = ymax). Returns -1 when
+    # y should not be plotted (nan, or finite but outside [ymin, ymax]);
+    # +inf clips to the top row, -inf clips to the bottom row (so a function
+    # visibly runs off an edge near an asymptote instead of vanishing).
+    if math.isnan(y):
+        return -1
+    if math.isinf(y):
+        if y > 0.0:
+            return 0
+        return height - 1
+    if y < window.ymin or y > window.ymax:
+        return -1
+    span: float = window.ymax - window.ymin
+    if span <= 0.0:
+        return height // 2
+    frac: float = (y - window.ymin) / span
+    row: int = int(float(height - 1) * (1.0 - frac) + 0.5)
+    if row < 0:
+        row = 0
+    if row > height - 1:
+        row = height - 1
+    return row
+
+
+def _col_for_x0(window: Window, width: int) -> int:
+    # Grid column of the x = 0 axis, or -1 if 0 is outside [xmin, xmax].
+    if 0.0 < window.xmin or 0.0 > window.xmax:
+        return -1
+    span: float = window.xmax - window.xmin
+    if span <= 0.0:
+        return 0
+    frac: float = (0.0 - window.xmin) / span
+    col: int = int(float(width - 1) * frac + 0.5)
+    if col < 0:
+        col = 0
+    if col > width - 1:
+        col = width - 1
+    return col
+
+
+def render(specs: list[PlotSpec], window: Window, width: int, height: int) -> str:
+    # Pure: paint each spec's glyph into a width x height ASCII grid (axes
+    # drawn UNDER the glyphs), framed by header/footer bound labels and a
+    # legend. Byte-for-byte testable against golden strings. NaN samples are
+    # skipped; +-inf is clipped to the nearest edge row (see _row_for).
+    grid: list[list[str]] = []
+    r: int = 0
+    while r < height:
+        row_cells: list[str] = []
+        c: int = 0
+        while c < width:
+            row_cells.append(" ")
+            c += 1
+        grid.append(row_cells)
+        r += 1
+
+    # Axes first, so function glyphs overwrite them.
+    axis_row: int = _row_for(0.0, window, height)
+    axis_col: int = _col_for_x0(window, width)
+    if axis_row >= 0:
+        c2: int = 0
+        while c2 < width:
+            grid[axis_row][c2] = "-"
+            c2 += 1
+    if axis_col >= 0:
+        r2: int = 0
+        while r2 < height:
+            grid[r2][axis_col] = "|"
+            r2 += 1
+    if axis_row >= 0 and axis_col >= 0:
+        grid[axis_row][axis_col] = "+"
+
+    # Function glyphs on top.
+    xs: list[float] = xs_for_window(window, width)
+    for spec in specs:
+        col_i: int = 0
+        while col_i < width:
+            y: float = eval_expr(spec.expr, xs[col_i])
+            row_i: int = _row_for(y, window, height)
+            if row_i >= 0:
+                grid[row_i][col_i] = spec.glyph
+            col_i += 1
+
+    lines: list[str] = []
+    lines.append("y=" + _fmt(window.ymax) + " " + ("-" * (width - 1)))
+    r3: int = 0
+    while r3 < height:
+        lines.append("".join(grid[r3]))
+        r3 += 1
+    footer: str = "y=" + _fmt(window.ymin) + "  x: " + _fmt(window.xmin) + " .. " + _fmt(window.xmax)
+    lines.append(footer)
+    if len(specs) > 0:
+        lines.append("functions:")
+        for spec in specs:
+            lines.append("  " + spec.glyph + "  y = " + spec.source)
+    else:
+        lines.append("(no functions plotted — try: plot sin(x))")
+    return "\n".join(lines)
+
+
+def make_table(expr: Expr, xmin: float, xmax: float, steps: int) -> str:
+    # `steps` evenly spaced samples across [xmin, xmax] inclusive, one
+    # "x = ..   y = .." row each (nan/inf shown honestly). Pure.
+    lines: list[str] = []
+    lines.append("  x         y")
+    lines.append("  --------  --------")
+    n: int = steps
+    if n < 1:
+        n = 1
+    denom: int = n - 1
+    if denom < 1:
+        denom = 1
+    span: float = xmax - xmin
+    i: int = 0
+    while i < n:
+        x: float = xmin + span * float(i) / float(denom)
+        y: float = eval_expr(expr, x)
+        lines.append("  " + f"{x:8.3f}" + "  " + _fmt(y))
+        i += 1
+    return "\n".join(lines)

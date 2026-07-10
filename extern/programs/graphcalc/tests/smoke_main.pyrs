@@ -1,0 +1,35 @@
+# smoke_main.pyrs — non-interactive "build + run main, piped help+quit"
+# smoke test.
+#
+# USAGE (from extern/programs/graphcalc/):
+#   pyrst build main.pyrs
+#   pyrst build tests/smoke_main.pyrs
+#   printf 'help\nquit\n' | ./smoke_main
+#
+# GAP: `subprocess.run` has no `input=` / stdin-piping support (see
+# lib/subprocess.pyrs, card 27aeeb3e — the same gap logged by the sibling
+# tabletop dogfood project's tests/smoke_main.pyrs) — a pyrst program cannot
+# itself feed bytes into a spawned child's stdin. Workaround used here:
+# `subprocess.run([...], capture_output=False)` INHERITS this process's own
+# stdio (Rust `Command::status()`'s default), so piping input into *this*
+# smoke-test binary's stdin (`printf 'help\nquit\n' | ./smoke_main`) flows
+# through to `./main`'s stdin transparently, letting main's REPL loop read
+# "help" then "quit" and exit cleanly. `capture_output=True` instead sets
+# the child's stdin to `Stdio::null()` (Rust `Command::output()`'s
+# documented behavior), which would make main's `input()` call return ""
+# immediately at EOF — and main.pyrs's REPL treats a blank line exactly
+# like `quit` (see main.pyrs's EOF policy note), so THAT path would also
+# exit 0 without ever exercising the `help` command. So this smoke test can
+# only assert on the child's exit code, not on main's printed output —
+# stdout-content assertions belong on evaluator/rasterizer/expr_parser's
+# pure functions instead (directly importable, no subprocess needed).
+import subprocess
+
+
+def main() -> None:
+    result = subprocess.run(["./main"], capture_output=False)
+    if result.returncode == 0:
+        print("PASS: main ran to completion via piped help+quit (exit 0)")
+    else:
+        print(f"FAIL: main exited with code {result.returncode}")
+        assert False

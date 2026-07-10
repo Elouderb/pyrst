@@ -1,0 +1,231 @@
+# expr_parser.pyrs — tokenizer + recursive-descent parser for graphcalc.
+#
+# Grammar (precedence low -> high):
+#   expr    := term (("+" | "-") term)*
+#   term    := factor (("*" | "/") factor)*
+#   factor  := "-" factor | power               # unary minus (BELOW "**")
+#   power   := atom ("**" factor)?              # right-associative
+#   atom    := NUMBER | "x" | "pi" | "e"
+#            | FUNC "(" expr ")"                # sin/cos/tan/sqrt/abs/log/ln/exp/floor/ceil
+#            | "(" expr ")"
+#
+# NOTE (deliberate correctness change from the scaffold's grammar sketch,
+# logged on card d949c3e7): unary minus is placed BELOW "**" so it binds
+# LOOSER than exponentiation, matching Python/CPython. This is what makes
+# `-x**2` parse as `-(x**2)` (a downward-opening parabola) rather than
+# `(-x)**2` (an upward one) — the latter would be a visibly wrong plot for
+# the most common calculator input there is. `**`'s exponent is itself a
+# `factor`, so `2**-3` and `x**-1` also parse correctly.
+#
+# AST representation: a single flat `Expr` class tagged by `kind`, with
+# operands held in `args: list[Expr]` (a `list[Expr]` field needs no Box
+# indirection in pyrst, unlike a recursive `Optional[Self]` field — see
+# examples/parity_recursive_class.pyrs). This keeps the tree a plain value
+# type with no ownership gymnastics, and both `parse` and `eval_expr`
+# (evaluator.pyrs) are pure functions over it, per the card's testability
+# requirement.
+#
+# Token/AST kinds:
+#   Token.kind  in {"num", "ident", "+", "-", "*", "/", "**", "(", ")", "end"}
+#   Expr.kind   in {"num", "var", "const", "unary", "binary", "call"}
+#     "num"     -> Expr.num is the literal value, args == []
+#     "var"     -> the variable `x`, args == []
+#     "const"   -> Expr.op in {"pi", "e"}, args == []
+#     "unary"   -> Expr.op == "-", args == [operand]
+#     "binary"  -> Expr.op in {"+", "-", "*", "/", "**"}, args == [lhs, rhs]
+#     "call"    -> Expr.op is the function name, args == [argument]
+#
+# Parse errors: `parse` raises ValueError with a message that names the
+# offending token and its 0-based source column, e.g.
+#   "unexpected character '?' at column 4"
+#   "expected ')' at column 9, found end of input"
+# so the REPL can print the message directly under the input line.
+
+
+class Token:
+    kind: str
+    text: str
+    num: float
+    col: int
+
+    def __init__(self, kind: str, text: str, num: float, col: int) -> None:
+        self.kind = kind
+        self.text = text
+        self.num = num
+        self.col = col
+
+
+class Expr:
+    kind: str
+    num: float
+    op: str
+    args: list[Expr]
+
+    def __init__(self, kind: str, num: float, op: str, args: list[Expr]) -> None:
+        self.kind = kind
+        self.num = num
+        self.op = op
+        self.args = args
+
+
+def is_func_name(name: str) -> bool:
+    # The recognized unary function names (sin/cos/tan/sqrt/abs/log/ln/exp/
+    # floor/ceil), each backed by `lib/math.pyrs` (or the `abs` builtin).
+    # A plain function (not a module-level list constant) to sidestep any
+    # question about module-level mutable-collection globals (see README GAP
+    # note); tokenize() calls this per identifier.
+    return (
+        name == "sin" or name == "cos" or name == "tan" or name == "sqrt"
+        or name == "abs" or name == "log" or name == "ln" or name == "exp"
+        or name == "floor" or name == "ceil"
+    )
+
+
+def tokenize(src: str) -> list[Token]:
+    # Scan `src` into a list[Token] + a trailing ("end", ...) sentinel whose
+    # col is len(src) (so "found end of input" errors report past the last
+    # char). Numbers allow a single '.'; identifiers are [A-Za-z][A-Za-z0-9]*
+    # ("x"/"pi"/"e"/FUNC_NAMES — validated in the parser, not here); "*" vs
+    # "**" is disambiguated by lookahead. An unrecognized character raises
+    # ValueError naming the char and its 0-based column.
+    tokens: list[Token] = []
+    i: int = 0
+    n: int = len(src)
+    while i < n:
+        ch: str = src[i]
+        if ch == " " or ch == "\t":
+            i += 1
+        elif ch == "(" or ch == ")" or ch == "+" or ch == "-" or ch == "/":
+            tokens.append(Token(ch, ch, 0.0, i))
+            i += 1
+        elif ch == "*":
+            if i + 1 < n and src[i + 1] == "*":
+                tokens.append(Token("**", "**", 0.0, i))
+                i += 2
+            else:
+                tokens.append(Token("*", "*", 0.0, i))
+                i += 1
+        elif ch.isdigit() or ch == ".":
+            start: int = i
+            dots: int = 0
+            while i < n and (src[i].isdigit() or src[i] == "."):
+                if src[i] == ".":
+                    dots += 1
+                i += 1
+            text: str = src[start:i]
+            if dots > 1:
+                raise ValueError("malformed number '" + text + "' at column " + str(start))
+            tokens.append(Token("num", text, float(text), start))
+        elif ch.isalpha():
+            start2: int = i
+            while i < n and (src[i].isalpha() or src[i].isdigit()):
+                i += 1
+            tokens.append(Token("ident", src[start2:i], 0.0, start2))
+        else:
+            raise ValueError("unexpected character '" + ch + "' at column " + str(i))
+    tokens.append(Token("end", "", 0.0, n))
+    return tokens
+
+
+class Parser:
+    tokens: list[Token]
+    pos: int
+
+    def __init__(self, tokens: list[Token]) -> None:
+        self.tokens = tokens
+        self.pos = 0
+
+    def peek(self) -> Token:
+        return self.tokens[self.pos]
+
+    def advance(self) -> Token:
+        tok: Token = self.tokens[self.pos]
+        self.pos += 1
+        return tok
+
+    def parse_expr(self) -> Expr:
+        result: Expr = self.parse_term()
+        while self.peek().kind == "+" or self.peek().kind == "-":
+            op: str = self.advance().kind
+            rhs: Expr = self.parse_term()
+            result = Expr("binary", 0.0, op, [result, rhs])
+        return result
+
+    def parse_term(self) -> Expr:
+        result: Expr = self.parse_factor()
+        while self.peek().kind == "*" or self.peek().kind == "/":
+            op: str = self.advance().kind
+            rhs: Expr = self.parse_factor()
+            result = Expr("binary", 0.0, op, [result, rhs])
+        return result
+
+    def parse_factor(self) -> Expr:
+        # Unary minus binds looser than "**": "-" factor.
+        if self.peek().kind == "-":
+            self.advance()
+            operand: Expr = self.parse_factor()
+            return Expr("unary", 0.0, "-", [operand])
+        return self.parse_power()
+
+    def parse_power(self) -> Expr:
+        base: Expr = self.parse_atom()
+        if self.peek().kind == "**":
+            self.advance()
+            # Right-associative, and the exponent may itself be unary/negative.
+            exp: Expr = self.parse_factor()
+            return Expr("binary", 0.0, "**", [base, exp])
+        return base
+
+    def parse_atom(self) -> Expr:
+        tok: Token = self.peek()
+        if tok.kind == "num":
+            self.advance()
+            return Expr("num", tok.num, "", [])
+        if tok.kind == "(":
+            self.advance()
+            inner: Expr = self.parse_expr()
+            closing: Token = self.peek()
+            if closing.kind != ")":
+                if closing.kind == "end":
+                    raise ValueError("expected ')' at column " + str(closing.col) + ", found end of input")
+                raise ValueError("expected ')' at column " + str(closing.col))
+            self.advance()
+            return inner
+        if tok.kind == "ident":
+            self.advance()
+            name: str = tok.text
+            if name == "x":
+                return Expr("var", 0.0, "", [])
+            if name == "pi" or name == "e":
+                return Expr("const", 0.0, name, [])
+            if is_func_name(name):
+                opening: Token = self.peek()
+                if opening.kind != "(":
+                    raise ValueError("expected '(' after '" + name + "' at column " + str(opening.col))
+                self.advance()
+                arg: Expr = self.parse_expr()
+                close2: Token = self.peek()
+                if close2.kind != ")":
+                    if close2.kind == "end":
+                        raise ValueError("expected ')' at column " + str(close2.col) + ", found end of input")
+                    raise ValueError("expected ')' at column " + str(close2.col))
+                self.advance()
+                return Expr("call", 0.0, name, [arg])
+            raise ValueError("unknown name '" + name + "' at column " + str(tok.col))
+        if tok.kind == "end":
+            raise ValueError("unexpected end of input at column " + str(tok.col))
+        raise ValueError("unexpected token '" + tok.text + "' at column " + str(tok.col))
+
+
+def parse(src: str) -> Expr:
+    # tokenize(src) then recursive-descent parse per the grammar above. Raises
+    # ValueError (pointing at a 0-based column) on an empty expression, an
+    # unexpected/unknown token, an unmatched paren, or trailing input.
+    parser: Parser = Parser(tokenize(src))
+    if parser.peek().kind == "end":
+        raise ValueError("empty expression")
+    tree: Expr = parser.parse_expr()
+    trailing: Token = parser.peek()
+    if trailing.kind != "end":
+        raise ValueError("unexpected token '" + trailing.text + "' at column " + str(trailing.col))
+    return tree

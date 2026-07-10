@@ -1,0 +1,39 @@
+# main.pyrs — tabletop game sim menu shell.
+#
+# Build + run: `pyrst build main.pyrs && ./main` (from this directory).
+# Picks a game (all player-vs-CPU) or quits. See README.md.
+
+import ui
+import blackjack
+import holdem
+import checkers
+import chess
+
+DEFAULT_SEED: int = 42
+
+
+def print_menu() -> None:
+    print(ui.title("Tabletop Game Sim"))
+    print("1) Blackjack   (player + 2 CPU seats)")
+    print("2) Texas Hold'em (player + 2 CPU seats)")
+    print("3) Checkers    (vs CPU)")
+    print("4) Chess       (vs CPU)")
+    print("5) Quit")
+    print(ui.hr())
+
+
+def main() -> None:
+    while True:
+        print_menu()
+        choice: int = ui.prompt_int("Select an option (1-5): ", 1, 5)
+        if choice == 1:
+            blackjack.play_blackjack(DEFAULT_SEED)
+        elif choice == 2:
+            holdem.play_holdem(DEFAULT_SEED)
+        elif choice == 3:
+            checkers.play_checkers()
+        elif choice == 4:
+            chess.play_chess()
+        else:
+            print("Goodbye.")
+            return

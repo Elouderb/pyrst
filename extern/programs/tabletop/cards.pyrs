@@ -1,0 +1,80 @@
+# cards.pyrs — shared playing-card deck used by blackjack and hold-em.
+#
+# Card ranks are stored as int 2..14 (11=Jack, 12=Queen, 13=King, 14=Ace).
+# Suits are stored as a single-char str code ("S","H","D","C"); the class-const
+# pattern below stands in for an enum (pyrst has no metaclass-based `enum.Enum`
+# — see examples/parity_enum.pyrs for the established convention).
+#
+# Shuffling: pyrst has no `random.shuffle` (documented gap — module-level
+# mutable-state ownership rules; see README "Known limitations"). The
+# CPython-faithful workaround is `random.sample(xs, len(xs))`, which this
+# module uses after seeding the shared generator via `random.seed(...)`.
+
+import random
+
+
+class Suit:
+    SPADES: str = "S"
+    HEARTS: str = "H"
+    DIAMONDS: str = "D"
+    CLUBS: str = "C"
+
+
+class Card:
+    rank: int
+    suit: str
+
+    def __init__(self, rank: int, suit: str) -> None:
+        self.rank = rank
+        self.suit = suit
+
+    def rank_str(self) -> str:
+        if self.rank == 14:
+            return "A"
+        if self.rank == 13:
+            return "K"
+        if self.rank == 12:
+            return "Q"
+        if self.rank == 11:
+            return "J"
+        return str(self.rank)
+
+    def __str__(self) -> str:
+        return self.rank_str() + self.suit
+
+    def __eq__(self, other: Card) -> bool:
+        return self.rank == other.rank and self.suit == other.suit
+
+
+class Deck:
+    cards: list[Card]
+
+    def __init__(self) -> None:
+        self.cards = new_deck_cards()
+
+    def shuffle(self, seed: int) -> None:
+        random.seed(seed)
+        self.cards = random.sample(self.cards, len(self.cards))
+
+    def remaining(self) -> int:
+        return len(self.cards)
+
+    def draw(self) -> Card:
+        assert len(self.cards) > 0
+        c: Card = self.cards[len(self.cards) - 1]
+        self.cards = self.cards[0:len(self.cards) - 1]
+        return c
+
+
+# NOTE: the local list is named `deck_cards`, not `cards` — a local variable
+# shadowing this module's own name (`cards`) confuses the resolver ("module
+# `cards` has no function `append`"); see card f1ac8d46 GAP note.
+def new_deck_cards() -> list[Card]:
+    suits: list[str] = [Suit.SPADES, Suit.HEARTS, Suit.DIAMONDS, Suit.CLUBS]
+    deck_cards: list[Card] = []
+    for suit in suits:
+        rank: int = 2
+        while rank <= 14:
+            deck_cards.append(Card(rank, suit))
+            rank = rank + 1
+    return deck_cards

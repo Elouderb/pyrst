@@ -1,0 +1,124 @@
+# ast_types.pyrs — typed AST node definitions for pyrstdb's SQL subset.
+#
+# DESIGN NOTE (GAP workaround, log on card 283e473a): pyrst has no algebraic
+# sum types and no isinstance()/getattr()-style downcasting from a base class
+# to a concrete subclass's own fields (reading a derived-only field through a
+# base-typed variable is a check-time error). A classic "one class per node
+# kind + polymorphic dispatch" AST is therefore awkward here: the executor
+# would need to downcast a `Statement` to `InsertStmt` to reach its rows, and
+# that path does not exist. Instead this module uses the flat
+# "tagged struct" pattern already used for `Value` below: ONE `Statement`
+# class carries a `kind: str` discriminant plus every field any statement
+# kind might need (unused fields stay at their zero value for a given kind).
+# The parser fills in only the fields relevant to `kind`; the executor
+# switches on `kind` with if/elif. This is a deliberate scaffold decision,
+# not a bug — revisit only if a future compiler epic adds real sum types.
+
+class ColumnDef:
+    name: str
+    col_type: str  # "INT" | "FLOAT" | "TEXT" | "BOOL"
+
+    def __init__(self, name: str, col_type: str) -> None:
+        self.name = name
+        self.col_type = col_type
+
+
+class Value:
+    # Tagged literal value: exactly one of the typed fields is meaningful,
+    # selected by `kind`. Mirrors ColumnDef.col_type plus "NULL".
+    kind: str  # "INT" | "FLOAT" | "TEXT" | "BOOL" | "NULL"
+    int_val: int
+    float_val: float
+    text_val: str
+    bool_val: bool
+
+    def __init__(self, kind: str, int_val: int, float_val: float, text_val: str, bool_val: bool) -> None:
+        self.kind = kind
+        self.int_val = int_val
+        self.float_val = float_val
+        self.text_val = text_val
+        self.bool_val = bool_val
+
+
+def null_value() -> Value:
+    return Value("NULL", 0, 0.0, "", False)
+
+
+def int_value(n: int) -> Value:
+    return Value("INT", n, 0.0, "", False)
+
+
+def float_value(f: float) -> Value:
+    return Value("FLOAT", 0, f, "", False)
+
+
+def text_value(s: str) -> Value:
+    return Value("TEXT", 0, 0.0, s, False)
+
+
+def bool_value(b: bool) -> Value:
+    return Value("BOOL", 0, 0.0, "", b)
+
+
+class Condition:
+    column: str
+    op: str  # "=" | "!=" | "<" | ">" | "<=" | ">="
+    value: Value
+
+    def __init__(self, column: str, op: str, value: Value) -> None:
+        self.column = column
+        self.op = op
+        self.value = value
+
+
+class WhereClause:
+    conditions: list[Condition]
+    # logic_ops[i] joins conditions[i] to conditions[i+1]; each is "AND"/"OR".
+    # len(logic_ops) == len(conditions) - 1. No operator precedence beyond
+    # strict left-to-right evaluation (no parenthesized sub-expressions) —
+    # matches the SQL subset documented in README.md.
+    logic_ops: list[str]
+
+    def __init__(self, conditions: list[Condition], logic_ops: list[str]) -> None:
+        self.conditions = conditions
+        self.logic_ops = logic_ops
+
+
+class Statement:
+    kind: str  # "CREATE_TABLE" | "INSERT" | "SELECT" | "UPDATE" | "DELETE" | "DROP_TABLE"
+    table_name: str
+
+    # CREATE_TABLE
+    columns: list[ColumnDef]
+
+    # INSERT — insert_columns empty means "all columns, declared order";
+    # insert_rows supports multi-row INSERT (one entry per row).
+    insert_columns: list[str]
+    insert_rows: list[list[Value]]
+
+    # SELECT — select_columns empty means "*" (all columns).
+    select_columns: list[str]
+    order_by: Optional[str]
+    order_desc: bool
+    limit: Optional[int]
+
+    # UPDATE — set_columns[i] = set_values[i]
+    set_columns: list[str]
+    set_values: list[Value]
+
+    # SELECT / UPDATE / DELETE
+    where: Optional[WhereClause]
+
+    def __init__(self, kind: str) -> None:
+        self.kind = kind
+        self.table_name = ""
+        self.columns = []
+        self.insert_columns = []
+        self.insert_rows = []
+        self.select_columns = []
+        self.order_by = None
+        self.order_desc = False
+        self.limit = None
+        self.set_columns = []
+        self.set_values = []
+        self.where = None

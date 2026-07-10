@@ -1,0 +1,231 @@
+# storage.pyrs — in-memory table store + file persistence.
+# See README.md "File format" for the on-disk layout `load_database` /
+# `save_database` must implement (uses the file handle API — open/read/write
+# — per card 283e473a; no external serde crate).
+#
+# NOTE: a qualified generic type arg (`list[ast_types.Value]`) does not
+# parse in pyrst, so cross-module types are pulled in via `from X import Y`
+# and used bare below.
+
+from ast_types import ColumnDef, Value
+from ast_types import int_value, float_value, text_value, bool_value, null_value
+
+# Sentinel written for a NULL cell in the on-disk file format. Chosen to be
+# unlikely in TEXT data; a TEXT column literally storing this string round-trips
+# as NULL (a documented v1 edge — see README "File format").
+NULL_TOKEN: str = "\\N"
+
+
+def coerce_value(col_name: str, col_type: str, v: Value) -> Value:
+    # Validate/adapt a literal for a typed column. NULL is accepted for any
+    # column; an INT literal widens into a FLOAT column; anything else must
+    # match the column type exactly, or it is a ValueError the executor turns
+    # into a per-statement error result.
+    if v.kind == "NULL":
+        return v
+    if col_type == "FLOAT" and v.kind == "INT":
+        return float_value(float(v.int_val))
+    if v.kind != col_type:
+        raise ValueError("type mismatch for column '" + col_name + "': expected " + col_type + ", got " + v.kind)
+    return v
+
+
+class Row:
+    values: list[Value]
+
+    def __init__(self, values: list[Value]) -> None:
+        self.values = values
+
+
+class Table:
+    name: str
+    columns: list[ColumnDef]
+    rows: list[Row]
+
+    def __init__(self, name: str, columns: list[ColumnDef]) -> None:
+        self.name = name
+        self.columns = columns
+        self.rows = []
+
+    def column_index(self, col_name: str) -> int:
+        i: int = 0
+        while i < len(self.columns):
+            if self.columns[i].name == col_name:
+                return i
+            i = i + 1
+        raise ValueError("no such column: " + col_name)
+
+    def insert_row(self, row: Row) -> None:
+        # Validate arity and per-column types (coercing where allowed), then
+        # append. The stored row uses the coerced values so on-disk and
+        # in-memory representations agree.
+        if len(row.values) != len(self.columns):
+            raise ValueError("row has " + str(len(row.values)) + " value(s) but table '" + self.name + "' has " + str(len(self.columns)) + " column(s)")
+        newvals: list[Value] = []
+        idx: int = 0
+        while idx < len(self.columns):
+            col: ColumnDef = self.columns[idx]
+            newvals.append(coerce_value(col.name, col.col_type, row.values[idx]))
+            idx = idx + 1
+        self.rows.append(Row(newvals))
+
+    def delete_row_at(self, index: int) -> None:
+        # WHERE-matching lives in executor.pyrs; it computes matching indices
+        # and calls this highest-index-first to keep indices stable.
+        self.rows.pop(index)
+
+
+class Database:
+    name: str
+    tables: dict[str, Table]
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.tables = {}
+
+    def has_table(self, name: str) -> bool:
+        return name in self.tables
+
+    def get_table(self, name: str) -> Optional[Table]:
+        if name in self.tables:
+            return self.tables[name]
+        return None
+
+    def create_table(self, name: str, columns: list[ColumnDef]) -> None:
+        if name in self.tables:
+            raise ValueError("table '" + name + "' already exists")
+        self.tables[name] = Table(name, columns)
+
+    def drop_table(self, name: str) -> None:
+        if name not in self.tables:
+            raise ValueError("no such table: " + name)
+        self.tables.pop(name)
+
+    def sorted_table_names(self) -> list[str]:
+        names: list[str] = []
+        for k in self.tables:
+            names.append(k)
+        names.sort()
+        return names
+
+
+def value_to_cell(v: Value) -> str:
+    # Serialize one cell for the on-disk format. TEXT is written raw; a '|' or
+    # newline inside TEXT would corrupt the row layout, so it is a named error
+    # on save rather than silent corruption (README "File format").
+    if v.kind == "NULL":
+        return NULL_TOKEN
+    if v.kind == "INT":
+        return str(v.int_val)
+    if v.kind == "FLOAT":
+        return str(v.float_val)
+    if v.kind == "BOOL":
+        if v.bool_val:
+            return "True"
+        return "False"
+    if "|" in v.text_val or "\n" in v.text_val:
+        raise ValueError("cannot serialize TEXT value containing '|' or a newline: '" + v.text_val + "'")
+    return v.text_val
+
+
+def cell_to_value(col_type: str, cell: str) -> Value:
+    if cell == NULL_TOKEN:
+        return null_value()
+    if col_type == "INT":
+        return int_value(int(cell))
+    if col_type == "FLOAT":
+        return float_value(float(cell))
+    if col_type == "BOOL":
+        return bool_value(cell == "True")
+    return text_value(cell)
+
+
+def load_database(name: str, path: str) -> Database:
+    # A missing file loads as a fresh empty Database (first-run UX). Otherwise
+    # parse the documented TABLE/ROW text format via the file-handle API.
+    db: Database = Database(name)
+    content: str = ""
+    try:
+        with open(path) as f:
+            content = f.read()
+    except OSError:
+        return db
+    lines: list[str] = content.splitlines()
+    for line in lines:
+        s: str = line.strip()
+        if s == "":
+            continue
+        parts: list[str] = s.split(" ")
+        tag: str = parts[0]
+        if tag == "TABLE":
+            if len(parts) < 2:
+                raise ValueError("malformed TABLE line: " + line)
+            tname: str = parts[1]
+            cols: list[ColumnDef] = []
+            ti: int = 2
+            while ti < len(parts):
+                spec: str = parts[ti]
+                if ":" not in spec:
+                    raise ValueError("malformed column spec '" + spec + "' in line: " + line)
+                sp: list[str] = spec.split(":")
+                cols.append(ColumnDef(sp[0], sp[1]))
+                ti = ti + 1
+            db.create_table(tname, cols)
+        elif tag == "ROW":
+            if len(parts) < 2:
+                raise ValueError("malformed ROW line: " + line)
+            rname: str = parts[1]
+            if rname not in db.tables:
+                raise ValueError("ROW references unknown table '" + rname + "' in line: " + line)
+            rest: list[str] = []
+            ri: int = 2
+            while ri < len(parts):
+                rest.append(parts[ri])
+                ri = ri + 1
+            cellstr: str = " ".join(rest)
+            t: Table = db.tables[rname]
+            cell_list: list[str] = []
+            if len(t.columns) == 1:
+                cell_list.append(cellstr)
+            else:
+                cell_list = cellstr.split("|")
+            if len(cell_list) != len(t.columns):
+                raise ValueError("ROW has " + str(len(cell_list)) + " cell(s) but table '" + rname + "' has " + str(len(t.columns)) + " column(s) in line: " + line)
+            vals: list[Value] = []
+            ci: int = 0
+            while ci < len(t.columns):
+                vals.append(cell_to_value(t.columns[ci].col_type, cell_list[ci]))
+                ci = ci + 1
+            # Append through the stored table, then write it back (value
+            # semantics: db.tables[rname] read yields a clone).
+            tt: Table = db.tables[rname]
+            tt.rows.append(Row(vals))
+            db.tables[rname] = tt
+        else:
+            raise ValueError("unknown line type '" + tag + "' in line: " + line)
+    return db
+
+
+def save_database(db: Database, path: str) -> None:
+    # Serialize in the documented format, tables emitted in sorted name order
+    # for deterministic file contents.
+    lines: list[str] = []
+    for name in db.sorted_table_names():
+        t: Table = db.tables[name]
+        specs: list[str] = []
+        for col in t.columns:
+            specs.append(col.name + ":" + col.col_type)
+        header: str = "TABLE " + name
+        if len(specs) > 0:
+            header = header + " " + " ".join(specs)
+        lines.append(header)
+        for row in t.rows:
+            cells: list[str] = []
+            for v in row.values:
+                cells.append(value_to_cell(v))
+            lines.append("ROW " + name + " " + "|".join(cells))
+    content: str = "\n".join(lines)
+    if len(lines) > 0:
+        content = content + "\n"
+    with open(path, "w") as f:
+        f.write(content)

@@ -1,0 +1,90 @@
+# test_evaluator.pyrs — pyrst-native unit tests for expr_parser.parse +
+# evaluator.eval_expr/sample against known values (precedence, associativity,
+# unary minus, nested functions, domain-error -> nan, div-by-zero -> inf).
+#
+# LOCATION NOTE (GAP worked around, logged on card d949c3e7): pyrst resolves
+# `import`/`from X import Y` relative to the IMPORTING FILE's own directory
+# (src/resolver.rs's `base_dir`), with no relative-import syntax (`from ..x
+# import y`) to reach a parent directory. A test file under tests/ therefore
+# CANNOT `from expr_parser import parse` (it would look for
+# tests/expr_parser.pyrs, which doesn't exist) — there is no package/pytest-
+# style "add parent to path" mechanism. Workaround: this pure-function unit
+# test lives at the project ROOT, alongside the modules it imports, exactly
+# like expr_parser.pyrs/evaluator.pyrs/rasterizer.pyrs/main.pyrs do for each
+# other. tests/ is reserved for the subprocess-based smoke test, which needs
+# no cross-directory import. Build+run from extern/programs/graphcalc/:
+#   pyrst build test_evaluator.pyrs && ./test_evaluator
+
+import math
+
+from expr_parser import parse
+from evaluator import eval_expr, sample
+
+EPS: float = 1e-9
+
+
+def approx(a: float, b: float) -> bool:
+    return abs(a - b) < EPS
+
+
+def check(name: str, cond: bool, fails: Mut[list[str]]) -> None:
+    if cond:
+        print("PASS: " + name)
+    else:
+        print("FAIL: " + name)
+        fails.append(name)
+
+
+def main() -> None:
+    fails: list[str] = []
+
+    # --- known values ---
+    check("sin(pi/2) == 1", approx(eval_expr(parse("sin(pi/2)"), 0.0), 1.0), fails)
+    check("cos(0) == 1", approx(eval_expr(parse("cos(0)"), 0.0), 1.0), fails)
+    check("sqrt(sqrt(16)) == 2 (nested fns)", approx(eval_expr(parse("sqrt(sqrt(16))"), 0.0), 2.0), fails)
+    check("ln(e) == 1", approx(eval_expr(parse("ln(e)"), 0.0), 1.0), fails)
+    check("log(100) == 2 (base-10)", approx(eval_expr(parse("log(100)"), 0.0), 2.0), fails)
+    check("exp(0) == 1", approx(eval_expr(parse("exp(0)"), 0.0), 1.0), fails)
+    check("floor(1.7) == 1", approx(eval_expr(parse("floor(1.7)"), 0.0), 1.0), fails)
+    check("ceil(1.2) == 2", approx(eval_expr(parse("ceil(1.2)"), 0.0), 2.0), fails)
+    check("abs(-3) == 3", approx(eval_expr(parse("abs(-3)"), 0.0), 3.0), fails)
+
+    # --- precedence / associativity ---
+    check("2+3*4 == 14 (precedence)", approx(eval_expr(parse("2+3*4"), 0.0), 14.0), fails)
+    check("(2+3)*4 == 20 (parens)", approx(eval_expr(parse("(2+3)*4"), 0.0), 20.0), fails)
+    check("2**3**2 == 512 (right-assoc **)", approx(eval_expr(parse("2**3**2"), 0.0), 512.0), fails)
+    check("2*3**2 == 18 (** over *)", approx(eval_expr(parse("2*3**2"), 0.0), 18.0), fails)
+
+    # --- unary minus precedence (below **, per grammar comment) ---
+    check("-x**2 at x=2 == -4 (unary below **)", approx(eval_expr(parse("-x**2"), 2.0), -4.0), fails)
+    check("(-x)**2 at x=2 == 4", approx(eval_expr(parse("(-x)**2"), 2.0), 4.0), fails)
+    check("-2**2 == -4", approx(eval_expr(parse("-2**2"), 0.0), -4.0), fails)
+    check("2**-3 == 0.125 (negative exponent)", approx(eval_expr(parse("2**-3"), 0.0), 0.125), fails)
+    check("--3 == 3 (double unary)", approx(eval_expr(parse("--3"), 0.0), 3.0), fails)
+
+    # --- variable substitution / polynomial ---
+    check("x*x+2*x+1 at x=3 == 16", approx(eval_expr(parse("x*x+2*x+1"), 3.0), 16.0), fails)
+    check("x at x=-7 == -7", approx(eval_expr(parse("x"), -7.0), -7.0), fails)
+
+    # --- domain errors normalize to nan, never raise ---
+    check("sqrt(-1) is nan (domain error)", math.isnan(eval_expr(parse("sqrt(-1)"), 0.0)), fails)
+    check("log(0) is nan (domain error)", math.isnan(eval_expr(parse("log(0)"), 0.0)), fails)
+    check("ln(-5) is nan (domain error)", math.isnan(eval_expr(parse("ln(x)"), -5.0)), fails)
+
+    # --- division by zero is IEEE inf, NOT an exception/nan ---
+    check("1/x at x=0 is +inf", math.isinf(eval_expr(parse("1/x"), 0.0)) and eval_expr(parse("1/x"), 0.0) > 0.0, fails)
+    check("-1/x at x=0 is -inf", math.isinf(eval_expr(parse("-1/x"), 0.0)) and eval_expr(parse("-1/x"), 0.0) < 0.0, fails)
+
+    # --- sample() vectorizes eval_expr ---
+    ys: list[float] = sample(parse("x**2"), [0.0, 1.0, 2.0, -3.0])
+    check("sample(x**2, [0,1,2,-3]) == [0,1,4,9]",
+          approx(ys[0], 0.0) and approx(ys[1], 1.0) and approx(ys[2], 4.0) and approx(ys[3], 9.0),
+          fails)
+    ys2: list[float] = sample(parse("sqrt(x)"), [-1.0, 4.0])
+    check("sample(sqrt(x), [-1,4]) == [nan, 2]", math.isnan(ys2[0]) and approx(ys2[1], 2.0), fails)
+
+    if len(fails) == 0:
+        print("PASS: test_evaluator — all " + str(24) + " checks passed")
+    else:
+        print("FAIL: test_evaluator — " + str(len(fails)) + " check(s) failed: " + ", ".join(fails))
+        assert False

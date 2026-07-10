@@ -1,0 +1,367 @@
+# executor.pyrs — runs a typed ast_types.Statement against a storage.Database
+# and produces a display-ready ExecResult. Pure-function style where
+# possible (a `Statement` in, a `Database` mutated by reference, an
+# `ExecResult` out) per card 283e473a's architecture note.
+#
+# NOTE: a qualified generic type arg (`list[storage.Row]`) does not parse in
+# pyrst, so cross-module types are pulled in via `from X import Y` and used
+# bare below.
+
+from ast_types import Statement, WhereClause, Condition, Value, ColumnDef
+from ast_types import null_value, float_value
+from storage import Table, Row, Database, coerce_value
+
+
+class ExecResult:
+    ok: bool
+    message: str      # human-readable status ("1 row inserted.", or an error)
+    columns: list[str]  # result-set column names (SELECT only; empty otherwise)
+    rows: list[Row]     # result-set rows (SELECT only; empty otherwise)
+
+    def __init__(self, ok: bool, message: str) -> None:
+        self.ok = ok
+        self.message = message
+        self.columns = []
+        self.rows = []
+
+
+def execute(stmt: Statement, db: Mut[Database]) -> ExecResult:
+    # Dispatch on stmt.kind. Any ValueError from the parser-validated storage
+    # layer (unknown table/column, type mismatch, duplicate table) becomes a
+    # per-statement error result rather than crashing the REPL loop.
+    try:
+        if stmt.kind == "CREATE_TABLE":
+            return exec_create_table(stmt, db)
+        if stmt.kind == "INSERT":
+            return exec_insert(stmt, db)
+        if stmt.kind == "SELECT":
+            return exec_select(stmt, db)
+        if stmt.kind == "UPDATE":
+            return exec_update(stmt, db)
+        if stmt.kind == "DELETE":
+            return exec_delete(stmt, db)
+        if stmt.kind == "DROP_TABLE":
+            return exec_drop_table(stmt, db)
+        return ExecResult(False, "error: internal: unknown statement kind '" + stmt.kind + "'")
+    except ValueError as e:
+        return ExecResult(False, "error: " + e)
+
+
+def exec_create_table(stmt: Statement, db: Mut[Database]) -> ExecResult:
+    db.create_table(stmt.table_name, stmt.columns)
+    return ExecResult(True, "Table '" + stmt.table_name + "' created.")
+
+
+def build_insert_row(table: Table, insert_columns: list[str], provided: list[Value]) -> list[Value]:
+    # Map a VALUES tuple onto the table's declared column order. An empty
+    # column list means "all columns in declared order"; a named list fills
+    # only those positions and leaves the rest NULL.
+    if len(insert_columns) == 0:
+        if len(provided) != len(table.columns):
+            raise ValueError("table '" + table.name + "' has " + str(len(table.columns)) + " column(s) but " + str(len(provided)) + " value(s) were given")
+        return provided
+    if len(insert_columns) != len(provided):
+        raise ValueError("column count (" + str(len(insert_columns)) + ") does not match value count (" + str(len(provided)) + ")")
+    result: list[Value] = []
+    ci: int = 0
+    while ci < len(table.columns):
+        result.append(null_value())
+        ci = ci + 1
+    pi: int = 0
+    while pi < len(insert_columns):
+        idx: int = table.column_index(insert_columns[pi])
+        result[idx] = provided[pi]
+        pi = pi + 1
+    return result
+
+
+def exec_insert(stmt: Statement, db: Mut[Database]) -> ExecResult:
+    if stmt.table_name not in db.tables:
+        return ExecResult(False, "error: no such table: " + stmt.table_name)
+    t: Table = db.tables[stmt.table_name]
+    count: int = 0
+    for rowvals in stmt.insert_rows:
+        full: list[Value] = build_insert_row(t, stmt.insert_columns, rowvals)
+        t.insert_row(Row(full))
+        count = count + 1
+    db.tables[stmt.table_name] = t
+    return ExecResult(True, str(count) + " row(s) inserted.")
+
+
+def exec_select(stmt: Statement, db: Mut[Database]) -> ExecResult:
+    if stmt.table_name not in db.tables:
+        return ExecResult(False, "error: no such table: " + stmt.table_name)
+    t: Table = db.tables[stmt.table_name]
+    out_cols: list[str] = []
+    if len(stmt.select_columns) == 0:
+        for col in t.columns:
+            out_cols.append(col.name)
+    else:
+        out_cols = stmt.select_columns
+    out_idx: list[int] = []
+    for cn in out_cols:
+        out_idx.append(t.column_index(cn))
+    matched: list[Row] = []
+    for row in t.rows:
+        if row_matches_where(t, row, stmt.where):
+            matched.append(row)
+    ob: Optional[str] = stmt.order_by
+    if ob is not None:
+        ob_idx: int = t.column_index(ob)
+        matched = stable_sort_rows(matched, ob_idx, stmt.order_desc)
+    lim_opt: Optional[int] = stmt.limit
+    if lim_opt is not None:
+        limval: int = lim_opt
+        # A negative LIMIT naturally yields zero rows (the loop never runs).
+        limited: list[Row] = []
+        k: int = 0
+        while k < len(matched) and k < limval:
+            limited.append(matched[k])
+            k = k + 1
+        matched = limited
+    res: ExecResult = ExecResult(True, "")
+    res.columns = out_cols
+    projected: list[Row] = []
+    for row in matched:
+        pv: list[Value] = []
+        for ix in out_idx:
+            pv.append(row.values[ix])
+        projected.append(Row(pv))
+    res.rows = projected
+    res.message = str(len(projected)) + " row(s)"
+    return res
+
+
+def exec_update(stmt: Statement, db: Mut[Database]) -> ExecResult:
+    if stmt.table_name not in db.tables:
+        return ExecResult(False, "error: no such table: " + stmt.table_name)
+    t: Table = db.tables[stmt.table_name]
+    set_idx: list[int] = []
+    coerced: list[Value] = []
+    si: int = 0
+    while si < len(stmt.set_columns):
+        idx: int = t.column_index(stmt.set_columns[si])
+        col: ColumnDef = t.columns[idx]
+        set_idx.append(idx)
+        coerced.append(coerce_value(col.name, col.col_type, stmt.set_values[si]))
+        si = si + 1
+    count: int = 0
+    new_rows: list[Row] = []
+    for row in t.rows:
+        if row_matches_where(t, row, stmt.where):
+            newvals: list[Value] = []
+            k: int = 0
+            while k < len(row.values):
+                newvals.append(row.values[k])
+                k = k + 1
+            m: int = 0
+            while m < len(set_idx):
+                newvals[set_idx[m]] = coerced[m]
+                m = m + 1
+            new_rows.append(Row(newvals))
+            count = count + 1
+        else:
+            new_rows.append(row)
+    t.rows = new_rows
+    db.tables[stmt.table_name] = t
+    return ExecResult(True, str(count) + " row(s) updated.")
+
+
+def exec_delete(stmt: Statement, db: Mut[Database]) -> ExecResult:
+    if stmt.table_name not in db.tables:
+        return ExecResult(False, "error: no such table: " + stmt.table_name)
+    t: Table = db.tables[stmt.table_name]
+    kept: list[Row] = []
+    count: int = 0
+    for row in t.rows:
+        if row_matches_where(t, row, stmt.where):
+            count = count + 1
+        else:
+            kept.append(row)
+    t.rows = kept
+    db.tables[stmt.table_name] = t
+    return ExecResult(True, str(count) + " row(s) deleted.")
+
+
+def exec_drop_table(stmt: Statement, db: Mut[Database]) -> ExecResult:
+    db.drop_table(stmt.table_name)
+    return ExecResult(True, "Table '" + stmt.table_name + "' dropped.")
+
+
+def as_float(v: Value) -> float:
+    if v.kind == "INT":
+        return float(v.int_val)
+    return v.float_val
+
+
+def compare_values(a: Value, b: Value) -> int:
+    # Total-ish ordering used by ORDER BY and range comparisons. NULL sorts as
+    # smallest; INT/FLOAT compare numerically together; TEXT lexicographically;
+    # BOOL False<True; mismatched non-numeric kinds fall back to kind-name
+    # order for determinism (they never compare equal).
+    if a.kind == "NULL" and b.kind == "NULL":
+        return 0
+    if a.kind == "NULL":
+        return -1
+    if b.kind == "NULL":
+        return 1
+    a_num: bool = a.kind == "INT" or a.kind == "FLOAT"
+    b_num: bool = b.kind == "INT" or b.kind == "FLOAT"
+    if a_num and b_num:
+        af: float = as_float(a)
+        bf: float = as_float(b)
+        if af < bf:
+            return -1
+        if af > bf:
+            return 1
+        return 0
+    if a.kind == "TEXT" and b.kind == "TEXT":
+        if a.text_val < b.text_val:
+            return -1
+        if a.text_val > b.text_val:
+            return 1
+        return 0
+    if a.kind == "BOOL" and b.kind == "BOOL":
+        ai: int = 0
+        if a.bool_val:
+            ai = 1
+        bi: int = 0
+        if b.bool_val:
+            bi = 1
+        if ai < bi:
+            return -1
+        if ai > bi:
+            return 1
+        return 0
+    if a.kind < b.kind:
+        return -1
+    if a.kind > b.kind:
+        return 1
+    return 0
+
+
+def stable_sort_rows(rows: list[Row], col_idx: int, desc: bool) -> list[Row]:
+    # Stable insertion sort by one column (equal keys keep source order).
+    result: list[Row] = []
+    for row in rows:
+        j: int = 0
+        placed: bool = False
+        while j < len(result):
+            c: int = compare_values(row.values[col_idx], result[j].values[col_idx])
+            if desc:
+                c = -c
+            if c < 0:
+                result.insert(j, row)
+                placed = True
+                break
+            j = j + 1
+        if not placed:
+            result.append(row)
+    return result
+
+
+def compare_op(cell: Value, op: str, target: Value) -> bool:
+    # Any comparison involving NULL is unknown -> not matched (deterministic
+    # v1 semantics, documented). Equality across mismatched non-numeric kinds
+    # is False.
+    if cell.kind == "NULL" or target.kind == "NULL":
+        return False
+    c: int = compare_values(cell, target)
+    if op == "=":
+        return c == 0
+    if op == "!=":
+        return c != 0
+    if op == "<":
+        return c < 0
+    if op == ">":
+        return c > 0
+    if op == "<=":
+        return c <= 0
+    if op == ">=":
+        return c >= 0
+    return False
+
+
+def eval_condition(table: Table, row: Row, cond: Condition) -> bool:
+    idx: int = table.column_index(cond.column)
+    return compare_op(row.values[idx], cond.op, cond.value)
+
+
+def row_matches_where(table: Table, row: Row, where: Optional[WhereClause]) -> bool:
+    if where is None:
+        return True
+    wc: WhereClause = where
+    result: bool = eval_condition(table, row, wc.conditions[0])
+    i: int = 0
+    while i < len(wc.logic_ops):
+        nextc: bool = eval_condition(table, row, wc.conditions[i + 1])
+        if wc.logic_ops[i] == "AND":
+            result = result and nextc
+        else:
+            result = result or nextc
+        i = i + 1
+    return result
+
+
+def display_value(v: Value) -> str:
+    if v.kind == "NULL":
+        return "NULL"
+    if v.kind == "INT":
+        return str(v.int_val)
+    if v.kind == "FLOAT":
+        return str(v.float_val)
+    if v.kind == "BOOL":
+        if v.bool_val:
+            return "True"
+        return "False"
+    return v.text_val
+
+
+def pad(s: str, width: int) -> str:
+    if len(s) >= width:
+        return s
+    return s + " " * (width - len(s))
+
+
+def format_result(result: ExecResult) -> str:
+    # A non-SELECT result renders as its status message. A SELECT renders as an
+    # aligned grid + a "(N row(s))" trailer. Single formatting seam shared by
+    # the REPL and the future line-protocol server (card 283e473a).
+    if len(result.columns) == 0:
+        return result.message
+    widths: list[int] = []
+    for h in result.columns:
+        widths.append(len(h))
+    cell_rows: list[list[str]] = []
+    for row in result.rows:
+        cells: list[str] = []
+        ci: int = 0
+        while ci < len(row.values):
+            s: str = display_value(row.values[ci])
+            cells.append(s)
+            if len(s) > widths[ci]:
+                widths[ci] = len(s)
+            ci = ci + 1
+        cell_rows.append(cells)
+    lines: list[str] = []
+    hparts: list[str] = []
+    hi: int = 0
+    while hi < len(result.columns):
+        hparts.append(pad(result.columns[hi], widths[hi]))
+        hi = hi + 1
+    lines.append((" | ".join(hparts)).rstrip())
+    sparts: list[str] = []
+    di: int = 0
+    while di < len(widths):
+        sparts.append("-" * widths[di])
+        di = di + 1
+    lines.append("-+-".join(sparts))
+    for cells in cell_rows:
+        rparts: list[str] = []
+        ci2: int = 0
+        while ci2 < len(cells):
+            rparts.append(pad(cells[ci2], widths[ci2]))
+            ci2 = ci2 + 1
+        lines.append((" | ".join(rparts)).rstrip())
+    lines.append("(" + str(len(result.rows)) + " row(s))")
+    return "\n".join(lines)

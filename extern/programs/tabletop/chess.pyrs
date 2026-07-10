@@ -1,0 +1,708 @@
+# chess.pyrs — chess vs a depth-limited alpha-beta CPU.
+#
+# Board model (card f1ac8d46): sq = list[int] of 64, index = row*8 + col where
+# row 0 = rank 8 (top of the display) and row 7 = rank 1. White is positive and
+# moves toward row 0; Black is negative and moves toward row 7. Piece codes:
+#   1 pawn, 2 knight, 3 bishop, 4 rook, 5 queen, 6 king (negated for Black).
+# Full legal move generation incl. castling, en passant, and promotion; check /
+# checkmate / stalemate detection. Move generation is PURE (operates on a Board
+# value, no I/O) and is exercised by perft in test_chess.pyrs.
+
+import ui
+
+WHITE: int = 1
+BLACK: int = -1
+
+PAWN: int = 1
+KNIGHT: int = 2
+BISHOP: int = 3
+ROOK: int = 4
+QUEEN: int = 5
+KING: int = 6
+
+# Move flags.
+F_NORMAL: int = 0
+F_DOUBLE: int = 1     # double pawn push (sets en-passant target)
+F_EP: int = 2         # en-passant capture
+F_CASTLE_K: int = 3   # king-side castle
+F_CASTLE_Q: int = 4   # queen-side castle
+
+MATE: int = 1000000
+
+
+# --- coordinates -------------------------------------------------------------
+def rowof(sq: int) -> int:
+    return sq // 8
+
+
+def colof(sq: int) -> int:
+    return sq % 8
+
+
+def idx(r: int, c: int) -> int:
+    return r * 8 + c
+
+
+def in_bounds(r: int, c: int) -> bool:
+    return r >= 0 and r < 8 and c >= 0 and c < 8
+
+
+def sign(v: int) -> int:
+    if v > 0:
+        return 1
+    if v < 0:
+        return -1
+    return 0
+
+
+def sq_name(sq: int) -> str:
+    f: str = chr(ord('a') + colof(sq))
+    return f + str(8 - rowof(sq))
+
+
+# --- board state -------------------------------------------------------------
+class Board:
+    sq: list[int]
+    stm: int          # side to move
+    wk: bool          # white may castle king-side
+    wq: bool
+    bk: bool
+    bq: bool
+    ep: int           # en-passant target square, -1 if none
+
+    def __init__(self) -> None:
+        self.sq = [0] * 64
+        self.stm = WHITE
+        self.wk = True
+        self.wq = True
+        self.bk = True
+        self.bq = True
+        self.ep = -1
+
+
+def start_board() -> Board:
+    b: Board = Board()
+    back: list[int] = [ROOK, KNIGHT, BISHOP, QUEEN, KING, BISHOP, KNIGHT, ROOK]
+    c: int = 0
+    while c < 8:
+        b.sq[idx(0, c)] = -back[c]      # black back rank (rank 8)
+        b.sq[idx(1, c)] = -PAWN         # black pawns (rank 7)
+        b.sq[idx(6, c)] = PAWN          # white pawns (rank 2)
+        b.sq[idx(7, c)] = back[c]       # white back rank (rank 1)
+        c = c + 1
+    return b
+
+
+# --- move type ---------------------------------------------------------------
+class Move:
+    frm: int
+    to: int
+    promo: int   # promotion piece type (KNIGHT..QUEEN) or 0
+    flag: int
+
+    def __init__(self, frm: int, to: int, promo: int, flag: int) -> None:
+        self.frm = frm
+        self.to = to
+        self.promo = promo
+        self.flag = flag
+
+    def uci(self) -> str:
+        s: str = sq_name(self.frm) + sq_name(self.to)
+        if self.promo == QUEEN:
+            s = s + "q"
+        elif self.promo == ROOK:
+            s = s + "r"
+        elif self.promo == BISHOP:
+            s = s + "b"
+        elif self.promo == KNIGHT:
+            s = s + "n"
+        return s
+
+
+# --- attack detection --------------------------------------------------------
+KNIGHT_DR: list[int] = [-2, -2, -1, -1, 1, 1, 2, 2]
+KNIGHT_DC: list[int] = [-1, 1, -2, 2, -2, 2, -1, 1]
+KING_DR: list[int] = [-1, -1, -1, 0, 0, 1, 1, 1]
+KING_DC: list[int] = [-1, 0, 1, -1, 1, -1, 0, 1]
+DIAG_DR: list[int] = [-1, -1, 1, 1]
+DIAG_DC: list[int] = [-1, 1, -1, 1]
+ORTH_DR: list[int] = [-1, 1, 0, 0]
+ORTH_DC: list[int] = [0, 0, -1, 1]
+
+
+def is_attacked(bsq: list[int], sq: int, by: int) -> bool:
+    r: int = rowof(sq)
+    c: int = colof(sq)
+
+    # Pawn: a pawn of side `by` sits one row toward its own back rank from sq.
+    pr: int = r + by
+    k: int = 0
+    while k < 2:
+        pc: int = c - 1 + 2 * k
+        if in_bounds(pr, pc):
+            if bsq[idx(pr, pc)] == by * PAWN:
+                return True
+        k = k + 1
+
+    # Knight.
+    i: int = 0
+    while i < 8:
+        nr: int = r + KNIGHT_DR[i]
+        nc: int = c + KNIGHT_DC[i]
+        if in_bounds(nr, nc):
+            if bsq[idx(nr, nc)] == by * KNIGHT:
+                return True
+        i = i + 1
+
+    # King.
+    i = 0
+    while i < 8:
+        nr = r + KING_DR[i]
+        nc = c + KING_DC[i]
+        if in_bounds(nr, nc):
+            if bsq[idx(nr, nc)] == by * KING:
+                return True
+        i = i + 1
+
+    # Diagonal sliders: bishop / queen.
+    i = 0
+    while i < 4:
+        dr: int = DIAG_DR[i]
+        dc: int = DIAG_DC[i]
+        nr = r + dr
+        nc = c + dc
+        while in_bounds(nr, nc):
+            v: int = bsq[idx(nr, nc)]
+            if v != 0:
+                if v == by * BISHOP or v == by * QUEEN:
+                    return True
+                break
+            nr = nr + dr
+            nc = nc + dc
+        i = i + 1
+
+    # Orthogonal sliders: rook / queen.
+    i = 0
+    while i < 4:
+        dr = ORTH_DR[i]
+        dc = ORTH_DC[i]
+        nr = r + dr
+        nc = c + dc
+        while in_bounds(nr, nc):
+            v = bsq[idx(nr, nc)]
+            if v != 0:
+                if v == by * ROOK or v == by * QUEEN:
+                    return True
+                break
+            nr = nr + dr
+            nc = nc + dc
+        i = i + 1
+
+    return False
+
+
+def king_square(bsq: list[int], side: int) -> int:
+    target: int = side * KING
+    s: int = 0
+    while s < 64:
+        if bsq[s] == target:
+            return s
+        s = s + 1
+    return -1
+
+
+def in_check(b: Board) -> bool:
+    ks: int = king_square(b.sq, b.stm)
+    return is_attacked(b.sq, ks, -b.stm)
+
+
+# --- make move ---------------------------------------------------------------
+def apply_move(board: Board, m: Move) -> Board:
+    nb: Board = board          # value semantics: deep, independent copy
+    piece: int = nb.sq[m.frm]
+    color: int = sign(piece)
+    nb.sq[m.frm] = 0
+
+    if m.flag == F_EP:
+        # Captured pawn sits on the mover's own row, at the destination file.
+        cap: int = idx(rowof(m.frm), colof(m.to))
+        nb.sq[cap] = 0
+
+    placed: int = piece
+    if m.promo != 0:
+        placed = color * m.promo
+    nb.sq[m.to] = placed
+
+    if m.flag == F_CASTLE_K:
+        # Rook from the h-file to the f-file on the king's rank.
+        row: int = rowof(m.frm)
+        nb.sq[idx(row, 5)] = color * ROOK
+        nb.sq[idx(row, 7)] = 0
+    elif m.flag == F_CASTLE_Q:
+        row2: int = rowof(m.frm)
+        nb.sq[idx(row2, 3)] = color * ROOK
+        nb.sq[idx(row2, 0)] = 0
+
+    # Castling-right updates.
+    if piece == KING:
+        nb.wk = False
+        nb.wq = False
+    elif piece == -KING:
+        nb.bk = False
+        nb.bq = False
+    if m.frm == 63 or m.to == 63:
+        nb.wk = False
+    if m.frm == 56 or m.to == 56:
+        nb.wq = False
+    if m.frm == 7 or m.to == 7:
+        nb.bk = False
+    if m.frm == 0 or m.to == 0:
+        nb.bq = False
+
+    # En-passant target.
+    nb.ep = -1
+    if m.flag == F_DOUBLE:
+        nb.ep = idx((rowof(m.frm) + rowof(m.to)) // 2, colof(m.frm))
+
+    nb.stm = -board.stm
+    return nb
+
+
+# --- pseudo-legal move generation -------------------------------------------
+def add_pawn_moves(b: Board, sq: int, out: Mut[list[Move]]) -> None:
+    side: int = b.stm
+    r: int = rowof(sq)
+    c: int = colof(sq)
+    fdir: int = -side                      # white moves up (row -1)
+    start_row: int = 6
+    promo_row: int = 0
+    if side == BLACK:
+        start_row = 1
+        promo_row = 7
+
+    # Single / double push.
+    r1: int = r + fdir
+    if in_bounds(r1, c) and b.sq[idx(r1, c)] == 0:
+        if r1 == promo_row:
+            out.append(Move(sq, idx(r1, c), QUEEN, F_NORMAL))
+            out.append(Move(sq, idx(r1, c), ROOK, F_NORMAL))
+            out.append(Move(sq, idx(r1, c), BISHOP, F_NORMAL))
+            out.append(Move(sq, idx(r1, c), KNIGHT, F_NORMAL))
+        else:
+            out.append(Move(sq, idx(r1, c), 0, F_NORMAL))
+            if r == start_row:
+                r2: int = r + 2 * fdir
+                if b.sq[idx(r2, c)] == 0:
+                    out.append(Move(sq, idx(r2, c), 0, F_DOUBLE))
+
+    # Captures + en passant.
+    dc: int = -1
+    while dc <= 1:
+        if dc != 0:
+            tc: int = c + dc
+            if in_bounds(r1, tc):
+                tsq: int = idx(r1, tc)
+                tv: int = b.sq[tsq]
+                if tv * side < 0:
+                    if r1 == promo_row:
+                        out.append(Move(sq, tsq, QUEEN, F_NORMAL))
+                        out.append(Move(sq, tsq, ROOK, F_NORMAL))
+                        out.append(Move(sq, tsq, BISHOP, F_NORMAL))
+                        out.append(Move(sq, tsq, KNIGHT, F_NORMAL))
+                    else:
+                        out.append(Move(sq, tsq, 0, F_NORMAL))
+                elif tsq == b.ep and b.ep >= 0:
+                    out.append(Move(sq, tsq, 0, F_EP))
+        dc = dc + 2
+
+
+def add_step_moves(b: Board, sq: int, drs: list[int], dcs: list[int], out: Mut[list[Move]]) -> None:
+    side: int = b.stm
+    r: int = rowof(sq)
+    c: int = colof(sq)
+    i: int = 0
+    while i < len(drs):
+        nr: int = r + drs[i]
+        nc: int = c + dcs[i]
+        if in_bounds(nr, nc):
+            t: int = idx(nr, nc)
+            if b.sq[t] * side <= 0:   # empty or enemy
+                out.append(Move(sq, t, 0, F_NORMAL))
+        i = i + 1
+
+
+def add_slide_moves(b: Board, sq: int, drs: list[int], dcs: list[int], out: Mut[list[Move]]) -> None:
+    side: int = b.stm
+    r: int = rowof(sq)
+    c: int = colof(sq)
+    i: int = 0
+    while i < len(drs):
+        nr: int = r + drs[i]
+        nc: int = c + dcs[i]
+        while in_bounds(nr, nc):
+            t: int = idx(nr, nc)
+            v: int = b.sq[t]
+            if v == 0:
+                out.append(Move(sq, t, 0, F_NORMAL))
+            else:
+                if v * side < 0:
+                    out.append(Move(sq, t, 0, F_NORMAL))
+                break
+            nr = nr + drs[i]
+            nc = nc + dcs[i]
+        i = i + 1
+
+
+def add_castle_moves(b: Board, out: Mut[list[Move]]) -> None:
+    side: int = b.stm
+    if side == WHITE:
+        e: int = idx(7, 4)
+        if b.wk and b.sq[idx(7, 5)] == 0 and b.sq[idx(7, 6)] == 0 and b.sq[idx(7, 7)] == ROOK:
+            if not is_attacked(b.sq, e, BLACK) and not is_attacked(b.sq, idx(7, 5), BLACK) and not is_attacked(b.sq, idx(7, 6), BLACK):
+                out.append(Move(e, idx(7, 6), 0, F_CASTLE_K))
+        if b.wq and b.sq[idx(7, 3)] == 0 and b.sq[idx(7, 2)] == 0 and b.sq[idx(7, 1)] == 0 and b.sq[idx(7, 0)] == ROOK:
+            if not is_attacked(b.sq, e, BLACK) and not is_attacked(b.sq, idx(7, 3), BLACK) and not is_attacked(b.sq, idx(7, 2), BLACK):
+                out.append(Move(e, idx(7, 2), 0, F_CASTLE_Q))
+    else:
+        e2: int = idx(0, 4)
+        if b.bk and b.sq[idx(0, 5)] == 0 and b.sq[idx(0, 6)] == 0 and b.sq[idx(0, 7)] == -ROOK:
+            if not is_attacked(b.sq, e2, WHITE) and not is_attacked(b.sq, idx(0, 5), WHITE) and not is_attacked(b.sq, idx(0, 6), WHITE):
+                out.append(Move(e2, idx(0, 6), 0, F_CASTLE_K))
+        if b.bq and b.sq[idx(0, 3)] == 0 and b.sq[idx(0, 2)] == 0 and b.sq[idx(0, 1)] == 0 and b.sq[idx(0, 0)] == -ROOK:
+            if not is_attacked(b.sq, e2, WHITE) and not is_attacked(b.sq, idx(0, 3), WHITE) and not is_attacked(b.sq, idx(0, 2), WHITE):
+                out.append(Move(e2, idx(0, 2), 0, F_CASTLE_Q))
+
+
+def gen_pseudo(b: Board) -> list[Move]:
+    out: list[Move] = []
+    side: int = b.stm
+    sq: int = 0
+    while sq < 64:
+        v: int = b.sq[sq]
+        if v * side > 0:
+            av: int = v
+            if av < 0:
+                av = -av
+            if av == PAWN:
+                add_pawn_moves(b, sq, out)
+            elif av == KNIGHT:
+                add_step_moves(b, sq, KNIGHT_DR, KNIGHT_DC, out)
+            elif av == BISHOP:
+                add_slide_moves(b, sq, DIAG_DR, DIAG_DC, out)
+            elif av == ROOK:
+                add_slide_moves(b, sq, ORTH_DR, ORTH_DC, out)
+            elif av == QUEEN:
+                add_slide_moves(b, sq, DIAG_DR, DIAG_DC, out)
+                add_slide_moves(b, sq, ORTH_DR, ORTH_DC, out)
+            elif av == KING:
+                add_step_moves(b, sq, KING_DR, KING_DC, out)
+        sq = sq + 1
+    add_castle_moves(b, out)
+    return out
+
+
+def is_legal(board: Board, m: Move) -> bool:
+    nb: Board = apply_move(board, m)
+    ks: int = king_square(nb.sq, board.stm)
+    return not is_attacked(nb.sq, ks, -board.stm)
+
+
+def gen_legal(board: Board) -> list[Move]:
+    out: list[Move] = []
+    for m in gen_pseudo(board):
+        if is_legal(board, m):
+            out.append(m)
+    return out
+
+
+# --- evaluation (positive favors White) -------------------------------------
+def piece_material(av: int) -> int:
+    if av == PAWN:
+        return 100
+    if av == KNIGHT:
+        return 320
+    if av == BISHOP:
+        return 330
+    if av == ROOK:
+        return 500
+    if av == QUEEN:
+        return 900
+    return 0
+
+
+def center_score(r: int, c: int) -> int:
+    dr: int = r
+    if 7 - r < dr:
+        dr = 7 - r
+    dc: int = c
+    if 7 - c < dc:
+        dc = 7 - c
+    return dr + dc   # 0 (corner) .. 6 (center)
+
+
+def positional(av: int, sq: int, color: int) -> int:
+    r: int = rowof(sq)
+    c: int = colof(sq)
+    cs: int = center_score(r, c)
+    if av == KNIGHT:
+        return cs * 5
+    if av == BISHOP:
+        return cs * 3
+    if av == QUEEN:
+        return cs
+    if av == PAWN:
+        adv: int = 6 - r
+        if color == BLACK:
+            adv = r - 1
+        return adv * 4 + cs
+    if av == KING:
+        return -cs * 4    # discourage the king wandering to the centre
+    return 0
+
+
+def eval_board(b: Board) -> int:
+    score: int = 0
+    sq: int = 0
+    while sq < 64:
+        v: int = b.sq[sq]
+        if v != 0:
+            color: int = sign(v)
+            av: int = v * color
+            score = score + color * (piece_material(av) + positional(av, sq, color))
+        sq = sq + 1
+    return score
+
+
+# --- search (negamax + alpha-beta, legality folded into make) ---------------
+def victim_value(b: Board, m: Move) -> int:
+    # Move-ordering key: captures (higher victim) and promotions first.
+    v: int = b.sq[m.to]
+    cap: int = 0
+    if v != 0:
+        av: int = v
+        if av < 0:
+            av = -av
+        cap = piece_material(av)
+    return cap + m.promo * 10
+
+
+def order_moves(b: Board, moves: list[Move]) -> list[Move]:
+    scored: list[Move] = moves[:]
+    scored.sort(key=lambda mv: -victim_value(b, mv))
+    return scored
+
+
+def negamax(board: Board, depth: int, ply: int, alpha: int, beta: int) -> int:
+    if depth == 0:
+        return eval_board(board) * board.stm
+    moves: list[Move] = order_moves(board, gen_pseudo(board))
+    best: int = -MATE * 2
+    a: int = alpha
+    legal: int = 0
+    for m in moves:
+        nb: Board = apply_move(board, m)
+        ks: int = king_square(nb.sq, board.stm)
+        if is_attacked(nb.sq, ks, -board.stm):
+            continue
+        legal = legal + 1
+        v: int = -negamax(nb, depth - 1, ply + 1, -beta, -a)
+        if v > best:
+            best = v
+        if best > a:
+            a = best
+        if a >= beta:
+            break
+    if legal == 0:
+        if in_check(board):
+            return -MATE + ply     # checkmated (prefer slower mates)
+        return 0                   # stalemate
+    return best
+
+
+def choose_move(board: Board, depth: int) -> int:
+    """Index into gen_legal(board) of the CPU's chosen move (-1 if none)."""
+    legal_moves: list[Move] = gen_legal(board)
+    if len(legal_moves) == 0:
+        return -1
+    ordered: list[Move] = order_moves(board, legal_moves)
+    best_idx: int = 0
+    best_val: int = -MATE * 4
+    j: int = 0
+    while j < len(ordered):
+        nb: Board = apply_move(board, ordered[j])
+        v: int = -negamax(nb, depth - 1, 1, -MATE * 4, MATE * 4)
+        if v > best_val:
+            best_val = v
+            best_idx = j
+        j = j + 1
+    # Map the chosen ordered move back to its index in legal_moves.
+    chosen: Move = ordered[best_idx]
+    k: int = 0
+    while k < len(legal_moves):
+        lm: Move = legal_moves[k]
+        if lm.frm == chosen.frm and lm.to == chosen.to and lm.promo == chosen.promo and lm.flag == chosen.flag:
+            return k
+        k = k + 1
+    return 0
+
+
+# --- rendering ---------------------------------------------------------------
+def glyph(v: int) -> str:
+    if v == 0:
+        return "."
+    av: int = v
+    if av < 0:
+        av = -av
+    letter: str = "?"
+    if av == PAWN:
+        letter = "P"
+    elif av == KNIGHT:
+        letter = "N"
+    elif av == BISHOP:
+        letter = "B"
+    elif av == ROOK:
+        letter = "R"
+    elif av == QUEEN:
+        letter = "Q"
+    elif av == KING:
+        letter = "K"
+    if v < 0:
+        return letter.lower()   # black lowercase
+    return letter
+
+
+def render(b: Board) -> str:
+    out: str = "     a   b   c   d   e   f   g   h\n"
+    out = out + "   +" + ("---+" * 8) + "\n"
+    r: int = 0
+    while r < 8:
+        rank: str = str(8 - r)
+        line: str = " " + rank + " |"
+        c: int = 0
+        while c < 8:
+            line = line + " " + glyph(b.sq[idx(r, c)]) + " |"
+            c = c + 1
+        out = out + line + " " + rank + "\n"
+        out = out + "   +" + ("---+" * 8) + "\n"
+        r = r + 1
+    out = out + "     a   b   c   d   e   f   g   h"
+    return out
+
+
+# --- input parsing -----------------------------------------------------------
+def parse_square(s: str) -> int:
+    # Returns square index, or -1 if malformed.
+    if len(s) != 2:
+        return -1
+    fc: int = ord(s[0]) - ord('a')
+    rc: int = ord(s[1]) - ord('1')
+    if fc < 0 or fc > 7 or rc < 0 or rc > 7:
+        return -1
+    row: int = 7 - rc
+    return idx(row, fc)
+
+
+def promo_from_char(ch: str) -> int:
+    if ch == "q":
+        return QUEEN
+    if ch == "r":
+        return ROOK
+    if ch == "b":
+        return BISHOP
+    if ch == "n":
+        return KNIGHT
+    return 0
+
+
+def match_move(legal_moves: list[Move], frm: int, to: int, promo: int) -> int:
+    # Returns index of a matching legal move, else -1. Missing promo defaults to
+    # queen for a promoting move.
+    i: int = 0
+    while i < len(legal_moves):
+        m: Move = legal_moves[i]
+        if m.frm == frm and m.to == to:
+            if m.promo == 0:
+                return i
+            if promo == 0 and m.promo == QUEEN:
+                return i
+            if promo != 0 and m.promo == promo:
+                return i
+        i = i + 1
+    return -1
+
+
+CPU_DEPTH: int = 4
+
+
+def play_chess() -> None:
+    print(ui.title("Chess"))
+    print("You are White (UPPERCASE), CPU is Black (lowercase).")
+    print("Enter moves like 'e2e4' (promotion: 'e7e8q'). Type 'moves' to list")
+    print("legal moves, or 'quit' to resign.")
+    print(ui.hr())
+
+    board: Board = start_board()
+
+    while True:
+        print("")
+        print(render(board))
+        print(ui.hr())
+
+        legal_moves: list[Move] = gen_legal(board)
+        checked: bool = in_check(board)
+        if len(legal_moves) == 0:
+            if checked:
+                if board.stm == WHITE:
+                    print("Checkmate. CPU (Black) wins.")
+                else:
+                    print("Checkmate. You (White) win!")
+            else:
+                print("Stalemate. Draw.")
+            return
+
+        if board.stm == WHITE:
+            if checked:
+                print("You are in check.")
+            raw: str = ui.prompt_str("Your move: ").lower()
+            if raw == "quit" or raw == "resign":
+                print("You resign. CPU (Black) wins.")
+                return
+            if raw == "moves":
+                line: str = ""
+                i: int = 0
+                while i < len(legal_moves):
+                    line = line + legal_moves[i].uci() + " "
+                    i = i + 1
+                print(line)
+                continue
+            if len(raw) < 4 or len(raw) > 5:
+                print("Bad format. Use e.g. e2e4 or e7e8q.")
+                continue
+            frm: int = parse_square(raw[0:2])
+            to: int = parse_square(raw[2:4])
+            promo: int = 0
+            if len(raw) == 5:
+                promo = promo_from_char(raw[4])
+            if frm < 0 or to < 0:
+                print("Bad square. Use files a-h and ranks 1-8.")
+                continue
+            mi: int = match_move(legal_moves, frm, to, promo)
+            if mi < 0:
+                print("Illegal move. Type 'moves' to see legal moves.")
+                continue
+            board = apply_move(board, legal_moves[mi])
+            print(f"You play {legal_moves[mi].uci()}")
+        else:
+            if checked:
+                print("CPU is in check.")
+            print("CPU is thinking...")
+            # Adaptive depth: in maximally tactical positions (many legal moves)
+            # the tree explodes, so shave one ply to stay comfortably under the
+            # 2s/move budget. Normal positions keep full depth.
+            search_depth: int = CPU_DEPTH
+            if len(legal_moves) > 35:
+                search_depth = CPU_DEPTH - 1
+            idx_c: int = choose_move(board, search_depth)
+            chosen: Move = legal_moves[idx_c]
+            board = apply_move(board, chosen)
+            print(f"CPU plays {chosen.uci()}")

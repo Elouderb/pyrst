@@ -1,0 +1,124 @@
+# test_checkers.pyrs — pure move-gen tests for checkers.
+# Root sibling (imports resolve between siblings only). Run:
+#   pyrst build test_checkers.pyrs && ./test_checkers   (exit 0 = PASS)
+
+from checkers import RED, WHITE, CMove, new_board, gen_moves, ck_apply_move, sq_of, alg
+
+FAILS: int = 0
+
+
+def check(cond: bool, msg: str) -> None:
+    global FAILS
+    if cond:
+        print(f"PASS: {msg}")
+    else:
+        print(f"FAIL: {msg}")
+        FAILS = FAILS + 1
+
+
+def perft(b: list[int], side: int, depth: int) -> int:
+    if depth == 0:
+        return 1
+    moves: list[CMove] = gen_moves(b, side)
+    total: int = 0
+    for m in moves:
+        nb: list[int] = ck_apply_move(b, side, m)
+        total = total + perft(nb, -side, depth - 1)
+    return total
+
+
+def empty_board() -> list[int]:
+    return [0] * 64
+
+
+def main() -> None:
+    # --- opening move counts (perft-lite) ---
+    start: list[int] = new_board()
+    red_open: list[CMove] = gen_moves(start, RED)
+    check(len(red_open) == 7, "opening: Red has 7 moves")
+    white_open: list[CMove] = gen_moves(start, WHITE)
+    check(len(white_open) == 7, "opening: White has 7 moves")
+    all_simple: bool = True
+    for m in red_open:
+        if m.is_jump():
+            all_simple = False
+    check(all_simple, "opening: all Red moves are simple (no jumps)")
+    check(perft(start, RED, 2) == 49, "perft(2) from opening == 49")
+
+    # --- forced single capture ---
+    b1: list[int] = empty_board()
+    b1[sq_of(5, 2)] = RED     # red man
+    b1[sq_of(4, 3)] = WHITE   # white man to be jumped; landing (3,4) empty
+    mv1: list[CMove] = gen_moves(b1, RED)
+    check(len(mv1) == 1, "forced capture: only the jump is legal")
+    check(mv1[0].is_jump(), "forced capture: move is a jump")
+    check(mv1[0].dst() == sq_of(3, 4), "forced capture: lands on (3,4)")
+    check(len(mv1[0].caps) == 1 and mv1[0].caps[0] == sq_of(4, 3), "forced capture: removes (4,3)")
+    after1: list[int] = ck_apply_move(b1, RED, mv1[0])
+    check(after1[sq_of(4, 3)] == 0, "apply: captured piece removed")
+    check(after1[sq_of(3, 4)] == RED, "apply: mover relocated")
+    check(after1[sq_of(5, 2)] == 0, "apply: origin cleared")
+
+    # --- forced capture suppresses simple moves for OTHER pieces ---
+    b1b: list[int] = empty_board()
+    b1b[sq_of(5, 2)] = RED
+    b1b[sq_of(4, 3)] = WHITE
+    b1b[sq_of(6, 5)] = RED    # a red man that has simple moves but no jump
+    mv1b: list[CMove] = gen_moves(b1b, RED)
+    only_jumps: bool = True
+    for m in mv1b:
+        if not m.is_jump():
+            only_jumps = False
+    check(only_jumps, "forced capture: simple moves of other pieces suppressed")
+
+    # --- multi-jump (double) ---
+    b2: list[int] = empty_board()
+    b2[sq_of(5, 2)] = RED
+    b2[sq_of(4, 3)] = WHITE   # jump to (3,4)
+    b2[sq_of(2, 3)] = WHITE   # then jump to (1,2)
+    mv2: list[CMove] = gen_moves(b2, RED)
+    check(len(mv2) == 1, "multi-jump: exactly one maximal sequence")
+    check(len(mv2[0].caps) == 2, "multi-jump: two captures")
+    check(mv2[0].dst() == sq_of(1, 2), "multi-jump: ends at (1,2)")
+    after2: list[int] = ck_apply_move(b2, RED, mv2[0])
+    check(after2[sq_of(4, 3)] == 0 and after2[sq_of(2, 3)] == 0, "multi-jump: both captured removed")
+
+    # --- promotion ends the move (American rule) ---
+    b3: list[int] = empty_board()
+    b3[sq_of(2, 1)] = RED     # red man one jump from king row
+    b3[sq_of(1, 2)] = WHITE   # jump to (0,3) = king row -> promote & STOP
+    b3[sq_of(1, 4)] = WHITE   # tempting continuation as a king from (0,3)
+    mv3: list[CMove] = gen_moves(b3, RED)
+    check(len(mv3) == 1, "promotion: one move")
+    check(len(mv3[0].caps) == 1, "promotion: exactly one capture (does NOT continue)")
+    check(mv3[0].dst() == sq_of(0, 3), "promotion: stops on king row (0,3)")
+    after3: list[int] = ck_apply_move(b3, RED, mv3[0])
+    check(after3[sq_of(0, 3)] == 2, "promotion: man became a Red king (value 2)")
+    check(after3[sq_of(1, 4)] == WHITE, "promotion: second white NOT captured")
+
+    # --- king moves both directions ---
+    b4: list[int] = empty_board()
+    b4[sq_of(4, 3)] = 2       # red king, center, all else empty
+    mv4: list[CMove] = gen_moves(b4, RED)
+    check(len(mv4) == 4, "king: 4 simple moves from center")
+
+    # --- king captures backward ---
+    b5: list[int] = empty_board()
+    b5[sq_of(4, 3)] = 2       # red king
+    b5[sq_of(5, 4)] = WHITE   # BACKWARD (downward) enemy; land (6,5) empty
+    mv5: list[CMove] = gen_moves(b5, RED)
+    has_back_jump: bool = False
+    for m in mv5:
+        if m.is_jump() and m.dst() == sq_of(6, 5):
+            has_back_jump = True
+    check(has_back_jump, "king: can capture backward")
+
+    # --- alg coordinate sanity ---
+    check(alg(sq_of(5, 0)) == "a3", "alg: (5,0) == a3")
+    check(alg(sq_of(0, 7)) == "h8", "alg: (0,7) == h8")
+
+    if FAILS == 0:
+        print("ALL CHECKERS TESTS PASSED")
+    else:
+        print(f"{FAILS} CHECKERS TEST(S) FAILED")
+        assert False

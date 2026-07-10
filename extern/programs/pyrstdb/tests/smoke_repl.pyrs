@@ -1,0 +1,71 @@
+# tests/smoke_repl.pyrs — smoke test for the main.pyrs REPL shell.
+#
+# Proves the shell itself works end to end now that the engine is real:
+# meta-commands, script-file mode, real SQL execution, named errors, clean
+# .quit. Drives the built `main` binary in SCRIPT mode (a file path in argv),
+# not by piping stdin into a live process — pyrst's `subprocess.run` has no
+# `input=` param and `input()` has no EOF signal (see main.pyrs header GAP).
+#
+# Run from extern/programs/pyrstdb/ after building both binaries:
+#   pyrst build main.pyrs
+#   pyrst build tests/smoke_repl.pyrs
+#   ./smoke_repl                 (optional arg: path to the `main` binary, default "./main")
+
+import sys
+from subprocess import run, CompletedProcess
+
+SCRIPT_PATH: str = "/tmp/pyrstdb_smoke_script.sql"
+
+
+def write_script() -> None:
+    with open(SCRIPT_PATH, "w") as f:
+        f.write("-- a comment line, should be skipped\n")
+        f.write("\n")
+        f.write(".help\n")
+        f.write("SELECT * FROM widgets;\n")
+        f.write(".nonsense\n")
+        f.write(".quit\n")
+
+
+def main_binary_path() -> str:
+    if len(sys.argv) > 1:
+        return sys.argv[1]
+    return "./main"
+
+
+def fail(message: str) -> None:
+    print("FAIL: " + message)
+    sys.exit(1)
+
+
+def main() -> None:
+    write_script()
+    binary: str = main_binary_path()
+    r: CompletedProcess = run([binary, SCRIPT_PATH], capture_output=True)
+
+    if r.returncode != 0:
+        fail("main exited with code " + str(r.returncode) + " (expected 0)")
+
+    out_bytes = r.stdout
+    if out_bytes is None:
+        fail("no stdout captured")
+        return
+    out: str = out_bytes.decode("utf-8")
+
+    # comment + blank lines produced no output of their own
+    if "-- a comment line" in out:
+        fail("comment line was not skipped:\n" + out)
+    # .help printed its banner
+    if "Meta-commands:" not in out:
+        fail(".help did not print the help banner:\n" + out)
+    # a SELECT against a missing table is a named error (engine is live now)
+    if "error: no such table: widgets" not in out:
+        fail("SELECT on a missing table did not report a named error:\n" + out)
+    # an unrecognized meta-command reports itself instead of erroring out
+    if "unknown meta-command: .nonsense" not in out:
+        fail("unknown meta-command was not reported:\n" + out)
+    # .quit produced a clean goodbye and (checked above) exit 0
+    if "bye" not in out:
+        fail(".quit did not print a goodbye:\n" + out)
+
+    print("PASS: smoke_repl")

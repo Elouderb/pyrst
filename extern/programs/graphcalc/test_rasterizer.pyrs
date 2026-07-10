@@ -1,0 +1,146 @@
+# test_rasterizer.pyrs — pyrst-native unit tests for rasterizer.render /
+# resolve_window / make_table: golden-shape checks, axes/tick presence,
+# NaN/domain-error blanking, +-inf discontinuity clipping (not a crash), and
+# auto-scale sanity. Uses small fixed grids (not the full 76x30 default) so
+# the goldens stay legible and the tests stay fast.
+#
+# LOCATION NOTE: see test_evaluator.pyrs's header — lives at the project
+# root, not tests/, because pyrst has no relative-import syntax to reach a
+# parent directory's sibling module. Build+run from
+# extern/programs/graphcalc/: pyrst build test_rasterizer.pyrs && ./test_rasterizer
+
+import math
+
+from expr_parser import parse, Expr
+from rasterizer import Window, PlotSpec, resolve_window, render, make_table, glyph_for_index
+
+
+def check(name: str, cond: bool, fails: Mut[list[str]]) -> None:
+    if cond:
+        print("PASS: " + name)
+    else:
+        print("FAIL: " + name)
+        fails.append(name)
+
+
+def main() -> None:
+    fails: list[str] = []
+
+    # --- axes / tick labels present in the rendered frame ---
+    w1: Window = Window(-2.0, 2.0, -4.0, 4.0)
+    spec_x2: PlotSpec = PlotSpec("x**2", parse("x**2"), glyph_for_index(0))
+    out1: str = render([spec_x2], w1, 21, 11)
+    lines1: list[str] = out1.split("\n")
+    check("render header starts with 'y='", lines1[0].startswith("y="), fails)
+    check("render footer (y-bound line) contains 'x:' bound label", "x:" in lines1[12], fails)
+    check("render legend lists the function source", "x**2" in out1, fails)
+    check("render grid has axes: a '|' column present somewhere", "|" in out1, fails)
+    check("render grid has axes: a '-' row present somewhere", "-" in out1, fails)
+
+    # --- x**2 over a symmetric window is left/right symmetric ---
+    grid_rows: list[str] = lines1[1:12]
+    # column 0 (x=-2) and column 20 (x=2) should carry the glyph in the SAME row
+    # (both endpoints map to y=4, the top of the window) since x**2 is even.
+    row_of_glyph_col0: int = -1
+    row_of_glyph_col20: int = -1
+    ri: int = 0
+    for row in grid_rows:
+        if row[0] == "*":
+            row_of_glyph_col0 = ri
+        if row[20] == "*":
+            row_of_glyph_col20 = ri
+        ri += 1
+    check("x**2 symmetric: glyph row at x=-2 equals glyph row at x=+2",
+          row_of_glyph_col0 >= 0 and row_of_glyph_col0 == row_of_glyph_col20, fails)
+
+    # --- sin(x) over a couple periods crosses the x-axis multiple times ---
+    w2: Window = Window(-6.5, 6.5, -1.2, 1.2)
+    spec_sin: PlotSpec = PlotSpec("sin(x)", parse("sin(x)"), glyph_for_index(0))
+    out2: str = render([spec_sin], w2, 41, 15)
+    lines2: list[str] = out2.split("\n")
+    grid2: list[str] = lines2[1:16]
+    # Count columns where the glyph sits at/near the vertical middle (row 7,
+    # the y=0 axis row for this symmetric window) -> sign changes visible.
+    crossings: int = 0
+    for row2 in grid2[6:9]:
+        for ch in row2:
+            if ch == "*":
+                crossings += 1
+    check("sin(x) over ~2 periods has multiple near-axis crossings (period visible)", crossings >= 3, fails)
+
+    # --- 1/x: discontinuity clips to an edge row, never crashes ---
+    w3: Window = Window(-2.0, 2.0, -5.0, 5.0)
+    spec_inv: PlotSpec = PlotSpec("1/x", parse("1/x"), glyph_for_index(0))
+    out3: str = render([spec_inv], w3, 21, 11)  # width=21 -> x=0.0 lands exactly on column 10
+    lines3: list[str] = out3.split("\n")
+    grid3: list[str] = lines3[1:12]
+    # At x=0, 1/x -> +inf (IEEE, no exception) which _row_for clips to row 0 (top edge).
+    check("1/x at x=0 clips to the top edge row (asymptote runs off, no crash)", grid3[0][10] == "*", fails)
+    # A middle-magnitude column (x != 0, finite) should NOT be clipped to an edge.
+    # x at column 11 is 0.2 (just past the asymptote) -> 1/0.2 = 5.0, at the very
+    # top of this window too (ymax=5), which is a legitimate finite in-range value,
+    # not a crash and not corrupting the frame.
+    check("render did not crash/empty out on the discontinuity", len(out3) > 0, fails)
+
+    # --- sqrt(x): negative-x region is blank (domain error -> nan -> skipped) ---
+    w4: Window = Window(-4.0, 4.0, -1.0, 3.0)
+    spec_sqrt: PlotSpec = PlotSpec("sqrt(x)", parse("sqrt(x)"), glyph_for_index(0))
+    out4: str = render([spec_sqrt], w4, 41, 11)
+    lines4: list[str] = out4.split("\n")
+    grid4: list[str] = lines4[1:12]
+    # Columns 0..19 are x in [-4, -0.2] (negative, domain error) -> no glyph anywhere.
+    neg_has_glyph: bool = False
+    for row4 in grid4:
+        col_i: int = 0
+        for ch4 in row4[0:19]:
+            neg_has_glyph = neg_has_glyph or (ch4 == "*")
+            col_i += 1
+    check("sqrt(x) negative-x region has no glyph (nan samples skipped, region blank)", not neg_has_glyph, fails)
+    # Columns from the positive side (near x=4, column 40) DO carry the glyph somewhere.
+    pos_has_glyph: bool = False
+    for row5 in grid4:
+        if row5[40] == "*" or row5[39] == "*" or row5[38] == "*":
+            pos_has_glyph = True
+    check("sqrt(x) positive-x region has the glyph plotted", pos_has_glyph, fails)
+
+    # --- no functions plotted: honest placeholder, not a blank/broken frame ---
+    out_empty: str = render([], w1, 21, 11)
+    check("render([]) shows the no-functions placeholder", "no functions plotted" in out_empty, fails)
+
+    # --- auto-scale sanity: resolve_window tracks sin(x)'s [-1, 1] range ---
+    base: Window = Window(-10.0, 10.0, -10.0, 10.0)
+    resolved: Window = resolve_window([spec_sin], base, True, 76)
+    check("auto-scale ymin for sin(x) is close to -1 (within padding)",
+          resolved.ymin > -1.2 and resolved.ymin < -0.9, fails)
+    check("auto-scale ymax for sin(x) is close to +1 (within padding)",
+          resolved.ymax < 1.2 and resolved.ymax > 0.9, fails)
+    check("auto-scale xmin/xmax pass through unchanged", resolved.xmin == -10.0 and resolved.xmax == 10.0, fails)
+
+    # --- auto-scale with y_auto=False leaves the base window untouched ---
+    resolved_off: Window = resolve_window([spec_sin], base, False, 76)
+    check("y_auto=False returns base window unchanged",
+          resolved_off.ymin == -10.0 and resolved_off.ymax == 10.0, fails)
+
+    # --- auto-scale with nothing finite (e.g. every sample nan) falls back to base ---
+    spec_domain_err: PlotSpec = PlotSpec("sqrt(x)", parse("sqrt(x)"), glyph_for_index(0))
+    base_neg: Window = Window(-10.0, -5.0, -1.0, 1.0)  # entirely negative x -> sqrt always nan
+    resolved_fallback: Window = resolve_window([spec_domain_err], base_neg, True, 76)
+    check("auto-scale falls back to base window when nothing is finite",
+          resolved_fallback.ymin == -1.0 and resolved_fallback.ymax == 1.0, fails)
+
+    # --- make_table: symmetric function gives symmetric endpoint y-values ---
+    table_out: str = make_table(parse("x**2"), -2.0, 2.0, 5)
+    table_lines: list[str] = table_out.split("\n")
+    check("make_table has header rows + 5 data rows", len(table_lines) == 7, fails)
+    check("make_table x**2 endpoints both read y=4.00 (symmetric)",
+          "4.00" in table_lines[2] and "4.00" in table_lines[6], fails)
+
+    # --- make_table: domain errors show 'nan' honestly, not a crash ---
+    table_sqrt: str = make_table(parse("sqrt(x)"), -2.0, 2.0, 5)
+    check("make_table sqrt(x) shows 'nan' for negative x rows", "nan" in table_sqrt, fails)
+
+    if len(fails) == 0:
+        print("PASS: test_rasterizer — all checks passed")
+    else:
+        print("FAIL: test_rasterizer — " + str(len(fails)) + " check(s) failed: " + ", ".join(fails))
+        assert False

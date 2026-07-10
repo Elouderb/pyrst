@@ -1,0 +1,145 @@
+# tokenizer.pyrs — lexer for pyrstdb's SQL subset. Turns a single SQL
+# statement (a source string, semicolon optional) into a flat token list.
+# SQL keywords are case-insensitive: normalize keyword tokens' `text` to
+# UPPERCASE so the parser can compare with plain `==`. Identifiers keep their
+# original case. See README.md for the full grammar this must accept.
+
+# NOTE: a qualified generic type arg (`list[tokenizer.Token]`) does not
+# parse — pyrstdb's other modules `from tokenizer import Token` and use the
+# bare name in annotations instead.
+
+
+class Token:
+    kind: str  # "KEYWORD" | "IDENT" | "INT" | "FLOAT" | "STRING" | "OP" | "EOF"
+    text: str  # normalized text ("SELECT", "my_table", "42", "'hi'" unquoted, "=", ...)
+    pos: int   # 0-based byte offset into the source, for error messages
+
+    def __init__(self, kind: str, text: str, pos: int) -> None:
+        self.kind = kind
+        self.text = text
+        self.pos = pos
+
+
+def keywords() -> list[str]:
+    return [
+        "CREATE", "TABLE", "INSERT", "INTO", "VALUES", "SELECT", "FROM",
+        "WHERE", "AND", "OR", "ORDER", "BY", "ASC", "DESC", "LIMIT",
+        "UPDATE", "SET", "DELETE", "DROP", "INT", "FLOAT", "TEXT", "BOOL",
+        "TRUE", "FALSE", "NULL",
+        # Reserved only to give JOINs an honest "not supported" parse error
+        # (see parser.parse_select) rather than a confusing generic one.
+        "JOIN", "INNER", "LEFT", "RIGHT", "OUTER", "CROSS", "ON",
+    ]
+
+
+class TokenizeError(Exception):
+    pass
+
+
+def tokenize(src: str) -> list[Token]:
+    # Scan `src` left to right into a flat token list terminated by EOF.
+    # Keywords are matched case-insensitively and normalized to UPPERCASE so
+    # the parser can compare with plain `==`; identifiers keep their case.
+    # Negative numeric literals are folded here ("-" immediately before a
+    # digit): the SQL subset has no subtraction operator, so a leading "-" is
+    # unambiguously a sign. NOTE: f-string conversion `{ch!r}` is a lex error
+    # in pyrst (logged as a GAP on card 283e473a) — messages concatenate.
+    tokens: list[Token] = []
+    chars: list[str] = []
+    for c in src:
+        chars.append(c)
+    n: int = len(chars)
+    kws: list[str] = keywords()
+    i: int = 0
+    while i < n:
+        ch: str = chars[i]
+        # whitespace
+        if ch == " " or ch == "\t" or ch == "\n" or ch == "\r":
+            i = i + 1
+            continue
+        start: int = i
+        # identifier / keyword
+        if ch.isalpha() or ch == "_":
+            j: int = i
+            buf: str = ""
+            while j < n and (chars[j].isalnum() or chars[j] == "_"):
+                buf = buf + chars[j]
+                j = j + 1
+            up: str = buf.upper()
+            if up in kws:
+                tokens.append(Token("KEYWORD", up, start))
+            else:
+                tokens.append(Token("IDENT", buf, start))
+            i = j
+            continue
+        # numeric literal (optionally signed)
+        if ch.isdigit() or (ch == "-" and i + 1 < n and chars[i + 1].isdigit()):
+            j = i
+            buf = ""
+            if chars[j] == "-":
+                buf = "-"
+                j = j + 1
+            while j < n and chars[j].isdigit():
+                buf = buf + chars[j]
+                j = j + 1
+            is_float: bool = False
+            if j + 1 < n and chars[j] == "." and chars[j + 1].isdigit():
+                is_float = True
+                buf = buf + "."
+                j = j + 1
+                while j < n and chars[j].isdigit():
+                    buf = buf + chars[j]
+                    j = j + 1
+            if is_float:
+                tokens.append(Token("FLOAT", buf, start))
+            else:
+                tokens.append(Token("INT", buf, start))
+            i = j
+            continue
+        # single-quoted string literal (no escapes in v1)
+        if ch == "'":
+            j = i + 1
+            buf = ""
+            closed: bool = False
+            while j < n:
+                if chars[j] == "'":
+                    closed = True
+                    break
+                buf = buf + chars[j]
+                j = j + 1
+            if not closed:
+                raise TokenizeError("unterminated string literal at position " + str(start))
+            tokens.append(Token("STRING", buf, start))
+            i = j + 1
+            continue
+        # single-character operators
+        if ch == "(" or ch == ")" or ch == "," or ch == ";" or ch == "*" or ch == "=":
+            tokens.append(Token("OP", ch, start))
+            i = i + 1
+            continue
+        # multi-character comparison operators
+        if ch == "!":
+            if i + 1 < n and chars[i + 1] == "=":
+                tokens.append(Token("OP", "!=", start))
+                i = i + 2
+                continue
+            raise TokenizeError("unexpected character '!' at position " + str(start) + " (did you mean '!='?)")
+        if ch == "<":
+            if i + 1 < n and chars[i + 1] == "=":
+                tokens.append(Token("OP", "<=", start))
+                i = i + 2
+                continue
+            tokens.append(Token("OP", "<", start))
+            i = i + 1
+            continue
+        if ch == ">":
+            if i + 1 < n and chars[i + 1] == "=":
+                tokens.append(Token("OP", ">=", start))
+                i = i + 2
+                continue
+            tokens.append(Token("OP", ">", start))
+            i = i + 1
+            continue
+        raise TokenizeError("unexpected character '" + ch + "' at position " + str(start))
+    tokens.append(Token("EOF", "", n))
+    return tokens

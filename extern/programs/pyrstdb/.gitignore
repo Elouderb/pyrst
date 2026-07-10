@@ -1,0 +1,11 @@
+# pyrst build outputs — `pyrst build <file.pyrs>` always emits its binary
+# into the CURRENT directory named after the source basename (ignores -o
+# and subdirectories), so tests/smoke_repl.pyrs builds to ./smoke_repl too.
+# Regenerable; never commit these.
+/main
+/smoke_repl
+/test_engine
+/test_persist
+/test_edge_cases
+*.db
+*.pdb

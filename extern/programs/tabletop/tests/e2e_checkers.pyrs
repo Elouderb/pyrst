@@ -1,0 +1,31 @@
+# e2e_checkers.pyrs — scripted-stdin end-to-end run of a FULL checkers game
+# through the real menu (main), always picking the first listed move.
+#
+# USAGE (from extern/programs/tabletop/):
+#   pyrst build main.pyrs
+#   pyrst build tests/e2e_checkers.pyrs
+#   python3 -c "print('3'); [print('1') for _ in range(80)]" | ./e2e_checkers
+#
+# Script: "3" picks Checkers; 80 lines of "1" always take the first legal
+# move offered (including forced captures, since the move list already
+# excludes non-capturing moves when a capture is forced). Manually verified
+# this plays a genuine full game to completion in 46 plies — the player
+# (always taking move #1, i.e. not a strong line) reaches a position with
+# no legal moves and the game correctly prints "You have no legal moves.
+# White (CPU) wins." before returning to the menu; input then runs out and
+# the EOF safety-valve (ui.prompt_int, EOF_GIVEUP=100) exits cleanly rather
+# than hanging.
+#
+# Same subprocess stdio-inheritance workaround as tests/smoke_main.pyrs
+# (GAP: subprocess.run has no input= piping) — only the exit code is
+# asserted here; correctness of the printed game was verified manually.
+import subprocess
+
+
+def main() -> None:
+    result = subprocess.run(["./main"], capture_output=False)
+    if result.returncode == 0:
+        print("PASS: checkers scripted game ran to completion (exit 0)")
+    else:
+        print(f"FAIL: main exited with code {result.returncode}")
+        assert False

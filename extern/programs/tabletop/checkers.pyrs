@@ -1,0 +1,391 @@
+# checkers.pyrs — American (English draughts) checkers vs a minimax CPU.
+#
+# Rules implemented (card f1ac8d46):
+#   - 8x8 board on dark squares ((row+col) odd). Player = Red (r/R), moves UP
+#     (toward row 0); CPU = White (w/W), moves DOWN (toward row 7).
+#   - Men move/capture one diagonal forward; kings both directions.
+#   - FORCED CAPTURE: if any capture exists for the side to move, only captures
+#     are legal, and each jump sequence must be MAXIMAL (multi-jumps continue).
+#   - Kinging on the far row. American rule: a man that reaches the king row by
+#     a jump PROMOTES and the move ends (no continued jump as a king that turn).
+#   - Draw claimed after 40 plies with no capture (simple stall guard).
+# Move generation is pure (board = list[int] of 64, +1/+2 red man/king,
+# -1/-2 white man/king, 0 empty), separated from I/O, and unit-tested in
+# test_checkers.pyrs (forced-capture / multi-jump / promotion / perft-lite).
+
+import ui
+
+RED: int = 1
+WHITE: int = -1
+
+# --- coordinates -------------------------------------------------------------
+def rc_row(sq: int) -> int:
+    return sq // 8
+
+
+def rc_col(sq: int) -> int:
+    return sq % 8
+
+
+def sq_of(r: int, c: int) -> int:
+    return r * 8 + c
+
+
+def on_board(r: int, c: int) -> bool:
+    return r >= 0 and r < 8 and c >= 0 and c < 8
+
+
+def is_king_row(sq: int, side: int) -> bool:
+    if side == RED:
+        return rc_row(sq) == 0
+    return rc_row(sq) == 7
+
+
+def alg(sq: int) -> str:
+    c: int = rc_col(sq)
+    r: int = rc_row(sq)
+    letter: str = chr(ord('a') + c)
+    return letter + str(8 - r)
+
+
+# --- move type ---------------------------------------------------------------
+class CMove:
+    path: list[int]
+    caps: list[int]
+
+    def __init__(self, path: list[int], caps: list[int]) -> None:
+        self.path = path
+        self.caps = caps
+
+    def frm(self) -> int:
+        return self.path[0]
+
+    def dst(self) -> int:
+        return self.path[len(self.path) - 1]
+
+    def is_jump(self) -> bool:
+        return len(self.caps) > 0
+
+    def label(self) -> str:
+        sep: str = "-"
+        if self.is_jump():
+            sep = "x"
+        out: str = alg(self.path[0])
+        i: int = 1
+        while i < len(self.path):
+            out = out + sep + alg(self.path[i])
+            i = i + 1
+        return out
+
+
+# --- board setup -------------------------------------------------------------
+def new_board() -> list[int]:
+    b: list[int] = [0] * 64
+    r: int = 0
+    while r < 8:
+        c: int = 0
+        while c < 8:
+            if (r + c) % 2 == 1:
+                if r <= 2:
+                    b[sq_of(r, c)] = WHITE
+                elif r >= 5:
+                    b[sq_of(r, c)] = RED
+            c = c + 1
+        r = r + 1
+    return b
+
+
+def piece_side(v: int) -> int:
+    if v > 0:
+        return RED
+    if v < 0:
+        return WHITE
+    return 0
+
+
+def is_king(v: int) -> bool:
+    return v == 2 or v == -2
+
+
+# Direction sets as (dr, dc).
+def man_dirs(side: int) -> list[tuple[int, int]]:
+    if side == RED:
+        return [(-1, -1), (-1, 1)]
+    return [(1, -1), (1, 1)]
+
+
+def all_dirs() -> list[tuple[int, int]]:
+    return [(-1, -1), (-1, 1), (1, -1), (1, 1)]
+
+
+def dirs_for(v: int, side: int) -> list[tuple[int, int]]:
+    if is_king(v):
+        return all_dirs()
+    return man_dirs(side)
+
+
+# --- capture (jump) generation ----------------------------------------------
+def dfs_jumps(b: list[int], side: int, cur: int, king_now: bool,
+              captured: list[int], path: list[int], out: Mut[list[CMove]]) -> None:
+    r: int = rc_row(cur)
+    c: int = rc_col(cur)
+    piece_val: int = 2 * side
+    if not king_now:
+        piece_val = side
+    dirs: list[tuple[int, int]] = dirs_for(piece_val, side)
+    extended: bool = False
+    for d in dirs:
+        dr: int = d[0]
+        dc: int = d[1]
+        mr: int = r + dr
+        mc: int = c + dc
+        lr: int = r + 2 * dr
+        lc: int = c + 2 * dc
+        if not on_board(lr, lc):
+            continue
+        mid: int = sq_of(mr, mc)
+        land: int = sq_of(lr, lc)
+        # Enemy on mid (not already captured this sequence), empty landing.
+        if b[mid] * side >= 0:
+            continue
+        if mid in captured:
+            continue
+        if b[land] != 0:
+            continue
+        promoted: bool = (not king_now) and is_king_row(land, side)
+        new_caps: list[int] = captured[:]
+        new_caps.append(mid)
+        new_path: list[int] = path[:]
+        new_path.append(land)
+        extended = True
+        if promoted:
+            # American rule: promotion ends the move.
+            out.append(CMove(new_path, new_caps))
+        else:
+            dfs_jumps(b, side, land, king_now, new_caps, new_path, out)
+    if not extended and len(path) > 1:
+        out.append(CMove(path[:], captured[:]))
+
+
+def gen_jumps(b: list[int], side: int) -> list[CMove]:
+    out: list[CMove] = []
+    sq: int = 0
+    while sq < 64:
+        if b[sq] * side > 0:
+            king_now: bool = is_king(b[sq])
+            start_path: list[int] = [sq]
+            start_caps: list[int] = []
+            dfs_jumps(b, side, sq, king_now, start_caps, start_path, out)
+        sq = sq + 1
+    return out
+
+
+def gen_simple(b: list[int], side: int) -> list[CMove]:
+    out: list[CMove] = []
+    sq: int = 0
+    while sq < 64:
+        if b[sq] * side > 0:
+            r: int = rc_row(sq)
+            c: int = rc_col(sq)
+            dirs: list[tuple[int, int]] = dirs_for(b[sq], side)
+            for d in dirs:
+                nr: int = r + d[0]
+                nc: int = c + d[1]
+                if on_board(nr, nc):
+                    ns: int = sq_of(nr, nc)
+                    if b[ns] == 0:
+                        out.append(CMove([sq, ns], []))
+        sq = sq + 1
+    return out
+
+
+# Legal moves: captures are forced when any exist.
+def gen_moves(b: list[int], side: int) -> list[CMove]:
+    jumps: list[CMove] = gen_jumps(b, side)
+    if len(jumps) > 0:
+        return jumps
+    return gen_simple(b, side)
+
+
+def ck_apply_move(b: list[int], side: int, m: CMove) -> list[int]:
+    nb: list[int] = b[:]
+    frm: int = m.frm()
+    dst: int = m.dst()
+    v: int = nb[frm]
+    nb[frm] = 0
+    for cap in m.caps:
+        nb[cap] = 0
+    if not is_king(v) and is_king_row(dst, side):
+        v = 2 * side
+    nb[dst] = v
+    return nb
+
+
+# --- evaluation (positive favors RED) ---------------------------------------
+def raw_eval(b: list[int]) -> int:
+    score: int = 0
+    sq: int = 0
+    while sq < 64:
+        v: int = b[sq]
+        if v != 0:
+            r: int = rc_row(sq)
+            if v == RED:
+                score = score + 100 + (7 - r)  # advancement toward row 0
+            elif v == 2:
+                score = score + 175
+            elif v == WHITE:
+                score = score - 100 - r
+            elif v == -2:
+                score = score - 175
+        sq = sq + 1
+    return score
+
+
+BIG: int = 1000000
+
+
+def ck_negamax(b: list[int], side: int, depth: int, alpha: int, beta: int) -> int:
+    moves: list[CMove] = gen_moves(b, side)
+    if len(moves) == 0:
+        return -BIG - depth  # side to move has no move: loss (prefer slower loss)
+    if depth == 0:
+        # side-relative static eval + light mobility term.
+        opp_moves: int = len(gen_moves(b, -side))
+        mob: int = (len(moves) - opp_moves) * 2
+        return raw_eval(b) * side + mob
+    best: int = -BIG * 4
+    a: int = alpha
+    for m in moves:
+        nb: list[int] = ck_apply_move(b, side, m)
+        v: int = -ck_negamax(nb, -side, depth - 1, -beta, -a)
+        if v > best:
+            best = v
+        if best > a:
+            a = best
+        if a >= beta:
+            break
+    return best
+
+
+def choose_cpu_move(b: list[int], side: int, depth: int) -> int:
+    """Returns index into gen_moves(b, side) of the CPU's chosen move (-1 none)."""
+    moves: list[CMove] = gen_moves(b, side)
+    if len(moves) == 0:
+        return -1
+    best_idx: int = 0
+    best_val: int = -BIG * 8
+    i: int = 0
+    while i < len(moves):
+        nb: list[int] = ck_apply_move(b, side, moves[i])
+        v: int = -ck_negamax(nb, -side, depth - 1, -BIG * 8, BIG * 8)
+        if v > best_val:
+            best_val = v
+            best_idx = i
+        i = i + 1
+    return best_idx
+
+
+def count_pieces(b: list[int], side: int) -> int:
+    n: int = 0
+    sq: int = 0
+    while sq < 64:
+        if b[sq] * side > 0:
+            n = n + 1
+        sq = sq + 1
+    return n
+
+
+# --- rendering ---------------------------------------------------------------
+def ck_glyph(v: int) -> str:
+    if v == RED:
+        return "r"
+    if v == 2:
+        return "R"
+    if v == WHITE:
+        return "w"
+    if v == -2:
+        return "W"
+    return "."
+
+
+def ck_render(b: list[int]) -> str:
+    out: str = "     a   b   c   d   e   f   g   h\n"
+    out = out + "   +" + ("---+" * 8) + "\n"
+    r: int = 0
+    while r < 8:
+        rank: str = str(8 - r)
+        line: str = " " + rank + " |"
+        c: int = 0
+        while c < 8:
+            sq: int = sq_of(r, c)
+            cell: str = " "
+            if (r + c) % 2 == 1:
+                cell = ck_glyph(b[sq])
+            line = line + " " + cell + " |"
+            c = c + 1
+        out = out + line + " " + rank + "\n"
+        out = out + "   +" + ("---+" * 8) + "\n"
+        r = r + 1
+    out = out + "     a   b   c   d   e   f   g   h"
+    return out
+
+
+# --- interactive game --------------------------------------------------------
+CPU_DEPTH: int = 7
+
+
+def play_checkers() -> None:
+    print(ui.title("Checkers"))
+    print("You are Red (r/R), moving up the board. CPU is White (w/W).")
+    print("Captures are forced. Pick a move by its number.")
+    print(ui.hr())
+
+    pos: list[int] = new_board()
+    side: int = RED  # player moves first
+    no_capture_plies: int = 0
+
+    while True:
+        print("")
+        print(ck_render(pos))
+        print(ui.hr())
+
+        red_left: int = count_pieces(pos, RED)
+        white_left: int = count_pieces(pos, WHITE)
+        print(f"Red pieces: {red_left}   White pieces: {white_left}")
+
+        moves: list[CMove] = gen_moves(pos, side)
+        if len(moves) == 0:
+            if side == RED:
+                print("You have no legal moves. White (CPU) wins.")
+            else:
+                print("CPU has no legal moves. You win!")
+            return
+        if no_capture_plies >= 40:
+            print("Draw: 40 plies with no capture.")
+            return
+
+        if side == RED:
+            i: int = 0
+            while i < len(moves):
+                print(f"  {i + 1}) {moves[i].label()}")
+                i = i + 1
+            pick: int = ui.prompt_int("Your move #: ", 1, len(moves))
+            chosen: CMove = moves[pick - 1]
+            pos = ck_apply_move(pos, side, chosen)
+            print(f"You play {chosen.label()}")
+            if chosen.is_jump():
+                no_capture_plies = 0
+            else:
+                no_capture_plies = no_capture_plies + 1
+        else:
+            print("CPU is thinking...")
+            idx: int = choose_cpu_move(pos, side, CPU_DEPTH)
+            chosen2: CMove = moves[idx]
+            pos = ck_apply_move(pos, side, chosen2)
+            print(f"CPU plays {chosen2.label()}")
+            if chosen2.is_jump():
+                no_capture_plies = 0
+            else:
+                no_capture_plies = no_capture_plies + 1
+
+        side = -side

@@ -1,0 +1,131 @@
+# tests/test_engine.pyrs — end-to-end engine matrix over the SQL subset.
+#
+# Drives the built `main` binary in SCRIPT mode and asserts on its captured
+# stdout: DDL, single/multi/partial INSERT, SELECT projection + WHERE
+# (comparison ops, AND/OR), ORDER BY (ASC/DESC), LIMIT, UPDATE, DELETE, DROP,
+# and named error paths. Prints PASS/FAIL and exits 0/1.
+#
+# Run from extern/programs/pyrstdb/ after building both binaries:
+#   pyrst build main.pyrs
+#   pyrst build tests/test_engine.pyrs
+#   ./test_engine                (optional arg: path to `main`, default "./main")
+
+import sys
+from subprocess import run, CompletedProcess
+
+SCRIPT_PATH: str = "/tmp/pyrstdb_engine_script.sql"
+
+
+def write_script() -> None:
+    with open(SCRIPT_PATH, "w") as f:
+        f.write("CREATE TABLE nums (id INT, label TEXT, val FLOAT, ok BOOL);\n")
+        f.write("INSERT INTO nums VALUES (1, 'one', 1.5, TRUE), (2, 'two', 2.5, FALSE), (3, 'three', 3.5, TRUE);\n")
+        f.write("INSERT INTO nums (id, label) VALUES (4, 'four');\n")
+        # projection + WHERE >= + ORDER BY DESC
+        f.write("SELECT id, label FROM nums WHERE id >= 2 ORDER BY id DESC;\n")
+        # AND range
+        f.write("SELECT label FROM nums WHERE val > 1.5 AND val < 3.5;\n")
+        # OR
+        f.write("SELECT id FROM nums WHERE id = 1 OR id = 3 ORDER BY id;\n")
+        # LIMIT
+        f.write("SELECT id FROM nums ORDER BY id LIMIT 2;\n")
+        # != and bool equality
+        f.write("SELECT id FROM nums WHERE ok = TRUE ORDER BY id;\n")
+        # UPDATE + verify
+        f.write("UPDATE nums SET val = 9.0, ok = FALSE WHERE id = 1;\n")
+        f.write("SELECT val FROM nums WHERE id = 1;\n")
+        # DELETE + verify count
+        f.write("DELETE FROM nums WHERE id = 4;\n")
+        f.write("SELECT id FROM nums ORDER BY id;\n")
+        # error paths
+        f.write("SELECT * FROM missing;\n")
+        f.write("SELECT nope FROM nums;\n")
+        f.write("INSERT INTO nums VALUES (5, 'x');\n")
+        f.write("INSERT INTO nums VALUES (6, 'y', 'notafloat', TRUE);\n")
+        f.write("CREATE TABLE nums (id INT);\n")
+        f.write("BOGUS statement here;\n")
+        f.write("SELECT * FROM nums WHERE id 5;\n")
+        # DROP + confirm gone
+        f.write("DROP TABLE nums;\n")
+        f.write("SELECT * FROM nums;\n")
+        f.write(".quit\n")
+
+
+def binpath() -> str:
+    if len(sys.argv) > 1:
+        return sys.argv[1]
+    return "./main"
+
+
+def fail(message: str, out: str) -> None:
+    print("FAIL: " + message + "\n----- output -----\n" + out)
+    sys.exit(1)
+
+
+def need(out: str, needle: str) -> None:
+    if needle not in out:
+        fail("missing expected output: " + needle, out)
+
+
+def need_order(out: str, first: str, second: str) -> None:
+    fi: int = out.find(first)
+    si: int = out.find(second)
+    if fi < 0:
+        fail("missing (order check) first token: " + first, out)
+    if si < 0:
+        fail("missing (order check) second token: " + second, out)
+    if fi >= si:
+        fail("expected '" + first + "' before '" + second + "'", out)
+
+
+def main() -> None:
+    write_script()
+    r: CompletedProcess = run([binpath(), SCRIPT_PATH], capture_output=True)
+    if r.returncode != 0:
+        print("FAIL: main exited " + str(r.returncode))
+        sys.exit(1)
+    ob = r.stdout
+    if ob is None:
+        print("FAIL: no stdout")
+        sys.exit(1)
+        return
+    out: str = ob.decode("utf-8")
+
+    # DDL + INSERT counts
+    need(out, "Table 'nums' created.")
+    need(out, "3 row(s) inserted.")
+    need(out, "1 row(s) inserted.")
+
+    # projection + WHERE >= + ORDER BY DESC: 3 before 2
+    need(out, "id | label")
+    need(out, "3  | three")
+    need(out, "2  | two")
+    need_order(out, "3  | three", "2  | two")
+
+    # AND range -> only 'two' (val 2.5 is the only 1.5<val<3.5)
+    need_order(out, "label\n-----\ntwo", "(1 row(s))")
+
+    # OR -> ids 1 and 3 (ASC)
+    need(out, "id\n--\n1\n3\n(2 row(s))")
+
+    # UPDATE + verify updated value present
+    need(out, "1 row(s) updated.")
+    need(out, "9.0")
+
+    # DELETE
+    need(out, "1 row(s) deleted.")
+
+    # error paths (named, positional where relevant)
+    need(out, "error: no such table: missing")
+    need(out, "error: no such column: nope")
+    need(out, "error: table 'nums' has 4 column(s) but 2 value(s) were given")
+    need(out, "type mismatch for column 'val': expected FLOAT, got TEXT")
+    need(out, "error: table 'nums' already exists")
+    need(out, "parse error: expected a statement keyword but found 'BOGUS'")
+    need(out, "parse error: expected a comparison operator")
+
+    # DROP then gone
+    need(out, "Table 'nums' dropped.")
+    need(out, "error: no such table: nums")
+
+    print("PASS: test_engine")

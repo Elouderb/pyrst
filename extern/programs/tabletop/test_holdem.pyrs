@@ -1,0 +1,135 @@
+# test_holdem.pyrs — pure hand-evaluator + side-pot tests for hold'em.
+# Root sibling of holdem.pyrs. Run:
+#   pyrst build test_holdem.pyrs && ./test_holdem   (exit 0 = PASS)
+
+from holdem import Card, hd_eval5, hd_eval_best, hd_cat_of, HandState, hd_award
+from holdem import HD_HIGH, HD_PAIR, HD_TWOPAIR, HD_TRIPS, HD_STRAIGHT
+from holdem import HD_FLUSH, HD_FULL, HD_QUADS, HD_SF
+
+FAILS: int = 0
+
+
+def check(cond: bool, msg: str) -> None:
+    global FAILS
+    if cond:
+        print(f"PASS: {msg}")
+    else:
+        print(f"FAIL: {msg}")
+        FAILS = FAILS + 1
+
+
+def C(rank: int, suit: str) -> Card:
+    return Card(rank, suit)
+
+
+def main() -> None:
+    # --- category detection ---
+    sf: list[Card] = [C(10, "S"), C(11, "S"), C(12, "S"), C(13, "S"), C(14, "S")]
+    quads: list[Card] = [C(9, "S"), C(9, "H"), C(9, "D"), C(9, "C"), C(13, "S")]
+    full: list[Card] = [C(12, "S"), C(12, "H"), C(12, "D"), C(4, "C"), C(4, "S")]
+    flush: list[Card] = [C(2, "H"), C(5, "H"), C(9, "H"), C(11, "H"), C(13, "H")]
+    straight: list[Card] = [C(5, "S"), C(6, "H"), C(7, "D"), C(8, "C"), C(9, "S")]
+    trips: list[Card] = [C(7, "S"), C(7, "H"), C(7, "D"), C(13, "C"), C(2, "S")]
+    twopair: list[Card] = [C(13, "S"), C(13, "H"), C(4, "D"), C(4, "C"), C(9, "S")]
+    pair: list[Card] = [C(14, "S"), C(14, "H"), C(9, "D"), C(5, "C"), C(2, "S")]
+    high: list[Card] = [C(14, "S"), C(11, "H"), C(9, "D"), C(5, "C"), C(2, "S")]
+
+    check(hd_cat_of(hd_eval5(sf)) == HD_SF, "royal flush -> straight flush category")
+    check(hd_cat_of(hd_eval5(quads)) == HD_QUADS, "quads category")
+    check(hd_cat_of(hd_eval5(full)) == HD_FULL, "full house category")
+    check(hd_cat_of(hd_eval5(flush)) == HD_FLUSH, "flush category")
+    check(hd_cat_of(hd_eval5(straight)) == HD_STRAIGHT, "straight category")
+    check(hd_cat_of(hd_eval5(trips)) == HD_TRIPS, "trips category")
+    check(hd_cat_of(hd_eval5(twopair)) == HD_TWOPAIR, "two pair category")
+    check(hd_cat_of(hd_eval5(pair)) == HD_PAIR, "pair category")
+    check(hd_cat_of(hd_eval5(high)) == HD_HIGH, "high card category")
+
+    # --- strict category ordering ---
+    check(hd_eval5(sf) > hd_eval5(quads), "SF > quads")
+    check(hd_eval5(quads) > hd_eval5(full), "quads > full house")
+    check(hd_eval5(full) > hd_eval5(flush), "full house > flush")
+    check(hd_eval5(flush) > hd_eval5(straight), "flush > straight")
+    check(hd_eval5(straight) > hd_eval5(trips), "straight > trips")
+    check(hd_eval5(trips) > hd_eval5(twopair), "trips > two pair")
+    check(hd_eval5(twopair) > hd_eval5(pair), "two pair > pair")
+    check(hd_eval5(pair) > hd_eval5(high), "pair > high card")
+
+    # --- wheel (A-2-3-4-5) is a 5-high straight, below a 6-high straight ---
+    wheel: list[Card] = [C(14, "S"), C(2, "H"), C(3, "D"), C(4, "C"), C(5, "S")]
+    six_high: list[Card] = [C(2, "S"), C(3, "H"), C(4, "D"), C(5, "C"), C(6, "S")]
+    ace_high_str: list[Card] = [C(10, "S"), C(11, "H"), C(12, "D"), C(13, "C"), C(14, "S")]
+    check(hd_cat_of(hd_eval5(wheel)) == HD_STRAIGHT, "wheel is a straight")
+    check(hd_eval5(six_high) > hd_eval5(wheel), "6-high straight > wheel")
+    check(hd_eval5(ace_high_str) > hd_eval5(six_high), "ace-high straight > 6-high")
+
+    # --- kickers ---
+    aa_kqj: list[Card] = [C(14, "S"), C(14, "H"), C(13, "D"), C(12, "C"), C(11, "S")]
+    aa_kqt: list[Card] = [C(14, "S"), C(14, "H"), C(13, "D"), C(12, "C"), C(10, "S")]
+    check(hd_eval5(aa_kqj) > hd_eval5(aa_kqt), "pair AA: J kicker beats T kicker")
+
+    kk_qq_a: list[Card] = [C(13, "S"), C(13, "H"), C(12, "D"), C(12, "C"), C(14, "S")]
+    kk_qq_j: list[Card] = [C(13, "S"), C(13, "H"), C(12, "D"), C(12, "C"), C(11, "S")]
+    check(hd_eval5(kk_qq_a) > hd_eval5(kk_qq_j), "two pair KKQQ: ace kicker beats jack kicker")
+
+    aa_low: list[Card] = [C(14, "S"), C(14, "H"), C(4, "D"), C(3, "C"), C(2, "S")]
+    kk_high: list[Card] = [C(13, "S"), C(13, "H"), C(12, "D"), C(11, "C"), C(10, "S")]
+    check(hd_eval5(aa_low) > hd_eval5(kk_high), "pair of aces > pair of kings regardless of kickers")
+
+    # --- eval7: best 5 of 7 ---
+    # flush made from hole+board
+    seven_flush: list[Card] = [C(14, "S"), C(13, "S"), C(12, "S"), C(11, "S"), C(2, "S"), C(3, "H"), C(4, "D")]
+    check(hd_cat_of(hd_eval_best(seven_flush)) == HD_FLUSH, "eval7 finds a flush")
+
+    # straight spanning hole+board
+    seven_straight: list[Card] = [C(9, "H"), C(8, "H"), C(7, "D"), C(6, "C"), C(5, "S"), C(13, "D"), C(2, "C")]
+    check(hd_cat_of(hd_eval_best(seven_straight)) == HD_STRAIGHT, "eval7 finds a straight")
+
+    # quads on board + hole
+    seven_quads: list[Card] = [C(2, "H"), C(7, "D"), C(2, "S"), C(2, "D"), C(2, "C"), C(13, "S"), C(12, "S")]
+    check(hd_cat_of(hd_eval_best(seven_quads)) == HD_QUADS, "eval7 finds quads")
+
+    # shared board, kicker decides (both a pair of tens, A kicker vs K kicker)
+    board: list[Card] = [C(10, "D"), C(10, "C"), C(6, "S"), C(3, "H"), C(2, "C")]
+    a_kick: list[Card] = board[:]
+    a_kick.append(C(14, "S"))
+    a_kick.append(C(9, "H"))
+    k_kick: list[Card] = board[:]
+    k_kick.append(C(13, "S"))
+    k_kick.append(C(9, "D"))
+    check(hd_eval_best(a_kick) > hd_eval_best(k_kick), "eval7: pair of tens with ace kicker beats king kicker")
+
+    # --- side pots: p0 all-in for 50, p1 & p2 in for 100 each ---
+    # Board makes no pairs/straights/flush; hands: p0 AA, p1 KK, p2 QQ.
+    hs: HandState = HandState([0, 0, 0])
+    hs.contributed = [50, 100, 100]
+    hole0: list[Card] = [C(14, "S"), C(14, "H")]
+    hole1: list[Card] = [C(13, "S"), C(13, "H")]
+    hole2: list[Card] = [C(12, "S"), C(12, "H")]
+    hs.hole = [hole0, hole1, hole2]
+    hs.community = [C(2, "C"), C(7, "D"), C(9, "S"), C(11, "C"), C(4, "H")]
+    hs.folded = [False, False, False]
+    hd_award(hs)
+    # Main pot 150 (3x50) -> p0 (AA). Side pot 100 (2x50) -> p1 (KK). p2 gets 0.
+    check(hs.stacks[0] == 150, "side pot: all-in p0 (AA) wins the 150 main pot")
+    check(hs.stacks[1] == 100, "side pot: p1 (KK) wins the 100 side pot")
+    check(hs.stacks[2] == 0, "side pot: p2 (QQ) wins nothing")
+
+    # --- split pot: two identical winners share; odd chip to first ---
+    hs2: HandState = HandState([0, 0, 0])
+    hs2.contributed = [45, 45, 45]     # pot 135, split two ways = 67 + odd chip
+    tie0: list[Card] = [C(14, "S"), C(13, "S")]
+    tie1: list[Card] = [C(14, "H"), C(13, "H")]   # same ranks -> tie with p0
+    lose2: list[Card] = [C(2, "S"), C(3, "S")]
+    hs2.hole = [tie0, tie1, lose2]
+    hs2.community = [C(14, "D"), C(13, "D"), C(9, "S"), C(11, "C"), C(4, "H")]
+    hs2.folded = [False, False, False]
+    hd_award(hs2)
+    check(hs2.stacks[0] + hs2.stacks[1] == 135, "split pot: two winners share the whole 135")
+    check(hs2.stacks[2] == 0, "split pot: loser gets nothing")
+    check(hs2.stacks[0] == 68 and hs2.stacks[1] == 67, "split pot: odd chip to the first winner")
+
+    if FAILS == 0:
+        print("ALL HOLDEM TESTS PASSED")
+    else:
+        print(f"{FAILS} HOLDEM TEST(S) FAILED")
+        assert False

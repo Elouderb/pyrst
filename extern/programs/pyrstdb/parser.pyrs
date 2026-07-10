@@ -1,0 +1,309 @@
+# parser.pyrs — recursive-descent parser: Token stream -> typed Statement.
+# One call to `parse()` consumes exactly one statement (an optional trailing
+# ";" OP token is allowed and dropped). Grammar covered: CREATE TABLE,
+# INSERT, SELECT, UPDATE, DELETE, DROP TABLE — see README.md.
+#
+# NOTE: a qualified generic type arg (`list[tokenizer.Token]`) does not
+# parse in pyrst, so cross-module types are pulled in via `from X import Y`
+# and used bare below.
+
+from tokenizer import Token, tokenize
+from ast_types import Statement, ColumnDef, Value, WhereClause, Condition
+from ast_types import int_value, float_value, text_value, bool_value, null_value
+
+
+class ParseError(Exception):
+    pass
+
+
+def is_col_type(text: str) -> bool:
+    return text == "INT" or text == "FLOAT" or text == "TEXT" or text == "BOOL"
+
+
+def is_cmp_op(text: str) -> bool:
+    return text == "=" or text == "!=" or text == "<" or text == ">" or text == "<=" or text == ">="
+
+
+class Parser:
+    tokens: list[Token]
+    pos: int
+
+    def __init__(self, tokens: list[Token]) -> None:
+        self.tokens = tokens
+        self.pos = 0
+
+    def peek(self) -> Token:
+        return self.tokens[self.pos]
+
+    def advance(self) -> Token:
+        t: Token = self.tokens[self.pos]
+        self.pos = self.pos + 1
+        return t
+
+    def expect(self, kind: str, text: str) -> Token:
+        t: Token = self.peek()
+        if t.kind != kind or (text != "" and t.text != text):
+            want: str = kind
+            if text != "":
+                want = "'" + text + "'"
+            raise ParseError("expected " + want + " but found '" + t.text + "' (" + t.kind + ") at position " + str(t.pos))
+        return self.advance()
+
+    def at_keyword(self, kw: str) -> bool:
+        t: Token = self.peek()
+        return t.kind == "KEYWORD" and t.text == kw
+
+    def at_op(self, op: str) -> bool:
+        t: Token = self.peek()
+        return t.kind == "OP" and t.text == op
+
+    def finish(self, stmt: Statement) -> Statement:
+        # Consume an optional trailing ';' then require EOF, so trailing
+        # garbage is a named error rather than a silent partial parse.
+        if self.at_op(";"):
+            self.advance()
+        end: Token = self.peek()
+        if end.kind != "EOF":
+            raise ParseError("unexpected token '" + end.text + "' after statement at position " + str(end.pos))
+        return stmt
+
+    def parse_statement(self) -> Statement:
+        t: Token = self.peek()
+        if t.kind != "KEYWORD":
+            raise ParseError("expected a statement keyword but found '" + t.text + "' at position " + str(t.pos))
+        # NOTE (GAP, card 283e473a): a nested self-mutating call
+        # `self.finish(self.parse_x())` lowers to two overlapping `&mut self`
+        # borrows and is rejected by rustc (E0499). Bind the inner result to a
+        # local first, then call finish on it.
+        stmt: Statement = Statement("")
+        if t.text == "CREATE":
+            stmt = self.parse_create_table()
+        elif t.text == "INSERT":
+            stmt = self.parse_insert()
+        elif t.text == "SELECT":
+            stmt = self.parse_select()
+        elif t.text == "UPDATE":
+            stmt = self.parse_update()
+        elif t.text == "DELETE":
+            stmt = self.parse_delete()
+        elif t.text == "DROP":
+            stmt = self.parse_drop_table()
+        else:
+            raise ParseError("unsupported statement '" + t.text + "' at position " + str(t.pos))
+        return self.finish(stmt)
+
+    def parse_create_table(self) -> Statement:
+        # CREATE TABLE name (col type, col type, ...)
+        self.expect("KEYWORD", "CREATE")
+        self.expect("KEYWORD", "TABLE")
+        name_tok: Token = self.expect("IDENT", "")
+        stmt: Statement = Statement("CREATE_TABLE")
+        stmt.table_name = name_tok.text
+        self.expect("OP", "(")
+        cols: list[ColumnDef] = []
+        while True:
+            col_tok: Token = self.expect("IDENT", "")
+            type_tok: Token = self.peek()
+            if type_tok.kind != "KEYWORD" or not is_col_type(type_tok.text):
+                raise ParseError("expected a column type (INT/FLOAT/TEXT/BOOL) but found '" + type_tok.text + "' at position " + str(type_tok.pos))
+            self.advance()
+            cols.append(ColumnDef(col_tok.text, type_tok.text))
+            if self.at_op(","):
+                self.advance()
+                continue
+            break
+        self.expect("OP", ")")
+        stmt.columns = cols
+        return stmt
+
+    def parse_insert(self) -> Statement:
+        # INSERT INTO name [(col, ...)] VALUES (v, ...) [, (v, ...) ...]
+        self.expect("KEYWORD", "INSERT")
+        self.expect("KEYWORD", "INTO")
+        name_tok: Token = self.expect("IDENT", "")
+        stmt: Statement = Statement("INSERT")
+        stmt.table_name = name_tok.text
+        cols: list[str] = []
+        if self.at_op("("):
+            self.advance()
+            while True:
+                c: Token = self.expect("IDENT", "")
+                cols.append(c.text)
+                if self.at_op(","):
+                    self.advance()
+                    continue
+                break
+            self.expect("OP", ")")
+        stmt.insert_columns = cols
+        self.expect("KEYWORD", "VALUES")
+        rows: list[list[Value]] = []
+        while True:
+            self.expect("OP", "(")
+            vals: list[Value] = []
+            while True:
+                vals.append(self.parse_value_literal())
+                if self.at_op(","):
+                    self.advance()
+                    continue
+                break
+            self.expect("OP", ")")
+            rows.append(vals)
+            if self.at_op(","):
+                self.advance()
+                continue
+            break
+        stmt.insert_rows = rows
+        return stmt
+
+    def parse_select(self) -> Statement:
+        # SELECT (* | col, ...) FROM name [WHERE ...] [ORDER BY col [ASC|DESC]] [LIMIT n]
+        self.expect("KEYWORD", "SELECT")
+        stmt: Statement = Statement("SELECT")
+        selcols: list[str] = []
+        if self.at_op("*"):
+            self.advance()
+        else:
+            while True:
+                c: Token = self.expect("IDENT", "")
+                selcols.append(c.text)
+                if self.at_op(","):
+                    self.advance()
+                    continue
+                break
+        stmt.select_columns = selcols
+        self.expect("KEYWORD", "FROM")
+        name_tok: Token = self.expect("IDENT", "")
+        stmt.table_name = name_tok.text
+        jt: Token = self.peek()
+        if jt.kind == "KEYWORD" and (jt.text == "JOIN" or jt.text == "INNER" or jt.text == "LEFT" or jt.text == "RIGHT" or jt.text == "OUTER" or jt.text == "CROSS" or jt.text == "ON"):
+            raise ParseError("JOINs are not supported in this SQL subset (found '" + jt.text + "' at position " + str(jt.pos) + ")")
+        if self.at_keyword("WHERE"):
+            self.advance()
+            stmt.where = self.parse_where_clause()
+        if self.at_keyword("ORDER"):
+            self.advance()
+            self.expect("KEYWORD", "BY")
+            ob: Token = self.expect("IDENT", "")
+            stmt.order_by = ob.text
+            if self.at_keyword("ASC"):
+                self.advance()
+            elif self.at_keyword("DESC"):
+                self.advance()
+                stmt.order_desc = True
+        if self.at_keyword("LIMIT"):
+            self.advance()
+            lt: Token = self.expect("INT", "")
+            stmt.limit = int(lt.text)
+        return stmt
+
+    def parse_update(self) -> Statement:
+        # UPDATE name SET col = v, ... [WHERE ...]
+        self.expect("KEYWORD", "UPDATE")
+        name_tok: Token = self.expect("IDENT", "")
+        stmt: Statement = Statement("UPDATE")
+        stmt.table_name = name_tok.text
+        self.expect("KEYWORD", "SET")
+        setcols: list[str] = []
+        setvals: list[Value] = []
+        while True:
+            c: Token = self.expect("IDENT", "")
+            self.expect("OP", "=")
+            setcols.append(c.text)
+            setvals.append(self.parse_value_literal())
+            if self.at_op(","):
+                self.advance()
+                continue
+            break
+        stmt.set_columns = setcols
+        stmt.set_values = setvals
+        if self.at_keyword("WHERE"):
+            self.advance()
+            stmt.where = self.parse_where_clause()
+        return stmt
+
+    def parse_delete(self) -> Statement:
+        # DELETE FROM name [WHERE ...]
+        self.expect("KEYWORD", "DELETE")
+        self.expect("KEYWORD", "FROM")
+        name_tok: Token = self.expect("IDENT", "")
+        stmt: Statement = Statement("DELETE")
+        stmt.table_name = name_tok.text
+        if self.at_keyword("WHERE"):
+            self.advance()
+            stmt.where = self.parse_where_clause()
+        return stmt
+
+    def parse_drop_table(self) -> Statement:
+        # DROP TABLE name
+        self.expect("KEYWORD", "DROP")
+        self.expect("KEYWORD", "TABLE")
+        name_tok: Token = self.expect("IDENT", "")
+        stmt: Statement = Statement("DROP_TABLE")
+        stmt.table_name = name_tok.text
+        return stmt
+
+    def parse_where_clause(self) -> WhereClause:
+        # col op literal [(AND|OR) col op literal]* — strict left-to-right,
+        # no parenthesized sub-expressions (documented SQL-subset limit).
+        conds: list[Condition] = []
+        ops: list[str] = []
+        conds.append(self.parse_condition())
+        while True:
+            t: Token = self.peek()
+            if t.kind == "KEYWORD" and (t.text == "AND" or t.text == "OR"):
+                self.advance()
+                ops.append(t.text)
+                conds.append(self.parse_condition())
+                continue
+            break
+        return WhereClause(conds, ops)
+
+    def parse_condition(self) -> Condition:
+        col: Token = self.expect("IDENT", "")
+        opt: Token = self.peek()
+        if opt.kind != "OP" or not is_cmp_op(opt.text):
+            raise ParseError("expected a comparison operator (= != < > <= >=) but found '" + opt.text + "' at position " + str(opt.pos))
+        self.advance()
+        val: Value = self.parse_value_literal()
+        return Condition(col.text, opt.text, val)
+
+    def parse_value_literal(self) -> Value:
+        # INT / FLOAT / STRING / TRUE / FALSE / NULL literal -> ast_types.Value.
+        # A leading '-' before a number is normally folded by the tokenizer;
+        # this handles a stray '-' token defensively.
+        t: Token = self.peek()
+        if t.kind == "OP" and t.text == "-":
+            self.advance()
+            nt: Token = self.peek()
+            if nt.kind == "INT":
+                self.advance()
+                return int_value(-int(nt.text))
+            if nt.kind == "FLOAT":
+                self.advance()
+                return float_value(-float(nt.text))
+            raise ParseError("expected a number after '-' at position " + str(nt.pos))
+        if t.kind == "INT":
+            self.advance()
+            return int_value(int(t.text))
+        if t.kind == "FLOAT":
+            self.advance()
+            return float_value(float(t.text))
+        if t.kind == "STRING":
+            self.advance()
+            return text_value(t.text)
+        if t.kind == "KEYWORD" and t.text == "TRUE":
+            self.advance()
+            return bool_value(True)
+        if t.kind == "KEYWORD" and t.text == "FALSE":
+            self.advance()
+            return bool_value(False)
+        if t.kind == "KEYWORD" and t.text == "NULL":
+            self.advance()
+            return null_value()
+        raise ParseError("expected a literal value but found '" + t.text + "' at position " + str(t.pos))
+
+
+def parse(src: str) -> Statement:
+    tokens: list[Token] = tokenize(src)
+    p: Parser = Parser(tokens)
+    return p.parse_statement()

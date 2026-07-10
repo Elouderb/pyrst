@@ -1,0 +1,39 @@
+# e2e_chess.pyrs — scripted-stdin end-to-end run of chess through the real
+# menu (main): list moves, play a legal move, exercise bad-format /
+# bad-square / illegal-move rejection, then resign.
+#
+# USAGE (from extern/programs/tabletop/):
+#   pyrst build main.pyrs
+#   pyrst build tests/e2e_chess.pyrs
+#   printf "4\nmoves\ne2e4\nbadmove\nzz99\ne7e5\nquit\n" | ./e2e_chess
+#
+# Script: "4" picks Chess; "moves" lists legal moves (no crash); "e2e4"
+# plays a real legal move (CPU replies, e.g. Nc6); "badmove" (wrong length)
+# -> "Bad format" reprompt; "zz99" (bad squares) -> "Bad square" reprompt;
+# "e7e5" is illegal for White to move (it's a Black-side square/turn
+# mismatch after CPU's reply) -> "Illegal move" reprompt, never a crash;
+# "quit" resigns cleanly. Manually verified the full transcript: board
+# renders after every ply, CPU search completes well under 2s, and each
+# malformed/illegal input is caught by validation and re-prompts instead of
+# raising.
+#
+# Full-game perft/checkmate/stalemate correctness is covered by
+# test_chess.pyrs (published perft counts for 5 standard positions +
+# fool's-mate + stalemate); this end-to-end test exercises the real I/O
+# loop (menu -> game -> input validation -> resign -> menu -> quit)
+# instead of playing a full game to mate, which is impractical to script.
+#
+# Same subprocess stdio-inheritance workaround as tests/smoke_main.pyrs
+# (GAP: subprocess.run has no input= piping) — only the exit code is
+# asserted here; correctness of the printed transcript was verified
+# manually.
+import subprocess
+
+
+def main() -> None:
+    result = subprocess.run(["./main"], capture_output=False)
+    if result.returncode == 0:
+        print("PASS: chess scripted session ran cleanly to resignation (exit 0)")
+    else:
+        print(f"FAIL: main exited with code {result.returncode}")
+        assert False

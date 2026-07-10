@@ -1,0 +1,185 @@
+# main.pyrs — graphcalc REPL entry point.
+#
+# Commands (see README.md for full reference):
+#   plot <expr>                  replace the plot set with a single function
+#   add <expr>                   add another function to the current plot set
+#   window xmin xmax [ymin ymax] set the view window, then redraw
+#   clear                        remove all plotted functions
+#   table <expr>                 print a sample table for one function
+#   help                         list commands
+#   quit                         exit the REPL
+#
+# EOF/blank-line policy (a documented design choice, not a language GAP):
+# pyrst's `input()` builtin wraps Rust's `read_line`, which returns an EMPTY
+# string on EOF WITHOUT blocking or raising — there is no `EOFError` to
+# catch (`input()` at EOF behaves like Python's `input()` under `sys.stdin =
+# io.StringIO("")` would raise EOFError; pyrst instead just returns ""). If
+# the REPL loop is not built to notice this, a piped/closed stdin causes a
+# tight infinite loop (every read_line call returns immediately with "").
+# So: a blank line (either literally typed, or produced by EOF) exits the
+# REPL exactly like `quit`, both here and in the smoke test.
+
+from expr_parser import parse, Expr
+from rasterizer import (
+    Window,
+    PlotSpec,
+    default_window,
+    resolve_window,
+    render,
+    make_table,
+    glyph_for_index,
+    DEFAULT_WIDTH,
+    DEFAULT_HEIGHT
+)
+
+
+class ReplState:
+    window: Window
+    plots: list[PlotSpec]
+    y_auto: bool
+
+    def __init__(self) -> None:
+        self.window = default_window()
+        self.plots = []
+        # y-range auto-scales to the sampled values until the user pins it
+        # with a 4-argument `window xmin xmax ymin ymax`.
+        self.y_auto = True
+
+
+def split_ws(s: str) -> list[str]:
+    # Whitespace-split with empty fields dropped (pyrst's str.split needs an
+    # explicit separator and has no bare-whitespace form — see README GAP).
+    out: list[str] = []
+    for part in s.split(" "):
+        if part != "":
+            out.append(part)
+    return out
+
+
+def redraw(state: Mut[ReplState]) -> None:
+    # Resolve the (possibly auto-scaled) window, then print the plot once.
+    view: Window = resolve_window(state.plots, state.window, state.y_auto, DEFAULT_WIDTH)
+    print(render(state.plots, view, DEFAULT_WIDTH, DEFAULT_HEIGHT))
+
+
+def do_plot(state: Mut[ReplState], rest: str, replace: bool) -> None:
+    # Shared body for `plot` (replace=True) and `add` (replace=False): parse
+    # the expression, and on a parse error print the message under the input
+    # line instead of crashing the REPL.
+    if rest == "":
+        print("usage: plot <expr>   e.g. plot sin(x)")
+        return
+    try:
+        expr: Expr = parse(rest)
+    except ValueError as e:
+        print("parse error: " + e)
+        return
+    if replace:
+        state.plots = []
+    glyph: str = glyph_for_index(len(state.plots))
+    state.plots.append(PlotSpec(rest, expr, glyph))
+    redraw(state)
+
+
+def do_window(state: Mut[ReplState], rest: str) -> None:
+    fields: list[str] = split_ws(rest)
+    if len(fields) != 2 and len(fields) != 4:
+        print("usage: window xmin xmax [ymin ymax]")
+        return
+    try:
+        xmin: float = float(fields[0])
+        xmax: float = float(fields[1])
+        if len(fields) == 4:
+            ymin: float = float(fields[2])
+            ymax: float = float(fields[3])
+            state.window = Window(xmin, xmax, ymin, ymax)
+            state.y_auto = False
+        else:
+            state.window = Window(xmin, xmax, state.window.ymin, state.window.ymax)
+            state.y_auto = True
+    except ValueError:
+        print("window bounds must be numbers, e.g. window -10 10")
+        return
+    if xmax <= xmin:
+        print("window error: xmax must be greater than xmin")
+        return
+    redraw(state)
+
+
+def do_table(state: Mut[ReplState], rest: str) -> None:
+    if rest == "":
+        print("usage: table <expr>   e.g. table x**2")
+        return
+    try:
+        expr: Expr = parse(rest)
+    except ValueError as e:
+        print("parse error: " + e)
+        return
+    print(make_table(expr, state.window.xmin, state.window.xmax, 20))
+
+
+def split_command(line: str) -> tuple[str, str]:
+    # `line.partition(" ")` gives (head, sep, tail) in one call without
+    # needing str.split()'s unsupported bare-whitespace form (pyrst's
+    # `.split(sep)` requires an explicit separator — see README.md GAP).
+    parts: tuple[str, str, str] = line.partition(" ")
+    head: str = parts[0]
+    tail: str = parts[2]
+    return (head, tail.strip())
+
+
+def dispatch(state: Mut[ReplState], line: str) -> bool:
+    # Returns False when the REPL should exit, True to keep looping.
+    stripped: str = line.strip()
+    if stripped == "":
+        return False
+    cmd_and_rest: tuple[str, str] = split_command(stripped)
+    cmd: str = cmd_and_rest[0]
+    rest: str = cmd_and_rest[1]
+    # if/elif (not match): the helpers below are called only from these
+    # command arms, and a function reachable ONLY from inside a `match`/`case`
+    # arm is wrongly pruned as dead code (GAP on card d949c3e7 —
+    # typeck's collect_calls_from_stmt has no Stmt::Match arm). if/elif is
+    # walked by the call-collector, so redraw/do_plot/do_window/do_table link.
+    if cmd == "help":
+        print("graphcalc commands:")
+        print("  plot <expr>                  plot a single function of x")
+        print("  add <expr>                   add another function to the plot")
+        print("  window xmin xmax [ymin ymax] set the view window")
+        print("  clear                        remove all plotted functions")
+        print("  table <expr>                 print a sample table")
+        print("  help                         show this message")
+        print("  quit                         exit graphcalc")
+        return True
+    elif cmd == "quit":
+        return False
+    elif cmd == "plot":
+        do_plot(state, rest, True)
+        return True
+    elif cmd == "add":
+        do_plot(state, rest, False)
+        return True
+    elif cmd == "window":
+        do_window(state, rest)
+        return True
+    elif cmd == "clear":
+        state.plots = []
+        state.y_auto = True
+        state.window = default_window()
+        print("cleared all functions.")
+        return True
+    elif cmd == "table":
+        do_table(state, rest)
+        return True
+    else:
+        print("unknown command: " + cmd + " (try 'help')")
+        return True
+
+
+def main() -> None:
+    print("graphcalc — a terminal graphing calculator. Type 'help' for commands, 'quit' to exit.")
+    state: ReplState = ReplState()
+    running: bool = True
+    while running:
+        line: str = input("graphcalc> ")
+        running = dispatch(state, line)

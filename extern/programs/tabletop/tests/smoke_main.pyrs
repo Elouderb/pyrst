@@ -1,0 +1,29 @@
+# smoke_main.pyrs — non-interactive "build + run main, piped quit" smoke test.
+#
+# USAGE (from extern/programs/tabletop/):
+#   pyrst build main.pyrs
+#   pyrst build tests/smoke_main.pyrs
+#   echo "5" | ./smoke_main
+#
+# GAP: `subprocess.run` has no `input=` / stdin-piping support (see
+# lib/subprocess.pyrs, card 27aeeb3e) — a pyrst program cannot itself feed
+# bytes into a spawned child's stdin. Workaround used here:
+# `subprocess.run([...], capture_output=False)` INHERITS this process's own
+# stdio (Rust `Command::status()`'s default), so piping input into *this*
+# smoke-test binary's stdin (`echo "5" | ./smoke_main`) flows through to
+# `./main`'s stdin transparently, letting main's menu read "5" (Quit) and
+# exit cleanly. `capture_output=True` instead sets the child's stdin to
+# `Stdio::null()` (Rust `Command::output()`'s documented behavior), which
+# would make `main`'s `input()` retry-loop spin forever on immediate EOF —
+# so this smoke test can only assert on the process exit code, not on
+# main's printed output.
+import subprocess
+
+
+def main() -> None:
+    result = subprocess.run(["./main"], capture_output=False)
+    if result.returncode == 0:
+        print("PASS: main ran to completion via piped quit (exit 0)")
+    else:
+        print(f"FAIL: main exited with code {result.returncode}")
+        assert False

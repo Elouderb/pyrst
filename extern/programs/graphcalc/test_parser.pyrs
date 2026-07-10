@@ -1,0 +1,80 @@
+# test_parser.pyrs — pyrst-native unit tests for expr_parser.parse: parse
+# error position correctness, and AST-shape checks for precedence/assoc.
+#
+# LOCATION NOTE: see test_evaluator.pyrs's header — this lives at the project
+# root (not tests/) because pyrst has no relative-import syntax to reach a
+# parent directory's sibling module from a subdirectory. Build+run from
+# extern/programs/graphcalc/: pyrst build test_parser.pyrs && ./test_parser
+
+from expr_parser import parse, tokenize, Expr, Token
+
+
+def check(name: str, cond: bool, fails: Mut[list[str]]) -> None:
+    if cond:
+        print("PASS: " + name)
+    else:
+        print("FAIL: " + name)
+        fails.append(name)
+
+
+def expect_error_contains(name: str, src: str, needle: str, fails: Mut[list[str]]) -> None:
+    try:
+        parse(src)
+        print("FAIL: " + name + " (expected ValueError, got a parsed tree)")
+        fails.append(name)
+    except ValueError as e:
+        msg: str = e
+        if needle in msg:
+            print("PASS: " + name + " (" + msg + ")")
+        else:
+            print("FAIL: " + name + " (message '" + msg + "' missing '" + needle + "')")
+            fails.append(name)
+
+
+def main() -> None:
+    fails: list[str] = []
+
+    # --- parse-error position correctness (columns are 0-based) ---
+    expect_error_contains("unmatched '(' at eof", "sin(x", "column 5", fails)
+    expect_error_contains("trailing operator at eof", "2 +", "column 3", fails)
+    expect_error_contains("bad character '@'", "x @ 2", "column 2", fails)
+    expect_error_contains("unknown function name", "foo(x)", "column 0", fails)
+    expect_error_contains("trailing token after full expr", "2 3", "column 2", fails)
+    expect_error_contains("empty expression", "", "empty expression", fails)
+    expect_error_contains("malformed number (two dots)", "1.2.3", "malformed number", fails)
+    expect_error_contains("func missing open paren", "sin x", "column 4", fails)
+    expect_error_contains("unmatched close paren has no crash, reports trailing", "(2+3))", "column 5", fails)
+
+    # --- tokenize: '*' vs '**' disambiguation, column tracking ---
+    single_star: list[Token] = tokenize("2*3")
+    check("tokenize '2*3' -> 3 tokens incl '*' (not '**')",
+          len(single_star) == 4 and single_star[1].kind == "*", fails)
+    double_star: list[Token] = tokenize("2**3")
+    check("tokenize '2**3' -> '**' as one token at column 1",
+          double_star[1].kind == "**" and double_star[1].col == 1, fails)
+
+    # --- AST shape: precedence should nest correctly, not just evaluate correctly ---
+    tree1: Expr = parse("2+3*4")
+    check("2+3*4 root is '+' (lowest precedence at top)", tree1.kind == "binary" and tree1.op == "+", fails)
+    check("2+3*4 rhs is '*' subtree", tree1.args[1].kind == "binary" and tree1.args[1].op == "*", fails)
+
+    tree2: Expr = parse("2**3**2")
+    check("2**3**2 root '**' rhs is itself '**' (right-assoc)",
+          tree2.kind == "binary" and tree2.op == "**" and tree2.args[1].kind == "binary" and tree2.args[1].op == "**",
+          fails)
+
+    tree3: Expr = parse("-x**2")
+    check("-x**2 root is unary wrapping a '**' (unary binds looser)",
+          tree3.kind == "unary" and tree3.args[0].kind == "binary" and tree3.args[0].op == "**",
+          fails)
+
+    tree4: Expr = parse("(-x)**2")
+    check("(-x)**2 root is '**' whose base is unary (parens override)",
+          tree4.kind == "binary" and tree4.op == "**" and tree4.args[0].kind == "unary",
+          fails)
+
+    if len(fails) == 0:
+        print("PASS: test_parser — all checks passed")
+    else:
+        print("FAIL: test_parser — " + str(len(fails)) + " check(s) failed: " + ", ".join(fails))
+        assert False

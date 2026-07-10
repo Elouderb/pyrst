@@ -1,0 +1,100 @@
+# tests/test_persist.pyrs — persistence round-trip over the documented file
+# format. Two separate `main --db <path>` runs share one DB file: the first
+# seeds and auto-saves on exit, the second reloads and must observe the same
+# rows (INT/TEXT-with-spaces/FLOAT/BOOL/NULL). Also checks that a missing file
+# loads as an empty DB. Prints PASS/FAIL, exits 0/1.
+#
+# Run from extern/programs/pyrstdb/ after building both binaries:
+#   pyrst build main.pyrs
+#   pyrst build tests/test_persist.pyrs
+#   ./test_persist               (optional arg: path to `main`, default "./main")
+
+import sys
+from subprocess import run, CompletedProcess
+
+DB_PATH: str = "/tmp/pyrstdb_persist.pdb"
+SEED_SQL: str = "/tmp/pyrstdb_persist_seed.sql"
+READ_SQL: str = "/tmp/pyrstdb_persist_read.sql"
+FRESH_DB: str = "/tmp/pyrstdb_persist_fresh.pdb"
+
+
+def binpath() -> str:
+    if len(sys.argv) > 1:
+        return sys.argv[1]
+    return "./main"
+
+
+def fail(message: str, out: str) -> None:
+    print("FAIL: " + message + "\n----- output -----\n" + out)
+    sys.exit(1)
+
+
+def run_script(binary: str, db: str, script: str) -> str:
+    r: CompletedProcess = run([binary, "--db", db, script], capture_output=True)
+    if r.returncode != 0:
+        print("FAIL: main exited " + str(r.returncode))
+        sys.exit(1)
+    ob = r.stdout
+    if ob is None:
+        print("FAIL: no stdout")
+        sys.exit(1)
+        return ""
+    return ob.decode("utf-8")
+
+
+def write_seed() -> None:
+    with open(SEED_SQL, "w") as f:
+        f.write("CREATE TABLE t (id INT, name TEXT, score FLOAT, ok BOOL);\n")
+        f.write("INSERT INTO t VALUES (1, 'hello world', 3.5, TRUE);\n")
+        f.write("INSERT INTO t VALUES (2, 'a b  c', -2.0, FALSE);\n")
+        f.write("INSERT INTO t (id, name) VALUES (3, 'partial');\n")
+        # no explicit .quit -> exercises save-on-exit for script mode
+    with open(READ_SQL, "w") as f:
+        f.write("SELECT id, name, score, ok FROM t ORDER BY id;\n")
+        f.write(".quit\n")
+
+
+def rm_if_exists(path: str) -> None:
+    try:
+        with open(path, "w") as f:
+            f.write("")
+    except OSError:
+        return
+
+
+def main() -> None:
+    binary: str = binpath()
+    # start from a clean DB file
+    with open(DB_PATH, "w") as f:
+        f.write("")
+    write_seed()
+
+    # seed run auto-saves on exit
+    seed_out: str = run_script(binary, DB_PATH, SEED_SQL)
+    if "saved to" not in seed_out:
+        fail("seed run did not report save-on-exit", seed_out)
+
+    # reload run must see the persisted rows
+    read_out: str = run_script(binary, DB_PATH, READ_SQL)
+    if "hello world | 3.5" not in read_out:
+        fail("row 1 not reloaded correctly", read_out)
+    if "a b  c" not in read_out:
+        fail("row 2 (TEXT with double space) not reloaded correctly", read_out)
+    if "-2.0" not in read_out:
+        fail("negative float not reloaded", read_out)
+    if "NULL" not in read_out:
+        fail("NULL cells not reloaded", read_out)
+    if "(3 row(s))" not in read_out:
+        fail("expected 3 reloaded rows", read_out)
+
+    # a never-before-seen DB file loads empty (missing-file UX)
+    with open(FRESH_DB, "w") as f:
+        f.write("")
+    with open(SEED_SQL, "w") as f:
+        f.write(".tables\n")
+        f.write(".quit\n")
+    fresh_out: str = run_script(binary, FRESH_DB, SEED_SQL)
+    if "(no tables)" not in fresh_out:
+        fail("empty DB did not report (no tables)", fresh_out)
+
+    print("PASS: test_persist")

@@ -1,0 +1,117 @@
+# ui.pyrs — shared terminal-formatting + input helpers for the tabletop games.
+#
+# Quality bar (card f1ac8d46): fixed-width layout (<=80 cols, no window-size
+# dependence), a clean separator printed once per turn (no live rewriting),
+# unicode symbols where terminals support them with an ASCII-fallback
+# constant, and robust input validation (bad input re-prompts, never
+# crashes).
+
+import sys
+
+WIDTH: int = 80
+USE_UNICODE: bool = True
+
+# input() returns "" on EOF (it does NOT raise), so a naive re-prompt loop would
+# spin forever once stdin is closed (Ctrl-D, or an exhausted piped test). This
+# generous threshold of consecutive empty reads within a single prompt is a
+# safety valve: no interactive user hits Enter this many times in one prompt,
+# but a closed stdin trips it immediately and we exit cleanly instead of hanging.
+EOF_GIVEUP: int = 100
+
+SUIT_UNICODE_SPADES: str = "♠"
+SUIT_UNICODE_HEARTS: str = "♥"
+SUIT_UNICODE_DIAMONDS: str = "♦"
+SUIT_UNICODE_CLUBS: str = "♣"
+
+
+def hr(ch: str = "-") -> str:
+    line: str = ""
+    i: int = 0
+    while i < WIDTH:
+        line = line + ch
+        i = i + 1
+    return line
+
+
+def center(text: str, width: int = WIDTH) -> str:
+    if len(text) >= width:
+        return text
+    total_pad: int = width - len(text)
+    left: int = total_pad // 2
+    right: int = total_pad - left
+    return (" " * left) + text + (" " * right)
+
+
+def title(text: str) -> str:
+    return hr("=") + "\n" + center(text) + "\n" + hr("=")
+
+
+def suit_symbol(code: str) -> str:
+    if not USE_UNICODE:
+        return code
+    if code == "S":
+        return SUIT_UNICODE_SPADES
+    if code == "H":
+        return SUIT_UNICODE_HEARTS
+    if code == "D":
+        return SUIT_UNICODE_DIAMONDS
+    if code == "C":
+        return SUIT_UNICODE_CLUBS
+    return code
+
+
+def prompt_int(prompt: str, lo: int, hi: int) -> int:
+    """Re-prompts on non-numeric or out-of-range input; never raises. Exits
+    cleanly if stdin is closed (see EOF_GIVEUP)."""
+    empties: int = 0
+    while True:
+        raw: str = input(prompt)
+        cleaned: str = raw.strip()
+        if cleaned == "":
+            empties = empties + 1
+            if empties >= EOF_GIVEUP:
+                print("\nNo more input; exiting.")
+                sys.exit(0)
+            continue
+        empties = 0
+        if not cleaned.isdigit():
+            print("Please enter a whole number.")
+            continue
+        n: int = int(cleaned)
+        if n < lo or n > hi:
+            print(f"Please enter a number between {lo} and {hi}.")
+            continue
+        return n
+
+
+def prompt_yes_no(prompt: str) -> bool:
+    empties: int = 0
+    while True:
+        raw: str = input(prompt).strip().lower()
+        if raw == "":
+            empties = empties + 1
+            if empties >= EOF_GIVEUP:
+                print("\nNo more input; exiting.")
+                sys.exit(0)
+            continue
+        empties = 0
+        if raw == "y" or raw == "yes":
+            return True
+        if raw == "n" or raw == "no":
+            return False
+        print("Please answer y or n.")
+
+
+def prompt_str(prompt: str) -> str:
+    """Reads a non-empty trimmed line; exits cleanly on closed stdin. The caller
+    validates content and re-prompts as needed."""
+    empties: int = 0
+    while True:
+        raw: str = input(prompt).strip()
+        if raw == "":
+            empties = empties + 1
+            if empties >= EOF_GIVEUP:
+                print("\nNo more input; exiting.")
+                sys.exit(0)
+            continue
+        return raw

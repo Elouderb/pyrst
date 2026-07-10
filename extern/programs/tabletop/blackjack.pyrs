@@ -1,0 +1,250 @@
+# blackjack.pyrs — 3-seat blackjack (player + 2 CPU seats) vs the dealer.
+#
+# Rules implemented (card f1ac8d46):
+#   - 6-deck-style single Deck reshuffled when low; seeded shuffle.
+#   - Soft-ace hand valuation (at most one ace counts as 11).
+#   - Player hit/stand loop with robust re-prompting.
+#   - 2 CPU seats play textbook BASIC STRATEGY (hard/soft tables vs dealer
+#     upcard), hit/stand only.
+#   - Dealer stands on all 17 (S17), hits 16 and below.
+#   - Naturals (2-card 21) pay 3:2; natural vs natural pushes.
+#   - Per-seat chip bankroll, flat 10-chip bet.
+# DEFERRED (documented, card-scoped): splitting pairs and doubling-down are not
+#   modelled — the CPU basic-strategy table is the hit/stand subset. Insurance
+#   is not offered. See card f1ac8d46.
+
+from cards import Card, Deck
+import ui
+
+BET: int = 10
+START_CHIPS: int = 100
+RESHUFFLE_AT: int = 15
+
+
+def card_hard_value(rank: int) -> int:
+    # Ace counted as 1 here; softness handled by hand_total.
+    if rank == 14:
+        return 1
+    if rank >= 11 and rank <= 13:
+        return 10
+    if rank == 10:
+        return 10
+    return rank
+
+
+def upcard_value(c: Card) -> int:
+    # Dealer upcard strength for strategy: Ace=11, faces/ten=10, else pip.
+    if c.rank == 14:
+        return 11
+    if c.rank >= 10:
+        return 10
+    return c.rank
+
+
+def hand_total(hand: list[Card]) -> int:
+    base: int = 0
+    aces: int = 0
+    for c in hand:
+        base = base + card_hard_value(c.rank)
+        if c.rank == 14:
+            aces = aces + 1
+    if aces > 0 and base + 10 <= 21:
+        return base + 10
+    return base
+
+
+def is_soft(hand: list[Card]) -> bool:
+    base: int = 0
+    aces: int = 0
+    for c in hand:
+        base = base + card_hard_value(c.rank)
+        if c.rank == 14:
+            aces = aces + 1
+    return aces > 0 and base + 10 <= 21
+
+
+def is_blackjack(hand: list[Card]) -> bool:
+    return len(hand) == 2 and hand_total(hand) == 21
+
+
+def card_face(c: Card) -> str:
+    return c.rank_str() + ui.suit_symbol(c.suit)
+
+
+def render_hand(hand: list[Card]) -> str:
+    out: str = ""
+    i: int = 0
+    while i < len(hand):
+        if i > 0:
+            out = out + " "
+        out = out + card_face(hand[i])
+        i = i + 1
+    return out
+
+
+# --- CPU basic strategy (hit/stand subset). Returns True to HIT. -------------
+def cpu_should_hit(hand: list[Card], dealer_up: int) -> bool:
+    total: int = hand_total(hand)
+    if is_soft(hand):
+        if total >= 19:
+            return False
+        if total == 18:
+            # Soft 18: stand vs 2-8, hit vs 9/10/Ace.
+            if dealer_up >= 9:
+                return True
+            return False
+        return True
+    if total >= 17:
+        return False
+    if total >= 13:
+        # Hard 13-16: stand vs 2-6, hit vs 7+.
+        if dealer_up >= 7:
+            return True
+        return False
+    if total == 12:
+        # Hard 12: stand vs 4-6, else hit.
+        if dealer_up >= 4 and dealer_up <= 6:
+            return False
+        return True
+    return True
+
+
+def seat_name(seat: int) -> str:
+    if seat == 0:
+        return "You"
+    return f"CPU-{seat}"
+
+
+# --- Settlement: +chips delta for one non-dealer hand vs the dealer. ---------
+def settle(hand: list[Card], dealer: list[Card]) -> int:
+    p: int = hand_total(hand)
+    d: int = hand_total(dealer)
+    p_bj: bool = is_blackjack(hand)
+    d_bj: bool = is_blackjack(dealer)
+    if p_bj and d_bj:
+        return 0
+    if p_bj:
+        return (BET * 3) // 2
+    if d_bj:
+        return -BET
+    if p > 21:
+        return -BET
+    if d > 21:
+        return BET
+    if p > d:
+        return BET
+    if p < d:
+        return -BET
+    return 0
+
+
+def play_blackjack(seed: int) -> None:
+    print(ui.title("Blackjack"))
+    print("You + CPU-1 + CPU-2 vs the Dealer. Flat bet 10. Blackjack pays 3:2.")
+    print("Dealer stands on all 17. (Splits/doubles/insurance not modelled.)")
+    print(ui.hr())
+
+    deck: Deck = Deck()
+    deck.shuffle(seed)
+    round_seed: int = seed
+
+    chips: list[int] = [START_CHIPS, START_CHIPS, START_CHIPS]
+
+    while True:
+        if chips[0] < BET:
+            print("You're out of chips. Thanks for playing!")
+            return
+
+        if deck.remaining() < RESHUFFLE_AT:
+            deck = Deck()
+            round_seed = round_seed + 1
+            deck.shuffle(round_seed)
+            print("(Deck reshuffled.)")
+
+        # Deal: three seats + dealer, two cards each.
+        seat0: list[Card] = []
+        seat1: list[Card] = []
+        seat2: list[Card] = []
+        seats: list[list[Card]] = [seat0, seat1, seat2]
+        dealer: list[Card] = []
+        deal_round: int = 0
+        while deal_round < 2:
+            s: int = 0
+            while s < 3:
+                seats[s].append(deck.draw())
+                s = s + 1
+            dealer.append(deck.draw())
+            deal_round = deal_round + 1
+
+        dealer_up: int = upcard_value(dealer[0])
+
+        print(ui.hr("="))
+        print(f"Dealer shows: {card_face(dealer[0])} [##]")
+        print(ui.hr())
+
+        # Player seat (0).
+        print(f"Your hand: {render_hand(seats[0])}  (total {hand_total(seats[0])})")
+        if is_blackjack(seats[0]):
+            print("Blackjack!")
+        else:
+            while hand_total(seats[0]) < 21:
+                hit: bool = ui.prompt_yes_no("Hit? (y/n): ")
+                if not hit:
+                    break
+                seats[0].append(deck.draw())
+                print(f"Your hand: {render_hand(seats[0])}  (total {hand_total(seats[0])})")
+            if hand_total(seats[0]) > 21:
+                print("Bust!")
+        print(ui.hr())
+
+        # CPU seats (1,2).
+        s2: int = 1
+        while s2 < 3:
+            while hand_total(seats[s2]) < 21 and cpu_should_hit(seats[s2], dealer_up):
+                seats[s2].append(deck.draw())
+            status: str = ""
+            if hand_total(seats[s2]) > 21:
+                status = " BUST"
+            elif is_blackjack(seats[s2]):
+                status = " BLACKJACK"
+            print(f"{seat_name(s2)} hand: {render_hand(seats[s2])}  (total {hand_total(seats[s2])}){status}")
+            s2 = s2 + 1
+        print(ui.hr())
+
+        # Dealer plays (reveal hole, hit below 17).
+        print(f"Dealer hand: {render_hand(dealer)}  (total {hand_total(dealer)})")
+        any_alive: bool = False
+        alive_check: int = 0
+        while alive_check < 3:
+            if hand_total(seats[alive_check]) <= 21:
+                any_alive = True
+            alive_check = alive_check + 1
+        if any_alive:
+            while hand_total(dealer) < 17:
+                dealer.append(deck.draw())
+                print(f"Dealer draws: {render_hand(dealer)}  (total {hand_total(dealer)})")
+            if hand_total(dealer) > 21:
+                print("Dealer busts!")
+        print(ui.hr("="))
+
+        # Settle every seat.
+        seat_i: int = 0
+        while seat_i < 3:
+            delta: int = settle(seats[seat_i], dealer)
+            chips[seat_i] = chips[seat_i] + delta
+            verdict: str = "push"
+            if delta > 0:
+                verdict = f"wins +{delta}"
+            elif delta < 0:
+                verdict = f"loses {delta}"
+            print(f"{seat_name(seat_i)}: {verdict}   (chips: {chips[seat_i]})")
+            seat_i = seat_i + 1
+        print(ui.hr())
+
+        if chips[0] < BET:
+            print("You're out of chips. Thanks for playing!")
+            return
+        again: bool = ui.prompt_yes_no("Play another round? (y/n): ")
+        if not again:
+            print(f"You leave with {chips[0]} chips.")
+            return

@@ -1,0 +1,199 @@
+# main.pyrs — pyrstdb REPL shell + script runner (card 283e473a, Track A).
+#
+# Modes / argv:
+#   pyrstdb                       interactive REPL, ephemeral in-memory DB
+#   pyrstdb <script.sql>          run a file's statements, one per line, then exit
+#   pyrstdb --db <path>           interactive REPL persisted to <path>
+#   pyrstdb --db <path> <script>  run a script against a persisted DB
+#
+# Persistence: with --db, the DB is loaded on start; a `.save` meta-command or
+# a bare `SAVE` statement writes it, and it is auto-saved on `.quit`/`.exit`
+# and at the end of a script run (save-on-exit). Without --db the session is
+# in-memory only.
+#
+# GAP (log on card 283e473a): pyrst's `input()` has no EOF signal — reading
+# past end-of-stdin returns "" forever rather than raising, so a REPL loop fed
+# piped stdin with no trailing `.quit` never terminates. The REPL therefore
+# ALWAYS requires an explicit `.quit`/`.exit`; script-file mode iterates a
+# file's lines instead of calling input() and is the automatable test seam.
+#
+# GAP (log on card 283e473a): f-string conversions `{x!r}`/`{x!s}` are a lex
+# error in pyrst — messages here concatenate with `+ str(...)` instead.
+
+import sys
+from ast_types import Statement
+from tokenizer import TokenizeError
+from parser import parse, ParseError
+from executor import ExecResult, execute, format_result
+from storage import Database, Table, load_database, save_database
+
+DB_NAME: str = "pyrstdb"
+
+
+def help_text() -> str:
+    return "\n".join([
+        "pyrstdb — a small SQL database REPL",
+        "",
+        "Meta-commands:",
+        "  .help              show this help text",
+        "  .tables            list tables in the current database",
+        "  .schema [table]    show CREATE TABLE for one table, or all tables",
+        "  .save              write the database to its file (needs --db)",
+        "  .quit / .exit      save (if --db) and exit the REPL",
+        "",
+        "SQL statements (case-insensitive keywords; end with ';' optional):",
+        "  CREATE TABLE name (col TYPE, ...)      TYPE in INT/FLOAT/TEXT/BOOL",
+        "  INSERT INTO name [(col, ...)] VALUES (v, ...) [, (v, ...) ...]",
+        "  SELECT (* | col, ...) FROM name [WHERE ...] [ORDER BY col [ASC|DESC]] [LIMIT n]",
+        "  UPDATE name SET col = v, ... [WHERE ...]",
+        "  DELETE FROM name [WHERE ...]",
+        "  DROP TABLE name",
+        "  SAVE                                   persist the database (needs --db)",
+    ])
+
+
+def table_ddl(t: Table) -> str:
+    specs: list[str] = []
+    for col in t.columns:
+        specs.append(col.name + " " + col.col_type)
+    return "CREATE TABLE " + t.name + " (" + ", ".join(specs) + ");"
+
+
+def show_tables(db: Mut[Database]) -> None:
+    names: list[str] = db.sorted_table_names()
+    if len(names) == 0:
+        print("(no tables)")
+        return
+    for n in names:
+        print(n)
+
+
+def show_schema(db: Mut[Database], table_name: str) -> None:
+    names: list[str] = db.sorted_table_names()
+    if table_name == "":
+        if len(names) == 0:
+            print("(no tables)")
+            return
+        for n in names:
+            print(table_ddl(db.tables[n]))
+        return
+    if table_name not in db.tables:
+        print("no such table: " + table_name)
+        return
+    print(table_ddl(db.tables[table_name]))
+
+
+def do_save(db: Mut[Database], db_path: str) -> None:
+    if db_path == "":
+        print("error: no database file (start with --db <path> to enable persistence)")
+        return
+    try:
+        save_database(db, db_path)
+        print("saved to " + db_path)
+    except ValueError as e:
+        print("error saving database: " + e)
+
+
+def run_line(db: Mut[Database], db_path: str, line: str) -> bool:
+    # Handle one statement or meta-command. Returns True if the loop should
+    # stop (a .quit/.exit was seen).
+    stripped: str = line.strip()
+    if stripped == "":
+        return False
+    if stripped.startswith("--") or stripped.startswith("#"):
+        return False  # comment line
+
+    if stripped.startswith("."):
+        if stripped == ".quit" or stripped == ".exit":
+            if db_path != "":
+                do_save(db, db_path)
+            print("bye")
+            return True
+        elif stripped == ".help":
+            print(help_text())
+        elif stripped == ".tables":
+            show_tables(db)
+        elif stripped == ".schema" or stripped.startswith(".schema "):
+            parts: list[str] = stripped.split(" ")
+            target: str = ""
+            if len(parts) > 1:
+                target = parts[1]
+            show_schema(db, target)
+        elif stripped == ".save":
+            do_save(db, db_path)
+        else:
+            print("unknown meta-command: " + stripped + " (try .help)")
+        return False
+
+    # SAVE as a SQL-adjacent statement (kept out of the grammar to avoid a
+    # reserved word that would collide with a column named "save").
+    upper: str = stripped.upper()
+    if upper == "SAVE" or upper == "SAVE;":
+        do_save(db, db_path)
+        return False
+
+    try:
+        stmt: Statement = parse(stripped)
+    except ParseError as e:
+        print("parse error: " + e)
+        return False
+    except TokenizeError as e:
+        print("tokenize error: " + e)
+        return False
+    result: ExecResult = execute(stmt, db)
+    print(format_result(result))
+    return False
+
+
+def run_interactive(db: Mut[Database], db_path: str) -> None:
+    print("pyrstdb 0.1.0 — type .help for commands, .quit to exit")
+    while True:
+        line: str = input("db> ")
+        should_quit: bool = run_line(db, db_path, line)
+        if should_quit:
+            break
+
+
+def run_script(db: Mut[Database], db_path: str, path: str) -> None:
+    with open(path) as f:
+        content: str = f.read()
+    lines: list[str] = content.splitlines()
+    quit_seen: bool = False
+    for line in lines:
+        should_quit: bool = run_line(db, db_path, line)
+        if should_quit:
+            quit_seen = True
+            break
+    # Save-on-exit for script mode when no explicit .quit already saved.
+    if not quit_seen and db_path != "":
+        do_save(db, db_path)
+
+
+def main() -> None:
+    db_path: str = ""
+    script_path: str = ""
+    i: int = 1
+    while i < len(sys.argv):
+        a: str = sys.argv[i]
+        if a == "--db":
+            if i + 1 >= len(sys.argv):
+                print("error: --db requires a path argument")
+                return
+            db_path = sys.argv[i + 1]
+            i = i + 2
+        else:
+            script_path = a
+            i = i + 1
+
+    db: Database = Database(DB_NAME)
+    if db_path != "":
+        try:
+            db = load_database(DB_NAME, db_path)
+        except ValueError as e:
+            print("error loading database: " + e)
+            return
+
+    if script_path != "":
+        run_script(db, db_path, script_path)
+    else:
+        run_interactive(db, db_path)

@@ -1,0 +1,670 @@
+# holdem.pyrs — 3-seat No-Limit Texas Hold'em (you + 2 CPU seats).
+#
+# Implemented (card f1ac8d46):
+#   - Blinds, button rotation, four streets (pre-flop / flop / turn / river).
+#   - Full 7-card hand evaluator (best 5 of 7) with correct category ranking
+#     AND kickers, packed into a single comparable int.
+#   - Correct multi-way SIDE POTS built from contribution layers (all-ins for
+#     less than a full call are handled; uncalled excess is refunded).
+#   - CPU seats: a hand-strength heuristic (Chen preflop, made-hand category
+#     postflop) flavoured with pot odds — NOT a solver.
+#   - Robust betting input (fold / check-call / raise) with re-prompting.
+# The evaluator + side-pot logic are pure and unit-tested in test_holdem.pyrs.
+# All identifiers are hd_-prefixed to stay clear of blackjack's card helpers
+# (same-named cross-module functions are conflated by the current codegen; see
+# card f1ac8d46 GAP notes).
+
+from cards import Card, Deck
+import ui
+
+HD_SB: int = 5
+HD_BB: int = 10
+HD_START: int = 200
+HD_N: int = 3
+
+
+# --- card helpers ------------------------------------------------------------
+def hd_card_face(c: Card) -> str:
+    return c.rank_str() + ui.suit_symbol(c.suit)
+
+
+def hd_render_cards(cs: list[Card]) -> str:
+    out: str = ""
+    i: int = 0
+    while i < len(cs):
+        if i > 0:
+            out = out + " "
+        out = out + hd_card_face(cs[i])
+        i = i + 1
+    return out
+
+
+# --- hand evaluation ---------------------------------------------------------
+# Category codes (higher is better).
+HD_HIGH: int = 0
+HD_PAIR: int = 1
+HD_TWOPAIR: int = 2
+HD_TRIPS: int = 3
+HD_STRAIGHT: int = 4
+HD_FLUSH: int = 5
+HD_FULL: int = 6
+HD_QUADS: int = 7
+HD_SF: int = 8
+
+HD_CATBASE: int = 1048576   # 16 ** 5
+
+
+def hd_pack(cat: int, tb: list[int]) -> int:
+    score: int = cat
+    i: int = 0
+    while i < 5:
+        v: int = 0
+        if i < len(tb):
+            v = tb[i]
+        score = score * 16 + v
+        i = i + 1
+    return score
+
+
+def hd_cat_of(score: int) -> int:
+    return score // HD_CATBASE
+
+
+def hd_straight_high(present: list[bool], low_ace: bool) -> int:
+    hi: int = 14
+    while hi >= 5:
+        ok: bool = True
+        k: int = 0
+        while k < 5:
+            need: int = hi - k
+            p: bool = False
+            if need == 1:
+                p = low_ace
+            else:
+                p = present[need]
+            if not p:
+                ok = False
+                break
+            k = k + 1
+        if ok:
+            return hi
+        hi = hi - 1
+    return 0
+
+
+def hd_eval5(cards: list[Card]) -> int:
+    counts: list[int] = [0] * 15
+    suit_count: list[int] = [0] * 4
+    present: list[bool] = [False] * 15
+    for c in cards:
+        counts[c.rank] = counts[c.rank] + 1
+        present[c.rank] = True
+        si: int = 0
+        if c.suit == "H":
+            si = 1
+        elif c.suit == "D":
+            si = 2
+        elif c.suit == "C":
+            si = 3
+        suit_count[si] = suit_count[si] + 1
+
+    is_flush: bool = False
+    fi: int = 0
+    while fi < 4:
+        if suit_count[fi] == 5:
+            is_flush = True
+        fi = fi + 1
+
+    sh: int = hd_straight_high(present, present[14])
+
+    # Group ranks by multiplicity (all lists sorted high-to-low by rank).
+    fours: list[int] = []
+    threes: list[int] = []
+    twos: list[int] = []
+    ones: list[int] = []
+    r: int = 14
+    while r >= 2:
+        if counts[r] == 4:
+            fours.append(r)
+        elif counts[r] == 3:
+            threes.append(r)
+        elif counts[r] == 2:
+            twos.append(r)
+        elif counts[r] == 1:
+            ones.append(r)
+        r = r - 1
+
+    ranks_desc: list[int] = []
+    rr: int = 14
+    while rr >= 2:
+        n: int = counts[rr]
+        while n > 0:
+            ranks_desc.append(rr)
+            n = n - 1
+        rr = rr - 1
+
+    if is_flush and sh > 0:
+        return hd_pack(HD_SF, [sh])
+    if len(fours) == 1:
+        return hd_pack(HD_QUADS, [fours[0], ones[0]])
+    if len(threes) == 1 and len(twos) >= 1:
+        return hd_pack(HD_FULL, [threes[0], twos[0]])
+    if is_flush:
+        return hd_pack(HD_FLUSH, ranks_desc)
+    if sh > 0:
+        return hd_pack(HD_STRAIGHT, [sh])
+    if len(threes) == 1:
+        return hd_pack(HD_TRIPS, [threes[0], ones[0], ones[1]])
+    if len(twos) == 2:
+        return hd_pack(HD_TWOPAIR, [twos[0], twos[1], ones[0]])
+    if len(twos) == 1:
+        return hd_pack(HD_PAIR, [twos[0], ones[0], ones[1], ones[2]])
+    return hd_pack(HD_HIGH, ranks_desc)
+
+
+def hd_eval_best(cards: list[Card]) -> int:
+    # Best 5-card score among any 5, 6, or 7 cards. Excludes 0 (n=5), 1 (n=6),
+    # or 2 (n=7) cards and evaluates every resulting 5-card hand.
+    n: int = len(cards)
+    if n <= 5:
+        return hd_eval5(cards)
+    best: int = -1
+    if n == 6:
+        i: int = 0
+        while i < 6:
+            five: list[Card] = []
+            k: int = 0
+            while k < 6:
+                if k != i:
+                    five.append(cards[k])
+                k = k + 1
+            s: int = hd_eval5(five)
+            if s > best:
+                best = s
+            i = i + 1
+        return best
+    # n == 7
+    a: int = 0
+    while a < 7:
+        b: int = a + 1
+        while b < 7:
+            five2: list[Card] = []
+            k2: int = 0
+            while k2 < 7:
+                if k2 != a and k2 != b:
+                    five2.append(cards[k2])
+                k2 = k2 + 1
+            s2: int = hd_eval5(five2)
+            if s2 > best:
+                best = s2
+            b = b + 1
+        a = a + 1
+    return best
+
+
+def hd_cat_name(cat: int) -> str:
+    if cat == HD_SF:
+        return "Straight Flush"
+    if cat == HD_QUADS:
+        return "Four of a Kind"
+    if cat == HD_FULL:
+        return "Full House"
+    if cat == HD_FLUSH:
+        return "Flush"
+    if cat == HD_STRAIGHT:
+        return "Straight"
+    if cat == HD_TRIPS:
+        return "Three of a Kind"
+    if cat == HD_TWOPAIR:
+        return "Two Pair"
+    if cat == HD_PAIR:
+        return "Pair"
+    return "High Card"
+
+
+# --- preflop hand strength (Chen-style, integer) ----------------------------
+def hd_high_value(rank: int) -> int:
+    if rank == 14:
+        return 10
+    if rank == 13:
+        return 8
+    if rank == 12:
+        return 7
+    if rank == 11:
+        return 6
+    return rank // 2
+
+
+def hd_chen(hole: list[Card]) -> int:
+    a: int = hole[0].rank
+    b: int = hole[1].rank
+    high: int = a
+    low: int = b
+    if b > a:
+        high = b
+        low = a
+    score: int = hd_high_value(high)
+    if a == b:
+        score = hd_high_value(high) * 2
+        if score < 5:
+            score = 5
+        return score
+    if hole[0].suit == hole[1].suit:
+        score = score + 2
+    gap: int = high - low - 1
+    if gap == 1:
+        score = score - 1
+    elif gap == 2:
+        score = score - 2
+    elif gap == 3:
+        score = score - 4
+    elif gap >= 4:
+        score = score - 5
+    if gap <= 1 and high < 12:
+        score = score + 1
+    return score
+
+
+# --- mutable per-hand state --------------------------------------------------
+class HandState:
+    stacks: list[int]
+    contributed: list[int]   # total committed this hand (across all rounds)
+    round_put: list[int]     # committed in the current betting round
+    folded: list[bool]
+    allin: list[bool]
+    hole: list[list[Card]]
+    community: list[Card]
+
+    def __init__(self, stacks: list[int]) -> None:
+        self.stacks = stacks
+        self.contributed = [0, 0, 0]
+        self.round_put = [0, 0, 0]
+        self.folded = [False, False, False]
+        self.allin = [False, False, False]
+        h0: list[Card] = []
+        h1: list[Card] = []
+        h2: list[Card] = []
+        self.hole = [h0, h1, h2]
+        self.community = []
+
+
+def hd_total_pot(hs: HandState) -> int:
+    total: int = 0
+    i: int = 0
+    while i < HD_N:
+        total = total + hs.contributed[i]
+        i = i + 1
+    return total
+
+
+def hd_put(hs: Mut[HandState], i: int, amount: int) -> int:
+    actual: int = amount
+    if actual > hs.stacks[i]:
+        actual = hs.stacks[i]
+    hs.stacks[i] = hs.stacks[i] - actual
+    hs.contributed[i] = hs.contributed[i] + actual
+    hs.round_put[i] = hs.round_put[i] + actual
+    if hs.stacks[i] == 0:
+        hs.allin[i] = True
+    return actual
+
+
+def hd_current_bet(hs: HandState) -> int:
+    m: int = 0
+    i: int = 0
+    while i < HD_N:
+        if hs.round_put[i] > m:
+            m = hs.round_put[i]
+        i = i + 1
+    return m
+
+
+def hd_not_folded_count(hs: HandState) -> int:
+    n: int = 0
+    i: int = 0
+    while i < HD_N:
+        if not hs.folded[i]:
+            n = n + 1
+        i = i + 1
+    return n
+
+
+def hd_name(i: int) -> str:
+    if i == 0:
+        return "You"
+    return f"CPU-{i}"
+
+
+# --- CPU decision (kind: 0 fold, 1 check/call, 2 raise; amount = raise size) --
+def hd_cpu_decide(hs: HandState, i: int, street: int) -> list[int]:
+    cur: int = hd_current_bet(hs)
+    to_call: int = cur - hs.round_put[i]
+    pot: int = hd_total_pot(hs)
+    if street == 0:
+        strength: int = hd_chen(hs.hole[i])
+        if strength >= 12:
+            return [2, HD_BB * 2]
+        if strength >= 8:
+            return [1, 0]
+        if to_call == 0:
+            return [1, 0]
+        if to_call <= HD_BB and strength >= 6:
+            return [1, 0]
+        return [0, 0]
+    seven: list[Card] = hs.hole[i][:]
+    for c in hs.community:
+        seven.append(c)
+    cat: int = hd_cat_of(hd_eval_best(seven))
+    if cat >= HD_TRIPS:
+        raise_amt: int = pot // 2
+        if raise_amt < HD_BB:
+            raise_amt = HD_BB
+        return [2, raise_amt]
+    if cat >= HD_PAIR:
+        if to_call == 0:
+            if cat >= HD_TWOPAIR:
+                return [2, pot // 2 + HD_BB]
+            return [1, 0]
+        if to_call <= pot:
+            return [1, 0]
+        return [0, 0]
+    if to_call == 0:
+        return [1, 0]
+    return [0, 0]
+
+
+# --- player decision via prompt ---------------------------------------------
+def hd_player_decide(hs: HandState, i: int, street: int) -> list[int]:
+    cur: int = hd_current_bet(hs)
+    to_call: int = cur - hs.round_put[i]
+    pot: int = hd_total_pot(hs)
+    print(ui.hr())
+    print(f"Your hole: {hd_render_cards(hs.hole[i])}")
+    if len(hs.community) > 0:
+        print(f"Board: {hd_render_cards(hs.community)}")
+    print(f"Pot: {pot}   Your stack: {hs.stacks[i]}   To call: {to_call}")
+    while True:
+        if to_call == 0:
+            raw: str = ui.prompt_str("Action [check / bet N / fold]: ").lower()
+        else:
+            raw = ui.prompt_str(f"Action [fold / call {to_call} / raise N]: ").lower()
+        parts: list[str] = raw.split(" ")
+        cmd: str = parts[0]
+        if cmd == "fold" or cmd == "f":
+            return [0, 0]
+        if cmd == "check" or cmd == "c":
+            if to_call == 0:
+                return [1, 0]
+            print("You cannot check facing a bet; use call, raise, or fold.")
+            continue
+        if cmd == "call":
+            return [1, 0]
+        if cmd == "bet" or cmd == "raise" or cmd == "r":
+            if len(parts) < 2 or not parts[1].isdigit():
+                print("Specify an amount, e.g. 'raise 20'.")
+                continue
+            amt: int = int(parts[1])
+            if amt <= 0:
+                print("Amount must be positive.")
+                continue
+            return [2, amt]
+        print("Unrecognized action.")
+
+
+# --- one betting round -------------------------------------------------------
+def hd_betting_round(hs: Mut[HandState], first: int, street: int, is_human: bool) -> None:
+    acted: list[bool] = [False, False, False]
+    cur_seat: int = first
+    while True:
+        if hd_not_folded_count(hs) <= 1:
+            return
+        found: int = -1
+        k: int = 0
+        while k < HD_N:
+            j: int = (cur_seat + k) % HD_N
+            if not hs.folded[j] and not hs.allin[j] and not acted[j]:
+                found = j
+                break
+            k = k + 1
+        if found < 0:
+            return
+
+        cur_bet: int = hd_current_bet(hs)
+        to_call: int = cur_bet - hs.round_put[found]
+        decision: list[int] = []
+        if found == 0 and is_human:
+            decision = hd_player_decide(hs, found, street)
+        else:
+            decision = hd_cpu_decide(hs, found, street)
+        kind: int = decision[0]
+        amount: int = decision[1]
+
+        if kind == 0:
+            hs.folded[found] = True
+            print(f"{hd_name(found)} folds.")
+        elif kind == 1:
+            paid: int = hd_put(hs, found, to_call)
+            if to_call == 0:
+                print(f"{hd_name(found)} checks.")
+            else:
+                print(f"{hd_name(found)} calls {paid}.")
+        else:
+            # Raise by `amount` over the call.
+            total: int = to_call + amount
+            hd_put(hs, found, total)
+            # Reopen action for the other still-active players.
+            m: int = 0
+            while m < HD_N:
+                if m != found and not hs.folded[m] and not hs.allin[m]:
+                    acted[m] = False
+                m = m + 1
+            print(f"{hd_name(found)} raises to {hs.round_put[found]}.")
+
+        acted[found] = True
+        cur_seat = (found + 1) % HD_N
+
+
+# --- side-pot construction + payout -----------------------------------------
+def hd_best_among(hs: HandState, players: list[int]) -> int:
+    best: int = -1
+    p: int = 0
+    while p < len(players):
+        idx: int = players[p]
+        seven: list[Card] = hs.hole[idx][:]
+        for c in hs.community:
+            seven.append(c)
+        s: int = hd_eval_best(seven)
+        if s > best:
+            best = s
+        p = p + 1
+    return best
+
+
+def hd_award(hs: Mut[HandState]) -> None:
+    contrib: list[int] = hs.contributed[:]
+    while True:
+        # Smallest positive remaining contribution defines the next layer.
+        min_c: int = 0
+        any_left: bool = False
+        i: int = 0
+        while i < HD_N:
+            if contrib[i] > 0:
+                if not any_left or contrib[i] < min_c:
+                    min_c = contrib[i]
+                    any_left = True
+            i = i + 1
+        if not any_left:
+            return
+        pot: int = 0
+        participants: list[int] = []
+        i = 0
+        while i < HD_N:
+            if contrib[i] > 0:
+                pot = pot + min_c
+                contrib[i] = contrib[i] - min_c
+                participants.append(i)
+            i = i + 1
+        eligible: list[int] = []
+        pp: int = 0
+        while pp < len(participants):
+            who: int = participants[pp]
+            if not hs.folded[who]:
+                eligible.append(who)
+            pp = pp + 1
+        if len(eligible) == 0:
+            # Everyone in this layer folded (uncalled bet): refund equally.
+            rp: int = 0
+            while rp < len(participants):
+                hs.stacks[participants[rp]] = hs.stacks[participants[rp]] + min_c
+                rp = rp + 1
+            continue
+        if len(eligible) == 1:
+            # Single contender (e.g. everyone folded pre-showdown): no board
+            # evaluation needed, and the community may be incomplete.
+            hs.stacks[eligible[0]] = hs.stacks[eligible[0]] + pot
+            print(f"{hd_name(eligible[0])} wins {pot}.")
+            continue
+        best: int = hd_best_among(hs, eligible)
+        winners: list[int] = []
+        ee: int = 0
+        while ee < len(eligible):
+            w: int = eligible[ee]
+            seven: list[Card] = hs.hole[w][:]
+            for c in hs.community:
+                seven.append(c)
+            if hd_eval_best(seven) == best:
+                winners.append(w)
+            ee = ee + 1
+        share: int = pot // len(winners)
+        rem: int = pot - share * len(winners)
+        wi: int = 0
+        while wi < len(winners):
+            add: int = share
+            if wi == 0:
+                add = add + rem   # odd chip to the first winner
+            hs.stacks[winners[wi]] = hs.stacks[winners[wi]] + add
+            print(f"{hd_name(winners[wi])} wins {add} from a pot.")
+            wi = wi + 1
+
+
+# --- one full hand -----------------------------------------------------------
+def hd_reset_round(hs: Mut[HandState]) -> None:
+    hs.round_put = [0, 0, 0]
+
+
+def hd_play_hand(hs: Mut[HandState], deck: Mut[Deck], button: int) -> None:
+    sb_pos: int = (button + 1) % HD_N
+    bb_pos: int = (button + 2) % HD_N
+
+    # Post blinds.
+    hd_put(hs, sb_pos, HD_SB)
+    hd_put(hs, bb_pos, HD_BB)
+    print(f"{hd_name(sb_pos)} posts small blind {HD_SB}; {hd_name(bb_pos)} posts big blind {HD_BB}.")
+
+    # Deal hole cards.
+    d: int = 0
+    while d < 2:
+        s: int = 0
+        while s < HD_N:
+            if not hs.folded[s]:
+                hs.hole[s].append(deck.draw())
+            s = s + 1
+        d = d + 1
+    print(f"Your hole cards: {hd_render_cards(hs.hole[0])}")
+
+    # Pre-flop betting: first to act is the button (seat after the big blind).
+    hd_betting_round(hs, button, 0, True)
+
+    streets: list[int] = [3, 1, 1]   # flop, turn, river
+    names: list[str] = ["Flop", "Turn", "River"]
+    st: int = 0
+    while st < 3:
+        if hd_not_folded_count(hs) <= 1:
+            break
+        hd_reset_round(hs)
+        n: int = 0
+        while n < streets[st]:
+            hs.community.append(deck.draw())
+            n = n + 1
+        print(ui.hr("="))
+        print(f"{names[st]}: {hd_render_cards(hs.community)}")
+        # Postflop first to act is the small blind (first active after button).
+        hd_betting_round(hs, sb_pos, st + 1, True)
+        st = st + 1
+
+    print(ui.hr("="))
+    if hd_not_folded_count(hs) > 1:
+        # Showdown: reveal contesting hands.
+        i: int = 0
+        while i < HD_N:
+            if not hs.folded[i]:
+                seven: list[Card] = hs.hole[i][:]
+                for c in hs.community:
+                    seven.append(c)
+                cat: int = hd_cat_of(hd_eval_best(seven))
+                print(f"{hd_name(i)} shows {hd_render_cards(hs.hole[i])}  -> {hd_cat_name(cat)}")
+            i = i + 1
+    hd_award(hs)
+
+
+def play_holdem(seed: int) -> None:
+    print(ui.title("Texas Hold'em"))
+    print("You + CPU-1 + CPU-2. Blinds 5/10, starting stacks 200 each.")
+    print("Actions: 'check', 'call', 'bet N', 'raise N', 'fold'.")
+    print(ui.hr())
+
+    deck: Deck = Deck()
+    deck.shuffle(seed)
+    reshuffle_seed: int = seed
+    stacks: list[int] = [HD_START, HD_START, HD_START]
+    button: int = 0
+    hand_no: int = 0
+
+    while True:
+        alive: int = 0
+        a: int = 0
+        while a < HD_N:
+            if stacks[a] > 0:
+                alive = alive + 1
+            a = a + 1
+        if stacks[0] <= 0:
+            print("You are out of chips. Thanks for playing!")
+            return
+        if alive <= 1:
+            print("You win the table!")
+            return
+
+        if deck.remaining() < 15:
+            deck = Deck()
+            reshuffle_seed = reshuffle_seed + 1
+            deck.shuffle(reshuffle_seed)
+
+        # Skip busted players for the button.
+        while stacks[button % HD_N] <= 0:
+            button = button + 1
+
+        hand_no = hand_no + 1
+        print(ui.hr("="))
+        print(f"--- Hand {hand_no} ---  Chips: You {stacks[0]} | CPU-1 {stacks[1]} | CPU-2 {stacks[2]}")
+
+        hs: HandState = HandState(stacks[:])
+        # Busted players sit out this hand.
+        so: int = 0
+        while so < HD_N:
+            if stacks[so] <= 0:
+                hs.folded[so] = True
+            so = so + 1
+        hd_play_hand(hs, deck, button % HD_N)
+        stacks = hs.stacks[:]
+
+        print(ui.hr())
+        print(f"After hand: You {stacks[0]} | CPU-1 {stacks[1]} | CPU-2 {stacks[2]}")
+        button = button + 1
+
+        if stacks[0] <= 0:
+            print("You are out of chips. Thanks for playing!")
+            return
+        again: bool = ui.prompt_yes_no("Play another hand? (y/n): ")
+        if not again:
+            print(f"You leave with {stacks[0]} chips.")
+            return

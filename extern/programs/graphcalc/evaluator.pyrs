@@ -1,0 +1,104 @@
+# evaluator.pyrs — pure evaluation of an expr_parser.Expr AST at a given x.
+#
+# IMPORTANT domain-error note (verified against lib/math.pyrs, not assumed):
+# pyrst's `math.sqrt`/`math.log`/`math.asin`/`math.acos` etc. raise a
+# catchable `ValueError("math domain error")` on an out-of-domain input —
+# they do NOT silently return `float('nan')` the way a hand-rolled float
+# routine might. Float division by zero, by contrast, is NOT an exception in
+# pyrst (a documented divergence from CPython's `ZeroDivisionError`): it
+# yields `inf`/`-inf`/`nan` by ordinary IEEE-754 float rules. So:
+#   - `1.0 / 0.0`         -> inf            (no exception; rasterizer clips it)
+#   - `sqrt(-1.0)`        -> raises ValueError("math domain error")
+#   - `log(0.0)`          -> raises ValueError("math domain error")
+# The card's policy ("domain errors = skipped samples, not crashes") means
+# `eval_expr` must catch that ValueError internally and normalize it to
+# `float('nan')` so every caller gets a plain float back and never has to
+# handle exceptions itself — this is the one place that policy is enforced.
+
+import math
+
+from expr_parser import Expr
+
+
+def _apply_func(name: str, v: float) -> float:
+    # Calculator naming convention (Desmos-style): `ln` is the natural log,
+    # `log` is base-10 (`abs` is the builtin). sqrt/log/ln raise
+    # ValueError("math domain error") out of domain — _eval catches it.
+    if name == "sin":
+        return math.sin(v)
+    if name == "cos":
+        return math.cos(v)
+    if name == "tan":
+        return math.tan(v)
+    if name == "sqrt":
+        return math.sqrt(v)
+    if name == "abs":
+        return abs(v)
+    if name == "ln":
+        return math.log(v)
+    if name == "log":
+        return math.log10(v)
+    if name == "exp":
+        return math.exp(v)
+    if name == "floor":
+        return float(math.floor(v))
+    if name == "ceil":
+        return float(math.ceil(v))
+    # Unreachable: parser only emits recognized func names (is_func_name).
+    raise ValueError("unknown function '" + name + "'")
+
+
+def _eval_raw(node: Expr, x: float) -> float:
+    # Recursive core; MAY raise ValueError on a math-domain error. eval_expr
+    # is the single try/except boundary that normalizes that to nan.
+    kind: str = node.kind
+    if kind == "num":
+        return node.num
+    if kind == "var":
+        return x
+    if kind == "const":
+        if node.op == "pi":
+            return math.pi
+        return math.e
+    if kind == "unary":
+        return -_eval_raw(node.args[0], x)
+    if kind == "call":
+        return _apply_func(node.op, _eval_raw(node.args[0], x))
+    # binary
+    lhs: float = _eval_raw(node.args[0], x)
+    rhs: float = _eval_raw(node.args[1], x)
+    op: str = node.op
+    if op == "+":
+        return lhs + rhs
+    if op == "-":
+        return lhs - rhs
+    if op == "*":
+        return lhs * rhs
+    if op == "/":
+        # No special-casing: pyrst float `/` yields inf/-inf/nan on a zero
+        # divisor by IEEE-754 (a documented divergence from CPython's
+        # ZeroDivisionError). The rasterizer clips the resulting inf.
+        return lhs / rhs
+    # "**"
+    return lhs ** rhs
+
+
+def eval_expr(node: Expr, x: float) -> float:
+    # Pure, and NEVER raises: evaluate `node` at `x`, catching a math-domain
+    # ValueError (sqrt(-1), log(0), ...) and normalizing it to float('nan')
+    # so every caller gets a plain float back — see the module docstring.
+    try:
+        return _eval_raw(node, x)
+    except ValueError:
+        return float("nan")
+
+
+def sample(node: Expr, xs: list[float]) -> list[float]:
+    # TODO(complex-implementer): eval_expr(node, x) for each x in xs,
+    # returning the parallel list[float] of y-values (may contain nan/inf —
+    # the rasterizer is responsible for skipping/clipping those). A thin,
+    # pure convenience wrapper the rasterizer and `table` command both use.
+    ys: list[float] = []
+    for x in xs:
+        ys.append(eval_expr(node, x))
+    return ys

@@ -1,0 +1,137 @@
+# test_chess.pyrs — perft correctness tests for chess move generation.
+# Root sibling of chess.pyrs. Perft counts leaf nodes of the legal move tree
+# from known positions; matching the published reference counts verifies
+# castling, en passant, promotion, pins, and check evasion all at once.
+# Run: pyrst build test_chess.pyrs && ./test_chess   (exit 0 = PASS)
+
+from chess import Board, WHITE, BLACK, PAWN, KNIGHT, BISHOP, ROOK, QUEEN, KING
+from chess import idx, gen_legal, apply_move, parse_square, start_board, Move, in_check
+
+FAILS: int = 0
+
+
+def check(cond: bool, msg: str) -> None:
+    global FAILS
+    if cond:
+        print(f"PASS: {msg}")
+    else:
+        print(f"FAIL: {msg}")
+        FAILS = FAILS + 1
+
+
+def perft(b: Board, depth: int) -> int:
+    if depth == 0:
+        return 1
+    moves: list[Move] = gen_legal(b)
+    if depth == 1:
+        return len(moves)
+    total: int = 0
+    for m in moves:
+        total = total + perft(apply_move(b, m), depth - 1)
+    return total
+
+
+def piece_from_char(ch: str) -> int:
+    up: str = ch.upper()
+    base: int = 0
+    if up == "P":
+        base = PAWN
+    elif up == "N":
+        base = KNIGHT
+    elif up == "B":
+        base = BISHOP
+    elif up == "R":
+        base = ROOK
+    elif up == "Q":
+        base = QUEEN
+    elif up == "K":
+        base = KING
+    if ch == up:
+        return base
+    return -base
+
+
+def parse_fen(fen: str) -> Board:
+    b: Board = Board()
+    parts: list[str] = fen.split(" ")
+    ranks: list[str] = parts[0].split("/")
+    r: int = 0
+    while r < 8:
+        c: int = 0
+        rankstr: str = ranks[r]
+        for ch in rankstr:
+            if ch.isdigit():
+                c = c + int(ch)
+            else:
+                b.sq[idx(r, c)] = piece_from_char(ch)
+                c = c + 1
+        r = r + 1
+    if parts[1] == "w":
+        b.stm = WHITE
+    else:
+        b.stm = BLACK
+    cast: str = parts[2]
+    b.wk = "K" in cast
+    b.wq = "Q" in cast
+    b.bk = "k" in cast
+    b.bq = "q" in cast
+    if parts[3] == "-":
+        b.ep = -1
+    else:
+        b.ep = parse_square(parts[3])
+    return b
+
+
+def main() -> None:
+    # --- starting position ---
+    start: Board = start_board()
+    check(perft(start, 1) == 20, "start perft(1) == 20")
+    check(perft(start, 2) == 400, "start perft(2) == 400")
+    check(perft(start, 3) == 8902, "start perft(3) == 8902")
+    check(perft(start, 4) == 197281, "start perft(4) == 197281")
+
+    # --- Kiwipete: castling, en passant, many captures ---
+    kiwi: Board = parse_fen("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1")
+    check(perft(kiwi, 1) == 48, "kiwipete perft(1) == 48")
+    check(perft(kiwi, 2) == 2039, "kiwipete perft(2) == 2039")
+    check(perft(kiwi, 3) == 97862, "kiwipete perft(3) == 97862")
+
+    # --- Position 3: en-passant and promotion edge cases ---
+    p3: Board = parse_fen("8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1")
+    check(perft(p3, 1) == 14, "pos3 perft(1) == 14")
+    check(perft(p3, 2) == 191, "pos3 perft(2) == 191")
+    check(perft(p3, 3) == 2812, "pos3 perft(3) == 2812")
+    check(perft(p3, 4) == 43238, "pos3 perft(4) == 43238")
+
+    # --- Position 4: promotions + castling under pressure ---
+    p4: Board = parse_fen("r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1")
+    check(perft(p4, 1) == 6, "pos4 perft(1) == 6")
+    check(perft(p4, 2) == 264, "pos4 perft(2) == 264")
+    check(perft(p4, 3) == 9467, "pos4 perft(3) == 9467")
+
+    # --- Position 5 ---
+    p5: Board = parse_fen("rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 0 1")
+    check(perft(p5, 1) == 44, "pos5 perft(1) == 44")
+    check(perft(p5, 2) == 1486, "pos5 perft(2) == 1486")
+    check(perft(p5, 3) == 62379, "pos5 perft(3) == 62379")
+
+    # --- checkmate detection (fool's mate: 1.f3 e5 2.g4 Qh4#) ---
+    fools: Board = parse_fen("rnb1kbnr/pppp1ppp/8/4p3/6Pq/5P2/PPPPP2P/RNBQKBNR w KQkq - 0 1")
+    check(len(gen_legal(fools)) == 0, "fool's mate: no legal moves")
+    check(in_check(fools), "fool's mate: side to move is in check -> CHECKMATE")
+
+    # --- stalemate detection (black king h8, Qf7, Kg6; black to move) ---
+    stale: Board = parse_fen("7k/5Q2/6K1/8/8/8/8/8 b - - 0 1")
+    check(len(gen_legal(stale)) == 0, "stalemate: no legal moves")
+    check(not in_check(stale), "stalemate: side to move NOT in check -> STALEMATE")
+
+    # --- not mate: a plain check with escapes exists ---
+    chk: Board = parse_fen("4k3/8/8/8/7b/8/8/4K3 w - - 0 1")
+    check(in_check(chk), "bishop on h4 checks the e1 king along the diagonal")
+    check(len(gen_legal(chk)) > 0, "in check but legal escapes exist (not mate)")
+
+    if FAILS == 0:
+        print("ALL CHESS PERFT TESTS PASSED")
+    else:
+        print(f"{FAILS} CHESS TEST(S) FAILED")
+        assert False

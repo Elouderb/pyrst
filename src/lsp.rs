@@ -24,7 +24,9 @@
 //! relying on `#[tokio::main]`.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::process::ExitCode;
+use std::str::FromStr;
 use std::sync::Mutex;
 
 use tower_lsp_server::jsonrpc::Result as RpcResult;
@@ -76,6 +78,29 @@ impl Backend {
         }
     }
 
+    /// Snapshot every open buffer as an in-memory overlay keyed by CANONICAL file
+    /// path, for the multi-file resolver: an open buffer overrides the on-disk
+    /// content of its file, so analysis reflects unsaved edits across ALL open
+    /// files (not just the current document). A stored document whose URI is not a
+    /// canonicalizable `file:` path (an `untitled:` buffer, or a file deleted on
+    /// disk) is skipped — it cannot be a resolvable sibling module. Stored text is
+    /// already line-ending-normalized by `store_text`.
+    fn overlay_snapshot(&self) -> HashMap<PathBuf, String> {
+        let mut overlay = HashMap::new();
+        if let Ok(docs) = self.docs.lock() {
+            for (uri_str, text) in docs.iter() {
+                if let Ok(uri) = Uri::from_str(uri_str) {
+                    if let Some(path) = uri_to_path(&uri) {
+                        if let Ok(canon) = path.canonicalize() {
+                            overlay.insert(canon, text.clone());
+                        }
+                    }
+                }
+            }
+        }
+        overlay
+    }
+
     /// Re-analyze `text` and publish the resulting diagnostics for `uri`.
     ///
     /// A clean program publishes an EMPTY vector, which clears any stale
@@ -84,13 +109,39 @@ impl Backend {
         // Editors send the raw (CRLF on Windows) buffer; normalize so the lexer
         // doesn't report a bare `\r` as an error on every line. See store_text.
         let text = crate::lexer::normalize_line_endings(text);
-        let diags: Vec<Diagnostic> =
-            analysis::analyze_str(&text).iter().map(to_lsp_diagnostic).collect();
+        // Run the REAL multi-file resolver anchored at this document's path, with
+        // every open buffer as an overlay, so sibling and embedded-stdlib imports
+        // resolve exactly as `pyrst check` resolves them (no false "unresolved
+        // name" squiggles). A pathless (untitled) buffer degrades to single-module
+        // analysis inside `analyze_str_at`.
+        let path = uri_to_path(&uri);
+        let overlay = self.overlay_snapshot();
+        let diags: Vec<Diagnostic> = analysis::analyze_str_at(&text, path.as_deref(), &overlay)
+            .iter()
+            .map(to_lsp_diagnostic)
+            .collect();
         self.client.publish_diagnostics(uri, diags, None).await;
     }
 }
 
 // ── Pure mappings (unit-testable without a running server) ────────────────────
+
+/// Derive an on-disk filesystem path from a document `Uri`, or `None` when the
+/// URI is not a `file:` URI (e.g. an `untitled:` unsaved buffer) — those callers
+/// fall back to single-module analysis.
+///
+/// Delegates the actual decoding to `ls_types`' [`Uri::to_file_path`], which
+/// percent-decodes the path and handles Windows drive-letter / UNC hosts. We
+/// guard on the scheme first because `to_file_path` does NOT check it (its own
+/// docs say so) and would yield a nonsensical relative path for a non-`file:`
+/// URI. Pure: depends only on its argument, so it is unit-testable without a
+/// server.
+pub fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
+    if !uri.as_str().starts_with("file:") {
+        return None;
+    }
+    uri.to_file_path().map(|cow| cow.into_owned())
+}
 
 /// Convert an [`analysis::Diagnostic`] into an LSP [`Diagnostic`].
 ///
@@ -416,7 +467,11 @@ impl LanguageServer for Backend {
             None => return Ok(None),
         };
 
-        let (module, ctx) = match analysis::analyze_document(&text) {
+        // Resolve against the full multi-file program (open buffers overlaid) so
+        // hovering an imported name yields its type instead of nothing.
+        let path = uri_to_path(&uri);
+        let overlay = self.overlay_snapshot();
+        let (module, ctx) = match analysis::analyze_document_at(&text, path.as_deref(), &overlay) {
             Some(pair) => pair,
             None => return Ok(None),
         };
@@ -456,7 +511,13 @@ impl LanguageServer for Backend {
             None => return Ok(None),
         };
 
-        let (module, ctx) = match analysis::analyze_document(&text) {
+        // Resolve against the full multi-file program (open buffers overlaid) so
+        // the merged ctx is available. Cross-file jumps are not yet emitted (an
+        // imported name resolves to no same-file declaration and returns None,
+        // the honest fallback); same-file definitions are unchanged.
+        let path = uri_to_path(&uri);
+        let overlay = self.overlay_snapshot();
+        let (module, ctx) = match analysis::analyze_document_at(&text, path.as_deref(), &overlay) {
             Some(pair) => pair,
             None => return Ok(None),
         };
@@ -505,9 +566,12 @@ impl LanguageServer for Backend {
                     analysis::member_completions_at(&text, position.line, position.character)
                 }
                 // Otherwise: in-scope names. Requires the buffer to parse; when it
-                // does not (mid-edit), stay silent rather than guess.
+                // does not (mid-edit), stay silent rather than guess. Resolve with
+                // the open-buffer overlay so imported symbols appear in scope.
                 analysis::CompletionContext::Scope { partial } => {
-                    match analysis::analyze_document(&text) {
+                    let path = uri_to_path(&uri);
+                    let overlay = self.overlay_snapshot();
+                    match analysis::analyze_document_at(&text, path.as_deref(), &overlay) {
                         Some((module, ctx)) => {
                             let mut items = analysis::scope_completions(
                                 &module,
@@ -545,8 +609,11 @@ impl LanguageServer for Backend {
 
         // On a parse failure (mid-edit), emit NO tokens — the TextMate grammar
         // still colors keywords/types, so the editor degrades gracefully rather
-        // than flickering stale highlights.
-        let (module, ctx) = match analysis::analyze_document(&text) {
+        // than flickering stale highlights. Resolve with the open-buffer overlay
+        // so imported symbols share the same merged ctx as the other handlers.
+        let path = uri_to_path(&uri);
+        let overlay = self.overlay_snapshot();
+        let (module, ctx) = match analysis::analyze_document_at(&text, path.as_deref(), &overlay) {
             Some(pair) => pair,
             None => return Ok(None),
         };
@@ -591,6 +658,7 @@ pub fn run() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
 
     #[test]
     fn maps_error_severity() {
@@ -904,5 +972,31 @@ mod tests {
                 1, 11, 1, 3, 0, // param use at (1,11): new line → absolute 11
             ]
         );
+    }
+
+    // ── URI → path (LSP import resolution, card 88486b59) ─────────────────────
+
+    #[test]
+    #[cfg(unix)]
+    fn uri_to_path_decodes_file_uri() {
+        let uri = Uri::from_str("file:///tmp/pyrst/main.pyrs").unwrap();
+        assert_eq!(uri_to_path(&uri), Some(std::path::PathBuf::from("/tmp/pyrst/main.pyrs")));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn uri_to_path_percent_decodes_spaces() {
+        // A `file:` URI percent-encodes spaces; `to_file_path` must decode them so
+        // the resolver opens the real on-disk file.
+        let uri = Uri::from_str("file:///tmp/my%20dir/main.pyrs").unwrap();
+        assert_eq!(uri_to_path(&uri), Some(std::path::PathBuf::from("/tmp/my dir/main.pyrs")));
+    }
+
+    #[test]
+    fn uri_to_path_rejects_non_file_scheme() {
+        // An `untitled:` unsaved buffer has no on-disk path → None, so the caller
+        // falls back to single-module analysis.
+        let uri = Uri::from_str("untitled:Untitled-1").unwrap();
+        assert_eq!(uri_to_path(&uri), None, "untitled buffers have no on-disk path");
     }
 }

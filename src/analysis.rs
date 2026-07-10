@@ -9,6 +9,8 @@
 //! program that imports other modules may report spurious "unresolved name"
 //! errors for symbols defined in those modules — acceptable for v1.
 
+use std::path::{Path, PathBuf};
+
 use crate::diag::{Error, Span};
 use crate::parser;
 use crate::resolver::merge_ctx_from_module;
@@ -67,25 +69,192 @@ pub fn analyze_str(src: &str) -> Vec<Diagnostic> {
         Ok(m) => m,
         Err(e) => return vec![diag_from_error(&e, src)],
     };
+    // Step 2+3: single-module signature merge + collect-all body check.
+    single_module_diags(&module, src)
+}
 
-    // Step 2: build a single-module TyCtx (builtins + this module's definitions).
-    // We reuse the same `merge_ctx_from_module` the multi-file resolver uses so
-    // that function/class signatures are registered identically. This pass is
-    // also fail-fast (it builds the signature table the per-body checks read).
+/// The single-module diagnostic pass shared by [`analyze_str`] (untitled buffers,
+/// pathless callers) and the fail-soft fallbacks of [`analyze_str_at`].
+///
+/// Builds a single-module `TyCtx` (builtins + this module's own definitions) via
+/// the same `merge_ctx_from_module` the multi-file resolver uses, then collects
+/// EVERY top-level-item type error (one squiggle per failing function/method),
+/// sorted top-to-bottom. `import`ed names are NOT resolved here — that is the
+/// caller's job when it has a file path (see [`analyze_str_at`]).
+fn single_module_diags(module: &Module, src: &str) -> Vec<Diagnostic> {
     let mut ctx = TyCtx::new();
     // `is_root = true` so top-level `main()` is not filtered out.
-    if let Err(e) = merge_ctx_from_module(&module, &mut ctx, true) {
+    if let Err(e) = merge_ctx_from_module(module, &mut ctx, true) {
         return vec![diag_from_error(&e, src)];
     }
-
-    // Step 3: collect EVERY top-level-item type error (one squiggle per failing
-    // function/method) and map each to an LSP diagnostic. `check_all` already
-    // sorts its errors by source position, so the diagnostics come out
-    // top-to-bottom.
-    typeck::check_all(&module, &ctx)
+    typeck::check_all(module, &ctx)
         .iter()
         .map(|e| diag_from_error(e, src))
         .collect()
+}
+
+/// Path-aware diagnostics for the LSP: like [`analyze_str`], but when `path`
+/// names a real on-disk file it runs the FULL multi-file resolver (sibling
+/// imports + embedded stdlib), with the open editor buffers supplied as an
+/// in-memory `overlay` (canonical path → text) so unsaved edits are analyzed.
+/// Imported names therefore resolve exactly as `pyrst check` resolves them, and
+/// a valid multi-file program reports ZERO false "unresolved name" diagnostics.
+///
+/// `path == None`, or a path that does not canonicalize (untitled / unsaved-new /
+/// deleted buffer), degrades to single-module analysis — identical to
+/// [`analyze_str`]. The buffer's OWN syntax error is always reported first and we
+/// never attempt resolution on an unparseable buffer.
+///
+/// Fail-soft (see [`fail_soft_diags`]): a resolve failure NEVER panics and never
+/// projects a sibling's error onto a wrong offset in the open buffer.
+pub fn analyze_str_at(
+    src: &str,
+    path: Option<&Path>,
+    overlay: &HashMap<PathBuf, String>,
+) -> Vec<Diagnostic> {
+    // A syntax error in the OPEN buffer is the user's immediate concern, indexes
+    // into `src`, and makes multi-file resolution moot — report it directly
+    // (identical to `analyze_str`) and do not attempt to resolve an unparseable
+    // buffer.
+    let module = match parser::parse(src) {
+        Ok(m) => m,
+        Err(e) => return vec![diag_from_error(&e, src)],
+    };
+
+    // No usable on-disk anchor → single-module fallback (untitled buffer, or a URI
+    // whose file does not exist on disk). Behaviour identical to `analyze_str`.
+    let abs = match path.and_then(|p| p.canonicalize().ok()) {
+        Some(a) => a,
+        None => return single_module_diags(&module, src),
+    };
+
+    // Guarantee the resolver analyzes the CURRENT buffer for the open file: its
+    // error spans are rendered against `src` below, so the open module's source
+    // MUST be `src` (which the LSP passes already line-ending-normalized). This
+    // holds even if the caller's overlay omitted the current document.
+    let mut overlay = overlay.clone();
+    overlay.insert(abs.clone(), src.to_string());
+
+    match crate::resolver::resolve_with_overlay(&abs, &overlay) {
+        Ok(prog) => {
+            // Type-check ONLY the OPEN (root) module's bodies against the MERGED
+            // ctx, mirroring the CLI's owner-first promotion (`check_bodies`), and
+            // collect EVERY top-level error (L4). Imported names now live in the
+            // merged ctx, so a valid program yields zero diagnostics.
+            let root = root_module(&prog, &abs);
+            let eff = prog.ctx.with_module_symbols_promoted(root.module_id.as_deref());
+            typeck::check_all(root, &eff)
+                .iter()
+                .map(|e| diag_from_error(e, src))
+                .collect()
+        }
+        Err(e) => fail_soft_diags(&e, &abs, &module, src),
+    }
+}
+
+/// The OPEN module within a resolved program: the module whose `source_path`
+/// equals the open file's canonical path, falling back to the LAST module (the
+/// resolver emits the root last in topological order). `prog.modules` is always
+/// non-empty on `Ok`, so the fallback never panics.
+fn root_module<'a>(prog: &'a crate::resolver::ResolvedProgram, abs: &Path) -> &'a Module {
+    prog.modules
+        .iter()
+        .find(|(m, _)| m.source_path.as_deref() == Some(abs))
+        .map(|(m, _)| m)
+        .unwrap_or_else(|| &prog.modules.last().expect("a resolved program has ≥1 module").0)
+}
+
+/// Fail-soft mapping of a multi-file resolve error to diagnostics for the OPEN
+/// file. The published diagnostics target ONLY the open document, so every
+/// diagnostic's span MUST index into the open buffer — otherwise a sibling's
+/// span would misplace the squiggle.
+///
+/// - **Error in the OPEN file** (a `from`-import that names a missing module, a
+///   bad annotation the merge rejects): its span indexes into `src`, so publish
+///   it directly. This is the honest current-file import/type error.
+/// - **Error in a SIBLING** (a dependency broken mid-edit): surface EXACTLY ONE
+///   diagnostic at the open file's `import` statement that pulled the broken
+///   sibling in (located by module leaf-name), rather than projecting the
+///   sibling's offset onto the buffer OR spamming "undefined name" for every
+///   imported symbol — the least-noisy honest option.
+/// - **Unattributable / transitive** breakage: degrade to single-module analysis
+///   so the server stays responsive. Never panics.
+fn fail_soft_diags(e: &Error, root_path: &Path, module: &Module, src: &str) -> Vec<Diagnostic> {
+    // Case 1: the error's own location is in the OPEN file → publish it verbatim.
+    if error_in_open_file(e, root_path) {
+        return vec![diag_from_error(e, src)];
+    }
+    // Case 2: a SIBLING is broken. Point one diagnostic at the import that
+    // reached it, so the buffer is neither poisoned nor spammed.
+    if let Some(stem) = broken_sibling_stem(e) {
+        if let Some(span) = import_stmt_span_for(module, &stem) {
+            let (start, end) = span_to_lsp_range(span, src);
+            return vec![Diagnostic {
+                message: format!("unresolved import: {}", e),
+                severity: Severity::Error,
+                start,
+                end,
+            }];
+        }
+    }
+    // Case 3: cannot attribute to a specific open-file import (e.g. a transitive
+    // dependency broke) → degrade to single-module analysis. Imported names may
+    // transiently show as unresolved until the dependency parses again.
+    single_module_diags(module, src)
+}
+
+/// True when a resolve error's location is the OPEN file (`root_path`), so its
+/// span is a valid offset into the open buffer and can be published directly.
+fn error_in_open_file(e: &Error, root_path: &Path) -> bool {
+    match e {
+        // The import statement lives in `importing_file`; when that is the open
+        // file, `span` indexes into the open buffer.
+        Error::ImportNotFound { importing_file, .. } => same_file(importing_file, root_path),
+        // A per-module Lex/Parse/Type error paired (`with_render_source`) with the
+        // file it belongs to.
+        Error::Sourced { file: Some(f), .. } => f == root_path,
+        // A root single-file error carries no file (root is not name-stamped);
+        // its span indexes into the open buffer.
+        Error::Sourced { file: None, .. } => true,
+        // A circular-import error is an import-level whole-program error; its span
+        // points at an `import`. Publish it (positions are clamped to the buffer
+        // by `span_to_lsp_range` / `byte_offset_to_position`, so it never panics
+        // even if the span belonged to another cycle member).
+        Error::CircularImport { .. } => true,
+        _ => false,
+    }
+}
+
+/// The file-stem of the SIBLING a resolve error belongs to, used to locate the
+/// open file's `import` of that module. `None` when the error is not
+/// sibling-attributable.
+fn broken_sibling_stem(e: &Error) -> Option<String> {
+    let path: &Path = match e {
+        Error::Sourced { file: Some(f), .. } => f.as_path(),
+        Error::ImportNotFound { importing_file, .. } => Path::new(importing_file),
+        _ => return None,
+    };
+    path.file_stem().map(|s| s.to_string_lossy().into_owned())
+}
+
+/// The span of the first top-level `import`/`from` statement in `module` whose
+/// LEAF module name equals `stem` (e.g. `from common import x` → leaf `common`;
+/// `import os.path` → leaf `path`). Used to place a fail-soft import diagnostic.
+fn import_stmt_span_for(module: &Module, stem: &str) -> Option<Span> {
+    module.stmts.iter().find_map(|s| match s {
+        Stmt::Import { path, span, .. } if path.last().map(String::as_str) == Some(stem) => {
+            Some(*span)
+        }
+        _ => None,
+    })
+}
+
+/// Compare a path STRING (as carried by `ImportNotFound.importing_file`, which is
+/// a canonical `Path::display()`) against the open file's canonical path. Falls
+/// back to canonicalizing the string so a non-canonical carrier still matches.
+fn same_file(candidate: &str, root_path: &Path) -> bool {
+    let p = Path::new(candidate);
+    p == root_path || p.canonicalize().ok().as_deref() == Some(root_path)
 }
 
 /// Parse `src` and build a single-module [`TyCtx`], returning both on success.
@@ -103,6 +272,71 @@ pub fn analyze_document(src: &str) -> Option<(crate::ast::Module, TyCtx)> {
     let mut ctx = TyCtx::new();
     merge_ctx_from_module(&module, &mut ctx, true).ok()?;
     Some((module, ctx))
+}
+
+/// Path-aware variant of [`analyze_document`] for hover / completion / go-to-def.
+///
+/// When `path` names a real on-disk file, this runs the FULL multi-file resolver
+/// (siblings + embedded stdlib) with the open buffers as an `overlay`, and
+/// returns the OPEN module paired with the MERGED `TyCtx`. Consumers
+/// (`type_at_position`, `scope_completions`, `definition_at_position`, semantic
+/// tokens) therefore see imported names — so hovering an imported call yields its
+/// type instead of nothing, and scope completion lists imported symbols.
+///
+/// Fail-soft: `path == None` / an un-canonicalizable path (untitled / unsaved), a
+/// resolve failure (a sibling broken mid-edit), or an unparseable buffer all fall
+/// back to the single-module `(module, ctx)` — identical to [`analyze_document`]
+/// — so these features degrade to same-file behaviour rather than going silent or
+/// panicking.
+pub fn analyze_document_at(
+    src: &str,
+    path: Option<&Path>,
+    overlay: &HashMap<PathBuf, String>,
+) -> Option<(crate::ast::Module, TyCtx)> {
+    let module = parser::parse(src).ok()?;
+
+    // No usable on-disk anchor → single-module ctx (identical to analyze_document).
+    let abs = match path.and_then(|p| p.canonicalize().ok()) {
+        Some(a) => a,
+        None => {
+            let mut ctx = TyCtx::new();
+            merge_ctx_from_module(&module, &mut ctx, true).ok()?;
+            return Some((module, ctx));
+        }
+    };
+
+    // Guarantee the resolver analyzes the CURRENT buffer for the open file, so the
+    // returned module's spans line up with `src` (which the LSP passes already
+    // line-ending-normalized) that hover/definition positions are computed
+    // against. Holds even if the caller's overlay omitted the current document.
+    let mut overlay = overlay.clone();
+    overlay.insert(abs.clone(), src.to_string());
+
+    match crate::resolver::resolve_with_overlay(&abs, &overlay) {
+        Ok(prog) => {
+            // Return the OPEN module paired with the MERGED ctx so imported names
+            // resolve. The open module is the one whose source_path is `abs` (the
+            // resolver emits it last), else the last module as a fallback.
+            let crate::resolver::ResolvedProgram { modules, ctx } = prog;
+            let mut chosen: Option<crate::ast::Module> = None;
+            for (m, _src) in modules {
+                let is_open = m.source_path.as_deref() == Some(abs.as_path());
+                chosen = Some(m);
+                if is_open {
+                    break;
+                }
+            }
+            Some((chosen?, ctx))
+        }
+        // Resolve failed (e.g. a dependency is mid-edit-broken). Degrade to a
+        // single-module ctx so hover/completion stay responsive; imported names
+        // simply won't resolve until the sibling parses again. Never panics.
+        Err(_) => {
+            let mut ctx = TyCtx::new();
+            merge_ctx_from_module(&module, &mut ctx, true).ok()?;
+            Some((module, ctx))
+        }
+    }
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
@@ -3308,5 +3542,240 @@ mod tests {
         // `    return q.bit_length`: `q`=11, `.`=12, `bit_length`=13.
         let attr = tok_at(&toks, 1, 13).expect("attr token at (1,13)");
         assert_eq!(attr.kind, SemTokKind::Property, "non-class receiver → Property default");
+    }
+}
+
+// ── Multi-file overlay resolution (LSP import resolution, card 88486b59) ────────
+//
+// These tests exercise `analyze_str_at` / `analyze_document_at`: the path-aware
+// entry points that run the REAL resolver with an in-memory buffer overlay so
+// sibling + embedded-stdlib imports resolve in the editor exactly as `pyrst
+// check` resolves them. Each test builds a throwaway temp directory of `.pyrs`
+// files so a real on-disk sibling layout exists to resolve against.
+#[cfg(test)]
+mod overlay_tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    /// A fresh, uniquely-named temp directory (created), so each test's sibling
+    /// modules are isolated from every other test and from the real filesystem.
+    fn temp_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "pyrst-lsp-overlay-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write(dir: &std::path::Path, name: &str, src: &str) -> PathBuf {
+        let p = dir.join(name);
+        std::fs::write(&p, src).unwrap();
+        p
+    }
+
+    const COMMON: &str = "def clamp(value: int, lo: int, hi: int) -> int:\n\
+        \x20   if value < lo:\n\
+        \x20       return lo\n\
+        \x20   if value > hi:\n\
+        \x20       return hi\n\
+        \x20   return value\n";
+
+    /// THE BUG (AC): opening `main.pyrs` of a multi-file project must resolve
+    /// `from common import clamp` and report ZERO diagnostics — not flag `clamp`
+    /// as undefined. Reproduces examples/multi_file_demo's shape.
+    #[test]
+    fn sibling_import_resolves_with_zero_diagnostics() {
+        let dir = temp_dir();
+        write(&dir, "common.pyrs", COMMON);
+        let main_src =
+            "from common import clamp\n\ndef main() -> None:\n    print(clamp(150, 0, 100))\n";
+        let main = write(&dir, "main.pyrs", main_src);
+
+        let diags = analyze_str_at(main_src, Some(&main), &HashMap::new());
+        assert!(
+            diags.is_empty(),
+            "clamp must resolve via the sibling module; got: {:?}",
+            diags
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The OVERLAY overrides on-disk content: `main.pyrs` on disk is stale (does
+    /// not import clamp, so a single-module analysis of it would flag `clamp`),
+    /// but the open buffer (passed as `src` AND overlaid) DOES import it. The
+    /// buffer must win — zero diagnostics.
+    #[test]
+    fn open_buffer_overrides_stale_disk() {
+        let dir = temp_dir();
+        write(&dir, "common.pyrs", COMMON);
+        // Stale on-disk main: NO import, and a body that references clamp.
+        write(
+            &dir,
+            "main.pyrs",
+            "def main() -> None:\n    print(clamp(1, 0, 2))\n",
+        );
+        let main = dir.join("main.pyrs");
+        // The live buffer adds the import that resolves clamp.
+        let buffer =
+            "from common import clamp\n\ndef main() -> None:\n    print(clamp(1, 0, 2))\n";
+
+        // Even with an EMPTY caller overlay, analyze_str_at injects the current
+        // buffer for the open file, so the buffer (not stale disk) is analyzed.
+        let diags = analyze_str_at(buffer, Some(&main), &HashMap::new());
+        assert!(
+            diags.is_empty(),
+            "the open buffer (which imports clamp) must override stale disk; got: {:?}",
+            diags
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A SIBLING overlay overrides that sibling's disk content too: `common.pyrs`
+    /// on disk is BROKEN, but an overlay entry supplies a valid `common` buffer,
+    /// so `main` resolves cleanly (proving all open buffers, not just the current
+    /// one, participate).
+    #[test]
+    fn open_sibling_buffer_overrides_broken_disk() {
+        let dir = temp_dir();
+        write(&dir, "common.pyrs", "def clamp(value: int, lo:\n"); // broken on disk
+        let main_src =
+            "from common import clamp\n\ndef main() -> None:\n    print(clamp(150, 0, 100))\n";
+        let main = write(&dir, "main.pyrs", main_src);
+
+        let mut overlay = HashMap::new();
+        overlay.insert(dir.join("common.pyrs").canonicalize().unwrap(), COMMON.to_string());
+
+        let diags = analyze_str_at(main_src, Some(&main), &overlay);
+        assert!(
+            diags.is_empty(),
+            "a valid overlay for the sibling must override its broken disk copy; got: {:?}",
+            diags
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// FAIL-SOFT: a sibling broken MID-EDIT (on disk, no valid overlay) must NOT
+    /// poison the open file. Expect EXACTLY ONE diagnostic, located on the open
+    /// file's `import` line (line 0), naming the unresolved import — never a
+    /// wrong-offset squiggle and never "undefined name" spam for clamp.
+    #[test]
+    fn broken_sibling_fails_soft_to_one_import_diagnostic() {
+        let dir = temp_dir();
+        write(&dir, "common.pyrs", "def clamp(value: int, lo:\n"); // parse error mid-edit
+        let main_src =
+            "from common import clamp\n\ndef main() -> None:\n    print(clamp(150, 0, 100))\n";
+        let main = write(&dir, "main.pyrs", main_src);
+
+        let diags = analyze_str_at(main_src, Some(&main), &HashMap::new());
+        assert_eq!(diags.len(), 1, "a broken sibling must yield exactly one diagnostic, not spam");
+        let d = &diags[0];
+        assert_eq!(d.start.0, 0, "the diagnostic must sit on the import line (line 0)");
+        assert!(
+            d.message.contains("unresolved import"),
+            "the diagnostic must name the unresolved import; got: {:?}",
+            d.message
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A genuinely MISSING sibling (not merely mid-edit-broken) surfaces the
+    /// normal import error for the open file.
+    #[test]
+    fn missing_sibling_is_a_normal_import_error() {
+        let dir = temp_dir();
+        let main_src =
+            "from nowhere import thing\n\ndef main() -> None:\n    print(thing())\n";
+        let main = write(&dir, "main.pyrs", main_src);
+
+        let diags = analyze_str_at(main_src, Some(&main), &HashMap::new());
+        assert_eq!(diags.len(), 1, "a missing import is one honest diagnostic");
+        assert!(
+            diags[0].message.contains("nowhere") || diags[0].message.contains("import"),
+            "the diagnostic must name the missing module; got: {:?}",
+            diags[0].message
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Embedded-stdlib imports resolve exactly as the CLI resolves them (no local
+    /// `os.pyrs` on disk → the baked-in `os` module is used): zero diagnostics.
+    #[test]
+    fn embedded_stdlib_import_is_clean() {
+        let dir = temp_dir();
+        let main_src =
+            "from os import getenv\n\ndef main() -> None:\n    print(getenv(\"X\", \"y\"))\n";
+        let main = write(&dir, "main.pyrs", main_src);
+
+        let diags = analyze_str_at(main_src, Some(&main), &HashMap::new());
+        assert!(diags.is_empty(), "embedded os::getenv must resolve; got: {:?}", diags);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// PATHLESS fallback (untitled / unsaved buffer): `analyze_str_at(src, None,
+    /// …)` is byte-for-byte the legacy single-module `analyze_str(src)`.
+    #[test]
+    fn pathless_fallback_equals_single_module() {
+        // Clean single-file program: both empty.
+        let clean = "def main() -> None:\n    print(1)\n";
+        assert_eq!(analyze_str_at(clean, None, &HashMap::new()), analyze_str(clean));
+
+        // A program using an unresolved imported name: single-module flags it, and
+        // the pathless path must match that legacy behaviour exactly.
+        let uses_import = "from common import clamp\n\ndef main() -> None:\n    print(clamp(1, 0, 2))\n";
+        assert_eq!(
+            analyze_str_at(uses_import, None, &HashMap::new()),
+            analyze_str(uses_import)
+        );
+    }
+
+    /// A path that does not exist on disk (deleted file / bogus path) also
+    /// degrades to single-module rather than crashing.
+    #[test]
+    fn nonexistent_path_degrades_gracefully() {
+        let bogus = PathBuf::from("/pyrst/definitely/not/a/real/file-xyz.pyrs");
+        let src = "def main() -> None:\n    print(1)\n";
+        let diags = analyze_str_at(src, Some(&bogus), &HashMap::new());
+        assert!(diags.is_empty(), "a clean buffer at a bogus path must still be clean");
+        assert_eq!(diags, analyze_str(src), "and must match the single-module path");
+    }
+
+    /// hover / completion path: `analyze_document_at` returns the open module
+    /// paired with the MERGED ctx, so an imported name is present in the ctx and
+    /// hovering an imported CALL yields its return type (not nothing/undefined).
+    #[test]
+    fn analyze_document_at_merges_imported_ctx_and_hovers_import() {
+        let dir = temp_dir();
+        write(&dir, "common.pyrs", COMMON);
+        let main_src =
+            "from common import clamp\n\ndef main() -> None:\n    print(clamp(150, 0, 100))\n";
+        let main = write(&dir, "main.pyrs", main_src);
+
+        let (module, ctx) =
+            analyze_document_at(main_src, Some(&main), &HashMap::new()).expect("resolves");
+        // The imported signature is available in the merged ctx.
+        assert!(ctx.funcs.contains_key("clamp"), "imported clamp must be in the merged ctx");
+
+        // Hover on the `clamp` call (line 3, on the callee) → the call's result
+        // type `int` (the existing callee→Call retarget), proving the imported
+        // name resolves to a type instead of Unknown.
+        // `    print(clamp(150, 0, 100))` — `clamp` starts at column 10.
+        let ty = type_at_position(&module, &ctx, main_src, 3, 11);
+        assert_eq!(ty, Some(Ty::Int), "hovering the imported clamp(...) call yields int");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `analyze_document_at` with no path falls back to a single-module ctx
+    /// (untitled buffer) without panicking.
+    #[test]
+    fn analyze_document_at_pathless_is_single_module() {
+        let src = "def helper(x: int) -> int:\n    return x\n\ndef main() -> None:\n    print(helper(1))\n";
+        let (_m, ctx) = analyze_document_at(src, None, &HashMap::new()).expect("parses");
+        assert!(ctx.funcs.contains_key("helper"), "own function present in single-module ctx");
     }
 }

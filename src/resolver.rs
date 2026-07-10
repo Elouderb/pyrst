@@ -24,6 +24,14 @@ struct Resolver {
     dfs_stack: Vec<PathBuf>,
     /// Topologically sorted paths: dependencies before dependents
     order: Vec<PathBuf>,
+    /// In-memory buffer OVERLAY (LSP): canonical file path → source text. When a
+    /// file being visited has an overlay entry, its text overrides the on-disk
+    /// content, so analysis runs on the editor's UNSAVED buffer instead of the
+    /// stale saved file. EMPTY on the CLI path (`resolve`), where every read
+    /// therefore goes to disk exactly as before. Embedded-stdlib modules are keyed
+    /// by synthetic `<stdlib>/…` paths and never appear here, so they resolve
+    /// identically regardless of the overlay.
+    overlay: HashMap<PathBuf, String>,
 }
 
 impl Resolver {
@@ -33,6 +41,7 @@ impl Resolver {
             in_flight: HashSet::new(),
             dfs_stack: Vec::new(),
             order: Vec::new(),
+            overlay: HashMap::new(),
         }
     }
 
@@ -59,16 +68,25 @@ impl Resolver {
         // and the diagnostic renderer (this `src` is cached below and later paired
         // into `Error::Sourced` via `with_render_source`); see
         // `lexer::normalize_line_endings`.
-        let src = std::fs::read_to_string(&abs_path)
-            .map(|s| crate::lexer::normalize_line_endings(&s))
-            .map_err(|_| {
-                let importing_file = abs_path.file_stem().unwrap_or_default().to_string_lossy().to_string();
-                Error::ImportNotFound {
-                    path: importing_file,
-                    span: import_span,
-                    importing_file: base_dir.display().to_string(),
-                }
-            })?;
+        //
+        // LSP OVERLAY: an open editor buffer for THIS file (keyed by its canonical
+        // path) overrides the on-disk content, so analysis reflects unsaved edits.
+        // The overlay text is already line-ending-normalized by the LSP layer, but
+        // normalizing again is idempotent and keeps this site's invariant local.
+        // `overlay` is empty on the CLI path, so that branch is never taken there.
+        let src = match self.overlay.get(&abs_path) {
+            Some(text) => crate::lexer::normalize_line_endings(text),
+            None => std::fs::read_to_string(&abs_path)
+                .map(|s| crate::lexer::normalize_line_endings(&s))
+                .map_err(|_| {
+                    let importing_file = abs_path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+                    Error::ImportNotFound {
+                        path: importing_file,
+                        span: import_span,
+                        importing_file: base_dir.display().to_string(),
+                    }
+                })?,
+        };
 
         self.process_module(abs_path, src, base_dir, import_span, module_id)
     }
@@ -561,11 +579,35 @@ fn detect_cross_module_collisions(
 }
 
 /// Resolve all imports from a root .pyrs file and return a merged program.
+///
+/// This is the CLI entry point (`pyrst check`/`build`/`emit` + the REPL): it
+/// reads every module from disk. It is exactly [`resolve_with_overlay`] with an
+/// EMPTY overlay, so its behaviour is byte-for-byte the pre-overlay resolver.
 pub fn resolve(root_path: &Path) -> Result<ResolvedProgram> {
+    resolve_with_overlay(root_path, &HashMap::new())
+}
+
+/// Resolve all imports from a root file, with an in-memory buffer `overlay`
+/// (canonical file path → source text) that overrides on-disk content for the
+/// matching files.
+///
+/// This is the LSP entry point: the editor's OPEN buffers (which may hold
+/// unsaved edits) are passed as the overlay so diagnostics / hover / completion
+/// reflect the live buffer rather than the last-saved file, while unopened
+/// sibling files and the embedded stdlib still resolve from disk / the baked-in
+/// sources exactly as the CLI does. `resolve(path)` == `resolve_with_overlay(path,
+/// &HashMap::new())`; an empty overlay never intercepts a read.
+pub fn resolve_with_overlay(
+    root_path: &Path,
+    overlay: &HashMap<PathBuf, String>,
+) -> Result<ResolvedProgram> {
     let abs_root = root_path.canonicalize().map_err(|e| crate::diag::Error::Io(e))?;
     let root_dir = abs_root.parent().unwrap_or_else(|| Path::new("."));
 
     let mut resolver = Resolver::new();
+    // Seed the buffer overlay (empty on the CLI path). Cloning is cheap: the map
+    // holds only the handful of files the editor currently has open.
+    resolver.overlay = overlay.clone();
     // The ROOT program has no dotted import path (`module_id = None`): it is the
     // sentinel root whose own top-level names stay crate-root-unwrapped (W3-1).
     resolver.visit(abs_root.clone(), root_dir, Span::DUMMY, None)?;

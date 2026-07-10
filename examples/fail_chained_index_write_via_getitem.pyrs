@@ -1,0 +1,16 @@
+# E1 fix / P1 negative: a chained index WRITE through a class `__getitem__`
+# (`b[0][2] = v`) is rejected at check. `b[0]` reads a fresh COPY under value
+# semantics, so writing into it would silently do nothing (unlike Python's
+# in-place mutation). Before this fix it check-passed and leaked a raw rustc
+# E0608 from emit_place_hoisted (no class case → `base[idx as usize]` on a struct).
+class Board:
+    rows: list[list[int]]
+    def __init__(self, rows: list[list[int]]) -> None:
+        self.rows = rows
+    def __getitem__(self, i: int) -> list[int]:
+        return self.rows[i]
+
+def main() -> None:
+    b: Board = Board([[1, 2, 3]])
+    b[0][2] = 99
+    print(b[0][2])

@@ -1,0 +1,14 @@
+# E1 fix / P3 negative: `__setitem__` with only one param (no value) is rejected
+# at check — `b[k] = v` passes a key AND a value. Before this fix it leaked raw
+# rustc E0061 at build.
+class Bad:
+    data: list[int]
+    def __init__(self) -> None:
+        self.data = [0]
+    def __setitem__(self, i: int) -> None:
+        self.data[i] = 0
+
+def main() -> None:
+    b: Bad = Bad()
+    b[0] = 5
+    print(b.data[0])

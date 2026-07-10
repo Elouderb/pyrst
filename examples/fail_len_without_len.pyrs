@@ -1,0 +1,11 @@
+# E1 negative: len() of a user class that defines NO __len__ is an honest check
+# error (Python: object of type 'NoLen' has no len()). Before E1 this emitted a
+# bare `.len()` and leaked a raw rustc E0599.
+class NoLen:
+    v: int
+    def __init__(self) -> None:
+        self.v = 5
+
+def main() -> None:
+    p: NoLen = NoLen()
+    print(len(p))

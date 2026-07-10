@@ -1,0 +1,15 @@
+# E1 fix / P5: `__len__` returning `bool` — an int subclass in Python (True->1,
+# False->0). pyrst accepts it and casts the result `as i64` for exact CPython
+# parity. Dual-run vs CPython.
+class Toggle:
+    on: bool
+    def __init__(self, on: bool) -> None:
+        self.on = on
+    def __len__(self) -> bool:
+        return self.on
+
+def main() -> None:
+    t: Toggle = Toggle(True)
+    f: Toggle = Toggle(False)
+    print(len(t))
+    print(len(f))

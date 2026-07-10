@@ -1748,6 +1748,25 @@ impl<'a> Codegen<'a> {
                                     return Ok(Some(format!("{{ let _ = &({}); {}i64 }}", a, tys.len())));
                                 }
                             }
+                            // (E1) `len(obj)` of a user class routes to its `__len__`
+                            // method. `__len__(self) -> int` already returns i64, so —
+                            // unlike the `.len() as i64` collection path below — no
+                            // cast is needed. typeck rejects a class without `__len__`,
+                            // so this only fires when routing is correct.
+                            if let Ty::Class(cn, _) = &arg_ty {
+                                if let Some(sig) = self.ctx.get_method(cn, "__len__") {
+                                    let a = self.emit_expr(&args[0])?;
+                                    // (E1 fix / P5) A `bool` return (an int subclass
+                                    // in Python: True->1, False->0) casts to i64 so
+                                    // `len()` — typed Int — stays i64. typeck has
+                                    // proven the return is `int` or `bool`.
+                                    return Ok(Some(if matches!(sig.ret, Ty::Bool) {
+                                        format!("(({}).__len__() as i64)", a)
+                                    } else {
+                                        format!("({}).__len__()", a)
+                                    }));
+                                }
+                            }
                             let a = self.emit_expr(&args[0])?;
                             // Python len() of a str is the CHARACTER count, not the
                             // UTF-8 byte count. Collections keep .len().
@@ -3378,10 +3397,35 @@ impl<'a> Codegen<'a> {
                     }
                 }
             }
-            Expr::Index { obj, idx, .. } => {
+            Expr::Index { obj, idx, span } => {
                 // type_of_expr (not just an Ident lookup) so nested/chained
                 // receivers resolve — e.g. grid["row"]["x"] sees the inner Dict.
                 let obj_ty = self.type_of_expr(obj);
+                // (E1) A user-class receiver routes `obj[k]` to its `__getitem__`,
+                // emitted through the shared user-method-call path (so a generic
+                // class's type args and any param coercion are handled uniformly).
+                // typeck has already proven `__getitem__` exists and the key type
+                // fits — a class without it is rejected there — so reaching this arm
+                // means routing is correct. A chained `board[r][c]` composes: the
+                // receiver-emit of the inner `board[r]` re-enters this arm, and
+                // `type_of_expr` (the oracle) types it as `__getitem__`'s return.
+                if let Ty::Class(cn, cls_args) = &obj_ty {
+                    if self.ctx.get_method(cn, "__getitem__").is_some() {
+                        let obj_s = self.emit_expr(obj)?;
+                        let parts = vec![self.emit_consuming(idx)?];
+                        let recv_ty = Ty::Class(cn.clone(), cls_args.clone());
+                        return self.emit_user_method_call(
+                            &obj_s,
+                            cn,
+                            "__getitem__",
+                            std::slice::from_ref(idx.as_ref()),
+                            &[],
+                            &parts,
+                            *span,
+                            &recv_ty,
+                        );
+                    }
+                }
                 let o = self.emit_expr(obj)?;
                 // Tuple subscript with a literal index -> Rust field access (t.N),
                 // cloned so the element can be used without moving out of the tuple.

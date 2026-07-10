@@ -1,0 +1,13 @@
+# E1 negative: item ASSIGNMENT on a class that defines __getitem__ but NO
+# __setitem__ is an honest check error (Python: 'RO' object does not support
+# item assignment). Read access (x[0]) is fine; only the store is rejected.
+class RO:
+    d: list[int]
+    def __init__(self) -> None:
+        self.d = [1, 2, 3]
+    def __getitem__(self, i: int) -> int:
+        return self.d[i]
+
+def main() -> None:
+    x: RO = RO()
+    x[0] = 9

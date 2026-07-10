@@ -2771,6 +2771,52 @@ fn live_handle_names(env: &FuncEnv) -> std::collections::HashSet<String> {
         .collect()
 }
 
+/// (E1 fix / P1) Walk the RECEIVER SPINE of an assignment place — the `Index.obj`
+/// and `Attr.obj` links ONLY — looking for an `Index` whose base is a user class
+/// that dispatches through `__getitem__`. Such an index is a value-semantics READ:
+/// it returns a fresh CLONE of the class's `__getitem__` result, so writing THROUGH
+/// it (`b[i][j] = v`, `b[i].field = v`) would mutate a discarded temporary — a
+/// silent no-op vs CPython's in-place mutation. We reject it at CHECK; before this
+/// fix it check-passed and died in `emit_place_hoisted` (no class case there — it
+/// emitted `base[idx as usize]` on a struct → raw rustc E0608).
+///
+/// The spine is ONLY the `.obj` chain: an `Index.idx` is a READ, not part of the
+/// place, so a class-`__getitem__` used AS AN INDEX (`board[b[0]] = v`) is legal
+/// and NOT flagged. A class reached through a genuine FIELD / LOCAL place
+/// (`self.data[i] = v`, `store[i] = v`) is a real lvalue routed to `__setitem__` —
+/// it never appears as a spine `Index` base. Native containers (`list`/`dict`)
+/// reached through a subscript stay lvalues, so `board[r][c] = v` and
+/// `d[k1][k2] = v` remain legal. Returns the offending class name.
+fn place_spine_class_getitem(place: &Expr, env: &FuncEnv) -> Option<String> {
+    match place {
+        Expr::Index { obj, .. } => {
+            if let Ty::Class(cn, _) = infer_expr_ty(obj, &env.locals, env.ctx) {
+                if env.ctx.get_method(&cn, "__getitem__").is_some() {
+                    return Some(cn);
+                }
+            }
+            place_spine_class_getitem(obj, env)
+        }
+        Expr::Attr { obj, .. } => place_spine_class_getitem(obj, env),
+        _ => None,
+    }
+}
+
+/// (E1 fix / P1) Honest error for a write THROUGH a class `__getitem__` read.
+fn chained_class_getitem_write_error(cn: &str, span: Span) -> Error {
+    Error::Type {
+        span,
+        msg: format!(
+            "cannot assign through `{0}.__getitem__` — `{0}[...]` returns a fresh COPY \
+             under pyrst value semantics, so writing into that copy would silently do \
+             nothing (unlike Python's in-place mutation). Restructure as a single \
+             `__setitem__`: use a tuple key (`m[i, j] = v`) or get / mutate / set \
+             (`row = m[i]; row[j] = v; m[i] = row`)",
+            cn
+        ),
+    }
+}
+
 pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
     match s {
         Stmt::Pass(_) | Stmt::Break(_) | Stmt::Continue(_) => Ok(()),
@@ -3578,6 +3624,14 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             // unknown names / bad nested attributes are rejected by check_expr).
             let obj_ty = check_expr(obj, env)?;
             check_expr(value, env)?;
+            // (E1 fix / P1) Reject `x[k].attr = v` where the base `x[k]` reads
+            // through a class `__getitem__` — value semantics returns a fresh
+            // clone, so the field write would be a silent no-op. A native place
+            // base (`pts[i].x = v` on a list element) has no class-getitem spine
+            // index and is unaffected.
+            if let Some(cn) = place_spine_class_getitem(obj, env) {
+                return Err(chained_class_getitem_write_error(&cn, *span));
+            }
             // Detect mutation of a by-value non-Copy parameter.
             // `param.field = v` where `param` is still the original binding is a
             // silent wrong-output bug — the caller's value is never updated.
@@ -3646,8 +3700,90 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             }
             // Validate the target base chain, the subscript, and the value.
             let obj_ty = check_expr(obj, env)?;
-            check_expr(idx, env)?;
-            check_expr(value, env)?;
+            let idx_ty = check_expr(idx, env)?;
+            let val_ty = check_expr(value, env)?;
+            // (E1 fix / P4) An un-narrowed Optional receiver (`opt[k] = v`) is
+            // rejected with the honest "narrow first" idiom rather than the
+            // pre-existing generic fall-through that leaked a raw rustc E0308.
+            reject_optional_subscript(&obj_ty, *span)?;
+            // (E1 fix / P1) Reject `b[i][j] = v` where the base `b[i]` reads
+            // through a class `__getitem__` (value semantics: it returns a clone,
+            // so the element write would be a silent no-op). BEFORE the __setitem__
+            // routing so a chain whose inner getitem returns a class-WITH-__setitem__
+            // is caught too (that receiver is a clone as well). Native nested writes
+            // (`board[r][c] = v`, `d[k1][k2] = v`) have no class-getitem spine index.
+            if let Some(cn) = place_spine_class_getitem(obj, env) {
+                return Err(chained_class_getitem_write_error(&cn, *span));
+            }
+            // (E1) A user-class receiver routes `obj[k] = v` to its `__setitem__`
+            // (key = first param, value = second). The key and value types are
+            // validated against those params — a mismatch is an honest CHECK error.
+            // A class WITHOUT `__setitem__` does not support item assignment (before
+            // E1 this fell through to the list-store path and leaked a raw rustc
+            // mismatch). Placed before the global/dict/list stores below so a class
+            // instance (even a module global) never takes the sequence-store path.
+            if let Ty::Class(cn, _) = &obj_ty {
+                match env.ctx.get_method(cn, "__setitem__") {
+                    Some(sig) => {
+                        // (E1 fix / P3) The subscript `obj[k] = v` passes EXACTLY a
+                        // key and a value, so `__setitem__` must take exactly two
+                        // parameters besides `self`. A wrong arity was accepted at
+                        // check and leaked a raw rustc E0061 (setitem-1) at build.
+                        if sig.params.len() != 2 {
+                            return Err(Error::Type {
+                                span: *span,
+                                msg: format!(
+                                    "`{}.__setitem__` must take exactly two parameters \
+                                     (key, value) besides `self`, but it takes {} — \
+                                     `{}[k] = v` passes a key and a value",
+                                    cn, sig.params.len(), cn
+                                ),
+                            });
+                        }
+                        // key = param 0, value = param 1 (self already excluded).
+                        // (E1 fix / P2) Types must match EXACTLY: pyrst does not
+                        // coerce int->float at any call-argument position (a normal
+                        // method/free call with an int literal into an `f64` param
+                        // leaks rustc E0308 too), so the old int_to_float allowance
+                        // let check accept `r[0] = 5` (int) into a float value slot
+                        // that build then rejected. Require the exact type; the user
+                        // writes `5.0`.
+                        for (slot, actual, what) in [
+                            (sig.params.first(), &idx_ty, "key"),
+                            (sig.params.get(1), &val_ty, "value"),
+                        ] {
+                            if let Some((_, decl)) = slot {
+                                let expected = subst_class_member(decl, &obj_ty, env.ctx);
+                                if !matches!(actual, Ty::Unknown)
+                                    && !matches!(expected, Ty::Unknown)
+                                    && !contains_typevar(&expected)
+                                    && !contains_typevar(actual)
+                                    && !types_compatible(actual, &expected, env.ctx)
+                                {
+                                    return Err(Error::Type {
+                                        span: *span,
+                                        msg: format!(
+                                            "`{}[...] = ...` expects a {} of type {}, but got {}",
+                                            cn, what, expected, actual
+                                        ),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    None => {
+                        return Err(Error::Type {
+                            span: *span,
+                            msg: format!(
+                                "type `{0}` does not support item assignment — define a \
+                                 `__setitem__` method (Python raises `TypeError: '{0}' \
+                                 object does not support item assignment`)",
+                                cn
+                            ),
+                        });
+                    }
+                }
+            }
             // (W5-a) `bytes` is IMMUTABLE — `b[i] = x` is a CPython TypeError
             // ("'bytes' object does not support item assignment"). Reject it
             // honestly rather than leak a `rustc` mismatch (`Vec<u8>[i] = i64`);

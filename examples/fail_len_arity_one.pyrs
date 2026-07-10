@@ -1,0 +1,10 @@
+# E1 fix / P3 negative: `__len__` with an extra param is rejected at check —
+# `len(x)` calls `__len__()` with no arguments and the emit does not default-fill.
+# Before this fix it leaked raw rustc E0061 at build.
+class Bad:
+    def __len__(self, extra: int) -> int:
+        return 3
+
+def main() -> None:
+    b: Bad = Bad()
+    print(len(b))

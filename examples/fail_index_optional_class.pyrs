@@ -1,0 +1,14 @@
+# E1 fix / P4 negative: subscripting an un-narrowed Optional value is an honest
+# check error — narrow it first with `if x is not None:`. Before this fix it fell
+# to the generic Index fall-through and leaked a raw rustc E0308 (identical for
+# Optional[list], a pre-existing hole this guard also closes).
+class Box:
+    data: list[int]
+    def __init__(self, data: list[int]) -> None:
+        self.data = data
+    def __getitem__(self, i: int) -> int:
+        return self.data[i]
+
+def main() -> None:
+    b: Optional[Box] = Box([1, 2, 3])
+    print(b[0])

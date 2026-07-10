@@ -1402,6 +1402,26 @@ impl Parser {
                             };
                             self.expect(&Tok::RBracket, "slice")?;
                             e = Expr::Slice { obj: Box::new(e), start: Some(Box::new(first)), stop, step, span };
+                        } else if matches!(self.peek(), Tok::Comma) {
+                            // Tuple-key subscript `a[i, j]` (numpy-style multi-index):
+                            // collect the comma-separated key list into an `Expr::Tuple`
+                            // and build a tuple-key `Index`. This was a parse error before
+                            // (the index branch expected `]` after the first element).
+                            // Only a user class whose `__getitem__` takes a matching tuple
+                            // param accepts it — typeck routes it to that method and
+                            // validates the key type; a builtin sequence indexed by a
+                            // tuple is an honest CHECK error, not a silent miscompile.
+                            // A trailing comma (`a[i,]`, a 1-tuple key) is allowed,
+                            // mirroring Python. A `:` inside the list (`a[i, :]`, a mixed
+                            // numpy slice) is out of scope for v1 and stays a parse error.
+                            let mut elems = vec![first];
+                            while self.eat(&Tok::Comma) {
+                                if matches!(self.peek(), Tok::RBracket) { break; }
+                                elems.push(self.parse_expr()?);
+                            }
+                            self.expect(&Tok::RBracket, "index")?;
+                            let idx = Expr::Tuple(elems, span);
+                            e = Expr::Index { obj: Box::new(e), idx: Box::new(idx), span };
                         } else {
                             // It's an index: [idx]
                             self.expect(&Tok::RBracket, "index")?;

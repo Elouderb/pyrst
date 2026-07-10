@@ -1,0 +1,23 @@
+# E1 fix / P2: the ACCEPTED shape after gate-tightening — float-typed
+# `__getitem__`/`__setitem__` params used with FLOAT arguments (exact types; pyrst
+# does not coerce int->float at call positions). Dual-run parity vs CPython.
+class Prices:
+    data: list[float]
+    def __init__(self, n: int) -> None:
+        self.data = [0.0] * n
+    def __getitem__(self, k: int) -> float:
+        return self.data[k]
+    def __setitem__(self, k: int, v: float) -> None:
+        self.data[k] = v
+    def __len__(self) -> int:
+        return len(self.data)
+
+def main() -> None:
+    p: Prices = Prices(3)
+    p[0] = 1.5
+    p[1] = 2.25
+    p[2] = p[0] + p[1]
+    print(p[0])
+    print(p[1])
+    print(p[2])
+    print(len(p))

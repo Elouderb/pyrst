@@ -818,6 +818,27 @@ pub(crate) fn reject_optional_truthiness(ty: &Ty, span: Span) -> Result<()> {
     Ok(())
 }
 
+/// (E1 fix / P4) Subscripting an Optional value — a READ `opt[k]` or a WRITE
+/// `opt[k] = v` — is not narrowed. Reject it with the same "narrow first" idiom
+/// `reject_optional_truthiness` uses. Before this it fell to the generic Index
+/// fall-through (`Ty::Unknown`) and leaked a raw rustc E0308 at build (identical
+/// for `Optional[list]`, a pre-existing hole — this guard closes both honestly).
+/// A NARROWED Optional (`if x is not None:`) reaches the subscript as its inner
+/// type, so this never fires on the correct idiom.
+pub(crate) fn reject_optional_subscript(ty: &Ty, span: Span) -> Result<()> {
+    if let Ty::Option(_) = ty {
+        return Err(Error::Type {
+            span,
+            msg: "cannot subscript an Optional value — it may be None. Narrow it \
+                  first with `if x is not None:` (or `x is None`) to obtain the inner \
+                  value, then index that. pyrst rejects this here so `check` and \
+                  `build` agree instead of leaking a rustc type error."
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Generics v2: a Rust trait bound INFERRED from an operation performed on a
 /// bare type variable inside a generic function body. The SUPPORTED subset of
 /// ops on a `T` no longer rejects (v1) but instead records the trait the

@@ -32,6 +32,13 @@ struct Resolver {
     /// by synthetic `<stdlib>/…` paths and never appear here, so they resolve
     /// identically regardless of the overlay.
     overlay: HashMap<PathBuf, String>,
+    /// (E1) Ordered `$PYRST_PATH` search directories, parsed ONCE at construction.
+    /// Consulted for a local import AFTER the root-relative `<base_dir>/…` lookup
+    /// and BEFORE the embedded stdlib (see [`Resolver::process_module`]). EMPTY when
+    /// the env var is unset/blank, which makes the PYRST_PATH branch a no-op — so a
+    /// build with no `PYRST_PATH` (the `test_all.sh` suite sets none) resolves
+    /// byte-for-byte as before this card.
+    pyrst_path: Vec<PathBuf>,
 }
 
 impl Resolver {
@@ -42,6 +49,7 @@ impl Resolver {
             dfs_stack: Vec::new(),
             order: Vec::new(),
             overlay: HashMap::new(),
+            pyrst_path: pyrst_search_dirs(),
         }
     }
 
@@ -212,14 +220,31 @@ impl Resolver {
                     }
                 };
 
-                // Resolution order: a LOCAL `<base_dir>/a/b.pyrs` on disk SHADOWS an
-                // embedded stdlib module keyed by the same dotted id.
+                // Resolution order (E1): a LOCAL `<base_dir>/a/b.pyrs` on disk SHADOWS
+                // a PYRST_PATH module, which SHADOWS an embedded stdlib module keyed by
+                // the same dotted id. So the precedence is:
+                //   root-relative  ->  PYRST_PATH (in order)  ->  embedded stdlib.
                 let dep_path = rel_layout(base_dir);
                 if let Ok(dep_abs) = dep_path.canonicalize() {
                     // Local file found. Its module id is the FULL dotted import path
                     // that reached it (W3-1/W3-3) — for a single-component `import
                     // mod` that is `mod_name` itself.
                     self.visit(dep_abs, base_dir, *span, Some(mod_id.clone()))?;
+                } else if let Some((pp_abs, pp_dir)) = self
+                    .pyrst_path
+                    .iter()
+                    .find_map(|dir| rel_layout(dir).canonicalize().ok().map(|abs| (abs, dir.clone())))
+                {
+                    // (E1) PYRST_PATH hit: a directory on `$PYRST_PATH` holds this
+                    // module (the FIRST matching entry wins). Visit it with THAT
+                    // directory as its own base, so the found package is self-rooted —
+                    // its internal imports resolve within it first (then PYRST_PATH,
+                    // then embedded). The dotted `mod_id` is location-independent, so
+                    // the module id (and therefore every mangled name it emits) is
+                    // identical no matter which PYRST_PATH entry supplied the file:
+                    // the abs path is used only as a cache/order/cycle key, never
+                    // emitted, so a PYRST_PATH build is byte-for-byte deterministic.
+                    self.visit(pp_abs, &pp_dir, *span, Some(mod_id.clone()))?;
                 } else if let Some(embedded_src) = crate::stdlib::lookup(mod_name) {
                     // No local file → resolve from the EMBEDDED stdlib, keyed by the
                     // DOTTED id (`EMBEDDED_STDLIB` gained dotted entries, e.g.
@@ -265,6 +290,29 @@ impl Resolver {
 /// the embedded lookup, matching the root resolution order.
 fn stdlib_synthetic_dir() -> PathBuf {
     PathBuf::from("<stdlib>")
+}
+
+/// (E1) Parse `$PYRST_PATH` into an ordered list of import-search directories.
+///
+/// Like `$PYTHONPATH`, `PYRST_PATH` is a COLON-separated list of directories;
+/// empty segments (a leading/trailing colon or `::`) are dropped. It is consulted
+/// AFTER a module's root-relative directory and BEFORE the embedded stdlib (see
+/// the resolution order in [`Resolver::process_module`]), so a root-relative file
+/// always shadows a PYRST_PATH module of the same dotted id.
+///
+/// SECURITY: this is a BUILD-TIME SOURCE PATH ONLY — the compiler reads `.pyrs`
+/// source from these directories exactly as it reads any local import. It grants
+/// no runtime capability and is nothing more than the pyrst analogue of
+/// `$PYTHONPATH`. Unset or blank yields an empty list, i.e. a complete no-op.
+fn pyrst_search_dirs() -> Vec<PathBuf> {
+    match std::env::var("PYRST_PATH") {
+        Ok(v) => v
+            .split(':')
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .collect(),
+        Err(_) => Vec::new(),
+    }
 }
 
 /// Merge function/class signatures from a single module into a context.
@@ -1286,5 +1334,131 @@ class Account:
             }
         }
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // (E1) PYRST_PATH import search path.
+    //
+    // `$PYRST_PATH` is process-global, so these tests serialize on a shared mutex
+    // and set/restore the var around each `resolve`. Fixture module names are
+    // unique (`ppmod_*`), so even the brief window an unrelated parallel test
+    // could observe the var is harmless — it only adds a miss on a path that
+    // holds no module that test imports.
+    // ─────────────────────────────────────────────────────────────────────────
+    static PYRST_PATH_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Create a UNIQUE two-directory fixture: a `root/` holding `main.pyrs`
+    /// (`src_main`) and a SIBLING `pkg/` holding `<mod_name>.pyrs` (`src_mod`).
+    /// Returns (root `main.pyrs` path, `pkg` dir path); the shared parent of both
+    /// is `main.parent().parent()`, which the caller removes to clean up.
+    fn two_dir_fixture(mod_name: &str, src_main: &str, src_mod: &str) -> (PathBuf, PathBuf) {
+        let base = std::env::temp_dir().join(format!(
+            "pyrst-pyrstpath-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let root = base.join("root");
+        let pkg = base.join("pkg");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(root.join("main.pyrs"), src_main).unwrap();
+        std::fs::write(pkg.join(format!("{}.pyrs", mod_name)), src_mod).unwrap();
+        (root.join("main.pyrs"), pkg)
+    }
+
+    /// Run `resolve(main)` with `$PYRST_PATH` set to `pyrst_path` for the duration,
+    /// restoring the prior value afterward. Serialized on the shared env lock so
+    /// concurrent PYRST_PATH tests never clobber each other's env.
+    fn resolve_with_pyrst_path(main: &Path, pyrst_path: &Path) -> Result<ResolvedProgram> {
+        let _guard = PYRST_PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var_os("PYRST_PATH");
+        std::env::set_var("PYRST_PATH", pyrst_path);
+        let result = resolve(main);
+        match prev {
+            Some(v) => std::env::set_var("PYRST_PATH", v),
+            None => std::env::remove_var("PYRST_PATH"),
+        }
+        result
+    }
+
+    /// (E1) A module present ONLY under a `$PYRST_PATH` directory (never next to
+    /// `main.pyrs`) resolves — proving the PYRST_PATH branch fired — and its
+    /// signatures merge into the shared ctx, keyed by the location-independent
+    /// dotted module id.
+    #[test]
+    fn pyrst_path_resolves_module_found_only_via_search_dir() {
+        let (main, pkg) = two_dir_fixture(
+            "ppmod_alpha",
+            "from ppmod_alpha import contribute\n\ndef main() -> None:\n    print(contribute(2))\n",
+            "def contribute(n: int) -> int:\n    return n + 1\n",
+        );
+        let prog = resolve_with_pyrst_path(&main, &pkg)
+            .expect("a module found only via PYRST_PATH must resolve");
+        assert!(
+            prog.ctx.funcs.contains_key("contribute"),
+            "the PYRST_PATH module's function must merge into the shared ctx"
+        );
+        assert!(
+            prog.ctx
+                .module_funcs
+                .get("ppmod_alpha")
+                .map_or(false, |fs| fs.iter().any(|n| n == "contribute")),
+            "the PYRST_PATH module must be qualifiable by its dotted id"
+        );
+        let _ = std::fs::remove_dir_all(main.parent().unwrap().parent().unwrap());
+    }
+
+    /// (E1) Precedence: a ROOT-RELATIVE file shadows a PYRST_PATH module of the
+    /// same dotted id. With both present, only the root-local module is loaded.
+    #[test]
+    fn root_relative_shadows_pyrst_path() {
+        let (main, pkg) = two_dir_fixture(
+            "ppmod_beta",
+            "from ppmod_beta import shared\n\ndef main() -> None:\n    print(shared())\n",
+            "def shared() -> int:\n    return 2\n\ndef only_in_pkg() -> int:\n    return 0\n",
+        );
+        // Drop a ROOT-LOCAL ppmod_beta.pyrs next to main.pyrs; it must WIN.
+        let root_dir = main.parent().unwrap();
+        std::fs::write(
+            root_dir.join("ppmod_beta.pyrs"),
+            "def shared() -> int:\n    return 1\n\ndef only_in_root() -> int:\n    return 0\n",
+        )
+        .unwrap();
+        let prog = resolve_with_pyrst_path(&main, &pkg)
+            .expect("resolve with a root-local shadow must succeed");
+        assert!(
+            prog.ctx.funcs.contains_key("only_in_root"),
+            "the ROOT-LOCAL module must shadow the PYRST_PATH one"
+        );
+        assert!(
+            !prog.ctx.funcs.contains_key("only_in_pkg"),
+            "the PYRST_PATH module must NOT load when a root-local file shadows it"
+        );
+        let _ = std::fs::remove_dir_all(main.parent().unwrap().parent().unwrap());
+    }
+
+    /// (E1) A module absent from BOTH the root dir and every PYRST_PATH dir stays
+    /// an honest `ImportNotFound` (PYRST_PATH does not make unknown imports resolve).
+    #[test]
+    fn pyrst_path_miss_stays_honest_import_error() {
+        let (main, pkg) = two_dir_fixture(
+            "ppmod_gamma",
+            "from ppmod_absent import f\n\ndef main() -> None:\n    print(f())\n",
+            "def f() -> int:\n    return 0\n",
+        );
+        match resolve_with_pyrst_path(&main, &pkg) {
+            Err(Error::ImportNotFound { path, .. }) => {
+                assert_eq!(
+                    path, "ppmod_absent",
+                    "a module on neither root nor PYRST_PATH stays an honest ImportNotFound"
+                );
+            }
+            Ok(_) => panic!("a module on neither root nor PYRST_PATH must not resolve"),
+            Err(other) => panic!("expected ImportNotFound, got: {:?}", other),
+        }
+        let _ = std::fs::remove_dir_all(main.parent().unwrap().parent().unwrap());
     }
 }

@@ -1,0 +1,11 @@
+# E1 fix / P3 negative: `__getitem__` with two separate key params is rejected at
+# check — the subscript passes exactly one key (use a single tuple-typed param,
+# `def __getitem__(self, key: tuple[int, int])`, for 2D). Before this fix it was
+# only caught at build ("missing a required argument").
+class Bad:
+    def __getitem__(self, i: int, j: int) -> int:
+        return i + j
+
+def main() -> None:
+    b: Bad = Bad()
+    print(b[0])

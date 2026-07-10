@@ -1,0 +1,10 @@
+# E1 fix / P3 negative: `__getitem__` with zero key params is rejected at check —
+# the subscript `b[k]` passes exactly one key. Before this fix it leaked raw
+# rustc E0061 at build.
+class Bad:
+    def __getitem__(self) -> int:
+        return 7
+
+def main() -> None:
+    b: Bad = Bad()
+    print(b[0])

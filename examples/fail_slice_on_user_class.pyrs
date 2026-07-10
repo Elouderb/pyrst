@@ -1,0 +1,13 @@
+# E1 negative: slicing a user class (x[a:b]) is an honest check error in v1 —
+# pyrst has no slice-key __getitem__ yet. Rejected here rather than leaking a
+# raw rustc mismatch from the list-slice path.
+class Seq:
+    d: list[int]
+    def __init__(self) -> None:
+        self.d = [1, 2, 3]
+    def __getitem__(self, i: int) -> int:
+        return self.d[i]
+
+def main() -> None:
+    x: Seq = Seq()
+    y: list[int] = x[0:2]

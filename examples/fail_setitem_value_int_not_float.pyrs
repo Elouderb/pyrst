@@ -1,0 +1,17 @@
+# E1 fix / P2 negative: an int value into a float-typed `__setitem__` value param
+# is an honest check error (pyrst does not coerce int->float at call positions).
+# The old int_to_float allowance passed check and leaked rustc E0308 at build.
+# Write `r[0] = 5.0`.
+class Row:
+    data: list[float]
+    def __init__(self, data: list[float]) -> None:
+        self.data = data
+    def __setitem__(self, k: int, v: float) -> None:
+        self.data[k] = v
+    def __getitem__(self, k: int) -> float:
+        return self.data[k]
+
+def main() -> None:
+    r: Row = Row([1.0, 2.0])
+    r[0] = 5
+    print(r[0])

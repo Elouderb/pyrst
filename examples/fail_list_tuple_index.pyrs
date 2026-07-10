@@ -1,0 +1,7 @@
+# E1 negative: a comma subscript `xs[i, j]` parses to a tuple key; on a builtin
+# sequence (here a list) that is an honest check error — the tuple-key form
+# routes only to a user class's __getitem__. Before E1 this was a parse error;
+# enabling tuple-key subscripts must not silently miscompile a list index.
+def main() -> None:
+    xs: list[int] = [1, 2, 3]
+    print(xs[0, 1])

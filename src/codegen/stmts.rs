@@ -1177,7 +1177,37 @@ impl<'a> Codegen<'a> {
                 // it matches the (escaped) struct field def.
                 self.line(&format!("{}.{} = {};", place, escape_ident(attr), v));
             }
-            Stmt::IndexAssign { obj, idx, value, .. } => {
+            Stmt::IndexAssign { obj, idx, value, span } => {
+                // (E1) A user-class receiver routes `obj[k] = v` to its `__setitem__`
+                // method (mutating -> `&mut self`, detected by `needs_mut_self` when
+                // the method is emitted). Handled BEFORE the global/dict/list stores
+                // below so a class instance — even a module global — never takes the
+                // sequence-store path. typeck has proven `__setitem__` exists and the
+                // key/value types fit. The receiver is emitted as a HOISTED PLACE so
+                // `&mut self` lands on the real instance (a bare local, `self.field`,
+                // or a list element like `grid[r]` whose element is a class), with any
+                // subscript index in the receiver run before the mutable borrow (E0502).
+                let recv = self.type_of_expr(obj);
+                if let Ty::Class(cn, cls_args) = &recv {
+                    if self.ctx.get_method(cn, "__setitem__").is_some() {
+                        let recv_ty = Ty::Class(cn.clone(), cls_args.clone());
+                        let mut prelude = Vec::new();
+                        let obj_s = self.emit_place_hoisted(obj, &mut prelude)?;
+                        let call_args = [idx.clone(), value.clone()];
+                        let parts = vec![
+                            self.emit_consuming(idx)?,
+                            self.emit_consuming(value)?,
+                        ];
+                        let call = self.emit_user_method_call(
+                            &obj_s, cn, "__setitem__", &call_args, &[], &parts, *span, &recv_ty,
+                        )?;
+                        for l in &prelude {
+                            self.line(l);
+                        }
+                        self.line(&format!("{};", call));
+                        return Ok(());
+                    }
+                }
                 // (W4-a) In-place INDEX mutation of a module global container
                 // (`items[i] = v` on a global list, `d[k] = v` on a global dict).
                 // Needs no `global` declaration. Value + key/index evaluated into

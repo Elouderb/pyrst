@@ -1335,6 +1335,21 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
                     Expr::Int(n, _) => elems.get(*n as usize).cloned().unwrap_or(Ty::Unknown),
                     _ => Ty::Unknown,
                 },
+                // (E1) A user-class receiver routes `obj[k]` to its `__getitem__`:
+                // the result type is that method's return type, with the receiver's
+                // class type args substituted in (a non-generic class is a no-op
+                // subst). Permissive oracle — a class WITHOUT `__getitem__` stays
+                // `Unknown` here; `check_expr`'s Index arm is the one that REJECTS it
+                // honestly (same oracle/check split the tuple arm documents above).
+                // This one arm also types a CHAINED `board[r][c]`: the inner
+                // `board[r]` resolves to `__getitem__`'s return class, so the outer
+                // index dispatches on it (and codegen's `type_of_expr` IS this oracle).
+                Ty::Class(n, args) => {
+                    let instance = Ty::Class(n.clone(), args.clone());
+                    ctx.get_method(&n, "__getitem__")
+                        .map(|s| subst_class_member(&s.ret, &instance, ctx))
+                        .unwrap_or(Ty::Unknown)
+                }
                 _ => Ty::Unknown,
             }
         }
@@ -2790,6 +2805,69 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                                     _ => {}
                                 }
                             }
+                            // (E1) `len(obj)` of a user class routes to `__len__`; a
+                            // class WITHOUT `__len__` has no length. Honest error
+                            // rather than the raw rustc `.len()` (E0599) the len path
+                            // leaked for a class receiver. `__len__` MUST return `int`:
+                            // `len()` is typed `Int` and codegen emits `__len__()`
+                            // directly, so a non-int return would silently miscompile
+                            // (e.g. `print(len(x))` printing a string) or leak a rustc
+                            // mismatch in an int context — reject it honestly here.
+                            if name == "len" {
+                                if let Ty::Class(cn, _) = &arg_ty {
+                                    match env.ctx.get_method(cn, "__len__") {
+                                        None => {
+                                            return Err(Error::Type {
+                                                span: *span,
+                                                msg: format!(
+                                                    "object of type `{0}` has no len() — define a \
+                                                     `__len__` method (Python raises `TypeError: \
+                                                     object of type '{0}' has no len()`)",
+                                                    cn
+                                                ),
+                                            });
+                                        }
+                                        Some(sig) => {
+                                            // (E1 fix / P3) `len(x)` calls `__len__()`
+                                            // with NO arguments, and the len() emit does
+                                            // not default-fill, so `__len__` must take
+                                            // exactly zero parameters besides `self`. A
+                                            // wrong arity leaked a raw rustc E0061 (len-1).
+                                            if !sig.params.is_empty() {
+                                                return Err(Error::Type {
+                                                    span: *span,
+                                                    msg: format!(
+                                                        "`{}.__len__` must take no parameters \
+                                                         besides `self`, but it takes {} — \
+                                                         `len(x)` calls `__len__()` with no \
+                                                         arguments",
+                                                        cn, sig.params.len()
+                                                    ),
+                                                });
+                                            }
+                                            // `__len__` MUST return `int` — or `bool`,
+                                            // which is an int subclass in Python (True==1,
+                                            // False==0), so (E1 fix / P5) pyrst accepts it
+                                            // and the len() emit casts the bool `as i64`
+                                            // for exact CPython parity. float/str/other
+                                            // non-int returns stay rejected (they would
+                                            // silently miscompile or leak a rustc mismatch).
+                                            if !matches!(sig.ret, Ty::Int | Ty::Bool | Ty::Unknown) {
+                                                return Err(Error::Type {
+                                                    span: *span,
+                                                    msg: format!(
+                                                        "`{}.__len__` must return `int` (or `bool`, \
+                                                         an int subclass), but it returns {} (Python \
+                                                         requires `__len__` to return a non-negative \
+                                                         int)",
+                                                        cn, sig.ret
+                                                    ),
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             // (W5-g) A move-only handle passed to a builtin that needs
                             // display (`print`/`str`/`repr`/`ascii`), a length, or
                             // iteration/collection is an honest error naming the kind —
@@ -3465,7 +3543,7 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
         }
         Expr::Index { obj, idx, span } => {
             let obj_ty = check_expr(obj, env)?;
-            check_expr(idx, env)?;
+            let idx_ty = check_expr(idx, env)?;
             // Generics v1: a bare type variable is OPAQUE — it is not known to be
             // a container, so indexing it (`t[i]`) needs a bound and is rejected.
             // (Indexing a `list[T]`/`dict[K, V]` whose ELEMENT is a type var is
@@ -3473,6 +3551,10 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
             reject_typevar_op(&obj_ty, "index", *span)?;
             // (W5-g) A handle is not indexable.
             reject_handle_op(&obj_ty, "index", *span)?;
+            // (E1 fix / P4) An un-narrowed Optional value is not subscriptable —
+            // narrow it first. Closes the pre-existing generic-fallthrough leak
+            // (indexing Optional[class] AND Optional[list] both leaked rustc E0308).
+            reject_optional_subscript(&obj_ty, *span)?;
             // (LAZY-GEN V1-d) A generator is single-pass with no random access —
             // `g[i]` is a `TypeError` in CPython too. Honest MATERIALIZE error
             // (closes the Index-vs-Slice asymmetry from review comment 123: Index
@@ -3512,6 +3594,88 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                     }),
                 };
             }
+            // (E1) A user-class receiver routes `obj[k]` to its `__getitem__`: the
+            // result type is that method's (class-arg-substituted) return type, and
+            // the key is validated against the method's single param — a wrong key
+            // type is an honest CHECK error (Python raises TypeError only at runtime,
+            // but pyrst has a static key type). A class WITHOUT `__getitem__` is
+            // honestly NOT subscriptable here (before E1 it fell through to the
+            // list-indexing path and leaked a raw rustc `&[_]` mismatch).
+            if let Ty::Class(cn, _) = &obj_ty {
+                return match env.ctx.get_method(cn, "__getitem__") {
+                    Some(sig) => {
+                        // (E1 fix / P3) The subscript `obj[k]` passes EXACTLY one
+                        // key, so `__getitem__` must take exactly one parameter
+                        // besides `self`. A wrong arity was accepted at check and
+                        // leaked a raw rustc E0061 (getitem-0) — or a build-time
+                        // "missing a required argument" (getitem-2) — at build.
+                        if sig.params.len() != 1 {
+                            return Err(Error::Type {
+                                span: *span,
+                                msg: format!(
+                                    "`{}.__getitem__` must take exactly one key parameter \
+                                     besides `self`, but it takes {} — the subscript \
+                                     `{}[k]` passes exactly one key",
+                                    cn, sig.params.len(), cn
+                                ),
+                            });
+                        }
+                        if let Some((_, key_param)) = sig.params.first() {
+                            let expected = subst_class_member(key_param, &obj_ty, env.ctx);
+                            // Concrete-only mismatch, mirroring the builtin arg check:
+                            // skip Unknown either side and a type-var param.
+                            // (E1 fix / P2) Types must match EXACTLY — pyrst does not
+                            // coerce int->float at any call-argument position (a normal
+                            // call with an int literal into an `f64` param leaks rustc
+                            // E0308 too), so the old int_to_float allowance let check
+                            // accept an int index into a float key that build rejected.
+                            if !matches!(idx_ty, Ty::Unknown)
+                                && !matches!(expected, Ty::Unknown)
+                                && !contains_typevar(&expected)
+                                && !contains_typevar(&idx_ty)
+                                && !types_compatible(&idx_ty, &expected, env.ctx)
+                            {
+                                return Err(Error::Type {
+                                    span: *span,
+                                    msg: format!(
+                                        "`{}[...]` expects a key of type {}, but the index is {}",
+                                        cn, expected, idx_ty
+                                    ),
+                                });
+                            }
+                        }
+                        Ok(subst_class_member(&sig.ret, &obj_ty, env.ctx))
+                    }
+                    None => Err(Error::Type {
+                        span: *span,
+                        msg: format!(
+                            "type `{0}` is not subscriptable — define a `__getitem__` \
+                             method (Python raises `TypeError: '{0}' object is not \
+                             subscriptable`)",
+                            cn
+                        ),
+                    }),
+                };
+            }
+            // (E1) A comma subscript `a[i, j]` parses to a tuple key; on a builtin
+            // SEQUENCE (list/str/bytes) that is an honest error — it was a parse error
+            // before tuple-key subscripts existed, and lowering it would leak a raw
+            // rustc mismatch (a tuple index into a `Vec`). A dict is left permissive:
+            // a tuple can be a legitimate dict key, and dict key-type validation is a
+            // separate pre-existing looseness this card does not touch.
+            if matches!(&idx_ty, Ty::Tuple(elems) if !elems.is_empty())
+                && matches!(obj_ty, Ty::List(_) | Ty::Str | Ty::Bytes)
+            {
+                return Err(Error::Type {
+                    span: *span,
+                    msg: format!(
+                        "cannot index {} with a tuple key — a comma subscript \
+                         (`a[i, j]`) routes to a user class's `__getitem__`; index a \
+                         builtin sequence with a single integer",
+                        obj_ty
+                    ),
+                });
+            }
             match obj_ty {
                 Ty::List(inner) => *inner,
                 Ty::Dict(_, v) => *v,
@@ -3528,6 +3692,20 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
             reject_typevar_op(&obj_ty, "slice", *span)?;
             // (W5-g) A handle is not sliceable.
             reject_handle_op(&obj_ty, "slice", *span)?;
+            // (E1) Slicing a user class is not supported in v1: routing a slice to
+            // `__getitem__` needs a synthesized slice-key object, which is out of
+            // scope here. Honest error rather than the raw rustc `&[_]` mismatch the
+            // list-slice path leaked for a class receiver.
+            if let Ty::Class(cn, _) = &obj_ty {
+                return Err(Error::Type {
+                    span: *span,
+                    msg: format!(
+                        "slicing a user class (`{}`) is not supported in v1 — pyrst has \
+                         no slice-key `__getitem__` yet; index with a single key instead",
+                        cn
+                    ),
+                });
+            }
             // (LAZY-GEN V1-d) Slicing a generator is a `TypeError` in CPython too.
             // Honest MATERIALIZE error at `check` time (previously only a codegen
             // error fired, so `pyrst check` leaked it — review comment 123).

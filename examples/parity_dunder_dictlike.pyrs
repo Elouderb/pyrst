@@ -1,0 +1,40 @@
+# E1: a dict-like user class exercising the container-protocol dunders
+# __getitem__ / __setitem__ / __len__. Dual-run parity vs CPython (the same
+# source runs unmodified under python3 — annotations are Python-legal).
+class StrIntMap:
+    keys_: list[str]
+    vals_: list[int]
+    def __init__(self) -> None:
+        self.keys_ = []
+        self.vals_ = []
+    def __getitem__(self, k: str) -> int:
+        i: int = 0
+        while i < len(self.keys_):
+            if self.keys_[i] == k:
+                return self.vals_[i]
+            i = i + 1
+        return -1
+    def __setitem__(self, k: str, v: int) -> None:
+        i: int = 0
+        while i < len(self.keys_):
+            if self.keys_[i] == k:
+                self.vals_[i] = v
+                return
+            i = i + 1
+        self.keys_.append(k)
+        self.vals_.append(v)
+    def __len__(self) -> int:
+        return len(self.keys_)
+
+def main() -> None:
+    m: StrIntMap = StrIntMap()
+    m["alpha"] = 1
+    m["beta"] = 2
+    m["gamma"] = 3
+    print(m["alpha"])
+    print(m["beta"])
+    print(m["gamma"])
+    print(m["missing"])
+    m["beta"] = 20
+    print(m["beta"])
+    print(len(m))

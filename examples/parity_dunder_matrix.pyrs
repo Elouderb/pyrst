@@ -1,0 +1,62 @@
+# E1: a 2D matrix class with TUPLE-KEY subscripts (m[i, j]), __setitem__
+# read-back, __len__, and CHAINED indexing (board[r][c]) via composed
+# __getitem__ returns. Dual-run parity vs CPython.
+class Matrix:
+    data: list[int]
+    rows: int
+    cols: int
+    def __init__(self, rows: int, cols: int) -> None:
+        self.rows = rows
+        self.cols = cols
+        self.data = [0] * (rows * cols)
+    def __getitem__(self, key: tuple[int, int]) -> int:
+        r: int = key[0]
+        c: int = key[1]
+        return self.data[r * self.cols + c]
+    def __setitem__(self, key: tuple[int, int], v: int) -> None:
+        r: int = key[0]
+        c: int = key[1]
+        self.data[r * self.cols + c] = v
+    def __len__(self) -> int:
+        return self.rows * self.cols
+
+class Row:
+    cells: list[int]
+    def __init__(self, cells: list[int]) -> None:
+        self.cells = cells
+    def __getitem__(self, c: int) -> int:
+        return self.cells[c]
+    def __len__(self) -> int:
+        return len(self.cells)
+
+class Board:
+    rows_: list[Row]
+    def __init__(self) -> None:
+        self.rows_ = []
+    def add_row(self, r: Row) -> None:
+        self.rows_.append(r)
+    def __getitem__(self, r: int) -> Row:
+        return self.rows_[r]
+    def __len__(self) -> int:
+        return len(self.rows_)
+
+def main() -> None:
+    m: Matrix = Matrix(2, 3)
+    m[0, 0] = 1
+    m[0, 1] = 2
+    m[0, 2] = 3
+    m[1, 0] = 4
+    m[1, 1] = 5
+    m[1, 2] = 6
+    print(m[0, 1])
+    print(m[1, 2])
+    m[1, 1] = 50
+    print(m[1, 1])
+    print(len(m))
+    b: Board = Board()
+    b.add_row(Row([10, 11, 12]))
+    b.add_row(Row([20, 21, 22]))
+    print(b[0][2])
+    print(b[1][0])
+    print(len(b))
+    print(len(b[0]))

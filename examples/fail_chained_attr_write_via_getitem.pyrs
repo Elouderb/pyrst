@@ -1,0 +1,19 @@
+# E1 fix / P1 negative: an attribute WRITE through a class `__getitem__` base
+# (`g[0].v = 42`) is rejected at check — `g[0]` is a value-semantics COPY, so the
+# field write would be a silent no-op. Before this fix it leaked a raw rustc E0608.
+class Cell:
+    v: int
+    def __init__(self, v: int) -> None:
+        self.v = v
+
+class Grid:
+    cells: list[Cell]
+    def __init__(self, cells: list[Cell]) -> None:
+        self.cells = cells
+    def __getitem__(self, i: int) -> Cell:
+        return self.cells[i]
+
+def main() -> None:
+    g: Grid = Grid([Cell(1)])
+    g[0].v = 42
+    print(g[0].v)

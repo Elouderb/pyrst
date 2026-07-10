@@ -1,0 +1,11 @@
+# E1 negative: indexing a user class that defines NO __getitem__ is an honest
+# check error (Python raises TypeError: 'Plain' object is not subscriptable).
+# Before E1 this leaked a raw rustc `&[_]` mismatch from the list-indexing path.
+class Plain:
+    v: int
+    def __init__(self) -> None:
+        self.v = 5
+
+def main() -> None:
+    p: Plain = Plain()
+    print(p[0])

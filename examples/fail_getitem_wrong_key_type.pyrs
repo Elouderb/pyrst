@@ -1,0 +1,12 @@
+# E1 negative: a __getitem__ whose key param is `int` indexed with a `str` key
+# is an honest check error — the key type is validated against the annotation.
+class Ix:
+    d: list[int]
+    def __init__(self) -> None:
+        self.d = [1, 2, 3]
+    def __getitem__(self, i: int) -> int:
+        return self.d[i]
+
+def main() -> None:
+    x: Ix = Ix()
+    print(x["a"])

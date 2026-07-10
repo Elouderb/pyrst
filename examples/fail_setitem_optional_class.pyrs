@@ -1,0 +1,12 @@
+# E1 fix / P4 negative: item-assigning an un-narrowed Optional value is an honest
+# check error — narrow it first. Before this fix it leaked a raw rustc E0308.
+class Box:
+    data: list[int]
+    def __init__(self, data: list[int]) -> None:
+        self.data = data
+    def __setitem__(self, k: int, v: int) -> None:
+        self.data[k] = v
+
+def main() -> None:
+    b: Optional[Box] = Box([1, 2, 3])
+    b[0] = 9

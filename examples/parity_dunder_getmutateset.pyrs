@@ -1,0 +1,32 @@
+# E1 fix / P1: native nested container writes are UNAFFECTED (board[r][c] = v on a
+# list-of-list, pts[i].x = v on a list element), and the RECOMMENDED workaround
+# for a class `__getitem__` write — get / mutate / set — is exercised (the P1
+# rejection's suggested restructuring). Dual-run parity vs CPython.
+class Cell:
+    x: int
+    def __init__(self, x: int) -> None:
+        self.x = x
+
+class Rows:
+    data: list[list[int]]
+    def __init__(self, data: list[list[int]]) -> None:
+        self.data = data
+    def __getitem__(self, i: int) -> list[int]:
+        return self.data[i]
+    def __setitem__(self, i: int, row: list[int]) -> None:
+        self.data[i] = row
+
+def main() -> None:
+    board: list[list[int]] = [[1, 2, 3], [4, 5, 6]]
+    board[0][2] = 99
+    board[1][0] = 88
+    print(board[0][2])
+    print(board[1][0])
+    pts: list[Cell] = [Cell(1), Cell(2)]
+    pts[0].x = 5
+    print(pts[0].x)
+    r: Rows = Rows([[10, 20], [30, 40]])
+    row: list[int] = r[0]
+    row[1] = 999
+    r[0] = row
+    print(r[0][1])

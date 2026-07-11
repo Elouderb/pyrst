@@ -15,6 +15,9 @@
 # order. See card 974fdff3 comment 610 for the locked Phase-2 decisions.
 
 from kodiak.series import Series
+from kodiak.lazy import Op
+from kodiak.lazy import optimize
+from kodiak.lazy import explain_plan
 from csv import writer
 from os import write_file
 
@@ -91,6 +94,32 @@ class DataFrame:
             new_names.append(name)
             new_cols.append(s.rename(name))
         return DataFrame(new_names, new_cols)
+
+    # ---- projection: keep a subset of columns, in the given order ----
+    def select(self, cols: list[str]) -> DataFrame:
+        new_names: list[str] = []
+        new_cols: list[Series] = []
+        i: int = 0
+        while i < len(cols):
+            c: str = cols[i]
+            if c not in self.names:
+                raise KeyError(repr(c))
+            idx: int = self.names.index(c)
+            new_names.append(c)
+            new_cols.append(self.cols[idx])
+            i += 1
+        return DataFrame(new_names, new_cols)
+
+    # ---- lazy entry point: df.lazy() -> LazyFrame --------------------
+    # Records subsequent ops into a logical plan that .collect() optimizes
+    # (predicate + projection pushdown) then executes against this eager
+    # engine. See lazy.pyrs for the op algebra + optimizer, and the LazyFrame
+    # class below for the builder/executor. (LazyFrame lives in THIS module,
+    # not lazy.pyrs, because pyrst forbids the frame<->lazy circular import —
+    # GAP on card 974fdff3.)
+    def lazy(self) -> LazyFrame:
+        ops: list[Op] = []
+        return LazyFrame(self, ops)
 
     # ---- row filtering by a bool mask Series -------------------------
     def filter(self, mask: Series) -> DataFrame:
@@ -620,3 +649,245 @@ def _render_table(df: DataFrame) -> str:
             out = out + "\n"
         i += 1
     return out
+
+
+# ==========================================================================
+# LAZY QUERY ENGINE (Phase 3, card 974fdff3)
+# ==========================================================================
+# `df.lazy()` returns a LazyFrame that RECORDS a logical plan (a list of `Op`
+# from lazy.pyrs) instead of computing eagerly. `.collect()` OPTIMIZES the plan
+# (predicate + projection pushdown, in lazy.optimize) then EXECUTES each op
+# against the eager engine via `_exec_op`. `.explain()` prints the logical and
+# optimized plans plus which optimizations fired.
+#
+# INVARIANT (the acceptance bar): for every pipeline,
+#   df.lazy()....collect()   ==   the equivalent eager chain
+# The optimizer only performs SOUND, equivalence-preserving reorderings; the
+# executor calls the exact same eager methods the hand-written chain would.
+#
+# Builders return a NEW LazyFrame (value semantics, chainable); the source frame
+# and prior op list are never mutated. LazyGroupBy mirrors the eager GroupBy so
+# `.groupby(k).mean()` reads the same in lazy and eager form.
+
+class LazyFrame:
+    source: DataFrame
+    ops: list[Op]
+
+    def __init__(self, source: DataFrame, ops: list[Op]) -> None:
+        self.source = source
+        self.ops = ops
+
+    def _extend(self, op: Op) -> LazyFrame:
+        new_ops: list[Op] = []
+        i: int = 0
+        while i < len(self.ops):
+            new_ops.append(self.ops[i])
+            i += 1
+        new_ops.append(op)
+        return LazyFrame(self.source, new_ops)
+
+    # ---- predicate: a single column-vs-scalar test -------------------
+    # cmp is one of ">", "<", ">=", "<=", "==", "!=". `filter` compares a
+    # NUMERIC column against a float scalar; `filter_str` compares a str
+    # column against a str value (== / != only). Two builders (not one union
+    # method) because pyrst has no union parameter — the fillna_float/str
+    # pattern. A compound predicate is several chained filters (they AND).
+    def filter(self, col: str, cmp: str, value: float) -> LazyFrame:
+        return self._extend(Op.mk_filter(col, cmp, value))
+
+    def filter_str(self, col: str, cmp: str, value: str) -> LazyFrame:
+        return self._extend(Op.mk_filter_str(col, cmp, value))
+
+    # ---- projection --------------------------------------------------
+    def select(self, cols: list[str]) -> LazyFrame:
+        return self._extend(Op.mk_select(cols))
+
+    # ---- derived columns (the two recorded recipes) ------------------
+    # A with_column in lazy mode records a REPLAYABLE recipe (not a
+    # pre-computed Series, which is what the eager with_column takes), so the
+    # optimizer can reorder around it and collect() can recompute it against
+    # whatever frame reaches it. Scalar: name = left <op> float. Binary:
+    # name = left <op> right. op in "+","-","*","/".
+    def with_column_scalar(self, name: str, left: str, op: str, scalar: float) -> LazyFrame:
+        return self._extend(Op.mk_wc_scalar(name, left, op, scalar))
+
+    def with_column_binary(self, name: str, left: str, op: str, right: str) -> LazyFrame:
+        return self._extend(Op.mk_wc_binary(name, left, op, right))
+
+    # ---- sort --------------------------------------------------------
+    def sort(self, by: str, ascending: bool = True) -> LazyFrame:
+        return self._extend(Op.mk_sort(by, ascending))
+
+    # ---- groupby -----------------------------------------------------
+    def groupby(self, key: str) -> LazyGroupBy:
+        return LazyGroupBy(self, key)
+
+    # ---- plan inspection ---------------------------------------------
+    def explain(self) -> str:
+        return explain_plan(self.ops, self.source.columns())
+
+    # ---- execute -----------------------------------------------------
+    def collect(self) -> DataFrame:
+        plan: list[Op] = optimize(self.ops, self.source.columns())
+        cur: DataFrame = self.source
+        i: int = 0
+        while i < len(plan):
+            cur = _exec_op(cur, plan[i])
+            i += 1
+        return cur
+
+
+# `df.lazy().groupby(k)` -> LazyGroupBy; each aggregation appends a groupby Op
+# and returns a LazyFrame (chainable). Mirrors the eager GroupBy surface.
+class LazyGroupBy:
+    lf: LazyFrame
+    key: str
+
+    def __init__(self, lf: LazyFrame, key: str) -> None:
+        self.lf = lf
+        self.key = key
+
+    def agg(self, how: str) -> LazyFrame:
+        return self.lf._extend(Op.mk_groupby(self.key, how))
+
+    def sum(self) -> LazyFrame:
+        return self.agg("sum")
+
+    def mean(self) -> LazyFrame:
+        return self.agg("mean")
+
+    def count(self) -> LazyFrame:
+        return self.agg("count")
+
+    def min(self) -> LazyFrame:
+        return self.agg("min")
+
+    def max(self) -> LazyFrame:
+        return self.agg("max")
+
+    def std(self) -> LazyFrame:
+        return self.agg("std")
+
+
+# ---- op executor: one optimized Op against an eager DataFrame -------------
+# Every branch delegates to the eager method the equivalent hand-written chain
+# would call, so lazy == eager holds by construction.
+
+def _exec_op(df: DataFrame, op: Op) -> DataFrame:
+    k: str = op.kind
+    if k == "filter":
+        return df.filter(_num_mask(df[op.col], op.cmp, op.fval))
+    if k == "filter_str":
+        return df.filter(_str_mask(df[op.col], op.cmp, op.sval))
+    if k == "select":
+        return df.select(op.cols)
+    if k == "wc_scalar":
+        return df.with_column(op.wname, _scalar_apply(df[op.wleft], op.wop, op.wscalar))
+    if k == "wc_binary":
+        return df.with_column(op.wname, _binary_apply(df[op.wleft], op.wop, df[op.wright]))
+    if k == "sort":
+        return df.sort_values(op.sby, op.sasc)
+    if k == "groupby":
+        return _apply_groupby(df, op.gkey, op.gagg)
+    raise ValueError("kodiak lazy: unknown op kind '" + k + "'")
+
+
+def _num_mask(col: Series, cmp: str, v: float) -> Series:
+    if cmp == ">":
+        return col.gt(v)
+    if cmp == "<":
+        return col.lt(v)
+    if cmp == ">=":
+        return col.ge(v)
+    if cmp == "<=":
+        return col.le(v)
+    if cmp == "==":
+        return col.eq(v)
+    if cmp == "!=":
+        return col.ne(v)
+    raise ValueError("kodiak lazy: unknown numeric comparison '" + cmp + "'")
+
+
+def _str_mask(col: Series, cmp: str, v: str) -> Series:
+    if cmp == "==":
+        return col.eq_str(v)
+    if cmp == "!=":
+        return col.ne_str(v)
+    raise ValueError("kodiak lazy: str filter supports only '==' and '!=', got '" + cmp + "'")
+
+
+def _scalar_apply(base: Series, op: str, x: float) -> Series:
+    if op == "+":
+        return base.add_scalar(x)
+    if op == "-":
+        return base.sub_scalar(x)
+    if op == "*":
+        return base.mul_scalar(x)
+    if op == "/":
+        return base.div_scalar(x)
+    raise ValueError("kodiak lazy: unknown scalar op '" + op + "'")
+
+
+def _binary_apply(l: Series, op: str, r: Series) -> Series:
+    if op == "+":
+        return l.add(r)
+    if op == "-":
+        return l.sub(r)
+    if op == "*":
+        return l.mul(r)
+    if op == "/":
+        return l.truediv(r)
+    raise ValueError("kodiak lazy: unknown binary op '" + op + "'")
+
+
+def _apply_groupby(df: DataFrame, key: str, how: str) -> DataFrame:
+    g: GroupBy = df.groupby(key)
+    if how == "sum":
+        return g.sum()
+    if how == "mean":
+        return g.mean()
+    if how == "count":
+        return g.count()
+    if how == "min":
+        return g.min()
+    if how == "max":
+        return g.max()
+    if how == "std":
+        return g.std()
+    raise ValueError("kodiak lazy: unknown groupby agg '" + how + "'")
+
+
+# ---- equality oracle: the lazy == eager acceptance check ------------------
+# Two frames are equal iff same column names/order, same row count, and every
+# column matches in dtype, length, rendered values (to_strings renders a null
+# as "NaN"), and validity mask. Used by the demo + the equivalence suite.
+
+def frame_equals(a: DataFrame, b: DataFrame) -> bool:
+    if len(a.names) != len(b.names):
+        return False
+    i: int = 0
+    while i < len(a.names):
+        if a.names[i] != b.names[i]:
+            return False
+        i += 1
+    if a._row_count() != b._row_count():
+        return False
+    c: int = 0
+    while c < len(a.cols):
+        ca: Series = a.cols[c]
+        cb: Series = b.cols[c]
+        if ca.dtype != cb.dtype:
+            return False
+        if ca.length != cb.length:
+            return False
+        sa: list[str] = ca.to_strings()
+        sb: list[str] = cb.to_strings()
+        r: int = 0
+        while r < len(sa):
+            if sa[r] != sb[r]:
+                return False
+            if ca.nulls[r] != cb.nulls[r]:
+                return False
+            r += 1
+        c += 1
+    return True

@@ -1,0 +1,163 @@
+# kodiak_demo/lazy_main.pyrs — the Phase-3 flagship: the polars-style lazy
+# query engine. Shows (A) a readable lazy pipeline whose .explain() reveals a
+# filter PUSHED to the front of the plan, then .collect()s it and asserts the
+# result is IDENTICAL to the equivalent eager chain (lazy == eager), and (B) a
+# lazy-vs-eager TIMING comparison over a ~12k-row synthetic frame where the
+# eager path runs the naive written order (expensive sort over all rows) while
+# the lazy path's optimizer filters first and sorts far fewer rows.
+#
+# See extern/packages/kodiak/README.md (Phase 3) for the LazyFrame API, the
+# optimizations that actually fire vs the ops that replay, and the explain()
+# format. Build + run (from this directory):
+#   PYRST_PATH=/home/ethos/Coding/pyrst/extern/packages \
+#     /home/ethos/Coding/pyrst/target/release/pyrst build lazy_main.pyrs
+#   ./lazy_main
+
+from kodiak.series import Series
+from kodiak.frame import DataFrame
+from kodiak.frame import LazyFrame
+from kodiak.frame import frame_equals
+from time import perf_counter
+
+
+def section(title: str) -> None:
+    print("")
+    print("== " + title + " ==")
+
+
+# ---- Part A: a small, readable pipeline (plan + equivalence) --------------
+
+def small_frame() -> DataFrame:
+    idc: Series = Series.from_ints("emp_id", [1, 2, 3, 4, 5, 6, 7, 8])
+    name: Series = Series.from_strs("name", ["Ana", "Bo", "Chi", "Dee", "Eli", "Fox", "Gil", "Hal"])
+    dept: Series = Series.from_strs("dept", ["Eng", "Sales", "Eng", "Ops", "Sales", "Eng", "Ops", "Sales"])
+    age: Series = Series.from_ints("age", [34, 29, 41, 22, 37, 45, 26, 31])
+    salary: Series = Series.from_floats("salary", [120.0, 90.0, 135.5, 80.0, 110.0, 99.0, 70.0, 105.0])
+    return DataFrame.from_columns([idc, name, dept, age, salary])
+
+
+def part_a() -> None:
+    df: DataFrame = small_frame()
+
+    # A lazy pipeline written in a "naive" order: derive bonus, filter on the
+    # derived column, sort by age, THEN filter on a source column (age). The
+    # optimizer will push the source-column filter (age > 30) to the FRONT,
+    # ahead of the sort, the derived filter, and the with_column.
+    lf: LazyFrame = df.lazy().with_column_scalar("bonus", "salary", "*", 0.10).filter("bonus", ">", 8.0).sort("age", True).filter("age", ">", 30.0).groupby("dept").mean()
+
+    section("lazy plan: explain() (before vs after optimization)")
+    print(lf.explain())
+
+    section("collect() result")
+    got: DataFrame = lf.collect()
+    print(got)
+
+    # the equivalent EAGER chain, written in the same logical order
+    e0: DataFrame = df.with_column("bonus", df["salary"].mul_scalar(0.10))
+    e1: DataFrame = e0.filter(e0["bonus"].gt(8.0))
+    e2: DataFrame = e1.sort_values("age", True)
+    e3: DataFrame = e2.filter(e2["age"].gt(30.0))
+    eager: DataFrame = e3.groupby("dept").mean()
+
+    section("equivalence: lazy.collect() == eager chain")
+    if frame_equals(got, eager):
+        print("lazy == eager : True")
+    else:
+        print("lazy == eager : FALSE")
+        print("--- eager ---")
+        print(eager)
+        assert False
+
+
+# ---- Part B: timing over a large synthetic frame --------------------------
+
+def synth_frame(n: int) -> DataFrame:
+    ids: list[int] = []
+    depts: list[str] = []
+    ages: list[int] = []
+    sals: list[float] = []
+    labels: list[str] = ["Eng", "Sales", "Ops", "Research"]
+    i: int = 0
+    while i < n:
+        ids.append(i)
+        labels_idx: int = i % 4
+        depts.append(labels[labels_idx])
+        ages.append(20 + (i % 45))
+        # spread salaries across 0..999 so `salary > 900` keeps ~10% of rows
+        sals.append(float((i * 37) % 1000))
+        i += 1
+    return DataFrame.from_columns([
+        Series.from_ints("id", ids),
+        Series.from_strs("dept", depts),
+        Series.from_ints("age", ages),
+        Series.from_floats("salary", sals),
+    ])
+
+
+def eager_pipeline(df: DataFrame) -> DataFrame:
+    # naive WRITTEN order: derive over all rows, sort ALL rows, then filter.
+    e0: DataFrame = df.with_column("bonus", df["salary"].mul_scalar(0.10))
+    e1: DataFrame = e0.sort_values("salary", True)
+    e2: DataFrame = e1.filter(e1["salary"].gt(900.0))
+    return e2.groupby("dept").mean()
+
+
+def lazy_pipeline(df: DataFrame) -> DataFrame:
+    return df.lazy().with_column_scalar("bonus", "salary", "*", 0.10).sort("salary", True).filter("salary", ">", 900.0).groupby("dept").mean().collect()
+
+
+def part_b() -> None:
+    n: int = 6000
+    df: DataFrame = synth_frame(n)
+
+    section("timing: lazy vs eager over " + str(n) + " rows")
+    print("pipeline (written order): with_column(bonus) -> sort(salary) -> filter(salary > 900) -> groupby(dept).mean()")
+    print("")
+    print(df.lazy().with_column_scalar("bonus", "salary", "*", 0.10).sort("salary", True).filter("salary", ">", 900.0).groupby("dept").mean().explain())
+
+    # correctness first: the two paths must agree on the large frame too
+    eager_res: DataFrame = eager_pipeline(df)
+    lazy_res: DataFrame = lazy_pipeline(df)
+    print("")
+    if frame_equals(eager_res, lazy_res):
+        print("large-frame equivalence: lazy == eager : True")
+    else:
+        print("large-frame equivalence: lazy == eager : FALSE")
+        assert False
+
+    reps: int = 5
+
+    # time the EAGER path (sorts all n rows every rep)
+    te0: float = perf_counter()
+    r: int = 0
+    while r < reps:
+        eager_pipeline(df)
+        r += 1
+    te1: float = perf_counter()
+    eager_ms: float = (te1 - te0) * 1000.0 / float(reps)
+
+    # time the LAZY path (optimizer filters first, sorts ~10% of rows)
+    tl0: float = perf_counter()
+    r = 0
+    while r < reps:
+        lazy_pipeline(df)
+        r += 1
+    tl1: float = perf_counter()
+    lazy_ms: float = (tl1 - tl0) * 1000.0 / float(reps)
+
+    print("")
+    print("eager (naive order) : " + str(eager_ms) + " ms/run")
+    print("lazy  (optimized)   : " + str(lazy_ms) + " ms/run")
+    if lazy_ms < eager_ms and lazy_ms > 0.0:
+        speedup: float = eager_ms / lazy_ms
+        print("=> lazy is faster (" + str(speedup) + "x): pushing the filter before the sort shrinks the sort input from " + str(n) + " rows to ~10%.")
+    else:
+        print("=> lazy did NOT win for this workload/run (reporting honestly; sort cost may be dominated by other stages or measurement noise).")
+
+
+def main() -> None:
+    print("kodiak lazy query engine — Phase 3 flagship")
+    part_a()
+    part_b()
+    print("")
+    print("OK: kodiak_demo lazy (explain shows predicate pushdown / collect() == eager / lazy-vs-eager timing)")

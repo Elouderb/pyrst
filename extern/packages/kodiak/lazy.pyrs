@@ -1,0 +1,354 @@
+# lazy.pyrs — the kodiak query-engine core (Phase 3, card 974fdff3): the
+# discriminated logical `Op` record, the plan OPTIMIZER (predicate pushdown +
+# projection pushdown), and the `explain_plan()` renderer.
+#
+# THIS MODULE IS PURE. It imports nothing from kodiak.frame / kodiak.series and
+# knows only about op metadata and column NAMES (list[str]). Everything here is
+# a total function over op lists — no DataFrame, no execution. Execution (turning
+# an optimized op list into a DataFrame) lives in frame.pyrs next to DataFrame,
+# alongside LazyFrame itself.
+#
+# WHY THE SPLIT (a language GAP, logged on card 974fdff3): pyrst forbids
+# circular imports. The pandas/polars-style entry point `df.lazy()` is a method
+# on DataFrame, so LazyFrame must live in frame.pyrs (a method cannot return a
+# type from a module that imports frame.pyrs back — that is a cycle). To still
+# have a real, separate query-engine module, the OP ALGEBRA + OPTIMIZER live
+# here (frame.pyrs imports this module one-directionally; this module imports
+# nothing from kodiak, so there is no cycle).
+#
+# Op is a DISCRIMINATED RECORD: a `kind` tag plus every field for every op kind,
+# exactly the same shape trick series.pyrs uses for columns (pyrst has no unions
+# and no usable subtyping — lead-design comment 608). Every consumer switches on
+# `kind`. Static constructors fill the unused fields with defaults.
+#
+# OP KINDS (the `kind` tag):
+#   "filter"      col cmp fval          numeric column vs a float scalar
+#   "filter_str"  col cmp sval          str column vs a str value (cmp: == / !=)
+#   "select"      cols                  projection to a subset of columns
+#   "wc_scalar"   wname = wleft wop wscalar   derived column: col <op> float
+#   "wc_binary"   wname = wleft wop wright    derived column: col <op> col
+#   "sort"        sby sasc              stable sort by one column
+#   "groupby"     gkey gagg             group by key, aggregate (sum/mean/count/
+#                                        min/max/std) every numeric value column
+#
+# SCOPE NOTE (honest): a filter predicate is a single column-vs-scalar test and
+# a with_column recipe is a single scalar- or two-column binary op. Full
+# expression trees (nested arithmetic, boolean AND/OR of predicates) are OUT OF
+# SCOPE for Phase 3 — a compound predicate is expressed as multiple adjacent
+# `filter` ops (they AND together and the optimizer clusters them).
+
+
+class Op:
+    kind: str
+    # filter / filter_str
+    col: str
+    cmp: str
+    fval: float
+    sval: str
+    # select
+    cols: list[str]
+    # with_column (wc_scalar / wc_binary)
+    wname: str
+    wleft: str
+    wop: str
+    wscalar: float
+    wright: str
+    # sort
+    sby: str
+    sasc: bool
+    # groupby
+    gkey: str
+    gagg: str
+
+    def __init__(self, kind: str, col: str, cmp: str, fval: float, sval: str, cols: list[str], wname: str, wleft: str, wop: str, wscalar: float, wright: str, sby: str, sasc: bool, gkey: str, gagg: str) -> None:
+        self.kind = kind
+        self.col = col
+        self.cmp = cmp
+        self.fval = fval
+        self.sval = sval
+        self.cols = cols
+        self.wname = wname
+        self.wleft = wleft
+        self.wop = wop
+        self.wscalar = wscalar
+        self.wright = wright
+        self.sby = sby
+        self.sasc = sasc
+        self.gkey = gkey
+        self.gagg = gagg
+
+    # ---- static constructors (fill the unused fields with defaults) --------
+    @staticmethod
+    def mk_filter(col: str, cmp: str, val: float) -> Op:
+        return Op("filter", col, cmp, val, "", [], "", "", "", 0.0, "", "", True, "", "")
+
+    @staticmethod
+    def mk_filter_str(col: str, cmp: str, sval: str) -> Op:
+        return Op("filter_str", col, cmp, 0.0, sval, [], "", "", "", 0.0, "", "", True, "", "")
+
+    @staticmethod
+    def mk_select(cols: list[str]) -> Op:
+        return Op("select", "", "", 0.0, "", cols, "", "", "", 0.0, "", "", True, "", "")
+
+    @staticmethod
+    def mk_wc_scalar(name: str, left: str, op: str, scalar: float) -> Op:
+        return Op("wc_scalar", "", "", 0.0, "", [], name, left, op, scalar, "", "", True, "", "")
+
+    @staticmethod
+    def mk_wc_binary(name: str, left: str, op: str, right: str) -> Op:
+        return Op("wc_binary", "", "", 0.0, "", [], name, left, op, 0.0, right, "", True, "", "")
+
+    @staticmethod
+    def mk_sort(by: str, asc: bool) -> Op:
+        return Op("sort", "", "", 0.0, "", [], "", "", "", 0.0, "", by, asc, "", "")
+
+    @staticmethod
+    def mk_groupby(key: str, agg: str) -> Op:
+        return Op("groupby", "", "", 0.0, "", [], "", "", "", 0.0, "", "", True, key, agg)
+
+    def is_filter(self) -> bool:
+        return self.kind == "filter" or self.kind == "filter_str"
+
+    # ---- one-line plan text (deterministic; used by explain_plan) ----------
+    def describe(self) -> str:
+        if self.kind == "filter":
+            return "FILTER   " + self.col + " " + self.cmp + " " + str(self.fval)
+        if self.kind == "filter_str":
+            return "FILTER   " + self.col + " " + self.cmp + " " + repr(self.sval)
+        if self.kind == "select":
+            return "SELECT   [" + _join(self.cols, ", ") + "]"
+        if self.kind == "wc_scalar":
+            return "WITHCOL  " + self.wname + " = " + self.wleft + " " + self.wop + " " + str(self.wscalar)
+        if self.kind == "wc_binary":
+            return "WITHCOL  " + self.wname + " = " + self.wleft + " " + self.wop + " " + self.wright
+        if self.kind == "sort":
+            d: str = "asc"
+            if not self.sasc:
+                d = "desc"
+            return "SORT     " + self.sby + " " + d
+        if self.kind == "groupby":
+            return "GROUPBY  " + self.gkey + " -> " + self.gagg
+        return "UNKNOWN(" + self.kind + ")"
+
+
+# ---- module-private helpers ----------------------------------------------
+
+def _join(xs: list[str], sep: str) -> str:
+    out: str = ""
+    i: int = 0
+    while i < len(xs):
+        out = out + xs[i]
+        if i < len(xs) - 1:
+            out = out + sep
+        i += 1
+    return out
+
+
+def _copy_ops(ops: list[Op]) -> list[Op]:
+    out: list[Op] = []
+    i: int = 0
+    while i < len(ops):
+        out.append(ops[i])
+        i += 1
+    return out
+
+
+def _reads(op: Op) -> list[str]:
+    # the column NAMES this op reads from its input frame.
+    if op.kind == "filter" or op.kind == "filter_str":
+        return [op.col]
+    if op.kind == "select":
+        return _copy_strs(op.cols)
+    if op.kind == "wc_scalar":
+        return [op.wleft]
+    if op.kind == "wc_binary":
+        return [op.wleft, op.wright]
+    if op.kind == "sort":
+        return [op.sby]
+    if op.kind == "groupby":
+        return [op.gkey]
+    return []
+
+
+def _copy_strs(xs: list[str]) -> list[str]:
+    out: list[str] = []
+    i: int = 0
+    while i < len(xs):
+        out.append(xs[i])
+        i += 1
+    return out
+
+
+def _has_groupby(ops: list[Op]) -> bool:
+    i: int = 0
+    while i < len(ops):
+        if ops[i].kind == "groupby":
+            return True
+        i += 1
+    return False
+
+
+# ---- predicate pushdown ---------------------------------------------------
+# Each filter is bubbled as EARLY as is provably sound. A filter F on column c
+# may move before an immediately-preceding op `pre` iff:
+#   pre is another filter        -> yes (row-subset filters commute)
+#   pre is a sort                -> yes (filter-then-sort == sort-then-filter:
+#                                   both yield the matching rows in sorted order)
+#   pre is a select(cols)        -> yes iff c in cols (the column still exists to
+#                                   filter on before the projection; if not, the
+#                                   filter is invalid there and we leave it)
+#   pre is a with_column(name)   -> yes iff c != name (a filter that reads the
+#                                   DERIVED column cannot precede its creation)
+#   pre is a groupby(key)        -> yes iff c == key (the group key is the only
+#                                   column that passes through unchanged; an
+#                                   aggregate column does not exist pre-group).
+# This clusters all pushable filters at the front and shrinks the row set before
+# the expensive sort / with_column / groupby. Deterministic and stable.
+
+def _can_push_before(f: Op, pre: Op) -> bool:
+    fc: str = f.col
+    k: str = pre.kind
+    if k == "filter" or k == "filter_str":
+        return True
+    if k == "sort":
+        return True
+    if k == "select":
+        return fc in pre.cols
+    if k == "wc_scalar" or k == "wc_binary":
+        return fc != pre.wname
+    if k == "groupby":
+        return fc == pre.gkey
+    return False
+
+
+def _predicate_pushdown(ops: list[Op]) -> list[Op]:
+    out: list[Op] = _copy_ops(ops)
+    target: int = 1
+    while target < len(out):
+        if out[target].is_filter():
+            j: int = target
+            while j > 0 and _can_push_before(out[j], out[j - 1]):
+                tmp: Op = out[j - 1]
+                out[j - 1] = out[j]
+                out[j] = tmp
+                j -= 1
+        target += 1
+    return out
+
+
+# ---- projection pushdown --------------------------------------------------
+# If the plan's final op is a `select` (so the output schema is a KNOWN subset)
+# and the plan contains NO groupby, insert an early SELECT of just the source
+# columns the plan ever references, at the very front, so every downstream op
+# carries fewer columns.
+#
+# DISABLED across a groupby (documented, on purpose): kodiak's eager groupby
+# implicitly aggregates EVERY numeric value column, so silently dropping a
+# numeric source column before the group would delete an output aggregate and
+# break the lazy == eager invariant. Being correct beats being clever.
+
+def _projection_pushdown(ops: list[Op], source_cols: list[str]) -> list[Op]:
+    if len(ops) == 0:
+        return _copy_ops(ops)
+    if _has_groupby(ops):
+        return _copy_ops(ops)
+    last: Op = ops[len(ops) - 1]
+    if last.kind != "select":
+        return _copy_ops(ops)          # output = full schema; nothing to prune
+
+    referenced: list[str] = []
+    i: int = 0
+    while i < len(ops):
+        rs: list[str] = _reads(ops[i])
+        j: int = 0
+        while j < len(rs):
+            if rs[j] not in referenced:
+                referenced.append(rs[j])
+            j += 1
+        i += 1
+
+    needed: list[str] = []
+    i = 0
+    while i < len(source_cols):
+        if source_cols[i] in referenced:
+            needed.append(source_cols[i])
+        i += 1
+
+    if len(needed) == 0 or len(needed) >= len(source_cols):
+        return _copy_ops(ops)          # keeps everything -> no benefit
+
+    out: list[Op] = [Op.mk_select(needed)]
+    i = 0
+    while i < len(ops):
+        out.append(ops[i])
+        i += 1
+    return out
+
+
+# ---- the optimizer entry point --------------------------------------------
+
+def optimize(ops: list[Op], source_cols: list[str]) -> list[Op]:
+    pushed: list[Op] = _predicate_pushdown(ops)
+    return _projection_pushdown(pushed, source_cols)
+
+
+# ---- explain --------------------------------------------------------------
+# Prints the logical plan (as written) and the optimized plan (as executed),
+# then a truthful note of exactly which optimizations fired. Deterministic; runs
+# the SAME optimize() stages collect() runs, so it never overstates.
+
+def _same_ops(a: list[Op], b: list[Op]) -> bool:
+    if len(a) != len(b):
+        return False
+    i: int = 0
+    while i < len(a):
+        if a[i].describe() != b[i].describe():
+            return False
+        i += 1
+    return True
+
+
+def _notes(logical: list[Op], pushed: list[Op], optimized: list[Op]) -> list[str]:
+    notes: list[str] = []
+    if not _same_ops(logical, pushed):
+        notes.append("predicate pushdown: filter(s) moved earlier (ahead of sort / with_column / select / groupby-key)")
+    if len(optimized) > len(pushed):
+        notes.append("projection pushdown: inserted an early " + optimized[0].describe())
+    if len(notes) == 0:
+        notes.append("none fired — every op replays in written order")
+    return notes
+
+
+def explain_plan(logical: list[Op], source_cols: list[str]) -> str:
+    pushed: list[Op] = _predicate_pushdown(logical)
+    optimized: list[Op] = _projection_pushdown(pushed, source_cols)
+
+    lines: list[str] = []
+    lines.append("LazyFrame plan")
+    lines.append("")
+    lines.append("logical plan (as written):")
+    if len(logical) == 0:
+        lines.append("  (empty)")
+    else:
+        i: int = 0
+        while i < len(logical):
+            lines.append("  " + str(i) + "  " + logical[i].describe())
+            i += 1
+    lines.append("")
+    lines.append("optimized plan (executed):")
+    if len(optimized) == 0:
+        lines.append("  (empty)")
+    else:
+        i = 0
+        while i < len(optimized):
+            lines.append("  " + str(i) + "  " + optimized[i].describe())
+            i += 1
+    lines.append("")
+    lines.append("optimizations:")
+    notes: list[str] = _notes(logical, pushed, optimized)
+    i = 0
+    while i < len(notes):
+        lines.append("  - " + notes[i])
+        i += 1
+
+    return _join(lines, "\n")

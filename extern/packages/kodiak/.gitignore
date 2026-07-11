@@ -1,9 +1,21 @@
 # pyrst build outputs — `pyrst build <file.pyrs>` always emits its binary
-# into the CURRENT directory named after the source basename. Regenerable;
-# never commit these.
+# into the CURRENT directory named after the source basename (and demo/test
+# scratch CSVs are written to CWD too). All regenerable; never commit these.
+# Builds may run from kodiak/ OR from kodiak/tests/, so both locations are
+# listed for the test artifacts.
+
+# module builds (built from kodiak/)
 /series
 /frame
-/smoke_scaffold
 /io
+/lazy
+
+# test builds + scratch CSVs (built from kodiak/ or kodiak/tests/)
+/smoke_scaffold
 /op_matrix
 /op_matrix_rt.csv
+/lazy_equiv
+tests/smoke_scaffold
+tests/op_matrix
+tests/op_matrix_rt.csv
+tests/lazy_equiv

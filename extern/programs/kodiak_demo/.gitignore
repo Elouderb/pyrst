@@ -2,4 +2,5 @@
 # into the CURRENT directory named after the source basename. Regenerable;
 # never commit these.
 /main
+/lazy_main
 /kodiak_report.csv

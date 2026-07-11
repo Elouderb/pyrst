@@ -4,16 +4,22 @@ A dataframe library for pyrst: pandas ergonomics + polars-style columnar
 storage (and, in a later phase, an optional lazy pipeline). Card `974fdff3`
 (epic `47cafe10`, the epic's capstone/FINAL package). Bear theme.
 
-**Status: Phase 2 (eager analytical core) IMPLEMENTED.** On top of the Phase-1
-scaffold, kodiak now has Series element-wise arithmetic + scalar broadcast,
-comparison → bool-mask methods, `df.filter(mask)`, stable `sort_values`,
-`groupby(...).sum()/.mean()/.count()/.min()/.max()`, `merge` (inner/left),
-a `nulls` validity-mask null model with `dropna`/`fillna_float`/`fillna_str`,
-`describe`, and CSV `read_csv`/`to_csv` with per-column dtype inference. All
-covered by `tests/op_matrix.pyrs` (hand-computed expected values) and driven
-end-to-end by the flagship demo `extern/programs/kodiak_demo/`. The lazy
-pipeline (Phase 3, `df.lazy()`) and the numpyrs/dateutil/tzdata capstone
-integration (Phase 4) are **not yet implemented** — see card `974fdff3`.
+**Status: Phase 3 (the lazy query engine) IMPLEMENTED** on top of the Phase-2
+eager core. kodiak now has `df.lazy() -> LazyFrame`: a polars-style deferred
+pipeline that records a logical op plan, `.explain()`s the plan (logical vs
+optimized), and `.collect()`s it — running a real OPTIMIZE pass (predicate
+pushdown + projection pushdown) before executing against the eager engine. The
+invariant is `df.lazy()....collect() == the equivalent eager chain`, verified
+over nine pipelines in `tests/lazy_equiv.pyrs` and demonstrated (with a
+lazy-vs-eager timing win) by `extern/programs/kodiak_demo/lazy_main.pyrs`. The
+Phase-2 eager core (Series arithmetic + scalar broadcast, comparison →
+bool-mask methods, `df.filter(mask)`, stable `sort_values`,
+`groupby(...).sum()/.mean()/.count()/.min()/.max()/.std()`, `merge`
+inner/left, the `nulls` validity-mask null model with
+`dropna`/`fillna_float`/`fillna_str`, `describe`, and CSV
+`read_csv`/`to_csv`) is unchanged and still covered by `tests/op_matrix.pyrs`.
+The numpyrs/dateutil/tzdata capstone integration (Phase 4) is **not yet
+implemented** — see card `974fdff3`.
 
 > **The single most important divergence to know before reading further:**
 > comparison **operators** cannot produce a mask. pyrst hard-types `<`, `>`,
@@ -256,6 +262,129 @@ rows; `fillna_*` fills and clears the flag.
 - **`fillna` is split by fill-value type** (`fillna_float` / `fillna_str`)
   because a method cannot take a union-typed fill value.
 
+## API surface (Phase 3 — the lazy query engine)
+
+`df.lazy()` returns a **`LazyFrame`** that records a logical plan instead of
+computing eagerly. Builders are chainable and value-semantic (each returns a
+*new* `LazyFrame`; the source and prior ops are never mutated):
+
+```python
+lf = (df.lazy()
+        .with_column_scalar("bonus", "salary", "*", 0.10)  # bonus = salary * 0.10
+        .filter("bonus", ">", 8.0)                          # filter on the DERIVED col
+        .sort("age", True)
+        .filter("age", ">", 30.0)                           # filter on a SOURCE col
+        .groupby("dept").mean())
+print(lf.explain())        # logical plan vs optimized plan + what fired
+result = lf.collect()      # DataFrame, IDENTICAL to the equivalent eager chain
+```
+
+### Builders (`LazyFrame`, in `frame.pyrs`)
+
+- `.filter(col: str, cmp: str, value: float)` — a single numeric column-vs-scalar
+  predicate; `cmp` in `">"`, `"<"`, `">="`, `"<="`, `"=="`, `"!="`.
+- `.filter_str(col: str, cmp: str, value: str)` — a str column vs a str value
+  (`"=="`/`"!="` only). Two builders (not one) because a method can't take a
+  union-typed value — the same split as `fillna_float`/`fillna_str`.
+- `.select(cols: list[str])` — projection to a subset of columns.
+- `.with_column_scalar(name, left, op, scalar: float)` — derived column
+  `name = left <op> scalar`; `op` in `"+"`,`"-"`,`"*"`,`"/"`.
+- `.with_column_binary(name, left, op, right)` — derived column
+  `name = left <op> right` (two source columns).
+- `.sort(by: str, ascending: bool = True)`.
+- `.groupby(key) -> LazyGroupBy`, then `.sum()`/`.mean()`/`.count()`/`.min()`/
+  `.max()`/`.std()` (or `.agg(how)`) — each appends a groupby op and returns a
+  `LazyFrame`.
+- `.explain() -> str` — the deterministic plan renderer (below).
+- `.collect() -> DataFrame` — optimize, then execute against the eager engine.
+
+**Scope (honest):** a filter predicate is *one* column-vs-scalar test and a
+`with_column` recipe is *one* scalar- or two-column op — **full expression
+trees** (nested arithmetic, boolean AND/OR predicates) are **out of scope** for
+Phase 3. A compound predicate is written as several chained `.filter(...)` calls
+(they AND, and the optimizer clusters them at the front).
+
+### What actually optimizes vs what replays
+
+`.collect()` runs `optimize(ops, source_cols)` (in `lazy.pyrs`), which applies
+**predicate pushdown then projection pushdown**, before executing each op. Only
+these two optimizations fire; everything else replays in written order.
+
+- **Predicate pushdown (implemented).** Each filter is bubbled as *early* as is
+  provably sound. A filter on column `c` may move before an immediately
+  preceding op iff: it's another filter (row-filters commute) or a sort (filter
+  and stable sort commute exactly, incl. tie order); a `select(cols)` and
+  `c in cols`; a `with_column(name)` and `c != name` (a filter that reads the
+  **derived** column can't precede its creation — it stays put); or a
+  `groupby(key)` and `c == key` (the group key is the only pass-through column —
+  an aggregate column doesn't exist before the group, so it's left alone). This
+  clusters filters at the front and shrinks the row set before the expensive
+  sort / with_column / groupby.
+- **Projection pushdown (implemented, bounded).** If the plan ends in a `select`
+  (so the output schema is a known subset) **and contains no groupby**, an early
+  `SELECT` of just the source columns the plan references is inserted at the very
+  front, so downstream ops carry fewer columns. It is **deliberately disabled
+  across a groupby**: kodiak's eager `groupby` implicitly aggregates *every*
+  numeric column, so silently dropping one would delete an output aggregate and
+  break `lazy == eager`. Correctness beats cleverness — this limitation is
+  intentional and documented.
+- **Replayed as written:** `with_column`, `sort`, `groupby`, and any filter that
+  can't be pushed (e.g. a filter on a derived column, or a filter on a
+  non-key/aggregate column after a groupby).
+
+### `explain()` format
+
+Deterministic; prints the **logical plan (as written)**, the **optimized plan
+(as executed)** — the same plan `collect()` runs, so it never overstates — and a
+truthful `optimizations:` note of exactly what fired (or "none fired — every op
+replays in written order"). Example (the pipeline above):
+
+```
+LazyFrame plan
+
+logical plan (as written):
+  0  WITHCOL  bonus = salary * 0.1
+  1  FILTER   bonus > 8.0
+  2  SORT     age asc
+  3  FILTER   age > 30.0
+  4  GROUPBY  dept -> mean
+
+optimized plan (executed):
+  0  FILTER   age > 30.0
+  1  WITHCOL  bonus = salary * 0.1
+  2  FILTER   bonus > 8.0
+  3  SORT     age asc
+  4  GROUPBY  dept -> mean
+
+optimizations:
+  - predicate pushdown: filter(s) moved earlier (ahead of sort / with_column / select / groupby-key)
+```
+
+`FILTER age > 30` (a source-column filter) is pushed to the front, ahead of the
+sort, the with_column, and the derived-column filter; `FILTER bonus > 8`
+correctly stays after the `WITHCOL` that creates `bonus`.
+
+### GAP — pyrst forbids circular imports, so lazy lives in two files
+
+The pandas/polars entry point `df.lazy()` is a *method on `DataFrame`*, so
+`LazyFrame` must be reachable from `frame.pyrs`. A separate `lazy.pyrs` that
+imported `frame.pyrs` back (to hold a `DataFrame` source / return `DataFrame`s)
+would be a **circular import**, which pyrst rejects outright (build error:
+`circular import detected: A → B → A`, probed directly). The resolution keeps
+both a real separate module *and* `df.lazy()`:
+
+- **`lazy.pyrs` is a pure, dependency-free module** — the discriminated `Op`
+  record, the optimizer (`optimize`, `_predicate_pushdown`,
+  `_projection_pushdown`), and `explain_plan`. It imports nothing from kodiak
+  and operates only on op metadata + column **names** (`list[str]`).
+- **`frame.pyrs` imports `lazy.pyrs` one-directionally** (no cycle) and hosts
+  `LazyFrame`/`LazyGroupBy` next to `DataFrame`, plus the op executor
+  (`_exec_op`) and the `frame_equals` equality oracle. `collect()` lives here
+  because it drives the eager engine.
+
+Logged on card `974fdff3` as
+`GAP: pyrst forbids circular imports … worked around by making lazy.pyrs a PURE module that frame.pyrs imports one-directionally, hosting LazyFrame inside frame.pyrs so df.lazy() stays a real method.`
+
 ## Forced API divergences (pyrst static-typing limits — see card `974fdff3`)
 
 - **`assign(**kwargs)` → `with_column(name, series)`.** pandas'
@@ -294,13 +423,20 @@ semantics: `head`/`tail`/`row_slice`/`with_column` all allocate and return a
   `agg_min`/`agg_max`/`agg_std`/`count`), `fillna_float`/`fillna_str`,
   `to_strings`/`to_field_strings`, `__len__`, `__str__`.
 - `frame.pyrs` — the `DataFrame` class (`from_columns`, `__getitem__`,
-  `shape`/`columns`/`head`/`tail`/`with_column`, `filter`, `sort_values`,
-  `groupby`, `merge`, `dropna`, `fillna_float`/`fillna_str`, `describe`,
-  `to_csv`, `__str__`) and the `GroupBy` class
-  (`sum`/`mean`/`count`/`min`/`max`/`std`), plus module-private helpers for
-  the stable merge-sort (`_argsort`/`_msort`/`_merge_idx`/`_key_*`), grouping
+  `shape`/`columns`/`head`/`tail`/`with_column`, `select`, `lazy`, `filter`,
+  `sort_values`, `groupby`, `merge`, `dropna`, `fillna_float`/`fillna_str`,
+  `describe`, `to_csv`, `__str__`) and the `GroupBy` class
+  (`sum`/`mean`/`count`/`min`/`max`/`std`); the **Phase-3 lazy engine**
+  (`LazyFrame`, `LazyGroupBy`, the op executor `_exec_op` + mask/derive/groupby
+  dispatch helpers, and the `frame_equals` equality oracle); plus
+  module-private helpers for the stable merge-sort
+  (`_argsort`/`_msort`/`_merge_idx`/`_key_*`), grouping
   (`_group`/`_agg_numeric_col`/`_count_col`), gathering
   (`_gather_frame`/`_slice_frame`), and the table renderer.
+- `lazy.pyrs` — the **pure** query-engine core (imports nothing from kodiak):
+  the discriminated `Op` record + static constructors + `Op.describe()`, the
+  optimizer (`optimize`, `_predicate_pushdown`, `_projection_pushdown`,
+  `_can_push_before`), and the `explain_plan(logical, source_cols)` renderer.
 - `io.pyrs` — `read_csv(path) -> DataFrame` (free function) with per-column
   dtype inference; uses `lib/csv` + `lib/os`.
 - `tests/smoke_scaffold.pyrs` — Phase 1 scaffold check.
@@ -308,7 +444,18 @@ semantics: `head`/`tail`/`row_slice`/`with_column` all allocate and return a
   arithmetic, every comparison, filter, sort (incl. stability), each groupby
   aggregation, inner + left merge, dropna/fillna, null propagation, and a CSV
   round-trip. Prints `PASS`/`FAIL`, nonzero exit on failure.
+- `tests/lazy_equiv.pyrs` — Phase 3 `lazy == eager` suite: nine pipelines
+  (filter-only, filter+select+projection, sort+filter, with_column+filter on a
+  source col, with_column+filter on a derived col, multi-filter, filter+groupby,
+  groupby+filter on the key, and the full mixed pipeline) — each asserts
+  `collect() == eager`, and several assert the *optimized* plan actually pushed
+  a filter earlier. Prints `PASS`/`FAIL`, nonzero exit on failure.
+
+The flagship demos live in `extern/programs/kodiak_demo/`: `main.pyrs` (Phase-2
+eager pipeline) and `lazy_main.pyrs` (Phase-3 lazy engine — `explain()` showing
+a pushed-down filter, `collect() == eager`, and a lazy-vs-eager timing
+comparison over a synthetic frame).
 
 See card `974fdff3` for the full staged plan (Phase 2 eager core, Phase 3
 lazy pipeline, Phase 4 capstone integration with numpyrs/dateutil/tzdata) and
-the lead-design comment (608) this scaffold implements.
+the lead-design comment (608) this package implements.

@@ -1,0 +1,137 @@
+# lazy_equiv.pyrs — the Phase-3 headline test: lazy == eager over a battery of
+# pipelines, plus assertions that the optimizer ACTUALLY reorders (pushes a
+# filter earlier) where it should and does NOT where that would be unsound.
+#
+# For every pipeline the lazy result (df.lazy()....collect()) is compared with
+# the hand-written eager chain via frame_equals — this is the acceptance bar
+# from card 974fdff3. Prints PASS and exits 0 on success; on any failure prints
+# one concise FAIL line and aborts (assert False).
+#
+# Build + run (from extern/packages/kodiak/):
+#   PYRST_PATH=/home/ethos/Coding/pyrst/extern/packages \
+#     /home/ethos/Coding/pyrst/target/release/pyrst build tests/lazy_equiv.pyrs
+#   ./lazy_equiv
+
+from kodiak.series import Series
+from kodiak.frame import DataFrame
+from kodiak.frame import LazyFrame
+from kodiak.frame import frame_equals
+from kodiak.lazy import Op
+from kodiak.lazy import optimize
+
+
+def fail(msg: str) -> None:
+    print("FAIL: " + msg)
+    assert False
+
+
+def base() -> DataFrame:
+    idc: Series = Series.from_ints("id", [1, 2, 3, 4, 5, 6, 7, 8])
+    dept: Series = Series.from_strs("dept", ["Eng", "Sales", "Eng", "Ops", "Sales", "Eng", "Ops", "Sales"])
+    age: Series = Series.from_ints("age", [34, 29, 41, 22, 37, 45, 26, 31])
+    salary: Series = Series.from_floats("salary", [120.0, 90.0, 135.5, 80.0, 110.0, 99.0, 70.0, 105.0])
+    return DataFrame.from_columns([idc, dept, age, salary])
+
+
+def assert_eq(label: str, got: DataFrame, want: DataFrame) -> None:
+    if not frame_equals(got, want):
+        fail(label + ": lazy != eager\n--- lazy ---\n" + str(got) + "\n--- eager ---\n" + str(want))
+
+
+def assert_first_is_filter(label: str, lf: LazyFrame) -> None:
+    # the optimizer must push a filter to the FRONT (index 0) of the executed
+    # plan, and the plan must NOT already have started with that filter.
+    logical: list[Op] = lf.ops
+    opt: list[Op] = optimize(logical, lf.source.columns())
+    if len(opt) == 0 or not opt[0].is_filter():
+        top: str = "<empty>"
+        if len(opt) > 0:
+            top = opt[0].describe()
+        fail(label + ": expected the optimized plan to START with a pushed-down FILTER, got " + top)
+    if logical[0].is_filter():
+        fail(label + ": logical plan already began with a filter — no reorder demonstrated")
+
+
+def assert_first_kind(label: str, lf: LazyFrame, kind: str) -> None:
+    opt: list[Op] = optimize(lf.ops, lf.source.columns())
+    if len(opt) == 0 or opt[0].kind != kind:
+        top: str = "<empty>"
+        if len(opt) > 0:
+            top = opt[0].describe()
+        fail(label + ": expected optimized plan to start with a '" + kind + "' op, got " + top)
+
+
+def main() -> None:
+    df: DataFrame = base()
+
+    # ---- 1. filter-only (equivalence; filter already first, no reorder) ----
+    lf1: LazyFrame = df.lazy().filter("age", ">", 30.0)
+    e1: DataFrame = df.filter(df["age"].gt(30.0))
+    assert_eq("filter-only", lf1.collect(), e1)
+
+    # ---- 2. filter + select (projection pushdown + equivalence) ------------
+    lf2: LazyFrame = df.lazy().filter("age", ">", 30.0).select(["dept", "age"])
+    e2a: DataFrame = df.filter(df["age"].gt(30.0))
+    e2: DataFrame = e2a.select(["dept", "age"])
+    assert_eq("filter+select", lf2.collect(), e2)
+    # projection pushdown must insert an early SELECT (plan grows by one op)
+    opt2: list[Op] = optimize(lf2.ops, df.columns())
+    if len(opt2) <= len(lf2.ops) or opt2[0].kind != "select":
+        fail("filter+select: expected projection pushdown to insert an early SELECT")
+
+    # ---- 3. sort THEN filter(source col): filter pushes ahead of sort ------
+    lf3: LazyFrame = df.lazy().sort("salary", True).filter("age", ">", 30.0)
+    e3a: DataFrame = df.sort_values("salary", True)
+    e3: DataFrame = e3a.filter(e3a["age"].gt(30.0))
+    assert_eq("sort+filter", lf3.collect(), e3)
+    assert_first_is_filter("sort+filter (REORDER)", lf3)          # REORDER #1
+
+    # ---- 4. with_column THEN filter(source col): filter pushes ahead of wc -
+    lf4: LazyFrame = df.lazy().with_column_scalar("bonus", "salary", "*", 0.10).filter("age", ">", 30.0)
+    e4a: DataFrame = df.with_column("bonus", df["salary"].mul_scalar(0.10))
+    e4: DataFrame = e4a.filter(e4a["age"].gt(30.0))
+    assert_eq("wc+filter-on-source", lf4.collect(), e4)
+    assert_first_is_filter("wc+filter-on-source (REORDER)", lf4)  # REORDER #2
+
+    # ---- 5. with_column THEN filter(DERIVED col): must NOT push -----------
+    lf5: LazyFrame = df.lazy().with_column_scalar("bonus", "salary", "*", 0.10).filter("bonus", ">", 10.0)
+    e5a: DataFrame = df.with_column("bonus", df["salary"].mul_scalar(0.10))
+    e5: DataFrame = e5a.filter(e5a["bonus"].gt(10.0))
+    assert_eq("wc+filter-on-derived", lf5.collect(), e5)
+    assert_first_kind("wc+filter-on-derived (NO reorder)", lf5, "wc_scalar")
+
+    # ---- 6. multi-filter over a sort: BOTH filters push ahead of sort ------
+    lf6: LazyFrame = df.lazy().sort("salary", True).filter("age", ">", 25.0).filter("salary", "<", 130.0)
+    e6a: DataFrame = df.sort_values("salary", True)
+    e6b: DataFrame = e6a.filter(e6a["age"].gt(25.0))
+    e6: DataFrame = e6b.filter(e6b["salary"].lt(130.0))
+    assert_eq("multi-filter", lf6.collect(), e6)
+    opt6: list[Op] = optimize(lf6.ops, df.columns())
+    if not opt6[0].is_filter() or not opt6[1].is_filter() or opt6[2].kind != "sort":
+        fail("multi-filter: expected both filters pushed ahead of the sort")
+
+    # ---- 7. filter + groupby (equivalence; the mean over a filtered frame) -
+    lf7: LazyFrame = df.lazy().filter("age", ">", 28.0).groupby("dept").mean()
+    e7a: DataFrame = df.filter(df["age"].gt(28.0))
+    e7: DataFrame = e7a.groupby("dept").mean()
+    assert_eq("filter+groupby-mean", lf7.collect(), e7)
+
+    # ---- 8. groupby THEN filter on the KEY: filter pushes before groupby ---
+    lf8: LazyFrame = df.lazy().groupby("dept").sum().filter_str("dept", "==", "Eng")
+    e8a: DataFrame = df.groupby("dept").sum()
+    e8: DataFrame = e8a.filter(e8a["dept"].eq_str("Eng"))
+    assert_eq("groupby+filter-key", lf8.collect(), e8)
+    assert_first_kind("groupby+filter-key (REORDER before groupby)", lf8, "filter_str")
+
+    # ---- 9. a full mixed pipeline: wc / filter-derived / sort / filter-src /
+    #         groupby — the demo shape — equivalence end to end ---------------
+    lf9: LazyFrame = df.lazy().with_column_scalar("bonus", "salary", "*", 0.10).filter("bonus", ">", 8.0).sort("age", True).filter("age", ">", 30.0).groupby("dept").mean()
+    e9a: DataFrame = df.with_column("bonus", df["salary"].mul_scalar(0.10))
+    e9b: DataFrame = e9a.filter(e9a["bonus"].gt(8.0))
+    e9c: DataFrame = e9b.sort_values("age", True)
+    e9d: DataFrame = e9c.filter(e9c["age"].gt(30.0))
+    e9: DataFrame = e9d.groupby("dept").mean()
+    assert_eq("mixed-pipeline", lf9.collect(), e9)
+    assert_first_is_filter("mixed-pipeline (REORDER age-filter to front)", lf9)
+
+    print("PASS: kodiak lazy_equiv (filter-only / filter+select+projection / sort+filter / wc+filter-source / wc+filter-derived / multi-filter / filter+groupby / groupby+filter-key / mixed pipeline — all collect()==eager; predicate & projection pushdown verified)")

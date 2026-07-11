@@ -1,0 +1,6 @@
+# Ergonomics fix (card a0a233b8): a trailing comma before `)` in a call is
+# allowed (`abs(5,)`), but an EMPTY/leading comma with no argument before it
+# must remain a parse error — `f(,)` never becomes an empty-argument hole.
+def main() -> None:
+    x: int = abs(,)
+    print(x)

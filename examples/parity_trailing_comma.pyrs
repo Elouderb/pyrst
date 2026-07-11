@@ -1,0 +1,38 @@
+# Parser ergonomics (dogfood finding, card a0a233b8): CPython accepts an
+# OPTIONAL trailing comma before the closing delimiter in a (usually
+# multi-line, formatter-friendly) parameter list, call-argument list, or
+# lambda parameter list — pyrst previously rejected it in the `def` and
+# `lambda` parameter-list positions (call-argument trailing commas already
+# worked). This dual-run golden folds all three positions into one file, each
+# exercised BOTH with and without the trailing comma, and checks pyrst
+# produces byte-identical output to real CPython.
+
+def add(
+    a: int,
+    b: int,
+) -> int:
+    return a + b
+
+
+def main() -> None:
+    # def parameter list with a trailing comma (see `add` above) vs. without.
+    with_trailing: int = add(1, 2)
+    print(with_trailing)
+
+    # call-argument list with a trailing comma vs. without.
+    call_trailing: int = add(3, 4,)
+    call_plain: int = add(5, 6)
+    print(call_trailing)
+    print(call_plain)
+
+    # lambda parameter list with a trailing comma vs. without.
+    combine: Callable[[int, int], int] = lambda n, m,: n + m
+    combine_plain: Callable[[int, int], int] = lambda n, m: n + m
+    print(combine(7, 8))
+    print(combine_plain(9, 10))
+
+    # single-param lambda, trailing comma vs. without.
+    triple: Callable[[int], int] = lambda n,: n * 3
+    triple_plain: Callable[[int], int] = lambda n: n * 3
+    print(triple(11))
+    print(triple_plain(12))

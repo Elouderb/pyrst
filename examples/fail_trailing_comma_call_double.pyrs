@@ -1,0 +1,6 @@
+# Ergonomics fix (card a0a233b8): a trailing comma before `)` in a call is
+# allowed (`max(1, 2,)`), but a DOUBLE/empty-slot comma between two real
+# arguments must remain a parse error — `f(a,,b)` is not a missing argument.
+def main() -> None:
+    x: int = max(1,,2)
+    print(x)

@@ -464,6 +464,9 @@ impl Parser {
             loop {
                 params.push(self.parse_param()?);
                 if !self.eat(&Tok::Comma) { break; }
+                // Allow a trailing comma before the closing paren (formatter-friendly
+                // multi-line param lists): def f(a: int, b: int,) -> int: ...
+                if matches!(self.peek(), Tok::RParen) { break; }
             }
         }
         self.expect(&Tok::RParen, "def")?;
@@ -1015,6 +1018,11 @@ impl Parser {
         let (name, name_span) = self.expect_str_arg("@crate crate name")?;
         self.expect(&Tok::Comma, "@crate requires a version after the crate name")?;
         let (version, version_span) = self.expect_str_arg("@crate version")?;
+        // Allow an optional trailing comma before the closing paren:
+        // @crate("name", "version",). A THIRD argument still hits the `expect`
+        // below (the next token after the comma is a value, not `)`), so the
+        // fixed two-argument arity is preserved.
+        self.eat(&Tok::Comma);
         self.expect(&Tok::RParen, "@crate takes exactly two string arguments")?;
 
         // SECURITY: the name and version are interpolated RAW into the generated
@@ -1100,6 +1108,10 @@ impl Parser {
                 break; // End of parameters, start of body
             }
             self.expect(&Tok::Comma, "lambda parameter separator")?;
+            // Allow a trailing comma before the body colon: lambda x, y,: x + y.
+            if matches!(self.peek(), Tok::Colon) {
+                break;
+            }
         }
 
         self.expect(&Tok::Colon, "lambda body")?;
@@ -1921,6 +1933,82 @@ mod tests {
         }
     }
 
+    /// `f(,)` (empty/leading comma, no argument before it) stays a parse error —
+    /// the trailing-comma allowance must not create an empty-argument hole.
+    #[test]
+    fn parse_empty_comma_call_is_rejected() {
+        assert!(parse("foo(,)\n").is_err(), "f(,) must remain a parse error");
+    }
+
+    /// `f(a,,b)` (a double/empty-slot comma) stays a parse error — the trailing-
+    /// comma allowance only permits ONE comma immediately before the closer.
+    #[test]
+    fn parse_double_comma_call_is_rejected() {
+        assert!(parse("foo(a,,b)\n").is_err(), "f(a,,b) must remain a parse error");
+    }
+
+    // ── Trailing comma in def parameter list (card a0a233b8) ─────────────────
+    // CPython accepts a trailing comma before the closing paren in a (usually
+    // multi-line, formatter-friendly) parameter list; pyrst previously rejected
+    // it because `parse_param` was re-invoked after the trailing comma and
+    // choked on the `)` where it expected a parameter name.
+
+    #[test]
+    fn parse_trailing_comma_in_def_params() {
+        let m = parse("def f(a: int, b: int,) -> int:\n    return a + b\n").unwrap();
+        let f = match &m.stmts[0] {
+            Stmt::Func(f) => f,
+            other => panic!("expected a Func, got {:?}", other),
+        };
+        assert_eq!(f.params.len(), 2, "trailing comma def params must have 2 params");
+    }
+
+    /// `def f(,)` (empty/leading comma) stays a parse error.
+    #[test]
+    fn parse_empty_comma_def_params_is_rejected() {
+        assert!(
+            parse("def f(,) -> None:\n    pass\n").is_err(),
+            "def f(,) must remain a parse error"
+        );
+    }
+
+    /// `def f(a: int,, b: int)` (a double comma) stays a parse error.
+    #[test]
+    fn parse_double_comma_def_params_is_rejected() {
+        assert!(
+            parse("def f(a: int,, b: int) -> None:\n    pass\n").is_err(),
+            "def f(a,,b) must remain a parse error"
+        );
+    }
+
+    // ── Trailing comma in lambda parameter list (card a0a233b8) ──────────────
+
+    #[test]
+    fn parse_trailing_comma_in_lambda_params() {
+        let m = parse("f = lambda x, y,: x + y\n").unwrap();
+        assert_eq!(m.stmts.len(), 1);
+        if let Stmt::Assign { value: Expr::Lambda { params, .. }, .. } = &m.stmts[0] {
+            assert_eq!(params.len(), 2, "trailing comma lambda params must have 2 params");
+        } else {
+            panic!("expected an Assign to a Lambda, got {:?}", m.stmts[0]);
+        }
+    }
+
+    /// `lambda ,: x` (empty/leading comma) stays a parse error.
+    #[test]
+    fn parse_empty_comma_lambda_params_is_rejected() {
+        assert!(parse("f = lambda ,: x\n").is_err(), "lambda ,: x must remain a parse error");
+    }
+
+    /// `lambda x,, y: x` (a double comma) stays a parse error.
+    #[test]
+    fn parse_double_comma_lambda_params_is_rejected() {
+        assert!(
+            parse("f = lambda x,, y: x\n").is_err(),
+            "lambda x,,y: x must remain a parse error"
+        );
+    }
+
     // ── Triple-quoted strings ─────────────────────────────────────────────────
 
     #[test]
@@ -1988,6 +2076,23 @@ mod tests {
         ] {
             assert!(parse(bad).is_err(), "expected parse error for: {:?}", bad);
         }
+    }
+
+    /// `@crate("name", "version",)` — a trailing comma after the two required
+    /// string arguments — parses identically to the comma-less form (card
+    /// a0a233b8). The fixed two-argument arity is still enforced: a trailing
+    /// comma followed by a THIRD argument (tested in
+    /// `parse_crate_decorator_rejects_bad_arity_and_non_string_args`) remains a
+    /// parse error.
+    #[test]
+    fn parse_crate_decorator_allows_trailing_comma() {
+        let src = "@crate(\"regex\", \"1\",)\n@extern\ndef is_match(p: str, t: str) -> bool:\n    \"true\"\n";
+        let m = parse(src).unwrap();
+        let f = match &m.stmts[0] {
+            Stmt::Func(f) => f,
+            other => panic!("expected a Func, got {:?}", other),
+        };
+        assert_eq!(f.crate_deps, vec![("regex".to_string(), "1".to_string())]);
     }
 
     /// SECURITY (BLOCKER fix): a `@crate` name or version carrying TOML

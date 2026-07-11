@@ -2489,11 +2489,28 @@ impl<'a> Codegen<'a> {
                             }));
                         }
                         "input" => {
+                            // (card df83419e) CPython's `input()` raises `EOFError`
+                            // when stdin hits true EOF before a line is read
+                            // (`EOFError: EOF when reading a line`); pyrst previously
+                            // mapped `read_line`'s `Ok(0)` (EOF) to the SAME `""` as
+                            // a normal empty line (`Ok(n>0)` for a lone `\n`),
+                            // making the two indistinguishable to the program and
+                            // forcing spin-cap heuristics (dogfood: tabletop's
+                            // "No more input; exiting" after ~100 re-prompts). Only
+                            // `Ok(0)` (nothing read at all — the stream is closed)
+                            // raises; a read that returns any bytes (including a
+                            // line that is just "\n") still yields "" via
+                            // `trim_end()`, matching CPython's line/EOF distinction.
+                            // Uses the established `TYPE\0message` panic-encoding
+                            // convention (see `Stmt::Raise` in codegen/stmts.rs) so
+                            // it is catchable via `except EOFError:` — the exact
+                            // literal message has no dynamic content, so a plain
+                            // single-arg `panic!("...")` suffices (no `format!`).
                             if args.is_empty() {
-                                return Ok(Some("{ let mut __s = String::new(); ::std::io::stdin().read_line(&mut __s).unwrap(); __s.trim_end().to_string() }".to_string()));
+                                return Ok(Some("{ let mut __s = String::new(); if ::std::io::stdin().read_line(&mut __s).unwrap() == 0 { panic!(\"EOFError\\0EOF when reading a line\"); } __s.trim_end().to_string() }".to_string()));
                             } else {
                                 let p = self.emit_expr(&args[0])?;
-                                return Ok(Some(format!("{{ print!(\"{{}}\" , {}); ::std::io::stdout().flush().ok(); let mut __s = String::new(); ::std::io::stdin().read_line(&mut __s).unwrap(); __s.trim_end().to_string() }}", p)));
+                                return Ok(Some(format!("{{ print!(\"{{}}\" , {}); ::std::io::stdout().flush().ok(); let mut __s = String::new(); if ::std::io::stdin().read_line(&mut __s).unwrap() == 0 {{ panic!(\"EOFError\\0EOF when reading a line\"); }} __s.trim_end().to_string() }}", p)));
                             }
                         }
                         "any" => {

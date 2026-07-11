@@ -1,0 +1,41 @@
+# card df83419e: input() at true EOF raises the catchable builtin `EOFError`
+# (CPython parity — `input()` raises `EOFError: EOF when reading a line` when
+# stdin is closed before a line is read), instead of the old silent `""` that
+# made an empty line and a closed stream indistinguishable to the program
+# (the dogfood/tabletop finding: a spin-cap re-prompt heuristic was the only
+# workaround). test_all.sh's positive loop runs each program with stdin from
+# /dev/null, so this golden observes true EOF immediately and deterministically
+# on the first `input()` — every `input()` call below exercises the EOFError
+# path. (The complementary "one empty line still
+# returns ''" case, and the byte-for-byte python3 dual-run of THIS EOF path,
+# were verified manually — `printf '' | python3 -c ...` vs `printf '' |
+# ./input_eof` — since the harness has no mechanism to pipe stdin to either
+# side; see card df83419e's handoff.)
+
+def main() -> None:
+    # 1. `except EOFError:` directly catches true EOF from input().
+    try:
+        s: str = input()
+        print("unexpected:" + s)
+    except EOFError:
+        print("caught EOFError")
+
+    # 2. `except Exception:` also catches it — CPython hierarchy:
+    #    `issubclass(EOFError, Exception)` is True.
+    try:
+        s2: str = input()
+        print("unexpected:" + s2)
+    except Exception:
+        print("caught via Exception")
+
+    # 3. An unrelated `except ValueError:` does NOT catch it (hierarchy
+    #    specificity) — it propagates past that handler to the enclosing
+    #    `except EOFError:`.
+    try:
+        try:
+            s3: str = input()
+            print("unexpected:" + s3)
+        except ValueError:
+            print("wrongly caught by ValueError")
+    except EOFError:
+        print("propagated past ValueError, caught by EOFError")

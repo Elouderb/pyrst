@@ -1,0 +1,3 @@
+caught EOFError
+caught via Exception
+propagated past ValueError, caught by EOFError

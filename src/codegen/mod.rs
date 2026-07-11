@@ -496,6 +496,20 @@ fn exc_descendants(base: &str) -> Vec<&'static str> {
         // `ConnectionError` is itself an OSError subclass WITH its own children;
         // `except ConnectionError:` catches those four (CPython-faithful).
         "ConnectionError" => CONNECTION_FAMILY.to_vec(),
+        // EOFError: a direct `Exception` child (CPython `issubclass(EOFError,
+        // Exception)` is True) with NO subclasses of its own — explicitly
+        // registered (rather than left to the leaf/unknown-name default below)
+        // so the hierarchy table documents its placement per card df83419e
+        // (input() now raises "EOFError\0EOF when reading a line" on true EOF,
+        // see codegen/exprs.rs's "input" arm). The singleton OR-expansion this
+        // produces (`__exc_type == "EOFError"`) is behaviorally identical to
+        // the exact-match fallback a leaf would otherwise get — this entry is
+        // documentation/registration, not a behavior change. `except
+        // Exception:` catches EOFError independent of this table, via the
+        // dedicated wildcard path in emit_try (`h.exc_type == Some("Exception")`
+        // short-circuits to `cond = "true"`) — this table is never consulted
+        // for the "Exception" base itself.
+        "EOFError" => vec!["EOFError"],
         // Leaves and unknown/custom types: caller uses an exact-match condition.
         _ => vec![],
     }

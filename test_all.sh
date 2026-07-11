@@ -138,7 +138,11 @@ for f in "$EXAMPLES"/*.pyrs; do
     # which resets it).
     argv_args=$(argv_for "$f")
     set -f
-    got=$(timeout 5 ./"$base" $argv_args 2>/dev/null)
+    # stdin from /dev/null so a positive that calls input() observes a
+    # deterministic immediate EOF (raising EOFError, card df83419e) instead of
+    # blocking on an interactive terminal's stdin; a no-op for programs that
+    # never read stdin, which is every other positive.
+    got=$(timeout 5 ./"$base" $argv_args </dev/null 2>/dev/null)
     run_exit=$?
     set +f
     rm -f "$base" "$base.rs"
@@ -257,7 +261,7 @@ MULTI_EXPECTED="$(printf '100\n5\n1000')"
 stderr_out=$(timeout 30 "$BIN" build "$EXAMPLES/multi_file_demo/main.pyrs" 2>&1 >/dev/null)
 multi_build_exit=$?
 if [[ $multi_build_exit -eq 0 ]]; then
-    multi_got=$(timeout 5 ./main 2>/dev/null)
+    multi_got=$(timeout 5 ./main </dev/null 2>/dev/null)
     multi_run_exit=$?
     rm -f main main.rs
     if [[ $multi_run_exit -eq 0 ]] && [[ "$multi_got" == "$MULTI_EXPECTED" ]]; then

@@ -1,0 +1,16 @@
+# card 3d46471e: a built-in `file` handle first-bound in BOTH arms of an `if`/`else`
+# (definitely assigned on every path -> a SURVIVOR, not sealed), then used AFTER the
+# block. Hoisted to an `Option<PyFile>` fn-scope slot; the `file` handle's methods
+# take `&mut self`, so a read borrows via `.as_mut().unwrap()`. Behavioral: write
+# through the after-block handle, then re-open and read the file back to prove the
+# correct handle ran.
+def main() -> None:
+    use_a: bool = True
+    if use_a:
+        f = open("/tmp/pyrst_handle_ifelse_a.txt", "w")
+    else:
+        f = open("/tmp/pyrst_handle_ifelse_b.txt", "w")
+    f.write("if-else-handle-ok\n")
+    f.close()
+    with open("/tmp/pyrst_handle_ifelse_a.txt") as g:
+        print(g.read())

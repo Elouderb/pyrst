@@ -1,6 +1,14 @@
 use super::*;
 use std::collections::HashSet;
 
+/// (card 3d46471e) The union of two name sets — the scope carried into a nested
+/// block by `scan_escaping_body` (`outer ∪ bound_here`).
+fn union_names(a: &HashSet<String>, b: &HashSet<String>) -> HashSet<String> {
+    let mut out = a.clone();
+    out.extend(b.iter().cloned());
+    out
+}
+
 /// (W4-a, F5) Depth-first walk of the import graph from the ROOT (module id
 /// `None`), visiting each module's top-level statements in SOURCE order and, at an
 /// import, recursing into the imported module at that exact point — a `visited` set
@@ -59,7 +67,7 @@ fn read_after_reassign_codegen_error(name: &str, outer: &Ty, inner: &Ty) -> crat
 
 impl<'a> Codegen<'a> {
     pub fn new(ctx: &'a TyCtx) -> Self {
-        Self { ctx, out: String::new(), indent: 0, locals: HashMap::new(), declared: Default::default(), current_class: None, current_ret_ty: Ty::Unit, dead_funcs: Default::default(), mut_self: HashMap::new(), by_ref_locals: Default::default(), poly_map: HashMap::new(), concrete_struct_params: Default::default(), const_names: Default::default(), const_strs: Default::default(), in_generator: false, try_return_escape: false, try_loopctl_escape: false, current_class_type_params: Vec::new(), current_fn_type_params: Vec::new(), hoisted: Default::default(), shadow_map: Default::default(), shadow_counter: 0, pending_inline_lambda_params: None, current_module: None, root_defined: Default::default(), fn_globals: Default::default() }
+        Self { ctx, out: String::new(), indent: 0, locals: HashMap::new(), declared: Default::default(), current_class: None, current_ret_ty: Ty::Unit, dead_funcs: Default::default(), mut_self: HashMap::new(), by_ref_locals: Default::default(), poly_map: HashMap::new(), concrete_struct_params: Default::default(), const_names: Default::default(), const_strs: Default::default(), in_generator: false, try_return_escape: false, try_loopctl_escape: false, current_class_type_params: Vec::new(), current_fn_type_params: Vec::new(), hoisted: Default::default(), option_handles: Default::default(), shadow_map: Default::default(), shadow_counter: 0, pending_inline_lambda_params: None, current_module: None, root_defined: Default::default(), fn_globals: Default::default() }
     }
 
     /// (W3-2) Emit a TOP-LEVEL free-function / const-adjacent name owner-qualified.
@@ -439,6 +447,180 @@ impl<'a> Codegen<'a> {
                 }
                 _ => {}
             }
+        }
+    }
+
+    /// (card 3d46471e) The set of move-only HANDLE names that ESCAPE the nested block
+    /// they are first bound in — i.e. a handle whose `let` lives in an inner Rust
+    /// block (`if`/`try`/`while`/`for`/`with`/`match`) but which is READ somewhere
+    /// that block's scope has already exited. These are exactly the names the hoist
+    /// loop must lower to a fn-scope `Option<Handle>` slot (`option_handles`), so the
+    /// after-block read resolves; a handle used ONLY inside its own block does NOT
+    /// escape and keeps its plain inner-scoped `let` (byte-identical emit).
+    ///
+    /// Models Rust block scoping exactly, mirroring typeck's `block_scope_snapshot` /
+    /// `seal_block_scope`: `bound_here` tracks handle names bound at the CURRENT
+    /// statement-list level; a nested block is scanned with `outer' = outer ∪
+    /// bound_here` (its bindings are local to it and never re-enter this level). A
+    /// handle Ident READ whose name is in neither `bound_here` nor `outer` is a read
+    /// of a binding no longer in scope → it escapes. typeck's definite-assignment
+    /// seal has already rejected the maybe-unassigned shapes, so every escaping
+    /// handle that reaches codegen is definitely assigned on all paths to each read.
+    pub(crate) fn collect_escaping_handles(&self, body: &[Stmt]) -> std::collections::HashSet<String> {
+        let mut escaping = std::collections::HashSet::new();
+        self.scan_escaping_body(body, &std::collections::HashSet::new(), &mut escaping);
+        escaping
+    }
+
+    fn scan_escaping_body(
+        &self,
+        body: &[Stmt],
+        outer: &std::collections::HashSet<String>,
+        escaping: &mut std::collections::HashSet<String>,
+    ) {
+        let mut bound_here: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for s in body {
+            // 1) A read of a handle name not currently in scope escapes.
+            let mut reads: Vec<String> = Vec::new();
+            for e in Self::stmt_own_exprs(s) {
+                Self::collect_idents(e, &mut reads);
+            }
+            for name in &reads {
+                if self.locals.get(name).and_then(|t| self.handle_kind_of(t)).is_some()
+                    && !bound_here.contains(name)
+                    && !outer.contains(name)
+                {
+                    escaping.insert(name.clone());
+                }
+            }
+            // 2) Recurse into nested block bodies with the current scope carried in.
+            match s {
+                Stmt::If { then, elifs, else_, .. } => {
+                    let o = union_names(outer, &bound_here);
+                    self.scan_escaping_body(then, &o, escaping);
+                    for (_, b) in elifs { self.scan_escaping_body(b, &o, escaping); }
+                    if let Some(b) = else_ { self.scan_escaping_body(b, &o, escaping); }
+                }
+                Stmt::While { body, .. } => {
+                    let o = union_names(outer, &bound_here);
+                    self.scan_escaping_body(body, &o, escaping);
+                }
+                Stmt::For { targets, body, .. } => {
+                    let mut o = union_names(outer, &bound_here);
+                    for t in targets { o.insert(t.clone()); }
+                    self.scan_escaping_body(body, &o, escaping);
+                }
+                Stmt::Try { body, handlers, else_, finally_, .. } => {
+                    let o = union_names(outer, &bound_here);
+                    self.scan_escaping_body(body, &o, escaping);
+                    for h in handlers { self.scan_escaping_body(&h.body, &o, escaping); }
+                    if let Some(b) = else_ { self.scan_escaping_body(b, &o, escaping); }
+                    if let Some(b) = finally_ { self.scan_escaping_body(b, &o, escaping); }
+                }
+                Stmt::With { body, as_name, .. } => {
+                    let mut o = union_names(outer, &bound_here);
+                    if let Some(nm) = as_name { o.insert(nm.clone()); }
+                    self.scan_escaping_body(body, &o, escaping);
+                }
+                Stmt::Match { arms, .. } => {
+                    let o = union_names(outer, &bound_here);
+                    for a in arms { self.scan_escaping_body(&a.body, &o, escaping); }
+                }
+                _ => {}
+            }
+            // 3) Apply this statement's binding effect at THIS level.
+            if let Stmt::Assign { target, .. } = s {
+                bound_here.insert(target.clone());
+            }
+        }
+    }
+
+    /// (card 3d46471e) The sub-expressions of a statement evaluated at the
+    /// statement's OWN scope level (a block's condition / iterable / subject / RHS),
+    /// EXCLUDING the bodies of any nested block it introduces — those are scanned
+    /// separately by `scan_escaping_body`'s recursion with the correct child scope.
+    fn stmt_own_exprs(s: &Stmt) -> Vec<&Expr> {
+        match s {
+            Stmt::Expr(e) | Stmt::Return(Some(e), _) | Stmt::Yield(e, _)
+            | Stmt::Assign { value: e, .. } | Stmt::AugAssign { value: e, .. }
+            | Stmt::Unpack { value: e, .. } => vec![e],
+            Stmt::If { cond, elifs, .. } => {
+                let mut v = vec![cond];
+                for (c, _) in elifs { v.push(c); }
+                v
+            }
+            Stmt::While { cond, .. } => vec![cond],
+            Stmt::For { iter, .. } => vec![iter],
+            Stmt::Assert { cond, msg, .. } => {
+                let mut v = vec![cond];
+                if let Some(m) = msg { v.push(m); }
+                v
+            }
+            Stmt::Raise { exc: Some(e), .. } => vec![e],
+            Stmt::With { ctx_expr, .. } => vec![ctx_expr],
+            Stmt::Match { subject, arms, .. } => {
+                let mut v = vec![subject];
+                for a in arms { if let Some(g) = &a.guard { v.push(g); } }
+                v
+            }
+            Stmt::Del { target, .. } => vec![target],
+            Stmt::AttrAssign { obj, value, .. } => vec![obj, value],
+            Stmt::IndexAssign { obj, idx, value, .. } => vec![obj, idx, value],
+            _ => vec![],
+        }
+    }
+
+    /// (card 3d46471e) Collect every `Expr::Ident` NAME read anywhere inside `e`
+    /// (the receiver of an attr/index/call, a call argument, a binop operand, …).
+    /// A handle can only appear as a bare-name read, so this is a complete
+    /// enumeration of a handle's use sites within an expression.
+    fn collect_idents(e: &Expr, out: &mut Vec<String>) {
+        match e {
+            Expr::Ident(n, _) => out.push(n.clone()),
+            Expr::List(xs, _) | Expr::Tuple(xs, _) | Expr::Set(xs, _) => {
+                for x in xs { Self::collect_idents(x, out); }
+            }
+            Expr::Dict(kvs, _) => {
+                for (k, v) in kvs { Self::collect_idents(k, out); Self::collect_idents(v, out); }
+            }
+            Expr::Call { callee, args, kwargs, .. } => {
+                Self::collect_idents(callee, out);
+                for a in args { Self::collect_idents(a, out); }
+                for (_, v) in kwargs { Self::collect_idents(v, out); }
+            }
+            Expr::Attr { obj, .. } => Self::collect_idents(obj, out),
+            Expr::Index { obj, idx, .. } => { Self::collect_idents(obj, out); Self::collect_idents(idx, out); }
+            Expr::Slice { obj, start, stop, step, .. } => {
+                Self::collect_idents(obj, out);
+                for o in [start, stop, step] {
+                    if let Some(x) = o { Self::collect_idents(x, out); }
+                }
+            }
+            Expr::BinOp { lhs, rhs, .. } => { Self::collect_idents(lhs, out); Self::collect_idents(rhs, out); }
+            Expr::UnOp { expr, .. } => Self::collect_idents(expr, out),
+            Expr::IfExp { test, body, orelse, .. } => {
+                Self::collect_idents(test, out);
+                Self::collect_idents(body, out);
+                Self::collect_idents(orelse, out);
+            }
+            Expr::FStr(parts, _) => {
+                for p in parts {
+                    if let crate::ast::FStrPart::Interp(x, _) = p { Self::collect_idents(x, out); }
+                }
+            }
+            Expr::ListComp { elt, iter, cond, .. } | Expr::SetComp { elt, iter, cond, .. } => {
+                Self::collect_idents(elt, out);
+                Self::collect_idents(iter, out);
+                if let Some(c) = cond { Self::collect_idents(c, out); }
+            }
+            Expr::DictComp { key, val, iter, cond, .. } => {
+                Self::collect_idents(key, out);
+                Self::collect_idents(val, out);
+                Self::collect_idents(iter, out);
+                if let Some(c) = cond { Self::collect_idents(c, out); }
+            }
+            Expr::Lambda { body, .. } => Self::collect_idents(body, out),
+            _ => {}
         }
     }
 

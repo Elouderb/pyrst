@@ -1,0 +1,27 @@
+# card 3d46471e: an Option-slot handle passed BY REFERENCE (`Mut[Stream]` -> a
+# borrow, NOT a move). `cli` is first-bound in an if/else (survivor -> Option slot)
+# and handed to `ping` by reference, which lowers the place to
+# `&mut (*cli.as_mut().unwrap())` — a `&mut Stream` the callee expects, leaving the
+# slot `Some` so `cli` stays usable after the call (close it below). Loopback echo.
+from socket import bind, connect, Listener, Stream
+
+
+def ping(s: Mut[Stream]) -> None:
+    s.send(b"br")
+
+
+def main() -> None:
+    lis: Listener = bind("127.0.0.1", 0)
+    host, port = lis.getsockname()
+    ok: bool = True
+    if ok:
+        cli: Stream = connect(host, port)
+    else:
+        cli = connect(host, port)
+    conn: Stream = lis.accept()
+    ping(cli)                    # by-reference borrow — cli stays live after
+    got: bytes = conn.recv(2)
+    print(got)
+    cli.close()
+    conn.close()
+    lis.close()

@@ -166,6 +166,20 @@ pub struct Codegen<'a> {
     /// block shadow keeps its own name (a function-scope `let` shadow works). Empty
     /// until the hoist loop runs; saved/restored around a nested `def`.
     hoisted: std::collections::HashSet<String>,
+    /// (card 3d46471e) Function-scope OPTION-slot handles: a move-only handle
+    /// (`file` / socket Stream+Listener / re.Pattern — no `Default`, non-`Clone`)
+    /// that is FIRST bound inside a nested block (`if`/`try`/…) and READ AFTER that
+    /// block. It cannot get a plain `Default`-hoist like a value local, so the hoist
+    /// loop emits it as `let mut <n>: Option<Handle> = None;` at fn scope and records
+    /// the name here. While a name is in this set: an assignment `<n> = e` lowers to
+    /// `<n> = Some(e)`, a BORROW/receiver read to `<n>.as_ref()/.as_mut().unwrap()`,
+    /// a MOVE/consume read to `<n>.take().unwrap()`, and a by-reference place to
+    /// `(*<n>.as_mut().unwrap())`. EMPTY in the overwhelmingly common case (no handle
+    /// escapes its block), so every other program's emission is byte-identical — the
+    /// new lowering branches are all gated on membership here. Populated by
+    /// `collect_escaping_handles` + the hoist loops; function-scoped like `hoisted`
+    /// (cleared per `emit_func`, saved/restored around a nested `def`).
+    option_handles: std::collections::HashSet<String>,
     /// (card 575bcf3a, poison2) ACTIVE divergent shadows of hoisted locals in the
     /// CURRENT scope: pyrst name -> (mangled Rust binding, the hoisted SLOT type).
     /// When a hoisted local is reassigned to a type that conflicts with its slot

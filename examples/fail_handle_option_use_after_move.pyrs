@@ -1,0 +1,21 @@
+# card 3d46471e: use-after-move is STILL an honest check error for an Option-hoisted
+# handle. `s` is first bound in BOTH arms of an `if`/`else` (definitely assigned -> a
+# survivor that codegen would lower to an `Option<Stream>` fn-scope slot), then MOVED
+# (`g = s`) and read again (`s.send`). The move-checker tracks liveness by NAME, so
+# it fires on the Option-slot handle exactly as on a plain one — proving the hoist did
+# not weaken use-after-move detection. (Reject at BOTH check and build.)
+from socket import bind, connect, Listener, Stream
+
+
+def main() -> None:
+    lis: Listener = bind("127.0.0.1", 0)
+    host, port = lis.getsockname()
+    flag: bool = True
+    if flag:
+        s: Stream = connect(host, port)
+    else:
+        s = connect(host, port)
+    g: Stream = s          # moves `s` out of its Option slot (take())
+    s.send(b"boom")        # use after move — honest check error
+    g.close()
+    lis.close()

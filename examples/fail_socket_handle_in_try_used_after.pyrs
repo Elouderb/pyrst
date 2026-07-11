@@ -1,8 +1,9 @@
-# E2 fix (card 2f62ad54): a move-only socket handle FIRST bound inside a `try`
-# block and then read AFTER that block is an honest CHECK error (it used to leak a
-# raw rustc `E0425 cannot find value`). The `try:` body is its own Rust block; a
-# non-default handle is not hoisted out of it. The natural `try: s = connect()` to
-# CATCH a connect error must therefore keep every use of `s` inside the `try`.
+# card 3d46471e (refining E2 card 2f62ad54): a move-only socket handle bound in a
+# `try` body whose `except` handler NEITHER binds it NOR diverges (`pass`) MAY BE
+# UNASSIGNED after the `try` — if `connect` raises, the handler swallows it and falls
+# through with `s` unbound (Python: `UnboundLocalError`). An honest CHECK error. (The
+# handler must bind `s` too — the retry pattern, examples/handle_retry_socket.pyrs —
+# or diverge, e.g. `return`/`raise`, for `s` to be definitely assigned after.)
 from socket import connect, Stream
 
 
@@ -10,6 +11,6 @@ def main() -> None:
     try:
         s: Stream = connect("127.0.0.1", 9)
     except OSError:
-        return
-    # `s`'s binding is scoped to the `try` block — using it here is out of scope.
+        pass
+    # `s` may be unassigned here (the `except` swallowed the error) — honest check error.
     s.close()

@@ -1,0 +1,16 @@
+# card 3d46471e: an @extern re.Pattern handle compiled in BOTH arms of an `if`/`else`
+# (a SURVIVOR), then MATCHED after the block. Hoisted to `Option<__PyHandle_Pattern>`;
+# an @extern handle's methods take `&self`, so a read borrows via `.as_ref().unwrap()`
+# (a shared borrow — the plain-handle shape). Behavioral: findall on a subject.
+import re
+
+
+def main() -> None:
+    digits: bool = True
+    if digits:
+        p = re.compile("[0-9]+")
+    else:
+        p = re.compile("[a-z]+")
+    # `p` is first bound inside the if/else and used AFTER it.
+    print(p.findall("a1 b22 c333"))
+    print(p.findall("zero9nine"))

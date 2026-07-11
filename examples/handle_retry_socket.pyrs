@@ -1,0 +1,29 @@
+# card 3d46471e: THE RETRY PATTERN. `cli` is a move-only socket Stream handle
+# first-bound INSIDE a `try` AND its `except` handler (both branches assign), then
+# used AFTER the try. Under E2 this was an honest check error; the proper fix hoists
+# such a handle to a fn-scope `Option<Stream>` slot (`cli = Some(..)`, reads via
+# `.as_ref().unwrap()` / moves via `.take().unwrap()`) so the after-block use works.
+# A single-process loopback echo (connect completes into the backlog, accept pulls
+# it) so this RUNS behaviorally — the first connect succeeds, so the retry `except`
+# body is present-but-not-taken (it is still typeck-checked as a binding path).
+from socket import bind, connect, Listener, Stream
+
+
+def main() -> None:
+    lis: Listener = bind("127.0.0.1", 0)
+    host, port = lis.getsockname()
+    try:
+        cli: Stream = connect(host, port)
+    except OSError:
+        cli = connect(host, port)
+    conn: Stream = lis.accept()
+    # `cli` is READ here, AFTER the try/except that first bound it (the escaping use).
+    cli.send(b"ping")
+    got: bytes = conn.recv(1024)
+    print(got)
+    conn.send(got)
+    echo: bytes = cli.recv(1024)
+    print(echo)
+    cli.close()
+    conn.close()
+    lis.close()

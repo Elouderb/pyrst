@@ -3231,8 +3231,26 @@ impl<'a> Codegen<'a> {
                     // local, so this correctly precedes the module-const path.
                     m
                 } else if self.locals.contains_key(n) {
-                    // A local always wins its bare name (shadows a module const/fn).
-                    escape_ident(n)
+                    // (card 3d46471e) A read of an Option-slot handle in a BORROW
+                    // position (a method-call receiver — the only non-consuming read
+                    // of a handle) borrows THROUGH the slot: `.as_mut().unwrap()` for
+                    // the built-in `file` handle (its FILE_METHODS take `&mut self`),
+                    // `.as_ref().unwrap()` for an @extern handle (all `&self` via
+                    // interior `RefCell`, so a shared borrow preserves the plain-handle
+                    // borrow shape and keeps e.g. `s.send(s.recv())` legal). Every MOVE
+                    // read went through `emit_consuming` (`.take().unwrap()`) already,
+                    // so reaching here means a borrow.
+                    if self.option_handles.contains(n) {
+                        let acc = if self.locals.get(n).and_then(|t| self.handle_kind_of(t)) == Some("file") {
+                            "as_mut"
+                        } else {
+                            "as_ref"
+                        };
+                        format!("{}.{}().unwrap()", escape_ident(n), acc)
+                    } else {
+                        // A local always wins its bare name (shadows a module const/fn).
+                        escape_ident(n)
+                    }
                 } else if let Some((owner, gty)) = self.resolve_bare_global(n) {
                     // (W4-a) A bare read of a promoted MUTABLE GLOBAL that is NOT a
                     // local: `G.with(|c| c.get())` (Cell) / `G.with(|c| c.borrow()

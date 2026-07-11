@@ -14,6 +14,7 @@ struct DunderBodyScope {
     locals: HashMap<String, Ty>,
     declared: std::collections::HashSet<String>,
     hoisted: std::collections::HashSet<String>,
+    option_handles: std::collections::HashSet<String>,
 }
 
 impl<'a> Codegen<'a> {
@@ -380,6 +381,11 @@ impl<'a> Codegen<'a> {
             self.declared.remove(&g);
             self.hoisted.remove(&g);
         }
+        // (card 3d46471e) A move-only handle first-bound in a nested block and read
+        // AFTER it has no `Default`, so the value-hoist above skipped it. Give it a
+        // fn-scope `let mut <n>: Option<Handle> = None;` slot instead (see
+        // `emit_option_handle_hoists`).
+        self.emit_option_handle_hoists(&f.body, &param_names)?;
 
         for s in &f.body {
             self.emit_stmt(s)?;
@@ -408,6 +414,7 @@ impl<'a> Codegen<'a> {
         // function-scoped; reset them (and the deterministic shadow counter) so the
         // next function starts clean and never inherits a stale slot/shadow.
         self.hoisted.clear();
+        self.option_handles.clear();
         self.shadow_map.clear();
         self.shadow_counter = 0;
         self.current_ret_ty = saved_ret_ty;
@@ -416,6 +423,46 @@ impl<'a> Codegen<'a> {
         self.try_return_escape = saved_try_return_escape;
         self.try_loopctl_escape = saved_try_loopctl_escape;
         self.current_fn_type_params = saved_fn_type_params;
+        Ok(())
+    }
+
+    /// (card 3d46471e) Emit a fn-scope `Option<Handle>` slot for every move-only
+    /// handle that ESCAPES its defining block (`collect_escaping_handles`) — one that
+    /// is first bound inside an `if`/`try`/… and read after it, so it cannot keep its
+    /// inner-block `let` and (having no `Default`) cannot be plain-hoisted like a
+    /// value local. Records each in `option_handles`, so the Assign/read/by-ref
+    /// lowering wraps it (`= Some(..)`, `.as_ref()/.as_mut()/.take().unwrap()`,
+    /// `(*..as_mut().unwrap())`). Shared by `emit_func` and `emit_nested_def`, run
+    /// right after the value-hoist loop. Same param/`global`/already-`declared`
+    /// filters as the value hoist. A handle used only within its block is NOT in the
+    /// escaping set, so this is a no-op for it (byte-identical emit).
+    pub(crate) fn emit_option_handle_hoists(
+        &mut self,
+        body: &[Stmt],
+        params: &std::collections::HashSet<String>,
+    ) -> Result<()> {
+        let escaping = self.collect_escaping_handles(body);
+        let mut names: Vec<String> = escaping.into_iter()
+            .filter(|n| !params.contains(n)
+                        && !self.declared.contains(n)
+                        && !self.fn_globals.contains(n))
+            .collect();
+        names.sort();
+        for name in names {
+            let ty = self.locals.get(&name).cloned().unwrap_or(Ty::Unknown);
+            // Only a real handle type gets an Option slot (defence-in-depth: the
+            // escaping set is already handle-filtered).
+            if self.handle_kind_of(&ty).is_some() {
+                self.line(&format!(
+                    "let mut {}: Option<{}> = None;",
+                    escape_ident(&name), self.rust_ty(&ty)
+                ));
+                // The name now has a fn-scope binding, so drop any captured shadow.
+                self.shadow_map.remove(&name);
+                self.declared.insert(name.clone());
+                self.option_handles.insert(name);
+            }
+        }
         Ok(())
     }
 
@@ -444,6 +491,7 @@ impl<'a> Codegen<'a> {
             locals: self.locals.clone(),
             declared: self.declared.clone(),
             hoisted: self.hoisted.clone(),
+            option_handles: self.option_handles.clone(),
         }
     }
 
@@ -453,6 +501,7 @@ impl<'a> Codegen<'a> {
         self.locals = scope.locals;
         self.declared = scope.declared;
         self.hoisted = scope.hoisted;
+        self.option_handles = scope.option_handles;
         self.fn_globals = scope.fn_globals;
     }
 
@@ -1738,6 +1787,17 @@ impl<'a> Codegen<'a> {
     }
 
     pub(crate) fn emit_consuming(&mut self, e: &Expr) -> Result<String> {
+        // (card 3d46471e) An Option-slot handle in a MOVE position (assign RHS,
+        // return, by-value arg, container elem) is MOVED OUT of its fn-scope slot:
+        // `<n>.take().unwrap()` leaves the slot `None`. typeck's use-after-move check
+        // (which now also understands the slot) guarantees the moved name is never
+        // read again, so the `.unwrap()` is sound. Must precede the bare-move handle
+        // arm below (which would emit the raw name — an `Option<Handle>`, wrong type).
+        if let Expr::Ident(n, _) = e {
+            if self.option_handles.contains(n) {
+                return Ok(format!("{}.take().unwrap()", escape_ident(n)));
+            }
+        }
         if self.is_copy_type(&self.type_of_expr(e)) {
             return self.emit_expr(e);
         }
@@ -1825,6 +1885,15 @@ impl<'a> Codegen<'a> {
         prelude: &mut Vec<String>,
     ) -> Result<String> {
         match e {
+            // (card 3d46471e) An Option-slot handle used as a by-reference (`Mut[T]`)
+            // argument place derefs THROUGH the slot: `byref_borrow` then forms
+            // `&mut (*<n>.as_mut().unwrap())` — a `&mut Handle` the callee's
+            // `Mut[Handle]` param expects, leaving the slot `Some` (a borrow, not a
+            // move). A handle cannot be an attr/index base, so no other place shape
+            // reaches an Option-slot handle.
+            Expr::Ident(n, _) if self.option_handles.contains(n) => {
+                Ok(format!("(*{}.as_mut().unwrap())", escape_ident(n)))
+            }
             Expr::Ident(n, _) => Ok(escape_ident(n)),
             Expr::Attr { obj, name, .. } => {
                 let base = self.emit_place_hoisted(obj, prelude)?;

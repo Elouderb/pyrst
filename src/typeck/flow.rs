@@ -2644,29 +2644,32 @@ pub(crate) fn collect_returned_param_idents_expr(
 fn check_handle_flow(e: &Expr, env: &mut FuncEnv, consumed: bool) -> Result<()> {
     match e {
         Expr::Ident(name, span) => {
-            // (E2 fix, card 2f62ad54) A read of a handle whose only binding is
-            // inside an EXITED nested block. A move-only handle has no `Default`, so
-            // codegen does NOT hoist it to function scope (unlike a value local);
-            // its `let` stays scoped to the inner Rust block, and a use after that
-            // block is a raw rustc `E0425 cannot find value`. Reject it here as an
-            // honest CHECK error naming the restriction — before the move check,
-            // since the binding does not even exist at this point (out of scope is a
-            // more fundamental error than use-after-move). The proper fix (hoist a
-            // non-`Default` handle as an `Option<Handle>` fn-scope slot + rewrite
-            // reads) is a larger codegen change tracked separately.
+            // (card 3d46471e, refining E2 card 2f62ad54) A read of a handle that MAY
+            // BE UNASSIGNED here: it is only bound inside a nested block that does not
+            // run on every path (an `if` with no `else`, a `while`/`for` that may run
+            // zero times, or a `try`/`except` where a handler neither binds it nor
+            // diverges). A move-only handle cannot be given a placeholder default, so
+            // codegen would lower it to an `Option<Handle>` slot that could still be
+            // `None` on the missed path — Python raises `UnboundLocalError` there.
+            // Reject it as an honest CHECK error before the move check (an unassigned
+            // binding is more fundamental than use-after-move). A handle DEFINITELY
+            // assigned on every path (an `if`/`else` all-branches-bind, a `try`
+            // whose every normal-completion path binds) is NOT sealed and reads fine
+            // (codegen's Option-hoist makes the after-block use resolve).
             if env.block_scoped_handles.contains(name) {
                 let kind = env.locals.get(name).and_then(|t| t.handle_name())
                     .unwrap_or("handle").to_string();
                 return Err(Error::Type {
                     span: *span,
                     msg: format!(
-                        "handle `{name}` (`{kind}`) is first bound inside a nested \
-                         `if`/`while`/`for`/`try` block and used after that block — a \
-                         move-only handle has no default value, so (unlike an ordinary \
-                         local) it is NOT hoisted to function scope and stays scoped to \
-                         the block it is created in. Bind it BEFORE the block (e.g. \
-                         `open(...)`/`bind(...)`/`connect(...)` at function scope), or \
-                         keep every use of `{name}` INSIDE the same block",
+                        "handle `{name}` (`{kind}`) may be unassigned here — it is only \
+                         bound inside a nested block that does not run on every path (an \
+                         `if` with no `else`, a `while`/`for` that may run zero times, or \
+                         a `try` whose handler does not also bind it). A move-only handle \
+                         has no placeholder default, so pyrst cannot leave it possibly \
+                         unbound (Python would raise `UnboundLocalError`). Assign `{name}` \
+                         on every path (add an `else`, bind it in each `except`, or bind \
+                         it before the block), or keep every use of `{name}` inside the block",
                     ),
                 });
             }
@@ -2847,22 +2850,128 @@ fn block_scope_snapshot(env: &FuncEnv) -> std::collections::HashSet<String> {
         .collect()
 }
 
-/// (E2 fix, card 2f62ad54) Seal a just-exited nested block: every handle-typed
-/// local NOT present in the pre-block snapshot is now out of scope (its `let` is
-/// scoped to the inner Rust block a move-only, non-`Default` handle is never
-/// hoisted out of), so record it in `block_scoped_handles`. A later READ of such a
-/// name is an honest CHECK error (`check_handle_flow`'s Ident arm) instead of a
-/// raw rustc `E0425 cannot find value`. Called at the END of each block arm, after
-/// any per-arm `locals` restore, so a `with`-bound or `match`-capture name that is
-/// already removed from `locals` is never wrongly sealed.
-fn seal_block_scope(env: &mut FuncEnv, pre: &std::collections::HashSet<String>) {
+/// (card 3d46471e, refining E2 card 2f62ad54) Seal a just-exited nested block. A
+/// handle-typed local NOT in the pre-block snapshot was first-bound inside this
+/// block; codegen lowers it to a fn-scope `Option<Handle>` slot IF (and only if) it
+/// is read after the block. That slot starts `None`, so a read is only sound when
+/// the handle is DEFINITELY assigned on every path through the construct. So:
+///   - definitely bound by `stmt` (an `if`/`elif`/`else` all-branches-bind, a
+///     `try`/`except` whose every normal-completion path binds, a `with` body, an
+///     exhaustive `match`) → a SURVIVOR: leave it in scope (and un-seal it if a
+///     prior sibling block had sealed it) so the after-block read is accepted and
+///     codegen's Option-hoist resolves it.
+///   - otherwise (an `if` with no `else`, a `while`/`for` that may run zero times, a
+///     `try` handler that neither binds nor diverges) → MAYBE-UNASSIGNED: seal it, so
+///     a later read is the honest CHECK error in `check_handle_flow`'s Ident arm
+///     (Python would raise `UnboundLocalError`) rather than an `Option::None.unwrap()`
+///     panic on the missed path. Called at the END of each block arm, after any
+///     per-arm `locals` restore, so a `with`-bound or `match`-capture name that is
+///     already removed from `locals` is never wrongly considered.
+fn seal_block_scope(env: &mut FuncEnv, pre: &std::collections::HashSet<String>, stmt: &Stmt) {
     let newly_scoped: Vec<String> = env.locals.iter()
         .filter(|(n, t)| t.handle_name().is_some() && !pre.contains(n.as_str()))
         .map(|(n, _)| n.clone())
         .collect();
     for n in newly_scoped {
-        env.block_scoped_handles.insert(n);
+        if stmt_definitely_binds(stmt, &n) {
+            // Definitely assigned on every path → survives (may revive a prior seal).
+            env.block_scoped_handles.remove(&n);
+        } else {
+            env.block_scoped_handles.insert(n);
+        }
     }
+}
+
+/// (card 3d46471e) True if `body`, when executed, assigns `name` on EVERY path that
+/// completes normally — control never falls out of `body` with `name` still unbound.
+/// A binding of `name` guarantees it from that point on; a diverging statement
+/// (`return`/`raise`/`break`/`continue`, or an all-exits-diverge `if`/`try`/`with`)
+/// means no normal path continues past it, so the binding requirement is vacuous
+/// there. A statement that only PARTIALLY binds/diverges is skipped — `name` may
+/// still be bound by a later statement (else the fall-through at the end is `false`).
+fn body_definitely_binds(body: &[Stmt], name: &str) -> bool {
+    for s in body {
+        if stmt_definitely_binds(s, name) { return true; }
+        if stmt_diverges(s) { return true; }
+    }
+    false
+}
+
+/// (card 3d46471e) True if executing `s` definitely leaves `name` bound on every
+/// normally-completing path (see `body_definitely_binds`).
+fn stmt_definitely_binds(s: &Stmt, name: &str) -> bool {
+    match s {
+        Stmt::Assign { target, .. } => target == name,
+        Stmt::Unpack { targets, .. } => targets.iter().any(|t| t == name),
+        Stmt::If { then, elifs, else_, .. } => {
+            // Needs an `else`: the fall-through path (no branch taken) binds nothing.
+            else_.as_ref().is_some_and(|e| {
+                body_definitely_binds(then, name)
+                    && elifs.iter().all(|(_, b)| body_definitely_binds(b, name))
+                    && body_definitely_binds(e, name)
+            })
+        }
+        Stmt::Try { body, handlers, else_, finally_, .. } => {
+            // A `finally` that binds runs on every normal exit of the try.
+            if finally_.as_ref().is_some_and(|f| body_definitely_binds(f, name)) {
+                return true;
+            }
+            // Else: the try-body-then-else normal path AND every handler that
+            // completes normally must bind it (a handler that diverges is vacuous —
+            // `body_definitely_binds` counts a diverging handler body as binding).
+            let try_path = body_definitely_binds(body, name)
+                || else_.as_ref().is_some_and(|e| body_definitely_binds(e, name));
+            let handlers_bind = handlers.iter().all(|h| body_definitely_binds(&h.body, name));
+            try_path && handlers_bind
+        }
+        // A `with` body runs exactly once. NOTE: this only considers a binding of
+        // `name` INSIDE the body; it intentionally ignores the with-statement's own
+        // `as_name`. That is safe (and inert today): a handle bound by the with-`as`
+        // target is scoped to the `with` — `check_stmt`'s With arm removes/restores
+        // `as_name` from `env.locals` around the body, so an after-block read of an
+        // `as_name` handle is already handled by that separate mechanism, not here.
+        Stmt::With { body, .. } => body_definitely_binds(body, name),
+        // An exhaustive `match` (a wildcard/bare-capture arm with no guard) whose
+        // every arm binds.
+        Stmt::Match { arms, .. } => {
+            arms.iter().any(|a| a.guard.is_none()
+                && matches!(a.pattern, MatchPattern::Wildcard | MatchPattern::Capture(_)))
+                && arms.iter().all(|a| body_definitely_binds(&a.body, name))
+        }
+        // A `while`/`for` body may run zero times — never a guaranteed binding.
+        _ => false,
+    }
+}
+
+/// (card 3d46471e) True if `s` never completes normally (control cannot fall through
+/// past it): a jump (`return`/`raise`/`break`/`continue`), or an `if`/`try`/`with`
+/// whose every exit diverges. Conservative — an unrecognised shape falls through.
+fn stmt_diverges(s: &Stmt) -> bool {
+    match s {
+        Stmt::Return(..) | Stmt::Raise { .. } | Stmt::Break(..) | Stmt::Continue(..) => true,
+        Stmt::If { then, elifs, else_, .. } => {
+            else_.as_ref().is_some_and(|e| {
+                body_diverges(then)
+                    && elifs.iter().all(|(_, b)| body_diverges(b))
+                    && body_diverges(e)
+            })
+        }
+        Stmt::With { body, .. } => body_diverges(body),
+        Stmt::Try { body, handlers, else_, finally_, .. } => {
+            if finally_.as_ref().is_some_and(|f| body_diverges(f)) { return true; }
+            let try_path = body_diverges(body)
+                || else_.as_ref().is_some_and(|e| body_diverges(e));
+            let handlers_diverge = handlers.iter().all(|h| body_diverges(&h.body));
+            try_path && handlers_diverge
+        }
+        _ => false,
+    }
+}
+
+/// (card 3d46471e) True if control never falls out of `body` (some statement
+/// diverges, making the rest unreachable).
+fn body_diverges(body: &[Stmt]) -> bool {
+    body.iter().any(stmt_diverges)
 }
 
 /// (E1 fix / P1) Walk the RECEIVER SPINE of an assignment place — the `Index.obj`
@@ -3403,7 +3512,7 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
                 }
             }
             // (E2 fix, card 2f62ad54) Seal handles first-bound in this `if`.
-            seal_block_scope(env, &bss_pre);
+            seal_block_scope(env, &bss_pre, s);
             Ok(())
         }
         Stmt::While { cond, body, .. } => {
@@ -3453,7 +3562,7 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             env.loop_handles.pop();
             rewiden_loop_narrows(&pre_loop, env);
             // (E2 fix, card 2f62ad54) Seal handles first-bound in this `while` body.
-            seal_block_scope(env, &bss_pre);
+            seal_block_scope(env, &bss_pre, s);
             Ok(())
         }
         Stmt::For { targets, iter, body, span } => {
@@ -3529,7 +3638,7 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             env.loop_handles.pop();
             rewiden_loop_narrows(&pre_loop, env);
             // (E2 fix, card 2f62ad54) Seal handles first-bound in this `for` body.
-            seal_block_scope(env, &bss_pre);
+            seal_block_scope(env, &bss_pre, s);
             Ok(())
         }
         Stmt::Import { .. } => Ok(()), // Ignored in v0
@@ -3573,12 +3682,12 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             // read in `else` is an E0425), so seal the body/handler handles NOW —
             // before checking `else`/`finally` — so a read of one there is an honest
             // CHECK error too, not a rustc leak.
-            seal_block_scope(env, &bss_pre);
+            seal_block_scope(env, &bss_pre, s);
             if let Some(b) = else_ { check_body(b, env)?; }
             if let Some(b) = finally_ { check_body(b, env)?; }
             // Seal any handle first-bound in `else`/`finally` too — a use after the
             // whole `try` statement is out of scope.
-            seal_block_scope(env, &bss_pre);
+            seal_block_scope(env, &bss_pre, s);
             Ok(())
         }
         Stmt::With { ctx_expr, as_name, body, .. } => {
@@ -3640,7 +3749,7 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
                 }
             }
             // (E2 fix, card 2f62ad54) Seal handles first-bound in this `with` body.
-            seal_block_scope(env, &bss_pre);
+            seal_block_scope(env, &bss_pre, s);
             Ok(())
         }
         Stmt::Del { target, span } => {
@@ -3759,7 +3868,7 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             moved_paths.push(moved_pre.clone());
             env.moved = union_moved(&moved_paths);
             // (E2 fix, card 2f62ad54) Seal handles first-bound in any `match` arm.
-            seal_block_scope(env, &bss_pre);
+            seal_block_scope(env, &bss_pre, s);
             Ok(())
         }
         Stmt::AttrAssign { obj, attr, value, span } => {

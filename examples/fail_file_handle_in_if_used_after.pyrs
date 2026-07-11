@@ -1,11 +1,11 @@
-# E2 fix (card 2f62ad54): the built-in `file` handle shares the block-scoping
-# restriction (it is `Ty::Handle`, non-default, like the socket handles). An
-# `open()` handle FIRST bound inside an `if` block and read AFTER it is an honest
-# CHECK error — the same shape that used to leak a raw rustc `E0425` — not a
-# socket-specific rule. Bind it before the block, or keep its use inside it.
+# card 3d46471e (refining E2 card 2f62ad54): the built-in `file` handle shares the
+# maybe-unassigned rule (it is `Ty::Handle`, non-default, like the socket handles).
+# An `open()` handle bound ONLY inside an `if` with NO `else`, read AFTER it, may be
+# unassigned on the no-branch path — an honest CHECK error (Python: `UnboundLocalError`),
+# not a socket-specific rule. Add an `else` (definitely assigned) or bind before the block.
 def main() -> None:
     flag: bool = True
     if flag:
-        f = open("scratch.txt", "w")
-    # `f`'s binding is scoped to the `if` block — using it here is out of scope.
+        f = open("/tmp/pyrst_handle_fail_if.txt", "w")
+    # `f` may be unassigned here (no `else` binds it) — honest check error.
     f.close()

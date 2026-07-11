@@ -1,0 +1,2 @@
+send-after-close OSError
+recv-after-close OSError

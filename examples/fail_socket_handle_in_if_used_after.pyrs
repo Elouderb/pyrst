@@ -1,8 +1,10 @@
-# E2 fix (card 2f62ad54): a move-only socket handle FIRST bound inside an `if`
-# block and then read AFTER that block is an honest CHECK error (it used to leak a
-# raw rustc `E0425 cannot find value`). A handle has no default value, so — unlike
-# an ordinary local — codegen does NOT hoist it to function scope; its `let` stays
-# scoped to the `if` block. Bind it before the block, or keep its use inside it.
+# card 3d46471e (refining E2 card 2f62ad54): a move-only socket handle bound ONLY
+# inside an `if` with NO `else`, then read AFTER the block, MAY BE UNASSIGNED (if
+# `flag` is False, `s` is never bound — Python raises `UnboundLocalError`). A
+# move-only handle has no placeholder default, so pyrst rejects the maybe-unassigned
+# read as an honest CHECK error rather than emitting an `Option::None.unwrap()` panic
+# on the missed path. (A handle bound in BOTH an `if` AND its `else` is definitely
+# assigned and IS accepted — see examples/handle_if_else_file.pyrs.)
 from socket import connect, Stream
 
 
@@ -10,5 +12,5 @@ def main() -> None:
     flag: bool = True
     if flag:
         s: Stream = connect("127.0.0.1", 9)
-    # `s`'s binding is scoped to the `if` block — using it here is out of scope.
+    # `s` may be unassigned here (no `else` binds it) — honest check error.
     s.close()

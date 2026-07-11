@@ -311,6 +311,16 @@ impl<'a> Codegen<'a> {
                             }
                         }
                     }
+                } else if self.option_handles.contains(target) {
+                    // (card 3d46471e) Assigning to an Option-slot handle (its fn-scope
+                    // `let mut <n>: Option<Handle> = None;` was emitted by the hoist).
+                    // Wrap the moved handle value in `Some(..)` so the slot becomes
+                    // live; a bare-handle RHS goes through `emit_consuming` (a plain
+                    // handle is a bare move, another Option-slot handle a `.take()`).
+                    // No shadow/divergence machinery applies — a handle's type is
+                    // fixed — so this bypasses the reassignment else-branch below.
+                    let v = self.emit_consuming(value)?;
+                    self.line(&format!("{} = Some({});", escape_ident(target), v));
                 } else {
                     let cur = self.locals.get(target).cloned().unwrap_or(Ty::Unknown);
                     // (first-class functions) Reassigning a Callable-typed (or
@@ -1550,6 +1560,9 @@ impl<'a> Codegen<'a> {
         // counter are per-function: the nested closure gets its OWN (empty / 0) and
         // the enclosing function's are restored on exit, mirroring locals/declared.
         let saved_hoisted = std::mem::take(&mut self.hoisted);
+        // (card 3d46471e) The Option-slot handle set is per-function like `hoisted`:
+        // the closure starts with none and the enclosing set is restored on exit.
+        let saved_option_handles = std::mem::take(&mut self.option_handles);
         // (card 575bcf3a fix) KEEP the definition-site shadow_map (only a CLONE is
         // saved for restore) so a READ of a captured enclosing name that is actively
         // shadowed at this point resolves to the mangled binding the `move` closure
@@ -1625,6 +1638,9 @@ impl<'a> Codegen<'a> {
             self.declared.remove(&g);
             self.hoisted.remove(&g);
         }
+        // (card 3d46471e) Same fn-scope `Option<Handle>` hoist as `emit_func`, for a
+        // move-only handle that escapes a block inside THIS closure's own body.
+        self.emit_option_handle_hoists(&f.body, &param_names)?;
         for s in &f.body {
             self.emit_stmt(s)?;
         }
@@ -1638,6 +1654,7 @@ impl<'a> Codegen<'a> {
         self.in_generator = saved_in_generator;
         self.by_ref_locals = saved_by_ref;
         self.hoisted = saved_hoisted;
+        self.option_handles = saved_option_handles;
         self.shadow_map = saved_shadow_map;
         self.shadow_counter = saved_shadow_counter;
         self.fn_globals = saved_fn_globals;

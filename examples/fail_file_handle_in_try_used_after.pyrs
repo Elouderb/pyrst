@@ -1,12 +1,12 @@
-# E2 fix (card 2f62ad54): the built-in `file` handle shares the block-scoping
-# restriction (it is `Ty::Handle`, non-default, like the socket handles). An
-# `open()` handle FIRST bound inside a `try` block and read AFTER it is an honest
-# CHECK error — the same shape that used to leak a raw rustc `E0425` — not a
-# socket-specific rule. Keep every use of `f` inside the `try` block.
+# card 3d46471e (refining E2 card 2f62ad54): the built-in `file` handle shares the
+# maybe-unassigned rule. An `open()` handle bound in a `try` body whose `except`
+# handler neither binds it nor diverges (`pass`) may be unassigned after the `try`
+# (if `open` raises, the handler swallows it and `f` is unbound) — an honest CHECK
+# error (Python: `UnboundLocalError`). Bind `f` in the handler too, or let it diverge.
 def main() -> None:
     try:
-        f = open("scratch.txt", "w")
+        f = open("/tmp/pyrst_handle_fail_try.txt", "w")
     except OSError:
-        return
-    # `f`'s binding is scoped to the `try` block — using it here is out of scope.
+        pass
+    # `f` may be unassigned here (the `except` swallowed the error) — honest check error.
     f.close()

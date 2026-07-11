@@ -1,0 +1,32 @@
+# card 3d46471e: CRITICAL — use-after-close STILL raises the catchable OSError
+# [Errno 9] on an OPTION-HOISTED handle. `cli` is bound in BOTH arms of an if/else
+# (a survivor -> a fn-scope `Option<Stream>` slot), then closed and used after. The
+# outer Option slot (the binding) is Some; close() nulls the INNER RefCell resource,
+# so the after-close send sees the inner None and raises OSError [Errno 9] exactly as
+# for a plain handle — the Option-hoist did NOT break close-then-use detection.
+from socket import bind, connect, Listener, Stream
+
+
+def main() -> None:
+    lis: Listener = bind("127.0.0.1", 0)
+    host, port = lis.getsockname()
+    ok: bool = True
+    if ok:
+        cli: Stream = connect(host, port)
+    else:
+        cli = connect(host, port)
+    conn: Stream = lis.accept()
+    # `cli` (option-hoisted) is used AFTER the if/else: close it, then use-after-close.
+    cli.close()
+    try:
+        cli.send(b"x")
+        print("no error (wrong)")
+    except OSError:
+        print("send-after-close OSError")
+    try:
+        print(cli.recv(10))
+        print("no error (wrong)")
+    except OSError:
+        print("recv-after-close OSError")
+    conn.close()
+    lis.close()

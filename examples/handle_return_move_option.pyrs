@@ -1,0 +1,37 @@
+# card 3d46471e: the MOVE use-sites of an Option-slot handle (via `take().unwrap()`).
+# - `open_client` first-binds `c` in an if/else (survivor -> Option slot) and RETURNS
+#   it: a return is a move -> `c.take().unwrap()`.
+# - `main` first-binds `cli` in an if/else (Option slot) and passes it BY VALUE to
+#   `consume`: a by-value arg is a move -> `cli.take().unwrap()`.
+# Loopback echo proves both moves transfer a live socket.
+from socket import bind, connect, Listener, Stream
+
+
+def open_client(host: str, port: int) -> Stream:
+    ok: bool = True
+    if ok:
+        c: Stream = connect(host, port)
+    else:
+        c = connect(host, port)
+    return c
+
+
+def consume(s: Stream) -> None:
+    s.send(b"mv")
+    s.close()
+
+
+def main() -> None:
+    lis: Listener = bind("127.0.0.1", 0)
+    host, port = lis.getsockname()
+    fresh: bool = True
+    if fresh:
+        cli: Stream = open_client(host, port)
+    else:
+        cli = open_client(host, port)
+    conn: Stream = lis.accept()
+    consume(cli)                 # `cli` moved by value into consume
+    got: bytes = conn.recv(2)
+    print(got)
+    conn.close()
+    lis.close()

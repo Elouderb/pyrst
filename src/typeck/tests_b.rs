@@ -1884,3 +1884,58 @@ def my_fn() -> float:
         let src = "class C:\n    n: int\n    def __init__(self) -> None:\n        self.n = 0\n    def __bool__(self, x: int) -> bool:\n        return True\ndef main() -> None:\n    pass\n";
         assert_type_err_unit(check_src(src), "no arguments other than self");
     }
+
+    #[test]
+    fn seq_repeat_infers_sequence_type_not_int() {
+        // (card ed1d85cc) The codegen type-oracle `infer_expr_ty` must type a
+        // sequence-repeat as its SEQUENCE type: `[0.0]*4` -> list[float],
+        // `3*[7]` -> list[int], `"ab"*3` -> str. The former int-biased fallthrough
+        // returned `Int`, which — as the inferred value-type of a block-scoped
+        // HOISTED binding — diverged from the real list/str slot and drove the
+        // reassign machinery to spill the sized initializer into a discarded shadow
+        // (an empty `Vec::new()` slot, then a runtime index panic). Bytes and a
+        // class `__mul__` are typed elsewhere; guarded on an `int` count so no
+        // invalid form is newly accepted.
+        let ctx = TyCtx::new();
+        let locals = HashMap::new();
+        let mul = |l: Expr, r: Expr| Expr::BinOp {
+            op: BinOp::Mul,
+            lhs: Box::new(l),
+            rhs: Box::new(r),
+            span: Span::DUMMY,
+        };
+        // [0.0] * 4  ->  list[float]
+        let list_f = Expr::List(vec![float_lit(0.0)], Span::DUMMY);
+        assert_eq!(
+            infer_expr_ty(&mul(list_f, int_lit(4)), &locals, &ctx),
+            Ty::List(Box::new(Ty::Float)),
+        );
+        // 3 * [7]  ->  list[int]  (the int operand on the LEFT)
+        let list_i = Expr::List(vec![int_lit(7)], Span::DUMMY);
+        assert_eq!(
+            infer_expr_ty(&mul(int_lit(3), list_i), &locals, &ctx),
+            Ty::List(Box::new(Ty::Int)),
+        );
+        // "ab" * 3  ->  str
+        assert_eq!(
+            infer_expr_ty(&mul(str_lit("ab"), int_lit(3)), &locals, &ctx),
+            Ty::Str,
+        );
+        // (review ed1d85cc/578) a BOOL count is a valid repeat (Python `bool` is an
+        // `int` subtype), so it must keep the sequence type too — an Int-only guard
+        // left the silent miscompile live for `[x]*True`. Both orderings, list + str.
+        let list_f2 = Expr::List(vec![float_lit(0.0)], Span::DUMMY);
+        assert_eq!(
+            infer_expr_ty(&mul(list_f2, bool_lit(true)), &locals, &ctx),
+            Ty::List(Box::new(Ty::Float)),
+        );
+        let list_i2 = Expr::List(vec![int_lit(7)], Span::DUMMY);
+        assert_eq!(
+            infer_expr_ty(&mul(bool_lit(true), list_i2), &locals, &ctx),
+            Ty::List(Box::new(Ty::Int)),
+        );
+        assert_eq!(
+            infer_expr_ty(&mul(str_lit("ab"), bool_lit(true)), &locals, &ctx),
+            Ty::Str,
+        );
+    }

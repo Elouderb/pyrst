@@ -1199,3 +1199,59 @@ def main() -> None:
             );
         }
     }
+
+    #[test]
+    fn block_scoped_seq_repeat_fills_hoisted_slot_no_shadow() {
+        // (card ed1d85cc) A sequence-repeat initializer (`[x]*n`) DECLARED inside a
+        // nested block must lower its SIZED value into the hoisted function-scope
+        // slot — not into a discarded shadow. Regression guard for the silent
+        // miscompile: `buf` was hoisted `Vec::new()` (empty), the `[0.0]*4` was
+        // emitted into `__pyrst_shadow_buf_0`, and `buf[i]=..` then indexed the
+        // still-empty slot and panicked at runtime on valid Python.
+        let src = "\
+def f() -> int:
+    if True:
+        buf: list[float] = [0.0] * 4
+        buf[0] = 1.0
+        return len(buf)
+    return -1
+";
+        let out = emit_src(src);
+        assert!(
+            !out.contains("__pyrst_shadow_buf"),
+            "block-scoped `[x]*n` must not spill into a discarded shadow:\n{out}"
+        );
+        // The hoisted `buf` is REASSIGNED (`buf = ...`, not a fresh `let`) with the
+        // sized repeat builder (`__rep`), so the index write hits the filled slot.
+        assert!(
+            out.contains("buf = {") && out.contains("__rep"),
+            "the sized repeat must be reassigned into the hoisted `buf`:\n{out}"
+        );
+    }
+
+    #[test]
+    fn block_scoped_seq_repeat_bool_count_fills_hoisted_slot_no_shadow() {
+        // (review ed1d85cc/578) A BOOL repeat count (`[x]*True`) is valid Python
+        // (bool is an int subtype). The first fix guarded only on Ty::Int, so a
+        // bool count still mis-typed to Int, still diverged from the hoisted list
+        // slot, and still spilled the sized value into a discarded shadow -> the
+        // exact silent miscompile stayed live for `[x]*True`. Same no-shadow /
+        // reassign-into-slot guarantee as the int-count case.
+        let src = "\
+def f() -> int:
+    if True:
+        buf: list[float] = [0.0] * True
+        buf[0] = 1.0
+        return len(buf)
+    return -1
+";
+        let out = emit_src(src);
+        assert!(
+            !out.contains("__pyrst_shadow_buf"),
+            "block-scoped `[x]*True` must not spill into a discarded shadow:\n{out}"
+        );
+        assert!(
+            out.contains("buf = {") && out.contains("__rep"),
+            "the sized bool-count repeat must be reassigned into the hoisted `buf`:\n{out}"
+        );
+    }

@@ -739,6 +739,31 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
             if (l == Ty::Bytes || r == Ty::Bytes) && matches!(op, BinOp::Add | BinOp::Mul) {
                 return Ty::Bytes;
             }
+            // (card ed1d85cc) SEQUENCE REPETITION `seq * int` / `int * seq`: a
+            // `list` repeated by an int keeps the list type; a `str` repeated by an
+            // int is a `str` — mirroring codegen's Mul EMISSION (codegen/exprs.rs:
+            // list-repeat -> `Vec`, str-repeat -> `String`) and the bytes rule just
+            // above. WITHOUT this the int-biased arithmetic arm below returned
+            // `Ty::Int` for `[0.0]*n` / `"a"*n`; as the inferred value-type of a
+            // block-scoped HOISTED binding that `Int` diverged from the real slot
+            // type (`branch_divergent(List, Int)` == true), so the reassign
+            // machinery emitted a discarded shadow and left the sized initializer
+            // out of the hoisted slot — a silent miscompile (empty `Vec::new()`
+            // then `buf[i]=..` panics). Guarded on an int/bool COUNT — Python's
+            // `bool` is an `int` subtype and a valid repeat count (`[x]*True`), but
+            // pyrst types it `Ty::Bool`, so an `Int`-only guard would MISS it and
+            // leave the exact silent miscompile live for a bool count (review
+            // ed1d85cc/578, lead-reproduced). No invalid form is newly accepted
+            // (only a sequence LHS/RHS pairs with the int|bool count). `bytes*int`
+            // handled above; a class `__mul__` is handled in the arithmetic arm below.
+            if *op == BinOp::Mul {
+                if matches!((&l, &r), (Ty::List(_), Ty::Int | Ty::Bool)) { return l; }
+                if matches!((&l, &r), (Ty::Int | Ty::Bool, Ty::List(_))) { return r; }
+                if matches!((&l, &r),
+                    (Ty::Str, Ty::Int | Ty::Bool) | (Ty::Int | Ty::Bool, Ty::Str)) {
+                    return Ty::Str;
+                }
+            }
             match op {
                 // D5: Python `**` always yields a float (split out of the
                 // int-biased arithmetic arm below — codegen's bug).
@@ -1453,6 +1478,24 @@ pub(crate) fn infer_expr_ty_bound(
         Expr::BinOp { lhs, op, rhs, .. } => {
             let l = infer_expr_ty_bound(lhs, param, elem, locals, ctx);
             let r = infer_expr_ty_bound(rhs, param, elem, locals, ctx);
+            // (card ed1d85cc, review 578) SEQUENCE REPETITION — mirrored from
+            // `infer_expr_ty`'s Mul arm. This bound oracle IS reachable from
+            // `infer_expr_ty`'s `map` arm via `lambda_applied_ty` (e.g.
+            // `map(lambda row: row * n, xs)` with `row: list[..]`), so without this
+            // it mis-types the body as `Int`, the map result as `list[int]`, and a
+            // block-scoped binding taken from `ys[0]` reopens the very hoist/shadow
+            // silent miscompile this card closes — today inert ONLY by an unrelated
+            // lambda-param-typing gap (an incidental, not designed, guard). Kept
+            // identical to the main oracle: `list`/`str` repeated by an int|bool
+            // count keeps the sequence type; bytes/class-`__mul__` handled elsewhere.
+            if *op == BinOp::Mul {
+                if matches!((&l, &r), (Ty::List(_), Ty::Int | Ty::Bool)) { return l; }
+                if matches!((&l, &r), (Ty::Int | Ty::Bool, Ty::List(_))) { return r; }
+                if matches!((&l, &r),
+                    (Ty::Str, Ty::Int | Ty::Bool) | (Ty::Int | Ty::Bool, Ty::Str)) {
+                    return Ty::Str;
+                }
+            }
             match op {
                 BinOp::Div | BinOp::Pow => Ty::Float,
                 BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Mod | BinOp::FloorDiv => {

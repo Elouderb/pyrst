@@ -573,6 +573,35 @@ impl<'a> Codegen<'a> {
                     self.line(&format!("{} = {};", tgt, rhs));
                     return Ok(());
                 }
+                // (card 333e34a7) Augmented arithmetic on a user-class target whose
+                // class defines the operator's dunder (`/= //= %= **=`) desugars to
+                // `target = target <op> value`, routing through the BinOp lowering
+                // that emits the dunder method call — the same shape as the set /
+                // global augmented desugars above. pyrst models no in-place dunders
+                // (`__itruediv__` etc.), so this matches CPython's fallback to the
+                // binary dunder. The RHS is emitted ONCE, inside the synthesized
+                // BinOp. Scoped to the four operators this card routes; `+= -= *=`
+                // on a class keep their prior behavior (the non-Copy arm below).
+                if matches!(op, BinOp::Div | BinOp::FloorDiv | BinOp::Mod | BinOp::Pow) {
+                    if let Ty::Class(cls, _) = &target_ty {
+                        if op.arith_dunder()
+                            .and_then(|d| self.ctx.get_method(cls, d))
+                            .is_some()
+                        {
+                            let desugar = Expr::BinOp {
+                                op: *op,
+                                lhs: Box::new(Expr::Ident(target.clone(), *span)),
+                                rhs: Box::new(value.clone()),
+                                span: *span,
+                            };
+                            let rhs = self.emit_expr(&desugar)?;
+                            let tgt = self.shadow_read_name(target)
+                                .unwrap_or_else(|| escape_ident(target));
+                            self.line(&format!("{} = {};", tgt, rhs));
+                            return Ok(());
+                        }
+                    }
+                }
                 // (card 12052b4c) `xs += ys` (list target, Add) lowers to
                 // `xs.extend(<rhs>)` and `s += t` (str target, Add) lowers to
                 // `s += &(<rhs>)` below — both need the RHS built through the uniform

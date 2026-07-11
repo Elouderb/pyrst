@@ -764,26 +764,28 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
                     return Ty::Str;
                 }
             }
+            // (card 333e34a7) OPERATOR OVERLOADING for a user-class lhs: the result
+            // type is the matching dunder's declared return. Placed BEFORE the
+            // `match op` below so it wins over the builtin `Pow=>Float`/`Div=>Float`
+            // shortcut (which formerly made `/`/`**` skip `__truediv__`/`__pow__`)
+            // and covers `// %` too, mirroring `check_expr`. Fires ONLY when the
+            // class actually defines the dunder — a class lhs WITHOUT it falls
+            // through to the prior builtin behavior unchanged; a non-class lhs never
+            // enters here.
+            if let Ty::Class(cls, _) = &l {
+                if let Some(ret) = op.arith_dunder()
+                    .and_then(|d| ctx.get_method(cls, d))
+                    .map(|s| s.ret.clone())
+                {
+                    return ret;
+                }
+            }
             match op {
                 // D5: Python `**` always yields a float (split out of the
                 // int-biased arithmetic arm below — codegen's bug).
                 BinOp::Pow => Ty::Float,
                 BinOp::Div => Ty::Float,
                 BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Mod | BinOp::FloorDiv => {
-                    // Operator overloading: a class lhs uses its dunder return type.
-                    if let Ty::Class(cls, _) = &l {
-                        let dunder = match op {
-                            BinOp::Add => Some("__add__"),
-                            BinOp::Sub => Some("__sub__"),
-                            BinOp::Mul => Some("__mul__"),
-                            _ => None,
-                        };
-                        if let Some(ret) =
-                            dunder.and_then(|d| ctx.get_method(cls, d)).map(|s| s.ret.clone())
-                        {
-                            return ret;
-                        }
-                    }
                     // String concatenation for Add.
                     if *op == BinOp::Add && (l == Ty::Str || r == Ty::Str) {
                         Ty::Str
@@ -1478,22 +1480,36 @@ pub(crate) fn infer_expr_ty_bound(
         Expr::BinOp { lhs, op, rhs, .. } => {
             let l = infer_expr_ty_bound(lhs, param, elem, locals, ctx);
             let r = infer_expr_ty_bound(rhs, param, elem, locals, ctx);
-            // (card ed1d85cc, review 578) SEQUENCE REPETITION — mirrored from
-            // `infer_expr_ty`'s Mul arm. This bound oracle IS reachable from
-            // `infer_expr_ty`'s `map` arm via `lambda_applied_ty` (e.g.
-            // `map(lambda row: row * n, xs)` with `row: list[..]`), so without this
-            // it mis-types the body as `Int`, the map result as `list[int]`, and a
-            // block-scoped binding taken from `ys[0]` reopens the very hoist/shadow
-            // silent miscompile this card closes — today inert ONLY by an unrelated
-            // lambda-param-typing gap (an incidental, not designed, guard). Kept
-            // identical to the main oracle: `list`/`str` repeated by an int|bool
-            // count keeps the sequence type; bytes/class-`__mul__` handled elsewhere.
-            if *op == BinOp::Mul {
-                if matches!((&l, &r), (Ty::List(_), Ty::Int | Ty::Bool)) { return l; }
-                if matches!((&l, &r), (Ty::Int | Ty::Bool, Ty::List(_))) { return r; }
-                if matches!((&l, &r),
-                    (Ty::Str, Ty::Int | Ty::Bool) | (Ty::Int | Ty::Bool, Ty::Str)) {
-                    return Ty::Str;
+            // (cards 333e34a7 / ed1d85cc, review 585) CONSISTENCY WITH CODEGEN.
+            // This oracle types a map/filter lambda BODY, where codegen carries NO
+            // static type for the bare lambda param (it stays `Unknown` in
+            // `self.locals`). So it may only claim a result type codegen can
+            // actually EMIT for an Unknown-typed operand — else `check` accepts a
+            // body `build` cannot lower, turning an honest check error into a rustc
+            // leak (E0605/E0308/E0369).
+            //   - `+ - *` on a user class ARE emittable: codegen lowers them to the
+            //     Rust `Add`/`Sub`/`Mul` trait impls generated for the class, which
+            //     Rust resolves from the iterator element type without pyrst's help
+            //     (verified: class `+`/`-`/`*` in a map-lambda build+run). Route
+            //     those dunders so check stays consistent with a build that works.
+            //   - `/ ** // %` desugar to a METHOD call that fires only when codegen
+            //     knows the operand is a class; for an Unknown param it can't, and
+            //     falls to the builtin `as f64`/`__py_mod`/`__py_floordiv` path.
+            //     A `list * int` sequence-repeat likewise needs the operand's type.
+            //     Do NOT route those here: leaving them at the builtin arithmetic
+            //     result makes such a lambda body an HONEST check error (the
+            //     list-comprehension form is the supported path). Full lambda
+            //     support is codegen card 7fbd3346 — re-add the rest of the routing
+            //     (and the list/str-repeat) here once codegen can type-direct the
+            //     param.
+            if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul) {
+                if let Ty::Class(cls, _) = &l {
+                    if let Some(ret) = op.arith_dunder()
+                        .and_then(|d| ctx.get_method(cls, d))
+                        .map(|s| s.ret.clone())
+                    {
+                        return ret;
+                    }
                 }
             }
             match op {
@@ -1703,6 +1719,23 @@ pub(crate) fn lambda_ret_with_elem(
                 lambda_env.locals.insert(param_name.clone(), ty);
             }
             let body_ty = check_expr(body, &mut lambda_env)?;
+            // (card 333e34a7, review 585) A map/filter lambda param carries NO
+            // static type into codegen's closure body — codegen REMOVES the bare
+            // param from `self.locals` (codegen/exprs.rs) — so a body operation
+            // whose lowering needs the operand's static class / sequence type
+            // (`/ // % **` dunder dispatch, `list`/`str` seq-repeat) that `check`
+            // just routed via the CONCRETE `elem` binding above cannot be emitted
+            // and would leak rustc (E0605/E0308/E0369) on a `check`-passing
+            // program. Reject those here so `check` accepts EXACTLY what `build`
+            // can lower. `+ - *` on a class are NOT rejected (codegen lowers them
+            // to the class's std::ops trait impls, resolved by Rust from the
+            // iterator element type). The bare param's type is the FIRST param's
+            // `elem`; the codegen view removes every lambda param.
+            let mut cg_locals = lambda_env.locals.clone();
+            for (param_name, _) in params.iter() {
+                cg_locals.remove(param_name);
+            }
+            reject_unemittable_bare_lambda_body(body, &lambda_env.locals, &cg_locals, env.ctx)?;
             return Ok(Some(body_ty));
         }
     }
@@ -1710,6 +1743,166 @@ pub(crate) fn lambda_ret_with_elem(
     // errors, but we cannot infer an applied return type here.
     check_expr(callable, env)?;
     Ok(None)
+}
+
+/// (card 333e34a7, review 585) Reject a `map()` / `filter()` lambda BODY
+/// sub-expression that `check` type-routes but codegen CANNOT lower for the
+/// BARE lambda parameter. A bare lambda param has no static type in the
+/// generated closure body — codegen removes it from its `self.locals` — so any
+/// operation whose lowering consults the operand's static type falls to a
+/// builtin that rustc rejects, turning a `check`-passing program into a rustc
+/// leak. This restores the iron rule (`check` accepts ⇔ `build` succeeds) by
+/// making those bodies an HONEST check error; full map/filter support for them
+/// is codegen card 7fbd3346 (use a list comprehension meanwhile).
+///
+/// The test mirrors codegen's OWN dispatch decision, which is
+/// `infer_expr_ty(operand, self.locals)` — the same oracle codegen's
+/// `type_of_expr` uses:
+///   * `check_locals` binds the param to the real element type (what `check`
+///     saw), so `infer_expr_ty` here reproduces the routed type.
+///   * `cg_locals` has every lambda param REMOVED (exactly codegen's closure
+///     view), so `infer_expr_ty` here reproduces codegen's decision.
+/// A divergence — `check` routes, codegen does not — is the defect; a class /
+/// sequence operand that does NOT derive from the bare param (an outer local, a
+/// literal) resolves identically in both views and is left buildable.
+///
+/// Rejected shapes:
+///   * `/ // % **` on a param-derived user-class operand whose class defines the
+///     matching arithmetic dunder (codegen would emit `(x as f64)/…` /
+///     `__py_mod` / `__py_floordiv`). `+ - *` are deliberately excluded.
+///   * `list` / `str` / `bytes` sequence-repeat `seq * n` on a param-derived
+///     operand (codegen would emit a numeric `*`, rustc E0369). A class `*`
+///     (trait-lowered) is excluded.
+///
+/// Walks the compound forms a lambda body can contain; does NOT descend into a
+/// nested `Lambda` (validated by its own `lambda_ret_with_elem`) or a
+/// comprehension (its loop target rebinds the element type in its own scope).
+fn reject_unemittable_bare_lambda_body(
+    e: &Expr,
+    check_locals: &HashMap<String, Ty>,
+    cg_locals: &HashMap<String, Ty>,
+    ctx: &TyCtx,
+) -> Result<()> {
+    match e {
+        Expr::BinOp { lhs, op, rhs, span } => {
+            reject_unemittable_bare_lambda_body(lhs, check_locals, cg_locals, ctx)?;
+            reject_unemittable_bare_lambda_body(rhs, check_locals, cg_locals, ctx)?;
+            // How `check` typed the lhs (param -> elem) vs. how codegen sees it
+            // (param removed) — codegen's dispatch guard is exactly this oracle.
+            let check_l = infer_expr_ty(lhs, check_locals, ctx);
+            let cg_l = infer_expr_ty(lhs, cg_locals, ctx);
+            match op {
+                BinOp::Div | BinOp::FloorDiv | BinOp::Mod | BinOp::Pow => {
+                    if let Ty::Class(cls, _) = &check_l {
+                        let check_routes = op
+                            .arith_dunder()
+                            .and_then(|d| ctx.get_method(cls, d))
+                            .is_some();
+                        let cg_routes = matches!(&cg_l, Ty::Class(cg_cls, _)
+                            if op.arith_dunder()
+                                .and_then(|d| ctx.get_method(cg_cls, d))
+                                .is_some());
+                        if check_routes && !cg_routes {
+                            return Err(Error::Type {
+                                span: *span,
+                                msg: format!(
+                                    "operator `{}` overloaded via `{}` on class `{}` is not \
+                                     yet supported inside a `map()`/`filter()` lambda: the \
+                                     lambda parameter has no static type in the generated \
+                                     closure, so the dunder cannot be dispatched. Use a list \
+                                     comprehension (`[... for x in ...]`) instead (tracked by \
+                                     card 7fbd3346).",
+                                    binop_symbol(*op),
+                                    op.arith_dunder().unwrap_or("?"),
+                                    cls
+                                ),
+                            });
+                        }
+                    }
+                }
+                BinOp::Mul => {
+                    let is_seq = |t: &Ty| matches!(t, Ty::List(_) | Ty::Str | Ty::Bytes);
+                    if is_seq(&check_l) && !is_seq(&cg_l) {
+                        return Err(Error::Type {
+                            span: *span,
+                            msg: format!(
+                                "sequence repetition (`{} * n`) is not yet supported inside a \
+                                 `map()`/`filter()` lambda: the lambda parameter has no static \
+                                 type in the generated closure, so codegen emits a numeric \
+                                 multiply that rustc rejects. Use a list comprehension instead \
+                                 (tracked by card 7fbd3346).",
+                                match &check_l {
+                                    Ty::Str => "str",
+                                    Ty::Bytes => "bytes",
+                                    _ => "list",
+                                }
+                            ),
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+        Expr::UnOp { expr, .. } => {
+            reject_unemittable_bare_lambda_body(expr, check_locals, cg_locals, ctx)?
+        }
+        Expr::Attr { obj, .. } => {
+            reject_unemittable_bare_lambda_body(obj, check_locals, cg_locals, ctx)?
+        }
+        Expr::Index { obj, idx, .. } => {
+            reject_unemittable_bare_lambda_body(obj, check_locals, cg_locals, ctx)?;
+            reject_unemittable_bare_lambda_body(idx, check_locals, cg_locals, ctx)?;
+        }
+        Expr::Slice { obj, start, stop, step, .. } => {
+            reject_unemittable_bare_lambda_body(obj, check_locals, cg_locals, ctx)?;
+            if let Some(x) = start {
+                reject_unemittable_bare_lambda_body(x, check_locals, cg_locals, ctx)?;
+            }
+            if let Some(x) = stop {
+                reject_unemittable_bare_lambda_body(x, check_locals, cg_locals, ctx)?;
+            }
+            if let Some(x) = step {
+                reject_unemittable_bare_lambda_body(x, check_locals, cg_locals, ctx)?;
+            }
+        }
+        Expr::Call { callee, args, kwargs, .. } => {
+            reject_unemittable_bare_lambda_body(callee, check_locals, cg_locals, ctx)?;
+            for a in args {
+                reject_unemittable_bare_lambda_body(a, check_locals, cg_locals, ctx)?;
+            }
+            for (_, v) in kwargs {
+                reject_unemittable_bare_lambda_body(v, check_locals, cg_locals, ctx)?;
+            }
+        }
+        Expr::List(xs, _) | Expr::Tuple(xs, _) | Expr::Set(xs, _) => {
+            for x in xs {
+                reject_unemittable_bare_lambda_body(x, check_locals, cg_locals, ctx)?;
+            }
+        }
+        Expr::Dict(pairs, _) => {
+            for (k, v) in pairs {
+                reject_unemittable_bare_lambda_body(k, check_locals, cg_locals, ctx)?;
+                reject_unemittable_bare_lambda_body(v, check_locals, cg_locals, ctx)?;
+            }
+        }
+        Expr::FStr(parts, _) => {
+            for p in parts {
+                if let FStrPart::Interp(x, _) = p {
+                    reject_unemittable_bare_lambda_body(x, check_locals, cg_locals, ctx)?;
+                }
+            }
+        }
+        Expr::IfExp { test, body, orelse, .. } => {
+            reject_unemittable_bare_lambda_body(test, check_locals, cg_locals, ctx)?;
+            reject_unemittable_bare_lambda_body(body, check_locals, cg_locals, ctx)?;
+            reject_unemittable_bare_lambda_body(orelse, check_locals, cg_locals, ctx)?;
+        }
+        // Leaves; a nested `Lambda` (own `lambda_ret_with_elem` validates it) and
+        // comprehensions (loop target rebinds the element type in their own
+        // scope) are intentionally NOT descended into here.
+        _ => {}
+    }
+    Ok(())
 }
 
 // (card 87bd8eb4) The former `range_step_nonpositive_literal` gate is GONE:
@@ -3951,6 +4144,23 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
             if is_bytes_binop(*op, &l, &r) {
                 return bytes_binop_ty(*op, &l, &r, *span);
             }
+            // (card 333e34a7) OPERATOR OVERLOADING: a user-class lhs whose class
+            // defines the operator's arithmetic dunder types as that dunder's
+            // declared return. Placed BEFORE the `match op` so it wins over the
+            // builtin `Pow|Div => Float` shortcut (which formerly made `/`/`**`
+            // ignore `__truediv__`/`__pow__`, rejecting valid class arithmetic) and
+            // covers `// %` too. Fires ONLY when the dunder exists — a class lhs
+            // WITHOUT it falls through to the prior behavior (Div/Pow -> Float, the
+            // arithmetic arm's `l.clone()`), so no previously-loud shape is newly
+            // accepted; a non-class lhs never enters here.
+            if let Ty::Class(cls, _) = &l {
+                if let Some(ret) = op.arith_dunder()
+                    .and_then(|d| env.ctx.get_method(cls, d))
+                    .map(|s| s.ret.clone())
+                {
+                    return Ok(ret);
+                }
+            }
             match op {
                 BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le
                 | BinOp::Gt | BinOp::Ge | BinOp::And | BinOp::Or
@@ -3960,19 +4170,11 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 _ => {
                     // Arithmetic: apply numeric type promotion rules
                     match (&l, &r) {
-                        // Operator overloading: a class lhs dispatches to the
-                        // declared return type of its dunder (__add__/__sub__/__mul__).
-                        (Ty::Class(cls, _), _) => {
-                            let dunder = match op {
-                                BinOp::Add => Some("__add__"),
-                                BinOp::Sub => Some("__sub__"),
-                                BinOp::Mul => Some("__mul__"),
-                                _ => None,
-                            };
-                            dunder.and_then(|d| env.ctx.get_method(cls, d))
-                                .map(|s| s.ret.clone())
-                                .unwrap_or_else(|| l.clone())
-                        }
+                        // Operator overloading is handled by the class early-return
+                        // above (all of + - * / // % **). A class lhs reaching here
+                        // therefore lacks the op's dunder; keep the prior fallback of
+                        // typing it as the class itself.
+                        (Ty::Class(..), _) => l.clone(),
                         // Same type: return that type
                         (a, b) if a == b => l,
                         // Mixed numeric types: promote to float

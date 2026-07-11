@@ -1,0 +1,14 @@
+# NEGATIVE (card 333e34a7 / ed1d85cc, review 585): `list * int` sequence
+# repetition inside a `map()` lambda is an HONEST check error. The bare lambda
+# parameter has no static type in the generated closure, so codegen cannot see
+# it as a sequence and emits a numeric multiply — `Vec * i64`, rustc E0369 — on
+# a program `check` had accepted. Reject it up front. The list-comprehension
+# form (`[row * 2 for row in xss]`) is the supported path; full lambda support
+# is card 7fbd3346.
+
+
+def main() -> None:
+    xss: list[list[int]] = [[1], [2, 3]]
+    ys: list[list[int]] = list(map(lambda row: row * 2, xss))
+    for y in ys:
+        print(len(y))

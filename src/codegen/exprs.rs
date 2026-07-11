@@ -3606,6 +3606,40 @@ impl<'a> Codegen<'a> {
                     return self.emit_expr(&folded);
                 }
 
+                // (card 333e34a7) OPERATOR OVERLOADING for `/ // % **` on a
+                // user-class lhs: route to the class's __truediv__ / __floordiv__ /
+                // __mod__ / __pow__ dunder. Desugar to a method call on a SYNTHETIC
+                // AST node and re-emit, so emit_call's receiver-borrow, argument
+                // by-ref/clone (value-semantics), and inheritance-aware dispatch are
+                // reused verbatim — exactly what a hand-written `a.__truediv__(b)`
+                // lowers to. Placed FIRST so it wins over the builtin
+                // float-division / powf / __py_floordiv / __py_mod lowerings below,
+                // which would cast a class operand `as f64` (rustc E0605). `+ - *`
+                // keep their existing std::ops trait-impl path further down; only
+                // these four — which have no Rust operator (`**`/`//`) or would
+                // mis-lower to float (`/`) — are intercepted here. Fires ONLY when
+                // the class defines the dunder; otherwise the prior behavior is
+                // unchanged.
+                if matches!(op, BinOp::Div | BinOp::FloorDiv | BinOp::Mod | BinOp::Pow) {
+                    if let Ty::Class(cls, _) = self.type_of_expr(lhs) {
+                        if let Some(dunder) = op.arith_dunder() {
+                            if self.ctx.get_method(&cls, dunder).is_some() {
+                                let call = Expr::Call {
+                                    callee: Box::new(Expr::Attr {
+                                        obj: lhs.clone(),
+                                        name: dunder.to_string(),
+                                        span: *span,
+                                    }),
+                                    args: vec![(**rhs).clone()],
+                                    kwargs: vec![],
+                                    span: *span,
+                                };
+                                return self.emit_expr(&call);
+                            }
+                        }
+                    }
+                }
+
                 // Handle sequence repetition: "abc" * 3 and [0] * 5
                 if *op == BinOp::Mul {
                     let lt = self.type_of_expr(lhs);

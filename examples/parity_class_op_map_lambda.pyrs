@@ -1,0 +1,37 @@
+# parity: dual-run
+# Dual-run CPython parity golden (card 333e34a7, review 585): the class
+# arithmetic operators codegen CAN lower inside a `map()` lambda — `+` and `*` —
+# build and run identically to CPython. They lower to the class's
+# std::ops::Add / Mul trait impls, which Rust resolves from the iterator element
+# type without pyrst needing the bare lambda parameter's static type (unlike
+# `/ // % **`, which are honest check errors in a lambda — see the fail_* files).
+# This is the positive companion proving the review-585 fix did NOT over-reject
+# the trait-lowered operators.
+
+
+class V:
+    x: int
+
+    def __init__(self, x: int) -> None:
+        self.x = x
+
+    def __add__(self, other: V) -> V:
+        return V(self.x + other.x)
+
+    def __mul__(self, other: V) -> V:
+        return V(self.x * other.x)
+
+
+def main() -> None:
+    xs: list[V] = [V(20), V(40), V(60)]
+    d: V = V(2)
+
+    # class `+` in a map lambda -> __add__ (22, 42, 62)
+    adds: list[V] = list(map(lambda r: r + d, xs))
+    for a in adds:
+        print(a.x)
+
+    # class `*` in a map lambda -> __mul__ (40, 80, 120)
+    muls: list[V] = list(map(lambda r: r * d, xs))
+    for m in muls:
+        print(m.x)

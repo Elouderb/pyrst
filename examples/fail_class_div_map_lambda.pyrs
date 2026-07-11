@@ -1,0 +1,29 @@
+# NEGATIVE (card 333e34a7, review 585): class operator `/` (__truediv__) inside
+# a `map()` lambda is an HONEST check error, NOT a check-accept/build-fail.
+#
+# A bare lambda parameter carries no static type into the generated Rust closure
+# (codegen removes it from its locals), so codegen cannot dispatch the class
+# dunder for `row / d` and would emit `(row as f64) / (d as f64)` — a rustc leak
+# (E0605/E0308) on a program `check` had accepted. `check` must reject it up
+# front instead. `+ - *` on a class DO work in a map lambda (trait-lowered);
+# only `/ // % **` are affected. Full support is card 7fbd3346.
+#
+# This is the reviewer's exact Finding-1 repro.
+
+
+class V:
+    x: int
+
+    def __init__(self, x: int) -> None:
+        self.x = x
+
+    def __truediv__(self, other: V) -> V:
+        return V(self.x // other.x)
+
+
+def main() -> None:
+    xs: list[V] = [V(20), V(40), V(60)]
+    d: V = V(2)
+    ys: list[V] = list(map(lambda row: row / d, xs))
+    for y in ys:
+        print(y.x)

@@ -1939,3 +1939,183 @@ def my_fn() -> float:
             Ty::Str,
         );
     }
+
+    #[test]
+    fn oracle_routes_div_pow_floordiv_mod_to_class_dunders() {
+        // (card 333e34a7) The codegen type-oracle `infer_expr_ty` must route `/`,
+        // `**`, `//`, `%` on a user-class lhs to the class's dunder RETURN type —
+        // exactly like `+`/`-`/`*` already do — instead of the builtin `Float`
+        // shortcut that formerly made them skip __truediv__/__pow__/etc.
+        let src = "\
+class V:
+    x: int
+    def __init__(self, x: int) -> None:
+        self.x = x
+    def __add__(self, other: V) -> V:
+        return V(self.x + other.x)
+    def __truediv__(self, other: V) -> V:
+        return V(self.x)
+    def __floordiv__(self, other: V) -> V:
+        return V(self.x)
+    def __mod__(self, other: V) -> V:
+        return V(self.x)
+    def __pow__(self, other: V) -> V:
+        return V(self.x)
+
+class W:
+    y: int
+    def __init__(self, y: int) -> None:
+        self.y = y
+";
+        let m = crate::parser::parse(src).expect("parse");
+        let mut ctx = TyCtx::new();
+        for s in &m.stmts {
+            if let Stmt::Class(c) = s {
+                let mut c = c.clone();
+                extract_init_fields(&mut c);
+                ctx.classes.insert(c.name.clone(), c);
+            }
+        }
+        let v = Ty::Class("V".into(), vec![]);
+        let w = Ty::Class("W".into(), vec![]);
+        let mut locals = std::collections::HashMap::new();
+        locals.insert("a".to_string(), v.clone());
+        locals.insert("b".to_string(), v.clone());
+        locals.insert("w1".to_string(), w.clone());
+        locals.insert("w2".to_string(), w);
+        let bin = |op: BinOp, l: &str, r: &str| Expr::BinOp {
+            op,
+            lhs: Box::new(ident(l)),
+            rhs: Box::new(ident(r)),
+            span: Span::DUMMY,
+        };
+        // A class defining the dunder types `classV <op> classV` as V (Add is the
+        // already-routed control; the other four are the fix).
+        for op in [BinOp::Div, BinOp::Pow, BinOp::FloorDiv, BinOp::Mod, BinOp::Add] {
+            assert_eq!(
+                infer_expr_ty(&bin(op, "a", "b"), &locals, &ctx),
+                v,
+                "op {:?} on a class defining its dunder must type as the class",
+                op
+            );
+        }
+        // A class WITHOUT the dunder keeps the builtin float result for `/` and
+        // `**` (no over-routing — the guard is `.is_some()`, not unconditional).
+        assert_eq!(infer_expr_ty(&bin(BinOp::Div, "w1", "w2"), &locals, &ctx), Ty::Float);
+        assert_eq!(infer_expr_ty(&bin(BinOp::Pow, "w1", "w2"), &locals, &ctx), Ty::Float);
+    }
+
+    #[test]
+    fn arith_dunder_maps_every_arithmetic_operator_and_nothing_else() {
+        // (card 333e34a7) The ONE source of truth shared by every operator->type
+        // layer. Arithmetic ops map to their Python dunder; every non-arithmetic
+        // operator maps to None (never consults a class dunder).
+        assert_eq!(BinOp::Add.arith_dunder(), Some("__add__"));
+        assert_eq!(BinOp::Sub.arith_dunder(), Some("__sub__"));
+        assert_eq!(BinOp::Mul.arith_dunder(), Some("__mul__"));
+        assert_eq!(BinOp::Div.arith_dunder(), Some("__truediv__"));
+        assert_eq!(BinOp::FloorDiv.arith_dunder(), Some("__floordiv__"));
+        assert_eq!(BinOp::Mod.arith_dunder(), Some("__mod__"));
+        assert_eq!(BinOp::Pow.arith_dunder(), Some("__pow__"));
+        for op in [
+            BinOp::Eq, BinOp::Ne, BinOp::Lt, BinOp::Le, BinOp::Gt, BinOp::Ge,
+            BinOp::And, BinOp::Or, BinOp::Is, BinOp::IsNot, BinOp::In, BinOp::NotIn,
+            BinOp::BitAnd, BinOp::BitOr, BinOp::BitXor, BinOp::LShift, BinOp::RShift,
+        ] {
+            assert_eq!(op.arith_dunder(), None, "op {:?} must not map to an arith dunder", op);
+        }
+    }
+
+    #[test]
+    fn map_filter_lambda_class_op_check_agrees_with_codegen() {
+        // (card 333e34a7, review 585) A class `/ // % **` or a `list*int`
+        // seq-repeat on the BARE param of a map()/filter() lambda cannot be
+        // lowered by codegen (the param has no static type in the closure), so
+        // `check` must REJECT it — no check-accept/build-fail. `+ - *` on a class
+        // stay accepted (trait-lowered). Direct (non-lambda) class ops and a class
+        // op on an OUTER local inside a lambda body stay accepted (buildable).
+        let cls = "\
+class V:
+    x: int
+    def __init__(self, x: int) -> None:
+        self.x = x
+    def __add__(self, other: V) -> V:
+        return V(self.x + other.x)
+    def __mul__(self, other: V) -> V:
+        return V(self.x * other.x)
+    def __truediv__(self, other: V) -> V:
+        return V(self.x // other.x)
+    def __pow__(self, other: V) -> V:
+        return V(self.x + other.x)
+";
+        let with_main = |body: &str| format!("{}\ndef main() -> None:\n{}\n", cls, body);
+
+        // REJECTED — bare-param class `/` / `**` in a map lambda (the reviewer's
+        // Finding-1 shape); the message points the user at card 7fbd3346.
+        assert_type_err_unit(
+            check_src(&with_main(
+                "    xs: list[V] = [V(20)]\n    d: V = V(2)\n    \
+                 ys: list[V] = list(map(lambda row: row / d, xs))\n    print(len(ys))",
+            )),
+            "7fbd3346",
+        );
+        assert_type_err_unit(
+            check_src(&with_main(
+                "    xs: list[V] = [V(20)]\n    d: V = V(2)\n    \
+                 ys: list[V] = list(map(lambda row: row ** d, xs))\n    print(len(ys))",
+            )),
+            "not yet supported inside a `map()`/`filter()` lambda",
+        );
+        // REJECTED — same class `%` in a filter PREDICATE (filter is covered too).
+        assert_type_err_unit(
+            check_src(&with_main(
+                "    xs: list[V] = [V(20)]\n    d: V = V(2)\n    \
+                 ys: list[V] = list(filter(lambda row: (row / d).x > 1, xs))\n    print(len(ys))",
+            )),
+            "not yet supported inside a `map()`/`filter()` lambda",
+        );
+        // REJECTED — `list * int` seq-repeat on the bare param.
+        assert_type_err_unit(
+            check_src(
+                "def main() -> None:\n    xss: list[list[int]] = [[1], [2, 3]]\n    \
+                 ys: list[list[int]] = list(map(lambda row: row * 2, xss))\n    print(len(ys))\n",
+            ),
+            "sequence repetition",
+        );
+
+        // ACCEPTED — class `+` / `*` in a map lambda (trait-lowered, buildable).
+        assert!(
+            check_src(&with_main(
+                "    xs: list[V] = [V(20)]\n    d: V = V(2)\n    \
+                 ys: list[V] = list(map(lambda row: row + d, xs))\n    print(len(ys))",
+            ))
+            .is_ok(),
+            "class `+` in a map lambda must still typecheck"
+        );
+        assert!(
+            check_src(&with_main(
+                "    xs: list[V] = [V(20)]\n    d: V = V(2)\n    \
+                 ys: list[V] = list(map(lambda row: row * d, xs))\n    print(len(ys))",
+            ))
+            .is_ok(),
+            "class `*` in a map lambda must still typecheck"
+        );
+        // ACCEPTED — precision: class `/` on an OUTER local (a/b, NOT the bare
+        // param) inside a lambda body keeps its static type in codegen and builds.
+        assert!(
+            check_src(&with_main(
+                "    xs: list[V] = [V(1)]\n    a: V = V(100)\n    b: V = V(5)\n    \
+                 ys: list[V] = list(map(lambda row: row + (a / b), xs))\n    print(len(ys))",
+            ))
+            .is_ok(),
+            "class `/` on an OUTER local inside a lambda must NOT be over-rejected"
+        );
+        // ACCEPTED — direct (non-lambda) class `/` still routes to __truediv__.
+        assert!(
+            check_src(&with_main(
+                "    a: V = V(20)\n    b: V = V(2)\n    d: V = a / b\n    print(d.x)",
+            ))
+            .is_ok(),
+            "direct-expression class `/` dispatch must be unaffected"
+        );
+    }

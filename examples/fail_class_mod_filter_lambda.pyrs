@@ -1,0 +1,22 @@
+# NEGATIVE (card 333e34a7, review 585): the bare-lambda-param limitation applies
+# to `filter()` predicates too, not just `map()`. Class operator `%` (__mod__) on
+# the bare param inside a filter predicate is an HONEST check error — codegen
+# would emit `__py_mod` over an un-typed operand (rustc leak) on a program
+# `check` had accepted. Guards the filter path. Full support: card 7fbd3346.
+
+
+class V:
+    x: int
+
+    def __init__(self, x: int) -> None:
+        self.x = x
+
+    def __mod__(self, other: V) -> V:
+        return V(self.x % other.x)
+
+
+def main() -> None:
+    xs: list[V] = [V(20), V(41), V(60)]
+    d: V = V(2)
+    ys: list[V] = list(filter(lambda row: (row % d).x == 1, xs))
+    print(len(ys))

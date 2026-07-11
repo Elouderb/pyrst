@@ -1,0 +1,23 @@
+# NEGATIVE (card 333e34a7, review 585): class operator `**` (__pow__) inside a
+# `map()` lambda is an HONEST check error (same bare-lambda-param cause as `/`).
+# `**` has no Rust operator, so codegen desugars it to a method call that fires
+# ONLY when it statically sees a class — which it does not for a bare lambda
+# param — leaving the builtin float path, a rustc leak. Full support: card
+# 7fbd3346.
+
+
+class V:
+    x: int
+
+    def __init__(self, x: int) -> None:
+        self.x = x
+
+    def __pow__(self, other: V) -> V:
+        return V(self.x + other.x)
+
+
+def main() -> None:
+    xs: list[V] = [V(2), V(3)]
+    d: V = V(10)
+    ys: list[V] = list(map(lambda row: row ** d, xs))
+    print(len(ys))

@@ -221,6 +221,29 @@ pub enum BinOp {
     BitAnd, BitOr, BitXor, LShift, RShift,
 }
 
+impl BinOp {
+    /// (card 333e34a7) The Python arithmetic dunder an ARITHMETIC binary operator
+    /// dispatches to when its left operand is a user class — the ONE source of
+    /// truth shared by every operator->type layer (the real checker `check_expr`,
+    /// the codegen oracles `infer_expr_ty` / `infer_expr_ty_bound`) and codegen's
+    /// BinOp / AugAssign emission, so class operator overloading routes identically
+    /// everywhere. `None` for the non-arithmetic operators (comparison, logical,
+    /// identity, membership, bitwise/shift), which are typed/emitted directly and
+    /// never consult a class dunder here.
+    pub fn arith_dunder(self) -> Option<&'static str> {
+        match self {
+            BinOp::Add => Some("__add__"),
+            BinOp::Sub => Some("__sub__"),
+            BinOp::Mul => Some("__mul__"),
+            BinOp::Div => Some("__truediv__"),
+            BinOp::FloorDiv => Some("__floordiv__"),
+            BinOp::Mod => Some("__mod__"),
+            BinOp::Pow => Some("__pow__"),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnOp {
     Neg, Not, BitNot,

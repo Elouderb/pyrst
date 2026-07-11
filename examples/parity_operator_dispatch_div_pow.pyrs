@@ -1,0 +1,105 @@
+# parity: dual-run
+# Dual-run CPython parity golden for operator overloading of `/ ** // %` on a
+# user class (card 333e34a7). Before this fix, `/` and `**` on a class operand
+# fell through to builtin float arithmetic (ignoring __truediv__/__pow__) — a
+# valid Python program was wrongly rejected at `check` ("declared V, got
+# float") or, when a dunder returned a float, leaked a rustc E0605 at `build`
+# (a class cannot cast `as f64`). `+ - *` already routed to __add__/__sub__/
+# __mul__; this file exercises ALL seven arithmetic operators plus their
+# augmented forms together and asserts byte-identity with CPython.
+#
+# Every dunder body below uses CUSTOM (non-builtin) semantics — e.g. `__pow__`
+# returns `self.x + other.x * 100`, NOT a real power — so a printed value that
+# matches CPython PROVES the dunder body ran, not the builtin operator (real
+# `20 ** 6` is 64000000, not 620). Class F's float-returning `__truediv__` /
+# `__pow__` are the silent-miscompile probe: `f1 / f2` must be
+# `self.x + other.x`, never `8.0 / 4.5`.
+
+
+class V:
+    x: int
+
+    def __init__(self, x: int) -> None:
+        self.x = x
+
+    def __add__(self, other: V) -> V:
+        return V(self.x + other.x)
+
+    def __sub__(self, other: V) -> V:
+        return V(self.x - other.x)
+
+    def __mul__(self, other: V) -> V:
+        return V(self.x * other.x)
+
+    def __truediv__(self, other: V) -> V:
+        return V(self.x // other.x)
+
+    def __floordiv__(self, other: V) -> V:
+        return V(self.x // other.x)
+
+    def __mod__(self, other: V) -> V:
+        return V(self.x % other.x)
+
+    def __pow__(self, other: V) -> V:
+        return V(self.x + other.x * 100)
+
+
+class F:
+    x: float
+
+    def __init__(self, x: float) -> None:
+        self.x = x
+
+    # CUSTOM semantics — deliberately NOT real division / power. A matching
+    # printed value proves the dunder body ran instead of builtin float `/`/`**`.
+    def __truediv__(self, other: F) -> float:
+        return self.x + other.x
+
+    def __pow__(self, other: F) -> float:
+        return self.x - other.x
+
+
+def main() -> None:
+    a: V = V(20)
+    b: V = V(6)
+
+    # Already-routed operators (unchanged) mixed with the newly-routed ones.
+    print((a + b).x)      # __add__  -> 26
+    print((a - b).x)      # __sub__  -> 14
+    print((a * b).x)      # __mul__  -> 120
+    print((a / b).x)      # __truediv__  -> 20 // 6 = 3
+    print((a // b).x)     # __floordiv__ -> 20 // 6 = 3
+    print((a % b).x)      # __mod__      -> 20 % 6 = 2
+    print((a ** b).x)     # __pow__      -> 20 + 6 * 100 = 620
+
+    # Negative operands exercise Python floor/sign-of-divisor semantics through
+    # the dunder body (the class delegates to builtin int `//` / `%` internally).
+    n: V = V(-7)
+    m: V = V(3)
+    print((n // m).x)     # -7 // 3 = -3 (floors toward -inf)
+    print((n % m).x)      # -7 % 3  = 2  (sign of divisor)
+
+    # Chained expression: dunder result feeds the next operator.
+    print(((a / b) + (a % b)).x)   # V(3) + V(2) = V(5)
+
+    # Augmented forms desugar to `c = c <op> V(..)` and route via the binary
+    # dunder path (pyrst has no in-place dunders; CPython falls back the same way).
+    c: V = V(100)
+    c /= V(7)             # 100 // 7 = 14
+    print(c.x)
+    c **= V(2)            # 14 + 2 * 100 = 214
+    print(c.x)
+    c //= V(5)            # 214 // 5 = 42
+    print(c.x)
+    c %= V(10)            # 42 % 10 = 2
+    print(c.x)
+
+    # Float-returning dunders with CUSTOM semantics — the silent-miscompile
+    # probe. `f1 / f2` must be self.x + other.x (12.5), never 8.0 / 4.5 (1.777…);
+    # `f1 ** f2` must be self.x - other.x (3.5), never 8.0 ** 4.5.
+    f1: F = F(8.0)
+    f2: F = F(4.5)
+    d: float = f1 / f2
+    p: float = f1 ** f2
+    print(d)              # 12.5
+    print(p)              # 3.5

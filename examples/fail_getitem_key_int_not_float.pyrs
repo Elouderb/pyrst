@@ -1,8 +1,10 @@
-# E1 fix / P2 negative: pyrst does not coerce int->float at a call-argument
-# position (a normal method/free call with an int literal into an `f64` param
-# leaks rustc E0308 too), so an int index into a float-typed `__getitem__` key is
-# an honest check error — the old int_to_float allowance let it pass check and
-# leak E0308 at build. Write `t[1.0]`.
+# E1 fix / P2 negative: SUBSCRIPT key/value positions stay EXACT — int->float
+# widening (card 0f41297a) applies at call args, dunder ARITHMETIC operands,
+# defaults, returns, and annotated/field assignments, but NOT at a `__getitem__`
+# key. An int index into a float-typed `__getitem__` key is therefore an honest
+# check error (a deliberate, conservative scoping — no silent miscompile). Write
+# `t[1.0]`. (Note: a *normal* method/free call with an int into an `f64` param
+# now DOES widen — see examples/int_float_widen.pyrs — but subscripts do not.)
 class Tbl:
     data: list[float]
     def __init__(self, data: list[float]) -> None:

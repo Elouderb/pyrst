@@ -102,6 +102,38 @@ pub(crate) fn types_compatible(val_ty: &Ty, declared_ty: &Ty, ctx: &TyCtx) -> bo
     }
 }
 
+/// (card 0f41297a) Int→Float value-boundary widening predicate. Python widens an
+/// `int` to `float` implicitly in numeric / assignment / argument contexts;
+/// pyrst mirrors that at VALUE BOUNDARIES only (call args, dunder operands,
+/// defaults, returns, annotated / field assignments, and a float-typed container
+/// LITERAL). `types_compatible` itself stays strict (it is unit-tested to reject
+/// `Int`→`Float` and is reused in variance-sensitive positions where widening
+/// would be unsound); each boundary caller ORs this predicate in.
+///
+/// Returns true when a value of `val_ty` may implicitly widen into a `declared`
+/// slot:
+///   - scalar `int` → `float`;
+///   - a `list` LITERAL of `int` elements → `list[float]` (codegen rebuilds the
+///     vec element-wise). The list arm fires ONLY when `value` is a list literal
+///     so codegen can widen it in place — an int-list VARIABLE into a `list[float]`
+///     slot stays an honest error (no silent O(n) move).
+///
+/// This is the ONLY implicit numeric widening pyrst performs. It is DIRECTIONAL:
+/// NEVER float→int (that loses data — an honest error requiring `int(...)`), and
+/// never the reverse container direction. A large int → f64 loses precision above
+/// 2^53, exactly as CPython — expected, not a pyrst bug.
+pub(crate) fn int_widens_to_float(val_ty: &Ty, declared: &Ty, value: Option<&Expr>) -> bool {
+    match (val_ty, declared) {
+        (Ty::Int, Ty::Float) => true,
+        (Ty::List(v), Ty::List(d)) => {
+            matches!(value, Some(Expr::List(..)))
+                && matches!(**v, Ty::Int)
+                && matches!(**d, Ty::Float)
+        }
+        _ => false,
+    }
+}
+
 // ── Generics v1: call-site unification + substitution ────────────────────────
 //
 // When a parametric generic function `def f[T, U](..)` is called, each declared

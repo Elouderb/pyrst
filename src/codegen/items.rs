@@ -1070,7 +1070,13 @@ impl<'a> Codegen<'a> {
                     self.line("");
                 }
                 "__add__" => {
-                    let other_param = m.params.iter().find(|p| p.name == "other");
+                    // (card 0f41297a) Bind the operand by the FIRST non-`self` param,
+                    // not the hardcoded name `other` — a `__add__(self, o: T)` operand
+                    // was otherwise mis-typed as `Self` and emitted as `other`, so the
+                    // body's `o` did not resolve. Emit the Rust param under its real
+                    // source name so the body compiles for any operand name.
+                    let other_param = m.params.iter().find(|p| p.name != "self");
+                    let other_name = other_param.map(|p| p.name.clone()).unwrap_or_else(|| "other".to_string());
                     let other_ty = other_param
                         .map(|p| Ty::from_type_expr_scoped(&p.ty, p.span, &c.type_params).unwrap_or(Ty::Class(c.name.clone(), vec![])))
                         .unwrap_or(Ty::Class(c.name.clone(), vec![]));
@@ -1080,13 +1086,13 @@ impl<'a> Codegen<'a> {
                     self.line(&format!("impl{} ::std::ops::Add<{}> for {} {{", impl_generics, other_s, recv_ty_str));
                     self.indent += 1;
                     self.line(&format!("type Output = {};", ret_s));
-                    self.line(&format!("fn add(self, other: {}) -> {} {{", other_s, ret_s));
+                    self.line(&format!("fn add(self, {}: {}) -> {} {{", escape_ident(&other_name), other_s, ret_s));
                     self.indent += 1;
                     self.locals.insert("self".into(), self_class_ty.clone());
-                    self.locals.insert("other".into(), other_ty);
+                    self.locals.insert(other_name.clone(), other_ty);
                     self.emit_dunder_body(&m.body)?;
                     self.locals.remove("self");
-                    self.locals.remove("other");
+                    self.locals.remove(&other_name);
                     self.indent -= 1;
                     self.line("}");
                     self.indent -= 1;
@@ -1114,7 +1120,10 @@ impl<'a> Codegen<'a> {
                     self.line("");
                 }
                 "__sub__" => {
-                    let other_param = m.params.iter().find(|p| p.name == "other");
+                    // (card 0f41297a) See __add__: bind the operand by the first
+                    // non-`self` param and emit it under its real source name.
+                    let other_param = m.params.iter().find(|p| p.name != "self");
+                    let other_name = other_param.map(|p| p.name.clone()).unwrap_or_else(|| "other".to_string());
                     let other_ty = other_param
                         .map(|p| Ty::from_type_expr_scoped(&p.ty, p.span, &c.type_params).unwrap_or(Ty::Class(c.name.clone(), vec![])))
                         .unwrap_or(Ty::Class(c.name.clone(), vec![]));
@@ -1124,13 +1133,13 @@ impl<'a> Codegen<'a> {
                     self.line(&format!("impl{} ::std::ops::Sub<{}> for {} {{", impl_generics, other_s, recv_ty_str));
                     self.indent += 1;
                     self.line(&format!("type Output = {};", ret_s));
-                    self.line(&format!("fn sub(self, other: {}) -> {} {{", other_s, ret_s));
+                    self.line(&format!("fn sub(self, {}: {}) -> {} {{", escape_ident(&other_name), other_s, ret_s));
                     self.indent += 1;
                     self.locals.insert("self".into(), self_class_ty.clone());
-                    self.locals.insert("other".into(), other_ty);
+                    self.locals.insert(other_name.clone(), other_ty);
                     self.emit_dunder_body(&m.body)?;
                     self.locals.remove("self");
-                    self.locals.remove("other");
+                    self.locals.remove(&other_name);
                     self.indent -= 1;
                     self.line("}");
                     self.indent -= 1;
@@ -1138,7 +1147,12 @@ impl<'a> Codegen<'a> {
                     self.line("");
                 }
                 "__mul__" => {
-                    let other_param = m.params.iter().find(|p| p.name == "other");
+                    // (card 0f41297a) See __add__: bind the operand by the first
+                    // non-`self` param and emit it under its real source name. This is
+                    // what makes `s * 2` with `__mul__(self, o: float)` compile (the
+                    // scalar-broadcast operator pattern Kodiak needed).
+                    let other_param = m.params.iter().find(|p| p.name != "self");
+                    let other_name = other_param.map(|p| p.name.clone()).unwrap_or_else(|| "other".to_string());
                     let other_ty = other_param
                         .map(|p| Ty::from_type_expr_scoped(&p.ty, p.span, &c.type_params).unwrap_or(Ty::Class(c.name.clone(), vec![])))
                         .unwrap_or(Ty::Class(c.name.clone(), vec![]));
@@ -1148,13 +1162,13 @@ impl<'a> Codegen<'a> {
                     self.line(&format!("impl{} ::std::ops::Mul<{}> for {} {{", impl_generics, other_s, recv_ty_str));
                     self.indent += 1;
                     self.line(&format!("type Output = {};", ret_s));
-                    self.line(&format!("fn mul(self, other: {}) -> {} {{", other_s, ret_s));
+                    self.line(&format!("fn mul(self, {}: {}) -> {} {{", escape_ident(&other_name), other_s, ret_s));
                     self.indent += 1;
                     self.locals.insert("self".into(), self_class_ty.clone());
-                    self.locals.insert("other".into(), other_ty);
+                    self.locals.insert(other_name.clone(), other_ty);
                     self.emit_dunder_body(&m.body)?;
                     self.locals.remove("self");
-                    self.locals.remove("other");
+                    self.locals.remove(&other_name);
                     self.indent -= 1;
                     self.line("}");
                     self.indent -= 1;

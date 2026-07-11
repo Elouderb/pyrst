@@ -1,7 +1,10 @@
-# E1 fix / P2 negative: an int value into a float-typed `__setitem__` value param
-# is an honest check error (pyrst does not coerce int->float at call positions).
-# The old int_to_float allowance passed check and leaked rustc E0308 at build.
-# Write `r[0] = 5.0`.
+# E1 fix / P2 negative: SUBSCRIPT key/value positions stay EXACT — int->float
+# widening (card 0f41297a) applies at call args, dunder ARITHMETIC operands,
+# defaults, returns, and annotated/field assignments, but NOT at a `__setitem__`
+# value. An int value into a float-typed `__setitem__` value param is therefore
+# an honest check error (a deliberate, conservative scoping — no silent
+# miscompile). Write `r[0] = 5.0`. (Note: a *normal* call with an int into an
+# `f64` param now DOES widen — see examples/int_float_widen.pyrs — subscripts do not.)
 class Row:
     data: list[float]
     def __init__(self, data: list[float]) -> None:

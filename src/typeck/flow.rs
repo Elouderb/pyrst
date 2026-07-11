@@ -3103,7 +3103,13 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             // (LAZY-GEN V1-d) Returning a generator where a `list[T]` is declared:
             // honest MATERIALIZE error (`list(g)`) before the bare mismatch.
             reject_iterator_into_list(&ty, &env.ret_ty, *span)?;
-            if !types_compatible(&ty, &env.ret_ty, env.ctx) {
+            // (card 0f41297a) `return <int>` from a `-> float` function widens the
+            // int value to f64 (CPython widens int→float). Scalar only here (`None`
+            // passed as `value` so a list literal is NOT accepted — the return
+            // codegen does not element-widen a returned list). Never float→int.
+            if !types_compatible(&ty, &env.ret_ty, env.ctx)
+                && !int_widens_to_float(&ty, &env.ret_ty, None)
+            {
                 return Err(Error::Type {
                     span: *span,
                     msg: format!("return type mismatch: expected {}, found {}", env.ret_ty, ty),
@@ -3206,7 +3212,14 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
                 // (LAZY-GEN V1-d) A generator assigned into a `list[T]` slot:
                 // honest MATERIALIZE error (`list(g)`) before the bare mismatch.
                 reject_iterator_into_list(&val_ty, &explicit, *span)?;
-                if !types_compatible(&val_ty, &explicit, env.ctx) {
+                // (card 0f41297a) `x: float = <int>` (scalar) and `xs: list[float]
+                // = [<int>, ...]` (list LITERAL) widen int→float at the assignment
+                // boundary — codegen emits the `as f64` cast (scalar) / rebuilds the
+                // vec element-wise (list). `value` is passed so the list-literal arm
+                // can fire; never float→int (an honest error requiring `int(...)`).
+                if !types_compatible(&val_ty, &explicit, env.ctx)
+                    && !int_widens_to_float(&val_ty, &explicit, Some(value))
+                {
                     return Err(Error::Type {
                         span: *span,
                         msg: format!("type mismatch in assignment: declared {}, got {}", explicit, val_ty),

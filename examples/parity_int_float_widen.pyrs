@@ -1,0 +1,56 @@
+# (card 0f41297a) int->float widening at value boundaries — DUAL-RUN parity.
+#
+# pyrst ENFORCES a `float` annotation (it coerces an int value to f64 at the
+# boundary); CPython IGNORES the annotation at runtime. So a BARE widened value
+# would diverge (`2.0` vs `2`). Here every widened value instead flows through
+# FLOAT arithmetic (or a `float` accumulator) before printing, so the NUMERIC
+# result — and its float repr — is byte-identical under both runtimes. This
+# proves pyrst runs the widened program and computes the CPython-correct value.
+
+
+def scale(x: float) -> float:
+    return x * 2.0
+
+
+def with_default(x: float = 10) -> float:
+    return x + 0.5
+
+
+class Scalar:
+    v: float
+
+    def __init__(self, v: float) -> None:
+        self.v = v
+
+    def __mul__(self, o: float) -> float:
+        return self.v * o
+
+
+def total(xs: list[float]) -> float:
+    s: float = 0.0
+    for x in xs:
+        s = s + x
+    return s
+
+
+def main() -> None:
+    # call arg: int literal + int var into a float param (result * 2.0 -> float)
+    print(scale(2))
+    n: int = 3
+    print(scale(n))
+    # float default: no-arg fill and int arg (both + 0.5 -> float)
+    print(with_default())
+    print(with_default(5))
+    # arithmetic dunder operand: obj * int-literal and obj * int-var (float field)
+    sc: Scalar = Scalar(4.0)
+    print(sc * 2)
+    print(sc * n)
+    # list[float] literal (widened at the annotated-assign boundary) summed into
+    # a float accumulator
+    xs: list[float] = [1, 2, 3]
+    print(total(xs))
+    # annotated assign int->float, observed through float arithmetic
+    a: float = 7
+    print(a + 0.25)
+    b: float = n
+    print(b + 0.75)

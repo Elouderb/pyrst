@@ -3849,7 +3849,27 @@ impl<'a> Codegen<'a> {
                     && matches!(self.type_of_expr(lhs), Ty::Class(..))
                 {
                     let l = self.emit_consuming(lhs)?;
-                    let r = self.emit_consuming(rhs)?;
+                    let mut r = self.emit_consuming(rhs)?;
+                    // (card 0f41297a) Widen an INT operand to f64 when the operator
+                    // dunder's DECLARED operand type is `float` — `s * 2` with
+                    // `__mul__(self, o: float)`. The operand type comes from the
+                    // dunder signature (params[0]; `self` is filtered out of FuncSig),
+                    // so it is correct regardless of the operand param's name. Never
+                    // float→int.
+                    if let Ty::Class(cls, _) = self.type_of_expr(lhs) {
+                        let dunder = match op {
+                            BinOp::Add => "__add__",
+                            BinOp::Sub => "__sub__",
+                            BinOp::Mul => "__mul__",
+                            _ => unreachable!(),
+                        };
+                        if let Some(sig) = self.ctx.get_method(&cls, dunder) {
+                            if let Some((_, operand_ty)) = sig.params.get(0) {
+                                let rt = self.type_of_expr(rhs);
+                                r = self.widen_int_arg_to_float(r, &rt, operand_ty);
+                            }
+                        }
+                    }
                     let op_s = match op {
                         BinOp::Add => "+",
                         BinOp::Sub => "-",

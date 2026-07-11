@@ -1,0 +1,9 @@
+# NEGATIVE (card 0f41297a): int->float widening is DIRECTIONAL. A `float` value
+# into an `int` parameter is NARROWING (loses the fractional part) and must stay
+# an honest error — pyrst never silently truncates; the user must write `int(x)`.
+# The companion positive (int_float_widen.pyrs) shows int->float IS accepted.
+def f(x: int) -> int:
+    return x
+
+def main() -> None:
+    print(f(3.5))

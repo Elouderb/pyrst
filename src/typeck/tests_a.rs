@@ -46,6 +46,46 @@ use super::test_support::*;
         assert!(!types_compatible(&Ty::Int, &Ty::Float));
     }
 
+    // (card 0f41297a) The DIRECTIONAL int→float widening predicate the boundary
+    // callers OR in (types_compatible itself stays strict, above).
+    #[test]
+    fn widen_int_to_float_scalar_directional() {
+        assert!(int_widens_to_float(&Ty::Int, &Ty::Float, None));
+        // float→int is NARROWING — never widens (stays an honest error).
+        assert!(!int_widens_to_float(&Ty::Float, &Ty::Int, None));
+    }
+
+    #[test]
+    fn widen_int_to_float_leaves_other_types() {
+        // bool is deliberately NOT widened; non-numeric mismatches stay errors.
+        assert!(!int_widens_to_float(&Ty::Bool, &Ty::Float, None));
+        assert!(!int_widens_to_float(&Ty::Str, &Ty::Float, None));
+        assert!(!int_widens_to_float(&Ty::Int, &Ty::Int, None));
+    }
+
+    #[test]
+    fn widen_int_list_literal_into_float_list_only() {
+        let lit = Expr::List(vec![], Span::DUMMY);
+        // A list LITERAL of ints fills a list[float] slot (codegen widens elems).
+        assert!(int_widens_to_float(
+            &Ty::List(Box::new(Ty::Int)),
+            &Ty::List(Box::new(Ty::Float)),
+            Some(&lit)
+        ));
+        // Same types, but the RHS is NOT a list literal -> honest error (no widen).
+        assert!(!int_widens_to_float(
+            &Ty::List(Box::new(Ty::Int)),
+            &Ty::List(Box::new(Ty::Float)),
+            None
+        ));
+        // Reverse container direction (float list into int list) never widens.
+        assert!(!int_widens_to_float(
+            &Ty::List(Box::new(Ty::Float)),
+            &Ty::List(Box::new(Ty::Int)),
+            Some(&lit)
+        ));
+    }
+
     #[test]
     fn compat_unknown_lhs() {
         assert!(types_compatible(&Ty::Unknown, &Ty::Int));

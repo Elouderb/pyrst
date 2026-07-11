@@ -150,6 +150,11 @@ impl<'a> Codegen<'a> {
                     } else {
                         self.emit_consuming(e)?
                     };
+                    // (card 0f41297a) `return <int>` from a `-> float` function widens
+                    // the int value to f64 (CPython widens int→float). Never float→int.
+                    let ret_ty = self.current_ret_ty.clone();
+                    let val_ty = self.type_of_expr(e);
+                    let s = self.widen_int_arg_to_float(s, &val_ty, &ret_ty);
                     // (try/except control flow) thread the (already coerced)
                     // value out of the catch_unwind closure when emitting the try
                     // body; otherwise issue the plain function return as before.
@@ -260,6 +265,18 @@ impl<'a> Codegen<'a> {
                             // `emits_int_pow` covers the case the oracle now types as
                             // Float (D5) but emission still lowers to i64.
                             let value_ty = self.type_of_expr(value);
+                            // (card 0f41297a) `xs: list[float] = [1, 2, 3]` — a
+                            // float-element list LITERAL whose int elements emit as
+                            // i64: rebuild as `Vec<f64>` element-wise so the declared
+                            // slot type is met. typeck (`int_widens_to_float`) accepts
+                            // this ONLY for a list literal, so `v` here is a `vec![..]`.
+                            let v = if matches!(&ty_obj, Ty::List(inner) if matches!(**inner, Ty::Float))
+                                && matches!(&value_ty, Ty::List(inner) if matches!(**inner, Ty::Int))
+                            {
+                                format!("{}.into_iter().map(|__x| __x as f64).collect::<Vec<f64>>()", v)
+                            } else {
+                                v
+                            };
                             // (EPIC-6) Escape the emitted binding name; the raw
                             // `target` stays the `declared`/`locals` key.
                             let target_e = escape_ident(target);
@@ -1208,8 +1225,13 @@ impl<'a> Codegen<'a> {
                     None
                 };
                 let v = self.emit_consuming(value)?;
+                // (card 0f41297a) Static type of the RHS, for the int→float field widen.
+                let field_value_ty = self.type_of_expr(value);
                 let v = if let Some((cn, ft)) = &field_info {
                     let coerced = self.coerce_to_option(v, value, ft);
+                    // (card 0f41297a) A `float` FIELD assigned an `int` value
+                    // (`self.x = 3` where `x: float`): widen to f64. Never float→int.
+                    let coerced = self.widen_int_arg_to_float(coerced, &field_value_ty, ft);
                     // (card 30e4fdd0) A boxed-recursive field STORES `Option<Box<Node>>`
                     // (the struct boxes the inline self-reference to break E0072).
                     // Box the (Some-wrapped) value at the write boundary:

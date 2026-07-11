@@ -1438,6 +1438,22 @@ impl<'a> Codegen<'a> {
     /// sites); otherwise keep the uniform clone-on-use emission. A `None` slot
     /// (untyped / variadic) also keeps clone-on-use. This closes the constructor
     /// arg path, which the keystone's three `ty_has_poly_base` sites did not cover.
+    /// (card 0f41297a) Codegen half of pyrst's int→float value-boundary coercion:
+    /// wrap an emitted INT value as `(<e> as f64)` when the target `slot` is
+    /// `float`. Python widens int→float implicitly in numeric / assignment /
+    /// argument contexts; the emitted `as f64` makes rustc see an f64 at the
+    /// coerced site. `val_ty` is the SOURCE expression's static type (so a value
+    /// already typed `float`, or any non-int, is untouched). DIRECTIONAL: only
+    /// int→float, never float→int (that stays an honest error requiring `int(x)`).
+    /// A large int → f64 loses precision above 2^53, exactly as CPython.
+    pub(crate) fn widen_int_arg_to_float(&self, e: String, val_ty: &Ty, slot: &Ty) -> String {
+        if matches!(val_ty, Ty::Int) && matches!(slot, Ty::Float) {
+            format!("({} as f64)", e)
+        } else {
+            e
+        }
+    }
+
     pub(crate) fn emit_arg_into_slot(&mut self, arg: &Expr, slot: Option<&Ty>) -> Result<String> {
         match slot {
             Some(t) if self.ty_has_poly_base(t) => self.emit_into_base_slot(arg, t),
@@ -1461,7 +1477,18 @@ impl<'a> Codegen<'a> {
                 let s = self.emit_consuming(arg)?;
                 Ok(self.coerce_to_option(s, arg, t))
             }
-            _ => self.emit_consuming(arg),
+            // (card 0f41297a) A `float` slot filled with an `int` value (constructor
+            // `__init__(x: float)` called `P(3)`): widen the int to f64.
+            _ => {
+                let s = self.emit_consuming(arg)?;
+                match slot {
+                    Some(t) => {
+                        let vt = self.type_of_expr(arg);
+                        Ok(self.widen_int_arg_to_float(s, &vt, t))
+                    }
+                    None => Ok(s),
+                }
+            }
         }
     }
 
@@ -1502,8 +1529,19 @@ impl<'a> Codegen<'a> {
             Some(pt) if self.ty_has_poly_base(pt) => self.emit_into_base_slot(a, pt)?,
             _ => self.emit_consuming(a)?,
         };
-        Ok(match param_tys.get(p) {
+        let s = match param_tys.get(p) {
             Some(pt) => self.coerce_to_option(s, a, pt),
+            None => s,
+        };
+        // (card 0f41297a) int→float widening at the call-arg boundary (free-fn AND
+        // method calls, and default-fill which routes here): a `float` param filled
+        // with an `int` value / literal is cast `(x as f64)`. A `None`/poly/Func/
+        // Option slot is untouched (val_ty is not `Int` or slot is not `Float`).
+        Ok(match param_tys.get(p) {
+            Some(pt) => {
+                let vt = self.type_of_expr(a);
+                self.widen_int_arg_to_float(s, &vt, pt)
+            }
             None => s,
         })
     }

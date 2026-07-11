@@ -1,0 +1,9 @@
+# NEGATIVE (card 0f41297a): int->float widening is DIRECTIONAL. Returning a
+# `float` from a function declared `-> int` is float->int NARROWING and must stay
+# an honest error. Only int->float widens (`return 3` from `-> float` is
+# accepted). Write `return int(3.5)` to narrow explicitly.
+def g() -> int:
+    return 3.5
+
+def main() -> None:
+    print(g())

@@ -1,0 +1,7 @@
+# NEGATIVE (card 0f41297a): int->float widening is DIRECTIONAL. `x: int = 3.5`
+# is float->int NARROWING and must stay an honest error (it silently drops the
+# fraction). Only int->float widens (`x: float = 3` is accepted). Write
+# `x: int = int(3.5)` to narrow explicitly.
+def main() -> None:
+    x: int = 3.5
+    print(x)

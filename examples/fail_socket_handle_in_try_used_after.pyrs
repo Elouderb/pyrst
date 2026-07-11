@@ -1,0 +1,15 @@
+# E2 fix (card 2f62ad54): a move-only socket handle FIRST bound inside a `try`
+# block and then read AFTER that block is an honest CHECK error (it used to leak a
+# raw rustc `E0425 cannot find value`). The `try:` body is its own Rust block; a
+# non-default handle is not hoisted out of it. The natural `try: s = connect()` to
+# CATCH a connect error must therefore keep every use of `s` inside the `try`.
+from socket import connect, Stream
+
+
+def main() -> None:
+    try:
+        s: Stream = connect("127.0.0.1", 9)
+    except OSError:
+        return
+    # `s`'s binding is scoped to the `try` block — using it here is out of scope.
+    s.close()

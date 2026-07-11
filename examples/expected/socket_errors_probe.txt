@@ -1,0 +1,6 @@
+recv-after-close OSError
+send-after-close OSError
+getsockname-after-close OSError
+double-close ok
+connect refused
+refused-as-OSError

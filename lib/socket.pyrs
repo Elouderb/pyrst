@@ -1,0 +1,176 @@
+# pyrst standard library — socket (E2, card 2f62ad54; epic 47cafe10)
+#
+# Minimal TCP networking as embedded stdlib, built on the W5-h `@extern class`
+# HANDLE decl form (docs/design/w5-bytes-handles.md §C/§F — re.Pattern was its
+# first consumer; this is the first NEW-module consumer). Two opaque move-only
+# handles + two module constructors, ZERO compiler change:
+#
+#   * `bind(host, port) -> Listener`   — bind+listen a TCP server socket.
+#   * `connect(host, port) -> Stream`  — connect a TCP client socket.
+#   * `Listener`  — a bound, listening socket:
+#       - `accept() -> Stream`         BORROWS self (a &self method), so the
+#                                      accept loop `while ...: c = lis.accept()`
+#                                      is legal (the listener is NOT consumed);
+#                                      each call returns a FRESH per-connection
+#                                      `Stream` (loop-created, so the move
+#                                      checker permits it).
+#       - `getsockname() -> (host, port)`  the bound address — the way to read
+#                                      the OS-assigned port after `bind(h, 0)`.
+#       - `close()`                    stop listening (idempotent); Drop closes.
+#   * `Stream`    — a connected endpoint (client or accepted):
+#       - `recv(n) -> bytes`           read up to n bytes; `b""` on EOF.
+#       - `recv_line() -> bytes`       read up to AND INCLUDING the first b'\n'
+#                                      (readline semantics), or until EOF.
+#       - `send(data: bytes) -> int`   write ALL of data, return the count.
+#       - `close()`                    close now (idempotent); Drop closes.
+#
+# BYTES, NOT STR (probed + decided): CPython's socket surface is `bytes`
+# (`sock.recv(n) -> bytes`, `sock.send(b) -> int`), and pyrst has a real `bytes`
+# value type (W5-a), so recv/recv_line/send are `bytes` — CPython-faithful. STR
+# convenience is already FREE and needs no extra API: send text with
+# `sock.send("hi".encode())` and read text with `sock.recv(n).decode()` (the
+# built-in `str.encode()` / `bytes.decode()`), so no redundant str methods ship.
+#
+# MOVE-ONLY HANDLES (inherited from W5-g via the @extern-class form, for free):
+# a `Listener`/`Stream` is non-`Clone`, non-user-constructible, and CONSUMED
+# (moved) when passed / returned / reassigned; a METHOD call only BORROWS it. So
+# `c = lis.accept(); c.recv(1024); c.send(data)` reuses the one connection, while
+# `d = c` (move) then using `c` is a compile error, and a `Stream` field on a
+# value class is rejected at check (H5). close() + Drop follow the built-in
+# `file` handle model (src/codegen/mod.rs FILE_PRELUDE): the opaque struct holds
+# a `RefCell<Option<Tcp*>>` whose `None` IS the closed flag (interior mutability
+# because an @extern method lowers to `&self` — its opaque body has no analysable
+# statement, so the codegen mut-self heuristic gives every handle method `&self`;
+# the RefCell is what lets close() set `None` and recv/send borrow the stream
+# through that `&self`). close() drops the OS handle NOW (eager, like CPython);
+# a SECOND close() is an idempotent no-op; any recv/recv_line/send/accept/
+# getsockname AFTER close is a catchable `OSError` `[Errno 9] Bad file descriptor`
+# — matching CPython, whose SOCKET operations on a closed fd raise `OSError`
+# (EBADF), NOT the `ValueError` a closed FILE raises ('I/O operation on closed
+# file.'); an idiomatic `except OSError:` guard therefore catches post-close use.
+# Drop closes via the `Option`'s own drop (RAII), so a handle that leaves scope
+# without an explicit close() is still closed.
+#
+# CPython FIDELITY (python3 3.12.9 socket-module oracle, where the shapes agree —
+# note pyrst SPLITS the server (`Listener`) and connection (`Stream`) into two
+# handles rather than CPython's one `socket.socket`, a documented divergence, so
+# the fidelity is on BEHAVIOUR, oracle-checked, not on the class shape):
+#   * echo round-trip:      client `send(b"hello")` -> server `recv(1024)` ==
+#                           `b"hello"` -> echo back -> client `recv` == `b"hello"`.
+#   * recv_line:            after `send(b"line1\nline2\n")`, `recv_line()` ==
+#                           `b"line1\n"` (the trailing newline is included).
+#   * recv at EOF:          a peer that closed -> `recv(n) == b""`.
+#   * use after close:      recv/recv_line/send/accept/getsockname on a CLOSED
+#                           handle -> a catchable `OSError` `[Errno 9] Bad file
+#                           descriptor` (oracle: `s.close(); s.recv(10)` raises
+#                           `OSError` EBADF, `isinstance(e, OSError)` is True) — so
+#                           a bare `except OSError` catches it. (Contrast the FILE
+#                           handle, which correctly raises `ValueError` because
+#                           that is what CPython does for a closed FILE.)
+#   * connect to a dead port: a catchable `ConnectionRefusedError` (an `OSError`
+#                           subclass — a bare `except OSError` catches it too, via
+#                           the W2 hierarchy) with CPython's exact payload
+#                           `[Errno 111] Connection refused`.
+#   * bind an in-use port:  a catchable `OSError` `[Errno 98] Address already in
+#                           use` (CPython has no named subclass for EADDRINUSE).
+#   * bind a denied port:   a catchable `PermissionError` (an `OSError` subclass)
+#                           `[Errno 13] Permission denied`.
+#
+# SCOPE — TCP over localhost is the focus; these are HONEST v1 DEFERRALS (each a
+# documented follow-on, not a silent gap):
+#   * UDP (SOCK_DGRAM), TLS/SSL, `AF_INET6`, and Unix-domain sockets.
+#   * non-blocking mode, `settimeout`/timeouts, `select`/`poll` — every call here
+#     is BLOCKING; a peer that never sends the awaited bytes (and never closes)
+#     will block until the OS tears the connection down. (The one-process test
+#     below only ever recv's bytes already sent, so it never blocks.)
+#   * `send` has SENDALL semantics (it write_all's the whole buffer and returns
+#     the count) rather than CPython's partial-write `send`; there is no separate
+#     `sendall`. Reading exactly N bytes similarly needs a recv loop — `recv(n)`
+#     returns UP TO n bytes (CPython-faithful), not exactly n.
+#   * spawn/bind errnos other than ECONNREFUSED/EADDRINUSE/EACCES/EADDRNOTAVAIL
+#     collapse to a bare `OSError` whose message is Rust's `io::Error` text (it
+#     carries the errno as "(os error N)") rather than CPython's `[Errno N]
+#     <strerror>` shape — the strerror text is the only divergence, on paths that
+#     are not hermetically reproducible, so untested-by-design, not fudged. The
+#     mapped errnos (111/98/13/99) are the Linux values (the oracle platform),
+#     hardcoded like subprocess's `[Errno 2]`/`[Errno 13]`.
+#
+# std::net only — NO `@crate` — so importing `socket` stays on the single-file
+# build path (like `subprocess`).
+
+
+# A connected TCP endpoint (client- or accept-side). Move-only opaque handle: the
+# `RefCell<Option<TcpStream>>` holds the OS socket; `None` is the closed flag.
+@extern
+class Stream:
+    __rust__: str = "inner: std::cell::RefCell<Option<std::net::TcpStream>>"
+
+    # Read up to `n` bytes (fewer if that is all that is buffered; `b""` at EOF /
+    # peer-close). `n < 0` is a catchable `ValueError` (CPython-exact). recv on a
+    # closed stream is a catchable `OSError` `[Errno 9] Bad file descriptor`.
+    @extern
+    def recv(self, n: int) -> bytes:
+        "{ use std::io::Read; if {n} < 0 { panic!(\"ValueError\\0negative buffersize in recv\"); } let mut g = {self}.inner.borrow_mut(); let s = g.as_mut().unwrap_or_else(|| panic!(\"OSError\\0[Errno 9] Bad file descriptor\")); let mut buf = vec![0u8; {n} as usize]; let got = s.read(&mut buf).unwrap_or_else(|e| panic!(\"OSError\\0{}\", e)); buf.truncate(got); buf }"
+
+    # Read up to AND INCLUDING the first b'\n' (readline semantics), or until EOF
+    # (whichever comes first). `b""` only at immediate EOF. recv on a closed
+    # stream is a catchable `OSError` `[Errno 9] Bad file descriptor`.
+    @extern
+    def recv_line(self) -> bytes:
+        "{ use std::io::Read; let mut g = {self}.inner.borrow_mut(); let s = g.as_mut().unwrap_or_else(|| panic!(\"OSError\\0[Errno 9] Bad file descriptor\")); let mut out: Vec<u8> = Vec::new(); let mut one = [0u8; 1]; loop { let got = s.read(&mut one).unwrap_or_else(|e| panic!(\"OSError\\0{}\", e)); if got == 0 { break; } out.push(one[0]); if one[0] == b'\\n' { break; } } out }"
+
+    # Write ALL of `data` (sendall semantics) and return the number of bytes sent.
+    # send on a closed stream is a catchable `OSError` `[Errno 9] Bad file descriptor`.
+    @extern
+    def send(self, data: bytes) -> int:
+        "{ use std::io::Write; let mut g = {self}.inner.borrow_mut(); let s = g.as_mut().unwrap_or_else(|| panic!(\"OSError\\0[Errno 9] Bad file descriptor\")); s.write_all(&{data}).unwrap_or_else(|e| panic!(\"OSError\\0{}\", e)); {data}.len() as i64 }"
+
+    # Close the socket NOW (drops the fd). Idempotent: a second close() is a
+    # silent no-op (matching the built-in `file` handle). Drop closes too.
+    @extern
+    def close(self) -> None:
+        "{ {self}.inner.borrow_mut().take(); }"
+
+
+# A bound, listening TCP server socket. Move-only opaque handle: the
+# `RefCell<Option<TcpListener>>` holds the OS socket; `None` is the closed flag.
+@extern
+class Listener:
+    __rust__: str = "inner: std::cell::RefCell<Option<std::net::TcpListener>>"
+
+    # Block for the next incoming connection and return it as a fresh `Stream`.
+    # BORROWS self (`&self`), so an accept LOOP is legal and the listener is not
+    # consumed. accept on a closed listener is a catchable `OSError` `[Errno 9]
+    # Bad file descriptor`.
+    @extern
+    def accept(self) -> Stream:
+        "{ let g = {self}.inner.borrow(); let l = g.as_ref().unwrap_or_else(|| panic!(\"OSError\\0[Errno 9] Bad file descriptor\")); let (stream, _addr) = l.accept().unwrap_or_else(|e| panic!(\"OSError\\0{}\", e)); __PyHandle_Stream { inner: std::cell::RefCell::new(Some(stream)) } }"
+
+    # The bound address as `(host, port)`. After `bind(host, 0)` this is how you
+    # read the OS-assigned ephemeral port. Closed listener -> catchable `OSError`
+    # `[Errno 9] Bad file descriptor`.
+    @extern
+    def getsockname(self) -> tuple[str, int]:
+        "{ let g = {self}.inner.borrow(); let l = g.as_ref().unwrap_or_else(|| panic!(\"OSError\\0[Errno 9] Bad file descriptor\")); let a = l.local_addr().unwrap_or_else(|e| panic!(\"OSError\\0{}\", e)); (a.ip().to_string(), a.port() as i64) }"
+
+    # Stop listening NOW. Idempotent; Drop closes too.
+    @extern
+    def close(self) -> None:
+        "{ {self}.inner.borrow_mut().take(); }"
+
+
+# `bind(host, port)` — bind AND listen a TCP server socket (CPython separates
+# bind() and listen(); pyrst does both here — a documented convenience). Use
+# port 0 for an OS-assigned ephemeral port (read it back with getsockname()).
+# EADDRINUSE -> `OSError [Errno 98]`; EACCES -> `PermissionError [Errno 13]`.
+@extern
+def bind(host: str, port: int) -> Listener:
+    "{ let addr = format!(\"{}:{}\", {host}, {port}); match std::net::TcpListener::bind(&addr) { Ok(l) => __PyHandle_Listener { inner: std::cell::RefCell::new(Some(l)) }, Err(e) => match e.kind() { std::io::ErrorKind::AddrInUse => panic!(\"OSError\\0[Errno 98] Address already in use\"), std::io::ErrorKind::PermissionDenied => panic!(\"PermissionError\\0[Errno 13] Permission denied\"), std::io::ErrorKind::AddrNotAvailable => panic!(\"OSError\\0[Errno 99] Cannot assign requested address\"), _ => panic!(\"OSError\\0{}\", e) } } }"
+
+
+# `connect(host, port)` — connect a TCP client socket, returning a `Stream`.
+# ECONNREFUSED -> `ConnectionRefusedError [Errno 111]` (an `OSError` subclass);
+# EACCES -> `PermissionError [Errno 13]`.
+@extern
+def connect(host: str, port: int) -> Stream:
+    "{ let addr = format!(\"{}:{}\", {host}, {port}); match std::net::TcpStream::connect(&addr) { Ok(s) => __PyHandle_Stream { inner: std::cell::RefCell::new(Some(s)) }, Err(e) => match e.kind() { std::io::ErrorKind::ConnectionRefused => panic!(\"ConnectionRefusedError\\0[Errno 111] Connection refused\"), std::io::ErrorKind::PermissionDenied => panic!(\"PermissionError\\0[Errno 13] Permission denied\"), std::io::ErrorKind::AddrNotAvailable => panic!(\"OSError\\0[Errno 99] Cannot assign requested address\"), _ => panic!(\"OSError\\0{}\", e) } } }"

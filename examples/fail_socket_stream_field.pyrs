@@ -1,0 +1,14 @@
+# NEGATIVE (E2, H5 — lib-handle class FIELD): a move-only socket `Stream` handle
+# cannot be a struct field. It is non-`Clone`/non-`Default` (an external OS
+# socket), so a `s: Stream` field breaks the value class's derived semantics. The
+# handle-aware field gate (the W5-h fix, card 27aeeb3e) rejects it at CHECK —
+# hold the connection in a local and pass it to methods instead.
+from socket import connect, Stream
+
+
+class Holder:
+    s: Stream
+
+
+def main() -> None:
+    print("unreached")

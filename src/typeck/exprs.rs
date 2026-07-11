@@ -1643,6 +1643,10 @@ pub(crate) fn lambda_ret_with_elem(
                 // expression scope), so `loop_handles` is inherited but never pushed.
                 moved: env.moved.clone(),
                 loop_handles: env.loop_handles.clone(),
+                // (E2 fix, card 2f62ad54) A nested def/lambda is its OWN Rust
+                // scope; the enclosing function's block-scoped handles are not
+                // visible in it, so start fresh (its own walk populates its set).
+                block_scoped_handles: std::collections::HashSet::new(),
             };
             // Bind every param: the first to the iterable element type, the
             // rest to their declared type or Unknown (map/filter pass a single
@@ -1778,6 +1782,10 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 // expression scope), so `loop_handles` is inherited but never pushed.
                 moved: env.moved.clone(),
                 loop_handles: env.loop_handles.clone(),
+                // (E2 fix, card 2f62ad54) A nested def/lambda is its OWN Rust
+                // scope; the enclosing function's block-scoped handles are not
+                // visible in it, so start fresh (its own walk populates its set).
+                block_scoped_handles: std::collections::HashSet::new(),
             };
             bind_comp_targets(targets, elem_ty, &mut inner_env.locals);
             if let Some(c) = cond { let ct = check_expr(c, &mut inner_env)?; reject_optional_truthiness(&ct, c.span())?; }
@@ -1839,6 +1847,10 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 // expression scope), so `loop_handles` is inherited but never pushed.
                 moved: env.moved.clone(),
                 loop_handles: env.loop_handles.clone(),
+                // (E2 fix, card 2f62ad54) A nested def/lambda is its OWN Rust
+                // scope; the enclosing function's block-scoped handles are not
+                // visible in it, so start fresh (its own walk populates its set).
+                block_scoped_handles: std::collections::HashSet::new(),
             };
             bind_comp_targets(targets, elem_ty, &mut inner_env.locals);
             if let Some(c) = cond { let ct = check_expr(c, &mut inner_env)?; reject_optional_truthiness(&ct, c.span())?; }
@@ -1901,6 +1913,10 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 // expression scope), so `loop_handles` is inherited but never pushed.
                 moved: env.moved.clone(),
                 loop_handles: env.loop_handles.clone(),
+                // (E2 fix, card 2f62ad54) A nested def/lambda is its OWN Rust
+                // scope; the enclosing function's block-scoped handles are not
+                // visible in it, so start fresh (its own walk populates its set).
+                block_scoped_handles: std::collections::HashSet::new(),
             };
             bind_comp_targets(targets, elem_ty, &mut inner_env.locals);
             if let Some(c) = cond { let ct = check_expr(c, &mut inner_env)?; reject_optional_truthiness(&ct, c.span())?; }
@@ -4025,6 +4041,9 @@ pub(crate) fn lambda_body_ty(
         // (W5-g) Inherit handle liveness (see the comprehension envs).
         moved: env.moved.clone(),
         loop_handles: env.loop_handles.clone(),
+        // (E2 fix, card 2f62ad54) A lambda is its own Rust closure scope; start
+        // fresh (a lambda cannot reference an enclosing block-scoped handle).
+        block_scoped_handles: std::collections::HashSet::new(),
     };
     for (param_name, param_ty) in params {
         let ty = lambda_param_ty(param_ty);

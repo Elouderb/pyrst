@@ -79,6 +79,20 @@ pub(crate) struct FuncEnv<'a> {
     /// (it would be a use-after-move on the second iteration); a handle CREATED
     /// inside the loop is not in any frame and moves freely. Empty outside loops.
     pub(crate) loop_handles: Vec<std::collections::HashSet<String>>,
+    /// (E2 fix, card 2f62ad54) Handle bindings whose ONLY binding so far is inside
+    /// an EXITED nested block (`if`/`while`/`for`/`try`/`with`/`match` body). A
+    /// move-only handle has no `Default` (the E2 `type_has_default` guard), so —
+    /// unlike a value local — codegen does NOT hoist it to function scope; its
+    /// `let` stays scoped to the inner Rust block. Reading it AFTER that block is a
+    /// raw rustc `E0425 cannot find value`. This set turns that leak into an honest
+    /// CHECK error: a name is added when a block that first-binds it exits (see the
+    /// `seal_block_scope` sites in `flow.rs`), removed when it is re-bound at the
+    /// current scope (an `Assign` revives it), and any READ of a name in it
+    /// (`check_handle_flow`'s Ident arm) is rejected naming the restriction. Empty
+    /// for every function whose handles are all bound at function scope. The proper
+    /// fix (hoist a non-`Default` handle as `Option<Handle>` at fn scope + rewrite
+    /// reads) is a larger codegen change tracked separately.
+    pub(crate) block_scoped_handles: std::collections::HashSet<String>,
 }
 
 impl<'a> FuncEnv<'a> {
@@ -95,7 +109,7 @@ impl<'a> FuncEnv<'a> {
             param_set.insert(name.clone());
         }
         let by_ref_params = by_ref_names.iter().cloned().collect();
-        FuncEnv { ctx, locals, ret_ty, used_vars, params: param_set, reassigned_params: std::collections::HashSet::new(), returned_params: std::collections::HashSet::new(), by_ref_params, is_generator: false, type_params: std::collections::HashSet::new(), globals_declared: std::collections::HashSet::new(), narrowed: HashMap::new(), module_id: None, moved: HashMap::new(), loop_handles: Vec::new() }
+        FuncEnv { ctx, locals, ret_ty, used_vars, params: param_set, reassigned_params: std::collections::HashSet::new(), returned_params: std::collections::HashSet::new(), by_ref_params, is_generator: false, type_params: std::collections::HashSet::new(), globals_declared: std::collections::HashSet::new(), narrowed: HashMap::new(), module_id: None, moved: HashMap::new(), loop_handles: Vec::new(), block_scoped_handles: std::collections::HashSet::new() }
     }
 
     /// The enclosing generic function's declared type-parameter names as a

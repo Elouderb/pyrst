@@ -256,6 +256,18 @@ impl<'a> Codegen<'a> {
             // exactly like a list, so hoisting stays byte-identical.
             // (W5-a) `bytes` is a `Vec<u8>` — `Default` (empty) like a list.
             Ty::Bytes | Ty::List(_) | Ty::Iterator(_) | Ty::Set(_) | Ty::Dict(_, _) | Ty::Option(_) => true,
+            // (E2, card 2f62ad54) A move-only HANDLE has NO `Default` — it is an
+            // opaque, non-`Clone`/non-`Default` external resource. The built-in
+            // `file` handle (`Ty::Handle`) already yields false via the `_` arm;
+            // extend the SAME truth to a lib `@extern class` handle, which codegen
+            // sees spelled `Ty::Class(n)` with `is_handle_class(n)` (re.Pattern,
+            // socket.Listener/Stream). Without this guard a handle local first
+            // assigned inside a nested block (`try:`/`if:`) is Default-hoisted to
+            // `let mut h: __PyHandle_X = Default::default();` by the hoist site
+            // (default_val -> items.rs), a check-pass / rustc-E0277. This is the
+            // W5-h Class-vs-Handle chokepoint pattern (card 27aeeb3e) at a site the
+            // handle keystone did not cover, exposed by E2's `try: s = connect()`.
+            Ty::Class(n, args) if args.is_empty() && self.ctx.is_handle_class(n) => false,
             Ty::Class(n, _) => {
                 // (EPIC-5 C2-3) A polymorphic base lowers (via `rust_ty`) to its
                 // companion enum `n__`, a data-variant enum that CANNOT derive

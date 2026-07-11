@@ -315,6 +315,16 @@ pub const EMBEDDED_STDLIB: &[(&str, &str)] = &[
     // move-only handle, inside the existing `re` module via the `@extern class` decl
     // form — no new registration.)
     ("subprocess", include_str!("../lib/subprocess.pyrs")),
+    // E2 (card 2f62ad54, epic 47cafe10): `socket` — minimal TCP networking
+    // (localhost focus) via the W5-h `@extern class` HANDLE decl form (its first
+    // NEW-module consumer): move-only `Listener` (bind+listen; accept() BORROWS
+    // self so the accept loop is legal, returning a fresh per-connection `Stream`)
+    // and `Stream` (recv/recv_line/send over `bytes`, close() + Drop per the
+    // built-in `file` handle model). Client `connect(host, port) -> Stream`. Errors
+    // map to the CPython-shaped OSError family (ConnectionRefusedError/
+    // PermissionError/OSError). std::net only (no @crate), so it stays on the
+    // single-file build path. UDP/TLS/nonblocking/timeout are documented deferrals.
+    ("socket", include_str!("../lib/socket.pyrs")),
 ];
 
 /// Look up an embedded stdlib module's source by NAME (e.g. `"os"`).
@@ -392,5 +402,25 @@ mod tests {
         assert!(src.contains("def dumps"), "json must define dumps");
         assert!(src.contains("class JsonValue"), "json must define JsonValue");
         assert!(!src.contains("@crate"), "json is pure pyrst and needs no crate");
+    }
+
+    /// (E2, card 2f62ad54) `socket` is an embedded module built on the W5-h
+    /// `@extern class` handle decl form: its source is baked in, declares the
+    /// `Listener`/`Stream` handles and the `bind`/`connect` constructors, and —
+    /// being backed by Rust `std::net` — declares NO `@crate` dependency (it
+    /// stays on the single-file build path).
+    #[test]
+    fn socket_module_is_embedded() {
+        let src = lookup("socket").expect("`socket` must be an embedded stdlib module");
+        assert!(!src.trim().is_empty(), "embedded socket source must be non-empty");
+        assert!(src.contains("class Listener"), "socket must define the Listener handle");
+        assert!(src.contains("class Stream"), "socket must define the Stream handle");
+        assert!(src.contains("def bind"), "socket must define bind");
+        assert!(src.contains("def connect"), "socket must define connect");
+        assert!(src.contains("@extern"), "socket handles/constructors must be @extern");
+        // The DECLARATION form is `@crate("name", "ver")` (with the paren) — the
+        // module header legitimately discusses "@crate" in prose, so match the
+        // paren to detect only a real dependency declaration.
+        assert!(!src.contains("@crate("), "socket is std::net-backed and needs no crate");
     }
 }

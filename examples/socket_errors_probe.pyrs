@@ -1,0 +1,73 @@
+# parity: pyrst-only
+#
+# E2 (card 2f62ad54): the catchable-error surface of socket. pyrst-only — the
+# Listener/Stream handle split is a pyrst-shaped API that python3's unified
+# socket.socket cannot run, so this is a REGULAR positive golden whose ERROR
+# TYPES + shapes are oracled against python3 3.12.9 separately (connect-refused
+# is ConnectionRefusedError [Errno 111], an OSError subclass; see the header).
+# Proves: use-after-close on a socket = catchable OSError [Errno 9] Bad file
+# descriptor (CPython raises OSError/EBADF for a closed SOCKET, unlike the
+# ValueError a closed FILE raises — so an idiomatic `except OSError:` catches
+# recv/send/getsockname after close); a 2nd close is an idempotent no-op (the
+# File handle model); connect to a dead port = catchable ConnectionRefusedError,
+# also caught by a bare `except OSError`.
+from socket import bind, connect, Listener, Stream
+
+
+def main() -> None:
+    # --- use-after-close: recv/send on a closed Stream is a catchable OSError ---
+    # (CPython raises OSError [Errno 9] Bad file descriptor for a closed socket,
+    # so a bare `except OSError` catches it; oracle: s.close(); s.recv(10)).
+    lis: Listener = bind("127.0.0.1", 0)
+    host, port = lis.getsockname()
+    cli: Stream = connect(host, port)
+    conn: Stream = lis.accept()
+    cli.close()
+    try:
+        print(cli.recv(10))
+        print("no error (wrong)")
+    except OSError:
+        print("recv-after-close OSError")
+    try:
+        cli.send(b"x")
+        print("no error (wrong)")
+    except OSError:
+        print("send-after-close OSError")
+
+    # --- getsockname on a closed Listener is a catchable OSError too ---
+    conn.close()
+    lis.close()
+    try:
+        print(lis.getsockname())
+        print("no error (wrong)")
+    except OSError:
+        print("getsockname-after-close OSError")
+
+    # --- a second close() is an idempotent no-op (matches the `file` handle) ---
+    cli.close()
+    print("double-close ok")
+
+    # --- connect to a closed port -> catchable ConnectionRefusedError. Bind an
+    # ephemeral port, read it, then close the listener so the port is free; a
+    # connect to it is refused. (Microsecond port-reuse race is theoretical on a
+    # single-process localhost close->connect and has never been observed.)
+    lis2: Listener = bind("127.0.0.1", 0)
+    h2, p2 = lis2.getsockname()
+    lis2.close()
+    try:
+        s: Stream = connect(h2, p2)
+        s.close()
+        print("connected (wrong)")
+    except ConnectionRefusedError:
+        print("connect refused")
+
+    # --- ConnectionRefusedError is an OSError subclass (bare `except OSError`) ---
+    lis3: Listener = bind("127.0.0.1", 0)
+    h3, p3 = lis3.getsockname()
+    lis3.close()
+    try:
+        s2: Stream = connect(h3, p3)
+        s2.close()
+        print("connected (wrong)")
+    except OSError:
+        print("refused-as-OSError")

@@ -1,0 +1,11 @@
+# NEGATIVE (E2): a move-only socket `Listener` cannot be used after it is moved.
+# `b = a` MOVES the listening socket out of `a`, so the later `a.getsockname()`
+# is a use-after-move — rejected at typeck. Same move-only guarantee as `Stream`,
+# inherited from the W5-h `@extern class` handle form (`Ty::Handle("Listener")`).
+from socket import bind, Listener
+
+
+def main() -> None:
+    a: Listener = bind("127.0.0.1", 0)
+    b: Listener = a
+    print(a.getsockname())

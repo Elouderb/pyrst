@@ -1,0 +1,27 @@
+# E2 fix (card 2f62ad54): PROBE that the block-scoping CHECK does not
+# false-positive. A handle bound at FUNCTION scope (before any block) has a real
+# fn-scope `let`, so BORROWING it inside a block and then USING it after the block
+# is legal — only a handle FIRST bound inside a block is restricted. This is a
+# regular positive golden (socket cannot dual-run python3's unified socket.socket;
+# behaviour is oracled separately — see PYTHON_COMPATIBILITY.md).
+from socket import bind, Listener
+
+
+def main() -> None:
+    # `lis` is bound at function scope.
+    lis: Listener = bind("127.0.0.1", 0)
+    flag: bool = True
+    if flag:
+        # Borrowing a fn-scope handle inside a block is fine (a method borrows).
+        host, port = lis.getsockname()
+        print(host)
+        print(port >= 0)
+    i: int = 0
+    while i < 2:
+        h, p = lis.getsockname()
+        print(len(h) > 0)
+        i = i + 1
+    # `lis` is bound at fn scope, so using it AFTER the `if` and the `while` is
+    # fine (no false-positive from the block-scoping check).
+    lis.close()
+    print("fn-top handle usable after blocks")

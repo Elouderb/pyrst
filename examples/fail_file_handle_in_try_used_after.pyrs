@@ -1,0 +1,12 @@
+# E2 fix (card 2f62ad54): the built-in `file` handle shares the block-scoping
+# restriction (it is `Ty::Handle`, non-default, like the socket handles). An
+# `open()` handle FIRST bound inside a `try` block and read AFTER it is an honest
+# CHECK error — the same shape that used to leak a raw rustc `E0425` — not a
+# socket-specific rule. Keep every use of `f` inside the `try` block.
+def main() -> None:
+    try:
+        f = open("scratch.txt", "w")
+    except OSError:
+        return
+    # `f`'s binding is scoped to the `try` block — using it here is out of scope.
+    f.close()

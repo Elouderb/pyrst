@@ -2609,6 +2609,32 @@ pub(crate) fn collect_returned_param_idents_expr(
 fn check_handle_flow(e: &Expr, env: &mut FuncEnv, consumed: bool) -> Result<()> {
     match e {
         Expr::Ident(name, span) => {
+            // (E2 fix, card 2f62ad54) A read of a handle whose only binding is
+            // inside an EXITED nested block. A move-only handle has no `Default`, so
+            // codegen does NOT hoist it to function scope (unlike a value local);
+            // its `let` stays scoped to the inner Rust block, and a use after that
+            // block is a raw rustc `E0425 cannot find value`. Reject it here as an
+            // honest CHECK error naming the restriction — before the move check,
+            // since the binding does not even exist at this point (out of scope is a
+            // more fundamental error than use-after-move). The proper fix (hoist a
+            // non-`Default` handle as an `Option<Handle>` fn-scope slot + rewrite
+            // reads) is a larger codegen change tracked separately.
+            if env.block_scoped_handles.contains(name) {
+                let kind = env.locals.get(name).and_then(|t| t.handle_name())
+                    .unwrap_or("handle").to_string();
+                return Err(Error::Type {
+                    span: *span,
+                    msg: format!(
+                        "handle `{name}` (`{kind}`) is first bound inside a nested \
+                         `if`/`while`/`for`/`try` block and used after that block — a \
+                         move-only handle has no default value, so (unlike an ordinary \
+                         local) it is NOT hoisted to function scope and stays scoped to \
+                         the block it is created in. Bind it BEFORE the block (e.g. \
+                         `open(...)`/`bind(...)`/`connect(...)` at function scope), or \
+                         keep every use of `{name}` INSIDE the same block",
+                    ),
+                });
+            }
             // A read of an already-moved handle — the use-after-move error.
             if let Some(move_span) = env.moved.get(name).copied() {
                 let kind = env.locals.get(name).and_then(|t| t.handle_name())
@@ -2769,6 +2795,39 @@ fn live_handle_names(env: &FuncEnv) -> std::collections::HashSet<String> {
         .filter(|(n, t)| t.handle_name().is_some() && !env.moved.contains_key(n.as_str()))
         .map(|(n, _)| n.clone())
         .collect()
+}
+
+/// (E2 fix, card 2f62ad54) Snapshot, at the START of a nested block, the handle
+/// names that are IN SCOPE for the enclosing context — every handle-typed local
+/// that is NOT already block-scoped from a prior sibling block. `seal_block_scope`
+/// diffs against this after the block: any handle-typed local NOT in the snapshot
+/// is one the block first-bound (or one that was already block-scoped and is still
+/// in `locals`), so it is out of scope after the block. Excluding the
+/// already-block-scoped names is what lets a handle rebound in a *later* sibling
+/// block be re-sealed rather than silently forgotten.
+fn block_scope_snapshot(env: &FuncEnv) -> std::collections::HashSet<String> {
+    env.locals.iter()
+        .filter(|(n, t)| t.handle_name().is_some() && !env.block_scoped_handles.contains(n.as_str()))
+        .map(|(n, _)| n.clone())
+        .collect()
+}
+
+/// (E2 fix, card 2f62ad54) Seal a just-exited nested block: every handle-typed
+/// local NOT present in the pre-block snapshot is now out of scope (its `let` is
+/// scoped to the inner Rust block a move-only, non-`Default` handle is never
+/// hoisted out of), so record it in `block_scoped_handles`. A later READ of such a
+/// name is an honest CHECK error (`check_handle_flow`'s Ident arm) instead of a
+/// raw rustc `E0425 cannot find value`. Called at the END of each block arm, after
+/// any per-arm `locals` restore, so a `with`-bound or `match`-capture name that is
+/// already removed from `locals` is never wrongly sealed.
+fn seal_block_scope(env: &mut FuncEnv, pre: &std::collections::HashSet<String>) {
+    let newly_scoped: Vec<String> = env.locals.iter()
+        .filter(|(n, t)| t.handle_name().is_some() && !pre.contains(n.as_str()))
+        .map(|(n, _)| n.clone())
+        .collect();
+    for n in newly_scoped {
+        env.block_scoped_handles.insert(n);
+    }
 }
 
 /// (E1 fix / P1) Walk the RECEIVER SPINE of an assignment place — the `Index.obj`
@@ -3036,6 +3095,12 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             // moved-state on its name — a rebind revives the name.
             check_handle_flow(value, env, true)?;
             env.moved.remove(target.as_str());
+            // (E2 fix, card 2f62ad54) A rebind at the CURRENT scope gives the name a
+            // fresh in-scope `let`, so it is no longer a stale block-scoped handle.
+            // (A rebind that is itself inside a nested block is re-sealed when that
+            // block exits, via `seal_block_scope`'s snapshot that excludes the
+            // already-sealed set — so only a current-scope rebind truly revives it.)
+            env.block_scoped_handles.remove(target.as_str());
             Ok(())
         }
         Stmt::AugAssign { target, op, value, span } => {
@@ -3169,6 +3234,9 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             Ok(())
         }
         Stmt::If { cond, then, elifs, else_, .. } => {
+            // (E2 fix, card 2f62ad54) Snapshot in-scope handles before the block so
+            // a handle first-bound in any branch is sealed as block-scoped after.
+            let bss_pre = block_scope_snapshot(env);
             let cond_ty = check_expr(cond, env)?;
             // Generics v1: a bare type variable in a boolean context (`if t:`)
             // needs truthiness, which a generic value lacks (no Bool coercion in
@@ -3278,9 +3346,14 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
                     env.locals.insert(name.clone(), inner.clone());
                 }
             }
+            // (E2 fix, card 2f62ad54) Seal handles first-bound in this `if`.
+            seal_block_scope(env, &bss_pre);
             Ok(())
         }
         Stmt::While { cond, body, .. } => {
+            // (E2 fix, card 2f62ad54) A handle first-created in the loop body is
+            // scoped to the body's Rust block; using it after the loop is E0425.
+            let bss_pre = block_scope_snapshot(env);
             let cond_ty = check_expr(cond, env)?;
             // Generics v1: a bare type variable as a loop condition (`while t:`)
             // needs truthiness — rejected (see the `if` arm).
@@ -3323,9 +3396,14 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             check_body(body, env)?;
             env.loop_handles.pop();
             rewiden_loop_narrows(&pre_loop, env);
+            // (E2 fix, card 2f62ad54) Seal handles first-bound in this `while` body.
+            seal_block_scope(env, &bss_pre);
             Ok(())
         }
         Stmt::For { targets, iter, body, span } => {
+            // (E2 fix, card 2f62ad54) A handle first-created in the loop body is
+            // scoped to the body's Rust block; using it after the loop is E0425.
+            let bss_pre = block_scope_snapshot(env);
             let iter_ty = check_expr(iter, env)?;
             // Generics v1: iterating a bare type variable (`for it in xs` where
             // `xs: T`) needs an `IntoIterator` bound — `T` is opaque, with no
@@ -3394,10 +3472,18 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             check_body(body, env)?;
             env.loop_handles.pop();
             rewiden_loop_narrows(&pre_loop, env);
+            // (E2 fix, card 2f62ad54) Seal handles first-bound in this `for` body.
+            seal_block_scope(env, &bss_pre);
             Ok(())
         }
         Stmt::Import { .. } => Ok(()), // Ignored in v0
         Stmt::Try { body, handlers, else_, finally_, .. } => {
+            // (E2 fix, card 2f62ad54) A handle first-bound in the `try` body or a
+            // handler is scoped to that Rust block; a use AFTER the whole `try` is
+            // E0425. Snapshot in-scope handles now, seal at the end. (A read of a
+            // try-body handle from within `else`/`finally` — a separate Rust block —
+            // is a documented residual left to the proper hoist fix.)
+            let bss_pre = block_scope_snapshot(env);
             // (LAZY-GEN V1-d BLOCKER) The `try` body and each `except` handler body
             // are SIBLING value-paths that codegen merges into one hoisted slot —
             // the same silent-drop hazard as `if`/`else`. A bare local assigned
@@ -3426,11 +3512,24 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
                 moved_paths.push(env.moved.clone());
             }
             env.moved = union_moved(&moved_paths);
+            // (E2 fix, card 2f62ad54) The `else`/`finally` clauses are SEPARATE Rust
+            // blocks from the `try` body and handlers (verified: a try-body handle
+            // read in `else` is an E0425), so seal the body/handler handles NOW —
+            // before checking `else`/`finally` — so a read of one there is an honest
+            // CHECK error too, not a rustc leak.
+            seal_block_scope(env, &bss_pre);
             if let Some(b) = else_ { check_body(b, env)?; }
             if let Some(b) = finally_ { check_body(b, env)?; }
+            // Seal any handle first-bound in `else`/`finally` too — a use after the
+            // whole `try` statement is out of scope.
+            seal_block_scope(env, &bss_pre);
             Ok(())
         }
         Stmt::With { ctx_expr, as_name, body, .. } => {
+            // (E2 fix, card 2f62ad54) A handle first-bound in the `with` body is
+            // scoped to that Rust block; a use after the `with` is E0425. (The
+            // `as` name itself is already save/restored below.)
+            let bss_pre = block_scope_snapshot(env);
             let ctx_ty = check_expr(ctx_expr, env)?;
             // Generics v1: a `with t as r:` context manager needs the
             // enter/exit protocol (in pyrst, a concrete `file` handle). A bare
@@ -3484,6 +3583,8 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
                     None => { env.locals.remove(name.as_str()); }
                 }
             }
+            // (E2 fix, card 2f62ad54) Seal handles first-bound in this `with` body.
+            seal_block_scope(env, &bss_pre);
             Ok(())
         }
         Stmt::Del { target, span } => {
@@ -3519,6 +3620,9 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             Ok(())
         }
         Stmt::Match { subject, arms, span } => {
+            // (E2 fix, card 2f62ad54) A handle first-bound in an arm body is scoped
+            // to that arm's Rust block; a use after the `match` is E0425.
+            let bss_pre = block_scope_snapshot(env);
             let subject_ty = check_expr(subject, env)?;
             // (LAZY-GEN V1-d) A generator cannot be the scrutinee of a `match`:
             // match codegen clones the subject (`let __match_val = g.clone();`),
@@ -3598,6 +3702,8 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             // "possibly moved" when a fall-through exists. Conservative either way.
             moved_paths.push(moved_pre.clone());
             env.moved = union_moved(&moved_paths);
+            // (E2 fix, card 2f62ad54) Seal handles first-bound in any `match` arm.
+            seal_block_scope(env, &bss_pre);
             Ok(())
         }
         Stmt::AttrAssign { obj, attr, value, span } => {

@@ -1,0 +1,13 @@
+# NEGATIVE (E2): a move-only socket `Stream` cannot be used after it is moved.
+# Via the W5-h `@extern class` handle form it registers as `Ty::Handle("Stream")`
+# and inherits the W5-g move-only + use-after-move checker for free: assigning
+# `t = s` MOVES the connection out of `s`, so the later `s.recv(1)` is a
+# use-after-move — rejected at typeck (never reaches rustc). (The connect target
+# is irrelevant; a negative is only checked/built, never run.)
+from socket import connect, Stream
+
+
+def main() -> None:
+    s: Stream = connect("127.0.0.1", 9)
+    t: Stream = s
+    print(s.recv(1))

@@ -1,0 +1,6 @@
+127.0.0.1
+b'hello'
+b'hello'
+b'line1\n'
+3
+b'xyz'

@@ -1,0 +1,44 @@
+# E2 (card 2f62ad54): the socket AC — a SINGLE-PROCESS sequential loopback echo
+# over the W5-h @extern-class handles (Listener + Stream). No threads: on
+# localhost, connect() completes the handshake into the listener's backlog, so a
+# later accept() pulls the already-established connection, and small sends sit in
+# the kernel socket buffers until the matching recv() reads them. This is why the
+# whole round-trip runs in one process, sequentially. (It cannot dual-run against
+# python3 — pyrst splits Listener/Stream where python3 has one socket.socket — so
+# it is a REGULAR positive golden, its BEHAVIOUR oracled against python3 3.12.9
+# separately; see PYTHON_COMPATIBILITY.md and lib/socket.pyrs's header.)
+from socket import bind, connect, Listener, Stream
+
+
+def main() -> None:
+    # Bind an ephemeral (OS-assigned) loopback port and read it back.
+    lis: Listener = bind("127.0.0.1", 0)
+    host, port = lis.getsockname()
+    print(host)
+
+    # Client connects (handshake completes into the backlog); server accepts.
+    cli: Stream = connect(host, port)
+    conn: Stream = lis.accept()
+
+    # Echo round-trip: client -> server -> client.
+    cli.send(b"hello")
+    got: bytes = conn.recv(1024)
+    print(got)
+    conn.send(got)
+    echo: bytes = cli.recv(1024)
+    print(echo)
+
+    # recv_line reads up to and including the first newline.
+    cli.send(b"line1\nline2\n")
+    line: bytes = conn.recv_line()
+    print(line)
+
+    # send returns the byte count.
+    n: int = conn.send(b"xyz")
+    print(n)
+    tail: bytes = cli.recv(1024)
+    print(tail)
+
+    cli.close()
+    conn.close()
+    lis.close()

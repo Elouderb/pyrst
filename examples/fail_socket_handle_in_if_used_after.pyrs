@@ -1,0 +1,14 @@
+# E2 fix (card 2f62ad54): a move-only socket handle FIRST bound inside an `if`
+# block and then read AFTER that block is an honest CHECK error (it used to leak a
+# raw rustc `E0425 cannot find value`). A handle has no default value, so — unlike
+# an ordinary local — codegen does NOT hoist it to function scope; its `let` stays
+# scoped to the `if` block. Bind it before the block, or keep its use inside it.
+from socket import connect, Stream
+
+
+def main() -> None:
+    flag: bool = True
+    if flag:
+        s: Stream = connect("127.0.0.1", 9)
+    # `s`'s binding is scoped to the `if` block — using it here is out of scope.
+    s.close()

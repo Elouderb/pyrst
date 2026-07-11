@@ -2459,3 +2459,102 @@ def main() -> None:
         let msg = format!("{:?}", check_src(&unknown).expect_err("unknown field kwarg"));
         assert!(msg.contains("got an unexpected keyword argument `bogus`"), "got: {msg}");
     }
+
+    // =========================================================================
+    // card 8f7fb58e — general (non-Optional) union honesty in USER func/method
+    // param/return annotations. A 2+-non-none-arm union has no pyrst type; it
+    // used to pass `check` and miscompile to `()` (rustc E0308). It is now an
+    // honest check error, while `Optional[T]` / `T | None` stay valid.
+    // =========================================================================
+
+    #[test]
+    fn union_walker_flags_nonoptional_but_not_optional() {
+        use crate::ast::TypeExpr as TE;
+        let named = |n: &str| TE::Named(n.to_string());
+        // `int | str` — a general union: flagged.
+        assert!(type_expr_has_nonoptional_union(&TE::Generic(
+            "Union".into(),
+            vec![named("int"), named("str")]
+        )));
+        // `Optional[int]` — single arm: NOT flagged.
+        assert!(!type_expr_has_nonoptional_union(&TE::Generic(
+            "Optional".into(),
+            vec![named("int")]
+        )));
+        // `Union[int, None]` (explicit generic form, one non-none arm): NOT flagged.
+        assert!(!type_expr_has_nonoptional_union(&TE::Generic(
+            "Union".into(),
+            vec![named("int"), TE::None_]
+        )));
+        // `int | str | None` — parser-folded to `Optional[Union[int, str]]`: the
+        // nested general union is still flagged.
+        assert!(type_expr_has_nonoptional_union(&TE::Generic(
+            "Optional".into(),
+            vec![TE::Generic("Union".into(), vec![named("int"), named("str")])]
+        )));
+        // `list[int | str]` — a general union nested in a container: flagged.
+        assert!(type_expr_has_nonoptional_union(&TE::Generic(
+            "list".into(),
+            vec![TE::Generic("Union".into(), vec![named("int"), named("str")])]
+        )));
+        // A plain type is never flagged.
+        assert!(!type_expr_has_nonoptional_union(&named("int")));
+    }
+
+    #[test]
+    fn error_union_param_method_rejected() {
+        // The numpyrs repro: a `Class | float` PARAM on a user method.
+        let src = "class NDArray:
+    n: int
+
+    def __init__(self, n: int) -> None:
+        self.n = n
+
+    def __mul__(self, other: NDArray | float) -> NDArray:
+        return NDArray(self.n)
+";
+        assert_type_err_unit(check_src(src), "union");
+    }
+
+    #[test]
+    fn error_union_param_func_rejected() {
+        // A general `int | str` PARAM on a top-level user function.
+        let src = "def describe(x: int | str) -> int:
+    return 0
+";
+        assert_type_err_unit(check_src(src), "union");
+    }
+
+    #[test]
+    fn error_union_return_func_rejected() {
+        // A general `int | str` RETURN annotation on a user function.
+        let src = "def pick(flag: bool) -> int | str:
+    return 0
+";
+        assert_type_err_unit(check_src(src), "union");
+    }
+
+    #[test]
+    fn error_union_param_nested_def_rejected() {
+        // A general union PARAM on a NESTED def (closure) — the flow.rs vector.
+        let src = "def outer() -> int:
+    def inner(x: int | str) -> int:
+        return 0
+    return inner(5)
+";
+        assert_type_err_unit(check_src(src), "union");
+    }
+
+    #[test]
+    fn ok_optional_param_return_still_accepted() {
+        // `Optional[T]` AND the parser-folded `T | None`, in PARAM and RETURN
+        // position, remain valid — only the 2+-non-none-arm union is rejected.
+        let src = "def opt_form(fallback: Optional[int]) -> Optional[int]:
+    return fallback
+
+
+def pipe_form(x: int | None) -> int | None:
+    return x
+";
+        assert!(check_src(src).is_ok(), "Optional[T]/T|None must still typecheck");
+    }

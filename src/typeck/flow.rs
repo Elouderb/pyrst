@@ -3999,6 +3999,12 @@ pub(crate) fn check_nested_def(f: &Func, env: &mut FuncEnv) -> Result<()> {
         });
     }
 
+    // (card 8f7fb58e) A general (non-Optional) union in a nested def's param/return
+    // annotation lowers to `Ty::Unknown` -> `()` and miscompiles identically to a
+    // top-level func/method; reject it honestly at the def site (a nested def IS a
+    // user function) so the union honesty holds uniformly across every def vector.
+    reject_nonoptional_union_signature(f)?;
+
     // Lower the nested signature (scoped to the ENCLOSING function's type params,
     // so a nested def inside a generic function may still name them in annotations
     // — they are opaque type variables there, never bound by the nested def).

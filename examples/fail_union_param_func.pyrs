@@ -1,0 +1,10 @@
+# card 8f7fb58e — a general (non-Optional) union `int | str` in a top-level
+# FUNCTION PARAM annotation is an honest check error. pyrst supports only
+# `Optional[T]` (equivalently `T | None`); a 2+-arm union has no pyrst type and
+# would otherwise lower to `()` and miscompile.
+def describe(x: int | str) -> int:
+    return 0
+
+
+def main() -> None:
+    print(describe(5))

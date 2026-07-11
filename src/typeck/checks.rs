@@ -1110,6 +1110,13 @@ pub(crate) fn check_one_func(f: &Func, ctx: &TyCtx, module_id: Option<&str>) -> 
         return validate_extern_func(f, ctx);
     }
 
+    // (card 8f7fb58e) A general (non-Optional) union in a param/return annotation
+    // has no pyrst type: the resolver lowers it to `Ty::Unknown` and codegen emits
+    // `()`, a silent miscompile (rustc E0308) after `check` wrongly passed. Reject
+    // it honestly here — the free-function counterpart of the `@extern`
+    // "requires fully-typed" gate (run above and returned from for `@extern`).
+    reject_nonoptional_union_signature(f)?;
+
     // Generics v1: param/return annotations naming a declared type parameter
     // lower to `Ty::TypeVar` (scoped lowering). Empty `type_params` => identical
     // to the non-generic path.
@@ -1517,6 +1524,78 @@ pub(crate) fn reject_iterator_params(params: &[Param]) -> Result<()> {
 /// form). Spelled as a single-argument `Generic("Iterator", [T])` by the parser.
 pub(crate) fn is_iterator_type_expr(t: &TypeExpr) -> bool {
     matches!(t, TypeExpr::Generic(name, args) if name == "Iterator" && args.len() == 1)
+}
+
+/// (card 8f7fb58e) Does `te` contain a GENERAL (non-`Optional`) union anywhere —
+/// a `Union[...]` node with 2+ non-`None` arms (i.e. NOT the `Optional[T]` /
+/// `T | None` shape)? Such a union has NO pyrst representation: the resolver's
+/// `("Union", args)` arm (`Ty::from_type_expr_scoped_inner`) lowers a 2+-non-none
+/// union to `Ty::Unknown`, which codegen then emits as `()` — the silent
+/// miscompile (rustc E0308) this card closes. The parser folds `T | None` /
+/// `None | T` to `Optional(T)` up front (src/parser.rs), so a bare `A | B`
+/// produces the offending node; the explicit `Union[A, None]` generic form has a
+/// single non-none arm and is Optional-shaped, so it is NOT flagged. The walk
+/// descends into every nested position (`list[A | B]`, tuples, `Callable`, and
+/// `Optional[int | str]` == the parser-folded `int | str | None`) so the bad
+/// union is caught wherever it sits.
+pub(crate) fn type_expr_has_nonoptional_union(te: &TypeExpr) -> bool {
+    match te {
+        TypeExpr::Named(_) | TypeExpr::None_ => false,
+        TypeExpr::Generic(name, args) => {
+            if name == "Union"
+                && args.iter().filter(|a| !matches!(a, TypeExpr::None_)).count() >= 2
+            {
+                return true;
+            }
+            args.iter().any(type_expr_has_nonoptional_union)
+        }
+        TypeExpr::Tuple(parts) => parts.iter().any(type_expr_has_nonoptional_union),
+        TypeExpr::Func(args, ret) => {
+            args.iter().any(type_expr_has_nonoptional_union)
+                || type_expr_has_nonoptional_union(ret)
+        }
+    }
+}
+
+/// (card 8f7fb58e) Reject a GENERAL (non-`Optional`) union in any PARAM or RETURN
+/// annotation of a USER (non-`@extern`) function/method. pyrst has no general
+/// union type — only `Optional[T]` (equivalently `T | None`, a single non-none
+/// arm) is supported. A 2+-non-none-arm union such as numpyrs's
+/// `def __mul__(self, other: NDArray | float)` previously PASSED `check` and then
+/// miscompiled: codegen lowered the union to `()`, so the param/return became
+/// `()` and rustc failed (E0308) — a check-pass/build-fail that breaches the
+/// honest-errors invariant. `@extern` bindings already reject this via their
+/// "requires fully-typed params and return" gate (`validate_extern_func`); this
+/// extends the SAME honesty to user funcs/methods. Callers invoke this only after
+/// the `@extern` early-return, so the @extern-specific message is preserved.
+/// `self` carries no user annotation and is skipped.
+pub(crate) fn reject_nonoptional_union_signature(f: &Func) -> Result<()> {
+    const HINT: &str = "pyrst has no general union type — only `Optional[T]` \
+        (equivalently `T | None`) is supported. Use `Optional[T]`, or provide a \
+        separate overload per type (e.g. a scalar `.muls(s: float)` method \
+        alongside the object one).";
+    for p in f.params.iter().filter(|p| p.name != "self") {
+        if type_expr_has_nonoptional_union(&p.ty) {
+            return Err(Error::Type {
+                span: p.span,
+                msg: format!(
+                    "parameter `{}` has a general (non-Optional) union type, which \
+                     pyrst does not support. {HINT}",
+                    p.name
+                ),
+            });
+        }
+    }
+    if type_expr_has_nonoptional_union(&f.ret) {
+        return Err(Error::Type {
+            span: f.span,
+            msg: format!(
+                "the return type is a general (non-Optional) union, which pyrst \
+                 does not support. {HINT}"
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Per-CLASS checks that run before (and gate) the method checks: multiple
@@ -1932,6 +2011,13 @@ pub(crate) fn check_one_method(c: &ClassDef, method: &Func, ctx: &TyCtx, module_
                 .to_string(),
         });
     }
+
+    // (card 8f7fb58e) A general (non-Optional) union in a method param/return
+    // annotation — e.g. numpyrs's `def __mul__(self, other: NDArray | float)` —
+    // has no pyrst type and would lower to `()` and miscompile (rustc E0308) after
+    // wrongly passing `check`. Reject it honestly here (after the `@extern`
+    // early-returns above, which keep their own "requires fully-typed" message).
+    reject_nonoptional_union_signature(method)?;
 
     // (card 18682938) `__bool__` IS supported: object truthiness lowers to a
     // `.__bool__()` call at every bool-context site codegen threads through

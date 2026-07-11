@@ -1,0 +1,28 @@
+# card 8f7fb58e — proof that the OPTIONAL-shaped union forms still typecheck,
+# build, and run after the general-(non-Optional)-union honesty gate. Both the
+# `Optional[T]` spelling and the parser-folded `T | None` spelling are exercised
+# in PARAM and RETURN position — the exact positions the gate now rejects for a
+# NON-Optional (2+ non-none arm) union, which must stay valid for the 1-non-none
+# Optional case.
+def opt_form(xs: list[int], fallback: Optional[int]) -> Optional[int]:
+    if len(xs) > 0:
+        return xs[0]
+    return fallback
+
+
+def pipe_form(x: int | None) -> int | None:
+    return x
+
+
+def main() -> None:
+    a: Optional[int] = opt_form([10, 20], None)
+    if a is not None:
+        print(a)
+    b: Optional[int] = opt_form([], 99)
+    if b is not None:
+        print(b)
+    c: int | None = pipe_form(None)
+    print(c is None)
+    d: int | None = pipe_form(7)
+    if d is not None:
+        print(d)

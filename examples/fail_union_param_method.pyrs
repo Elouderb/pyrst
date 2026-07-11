@@ -1,0 +1,20 @@
+# card 8f7fb58e — the numpyrs dogfood repro. A NON-Optional 2-arm union
+# (`NDArray | float`) in a METHOD PARAM annotation passed `check`, then codegen
+# lowered the union to `()` (emitting `other` as `()`), failing at rustc E0308 —
+# a check-pass/build-fail. It is now an HONEST check error: pyrst has no general
+# union type; use `Optional[T]`, or split into per-type overloads (e.g. a scalar
+# `.muls(s: float)` alongside the object `__mul__`).
+class NDArray:
+    n: int
+
+    def __init__(self, n: int) -> None:
+        self.n = n
+
+    def __mul__(self, other: NDArray | float) -> NDArray:
+        return NDArray(self.n)
+
+
+def main() -> None:
+    a = NDArray(3)
+    b = a * a
+    print(b.n)

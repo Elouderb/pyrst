@@ -1,0 +1,10 @@
+# card 8f7fb58e — a general (non-Optional) union `int | str` in a RETURN
+# annotation is an honest check error (the return-type counterpart of the
+# param repro). pyrst has no general union type; use `Optional[T]` or a single
+# concrete return type.
+def pick(flag: bool) -> int | str:
+    return 0
+
+
+def main() -> None:
+    print(pick(True))

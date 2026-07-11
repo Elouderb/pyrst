@@ -3054,6 +3054,8 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             // (Z4, card 2b37b965) A bare `Optional` condition passes `check` but
             // leaks a rustc E0308 at `build`; reject it here so the two agree.
             reject_optional_truthiness(&cond_ty, cond.span())?;
+            // (card 4349fe41) assert: reject a non-bool user-class condition.
+            reject_nonbool_class_cond(&cond_ty, cond.span(), env.ctx)?;
             if let Some(m) = msg { check_expr(m, env)?; }
             Ok(())
         }
@@ -3390,6 +3392,10 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             // (Z4, card 2b37b965) A bare `Optional` condition passes `check` but
             // leaks a rustc E0308 at `build`; reject it here so the two agree.
             reject_optional_truthiness(&cond_ty, cond.span())?;
+            // (card 4349fe41) A user-class condition without `__bool__` (e.g. a
+            // comparison overloaded to return a boolean-mask class) is an honest
+            // check error, not a leaked rustc E0308.
+            reject_nonbool_class_cond(&cond_ty, cond.span(), env.ctx)?;
             // (card c34ac64a fix B3) A None-guard on a name already narrowed to a
             // concrete `T` (or any concrete non-Optional local) is statically
             // decided — honest error instead of a leaked `.is_none()`-on-`T`.
@@ -3459,6 +3465,8 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
                 let c_ty = check_expr(c, env)?;
                 reject_typevar_op(&c_ty, "use as a condition", c.span())?;
                 reject_optional_truthiness(&c_ty, c.span())?;
+                // (card 4349fe41) elif: reject a non-bool user-class condition.
+                reject_nonbool_class_cond(&c_ty, c.span(), env.ctx)?;
                 check_handle_flow(c, env, false)?;
                 env.moved = moved_pre.clone();
                 check_body(b, env)?;
@@ -3526,6 +3534,8 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
             // (Z4, card 2b37b965) A bare `Optional` condition passes `check` but
             // leaks a rustc E0308 at `build`; reject it here so the two agree.
             reject_optional_truthiness(&cond_ty, cond.span())?;
+            // (card 4349fe41) while: reject a non-bool user-class condition.
+            reject_nonbool_class_cond(&cond_ty, cond.span(), env.ctx)?;
             // (card c34ac64a fix B3) A None-guard header on a name already narrowed
             // to a concrete `T` (or any concrete non-Optional local) is statically
             // decided — honest error instead of a leaked `.is_none()`-on-`T`.

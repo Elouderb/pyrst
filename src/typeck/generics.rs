@@ -818,6 +818,41 @@ pub(crate) fn reject_optional_truthiness(ty: &Ty, span: Span) -> Result<()> {
     Ok(())
 }
 
+/// (card 4349fe41) Reject a USER-CLASS value used in a BOOLEAN context — an
+/// `if`/`while`/`elif`/ternary/comprehension-`if`/`assert` condition, an
+/// `and`/`or` operand, or `not x` — when the class defines NO `__bool__`.
+///
+/// pyrst requires a condition to already be `bool`: codegen's `emit_truthy`
+/// lowers a class value only via `.__bool__()`, so a class WITHOUT `__bool__` in
+/// a condition would emit a bare struct where rustc expects `bool` (E0308) — a
+/// check-accept / build-fail. This was a pre-existing latent hole; it becomes
+/// reachable now that a comparison overloaded via `__gt__`/`__le__`/`__ge__`/
+/// `__ne__` (card 4349fe41) can PRODUCE a non-bool class value (e.g. a
+/// boolean-mask class), so `if df["x"] > 3:` must be an HONEST check error rather
+/// than a leaked rustc failure. A class WITH `__bool__` (e.g. `Fraction`) is
+/// accepted — codegen lowers it through `.__bool__()`. Mirrors
+/// `reject_optional_truthiness` / the handle-truthiness rejection; non-class
+/// types are untouched (their own bool requirement is unchanged).
+pub(crate) fn reject_nonbool_class_cond(ty: &Ty, span: Span, ctx: &TyCtx) -> Result<()> {
+    if let Ty::Class(cls, _) = ty {
+        if ctx.get_method(cls, "__bool__").is_none() {
+            return Err(Error::Type {
+                span,
+                msg: format!(
+                    "class `{}` has no truthiness — it is not a `bool` and defines no \
+                     `__bool__`, so it cannot be used as a condition (`if`/`while`/\
+                     `and`/`or`/`not`). A comparison operator overloaded to return a \
+                     non-bool value (e.g. a boolean-mask class) must be reduced to a \
+                     bool first (e.g. an `.any()`/`.all()` method) — or define \
+                     `__bool__` on `{}`.",
+                    cls, cls
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// (E1 fix / P4) Subscripting an Optional value — a READ `opt[k]` or a WRITE
 /// `opt[k] = v` — is not narrowed. Reject it with the same "narrow first" idiom
 /// `reject_optional_truthiness` uses. Before this it fell to the generic Index

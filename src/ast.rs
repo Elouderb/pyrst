@@ -242,6 +242,40 @@ impl BinOp {
             _ => None,
         }
     }
+
+    /// (card 4349fe41) The Python comparison dunder a COMPARISON binary operator
+    /// dispatches to when its left operand is a user class defining it — the peer
+    /// of [`arith_dunder`](Self::arith_dunder) for the rich-comparison protocol,
+    /// and the ONE source of truth shared by every operator->type layer (the real
+    /// checker `check_expr`, the codegen oracle `infer_expr_ty`) and codegen's
+    /// BinOp emission, so a class comparison overload routes identically
+    /// everywhere. When it resolves to a defined method, `a <cmp> b` has that
+    /// method's declared return type (e.g. a boolean-mask class for `df["x"] > 3`)
+    /// and codegen desugars to `a.<dunder>(b)` instead of a native Rust compare.
+    ///
+    /// SCOPE — returns `Some` for ONLY the four comparison dunders codegen emits as
+    /// ORDINARY INHERENT methods (`fn __gt__(&self, other) -> RET`), which can
+    /// therefore return any type:
+    ///   Gt→`__gt__`  Le→`__le__`  Ge→`__ge__`  Ne→`__ne__`.
+    ///
+    /// `Lt` (`__lt__`) and `Eq` (`__eq__`) return `None` DELIBERATELY: they are
+    /// `DUNDER_TRAIT_NAMES` (src/codegen/mod.rs) lowered to `impl PartialOrd`
+    /// (`__lt_impl -> bool`) / `impl PartialEq` (`fn eq -> bool`), whose Rust result
+    /// is HARD-LOCKED to `bool` and which also power sorting / dict-keys / min-max /
+    /// structural equality. Routing them to a non-bool declared return would be a
+    /// check-accept / rustc-E0308 build-fail (and break that machinery), so `<` and
+    /// `==` keep their existing bool typing + native emit unchanged — and `==`/`!=`
+    /// on builtins, containment (`in`), and dict-key / match equality are never
+    /// touched here. `None` for every non-comparison operator too.
+    pub fn comparison_dunder(self) -> Option<&'static str> {
+        match self {
+            BinOp::Gt => Some("__gt__"),
+            BinOp::Le => Some("__le__"),
+            BinOp::Ge => Some("__ge__"),
+            BinOp::Ne => Some("__ne__"),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

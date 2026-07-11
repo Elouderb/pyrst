@@ -780,6 +780,20 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
                     return ret;
                 }
             }
+            // (card 4349fe41) COMPARISON OPERATOR OVERLOADING (the codegen oracle
+            // peer of `check_expr`'s routing): a user-class lhs defining the op's
+            // comparison dunder (`__gt__`/`__le__`/`__ge__`/`__ne__`) types as that
+            // dunder's declared return, so `type_of_expr` agrees with codegen's
+            // method-desugar. `< __lt__` / `== __eq__` are NOT routed (bool-locked
+            // PartialOrd/PartialEq) and fall through to the `=> Bool` arm unchanged.
+            if let Ty::Class(cls, _) = &l {
+                if let Some(ret) = op.comparison_dunder()
+                    .and_then(|d| ctx.get_method(cls, d))
+                    .map(|s| s.ret.clone())
+                {
+                    return ret;
+                }
+            }
             match op {
                 // D5: Python `**` always yields a float (split out of the
                 // int-biased arithmetic arm below — codegen's bug).
@@ -1820,6 +1834,45 @@ fn reject_unemittable_bare_lambda_body(
                         }
                     }
                 }
+                BinOp::Gt | BinOp::Le | BinOp::Ge | BinOp::Ne => {
+                    // (card 4349fe41) A class comparison overloaded via `__gt__` /
+                    // `__le__` / `__ge__` / `__ne__` desugars to a METHOD call
+                    // (`a.__gt__(b)`) that codegen emits ONLY when it statically
+                    // knows the operand is that class. For a BARE lambda param
+                    // (Unknown in codegen's closure view) it can't, and falls to a
+                    // native Rust compare on an unsupported operand (E0369/E0308) —
+                    // the same check-accept / build-fail as the `/ // % **` case
+                    // above. Reject iff `check` routes (param -> elem is a class with
+                    // the dunder) but codegen cannot (param removed). An outer-local
+                    // / non-param class comparison resolves identically in both views
+                    // and stays buildable.
+                    if let Ty::Class(cls, _) = &check_l {
+                        let check_routes = op
+                            .comparison_dunder()
+                            .and_then(|d| ctx.get_method(cls, d))
+                            .is_some();
+                        let cg_routes = matches!(&cg_l, Ty::Class(cg_cls, _)
+                            if op.comparison_dunder()
+                                .and_then(|d| ctx.get_method(cg_cls, d))
+                                .is_some());
+                        if check_routes && !cg_routes {
+                            return Err(Error::Type {
+                                span: *span,
+                                msg: format!(
+                                    "comparison `{}` overloaded via `{}` on class `{}` is not \
+                                     yet supported inside a `map()`/`filter()` lambda: the \
+                                     lambda parameter has no static type in the generated \
+                                     closure, so the dunder cannot be dispatched. Use a list \
+                                     comprehension (`[... for x in ...]`) instead (tracked by \
+                                     card 7fbd3346).",
+                                    binop_symbol(*op),
+                                    op.comparison_dunder().unwrap_or("?"),
+                                    cls
+                                ),
+                            });
+                        }
+                    }
+                }
                 BinOp::Mul => {
                     let is_seq = |t: &Ty| matches!(t, Ty::List(_) | Ty::Str | Ty::Bytes);
                     if is_seq(&check_l) && !is_seq(&cg_l) {
@@ -1955,6 +2008,9 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
             // rustc error at build; reject it at check for parity with `if`.
             let test_ty = check_expr(test, env)?;
             reject_optional_truthiness(&test_ty, test.span())?;
+            // (card 4349fe41) A non-bool user-class ternary condition is an honest
+            // check error (parity with `if`), not a leaked rustc E0308.
+            reject_nonbool_class_cond(&test_ty, test.span(), env.ctx)?;
             let bt = check_expr(body, env)?;
             let ot = check_expr(orelse, env)?;
             // Both arms must agree; the more concrete side wins so a branch like
@@ -2024,7 +2080,7 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 block_scoped_handles: std::collections::HashSet::new(),
             };
             bind_comp_targets(targets, elem_ty, &mut inner_env.locals);
-            if let Some(c) = cond { let ct = check_expr(c, &mut inner_env)?; reject_optional_truthiness(&ct, c.span())?; }
+            if let Some(c) = cond { let ct = check_expr(c, &mut inner_env)?; reject_optional_truthiness(&ct, c.span())?; reject_nonbool_class_cond(&ct, c.span(), inner_env.ctx)?; }
             let elt_ty = check_expr(elt, &mut inner_env)?;
             // (W5-g, H1) A comprehension-BUILT container of handles is the same
             // hole as a container LITERAL of handles: `[open(p) for p in paths]`
@@ -2089,7 +2145,7 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 block_scoped_handles: std::collections::HashSet::new(),
             };
             bind_comp_targets(targets, elem_ty, &mut inner_env.locals);
-            if let Some(c) = cond { let ct = check_expr(c, &mut inner_env)?; reject_optional_truthiness(&ct, c.span())?; }
+            if let Some(c) = cond { let ct = check_expr(c, &mut inner_env)?; reject_optional_truthiness(&ct, c.span())?; reject_nonbool_class_cond(&ct, c.span(), inner_env.ctx)?; }
             let elt_ty = check_expr(elt, &mut inner_env)?;
             // (W5-g, H1) A comprehension-built SET of handles (`{open(p) for ..}`)
             // is the same un-clonable-container hole as the set literal — reject it.
@@ -2155,7 +2211,7 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 block_scoped_handles: std::collections::HashSet::new(),
             };
             bind_comp_targets(targets, elem_ty, &mut inner_env.locals);
-            if let Some(c) = cond { let ct = check_expr(c, &mut inner_env)?; reject_optional_truthiness(&ct, c.span())?; }
+            if let Some(c) = cond { let ct = check_expr(c, &mut inner_env)?; reject_optional_truthiness(&ct, c.span())?; reject_nonbool_class_cond(&ct, c.span(), inner_env.ctx)?; }
             let key_ty = check_expr(key, &mut inner_env)?;
             let val_ty = check_expr(val, &mut inner_env)?;
             // (W5-g, H1) A comprehension-built DICT storing handles as keys or
@@ -3989,6 +4045,15 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
         Expr::BinOp { op, lhs, rhs, span } => {
             let l = check_expr(lhs, env)?;
             let r = check_expr(rhs, env)?;
+            // (card 4349fe41) `and`/`or` put BOTH operands in a boolean context
+            // (codegen's `emit_truthy` recurses into each). A user-class operand
+            // without `__bool__` — e.g. a comparison overloaded to a boolean-mask
+            // class — is an honest check error, not a leaked `(mask && x)` (E0308),
+            // so `df["x"] > 3 and cond` is rejected exactly like `if df["x"] > 3:`.
+            if matches!(op, BinOp::And | BinOp::Or) {
+                reject_nonbool_class_cond(&l, lhs.span(), env.ctx)?;
+                reject_nonbool_class_cond(&r, rhs.span(), env.ctx)?;
+            }
             // (LAZY-GEN V1-d) A lazy generator has no binary-operator form in V1 —
             // `g + g` / `g * n` would need a materialized list, and membership
             // `x in g` (valid in Python but DRAINS the generator) has no lazy analog
@@ -4113,6 +4178,29 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                     return Ok(Ty::Set(Box::new(elem)));
                 }
             }
+            // (card 4349fe41) COMPARISON OPERATOR OVERLOADING: a user-class lhs
+            // whose class defines the operator's comparison dunder (`__gt__` /
+            // `__le__` / `__ge__` / `__ne__`) types as that dunder's declared
+            // return — so `df["x"] > 3` can yield a boolean-mask class instead of a
+            // hard `bool`. Placed BEFORE the ordering gate below so `a > b` routes on
+            // `__gt__` even when the class has NO `__lt__` (the gate's requirement is
+            // only for classes reaching the native PartialOrd path). `comparison_
+            // dunder()` returns `Some` ONLY for the four dunders codegen emits as
+            // inherent methods; `< __lt__` and `== __eq__` return `None` (PartialOrd
+            // /PartialEq bool-lock) so they fall through unchanged to the ordering
+            // gate + the `=> Bool` arm. Fires ONLY when the dunder exists; the result
+            // is an ordinary value of the dunder's return type, so using it in a bool
+            // context is a normal type check (the truthiness gate below demands a
+            // bool / `__bool__`-bearing value). Handle/typevar/Optional operands were
+            // already rejected above, so an invalid operand never reaches here.
+            if let Ty::Class(cls, _) = &l {
+                if let Some(ret) = op.comparison_dunder()
+                    .and_then(|d| env.ctx.get_method(cls, d))
+                    .map(|s| s.ret.clone())
+                {
+                    return Ok(ret);
+                }
+            }
             // (enabler-fix-1 #1) An ORDERING comparison (`< <= > >=`) over a
             // USER-CLASS operand REQUIRES a defined `__lt__` (base chain). Without
             // it CPython raises `TypeError: '<' not supported between instances`,
@@ -4198,7 +4286,7 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 // (Z4, card 2b37b965) `not <Optional>` is a truthiness use —
                 // reject a bare Optional here (check/build agreement). Neg/BitNot
                 // are arithmetic, not truthiness, so they are untouched.
-                UnOp::Not => { reject_optional_truthiness(&t, *span)?; Ty::Bool }
+                UnOp::Not => { reject_optional_truthiness(&t, *span)?; reject_nonbool_class_cond(&t, *span, env.ctx)?; Ty::Bool }
                 UnOp::Neg => t,
                 UnOp::BitNot => Ty::Int,
             }

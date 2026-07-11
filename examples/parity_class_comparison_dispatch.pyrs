@@ -1,0 +1,91 @@
+# parity: dual-run
+# Dual-run CPython parity golden for COMPARISON operator overloading on a user
+# class (card 4349fe41). Before this fix, `> < >= <= == !=` were hard-typed to
+# `bool` regardless of a class's __gt__/__le__/__ge__/__ne__ return annotation,
+# so a class could NOT overload a comparison to return a non-bool value — the
+# single most pandas-idiomatic operation `df["x"] > 3` yielding a boolean-MASK
+# was blocked (`m: Mask = s > 2` raised "declared Mask, got bool"). Now `> >= <=
+# !=` on a user-class lhs route to the class's __gt__/__ge__/__le__/__ne__ dunder
+# (the peer of the existing __add__/__sub__/__mul__ arithmetic routing), yielding
+# the dunder's declared return type and dispatching to it in codegen.
+#
+# `<` (__lt__) and `==` (__eq__) are DELIBERATELY excluded: they lower to Rust's
+# `impl PartialOrd`/`impl PartialEq` (hard-locked to `bool`, and powering sorting
+# / dict-keys / structural equality), so they keep their native bool compare —
+# see the file's Series class, which overloads only the four routable operators.
+#
+# This file exercises (1) all four mask-returning comparisons over a list, (2) a
+# mask reduced to a bool via a method used as an `if` condition, and (3) a
+# SEPARATE class whose bool-returning __gt__ is used DIRECTLY as an `if`
+# condition (works because the routed result is a real bool). Every line runs
+# UNMODIFIED and byte-identically under both the pyrst binary and CPython (the
+# harness prepends `from __future__ import annotations` and calls `main()`).
+
+
+class Mask:
+    def __init__(self, bits: list[bool]) -> None:
+        self.bits = bits
+
+    def show(self) -> str:
+        return str(self.bits)
+
+    # Reduce a mask to a bool so it can drive a boolean context.
+    def any_true(self) -> bool:
+        for b in self.bits:
+            if b:
+                return True
+        return False
+
+
+class Series:
+    def __init__(self, data: list[int]) -> None:
+        self.data = data
+
+    def __gt__(self, other: int) -> Mask:
+        return Mask([x > other for x in self.data])
+
+    def __ge__(self, other: int) -> Mask:
+        return Mask([x >= other for x in self.data])
+
+    def __le__(self, other: int) -> Mask:
+        return Mask([x <= other for x in self.data])
+
+    def __ne__(self, other: int) -> Mask:
+        return Mask([x != other for x in self.data])
+
+
+class Cmp:
+    def __init__(self, v: int) -> None:
+        self.v = v
+
+    # A bool-returning comparison overload: `a > b` is a real bool, usable
+    # directly as a condition (the ordering gate does not require __lt__ here —
+    # the __gt__ routing fires ahead of it).
+    def __gt__(self, other: Cmp) -> bool:
+        return self.v > other.v
+
+
+def main() -> None:
+    s: Series = Series([1, 2, 3, 4])
+    # Each comparison against a scalar yields a fresh boolean mask.
+    print((s > 2).show())
+    print((s >= 2).show())
+    print((s <= 2).show())
+    print((s != 2).show())
+
+    # A mask reduced to a bool via a method drives an `if` — the supported way
+    # to use a non-bool comparison result in a boolean context.
+    if (s > 2).any_true():
+        print("some > 2")
+    if not (s <= 0).any_true():
+        print("none <= 0")
+
+    # A bool-returning __gt__ used DIRECTLY as a condition and printed.
+    a: Cmp = Cmp(5)
+    b: Cmp = Cmp(3)
+    if a > b:
+        print("a>b")
+    else:
+        print("no")
+    print(a > b)
+    print(b > a)

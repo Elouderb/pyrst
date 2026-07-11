@@ -3675,6 +3675,41 @@ impl<'a> Codegen<'a> {
                     }
                 }
 
+                // (card 4349fe41) COMPARISON OPERATOR OVERLOADING for `> <= >= !=`
+                // on a user-class lhs: route to the class's __gt__ / __le__ / __ge__
+                // / __ne__ dunder, so `df["x"] > 3` runs the overload (yielding e.g.
+                // a boolean-mask class) instead of a native Rust compare (which is
+                // bool-typed and, for a class operand, would use the derived
+                // PartialOrd/PartialEq and mistype the result). Desugars to a method
+                // call on a SYNTHETIC node and re-emits, reusing emit_call's
+                // receiver-borrow / by-value-arg (value-semantics) / inheritance
+                // dispatch verbatim — exactly the `/ // % **` arith desugar above.
+                // Placed FIRST so it wins over the native comparison lowering below.
+                // `comparison_dunder()` covers ONLY the four dunders emitted as
+                // inherent methods; `< __lt__` / `== __eq__` return None (they lower
+                // to PartialOrd/PartialEq and keep their native compare), so `<`, `==`
+                // and every builtin/containment/match compare are untouched. Fires
+                // ONLY when the class defines the dunder; else behavior is unchanged.
+                if op.comparison_dunder().is_some() {
+                    if let Ty::Class(cls, _) = self.type_of_expr(lhs) {
+                        if let Some(dunder) = op.comparison_dunder() {
+                            if self.ctx.get_method(&cls, dunder).is_some() {
+                                let call = Expr::Call {
+                                    callee: Box::new(Expr::Attr {
+                                        obj: lhs.clone(),
+                                        name: dunder.to_string(),
+                                        span: *span,
+                                    }),
+                                    args: vec![(**rhs).clone()],
+                                    kwargs: vec![],
+                                    span: *span,
+                                };
+                                return self.emit_expr(&call);
+                            }
+                        }
+                    }
+                }
+
                 // Handle sequence repetition: "abc" * 3 and [0] * 5
                 if *op == BinOp::Mul {
                     let lt = self.type_of_expr(lhs);

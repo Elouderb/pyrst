@@ -1,0 +1,30 @@
+# NEGATIVE (card 4349fe41): a comparison overloaded to return a NON-bool value
+# (a boolean-mask class) used DIRECTLY as an `if` condition is an HONEST check
+# error, NOT a check-accept / rustc-build-fail.
+#
+# `s > 2` now routes to Series.__gt__ and types as `Mask` (the overload's
+# declared return). A condition must be a `bool` (or a class with `__bool__`);
+# `Mask` has neither, so codegen would emit a bare struct where rustc expects
+# `bool` (E0308). `check` rejects it up front and points at the fix: reduce the
+# mask to a bool first (e.g. a `.any()`/`.all()` method) or define `__bool__`.
+# A bool-returning __gt__ used as a condition DOES work (parity_class_comparison_
+# dispatch.pyrs); only a non-bool result is rejected here.
+
+
+class Mask:
+    def __init__(self, n: int) -> None:
+        self.n = n
+
+
+class Series:
+    def __init__(self, v: int) -> None:
+        self.v = v
+
+    def __gt__(self, other: int) -> Mask:
+        return Mask(self.v)
+
+
+def main() -> None:
+    s: Series = Series(3)
+    if s > 2:
+        print("unreachable")

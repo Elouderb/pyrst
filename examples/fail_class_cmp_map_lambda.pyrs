@@ -1,0 +1,31 @@
+# NEGATIVE (card 4349fe41): a class comparison overloaded via __gt__/__le__/
+# __ge__/__ne__ inside a `map()`/`filter()` lambda BODY is an HONEST check error,
+# NOT a check-accept / rustc-build-fail — the comparison peer of the `/ // % **`
+# rejection (fail_class_div_map_lambda.pyrs, card 333e34a7).
+#
+# `check` binds the bare lambda param `s` to the element type (`Series`) and
+# routes `s > 1` to Series.__gt__ (-> Mask). But codegen carries NO static type
+# for a bare lambda param in the generated closure, so it cannot dispatch the
+# dunder and would emit a native compare on an untyped operand (rustc
+# E0369/E0308). `reject_unemittable_bare_lambda_body` makes `check` reject
+# exactly what `build` cannot lower. Use a list comprehension instead (tracked by
+# card 7fbd3346).
+
+
+class Mask:
+    def __init__(self, n: int) -> None:
+        self.n = n
+
+
+class Series:
+    def __init__(self, v: int) -> None:
+        self.v = v
+
+    def __gt__(self, other: int) -> Mask:
+        return Mask(self.v)
+
+
+def main() -> None:
+    xs: list[Series] = [Series(1), Series(2)]
+    ys: list[Mask] = list(map(lambda s: s > 1, xs))
+    print(len(ys))

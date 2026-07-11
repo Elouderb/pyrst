@@ -2027,6 +2027,157 @@ class W:
     }
 
     #[test]
+    fn comparison_dunder_maps_only_the_four_inherent_dunders() {
+        // (card 4349fe41) Peer of arith_dunder(): the four comparison ops codegen
+        // emits as INHERENT methods map to their Python dunder; `Lt`/`Eq` map to
+        // None DELIBERATELY (they lower to PartialOrd/PartialEq, hard-locked to
+        // bool), and so does every non-comparison operator.
+        assert_eq!(BinOp::Gt.comparison_dunder(), Some("__gt__"));
+        assert_eq!(BinOp::Le.comparison_dunder(), Some("__le__"));
+        assert_eq!(BinOp::Ge.comparison_dunder(), Some("__ge__"));
+        assert_eq!(BinOp::Ne.comparison_dunder(), Some("__ne__"));
+        assert_eq!(BinOp::Lt.comparison_dunder(), None, "`<`/__lt__ is bool-locked (PartialOrd) — not routed");
+        assert_eq!(BinOp::Eq.comparison_dunder(), None, "`==`/__eq__ is bool-locked (PartialEq) — not routed");
+        for op in [
+            BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::Div, BinOp::FloorDiv,
+            BinOp::Mod, BinOp::Pow, BinOp::And, BinOp::Or, BinOp::Is, BinOp::IsNot,
+            BinOp::In, BinOp::NotIn, BinOp::BitAnd, BinOp::BitOr, BinOp::BitXor,
+            BinOp::LShift, BinOp::RShift,
+        ] {
+            assert_eq!(op.comparison_dunder(), None, "op {:?} must not map to a comparison dunder", op);
+        }
+    }
+
+    #[test]
+    fn oracle_routes_gt_le_ge_ne_to_class_dunders_but_not_lt_eq() {
+        // (card 4349fe41) The codegen type-oracle `infer_expr_ty` routes `> >= <=
+        // !=` on a user-class lhs to the matching dunder's RETURN type (a mask
+        // class here) so `type_of_expr` agrees with codegen's method-desugar. `<`
+        // (__lt__) / `==` (__eq__) stay `Bool` even when defined (bool-locked), and
+        // a class WITHOUT the dunder stays `Bool` (no over-routing).
+        let src = "\
+class M:
+    n: int
+    def __init__(self, n: int) -> None:
+        self.n = n
+
+class S:
+    x: int
+    def __init__(self, x: int) -> None:
+        self.x = x
+    def __gt__(self, other: int) -> M:
+        return M(self.x)
+    def __ge__(self, other: int) -> M:
+        return M(self.x)
+    def __le__(self, other: int) -> M:
+        return M(self.x)
+    def __ne__(self, other: int) -> M:
+        return M(self.x)
+    def __lt__(self, other: S) -> bool:
+        return self.x < other.x
+
+class P:
+    y: int
+    def __init__(self, y: int) -> None:
+        self.y = y
+";
+        let m = crate::parser::parse(src).expect("parse");
+        let mut ctx = TyCtx::new();
+        for s in &m.stmts {
+            if let Stmt::Class(c) = s {
+                let mut c = c.clone();
+                extract_init_fields(&mut c);
+                ctx.classes.insert(c.name.clone(), c);
+            }
+        }
+        let mask = Ty::Class("M".into(), vec![]);
+        let mut locals = std::collections::HashMap::new();
+        locals.insert("s".to_string(), Ty::Class("S".into(), vec![]));
+        locals.insert("p".to_string(), Ty::Class("P".into(), vec![]));
+        let cmp = |op: BinOp, l: &str, r: &str| Expr::BinOp {
+            op, lhs: Box::new(ident(l)), rhs: Box::new(ident(r)), span: Span::DUMMY,
+        };
+        // The four routable comparisons type as the mask class.
+        for op in [BinOp::Gt, BinOp::Le, BinOp::Ge, BinOp::Ne] {
+            assert_eq!(
+                infer_expr_ty(&cmp(op, "s", "s"), &locals, &ctx), mask,
+                "op {:?} on a class defining its comparison dunder must type as the dunder return", op
+            );
+        }
+        // `<`/`==` stay Bool though S defines __lt__ (bool-locked PartialOrd/PartialEq).
+        assert_eq!(infer_expr_ty(&cmp(BinOp::Lt, "s", "s"), &locals, &ctx), Ty::Bool);
+        assert_eq!(infer_expr_ty(&cmp(BinOp::Eq, "s", "s"), &locals, &ctx), Ty::Bool);
+        // A class WITHOUT the dunder keeps Bool (the guard is `.is_some()`).
+        assert_eq!(infer_expr_ty(&cmp(BinOp::Gt, "p", "p"), &locals, &ctx), Ty::Bool);
+    }
+
+    #[test]
+    fn class_comparison_soundness_bool_context_and_lambda() {
+        // (card 4349fe41) A comparison overloaded to a non-bool (mask) class:
+        //   * usable as a VALUE (assigned to the mask type) — accepted;
+        //   * used DIRECTLY as an `if` condition — HONEST check error (no __bool__);
+        //   * inside a `map()` lambda — HONEST check error (bare-param unemittable);
+        //   * a bool-returning __gt__ IS usable as a condition.
+        // `<` (__lt__) stays bool (Lt excluded), so a mask assignment from it is the
+        // pre-fix "got bool" error, unchanged.
+        let cls = "\
+class M:
+    n: int
+    def __init__(self, n: int) -> None:
+        self.n = n
+class S:
+    x: int
+    def __init__(self, x: int) -> None:
+        self.x = x
+    def __gt__(self, other: int) -> M:
+        return M(self.x)
+    def __lt__(self, other: int) -> M:
+        return M(self.x)
+class C:
+    v: int
+    def __init__(self, v: int) -> None:
+        self.v = v
+    def __gt__(self, other: C) -> bool:
+        return self.v > other.v
+";
+        let with_main = |body: &str| format!("{}\ndef main() -> None:\n{}\n", cls, body);
+        // ACCEPTED — a routed mask is an ordinary value.
+        assert!(
+            check_src(&with_main("    s: S = S(3)\n    m: M = s > 2\n    print(m.n)")).is_ok(),
+            "a mask-returning `>` assigned to the mask type must typecheck"
+        );
+        // ACCEPTED — a bool-returning __gt__ used DIRECTLY as a condition.
+        assert!(
+            check_src(&with_main("    a: C = C(5)\n    b: C = C(3)\n    if a > b:\n        print(1)")).is_ok(),
+            "a bool-returning `>` used as an `if` condition must typecheck"
+        );
+        // REJECTED — a non-bool (mask) `>` used directly as an `if` condition.
+        assert_type_err_unit(
+            check_src(&with_main("    s: S = S(3)\n    if s > 2:\n        print(1)")),
+            "has no truthiness",
+        );
+        // REJECTED — the same, in an `and` (both operands are a boolean context).
+        assert_type_err_unit(
+            check_src(&with_main("    s: S = S(3)\n    if (s > 2) and True:\n        print(1)")),
+            "has no truthiness",
+        );
+        // REJECTED — a class comparison on the bare param of a `map()` lambda.
+        assert_type_err_unit(
+            check_src(&with_main(
+                "    xs: list[S] = [S(1)]\n    \
+                 ys: list[M] = list(map(lambda s: s > 1, xs))\n    print(len(ys))",
+            )),
+            "not yet supported inside a `map()`/`filter()` lambda",
+        );
+        // UNCHANGED — `<` (__lt__) is bool-locked, NOT routed; the mask assignment
+        // is the pre-fix "declared M, got bool" honest error.
+        assert_type_err_unit(
+            check_src(&with_main("    s: S = S(3)\n    m: M = s < 2\n    print(m.n)")),
+            "got bool",
+        );
+    }
+
+    #[test]
     fn map_filter_lambda_class_op_check_agrees_with_codegen() {
         // (card 333e34a7, review 585) A class `/ // % **` or a `list*int`
         // seq-repeat on the BARE param of a map()/filter() lambda cannot be

@@ -1,0 +1,24 @@
+# NEGATIVE (card 4349fe41): a comparison overloaded to a NON-bool value (a
+# boolean-mask class) used as a `while` condition is an HONEST check error, NOT a
+# check-accept / rustc-build-fail — the `while`-condition peer of
+# fail_class_gt_mask_cond.pyrs. `s > 2` types as `Mask`, which has no truthiness
+# (no `__bool__`), so it cannot drive a loop; reduce it to a bool first.
+
+
+class Mask:
+    def __init__(self, n: int) -> None:
+        self.n = n
+
+
+class Series:
+    def __init__(self, v: int) -> None:
+        self.v = v
+
+    def __gt__(self, other: int) -> Mask:
+        return Mask(self.v)
+
+
+def main() -> None:
+    s: Series = Series(3)
+    while s > 2:
+        print("unreachable")

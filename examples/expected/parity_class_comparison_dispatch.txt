@@ -1,0 +1,9 @@
+[False, False, True, True]
+[False, True, True, True]
+[True, True, False, False]
+[True, False, True, True]
+some > 2
+none <= 0
+a>b
+True
+False

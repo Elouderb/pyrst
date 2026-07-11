@@ -1,0 +1,78 @@
+# kodiak_demo — the flagship Phase-2 eager pipeline: build a frame, round-trip
+# it through CSV (with dtype inference), filter via a comparison -> bool mask,
+# sort, group-by + aggregate, and merge against a lookup table — printing each
+# stage. See extern/packages/kodiak/README.md for the full API and the
+# documented pandas divergences (df.filter(mask) instead of df[mask]; masks
+# and scalar broadcast are methods, not operators).
+#
+# Build + run (from this directory):
+#   PYRST_PATH=/home/ethos/Coding/pyrst/extern/packages \
+#     /home/ethos/Coding/pyrst/target/release/pyrst build main.pyrs
+#   ./main
+
+from kodiak.series import Series
+from kodiak.frame import DataFrame
+from kodiak.io import read_csv
+
+
+def section(title: str) -> None:
+    print("")
+    print("== " + title + " ==")
+
+
+def main() -> None:
+    # --- construct an employees frame (columnar, typed) ---
+    emp_id: Series = Series.from_ints("emp_id", [1, 2, 3, 4, 5, 6])
+    name: Series = Series.from_strs("name", ["Ana", "Bo", "Chi", "Dee", "Eli", "Fox"])
+    dept: Series = Series.from_strs("dept", ["Eng", "Sales", "Eng", "Sales", "Eng", "Ops"])
+    age: Series = Series.from_ints("age", [34, 29, 41, 22, 37, 45])
+    salary: Series = Series.from_floats("salary", [120.0, 90.0, 135.5, 80.0, 110.0, 99.0])
+    emp: DataFrame = DataFrame.from_columns([emp_id, name, dept, age, salary])
+
+    section("employees")
+    print(emp)
+
+    # --- CSV round-trip: write, then read back with dtype inference ---
+    emp.to_csv("kodiak_report.csv")
+    loaded: DataFrame = read_csv("kodiak_report.csv")
+    section("read_csv (dtypes re-inferred from CSV)")
+    print(loaded)
+    print("inferred dtypes: emp_id=" + loaded["emp_id"].dtype + " name=" + loaded["name"].dtype + " dept=" + loaded["dept"].dtype + " age=" + loaded["age"].dtype + " salary=" + loaded["salary"].dtype)
+
+    # --- derived column via element-wise arithmetic (operator form) ---
+    bonus: Series = loaded["salary"].mul_scalar(0.10)          # scalar broadcast
+    with_bonus: DataFrame = loaded.with_column("bonus", bonus)
+    total: Series = with_bonus["salary"] + with_bonus["bonus"] # Series + Series
+    with_total: DataFrame = with_bonus.with_column("total_comp", total)
+    section("with derived bonus (salary*0.10) and total_comp (salary + bonus)")
+    print(with_total)
+
+    # --- comparison -> bool mask -> filter (the pandas df[df.x>k] shape) ---
+    mask: Series = with_total["salary"].gt(100.0)
+    high: DataFrame = with_total.filter(mask)
+    section("filter: salary > 100")
+    print(high)
+
+    # --- stable sort by total_comp, descending ---
+    section("sort_values by total_comp (desc)")
+    print(with_total.sort_values("total_comp", False))
+
+    # --- groupby dept: mean, then count ---
+    section("groupby dept -> mean")
+    print(with_total.groupby("dept").mean())
+    section("groupby dept -> count")
+    print(with_total.groupby("dept").count())
+
+    # --- merge against a dept -> region lookup (inner join on str key) ---
+    ldept: Series = Series.from_strs("dept", ["Eng", "Sales", "Ops"])
+    region: Series = Series.from_strs("region", ["West", "East", "West"])
+    lookup: DataFrame = DataFrame.from_columns([ldept, region])
+    section("merge employees with dept->region lookup (inner on dept)")
+    print(emp.merge(lookup, "dept", "inner").sort_values("emp_id", True))
+
+    # --- describe the numeric columns ---
+    section("describe")
+    print(with_total.describe())
+
+    print("")
+    print("OK: kodiak_demo (Phase 2 eager pipeline — csv round-trip / arithmetic / mask+filter / sort / groupby / merge / describe)")

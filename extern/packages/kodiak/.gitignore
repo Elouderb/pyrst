@@ -1,0 +1,9 @@
+# pyrst build outputs — `pyrst build <file.pyrs>` always emits its binary
+# into the CURRENT directory named after the source basename. Regenerable;
+# never commit these.
+/series
+/frame
+/smoke_scaffold
+/io
+/op_matrix
+/op_matrix_rt.csv

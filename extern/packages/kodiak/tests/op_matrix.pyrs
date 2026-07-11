@@ -1,0 +1,189 @@
+# op_matrix.pyrs — Phase 2 eager-core op matrix for kodiak. Asserts
+# HAND-COMPUTED expected values for arithmetic, every comparison, filter,
+# sort order (incl. stability), each groupby aggregation (sum/mean/count/
+# min/max), inner + left merge, dropna/fillna, null propagation, and a CSV
+# round-trip. Prints PASS and exits 0 on success; on any failure it prints a
+# single concise FAIL line and aborts (assert False) — no tracebacks.
+#
+# Build + run (from extern/packages/kodiak/):
+#   PYRST_PATH=/home/ethos/Coding/pyrst/extern/packages \
+#     /home/ethos/Coding/pyrst/target/release/pyrst build tests/op_matrix.pyrs
+#   ./op_matrix
+
+from kodiak.series import Series
+from kodiak.frame import DataFrame
+from kodiak.io import read_csv
+
+
+def fail(msg: str) -> None:
+    print("FAIL: " + msg)
+    assert False
+
+
+def check_strs(label: str, actual: list[str], expected: list[str]) -> None:
+    if len(actual) != len(expected):
+        fail(label + ": length " + str(len(actual)) + " != " + str(len(expected)) + " (" + str(actual) + ")")
+    i: int = 0
+    while i < len(actual):
+        if actual[i] != expected[i]:
+            fail(label + ": at " + str(i) + " got '" + actual[i] + "' expected '" + expected[i] + "' (" + str(actual) + ")")
+        i += 1
+
+
+def approx(a: float, b: float) -> bool:
+    d: float = a - b
+    if d < 0.0:
+        d = -d
+    return d < 0.000000001
+
+
+def check_close(label: str, actual: float, expected: float) -> None:
+    if not approx(actual, expected):
+        fail(label + ": got " + str(actual) + " expected " + str(expected))
+
+
+def main() -> None:
+    # ---- arithmetic: Series (+/-/*//) Series ----------------------------
+    a: Series = Series.from_ints("a", [1, 2, 3])
+    b: Series = Series.from_ints("b", [10, 20, 30])
+    check_strs("add i64", (a + b).to_strings(), ["11", "22", "33"])
+    check_strs("sub i64", (b - a).to_strings(), ["9", "18", "27"])
+    check_strs("mul i64", (a * b).to_strings(), ["10", "40", "90"])
+    # method-name aliases mirror the operators
+    check_strs("add method", a.add(b).to_strings(), ["11", "22", "33"])
+    # int op int stays i64
+    if (a + b).dtype != "i64":
+        fail("i64 + i64 must stay i64, got " + (a + b).dtype)
+    # truediv always f64
+    td: Series = a.truediv(b)
+    if td.dtype != "f64":
+        fail("truediv must be f64, got " + td.dtype)
+    check_close("truediv[0]", td.floats[0], 0.1)
+    # int op float -> f64
+    f: Series = Series.from_floats("f", [0.5, 0.5, 0.5])
+    mixed: Series = a + f
+    if mixed.dtype != "f64":
+        fail("i64 + f64 must be f64, got " + mixed.dtype)
+    check_strs("mixed add", mixed.to_strings(), ["1.5", "2.5", "3.5"])
+
+    # ---- scalar broadcast (float methods; result f64) ------------------
+    check_strs("mul_scalar", a.mul_scalar(2.0).to_strings(), ["2.0", "4.0", "6.0"])
+    check_strs("add_scalar", a.add_scalar(1.0).to_strings(), ["2.0", "3.0", "4.0"])
+    check_strs("div_scalar", b.div_scalar(10.0).to_strings(), ["1.0", "2.0", "3.0"])
+
+    # ---- comparisons -> bool mask (each operator, as a method) ---------
+    c: Series = Series.from_ints("c", [1, 2, 3, 4, 5])
+    check_strs("gt", c.gt(3.0).to_strings(), ["False", "False", "False", "True", "True"])
+    check_strs("ge", c.ge(3.0).to_strings(), ["False", "False", "True", "True", "True"])
+    check_strs("lt", c.lt(3.0).to_strings(), ["True", "True", "False", "False", "False"])
+    check_strs("le", c.le(3.0).to_strings(), ["True", "True", "True", "False", "False"])
+    check_strs("eq", c.eq(3.0).to_strings(), ["False", "False", "True", "False", "False"])
+    check_strs("ne", c.ne(3.0).to_strings(), ["True", "True", "False", "True", "True"])
+    # string equality
+    s: Series = Series.from_strs("s", ["x", "y", "x"])
+    check_strs("eq_str", s.eq_str("x").to_strings(), ["True", "False", "True"])
+    check_strs("ne_str", s.ne_str("x").to_strings(), ["False", "True", "False"])
+    # Series vs Series
+    check_strs("gt_series", b.gt_series(Series.from_ints("z", [5, 25, 25])).to_strings(), ["True", "False", "True"])
+
+    # ---- filter -------------------------------------------------------
+    age: Series = Series.from_ints("age", [34, 29, 41, 22, 37])
+    dept: Series = Series.from_strs("dept", ["A", "B", "A", "B", "A"])
+    df: DataFrame = DataFrame.from_columns([age, dept])
+    filtered: DataFrame = df.filter(df["age"].gt(30.0))
+    check_strs("filter age>30 rows", filtered["age"].to_strings(), ["34", "41", "37"])
+    check_strs("filter age>30 dept", filtered["dept"].to_strings(), ["A", "A", "A"])
+
+    # ---- sort_values (asc, desc, and stability on duplicate keys) ------
+    sv: Series = Series.from_ints("v", [3, 1, 2, 1])
+    tag: Series = Series.from_strs("tag", ["a", "b", "c", "d"])
+    sdf: DataFrame = DataFrame.from_columns([sv, tag])
+    asc: DataFrame = sdf.sort_values("v", True)
+    check_strs("sort asc v", asc["v"].to_strings(), ["1", "1", "2", "3"])
+    # stability: the two v==1 rows keep original order (b before d)
+    check_strs("sort asc stable tag", asc["tag"].to_strings(), ["b", "d", "c", "a"])
+    desc: DataFrame = sdf.sort_values("v", False)
+    check_strs("sort desc v", desc["v"].to_strings(), ["3", "2", "1", "1"])
+    check_strs("sort desc stable tag", desc["tag"].to_strings(), ["a", "c", "b", "d"])
+
+    # ---- groupby: sum/mean/count/min/max on a known frame --------------
+    # dept A: value [10, 30, 50]; dept B: value [20, 40]
+    gk: Series = Series.from_strs("k", ["A", "B", "A", "B", "A"])
+    gv: Series = Series.from_ints("v", [10, 20, 30, 40, 50])
+    gdf: DataFrame = DataFrame.from_columns([gk, gv])
+    gsum: DataFrame = gdf.groupby("k").sum()
+    check_strs("groupby keys sorted", gsum["k"].to_strings(), ["A", "B"])
+    check_strs("groupby sum", gsum["v"].to_strings(), ["90", "60"])
+    if gsum["v"].dtype != "i64":
+        fail("groupby sum of i64 should stay i64, got " + gsum["v"].dtype)
+    gmean: DataFrame = gdf.groupby("k").mean()
+    check_close("groupby mean A", gmean["v"].floats[0], 30.0)
+    check_close("groupby mean B", gmean["v"].floats[1], 30.0)
+    gcount: DataFrame = gdf.groupby("k").count()
+    check_strs("groupby count", gcount["v"].to_strings(), ["3", "2"])
+    gmin: DataFrame = gdf.groupby("k").min()
+    check_strs("groupby min", gmin["v"].to_strings(), ["10", "20"])
+    gmax: DataFrame = gdf.groupby("k").max()
+    check_strs("groupby max", gmax["v"].to_strings(), ["50", "40"])
+
+    # ---- merge: inner + left -------------------------------------------
+    lid: Series = Series.from_ints("id", [1, 2, 3])
+    lnm: Series = Series.from_strs("name", ["Ana", "Bo", "Chi"])
+    left: DataFrame = DataFrame.from_columns([lid, lnm])
+    rid: Series = Series.from_ints("id", [2, 3, 4])
+    rvl: Series = Series.from_floats("val", [9.5, 8.0, 7.0])
+    right: DataFrame = DataFrame.from_columns([rid, rvl])
+    inner: DataFrame = left.merge(right, "id", "inner")
+    check_strs("inner merge id", inner["id"].to_strings(), ["2", "3"])
+    check_strs("inner merge name", inner["name"].to_strings(), ["Bo", "Chi"])
+    check_strs("inner merge val", inner["val"].to_strings(), ["9.5", "8.0"])
+    lm: DataFrame = left.merge(right, "id", "left")
+    check_strs("left merge id", lm["id"].to_strings(), ["1", "2", "3"])
+    check_strs("left merge name", lm["name"].to_strings(), ["Ana", "Bo", "Chi"])
+    check_strs("left merge val (unmatched->NaN)", lm["val"].to_strings(), ["NaN", "9.5", "8.0"])
+
+    # ---- null model: dropna / fillna + arithmetic & agg skip ----------
+    na: Series = Series.from_ints_n("a", [1, 0, 3], [False, True, False])
+    nb: Series = Series.from_strs_n("b", ["x", "y", ""], [False, False, True])
+    ndf: DataFrame = DataFrame.from_columns([na, nb])
+    check_strs("null render", ndf["a"].to_strings(), ["1", "NaN", "3"])
+    dropped: DataFrame = ndf.dropna()
+    check_strs("dropna a", dropped["a"].to_strings(), ["1"])
+    check_strs("dropna b", dropped["b"].to_strings(), ["x"])
+    ff: DataFrame = ndf.fillna_float(-1.0)
+    check_strs("fillna_float a", ff["a"].to_strings(), ["1", "-1", "3"])
+    check_strs("fillna_float leaves str", ff["b"].to_strings(), ["x", "y", "NaN"])
+    fs: DataFrame = ndf.fillna_str("MISSING")
+    check_strs("fillna_str b", fs["b"].to_strings(), ["x", "y", "MISSING"])
+    check_strs("fillna_str leaves num", fs["a"].to_strings(), ["1", "NaN", "3"])
+    # arithmetic propagates null; aggregation skips it
+    nsum: Series = na + Series.from_ints("c", [10, 20, 30])
+    check_strs("null add", nsum.to_strings(), ["11", "NaN", "33"])
+    check_close("agg_sum skips null", na.agg_sum(), 4.0)
+    if na.count() != 2:
+        fail("count of non-null expected 2, got " + str(na.count()))
+
+    # ---- CSV round-trip equality --------------------------------------
+    ci: Series = Series.from_ints("i", [1, 2, 3])
+    cf: Series = Series.from_floats("f", [1.5, 2.0, 3.25])
+    cs: Series = Series.from_strs("s", ["a", "b", "c"])
+    cb: Series = Series.from_bools("bo", [True, False, True])
+    cdf: DataFrame = DataFrame.from_columns([ci, cf, cs, cb])
+    cdf.to_csv("op_matrix_rt.csv")
+    rt: DataFrame = read_csv("op_matrix_rt.csv")
+    check_strs("rt columns", rt.columns(), ["i", "f", "s", "bo"])
+    if rt["i"].dtype != "i64" or rt["f"].dtype != "f64" or rt["s"].dtype != "str" or rt["bo"].dtype != "bool":
+        fail("rt dtype mismatch: " + rt["i"].dtype + "/" + rt["f"].dtype + "/" + rt["s"].dtype + "/" + rt["bo"].dtype)
+    check_strs("rt i", rt["i"].to_strings(), ["1", "2", "3"])
+    check_strs("rt f", rt["f"].to_strings(), ["1.5", "2.0", "3.25"])
+    check_strs("rt s", rt["s"].to_strings(), ["a", "b", "c"])
+    check_strs("rt bo", rt["bo"].to_strings(), ["True", "False", "True"])
+
+    # ---- CSV round-trip preserves nulls (empty field <-> NA) ----------
+    cdf2: DataFrame = DataFrame.from_columns([na, nb])
+    cdf2.to_csv("op_matrix_rt.csv")
+    rt2: DataFrame = read_csv("op_matrix_rt.csv")
+    check_strs("rt null a", rt2["a"].to_strings(), ["1", "NaN", "3"])
+    check_strs("rt null b", rt2["b"].to_strings(), ["x", "y", "NaN"])
+
+    print("PASS: kodiak op_matrix (arithmetic/scalar/comparisons/filter/sort+stable/groupby sum-mean-count-min-max/merge inner+left/dropna+fillna/null-propagation/csv round-trip)")

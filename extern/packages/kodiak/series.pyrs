@@ -1,0 +1,660 @@
+# series.pyrs — the Series type for kodiak: a discriminated struct-of-arrays
+# column with a per-Series validity mask (the null model).
+#
+# WHY THIS SHAPE (read before touching this file): pyrst has no general union
+# types, and class-based subtyping / polymorphic collections are gated/buggy
+# (card ed56edfb) — see the kodiak epic card 974fdff3, lead-design comment
+# 608. A heterogeneous dataframe column therefore cannot be ONE polymorphic
+# value; instead every Series carries ALL FOUR typed backing stores plus a
+# `dtype` tag naming which ONE of them is populated for this column. Every
+# operation switches on `dtype`. This is a struct-of-arrays layout, so it
+# compiles straight to native Rust Vecs (no boxing / dynamic dispatch).
+#
+# NULL MODEL (Phase 2, card 974fdff3): a parallel `nulls: list[bool]`
+# validity mask sits alongside the typed store — nulls[i] == True means row i
+# is missing (NA), and the value in the typed store at that index is an
+# ignored placeholder. This is the lead's recommended general model (comment
+# 608): it works uniformly across every dtype, unlike an f64-only NaN
+# sentinel. The from_ints/from_floats/from_strs/from_bools constructors keep
+# their (name, values) signatures and default to all-valid; ops and read_csv
+# thread the mask through. Comparisons treat a null operand as
+# not-satisfying (mask False); numeric aggregations skip nulls; dropna drops
+# any-null rows; fillna fills the value and clears the flag.
+#
+# PYRST GAPS THAT SHAPE THE OP SURFACE (probed against target/release/pyrst,
+# logged on card 974fdff3):
+#   - Comparison OPERATORS (`<`, `>`, `==`, ...) are hard-typed to return
+#     bool regardless of a `__lt__`/`__eq__` declared return type, so a
+#     comparison cannot yield a bool-mask Series via an operator. Masks are
+#     therefore METHODS: gt/ge/lt/le/eq/ne (scalar), eq_str/ne_str, *_series.
+#   - Arithmetic dunders CAN return the class, so element-wise Series⊕Series
+#     is exposed via BOTH operators (__add__ ..) AND method aliases.
+#   - An int literal does not coerce to a float parameter, so scalar-broadcast
+#     methods take explicit floats (s.mul_scalar(2.0)).
+#
+# VALUE SEMANTICS: pyrst classes are clone-on-use. Every method that "returns
+# a Series" allocates a fresh Series; none mutate self.
+
+
+# ---- module-private helpers ----------------------------------------------
+
+def _rep_false(n: int) -> list[bool]:
+    out: list[bool] = []
+    i: int = 0
+    while i < n:
+        out.append(False)
+        i += 1
+    return out
+
+
+def _num_at(s: Series, i: int) -> float:
+    # numeric value at row i as a float (i64 store promoted); caller must have
+    # already checked the dtype is numeric.
+    if s.dtype == "i64":
+        return float(s.ints[i])
+    return s.floats[i]
+
+
+def _is_numeric_dtype(dt: str) -> bool:
+    return dt == "i64" or dt == "f64"
+
+
+class Series:
+    name: str
+    dtype: str          # "i64" | "f64" | "str" | "bool"
+    ints: list[int]
+    floats: list[float]
+    strs: list[str]
+    bools: list[bool]   # only the store matching `dtype` is populated
+    nulls: list[bool]   # validity mask; nulls[i] == True  =>  row i is NA
+    length: int
+
+    def __init__(self, name: str, dtype: str, ints: list[int], floats: list[float], strs: list[str], bools: list[bool], nulls: list[bool], length: int) -> None:
+        if dtype not in ["i64", "f64", "str", "bool"]:
+            raise ValueError("Series: unknown dtype " + repr(dtype) + " (expected one of i64/f64/str/bool)")
+        self.name = name
+        self.dtype = dtype
+        self.ints = ints
+        self.floats = floats
+        self.strs = strs
+        self.bools = bools
+        self.nulls = nulls
+        self.length = length
+
+    # ---- constructors (pandas-style: Series.from_ints(name, values)) ------
+    # These build an all-valid column (no nulls). The *_n variants take an
+    # explicit validity mask (used by read_csv and null-producing ops).
+    @staticmethod
+    def from_ints(name: str, values: list[int]) -> Series:
+        return Series(name, "i64", values, [], [], [], _rep_false(len(values)), len(values))
+
+    @staticmethod
+    def from_floats(name: str, values: list[float]) -> Series:
+        return Series(name, "f64", [], values, [], [], _rep_false(len(values)), len(values))
+
+    @staticmethod
+    def from_strs(name: str, values: list[str]) -> Series:
+        return Series(name, "str", [], [], values, [], _rep_false(len(values)), len(values))
+
+    @staticmethod
+    def from_bools(name: str, values: list[bool]) -> Series:
+        return Series(name, "bool", [], [], [], values, _rep_false(len(values)), len(values))
+
+    @staticmethod
+    def from_ints_n(name: str, values: list[int], nulls: list[bool]) -> Series:
+        return Series(name, "i64", values, [], [], [], nulls, len(values))
+
+    @staticmethod
+    def from_floats_n(name: str, values: list[float], nulls: list[bool]) -> Series:
+        return Series(name, "f64", [], values, [], [], nulls, len(values))
+
+    @staticmethod
+    def from_strs_n(name: str, values: list[str], nulls: list[bool]) -> Series:
+        return Series(name, "str", [], [], values, [], nulls, len(values))
+
+    @staticmethod
+    def from_bools_n(name: str, values: list[bool], nulls: list[bool]) -> Series:
+        return Series(name, "bool", [], [], [], values, nulls, len(values))
+
+    def __len__(self) -> int:
+        return self.length
+
+    def rename(self, name: str) -> Series:
+        return Series(name, self.dtype, self.ints, self.floats, self.strs, self.bools, self.nulls, self.length)
+
+    def is_numeric(self) -> bool:
+        return _is_numeric_dtype(self.dtype)
+
+    # ---- null helpers ------------------------------------------------------
+    def isna(self) -> Series:
+        # bool Series: True where the row is NA.
+        out: list[bool] = []
+        i: int = 0
+        while i < self.length:
+            out.append(self.nulls[i])
+            i += 1
+        return Series.from_bools(self.name, out)
+
+    def null_count(self) -> int:
+        c: int = 0
+        i: int = 0
+        while i < self.length:
+            if self.nulls[i]:
+                c += 1
+            i += 1
+        return c
+
+    def count(self) -> int:
+        # number of non-null rows (pandas Series.count()).
+        return self.length - self.null_count()
+
+    def fillna_float(self, x: float) -> Series:
+        # numeric columns only: replace each null with x (int(x) for i64),
+        # clearing the validity flag; non-null cells are copied unchanged.
+        if not _is_numeric_dtype(self.dtype):
+            raise TypeError("kodiak: fillna_float not supported on a '" + self.dtype + "' column ('" + self.name + "')")
+        nulls: list[bool] = _rep_false(self.length)
+        if self.dtype == "i64":
+            ints: list[int] = []
+            i: int = 0
+            while i < self.length:
+                if self.nulls[i]:
+                    ints.append(int(x))
+                else:
+                    ints.append(self.ints[i])
+                i += 1
+            return Series(self.name, "i64", ints, [], [], [], nulls, self.length)
+        floats: list[float] = []
+        i = 0
+        while i < self.length:
+            if self.nulls[i]:
+                floats.append(x)
+            else:
+                floats.append(self.floats[i])
+            i += 1
+        return Series(self.name, "f64", [], floats, [], [], nulls, self.length)
+
+    def fillna_str(self, v: str) -> Series:
+        if self.dtype != "str":
+            raise TypeError("kodiak: fillna_str not supported on a '" + self.dtype + "' column ('" + self.name + "')")
+        nulls: list[bool] = _rep_false(self.length)
+        strs: list[str] = []
+        i: int = 0
+        while i < self.length:
+            if self.nulls[i]:
+                strs.append(v)
+            else:
+                strs.append(self.strs[i])
+            i += 1
+        return Series(self.name, "str", [], [], strs, [], nulls, self.length)
+
+    # ---- rendering: every cell as a str, for the DataFrame table printer --
+    def to_strings(self) -> list[str]:
+        out: list[str] = []
+        i: int = 0
+        while i < self.length:
+            if self.nulls[i]:
+                out.append("NaN")
+            elif self.dtype == "i64":
+                out.append(str(self.ints[i]))
+            elif self.dtype == "f64":
+                out.append(str(self.floats[i]))
+            elif self.dtype == "str":
+                out.append(self.strs[i])
+            else:
+                out.append(str(self.bools[i]))
+            i += 1
+        return out
+
+    def to_field_strings(self) -> list[str]:
+        # like to_strings() but a null renders as the empty string (for CSV
+        # output: an empty field round-trips back to a null on read).
+        out: list[str] = []
+        i: int = 0
+        while i < self.length:
+            if self.nulls[i]:
+                out.append("")
+            elif self.dtype == "i64":
+                out.append(str(self.ints[i]))
+            elif self.dtype == "f64":
+                out.append(str(self.floats[i]))
+            elif self.dtype == "str":
+                out.append(self.strs[i])
+            else:
+                out.append(str(self.bools[i]))
+            i += 1
+        return out
+
+    # ---- row selection primitives -----------------------------------------
+    def row_slice(self, start: int, stop: int) -> Series:
+        # Contiguous slice, self-clamping to [0, length].
+        lo: int = start
+        if lo < 0:
+            lo = 0
+        hi: int = stop
+        if hi > self.length:
+            hi = self.length
+        if hi < lo:
+            hi = lo
+        ints: list[int] = []
+        floats: list[float] = []
+        strs: list[str] = []
+        bools: list[bool] = []
+        nulls: list[bool] = self.nulls[lo:hi]
+        if self.dtype == "i64":
+            ints = self.ints[lo:hi]
+        elif self.dtype == "f64":
+            floats = self.floats[lo:hi]
+        elif self.dtype == "str":
+            strs = self.strs[lo:hi]
+        else:
+            bools = self.bools[lo:hi]
+        return Series(self.name, self.dtype, ints, floats, strs, bools, nulls, hi - lo)
+
+    def take(self, idx: list[int]) -> Series:
+        # Arbitrary-index gather (the shared reorder/select primitive that
+        # filter / sort_values / groupby / merge build on). Every index must
+        # be a valid row of self. Carries the validity mask.
+        ints: list[int] = []
+        floats: list[float] = []
+        strs: list[str] = []
+        bools: list[bool] = []
+        nulls: list[bool] = []
+        k: int = 0
+        while k < len(idx):
+            j: int = idx[k]
+            nulls.append(self.nulls[j])
+            if self.dtype == "i64":
+                ints.append(self.ints[j])
+            elif self.dtype == "f64":
+                floats.append(self.floats[j])
+            elif self.dtype == "str":
+                strs.append(self.strs[j])
+            else:
+                bools.append(self.bools[j])
+            k += 1
+        return Series(self.name, self.dtype, ints, floats, strs, bools, nulls, len(idx))
+
+    def take_null(self, idx: list[int]) -> Series:
+        # Like take() but an index of -1 produces a NULL cell (used by left
+        # merge for unmatched right-side rows). A type-appropriate placeholder
+        # goes in the store; the null mask marks it NA.
+        ints: list[int] = []
+        floats: list[float] = []
+        strs: list[str] = []
+        bools: list[bool] = []
+        nulls: list[bool] = []
+        k: int = 0
+        while k < len(idx):
+            j: int = idx[k]
+            if j < 0:
+                nulls.append(True)
+                if self.dtype == "i64":
+                    ints.append(0)
+                elif self.dtype == "f64":
+                    floats.append(0.0)
+                elif self.dtype == "str":
+                    strs.append("")
+                else:
+                    bools.append(False)
+            else:
+                nulls.append(self.nulls[j])
+                if self.dtype == "i64":
+                    ints.append(self.ints[j])
+                elif self.dtype == "f64":
+                    floats.append(self.floats[j])
+                elif self.dtype == "str":
+                    strs.append(self.strs[j])
+                else:
+                    bools.append(self.bools[j])
+            k += 1
+        return Series(self.name, self.dtype, ints, floats, strs, bools, nulls, len(idx))
+
+    def head(self, n: int) -> Series:
+        return self.row_slice(0, n)
+
+    def tail(self, n: int) -> Series:
+        take: int = n
+        if take > self.length:
+            take = self.length
+        if take < 0:
+            take = 0
+        return self.row_slice(self.length - take, self.length)
+
+    # ---- element-wise arithmetic (Series ⊕ Series) ------------------------
+    # Result dtype: f64 if either operand is f64 else i64; truediv is always
+    # f64. Lengths must match, or one side may be length 1 (scalar broadcast).
+    # A result cell is null if either input cell is null.
+    def _binary(self, other: Series, op: str) -> Series:
+        if not _is_numeric_dtype(self.dtype):
+            raise TypeError("kodiak: arithmetic op '" + op + "' not supported on a '" + self.dtype + "' column ('" + self.name + "')")
+        if not _is_numeric_dtype(other.dtype):
+            raise TypeError("kodiak: arithmetic op '" + op + "' not supported on a '" + other.dtype + "' column ('" + other.name + "')")
+        n: int = self.length
+        if other.length != self.length:
+            if self.length == 1:
+                n = other.length
+            elif other.length == 1:
+                n = self.length
+            else:
+                raise ValueError("kodiak: length mismatch in '" + op + "': " + str(self.length) + " vs " + str(other.length))
+        result_float: bool = op == "truediv" or self.dtype == "f64" or other.dtype == "f64"
+        ints: list[int] = []
+        floats: list[float] = []
+        nulls: list[bool] = []
+        i: int = 0
+        while i < n:
+            li: int = i
+            if self.length == 1:
+                li = 0
+            ri: int = i
+            if other.length == 1:
+                ri = 0
+            if self.nulls[li] or other.nulls[ri]:
+                nulls.append(True)
+                if result_float:
+                    floats.append(0.0)
+                else:
+                    ints.append(0)
+            else:
+                nulls.append(False)
+                if result_float:
+                    av: float = _num_at(self, li)
+                    bv: float = _num_at(other, ri)
+                    if op == "add":
+                        floats.append(av + bv)
+                    elif op == "sub":
+                        floats.append(av - bv)
+                    elif op == "mul":
+                        floats.append(av * bv)
+                    else:
+                        floats.append(av / bv)
+                else:
+                    ai: int = self.ints[li]
+                    bi: int = other.ints[ri]
+                    if op == "add":
+                        ints.append(ai + bi)
+                    elif op == "sub":
+                        ints.append(ai - bi)
+                    else:
+                        ints.append(ai * bi)
+            i += 1
+        if result_float:
+            return Series(self.name, "f64", [], floats, [], [], nulls, n)
+        return Series(self.name, "i64", ints, [], [], [], nulls, n)
+
+    def add(self, other: Series) -> Series:
+        return self._binary(other, "add")
+
+    def sub(self, other: Series) -> Series:
+        return self._binary(other, "sub")
+
+    def mul(self, other: Series) -> Series:
+        return self._binary(other, "mul")
+
+    def truediv(self, other: Series) -> Series:
+        return self._binary(other, "truediv")
+
+    def __add__(self, other: Series) -> Series:
+        return self._binary(other, "add")
+
+    def __sub__(self, other: Series) -> Series:
+        return self._binary(other, "sub")
+
+    def __mul__(self, other: Series) -> Series:
+        return self._binary(other, "mul")
+
+    def __truediv__(self, other: Series) -> Series:
+        return self._binary(other, "truediv")
+
+    # ---- scalar broadcast (float scalar; result is always f64) ------------
+    def _scalar(self, x: float, op: str) -> Series:
+        if not _is_numeric_dtype(self.dtype):
+            raise TypeError("kodiak: scalar op '" + op + "' not supported on a '" + self.dtype + "' column ('" + self.name + "')")
+        floats: list[float] = []
+        nulls: list[bool] = []
+        i: int = 0
+        while i < self.length:
+            if self.nulls[i]:
+                nulls.append(True)
+                floats.append(0.0)
+            else:
+                nulls.append(False)
+                av: float = _num_at(self, i)
+                if op == "add":
+                    floats.append(av + x)
+                elif op == "sub":
+                    floats.append(av - x)
+                elif op == "mul":
+                    floats.append(av * x)
+                else:
+                    floats.append(av / x)
+            i += 1
+        return Series(self.name, "f64", [], floats, [], [], nulls, self.length)
+
+    def add_scalar(self, x: float) -> Series:
+        return self._scalar(x, "add")
+
+    def sub_scalar(self, x: float) -> Series:
+        return self._scalar(x, "sub")
+
+    def mul_scalar(self, x: float) -> Series:
+        return self._scalar(x, "mul")
+
+    def div_scalar(self, x: float) -> Series:
+        return self._scalar(x, "truediv")
+
+    # ---- comparisons -> bool mask Series (methods, not operators) ---------
+    def _cmp_scalar(self, x: float, op: str) -> Series:
+        if not _is_numeric_dtype(self.dtype):
+            raise TypeError("kodiak: numeric comparison '" + op + "' not supported on a '" + self.dtype + "' column ('" + self.name + "'); use eq_str/ne_str for str columns")
+        out: list[bool] = []
+        i: int = 0
+        while i < self.length:
+            if self.nulls[i]:
+                out.append(False)
+            else:
+                av: float = _num_at(self, i)
+                out.append(_cmp(av, x, op))
+            i += 1
+        return Series.from_bools(self.name, out)
+
+    def gt(self, x: float) -> Series:
+        return self._cmp_scalar(x, "gt")
+
+    def ge(self, x: float) -> Series:
+        return self._cmp_scalar(x, "ge")
+
+    def lt(self, x: float) -> Series:
+        return self._cmp_scalar(x, "lt")
+
+    def le(self, x: float) -> Series:
+        return self._cmp_scalar(x, "le")
+
+    def eq(self, x: float) -> Series:
+        return self._cmp_scalar(x, "eq")
+
+    def ne(self, x: float) -> Series:
+        return self._cmp_scalar(x, "ne")
+
+    def eq_str(self, v: str) -> Series:
+        if self.dtype != "str":
+            raise TypeError("kodiak: eq_str not supported on a '" + self.dtype + "' column ('" + self.name + "')")
+        out: list[bool] = []
+        i: int = 0
+        while i < self.length:
+            if self.nulls[i]:
+                out.append(False)
+            else:
+                out.append(self.strs[i] == v)
+            i += 1
+        return Series.from_bools(self.name, out)
+
+    def ne_str(self, v: str) -> Series:
+        if self.dtype != "str":
+            raise TypeError("kodiak: ne_str not supported on a '" + self.dtype + "' column ('" + self.name + "')")
+        out: list[bool] = []
+        i: int = 0
+        while i < self.length:
+            if self.nulls[i]:
+                out.append(False)
+            else:
+                out.append(self.strs[i] != v)
+            i += 1
+        return Series.from_bools(self.name, out)
+
+    def _cmp_series(self, other: Series, op: str) -> Series:
+        if not _is_numeric_dtype(self.dtype) or not _is_numeric_dtype(other.dtype):
+            raise TypeError("kodiak: Series comparison '" + op + "' needs two numeric columns")
+        if self.length != other.length:
+            raise ValueError("kodiak: length mismatch in Series comparison '" + op + "': " + str(self.length) + " vs " + str(other.length))
+        out: list[bool] = []
+        i: int = 0
+        while i < self.length:
+            if self.nulls[i] or other.nulls[i]:
+                out.append(False)
+            else:
+                out.append(_cmp(_num_at(self, i), _num_at(other, i), op))
+            i += 1
+        return Series.from_bools(self.name, out)
+
+    def gt_series(self, other: Series) -> Series:
+        return self._cmp_series(other, "gt")
+
+    def ge_series(self, other: Series) -> Series:
+        return self._cmp_series(other, "ge")
+
+    def lt_series(self, other: Series) -> Series:
+        return self._cmp_series(other, "lt")
+
+    def le_series(self, other: Series) -> Series:
+        return self._cmp_series(other, "le")
+
+    def eq_series(self, other: Series) -> Series:
+        return self._cmp_series(other, "eq")
+
+    def ne_series(self, other: Series) -> Series:
+        return self._cmp_series(other, "ne")
+
+    # ---- numeric aggregations (skip nulls) --------------------------------
+    def agg_sum(self) -> float:
+        if not _is_numeric_dtype(self.dtype):
+            raise TypeError("kodiak: sum not supported on a '" + self.dtype + "' column ('" + self.name + "')")
+        total: float = 0.0
+        i: int = 0
+        while i < self.length:
+            if not self.nulls[i]:
+                total += _num_at(self, i)
+            i += 1
+        return total
+
+    def agg_mean(self) -> float:
+        c: int = self.count()
+        if c == 0:
+            return float("nan")
+        return self.agg_sum() / float(c)
+
+    def agg_min(self) -> float:
+        if not _is_numeric_dtype(self.dtype):
+            raise TypeError("kodiak: min not supported on a '" + self.dtype + "' column ('" + self.name + "')")
+        seen: bool = False
+        best: float = 0.0
+        i: int = 0
+        while i < self.length:
+            if not self.nulls[i]:
+                v: float = _num_at(self, i)
+                if not seen or v < best:
+                    best = v
+                    seen = True
+            i += 1
+        if not seen:
+            return float("nan")
+        return best
+
+    def agg_max(self) -> float:
+        if not _is_numeric_dtype(self.dtype):
+            raise TypeError("kodiak: max not supported on a '" + self.dtype + "' column ('" + self.name + "')")
+        seen: bool = False
+        best: float = 0.0
+        i: int = 0
+        while i < self.length:
+            if not self.nulls[i]:
+                v: float = _num_at(self, i)
+                if not seen or v > best:
+                    best = v
+                    seen = True
+            i += 1
+        if not seen:
+            return float("nan")
+        return best
+
+    def agg_std(self) -> float:
+        # sample standard deviation (ddof=1), matching pandas' default.
+        c: int = self.count()
+        if c < 2:
+            return float("nan")
+        m: float = self.agg_mean()
+        acc: float = 0.0
+        i: int = 0
+        while i < self.length:
+            if not self.nulls[i]:
+                d: float = _num_at(self, i) - m
+                acc += d * d
+            i += 1
+        return _sqrt(acc / float(c - 1))
+
+    # ---- deterministic pandas-flavored single-column renderer -------------
+    def __str__(self) -> str:
+        cells: list[str] = self.to_strings()
+        idx_width: int = len(str(self.length - 1))
+        if idx_width < 1:
+            idx_width = 1
+        val_width: int = 0
+        i: int = 0
+        while i < len(cells):
+            if len(cells[i]) > val_width:
+                val_width = len(cells[i])
+            i += 1
+        lines: list[str] = []
+        i = 0
+        while i < len(cells):
+            lines.append(str(i).rjust(idx_width) + "    " + cells[i].rjust(val_width))
+            i += 1
+        lines.append("Name: " + self.name + ", dtype: " + self.dtype)
+        out: str = ""
+        i = 0
+        while i < len(lines):
+            out = out + lines[i]
+            if i < len(lines) - 1:
+                out = out + "\n"
+            i += 1
+        return out
+
+
+# ---- module-level numeric helpers ----------------------------------------
+
+def _cmp(a: float, b: float, op: str) -> bool:
+    if op == "gt":
+        return a > b
+    if op == "ge":
+        return a >= b
+    if op == "lt":
+        return a < b
+    if op == "le":
+        return a <= b
+    if op == "eq":
+        return a == b
+    return a != b
+
+
+def _sqrt(x: float) -> float:
+    # Newton's method (kodiak avoids a lib/math dependency here to stay
+    # self-contained; only used by describe()/agg_std, which are secondary).
+    if x <= 0.0:
+        return 0.0
+    g: float = x
+    i: int = 0
+    while i < 40:
+        g = (g + x / g) * 0.5
+        i += 1
+    return g

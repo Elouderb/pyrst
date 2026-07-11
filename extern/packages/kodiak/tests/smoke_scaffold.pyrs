@@ -1,0 +1,80 @@
+# smoke_scaffold.pyrs — Phase 1 scaffold check for kodiak. Builds a
+# 3-column, mixed-dtype DataFrame (i64/f64/str) via the from_columns
+# constructor, then asserts shape/columns, a column's dtype/length/contents,
+# missing-column KeyError, head/tail row counts + contents, and
+# with_column. Prints PASS/FAIL like the other extern packages' tests;
+# nonzero exit (assert False) on any failure.
+#
+# Build + run (from extern/packages/kodiak/):
+#   PYRST_PATH=/home/ethos/Coding/pyrst/extern/packages \
+#     /home/ethos/Coding/pyrst/target/release/pyrst build tests/smoke_scaffold.pyrs
+#   ./smoke_scaffold
+
+from kodiak.series import Series
+from kodiak.frame import DataFrame
+
+
+def fail(msg: str) -> None:
+    print("FAIL: " + msg)
+    assert False
+
+
+def main() -> None:
+    ints: Series = Series.from_ints("i", [1, 2, 3, 4, 5])
+    floats: Series = Series.from_floats("f", [1.5, 2.5, 3.5, 4.5, 5.5])
+    strs: Series = Series.from_strs("s", ["a", "b", "c", "d", "e"])
+
+    df: DataFrame = DataFrame.from_columns([ints, floats, strs])
+
+    shape: tuple[int, int] = df.shape()
+    if shape[0] != 5:
+        fail("shape rows expected 5, got " + str(shape[0]))
+    if shape[1] != 3:
+        fail("shape cols expected 3, got " + str(shape[1]))
+
+    cols: list[str] = df.columns()
+    if len(cols) != 3 or cols[0] != "i" or cols[1] != "f" or cols[2] != "s":
+        fail("columns() mismatch: " + str(cols))
+
+    got: Series = df["f"]
+    if got.dtype != "f64":
+        fail("df[\"f\"].dtype expected f64, got " + got.dtype)
+    if len(got) != 5:
+        fail("df[\"f\"] length expected 5, got " + str(len(got)))
+    fvals: list[str] = got.to_strings()
+    if fvals[2] != "3.5":
+        fail("df[\"f\"] cell[2] expected '3.5', got " + fvals[2])
+
+    caught: bool = False
+    try:
+        missing: Series = df["nope"]
+        print(missing)
+    except KeyError:
+        caught = True
+    if not caught:
+        fail("df[\"nope\"] missing column did not raise KeyError")
+
+    h: DataFrame = df.head(2)
+    if h.shape()[0] != 2:
+        fail("head(2) row count expected 2, got " + str(h.shape()[0]))
+    hstrs: list[str] = h["i"].to_strings()
+    if hstrs[0] != "1" or hstrs[1] != "2":
+        fail("head(2) content mismatch: " + str(hstrs))
+
+    t: DataFrame = df.tail(2)
+    if t.shape()[0] != 2:
+        fail("tail(2) row count expected 2, got " + str(t.shape()[0]))
+    tstrs: list[str] = t["i"].to_strings()
+    if tstrs[0] != "4" or tstrs[1] != "5":
+        fail("tail(2) content mismatch: " + str(tstrs))
+
+    wc: DataFrame = df.with_column("extra", Series.from_bools("extra", [True, False, True, False, True]))
+    if wc.shape()[1] != 4:
+        fail("with_column expected 4 cols, got " + str(wc.shape()[1]))
+    if wc.columns()[3] != "extra":
+        fail("with_column name mismatch: " + str(wc.columns()))
+    # original frame must be untouched (value semantics)
+    if df.shape()[1] != 3:
+        fail("with_column must not mutate the original frame")
+
+    print("PASS: kodiak scaffold smoke (from_columns/getitem/shape/columns/head/tail/with_column/KeyError)")

@@ -1,0 +1,622 @@
+# frame.pyrs — the DataFrame type for kodiak: order-preserving parallel
+# arrays over Series columns (see series.pyrs for the column representation and
+# the null model; card 974fdff3 comment 608 has the design rationale).
+#
+# CONSTRUCTION — `DataFrame.from_columns(cols: list[Series])` is the PRIMARY
+# constructor. Each column's name comes from the Series' own `.name` field.
+# (GAP: a mixed-dtype dict-of-lists literal is inexpressible — pyrst's
+# dict[K,V] requires one V per dict, no unions. Logged on card 974fdff3.)
+#
+# PHASE 2 (eager core): filter / sort_values / groupby+agg / merge /
+# dropna / fillna / describe / to_csv, all built on the shared row-reorder
+# primitive `Series.take` via the module-level `_gather_frame` helper. Every
+# operation returns a NEW DataFrame (value semantics). Determinism: sorts are
+# a hand-rolled stable merge sort; groupby emits groups in ascending key
+# order. See card 974fdff3 comment 610 for the locked Phase-2 decisions.
+
+from kodiak.series import Series
+from csv import writer
+from os import write_file
+
+
+class DataFrame:
+    names: list[str]
+    cols: list[Series]     # index-aligned with names
+
+    def __init__(self, names: list[str], cols: list[Series]) -> None:
+        self.names = names
+        self.cols = cols
+
+    @staticmethod
+    def from_columns(cols: list[Series]) -> DataFrame:
+        names: list[str] = []
+        i: int = 0
+        while i < len(cols):
+            names.append(cols[i].name)
+            i += 1
+        return DataFrame(names, cols)
+
+    # ---- column access: df["col"] -> Series --------------------------
+    def __getitem__(self, key: str) -> Series:
+        # GAP (df[mask]): __getitem__ takes exactly ONE key type. A str key
+        # selects a column; a bool-Series key (row filter) is a DIFFERENT
+        # type and pyrst has no union key types, so `df[mask]` is
+        # inexpressible. Row filtering is `df.filter(mask)` (documented
+        # divergence). Logged on card 974fdff3.
+        if key not in self.names:
+            raise KeyError(repr(key))
+        idx: int = self.names.index(key)
+        return self.cols[idx]
+
+    def has_column(self, key: str) -> bool:
+        return key in self.names
+
+    def _row_count(self) -> int:
+        if len(self.cols) == 0:
+            return 0
+        return self.cols[0].length
+
+    def shape(self) -> tuple[int, int]:
+        return (self._row_count(), len(self.cols))
+
+    def columns(self) -> list[str]:
+        return self.names
+
+    def head(self, n: int) -> DataFrame:
+        return _slice_frame(self, 0, n)
+
+    def tail(self, n: int) -> DataFrame:
+        rows: int = self._row_count()
+        take: int = n
+        if take > rows:
+            take = rows
+        if take < 0:
+            take = 0
+        return _slice_frame(self, rows - take, rows)
+
+    def with_column(self, name: str, s: Series) -> DataFrame:
+        # Value semantics: returns a NEW frame; self is untouched. Overwrites
+        # an existing same-named column in place; otherwise appends.
+        new_names: list[str] = []
+        new_cols: list[Series] = []
+        i: int = 0
+        while i < len(self.names):
+            new_names.append(self.names[i])
+            new_cols.append(self.cols[i])
+            i += 1
+        if name in self.names:
+            idx: int = self.names.index(name)
+            new_cols[idx] = s.rename(name)
+        else:
+            new_names.append(name)
+            new_cols.append(s.rename(name))
+        return DataFrame(new_names, new_cols)
+
+    # ---- row filtering by a bool mask Series -------------------------
+    def filter(self, mask: Series) -> DataFrame:
+        if mask.dtype != "bool":
+            raise TypeError("kodiak: filter() expects a bool mask Series, got dtype '" + mask.dtype + "'")
+        if mask.length != self._row_count():
+            raise ValueError("kodiak: filter() mask length " + str(mask.length) + " != row count " + str(self._row_count()))
+        idx: list[int] = []
+        i: int = 0
+        while i < mask.length:
+            if not mask.nulls[i] and mask.bools[i]:
+                idx.append(i)
+            i += 1
+        return _gather_frame(self, idx)
+
+    # ---- stable sort by a single column ------------------------------
+    def sort_values(self, by: str, ascending: bool = True) -> DataFrame:
+        key: Series = self[by]
+        perm: list[int] = _argsort(key, ascending)
+        return _gather_frame(self, perm)
+
+    # ---- null handling -----------------------------------------------
+    def dropna(self) -> DataFrame:
+        rows: int = self._row_count()
+        idx: list[int] = []
+        r: int = 0
+        while r < rows:
+            keep: bool = True
+            c: int = 0
+            while c < len(self.cols):
+                if self.cols[c].nulls[r]:
+                    keep = False
+                c += 1
+            if keep:
+                idx.append(r)
+            r += 1
+        return _gather_frame(self, idx)
+
+    def fillna_float(self, x: float) -> DataFrame:
+        # fills nulls in every NUMERIC column with x; non-numeric columns are
+        # returned unchanged. (fillna is split by fill-value type because
+        # pyrst has no union parameter — see fillna_str; documented divergence.)
+        new_cols: list[Series] = []
+        c: int = 0
+        while c < len(self.cols):
+            col: Series = self.cols[c]
+            if col.is_numeric():
+                new_cols.append(col.fillna_float(x))
+            else:
+                new_cols.append(col)
+            c += 1
+        return DataFrame(self.names, new_cols)
+
+    def fillna_str(self, v: str) -> DataFrame:
+        new_cols: list[Series] = []
+        c: int = 0
+        while c < len(self.cols):
+            col: Series = self.cols[c]
+            if col.dtype == "str":
+                new_cols.append(col.fillna_str(v))
+            else:
+                new_cols.append(col)
+            c += 1
+        return DataFrame(self.names, new_cols)
+
+    # ---- groupby -----------------------------------------------------
+    def groupby(self, key: str) -> GroupBy:
+        if key not in self.names:
+            raise KeyError(repr(key))
+        return GroupBy(self, key)
+
+    # ---- join --------------------------------------------------------
+    def merge(self, other: DataFrame, on: str, how: str = "inner") -> DataFrame:
+        if how not in ["inner", "left"]:
+            raise ValueError("kodiak: merge how must be 'inner' or 'left', got " + repr(how))
+        if on not in self.names:
+            raise KeyError(repr(on))
+        if on not in other.names:
+            raise KeyError(repr(on))
+        lkey: Series = self[on]
+        rkey: Series = other[on]
+        left_idx: list[int] = []
+        right_idx: list[int] = []
+        i: int = 0
+        while i < lkey.length:
+            matched: bool = False
+            j: int = 0
+            while j < rkey.length:
+                if _key_eq(lkey, i, rkey, j):
+                    left_idx.append(i)
+                    right_idx.append(j)
+                    matched = True
+                j += 1
+            if how == "left" and not matched:
+                left_idx.append(i)
+                right_idx.append(-1)
+            i += 1
+
+        out_names: list[str] = []
+        out_cols: list[Series] = []
+        # all left columns (left_idx are always real rows)
+        c: int = 0
+        while c < len(self.cols):
+            out_names.append(self.names[c])
+            out_cols.append(self.cols[c].take(left_idx))
+            c += 1
+        # right columns except the join key (right_idx may hold -1 -> null)
+        c = 0
+        while c < len(other.cols):
+            rname: str = other.names[c]
+            if rname != on:
+                use_name: str = rname
+                if rname in self.names:
+                    use_name = rname + "_right"
+                out_names.append(use_name)
+                out_cols.append(other.cols[c].take_null(right_idx).rename(use_name))
+            c += 1
+        return DataFrame(out_names, out_cols)
+
+    # ---- describe (count/mean/std/min/max per numeric column) --------
+    def describe(self) -> DataFrame:
+        stat_names: list[str] = ["count", "mean", "std", "min", "max"]
+        out_names: list[str] = ["statistic"]
+        out_cols: list[Series] = [Series.from_strs("statistic", stat_names)]
+        c: int = 0
+        while c < len(self.cols):
+            col: Series = self.cols[c]
+            if col.is_numeric():
+                raw: list[float] = [float(col.count()), col.agg_mean(), col.agg_std(), col.agg_min(), col.agg_max()]
+                vals: list[float] = []
+                nulls: list[bool] = []
+                s: int = 0
+                while s < len(raw):
+                    v: float = raw[s]
+                    if v != v:             # NaN -> null cell
+                        vals.append(0.0)
+                        nulls.append(True)
+                    else:
+                        vals.append(v)
+                        nulls.append(False)
+                    s += 1
+                out_names.append(col.name)
+                out_cols.append(Series.from_floats_n(col.name, vals, nulls))
+            c += 1
+        return DataFrame(out_names, out_cols)
+
+    # ---- CSV output --------------------------------------------------
+    def to_csv(self, path: str) -> None:
+        # null cells render as an empty field, so a written-then-read frame
+        # round-trips (read_csv infers empty -> null).
+        w = writer()
+        w.writerow(self.names)
+        fields: list[list[str]] = []
+        c: int = 0
+        while c < len(self.cols):
+            fields.append(self.cols[c].to_field_strings())
+            c += 1
+        rows: int = self._row_count()
+        r: int = 0
+        while r < rows:
+            row: list[str] = []
+            c = 0
+            while c < len(fields):
+                row.append(fields[c][r])
+                c += 1
+            w.writerow(row)
+            r += 1
+        write_file(path, w.getvalue())
+
+    # ---- deterministic aligned table renderer (pandas-flavored) ------
+    def __str__(self) -> str:
+        return _render_table(self)
+
+
+# ---- GroupBy -------------------------------------------------------------
+# `df.groupby("k")` -> GroupBy; `.sum()/.mean()/.count()/.min()/.max()` each
+# return a DataFrame: the sorted-unique group-key column followed by one
+# aggregated column per value column. Groups are emitted in ascending key
+# order (deterministic); a null key forms no group (pandas' dropna=True
+# default). sum/min/max preserve the source column's dtype; mean/std are f64;
+# count is i64. Numeric aggregations skip nulls.
+
+class GroupBy:
+    df: DataFrame
+    key: str
+
+    def __init__(self, df: DataFrame, key: str) -> None:
+        self.df = df
+        self.key = key
+
+    def _numeric_agg(self, how: str) -> DataFrame:
+        key_col: Series = self.df[self.key]
+        grp = _group(key_col)
+        buckets: list[list[int]] = grp[0]
+        firsts: list[int] = grp[1]
+        out_names: list[str] = [self.key]
+        out_cols: list[Series] = [key_col.take(firsts)]
+        c: int = 0
+        while c < len(self.df.cols):
+            col: Series = self.df.cols[c]
+            if col.name != self.key and col.is_numeric():
+                out_names.append(col.name)
+                out_cols.append(_agg_numeric_col(col, buckets, how))
+            c += 1
+        return DataFrame(out_names, out_cols)
+
+    def sum(self) -> DataFrame:
+        return self._numeric_agg("sum")
+
+    def mean(self) -> DataFrame:
+        return self._numeric_agg("mean")
+
+    def min(self) -> DataFrame:
+        return self._numeric_agg("min")
+
+    def max(self) -> DataFrame:
+        return self._numeric_agg("max")
+
+    def std(self) -> DataFrame:
+        return self._numeric_agg("std")
+
+    def count(self) -> DataFrame:
+        # counts non-null rows per group for EVERY value column (all dtypes).
+        key_col: Series = self.df[self.key]
+        grp = _group(key_col)
+        buckets: list[list[int]] = grp[0]
+        firsts: list[int] = grp[1]
+        out_names: list[str] = [self.key]
+        out_cols: list[Series] = [key_col.take(firsts)]
+        c: int = 0
+        while c < len(self.df.cols):
+            col: Series = self.df.cols[c]
+            if col.name != self.key:
+                out_names.append(col.name)
+                out_cols.append(_count_col(col, buckets))
+            c += 1
+        return DataFrame(out_names, out_cols)
+
+
+# ---- module-private helpers ----------------------------------------------
+
+def _slice_frame(df: DataFrame, start: int, stop: int) -> DataFrame:
+    new_cols: list[Series] = []
+    i: int = 0
+    while i < len(df.cols):
+        new_cols.append(df.cols[i].row_slice(start, stop))
+        i += 1
+    return DataFrame(df.names, new_cols)
+
+
+def _gather_frame(df: DataFrame, idx: list[int]) -> DataFrame:
+    new_cols: list[Series] = []
+    i: int = 0
+    while i < len(df.cols):
+        new_cols.append(df.cols[i].take(idx))
+        i += 1
+    return DataFrame(df.names, new_cols)
+
+
+def _key_eq(a: Series, i: int, b: Series, j: int) -> bool:
+    if a.nulls[i] or b.nulls[j]:
+        return False               # a null key never matches anything
+    if a.dtype == "i64":
+        return a.ints[i] == b.ints[j]
+    if a.dtype == "f64":
+        return a.floats[i] == b.floats[j]
+    if a.dtype == "str":
+        return a.strs[i] == b.strs[j]
+    return a.bools[i] == b.bools[j]
+
+
+def _key_lt(key: Series, a: int, b: int) -> bool:
+    # value-order (ascending) of two NON-null rows.
+    if key.dtype == "i64":
+        return key.ints[a] < key.ints[b]
+    if key.dtype == "f64":
+        return key.floats[a] < key.floats[b]
+    if key.dtype == "str":
+        return key.strs[a] < key.strs[b]
+    ab: int = 0
+    if key.bools[a]:
+        ab = 1
+    bb: int = 0
+    if key.bools[b]:
+        bb = 1
+    return ab < bb
+
+
+def _key_before(key: Series, a: int, b: int, ascending: bool) -> bool:
+    # True if row a strictly precedes row b in sort order (nulls always last).
+    an: bool = key.nulls[a]
+    bn: bool = key.nulls[b]
+    if an and bn:
+        return False
+    if an:
+        return False
+    if bn:
+        return True
+    if ascending:
+        return _key_lt(key, a, b)
+    return _key_lt(key, b, a)
+
+
+def _merge_idx(left: list[int], right: list[int], key: Series, ascending: bool) -> list[int]:
+    out: list[int] = []
+    i: int = 0
+    j: int = 0
+    while i < len(left) and j < len(right):
+        if _key_before(key, right[j], left[i], ascending):
+            out.append(right[j])
+            j += 1
+        else:
+            out.append(left[i])          # stable: take left when equal
+            i += 1
+    while i < len(left):
+        out.append(left[i])
+        i += 1
+    while j < len(right):
+        out.append(right[j])
+        j += 1
+    return out
+
+
+def _msort(idx: list[int], key: Series, ascending: bool) -> list[int]:
+    if len(idx) <= 1:
+        return idx
+    mid: int = len(idx) // 2
+    left: list[int] = _msort(idx[0:mid], key, ascending)
+    right: list[int] = _msort(idx[mid:len(idx)], key, ascending)
+    return _merge_idx(left, right, key, ascending)
+
+
+def _argsort(key: Series, ascending: bool) -> list[int]:
+    idx: list[int] = []
+    i: int = 0
+    while i < key.length:
+        idx.append(i)
+        i += 1
+    return _msort(idx, key, ascending)
+
+
+def _group(key: Series) -> tuple[list[list[int]], list[int]]:
+    # Returns (buckets, firsts): buckets[g] is the list of original row
+    # indices in group g (ascending key order, stable within a group);
+    # firsts[g] is the first row index of group g (to pull the key value).
+    # Rows with a null key are dropped (pandas groupby dropna=True default).
+    perm: list[int] = _argsort(key, True)
+    buckets: list[list[int]] = []
+    firsts: list[int] = []
+    p: int = 0
+    while p < len(perm):
+        r: int = perm[p]
+        if key.nulls[r]:
+            p += 1
+        else:
+            cur: list[int] = [r]
+            first: int = r
+            q: int = p + 1
+            while q < len(perm) and not key.nulls[perm[q]] and _key_eq(key, first, key, perm[q]):
+                cur.append(perm[q])
+                q += 1
+            buckets.append(cur)
+            firsts.append(first)
+            p = q
+    return (buckets, firsts)
+
+
+def _agg_numeric_col(col: Series, buckets: list[list[int]], how: str) -> Series:
+    n: int = len(buckets)
+    float_result: bool = how == "mean" or how == "std" or col.dtype == "f64"
+    if float_result:
+        floats: list[float] = []
+        nulls: list[bool] = []
+        g: int = 0
+        while g < n:
+            sub: Series = col.take(buckets[g])
+            v: float = _apply_agg(sub, how)
+            if v != v:
+                floats.append(0.0)
+                nulls.append(True)
+            else:
+                floats.append(v)
+                nulls.append(False)
+            g += 1
+        return Series.from_floats_n(col.name, floats, nulls)
+    ints: list[int] = []
+    inulls: list[bool] = []
+    g = 0
+    while g < n:
+        sub2: Series = col.take(buckets[g])
+        v2: float = _apply_agg(sub2, how)
+        if v2 != v2:
+            ints.append(0)
+            inulls.append(True)
+        else:
+            ints.append(int(v2))
+            inulls.append(False)
+        g += 1
+    return Series.from_ints_n(col.name, ints, inulls)
+
+
+def _apply_agg(sub: Series, how: str) -> float:
+    if how == "sum":
+        return sub.agg_sum()
+    if how == "mean":
+        return sub.agg_mean()
+    if how == "min":
+        return sub.agg_min()
+    if how == "max":
+        return sub.agg_max()
+    return sub.agg_std()
+
+
+def _count_col(col: Series, buckets: list[list[int]]) -> Series:
+    counts: list[int] = []
+    g: int = 0
+    while g < len(buckets):
+        sub: Series = col.take(buckets[g])
+        counts.append(sub.count())
+        g += 1
+    return Series.from_ints(col.name, counts)
+
+
+# ---- table renderer helpers ----------------------------------------------
+
+def _display_row_indices(rows: int) -> list[int]:
+    idxs: list[int] = []
+    if rows <= 10:
+        i: int = 0
+        while i < rows:
+            idxs.append(i)
+            i += 1
+        return idxs
+    i: int = 0
+    while i < 5:
+        idxs.append(i)
+        i += 1
+    i = rows - 5
+    while i < rows:
+        idxs.append(i)
+        i += 1
+    return idxs
+
+
+def _col_width(header: str, cells: list[str], min_width: int) -> int:
+    w: int = len(header)
+    if min_width > w:
+        w = min_width
+    i: int = 0
+    while i < len(cells):
+        cw: int = len(cells[i])
+        if cw > w:
+            w = cw
+        i += 1
+    return w
+
+
+def _render_table(df: DataFrame) -> str:
+    rows: int = df._row_count()
+    ncols: int = len(df.cols)
+    row_idx: list[int] = _display_row_indices(rows)
+    show_ellipsis: bool = rows > 10
+
+    idx_strs: list[str] = []
+    i: int = 0
+    while i < len(row_idx):
+        idx_strs.append(str(row_idx[i]))
+        i += 1
+    idx_width: int = 0
+    i = 0
+    while i < len(idx_strs):
+        if len(idx_strs[i]) > idx_width:
+            idx_width = len(idx_strs[i])
+        i += 1
+    if show_ellipsis and idx_width < 3:
+        idx_width = 3
+
+    col_cells: list[list[str]] = []
+    col_widths: list[int] = []
+    min_w: int = 0
+    if show_ellipsis:
+        min_w = 3
+    c: int = 0
+    while c < ncols:
+        all_cells: list[str] = df.cols[c].to_strings()
+        cells: list[str] = []
+        i = 0
+        while i < len(row_idx):
+            cells.append(all_cells[row_idx[i]])
+            i += 1
+        col_cells.append(cells)
+        col_widths.append(_col_width(df.names[c], cells, min_w))
+        c += 1
+
+    lines: list[str] = []
+
+    header: str = " " * idx_width
+    c = 0
+    while c < ncols:
+        header = header + "  " + df.names[c].rjust(col_widths[c])
+        c += 1
+    lines.append(header)
+
+    pos: int = 0
+    line: str = ""
+    while pos < len(row_idx):
+        if show_ellipsis and pos == 5:
+            line = "...".rjust(idx_width)
+            c = 0
+            while c < ncols:
+                line = line + "  " + "...".rjust(col_widths[c])
+                c += 1
+            lines.append(line)
+        line = idx_strs[pos].rjust(idx_width)
+        c = 0
+        while c < ncols:
+            line = line + "  " + col_cells[c][pos].rjust(col_widths[c])
+            c += 1
+        lines.append(line)
+        pos += 1
+
+    out: str = ""
+    i = 0
+    while i < len(lines):
+        out = out + lines[i]
+        if i < len(lines) - 1:
+            out = out + "\n"
+        i += 1
+    return out

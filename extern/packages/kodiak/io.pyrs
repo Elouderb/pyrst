@@ -1,0 +1,167 @@
+# io.pyrs — CSV input for kodiak. `read_csv(path) -> DataFrame` (a free
+# function; DataFrame.to_csv(path) is the write side, a method on the frame).
+# Uses lib/csv for RFC-4180 parsing and lib/os for file access — imported by
+# bare module name exactly like dateutil imports datetime.
+#
+# DTYPE INFERENCE (per column, from the non-empty cells): all-int -> i64;
+# else all-float-or-int -> f64; else all-true/false -> bool; else str. An
+# empty field is a NULL in every dtype (so a to_csv/read_csv round-trip
+# reproduces the frame — nulls are written as empty fields). A wholly-empty
+# column defaults to str (all-null).
+
+from kodiak.series import Series
+from kodiak.frame import DataFrame
+from csv import reader
+from os import read_file
+
+
+def read_csv(path: str) -> DataFrame:
+    text: str = read_file(path)
+    rows: list[list[str]] = reader(text)
+    if len(rows) == 0:
+        return DataFrame([], [])
+    header: list[str] = rows[0]
+    ncol: int = len(header)
+
+    cols: list[Series] = []
+    c: int = 0
+    while c < ncol:
+        raw: list[str] = []
+        r: int = 1
+        while r < len(rows):
+            row: list[str] = rows[r]
+            if c < len(row):
+                raw.append(row[c])
+            else:
+                raw.append("")
+            r += 1
+        cols.append(_infer_column(header[c], raw))
+        c += 1
+    return DataFrame(header, cols)
+
+
+def _infer_column(name: str, raw: list[str]) -> Series:
+    all_int: bool = True
+    all_float: bool = True
+    all_bool: bool = True
+    any_value: bool = False
+    i: int = 0
+    while i < len(raw):
+        cell: str = raw[i]
+        if cell != "":
+            any_value = True
+            if not _is_int(cell):
+                all_int = False
+            if not _is_float(cell):
+                all_float = False
+            if not _is_bool_token(cell):
+                all_bool = False
+        i += 1
+
+    nulls: list[bool] = []
+    i = 0
+    while i < len(raw):
+        nulls.append(raw[i] == "")
+        i += 1
+
+    if any_value and all_int:
+        ints: list[int] = []
+        i = 0
+        while i < len(raw):
+            if raw[i] == "":
+                ints.append(0)
+            else:
+                ints.append(int(raw[i]))
+            i += 1
+        return Series.from_ints_n(name, ints, nulls)
+    if any_value and all_float:
+        floats: list[float] = []
+        i = 0
+        while i < len(raw):
+            if raw[i] == "":
+                floats.append(0.0)
+            else:
+                floats.append(float(raw[i]))
+            i += 1
+        return Series.from_floats_n(name, floats, nulls)
+    if any_value and all_bool:
+        bools: list[bool] = []
+        i = 0
+        while i < len(raw):
+            if raw[i] == "":
+                bools.append(False)
+            else:
+                bools.append(_parse_bool(raw[i]))
+            i += 1
+        return Series.from_bools_n(name, bools, nulls)
+    # str column (or all-empty column): empty cell -> null.
+    strs: list[str] = []
+    i = 0
+    while i < len(raw):
+        strs.append(raw[i])
+        i += 1
+    return Series.from_strs_n(name, strs, nulls)
+
+
+# ---- token classifiers (no exceptions: validate before int()/float()) -----
+
+def _is_digit(ch: str) -> bool:
+    return ch >= "0" and ch <= "9"
+
+
+def _is_int(s: str) -> bool:
+    n: int = len(s)
+    if n == 0:
+        return False
+    start: int = 0
+    if s[0] == "-" or s[0] == "+":
+        start = 1
+    if start >= n:
+        return False
+    i: int = start
+    while i < n:
+        if not _is_digit(s[i]):
+            return False
+        i += 1
+    return True
+
+
+def _is_float(s: str) -> bool:
+    # accepts optional sign, digits with at most one '.', and an optional
+    # exponent (e/E with optional sign and digits). Requires >= 1 digit.
+    n: int = len(s)
+    if n == 0:
+        return False
+    i: int = 0
+    if s[0] == "-" or s[0] == "+":
+        i = 1
+    seen_digit: bool = False
+    seen_dot: bool = False
+    seen_exp: bool = False
+    while i < n:
+        ch: str = s[i]
+        if _is_digit(ch):
+            seen_digit = True
+        elif ch == ".":
+            if seen_dot or seen_exp:
+                return False
+            seen_dot = True
+        elif ch == "e" or ch == "E":
+            if seen_exp or not seen_digit:
+                return False
+            seen_exp = True
+            seen_digit = False           # exponent needs its own digits
+            if i + 1 < n and (s[i + 1] == "-" or s[i + 1] == "+"):
+                i += 1
+        else:
+            return False
+        i += 1
+    return seen_digit
+
+
+def _is_bool_token(s: str) -> bool:
+    return s in ["true", "True", "TRUE", "false", "False", "FALSE"]
+
+
+def _parse_bool(s: str) -> bool:
+    return s in ["true", "True", "TRUE"]

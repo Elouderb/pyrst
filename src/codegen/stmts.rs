@@ -760,6 +760,27 @@ impl<'a> Codegen<'a> {
                         Some(Ty::Option(inner)) => Some((var, is_not_none, (**inner).clone())),
                         _ => None,
                     });
+                // (card 65769edf) THEN-branch narrowings for an `and`-chain of
+                // `is not None` guards (a single guard is the one-element case).
+                // EACH Optional conjunct is unwrapped in the then block; `is None`
+                // and non-guard/`or` conjuncts emit nothing. Mirrors typeck
+                // flow.rs's `and_conjunct_narrowings` then-branch EXACTLY (same
+                // filter to `is not None`, same dedup), so the unwrapped set is
+                // identical to what the checker narrowed. `narrowed` (single guard)
+                // still drives ELSE + early-return below, and is None for any
+                // compound condition — so an and-chain never narrows its else.
+                let then_narrows: Vec<(String, Ty)> = {
+                    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+                    and_conjunct_narrowings(cond)
+                        .into_iter()
+                        .filter(|(_, is_not_none)| *is_not_none)
+                        .filter(|(var, _)| seen.insert(var.clone()))
+                        .filter_map(|(var, _)| match self.locals.get(var.as_str()) {
+                            Some(Ty::Option(inner)) => Some((var, (**inner).clone())),
+                            _ => None,
+                        })
+                        .collect()
+                };
                 let c = self.emit_truthy(cond)?;
                 self.line(&format!("if {} {{", c));
                 self.indent += 1;
@@ -769,25 +790,26 @@ impl<'a> Codegen<'a> {
                 // whole `if`. Per-branch (not per-`if`) so a `then` shadow also does
                 // not leak into an `elif`/`else`.
                 let __then_scope = self.scope_enter();
-                // THEN branch is the non-None case for `x is not None`. Emit the
-                // unwrap and retype the local so type-dispatched emission inside
-                // the block (e.g. `str(x)`) sees the inner type; restore after.
-                let then_narrow = narrowed.as_ref().filter(|(_, is_not_none, _)| *is_not_none);
-                let then_saved = then_narrow.map(|(var, _, inner)| {
-                    // (EPIC-6) `var` names an existing Optional local; both the new
-                    // shadow binding and the `.unwrap()` read escape identically.
-                    // (W1.5, card 71cbd940) `.clone().unwrap()` — a BORROWING
-                    // unwrap: the bare `.unwrap()` MOVED the Option, which is
-                    // E0382 when the narrowing guard sits inside a loop (the
-                    // accumulate2 shape: `if f is None: .. else: f(acc, ..)`
-                    // re-entered per iteration). pyrst locals are all Clone.
-                    let var_e = escape_ident(var);
-                    self.line(&format!("let {} = {}.clone().unwrap();", var_e, var_e));
-                    let prev = self.locals.insert(var.clone(), inner.clone());
-                    (var.clone(), prev)
-                });
+                // THEN branch is the non-None case for every `is not None`
+                // conjunct. Emit a borrowing-unwrap for EACH and retype the local so
+                // type-dispatched emission inside the block (e.g. `str(x)`) sees the
+                // inner type; restore each after.
+                // (W1.5, card 71cbd940) `.clone().unwrap()` — a BORROWING unwrap:
+                // a bare `.unwrap()` MOVES the Option, which is E0382 when the
+                // narrowing guard sits inside a loop (the accumulate2 shape:
+                // `if f is None: .. else: f(acc, ..)` re-entered per iteration).
+                // pyrst locals are all Clone. (EPIC-6) `var` names an existing
+                // Optional local; the new shadow binding and the read escape alike.
+                let then_saved: Vec<(String, Option<Ty>)> = then_narrows.iter()
+                    .map(|(var, inner)| {
+                        let var_e = escape_ident(var);
+                        self.line(&format!("let {} = {}.clone().unwrap();", var_e, var_e));
+                        let prev = self.locals.insert(var.clone(), inner.clone());
+                        (var.clone(), prev)
+                    })
+                    .collect();
                 for s in then { self.emit_stmt(s)?; }
-                if let Some((var, prev)) = then_saved {
+                for (var, prev) in then_saved.into_iter().rev() {
                     match prev { Some(t) => { self.locals.insert(var, t); } None => { self.locals.remove(var.as_str()); } }
                 }
                 self.scope_exit(__then_scope);

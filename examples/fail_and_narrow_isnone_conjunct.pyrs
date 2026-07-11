@@ -1,0 +1,16 @@
+# SOUNDNESS NEGATIVE (card 65769edf): an `is None` conjunct in an `and`-chain
+# does NOT grant a non-None payload. In the then-branch of
+# `a is not None and b is None:`, `b` IS None — it has no inner value to expose,
+# so it stays Optional[int] (exactly as the single `if b is None:` then-branch
+# leaves it). Using `b` as a bare int (`a + b`) must therefore be rejected at
+# typeck. `a` (the is-not-None conjunct) does narrow — this file isolates the
+# `b` misuse so an unsound regression that narrowed `is None` conjuncts to a
+# usable payload would be caught.
+def f(a: Optional[int], b: Optional[int]) -> int:
+    if a is not None and b is None:
+        return a + b
+    return 0
+
+
+def main() -> None:
+    print(f(1, None))

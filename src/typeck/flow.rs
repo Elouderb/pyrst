@@ -31,6 +31,41 @@ pub(crate) fn extract_none_guard(cond: &Expr) -> Option<(String, bool)> {
     None
 }
 
+/// (card 65769edf) Collect the None-guards that hold in the THEN branch of a
+/// (possibly compound) condition. A single `x is None` / `x is not None` yields
+/// one entry `(name, is_not_none)`; an `and`-conjunction yields one entry PER
+/// conjunct that is such a guard — recursion descends only through `BinOp::And`
+/// nodes (any nesting/association, so `a and b and c` gives all three regardless
+/// of how the parser grouped it), delegating every non-`And` sub-expression to
+/// `extract_none_guard`. The `and` short-circuit guarantees every conjunct holds
+/// in the body, so narrowing all of them in the THEN branch is SOUND.
+///
+/// A non-guard conjunct (`n > 0`) contributes nothing (the primitive returns
+/// None). Crucially, `or`/`not`/any other operator is NEVER descended into — its
+/// whole sub-expression is offered to `extract_none_guard` as one atom, which
+/// rejects it — so an `or`-chain (or a top-level `or`) yields the EMPTY list and
+/// therefore no THEN narrowing. That is correct: `A or B` being true does not
+/// imply any specific conjunct holds. The ELSE branch and the persistent
+/// early-return negative-narrow deliberately do NOT use this collector; they stay
+/// on the single-conjunct `extract_none_guard`, which is None for any compound
+/// (`and`/`or`) condition — so a compound condition NEVER narrows its else branch
+/// (`not(A and B)` = `not A or not B` identifies no single variable). Mirrors
+/// codegen's `and_conjunct_narrowings` so the two layers agree on which guards
+/// narrow the then branch.
+pub(crate) fn and_conjunct_narrowings(cond: &Expr) -> Vec<(String, bool)> {
+    fn collect(cond: &Expr, out: &mut Vec<(String, bool)>) {
+        if let Expr::BinOp { op: BinOp::And, lhs, rhs, .. } = cond {
+            collect(lhs, out);
+            collect(rhs, out);
+        } else if let Some(g) = extract_none_guard(cond) {
+            out.push(g);
+        }
+    }
+    let mut out = Vec::new();
+    collect(cond, &mut out);
+    out
+}
+
 /// Unify the two branch types of a conditional expression. Returns the more
 /// concrete type when the branches are compatible (an `Unknown`, or a
 /// collection with `Unknown` elements, absorbs the concrete side), or `None`
@@ -3276,17 +3311,38 @@ pub(crate) fn check_stmt(s: &Stmt, env: &mut FuncEnv) -> Result<()> {
                     Some(Ty::Option(inner)) => Some((name, is_not_none, (**inner).clone())),
                     _ => None,
                 });
-            // THEN branch: narrowed iff the guard is `is not None`.
+            // (card 65769edf) THEN-branch narrowings. For a single guard this is
+            // exactly the old behavior; for an `and`-chain it is EACH `is not None`
+            // conjunct whose LHS is a local `Option<T>`, narrowed to its non-None
+            // payload `T` — the `and` short-circuit guarantees every conjunct holds
+            // in the body. `is None` conjuncts contribute nothing here (they leave
+            // the local Optional, exactly as the single `is None` then-branch does),
+            // and non-guard/`or` conjuncts are ignored by `and_conjunct_narrowings`.
+            // Deduped by name so a repeated conjunct restores to the original type.
+            let then_narrows: Vec<(String, Ty)> = {
+                let mut seen: HashSet<String> = HashSet::new();
+                and_conjunct_narrowings(cond)
+                    .into_iter()
+                    .filter(|(_, is_not_none)| *is_not_none)
+                    .filter(|(name, _)| seen.insert(name.clone()))
+                    .filter_map(|(name, _)| match env.locals.get(name.as_str()) {
+                        Some(Ty::Option(inner)) => Some((name, (**inner).clone())),
+                        _ => None,
+                    })
+                    .collect()
+            };
+            // THEN branch: narrow every collected conjunct; restore each afterward.
             {
-                let restore = guard.as_ref().filter(|(_, is_not_none, _)| *is_not_none)
-                    .map(|(name, _, inner)| {
+                let restores: Vec<(String, Option<Ty>)> = then_narrows.iter()
+                    .map(|(name, inner)| {
                         let prev = env.locals.insert(name.clone(), inner.clone());
                         (name.clone(), prev)
-                    });
+                    })
+                    .collect();
                 env.moved = moved_pre.clone();
                 check_body(then, env)?;
                 moved_paths.push(env.moved.clone());
-                if let Some((name, prev)) = restore {
+                for (name, prev) in restores.into_iter().rev() {
                     match prev { Some(t) => { env.locals.insert(name, t); } None => { env.locals.remove(name.as_str()); } }
                 }
             }

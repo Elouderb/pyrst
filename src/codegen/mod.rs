@@ -526,6 +526,31 @@ fn extract_narrowing(cond: &Expr) -> Option<(String, bool)> {
     None
 }
 
+/// (card 65769edf) Codegen mirror of typeck flow.rs's `and_conjunct_narrowings`.
+/// Collects the None-guards that hold in the THEN branch of a (possibly compound)
+/// condition: recursion descends only through `BinOp::And` (any nesting), and
+/// every non-`And` sub-expression is delegated to `extract_narrowing`. An
+/// `and`-chain yields one entry per `is not None` / `is None` conjunct; a
+/// non-guard conjunct or an `or`-chain yields nothing (so an `or` condition
+/// narrows nothing). Kept byte-consistent with typeck: the `Stmt::If` codegen
+/// narrows only the `is not None` conjuncts (emitting one borrowing-unwrap each),
+/// while the ELSE / early-return paths stay on the single-guard `extract_narrowing`
+/// — which is None for any compound condition — so a compound condition never
+/// narrows its else branch, exactly as typeck decided.
+fn and_conjunct_narrowings(cond: &Expr) -> Vec<(String, bool)> {
+    fn collect(cond: &Expr, out: &mut Vec<(String, bool)>) {
+        if let Expr::BinOp { op: BinOp::And, lhs, rhs, .. } = cond {
+            collect(lhs, out);
+            collect(rhs, out);
+        } else if let Some(g) = extract_narrowing(cond) {
+            out.push(g);
+        }
+    }
+    let mut out = Vec::new();
+    collect(cond, &mut out);
+    out
+}
+
 /// Attempt to evaluate constant expressions at compile time.
 /// Returns the folded expression, or None if constant folding isn't possible.
 fn try_fold_const(expr: &Expr) -> Option<Expr> {

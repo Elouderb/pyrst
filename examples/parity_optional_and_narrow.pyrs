@@ -1,0 +1,84 @@
+# DUAL-RUN parity (card 65769edf): COMPOUND Optional narrowing — an `and`-chain
+# of `is not None` guards narrows EVERY conjunct in the then-branch (the tzdata
+# dogfood finding). Previously the flow pass only fired on a single `x is not
+# None`, so `if a is not None and b is not None:` narrowed neither and forced a
+# nested `if`. Covered here:
+#   - two Optionals guarded together, BOTH used in the then-branch;
+#   - a 3-way and-chain, all three used;
+#   - a mixed `is not None` / `is None` chain (only the is-not-None var narrows;
+#     the is-None conjunct still guarantees the whole branch is reachable);
+#   - `a is not None and n > 0` — the non-guard comparison conjunct is ignored
+#     for narrowing but is still a real part of the condition;
+#   - nested-if vs compound EQUIVALENCE — `both()` (compound) and `nested()`
+#     (hand-nested) must produce identical output for identical inputs.
+# python3 is the oracle (`from __future__ import annotations` stringizes the
+# pyrst annotations; main() is called explicitly by the harness).
+
+
+def both(a: Optional[int], b: Optional[int]) -> int:
+    if a is not None and b is not None:
+        return a + b
+    return -1
+
+
+def nested(a: Optional[int], b: Optional[int]) -> int:
+    # The hand-nested form the compound guard replaces — same semantics.
+    if a is not None:
+        if b is not None:
+            return a + b
+    return -1
+
+
+def three(a: Optional[int], b: Optional[int], c: Optional[int]) -> int:
+    if a is not None and b is not None and c is not None:
+        return a + b + c
+    return -1
+
+
+def mixed(a: Optional[int], b: Optional[int]) -> int:
+    # `a` narrows to int in the then-branch; `b is None` holds too but leaves `b`
+    # Optional (there is no non-None payload to expose). Only `a` is used.
+    if a is not None and b is None:
+        return a + 100
+    return -1
+
+
+def guard_cmp(a: Optional[int], n: int) -> int:
+    # The `n > 0` conjunct is a plain comparison — ignored for narrowing, but the
+    # short-circuit still requires it, so the body runs only when a is not None
+    # AND n > 0. `a` is narrowed; `n` was already int.
+    if a is not None and n > 0:
+        return a + n
+    return -1
+
+
+def strchain(s: Optional[str], t: Optional[str]) -> str:
+    # Narrowing is type-generic: two Optional[str] both narrow to str and
+    # concatenate — exercises a non-int payload through the same path.
+    if s is not None and t is not None:
+        return s + t
+    return "none"
+
+
+def main() -> None:
+    print(both(3, 4))
+    print(both(3, None))
+    print(both(None, 4))
+    print(both(None, None))
+    # nested-vs-compound equivalence: identical outputs across the input matrix.
+    print(nested(3, 4))
+    print(nested(3, None))
+    print(nested(None, 4))
+    print(three(1, 2, 3))
+    print(three(1, 2, None))
+    print(three(1, None, 3))
+    print(three(None, 2, 3))
+    print(mixed(5, None))
+    print(mixed(5, 9))
+    print(mixed(None, None))
+    print(guard_cmp(10, 5))
+    print(guard_cmp(10, 0))
+    print(guard_cmp(None, 5))
+    print(strchain("ab", "cd"))
+    print(strchain("ab", None))
+    print(strchain(None, None))

@@ -1,0 +1,15 @@
+# SOUNDNESS NEGATIVE (card 65769edf): the ELSE branch of an `and`-chain guard
+# must NOT be narrowed. `not(a is not None and b is not None)` is
+# `a is None or b is None` — either conjunct could be the false one, so NOTHING
+# is known about `a` specifically in the else branch. `a` is therefore STILL
+# Optional[int] there, and using it as a bare int (`a + 1`) must be rejected at
+# typeck. Accepting it would be a silent miscompile (deref of a possibly-None a).
+def f(a: Optional[int], b: Optional[int]) -> int:
+    if a is not None and b is not None:
+        return a + b
+    else:
+        return a + 1
+
+
+def main() -> None:
+    print(f(1, 2))

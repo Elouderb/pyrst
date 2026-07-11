@@ -348,6 +348,171 @@ use super::test_support::*;
         assert_eq!(env.locals.get("v"), Some(&Ty::Option(Box::new(Ty::Int))));
     }
 
+    // ── (card 65769edf) COMPOUND `and`-chain Optional narrowing ───────────────
+    // Helpers: build `name is None` / `name is not None`, and `and`/`or`/`+`.
+    fn cn_guard(name: &str, is_not_none: bool) -> Expr {
+        Expr::BinOp {
+            op: if is_not_none { BinOp::IsNot } else { BinOp::Is },
+            lhs: Box::new(ident(name)),
+            rhs: Box::new(Expr::None_(Span::DUMMY)),
+            span: Span::DUMMY,
+        }
+    }
+    fn cn_and(a: Expr, b: Expr) -> Expr {
+        Expr::BinOp { op: BinOp::And, lhs: Box::new(a), rhs: Box::new(b), span: Span::DUMMY }
+    }
+    fn cn_or(a: Expr, b: Expr) -> Expr {
+        Expr::BinOp { op: BinOp::Or, lhs: Box::new(a), rhs: Box::new(b), span: Span::DUMMY }
+    }
+    fn cn_add(a: Expr, b: Expr) -> Expr {
+        Expr::BinOp { op: BinOp::Add, lhs: Box::new(a), rhs: Box::new(b), span: Span::DUMMY }
+    }
+    fn cn_assign(target: &str, value: Expr) -> Stmt {
+        Stmt::Assign { target: target.into(), ty: None, value, span: Span::DUMMY }
+    }
+    fn cn_if(cond: Expr, then: Vec<Stmt>, else_: Option<Vec<Stmt>>) -> Stmt {
+        Stmt::If { cond, then, elifs: vec![], else_, span: Span::DUMMY }
+    }
+
+    #[test]
+    fn and_conjunct_narrowings_walks_and_ignores_or() {
+        // The collector: a single guard, an `and`-chain (incl. 3-way, either
+        // association), and mixed senses collect per-conjunct; an `or`-chain (or a
+        // non-guard atom) collects nothing.
+        assert_eq!(
+            and_conjunct_narrowings(&cn_guard("a", true)),
+            vec![("a".to_string(), true)]
+        );
+        assert_eq!(
+            and_conjunct_narrowings(&cn_and(cn_guard("a", true), cn_guard("b", false))),
+            vec![("a".to_string(), true), ("b".to_string(), false)]
+        );
+        // 3-way, left-associated: ((a and b) and c).
+        assert_eq!(
+            and_conjunct_narrowings(&cn_and(
+                cn_and(cn_guard("a", true), cn_guard("b", true)),
+                cn_guard("c", true),
+            )),
+            vec![("a".into(), true), ("b".into(), true), ("c".into(), true)]
+        );
+        // 3-way, right-associated: (a and (b and c)) — same result.
+        assert_eq!(
+            and_conjunct_narrowings(&cn_and(
+                cn_guard("a", true),
+                cn_and(cn_guard("b", true), cn_guard("c", true)),
+            )),
+            vec![("a".into(), true), ("b".into(), true), ("c".into(), true)]
+        );
+        // `or` is never descended: a top-level or (or an or nested under and)
+        // yields nothing for the whole or-subtree.
+        assert!(and_conjunct_narrowings(&cn_or(cn_guard("a", true), cn_guard("b", true))).is_empty());
+        // A non-guard conjunct (`n > 0`) is ignored; the guard conjunct still counts.
+        let ncmp = Expr::BinOp {
+            op: BinOp::Gt, lhs: Box::new(ident("n")), rhs: Box::new(int_lit(0)), span: Span::DUMMY,
+        };
+        assert_eq!(
+            and_conjunct_narrowings(&cn_and(cn_guard("a", true), ncmp)),
+            vec![("a".to_string(), true)]
+        );
+    }
+
+    #[test]
+    fn and_chain_narrows_both_conjuncts_in_then() {
+        // `if a is not None and b is not None: y = a + b` typechecks — BOTH narrow
+        // to int in the then-branch (the tzdata repro) — and both restore after.
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        env.locals.insert("a".into(), Ty::Option(Box::new(Ty::Int)));
+        env.locals.insert("b".into(), Ty::Option(Box::new(Ty::Int)));
+        let stmt = cn_if(
+            cn_and(cn_guard("a", true), cn_guard("b", true)),
+            vec![cn_assign("y", cn_add(ident("a"), ident("b")))],
+            None,
+        );
+        check_stmt(&stmt, &mut env).unwrap();
+        // Narrowing does not leak: both are Optional again after the `if`.
+        assert_eq!(env.locals.get("a"), Some(&Ty::Option(Box::new(Ty::Int))));
+        assert_eq!(env.locals.get("b"), Some(&Ty::Option(Box::new(Ty::Int))));
+    }
+
+    #[test]
+    fn and_chain_three_way_narrows_all_in_then() {
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        for n in ["a", "b", "c"] {
+            env.locals.insert(n.into(), Ty::Option(Box::new(Ty::Int)));
+        }
+        let stmt = cn_if(
+            cn_and(cn_and(cn_guard("a", true), cn_guard("b", true)), cn_guard("c", true)),
+            vec![cn_assign("y", cn_add(cn_add(ident("a"), ident("b")), ident("c")))],
+            None,
+        );
+        check_stmt(&stmt, &mut env).unwrap();
+        for n in ["a", "b", "c"] {
+            assert_eq!(env.locals.get(n), Some(&Ty::Option(Box::new(Ty::Int))));
+        }
+    }
+
+    #[test]
+    fn and_chain_mixed_narrows_only_is_not_none_conjunct() {
+        // `if a is not None and b is None:` narrows `a` (a+1 checks) but leaves `b`
+        // Optional — using `b` as int is still rejected (b is None here).
+        let ctx = TyCtx::new();
+        let cond = || cn_and(cn_guard("a", true), cn_guard("b", false));
+        // a narrows -> `a + 1` OK.
+        {
+            let mut env = make_env(&ctx);
+            env.locals.insert("a".into(), Ty::Option(Box::new(Ty::Int)));
+            env.locals.insert("b".into(), Ty::Option(Box::new(Ty::Int)));
+            check_stmt(
+                &cn_if(cond(), vec![cn_assign("y", cn_add(ident("a"), int_lit(1)))], None),
+                &mut env,
+            ).unwrap();
+        }
+        // b stays Optional -> `b + 1` rejected.
+        {
+            let mut env = make_env(&ctx);
+            env.locals.insert("a".into(), Ty::Option(Box::new(Ty::Int)));
+            env.locals.insert("b".into(), Ty::Option(Box::new(Ty::Int)));
+            assert!(check_stmt(
+                &cn_if(cond(), vec![cn_assign("y", cn_add(ident("b"), int_lit(1)))], None),
+                &mut env,
+            ).is_err());
+        }
+    }
+
+    #[test]
+    fn and_chain_else_branch_not_narrowed() {
+        // SOUNDNESS: the else branch of an and-chain narrows NOTHING — `a` is still
+        // Optional there, so `a + 1` in the else must be rejected.
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        env.locals.insert("a".into(), Ty::Option(Box::new(Ty::Int)));
+        env.locals.insert("b".into(), Ty::Option(Box::new(Ty::Int)));
+        let stmt = cn_if(
+            cn_and(cn_guard("a", true), cn_guard("b", true)),
+            vec![Stmt::Pass(Span::DUMMY)],
+            Some(vec![cn_assign("y", cn_add(ident("a"), int_lit(1)))]),
+        );
+        assert!(check_stmt(&stmt, &mut env).is_err());
+    }
+
+    #[test]
+    fn or_chain_then_branch_not_narrowed() {
+        // SOUNDNESS: an or-chain narrows NOTHING in the then-branch — `a` is still
+        // Optional, so `a + 1` in the then must be rejected.
+        let ctx = TyCtx::new();
+        let mut env = make_env(&ctx);
+        env.locals.insert("a".into(), Ty::Option(Box::new(Ty::Int)));
+        env.locals.insert("b".into(), Ty::Option(Box::new(Ty::Int)));
+        let stmt = cn_if(
+            cn_or(cn_guard("a", true), cn_guard("b", true)),
+            vec![cn_assign("y", cn_add(ident("a"), int_lit(1)))],
+            None,
+        );
+        assert!(check_stmt(&stmt, &mut env).is_err());
+    }
+
     #[test]
     fn second_none_guard_on_narrowed_var_rejected() {
         // (card c34ac64a fix B3) After `if x is None: return` narrows x to int, a

@@ -1,0 +1,8 @@
+# pyrst build outputs — `pyrst build <file.pyrs>` always emits its binary
+# into the CURRENT directory named after the source basename. Regenerable;
+# never commit these.
+/smoke_scaffold
+/oracle_core
+/oracle_extended
+/oracle_tz_dst
+/oracle_round3

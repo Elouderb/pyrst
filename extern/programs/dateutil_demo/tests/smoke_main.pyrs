@@ -1,0 +1,63 @@
+# tests/smoke_main.pyrs — smoke test for dateutil_demo's built `main` binary.
+#
+# Drives the compiled binary via subprocess.run (same pattern as
+# extern/programs/tzdata_demo/tests/smoke_main.pyrs and pyrstdb's tests).
+# Build both binaries first, from THIS directory:
+#
+#   PYRST_PATH=/home/ethos/Coding/pyrst/extern/packages \
+#     /home/ethos/Coding/pyrst/target/release/pyrst build main.pyrs
+#   PYRST_PATH=/home/ethos/Coding/pyrst/extern/packages \
+#     /home/ethos/Coding/pyrst/target/release/pyrst build tests/smoke_main.pyrs
+#   ./smoke_main                 (optional arg: path to the `main` binary, default "./main")
+#
+# Prints PASS: smoke_main / exits 0 on success, or FAIL: <reason> / exits
+# nonzero. Asserts on the demo's SHIPPED output: parsed meeting lines (ISO +
+# US + textual), the tz-glue conversion, both recurrence expansions, and the
+# relativedelta shift/age lines — all oracle-pinned against python3 dateutil.
+
+import sys
+from subprocess import run, CompletedProcess
+
+
+def main() -> None:
+    binary: str = "./main"
+    if len(sys.argv) > 1:
+        binary = sys.argv[1]
+
+    result: CompletedProcess = run([binary], capture_output=True)
+    stdout_bytes = result.stdout
+    out: str = ""
+    if stdout_bytes is not None:
+        out = stdout_bytes.decode()
+
+    failures: list[str] = []
+    if result.returncode != 0:
+        failures.append("main exited " + str(result.returncode) + ", want 0")
+    if "dateutil_demo" not in out:
+        failures.append("missing header line in output")
+    if "Standup           2026-07-13T09:00:00" not in out:
+        failures.append("missing/incorrect Standup line")
+    if "Design review     2026-07-14T14:30:00" not in out:
+        failures.append("missing/incorrect Design review line")
+    if "All-hands         2026-07-17T11:00:00" not in out:
+        failures.append("missing/incorrect All-hands line")
+    if "America/New_York 2026-07-10T05:30:00" not in out:
+        failures.append("missing/incorrect tz-glue conversion line")
+    if "2026-08-03T09:00:00" not in out:
+        failures.append("missing/incorrect weekly-recurrence expansion")
+    if "2026-02-28T16:00:00" not in out:
+        failures.append("missing/incorrect month-end recurrence expansion")
+    if "Standup + 1 month: 2026-08-13T09:00:00" not in out:
+        failures.append("missing/incorrect relativedelta shift line")
+    if "relativedelta(years=+36, months=+3, days=+18)" not in out:
+        failures.append("missing/incorrect age-between line")
+
+    if len(failures) == 0:
+        print("PASS: smoke_main")
+    else:
+        for f in failures:
+            print("FAIL: " + f)
+        sys.exit(1)
+
+
+main()

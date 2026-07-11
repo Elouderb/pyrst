@@ -1,0 +1,78 @@
+# main.pyrs — dateutil_demo: a meeting-scheduler / recurrence printer built on
+# pyrst-dateutil (card 0223a4b8). Exercises the SHIPPED surface end to end:
+#   - dateutil.parser.parse           (ISO + textual meeting-start strings)
+#   - dateutil.parser.parse_with_offset + astimezone_named  (tz glue via tzdata)
+#   - dateutil.relativedelta          (calendar-correct shifts + age-between)
+#   - dateutil.rrule.materialize      (recurrence expansion)
+#
+# Every printed value is oracle-pinned against python3 dateutil / zoneinfo (see
+# tests/smoke_main.pyrs, which asserts this program's output).
+#
+# Build from THIS directory:
+#   PYRST_PATH=/home/ethos/Coding/pyrst/extern/packages \
+#     /home/ethos/Coding/pyrst/target/release/pyrst build main.pyrs
+#   ./main
+
+from datetime import datetime
+from dateutil.parser import parse, parse_with_offset, astimezone_named, ParseResult, ParserError
+from dateutil.relativedelta import relativedelta, relativedelta_between, Weekday, MO
+from dateutil.rrule import rrule, materialize, WEEKLY, MONTHLY
+
+
+def _pad_right(s: str, width: int) -> str:
+    out: str = s
+    while len(out) < width:
+        out = out + " "
+    return out
+
+
+def main() -> None:
+    print("dateutil_demo — meeting scheduler & recurrence printer")
+    print("")
+
+    # 1. Parse a mix of ISO / US / textual meeting-start strings.
+    meetings: list[list[str]] = [
+        ["Standup", "2026-07-13T09:00:00"],
+        ["Design review", "07/14/2026 14:30"],
+        ["All-hands", "July 17, 2026 11:00"],
+    ]
+    print(_pad_right("Meeting", 18) + "Start")
+    for row in meetings:
+        label: str = row[0]
+        try:
+            start: datetime = parse(row[1])
+            print(_pad_right(label, 18) + start.isoformat())
+        except ParserError as e:
+            print(_pad_right(label, 18) + "(unparseable: " + str(e) + ")")
+    print("")
+
+    # 2. tz glue: a customer sends a start time with a UTC offset; show it in
+    #    the New York office's wall clock (via tzdata's DST-aware offsets).
+    incoming: ParseResult = parse_with_offset("2026-07-10T09:30:00+00:00")
+    ny: ParseResult = astimezone_named(incoming, "America/New_York")
+    print("Customer call 09:30 UTC  ->  America/New_York " + ny.value.isoformat())
+    print("")
+
+    # 3. Recurrence: a weekly standup, every Monday 09:00, 4 occurrences.
+    standup_start: datetime = datetime(2026, 7, 13, 9, 0, 0)
+    print("Weekly standup (WEEKLY, count=4):")
+    for occ in materialize(rrule(WEEKLY, standup_start, count=4), 4):
+        print("  " + occ.isoformat())
+    print("")
+
+    # 4. Recurrence: month-end review, last day of the month, 16:00, 3 months.
+    print("Month-end review (MONTHLY, bymonthday=[-1], count=3):")
+    review: rrule = rrule(MONTHLY, datetime(2026, 1, 1, 16, 0), count=3, bymonthday=[-1])
+    for occ2 in materialize(review, 3):
+        print("  " + occ2.isoformat())
+    print("")
+
+    # 5. relativedelta: shift a meeting one calendar month forward, and print
+    #    a person's age as a years/months/days relativedelta.
+    moved: datetime = relativedelta(months=1).apply(standup_start)
+    print("Standup + 1 month: " + moved.isoformat())
+    age: relativedelta = relativedelta_between(datetime(2026, 7, 13), datetime(1990, 3, 25))
+    print("Age on 2026-07-13 (born 1990-03-25): " + str(age))
+
+
+main()

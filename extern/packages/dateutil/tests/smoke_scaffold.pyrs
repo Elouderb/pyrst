@@ -1,0 +1,88 @@
+# smoke_scaffold.pyrs — scaffold smoke test for pyrst-dateutil (card 0223a4b8).
+#
+# Build from THIS directory (tests reference sibling package modules the
+# same way rrule.pyrs references relativedelta.pyrs — see the package
+# README's PYRST_PATH/dotted-import note):
+#   PYRST_PATH=/home/ethos/Coding/pyrst/extern/packages \
+#     /home/ethos/Coding/pyrst/target/release/pyrst build tests/smoke_scaffold.pyrs
+#   ./smoke_scaffold
+#
+# Prints PASS/FAIL lines and exits 0 on all-pass, nonzero on any failure
+# (this repo's test-program convention — see extern/packages/tzdata/tests/
+# for precedent). This test proves the SCAFFOLD wires up end to end: every
+# class constructs, the cross-package `tzdata` import resolves, and the one
+# currently-working slice of `parser.parse` (naive ISO strings) returns the
+# oracle-pinned value. It deliberately does NOT call any `TODO`/
+# `NotImplementedError` body (relativedelta arithmetic, rrule expansion,
+# tz-offset parsing) — that is `complex-implementer`'s + `test-engineer`'s
+# job once those land.
+
+import sys
+from datetime import datetime
+from dateutil.parser import parse, ParserError
+from dateutil.relativedelta import relativedelta, Weekday, MO, FR
+from dateutil.rrule import rrule, DAILY, WEEKLY
+from tzdata.api import available_zones
+
+
+def check_str(label: str, got: str, want: str, failures: Mut[list[str]]) -> None:
+    if got != want:
+        failures.append(label + ": got " + repr(got) + ", want " + repr(want))
+
+
+def check_int(label: str, got: int, want: int, failures: Mut[list[str]]) -> None:
+    if got != want:
+        failures.append(label + ": got " + str(got) + ", want " + str(want))
+
+
+def main() -> None:
+    failures: list[str] = []
+
+    # parser.parse: the working naive-ISO fast path.
+    # Oracle: python3 -c "from dateutil import parser; print(parser.parse('2026-07-10T09:30:00'))"
+    #         -> 2026-07-10 09:30:00
+    parsed: datetime = parse("2026-07-10T09:30:00")
+    check_str("parse(iso).isoformat", parsed.isoformat(), "2026-07-10T09:30:00", failures)
+
+    # parser.parse: honest ParserError on garbage input (never a guess).
+    caught_parser_error: bool = False
+    try:
+        parse("not a date at all")
+    except ParserError:
+        caught_parser_error = True
+    if not caught_parser_error:
+        failures.append("parse('not a date at all') should raise ParserError")
+
+    # relativedelta: construction only (arithmetic is TODO).
+    rd: relativedelta = relativedelta(years=1, months=2, days=3, weekday=Weekday(MO, 1))
+    check_int("relativedelta.years", rd.years, 1, failures)
+    check_int("relativedelta.months", rd.months, 2, failures)
+    check_int("relativedelta.days", rd.days, 3, failures)
+    rd_weekday: Optional[Weekday] = rd.weekday
+    if rd_weekday is None:
+        failures.append("relativedelta.weekday should not be None")
+    else:
+        check_int("relativedelta.weekday.weekday", rd_weekday.weekday, MO, failures)
+
+    # rrule: construction + freq validation only (expansion is TODO).
+    dtstart: datetime = datetime(2026, 7, 6)
+    daily: rrule = rrule(DAILY, dtstart, count=5)
+    check_int("rrule(DAILY).freq", daily.freq, DAILY, failures)
+    weekly: rrule = rrule(WEEKLY, dtstart, interval=2, byweekday=[MO, FR])
+    check_int("rrule(WEEKLY).interval", weekly.interval, 2, failures)
+
+    # Cross-package wiring proof: tzdata resolves via the dotted
+    # `tzdata.api` import from inside a `dateutil`-rooted build.
+    zones: list[str] = available_zones()
+    if len(zones) < 7:
+        failures.append("tzdata.available_zones(): expected >= 7 zones, got " + str(len(zones)))
+
+    if len(failures) == 0:
+        print("PASS: smoke_scaffold")
+    else:
+        for f in failures:
+            print("FAIL: " + f)
+        sys.exit(1)
+
+
+main()

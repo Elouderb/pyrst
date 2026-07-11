@@ -1,0 +1,102 @@
+# smoke_api.pyrs — scaffold smoke test for tzdata (card 965bf13f).
+#
+# Build from THIS directory (tests reference sibling package modules the same
+# way api.pyrs does):
+#   PYRST_PATH=/home/ethos/Coding/pyrst/extern/packages \
+#     /home/ethos/Coding/pyrst/target/release/pyrst build tests/smoke_api.pyrs
+#   ./smoke_api
+#
+# Prints PASS/FAIL lines and exits 0 on all-pass, nonzero on any failure —
+# matching this repo's test-program convention (see extern/programs/pyrstdb's
+# tests/ for precedent). Every asserted value is pinned against the python3
+# 3.12 `zoneinfo` oracle in `data.pyrs`'s comments; this file only re-checks
+# a handful of them (its job is to prove the scaffold WIRES UP end to end —
+# the full oracle matrix is test-engineer's job per the card's workflow).
+
+import sys
+from tzdata.api import available_zones, zone_info, utc_offset_at, is_dst_at
+
+
+def check(label: str, got: int, want: int, failures: Mut[list[str]]) -> None:
+    if got != want:
+        failures.append(label + ": got " + str(got) + ", want " + str(want))
+
+
+def check_bool(label: str, got: bool, want: bool, failures: Mut[list[str]]) -> None:
+    if got != want:
+        failures.append(label + ": got " + str(got) + ", want " + str(want))
+
+
+def main() -> None:
+    failures: list[str] = []
+
+    zones: list[str] = available_zones()
+    if len(zones) < 7:
+        failures.append("available_zones: expected >= 7 zones, got " + str(len(zones)))
+    if "UTC" not in zones:
+        failures.append("available_zones: missing UTC")
+
+    info = zone_info("UTC")
+    check("UTC.std_offset_min", info.std_offset_min, 0, failures)
+
+    # America/New_York: EST in January, EDT in July (oracle: data.pyrs header).
+    check("NY jan offset", utc_offset_at("America/New_York", 2026, 1, 15, 12, 0), -300, failures)
+    check("NY jul offset", utc_offset_at("America/New_York", 2026, 7, 15, 12, 0), -240, failures)
+    check_bool("NY jan is_dst", is_dst_at("America/New_York", 2026, 1, 15, 12, 0), False, failures)
+    check_bool("NY jul is_dst", is_dst_at("America/New_York", 2026, 7, 15, 12, 0), True, failures)
+
+    # Europe/London: GMT in January, BST in July.
+    check("London jan offset", utc_offset_at("Europe/London", 2026, 1, 15, 12, 0), 0, failures)
+    check("London jul offset", utc_offset_at("Europe/London", 2026, 7, 15, 12, 0), 60, failures)
+
+    # Asia/Tokyo: no DST, constant +540.
+    check("Tokyo jan offset", utc_offset_at("Asia/Tokyo", 2026, 1, 15, 12, 0), 540, failures)
+    check("Tokyo jul offset", utc_offset_at("Asia/Tokyo", 2026, 7, 15, 12, 0), 540, failures)
+
+    # Australia/Sydney: year-wrapping DST — active in January (southern
+    # summer), inactive in July (southern winter).
+    check("Sydney jan offset", utc_offset_at("Australia/Sydney", 2026, 1, 15, 12, 0), 660, failures)
+    check("Sydney jul offset", utc_offset_at("Australia/Sydney", 2026, 7, 15, 12, 0), 600, failures)
+
+    # Etc/GMT sign-flip convention.
+    check("Etc/GMT+5 offset", utc_offset_at("Etc/GMT+5", 2026, 1, 15, 12, 0), -300, failures)
+    check("Etc/GMT-9 offset", utc_offset_at("Etc/GMT-9", 2026, 1, 15, 12, 0), 540, failures)
+
+    # Half-hour offsets survive the pipeline. Kolkata is UTC+5:30 (330);
+    # St_Johns is UTC-3:30 (-210) in winter, UTC-2:30 (-150) in summer.
+    check("Kolkata offset", utc_offset_at("Asia/Kolkata", 2026, 1, 15, 12, 0), 330, failures)
+    check("St_Johns jan offset", utc_offset_at("America/St_Johns", 2026, 1, 15, 12, 0), -210, failures)
+    check("St_Johns jul offset", utc_offset_at("America/St_Johns", 2026, 7, 15, 12, 0), -150, failures)
+
+    # Unknown zone -> KeyError from ALL THREE lookups (the frozen contract),
+    # never a silent wrong answer.
+    threw_zi: bool = False
+    try:
+        zone_info("Nowhere/Land")
+    except KeyError:
+        threw_zi = True
+    check_bool("zone_info unknown raises KeyError", threw_zi, True, failures)
+
+    threw_off: bool = False
+    try:
+        _ignore: int = utc_offset_at("Nowhere/Land", 2026, 1, 1, 0, 0)
+    except KeyError:
+        threw_off = True
+    check_bool("utc_offset_at unknown raises KeyError", threw_off, True, failures)
+
+    threw_dst: bool = False
+    try:
+        _ignore2: bool = is_dst_at("Nowhere/Land", 2026, 1, 1, 0, 0)
+    except KeyError:
+        threw_dst = True
+    check_bool("is_dst_at unknown raises KeyError", threw_dst, True, failures)
+
+    if len(failures) == 0:
+        print("PASS: smoke_api")
+    else:
+        for f in failures:
+            print("FAIL: " + f)
+        sys.exit(1)
+
+
+main()

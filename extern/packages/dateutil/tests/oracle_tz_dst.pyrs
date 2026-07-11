@@ -1,0 +1,79 @@
+# oracle_tz_dst.pyrs — pyrst-dateutil DST-transition-adjacent tz oracle
+# tests (card 0223a4b8, test-engineer round 2). Targets the "unresolved
+# risk" complex-implementer flagged in comment 565/566: astimezone_named's
+# two-step UTC->local fixed point near a US DST transition.
+#
+# ORACLE (python3 3.12, zoneinfo — America/New_York, 2026 US DST rules:
+# spring-forward 2026-03-08 07:00 UTC (2am->3am local); fall-back
+# 2026-11-01 06:00 UTC (2am->1am local)):
+#   python3 -c "
+#   from datetime import datetime
+#   from zoneinfo import ZoneInfo
+#   for iso in ['2026-03-08T06:59:00+00:00','2026-03-08T07:00:00+00:00',
+#               '2026-11-01T05:59:00+00:00','2026-11-01T06:00:00+00:00']:
+#       print(iso, '->', datetime.fromisoformat(iso).astimezone(ZoneInfo('America/New_York')).isoformat())
+#   "
+#   2026-03-08T06:59:00+00:00 -> 2026-03-08T01:59:00-05:00
+#   2026-03-08T07:00:00+00:00 -> 2026-03-08T03:00:00-04:00
+#   2026-11-01T05:59:00+00:00 -> 2026-11-01T01:59:00-04:00
+#   2026-11-01T06:00:00+00:00 -> 2026-11-01T01:00:00-05:00
+#
+# Build (from this dir's package root, extern/packages/dateutil/):
+#   PYRST_PATH=/home/ethos/Coding/pyrst/extern/packages \
+#     /home/ethos/Coding/pyrst/target/release/pyrst build tests/oracle_tz_dst.pyrs
+#   ./oracle_tz_dst
+
+import sys
+from dateutil.parser import parse_with_offset, astimezone_named, ParseResult
+
+
+def ck(label: str, got: str, want: str, failures: Mut[list[str]]) -> None:
+    if got != want:
+        failures.append(label + ": got " + repr(got) + ", want " + repr(want))
+
+
+def fmt(pr: ParseResult) -> str:
+    maybe_off: Optional[int] = pr.utc_offset_minutes
+    off: int = 0
+    if maybe_off is not None:
+        off: int = maybe_off
+    return pr.value.isoformat() + " offset=" + str(off)
+
+
+def main() -> None:
+    failures: list[str] = []
+
+    before_spring: ParseResult = astimezone_named(
+        parse_with_offset("2026-03-08T06:59:00Z"), "America/New_York"
+    )
+    ck("spring-forward -1min (EST)", fmt(before_spring),
+       "2026-03-08T01:59:00 offset=-300", failures)
+
+    after_spring: ParseResult = astimezone_named(
+        parse_with_offset("2026-03-08T07:00:00Z"), "America/New_York"
+    )
+    ck("spring-forward +0min (EDT)", fmt(after_spring),
+       "2026-03-08T03:00:00 offset=-240", failures)
+
+    before_fall: ParseResult = astimezone_named(
+        parse_with_offset("2026-11-01T05:59:00Z"), "America/New_York"
+    )
+    ck("fall-back -1min (EDT)", fmt(before_fall),
+       "2026-11-01T01:59:00 offset=-240", failures)
+
+    after_fall: ParseResult = astimezone_named(
+        parse_with_offset("2026-11-01T06:00:00Z"), "America/New_York"
+    )
+    ck("fall-back +0min (EST)", fmt(after_fall),
+       "2026-11-01T01:00:00 offset=-300", failures)
+
+    if len(failures) == 0:
+        print("PASS: oracle_tz_dst")
+        sys.exit(0)
+    else:
+        for f in failures:
+            print("FAIL: " + f)
+        sys.exit(1)
+
+
+main()

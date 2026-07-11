@@ -1,0 +1,172 @@
+# main.pyrs — tzdata_demo: a world-clock printout (card 965bf13f).
+#
+# Given a single reference instant in UTC, prints the LOCAL wall-clock time,
+# UTC offset, and DST status of a curated set of major world cities — driving
+# the tzdata package's frozen API (available_zones / utc_offset_at / is_dst_at)
+# end to end. (pyrst has no timezone-aware "now" primitive yet, so the
+# reference instant is hardcoded below; that is the only stubbed part.)
+#
+# Build from THIS directory:
+#   PYRST_PATH=/home/ethos/Coding/pyrst/extern/packages \
+#     /home/ethos/Coding/pyrst/target/release/pyrst build main.pyrs
+#   ./main
+#
+# The local time is resolved with a two-pass offset lookup (guess local =
+# UTC + std-guess, then re-read the offset at that local wall time) — exact
+# except within the ambiguous transition hour, matching the package's
+# documented DST-boundary limitation. The reference instant below is chosen
+# away from any transition so every city resolves cleanly.
+
+from tzdata.api import available_zones, zone_info, utc_offset_at, is_dst_at
+
+
+def _is_leap_year(year: int) -> bool:
+    return (year % 4 == 0 and year % 100 != 0) or (year % 400 == 0)
+
+
+def _days_in_month(year: int, month: int) -> int:
+    lengths: list[int] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    if month == 2 and _is_leap_year(year):
+        return 29
+    return lengths[month - 1]
+
+
+class Instant:
+    year: int
+    month: int
+    day: int
+    hour: int
+    minute: int
+
+    def __init__(self, year: int, month: int, day: int, hour: int, minute: int) -> None:
+        self.year = year
+        self.month = month
+        self.day = day
+        self.hour = hour
+        self.minute = minute
+
+
+def _add_minutes(base: Instant, delta_min: int) -> Instant:
+    # Normalize base + delta_min into a valid calendar Instant (handles minute,
+    # hour, day, month, and year rollover in both directions).
+    total: int = base.hour * 60 + base.minute + delta_min
+    day: int = base.day
+    month: int = base.month
+    year: int = base.year
+    # roll days off the accumulated minutes
+    while total < 0:
+        total = total + 24 * 60
+        day = day - 1
+        if day < 1:
+            month = month - 1
+            if month < 1:
+                month = 12
+                year = year - 1
+            day = _days_in_month(year, month)
+    while total >= 24 * 60:
+        total = total - 24 * 60
+        day = day + 1
+        if day > _days_in_month(year, month):
+            day = 1
+            month = month + 1
+            if month > 12:
+                month = 1
+                year = year + 1
+    hour: int = total // 60
+    minute: int = total % 60
+    return Instant(year, month, day, hour, minute)
+
+
+def _format_offset(offset_min: int) -> str:
+    sign: str = "+"
+    minutes: int = offset_min
+    if minutes < 0:
+        sign = "-"
+        minutes = -minutes
+    hh: int = minutes // 60
+    mm: int = minutes % 60
+    hh_str: str = str(hh)
+    if hh < 10:
+        hh_str = "0" + hh_str
+    mm_str: str = str(mm)
+    if mm < 10:
+        mm_str = "0" + mm_str
+    return "UTC" + sign + hh_str + ":" + mm_str
+
+
+def _pad2(v: int) -> str:
+    s: str = str(v)
+    if v < 10:
+        return "0" + s
+    return s
+
+
+def _format_clock(t: Instant) -> str:
+    return (str(t.year) + "-" + _pad2(t.month) + "-" + _pad2(t.day)
+            + " " + _pad2(t.hour) + ":" + _pad2(t.minute))
+
+
+def _pad_right(s: str, width: int) -> str:
+    out: str = s
+    while len(out) < width:
+        out = out + " "
+    return out
+
+
+def _local_offset_for_utc(zone_name: str, utc: Instant) -> int:
+    # Two-pass: read the offset treating the UTC fields as a first guess for the
+    # local wall time, apply it, then re-read at the resulting local time. Away
+    # from a transition the second read is the true offset for this instant.
+    guess: int = utc_offset_at(zone_name, utc.year, utc.month, utc.day, utc.hour, utc.minute)
+    local1: Instant = _add_minutes(utc, guess)
+    return utc_offset_at(zone_name, local1.year, local1.month, local1.day, local1.hour, local1.minute)
+
+
+def main() -> None:
+    # A fixed reference instant in UTC, chosen away from any DST transition so
+    # every city resolves cleanly (mid-summer northern / mid-winter southern).
+    utc: Instant = Instant(2026, 7, 15, 12, 0)
+
+    # Curated display list: (city label, IANA zone). A readable world clock —
+    # the full curated table (incl. the Etc/GMT fixed-offset family) is what
+    # available_zones() exposes to callers; here we show representative cities.
+    cities: list[list[str]] = [
+        ["Los Angeles", "America/Los_Angeles"],
+        ["Denver", "America/Denver"],
+        ["Chicago", "America/Chicago"],
+        ["New York", "America/New_York"],
+        ["Sao Paulo", "America/Sao_Paulo"],
+        ["London", "Europe/London"],
+        ["Paris", "Europe/Paris"],
+        ["Athens", "Europe/Athens"],
+        ["Moscow", "Europe/Moscow"],
+        ["Dubai", "Asia/Dubai"],
+        ["Kolkata", "Asia/Kolkata"],
+        ["Shanghai", "Asia/Shanghai"],
+        ["Tokyo", "Asia/Tokyo"],
+        ["Sydney", "Australia/Sydney"],
+        ["Auckland", "Pacific/Auckland"],
+    ]
+
+    print("tzdata world clock")
+    print("reference instant (UTC): " + _format_clock(utc))
+    print("curated zones available: " + str(len(available_zones())))
+    print("")
+    print(_pad_right("City", 14) + _pad_right("Local time", 20) + _pad_right("Offset", 12) + "DST")
+
+    for row in cities:
+        label: str = row[0]
+        zone_name: str = row[1]
+        offset_min: int = _local_offset_for_utc(zone_name, utc)
+        local: Instant = _add_minutes(utc, offset_min)
+        dst: bool = is_dst_at(zone_name, local.year, local.month, local.day, local.hour, local.minute)
+        dst_label: str = "std"
+        if dst:
+            dst_label = "DST"
+        print(_pad_right(label, 14)
+              + _pad_right(_format_clock(local), 20)
+              + _pad_right(_format_offset(offset_min), 12)
+              + dst_label)
+
+
+main()

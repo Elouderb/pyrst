@@ -1,0 +1,424 @@
+# parser.pyrs — pyrst-dateutil's `dateutil.parser` subset (card 0223a4b8).
+# CORE IMPL (complex-implementer).
+#
+# ORACLE: python3 3.12's `dateutil.parser.parse` 2.9.0. Every shipped format
+# is pinned against it in tests/ (probe: `python3 -c "from dateutil import
+# parser; print(parser.parse('...'))"`).
+#
+# SHIPPED FORMATS (fuzzy=False only):
+#   - ISO-8601 (naive): via `lib/datetime`'s CPython-3.12-permissive
+#     `datetime_fromisoformat` fast path.
+#   - Numeric: `M/D/Y`, `D.M.Y`, `D-M-Y`, `Y/M/D`, 2-digit years — separators
+#     `/` `.` `-`, with `dayfirst`/`yearfirst` per the AMBIGUITY POLICY below.
+#   - Textual month: `Jan 10, 2026`, `January 10, 2026`, `10 January 2026`,
+#     `2026 Jul 4`, `Jul 4 2026` (+ `st/nd/rd/th`/`of`/weekday words ignored).
+#   - Optional trailing time `HH:MM[:SS]` (+ `AM`/`PM`).
+#
+# AMBIGUITY POLICY (oracle-pinned on `01/02/03`):
+#   default (df=F,yf=F): MONTH-first  -> 2003-01-02
+#   dayfirst=True       : DAY-first    -> 2003-02-01
+#   yearfirst=True      : YEAR-first   -> 2001-02-03
+#   both=True           : YEAR-then-DAY-> 2001-03-02
+# ISO-shaped strings are unambiguous and ignore both flags. When a numeric
+# field that would be the MONTH exceeds 12 while the other candidate is <= 12,
+# the two are auto-swapped (dateutil does the same: `31/12/2026` -> Dec 31
+# regardless of dayfirst). A 4-digit numeric field is always read as the year
+# (leading `YYYY/..` -> Y/M/D; trailing `../YYYY` -> year-last).
+#
+# TWO-DIGIT YEAR pivot = `now.year + 50` (`2000 + yy`, minus 100 if that lands
+# >= pivot) — this MATCHES dateutil's own current-year-relative window and is
+# therefore time-dependent exactly as dateutil is (documented; tests pin only
+# stable cases such as `03 -> 2003`).
+#
+# TIME-ONLY input (`9:30 AM`) -> `ParserError` here (DIVERGENCE, documented):
+# dateutil fills in TODAY's date, which would make results non-deterministic;
+# this subset requires a date.
+#
+# TZ-BEARING input: `parse()` (which returns a naive `datetime`) REJECTS a
+# `Z`/`+HH:MM`/`-HH:MM` suffix with `ParserError` and points at
+# `parse_with_offset()`, which returns a `ParseResult` (naive value + offset
+# minutes). `lib/datetime` has no tzinfo slot (TZINFO_GATE), so an offset
+# cannot ride on the `datetime` itself. `to_utc()`/`astimezone_named()` are
+# the tz-glue helpers built on that offset (+ `tzdata` for named zones).
+
+from datetime import datetime, timedelta, datetime_fromisoformat, datetime_now
+from tzdata.api import utc_offset_at, zone_info
+from tzdata.data import ZoneRule
+
+
+class ParserError(Exception):
+    pass
+
+
+class ParseResult:
+    value: datetime
+    # UTC offset in minutes (positive east of UTC), or `None` if the input
+    # carried no offset marker (a naive result).
+    utc_offset_minutes: Optional[int]
+
+    def __init__(self, value: datetime, utc_offset_minutes: Optional[int] = None) -> None:
+        self.value = value
+        self.utc_offset_minutes = utc_offset_minutes
+
+
+def _find_time_separator(s: str) -> int:
+    i: int = 0
+    while i < len(s):
+        if s[i] == "T" or s[i] == "t" or s[i] == " ":
+            return i
+        i = i + 1
+    return -1
+
+
+def _has_tz_suffix(s: str) -> bool:
+    if len(s) == 0:
+        return False
+    if s[-1] == "Z" or s[-1] == "z":
+        return True
+    if "+" in s:
+        return True
+    sep: int = _find_time_separator(s)
+    if sep == -1:
+        return False
+    i: int = sep + 1
+    while i < len(s):
+        if s[i] == "-":
+            return True
+        i = i + 1
+    return False
+
+
+def _is_alpha(c: str) -> bool:
+    return (c >= "a" and c <= "z") or (c >= "A" and c <= "Z")
+
+
+def _is_num_char(c: str) -> bool:
+    return (c >= "0" and c <= "9") or c == ":"
+
+
+def _tokenize(s: str) -> list[str]:
+    # Splits into maximal alpha runs and maximal numeric runs (a numeric run
+    # keeps embedded ':' so a `HH:MM[:SS]` time stays one token). All other
+    # characters (space, `/` `.` `-` `,`) are delimiters.
+    out: list[str] = []
+    i: int = 0
+    n: int = len(s)
+    while i < n:
+        c: str = s[i]
+        if _is_num_char(c):
+            j: int = i
+            while j < n and _is_num_char(s[j]):
+                j = j + 1
+            out.append(s[i:j])
+            i = j
+        elif _is_alpha(c):
+            j2: int = i
+            while j2 < n and _is_alpha(s[j2]):
+                j2 = j2 + 1
+            out.append(s[i:j2])
+            i = j2
+        else:
+            i = i + 1
+    return out
+
+
+def _month_num(w: str) -> int:
+    if w == "jan" or w == "january":
+        return 1
+    if w == "feb" or w == "february":
+        return 2
+    if w == "mar" or w == "march":
+        return 3
+    if w == "apr" or w == "april":
+        return 4
+    if w == "may":
+        return 5
+    if w == "jun" or w == "june":
+        return 6
+    if w == "jul" or w == "july":
+        return 7
+    if w == "aug" or w == "august":
+        return 8
+    if w == "sep" or w == "sept" or w == "september":
+        return 9
+    if w == "oct" or w == "october":
+        return 10
+    if w == "nov" or w == "november":
+        return 11
+    if w == "dec" or w == "december":
+        return 12
+    return 0
+
+
+def _is_weekday_word(w: str) -> bool:
+    return w in [
+        "mon", "monday", "tue", "tues", "tuesday", "wed", "weds", "wednesday",
+        "thu", "thur", "thurs", "thursday", "fri", "friday", "sat", "saturday",
+        "sun", "sunday"
+    ]
+
+
+def _is_ignorable_word(w: str) -> bool:
+    return _is_weekday_word(w) or w == "st" or w == "nd" or w == "rd" or w == "th" or w == "of"
+
+
+def _expand_year(yy: int) -> int:
+    now: int = datetime_now().year
+    century: int = (now // 100) * 100
+    full: int = century + yy
+    if full >= now + 50:
+        full = full - 100
+    elif full < now - 50:
+        full = full + 100
+    return full
+
+
+def _try_iso(s: str) -> Optional[datetime]:
+    try:
+        return datetime_fromisoformat(s)
+    except ValueError:
+        return None
+
+
+def _parse_time_token(tok: str) -> tuple[int, int, int, bool]:
+    parts: list[str] = tok.split(":")
+    if len(parts) < 2 or len(parts) > 3:
+        return (0, 0, 0, False)
+    if not parts[0].isdigit() or not parts[1].isdigit():
+        return (0, 0, 0, False)
+    h: int = int(parts[0])
+    mi: int = int(parts[1])
+    s: int = 0
+    if len(parts) == 3:
+        if not parts[2].isdigit():
+            return (0, 0, 0, False)
+        s = int(parts[2])
+    return (h, mi, s, True)
+
+
+def _parse_tokens(s: str, dayfirst: bool, yearfirst: bool) -> datetime:
+    tokens: list[str] = _tokenize(s)
+    numtoks: list[str] = []
+    month_name: int = 0
+    th: int = 0
+    tm: int = 0
+    ts: int = 0
+    ampm: int = 0
+    for tok in tokens:
+        if ":" in tok:
+            pt: tuple[int, int, int, bool] = _parse_time_token(tok)
+            if not pt[3]:
+                raise ParserError("Unknown string format: " + repr(s))
+            th = pt[0]
+            tm = pt[1]
+            ts = pt[2]
+        elif tok.isdigit():
+            numtoks.append(tok)
+        else:
+            low: str = tok.lower()
+            mn: int = _month_num(low)
+            if mn != 0:
+                month_name = mn
+            elif low == "am":
+                ampm = 1
+            elif low == "pm":
+                ampm = 2
+            elif _is_ignorable_word(low):
+                ampm = ampm
+            else:
+                raise ParserError("Unknown string format: " + repr(s))
+    if ampm == 2 and th < 12:
+        th = th + 12
+    if ampm == 1 and th == 12:
+        th = 0
+    year: int = 0
+    month: int = 0
+    day: int = 0
+    allow_swap: bool = False
+    if month_name != 0:
+        month = month_name
+        if len(numtoks) != 2:
+            raise ParserError("Unknown string format: " + repr(s))
+        a: int = int(numtoks[0])
+        b: int = int(numtoks[1])
+        if a > 31:
+            year = a
+            day = b
+        elif b > 31:
+            year = b
+            day = a
+        else:
+            day = a
+            year = b
+    else:
+        if len(numtoks) != 3:
+            raise ParserError("Unknown string format: " + repr(s))
+        n0: int = int(numtoks[0])
+        n1: int = int(numtoks[1])
+        n2: int = int(numtoks[2])
+        w0: int = len(numtoks[0])
+        w2: int = len(numtoks[2])
+        # `allow_swap` gates the month<->day auto-correction below: it is safe
+        # only for genuinely ambiguous M/D orderings, NOT when the year is
+        # read FIRST (there the remaining fields are unambiguously M then D, so
+        # a `month > 12` is a real error — e.g. `2026-13-01` -> ParserError,
+        # never silently swapped to 2026-01-13).
+        allow_swap = True
+        if w0 == 4 or n0 >= 100:
+            year = n0
+            month = n1
+            day = n2
+            allow_swap = False
+        elif w2 == 4 or n2 >= 100:
+            year = n2
+            if dayfirst:
+                day = n0
+                month = n1
+            else:
+                month = n0
+                day = n1
+        else:
+            if yearfirst and dayfirst:
+                year = n0
+                day = n1
+                month = n2
+                allow_swap = False
+            elif yearfirst:
+                year = n0
+                month = n1
+                day = n2
+                allow_swap = False
+            elif dayfirst:
+                day = n0
+                month = n1
+                year = n2
+            else:
+                month = n0
+                day = n1
+                year = n2
+    if allow_swap and month > 12 and day <= 12:
+        tmp: int = month
+        month = day
+        day = tmp
+    if year < 100:
+        year = _expand_year(year)
+    try:
+        return datetime(year, month, day, th, tm, ts, 0)
+    except ValueError:
+        raise ParserError("Unknown string format: " + repr(s))
+
+
+def _parse_naive(s: str, dayfirst: bool, yearfirst: bool) -> datetime:
+    iso: Optional[datetime] = _try_iso(s)
+    if iso is not None:
+        return iso
+    return _parse_tokens(s, dayfirst, yearfirst)
+
+
+def parse(timestr: str, dayfirst: bool = False, yearfirst: bool = False) -> datetime:
+    stripped: str = timestr.strip()
+    if len(stripped) == 0:
+        raise ParserError("String does not contain a date: " + repr(timestr))
+    if _has_tz_suffix(stripped):
+        raise ParserError(
+            "tz-bearing input has no naive datetime; use parse_with_offset(): " + repr(timestr)
+        )
+    return _parse_naive(stripped, dayfirst, yearfirst)
+
+
+def _parse_offset(off: str) -> int:
+    # `+HH:MM` / `-HH:MM` / `+HHMM` / `+HH` -> signed minutes east of UTC.
+    sign: int = 1
+    if off[0] == "-":
+        sign = -1
+    rest: str = off[1:].replace(":", "")
+    hh: int = int(rest[0:2])
+    mm: int = 0
+    if len(rest) >= 4:
+        mm = int(rest[2:4])
+    return sign * (hh * 60 + mm)
+
+
+def _split_offset(s: str) -> tuple[str, int, bool]:
+    # Returns (naive_body, offset_minutes, had_offset).
+    if len(s) > 0 and (s[-1] == "Z" or s[-1] == "z"):
+        return (s[0:len(s) - 1], 0, True)
+    sep: int = _find_time_separator(s)
+    if sep == -1:
+        return (s, 0, False)
+    i: int = sep + 1
+    while i < len(s):
+        if s[i] == "+" or s[i] == "-":
+            return (s[0:i], _parse_offset(s[i:]), True)
+        i = i + 1
+    return (s, 0, False)
+
+
+def parse_with_offset(timestr: str, dayfirst: bool = False, yearfirst: bool = False) -> ParseResult:
+    # tz-aware counterpart to `parse()`: strips a trailing `Z`/`+HH:MM`/`-HH:MM`,
+    # parses the naive body, and returns both the naive `datetime` and the
+    # offset in minutes (`None` if the input was naive). Oracle:
+    #   parser.parse('2026-07-10T09:30:00+02:00') -> 09:30:00+02:00  (offset 120)
+    stripped: str = timestr.strip()
+    if len(stripped) == 0:
+        raise ParserError("String does not contain a date: " + repr(timestr))
+    split: tuple[str, int, bool] = _split_offset(stripped)
+    body: str = split[0]
+    naive: datetime = _parse_naive(body, dayfirst, yearfirst)
+    if split[2]:
+        return ParseResult(naive, split[1])
+    return ParseResult(naive, None)
+
+
+def to_utc(pr: ParseResult) -> datetime:
+    # Naive UTC datetime for an offset-bearing ParseResult (UTC == local -
+    # offset). A naive ParseResult is returned unchanged. Oracle:
+    #   '2026-07-10T09:30:00+02:00' -> UTC 2026-07-10 07:30:00.
+    off: Optional[int] = pr.utc_offset_minutes
+    if off is None:
+        return pr.value
+    m: int = off
+    return pr.value + timedelta(minutes=-m)
+
+
+def astimezone_named(pr: ParseResult, zone: str) -> ParseResult:
+    # astimezone-style helper: convert an offset-bearing (or naive-as-UTC)
+    # ParseResult to WALL-CLOCK time in a named IANA zone, via `tzdata`'s
+    # `utc_offset_at`. Returns a ParseResult carrying the target zone's offset.
+    # Oracle (zoneinfo, which tzdata mirrors):
+    #   '2026-07-10T09:30:00+00:00' -> America/New_York = 05:30 (offset -240)
+    #   '2026-01-10T09:30:00+00:00' -> America/New_York = 04:30 (offset -300)
+    #   '2026-07-10T09:30:00+00:00' -> Asia/Kolkata     = 15:00 (offset +330)
+    # CONVERSION MODEL (candidate-selection, DST-transition-correct). tzdata's
+    # `utc_offset_at` is keyed on a naive LOCAL wall time, so UTC->local needs
+    # care: a naive two-step fixed point walks INTO the nonexistent (spring) or
+    # ambiguous (fall-back) local hour and returns a full hour wrong even for an
+    # UNAMBIGUOUS UTC instant. Instead we test the only two possible offsets a
+    # zone can have — its standard and DST offsets — against the UTC instant.
+    #
+    # For each candidate offset `o`, `loc = utc + o` is a candidate wall time;
+    # it is SELF-CONSISTENT iff `utc_offset_at(loc) == o`. Enumerating every
+    # region around a transition (`dst_off > std_off` always — DST springs the
+    # clock forward): deep winter -> only STD is consistent; deep summer / the
+    # instant at & after spring-forward / just before fall-back -> only DST is
+    # consistent; the instant just BEFORE spring-forward -> BOTH are consistent
+    # (the DST candidate is a phantom reading of the nonexistent hour); the
+    # repeated hour just AFTER fall-back -> NEITHER is consistent (tzdata always
+    # reports that local hour as its DST side, but the true UTC instant is STD).
+    # So the DST offset is correct EXACTLY when it is self-consistent AND the
+    # STD offset is not; in every other case (incl. both boundary quirks) the
+    # STD offset is the right answer. Oracle-pinned in tests/oracle_tz_dst.pyrs
+    # against python3 3.12 zoneinfo across both 2026 US transitions.
+    utc: datetime = to_utc(pr)
+    zi: ZoneRule = zone_info(zone)
+    std: int = zi.std_offset_min
+    dst: int = zi.dst_offset_min
+    loc_std: datetime = utc + timedelta(minutes=std)
+    loc_dst: datetime = utc + timedelta(minutes=dst)
+    off_at_std: int = utc_offset_at(zone, loc_std.year, loc_std.month, loc_std.day, loc_std.hour, loc_std.minute)
+    off_at_dst: int = utc_offset_at(zone, loc_dst.year, loc_dst.month, loc_dst.day, loc_dst.hour, loc_dst.minute)
+    std_ok: bool = off_at_std == std
+    dst_ok: bool = off_at_dst == dst
+    if dst_ok and not std_ok:
+        return ParseResult(loc_dst, dst)
+    return ParseResult(loc_std, std)

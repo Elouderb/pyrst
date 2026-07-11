@@ -1,0 +1,62 @@
+# ufunc.pyrs — numpy-style elementwise math free functions over NDArray.
+#
+# Each returns a NEW NDArray of the same shape (value semantics — no in-place).
+# `sqrt`/`log` inherit lib/math's CPython domain checks: sqrt(x<0) and
+# log(x<=0) raise ValueError("math domain error"). f64-only.
+
+from numpyrs.ndarray import NDArray
+import math
+
+
+def absolute(a: NDArray) -> NDArray:
+    buf: list[float] = [0.0] * len(a.data)
+    i: int = 0
+    while i < len(a.data):
+        buf[i] = abs(a.data[i])
+        i += 1
+    return NDArray(buf, a.shape)
+
+
+def sqrt(a: NDArray) -> NDArray:
+    buf: list[float] = [0.0] * len(a.data)
+    i: int = 0
+    while i < len(a.data):
+        buf[i] = math.sqrt(a.data[i])
+        i += 1
+    return NDArray(buf, a.shape)
+
+
+def exp(a: NDArray) -> NDArray:
+    buf: list[float] = [0.0] * len(a.data)
+    i: int = 0
+    while i < len(a.data):
+        buf[i] = math.exp(a.data[i])
+        i += 1
+    return NDArray(buf, a.shape)
+
+
+def log(a: NDArray) -> NDArray:
+    buf: list[float] = [0.0] * len(a.data)
+    i: int = 0
+    while i < len(a.data):
+        buf[i] = math.log(a.data[i])
+        i += 1
+    return NDArray(buf, a.shape)
+
+
+def sin(a: NDArray) -> NDArray:
+    buf: list[float] = [0.0] * len(a.data)
+    i: int = 0
+    while i < len(a.data):
+        buf[i] = math.sin(a.data[i])
+        i += 1
+    return NDArray(buf, a.shape)
+
+
+def cos(a: NDArray) -> NDArray:
+    buf: list[float] = [0.0] * len(a.data)
+    i: int = 0
+    while i < len(a.data):
+        buf[i] = math.cos(a.data[i])
+        i += 1
+    return NDArray(buf, a.shape)

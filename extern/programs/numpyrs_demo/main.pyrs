@@ -1,0 +1,105 @@
+# numpyrs_demo — a real worked example of the numpyrs package
+# (extern/packages/numpyrs/): 2D matrix operations, then a from-scratch
+# gradient-descent linear fit driven entirely by NDArray elementwise ops,
+# scalar methods, and reductions.
+#
+# Build (from this directory):
+#   PYRST_PATH=/home/ethos/Coding/pyrst/extern/packages \
+#     /home/ethos/Coding/pyrst/target/release/pyrst build main.pyrs
+#   ./main
+#
+# See extern/packages/numpyrs/README.md for the full API + value-semantics
+# notes and the two documented compiler GAPs (operator dispatch for `/` `**`;
+# pre-sized list in a nested block).
+
+from numpyrs.ndarray import NDArray
+from numpyrs.constructors import array, array2d, arange
+from numpyrs.ufunc import sqrt
+
+
+def section(title: str) -> None:
+    print("")
+    print("== " + title + " ==")
+
+
+def main() -> None:
+    # ---------------------------------------------------------------
+    # 1. Matrix operations
+    # ---------------------------------------------------------------
+    section("matrix ops")
+    a: NDArray = array2d([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+    b: NDArray = array2d([[7.0, 8.0], [9.0, 10.0], [11.0, 12.0]])
+    print("A (2x3):")
+    print(a)
+    print("B (3x2):")
+    print(b)
+
+    # elementwise on same-shape matrices
+    a2: NDArray = a + a
+    print("A + A:")
+    print(a2)
+    print("A * 3 (scalar):")
+    print(a.muls(3.0))
+
+    # matmul + transpose
+    ab: NDArray = a.dot(b)
+    print("A @ B (2x2):")
+    print(ab)
+    print("A.T (3x2):")
+    print(a.transpose())
+
+    # a reduction over the whole matrix
+    print("sum(A) = " + str(a.sum()) + ", mean(A) = " + str(a.mean()))
+
+    # ---------------------------------------------------------------
+    # 2. Gradient-descent linear fit:  y ~= w*x + b
+    #    True line: y = 2x + 1. We recover w -> 2, b -> 1 from data,
+    #    using ONLY NDArray ops (no hand loops over elements).
+    # ---------------------------------------------------------------
+    section("gradient-descent linear fit")
+    x: NDArray = arange(0.0, 8.0, 1.0)            # [0..7]
+    # y = 2x + 1 exactly (deterministic, so the fit is checkable)
+    y: NDArray = x.muls(2.0).adds(1.0)
+    n: float = float(len(x))
+
+    w: float = 0.0
+    b: float = 0.0
+    lr: float = 0.01
+    epochs: int = 5000
+
+    epoch: int = 0
+    while epoch < epochs:
+        # pred = w*x + b   (scalar broadcast via scalar methods)
+        pred: NDArray = x.muls(w).adds(b)
+        err: NDArray = pred - y                    # dunder '-', same shape
+        # gradients of MSE = mean(err^2):
+        #   dW = 2/n * sum(err * x);  dB = 2/n * sum(err)
+        grad_w: float = 2.0 * (err * x).sum() / n  # dunder '*', reduction
+        grad_b: float = 2.0 * err.sum() / n
+        w = w - lr * grad_w
+        b = b - lr * grad_b
+        epoch += 1
+
+    # final loss (RMSE) via elementwise square + reduction + ufunc sqrt
+    fin_pred: NDArray = x.muls(w).adds(b)
+    fin_err: NDArray = fin_pred - y
+    mse: float = (fin_err * fin_err).mean()
+    rmse: NDArray = sqrt(array([mse]))
+
+    print("fitted w = " + str(w) + " (true 2.0)")
+    print("fitted b = " + str(b) + " (true 1.0)")
+    print("RMSE = " + str(rmse.get(0)))
+
+    # sanity assertions — converged fit must be very close to the true line
+    if w < 1.99 or w > 2.01:
+        print("FAIL: w did not converge to 2.0")
+        assert False
+    if b < 0.99 or b > 1.01:
+        print("FAIL: b did not converge to 1.0")
+        assert False
+    if rmse.get(0) > 0.01:
+        print("FAIL: RMSE too high")
+        assert False
+
+    print("")
+    print("OK: numpyrs_demo (matrix ops + gradient-descent linear fit converged)")

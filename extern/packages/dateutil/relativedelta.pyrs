@@ -1,0 +1,335 @@
+# relativedelta.pyrs — pyrst-dateutil's `dateutil.relativedelta` subset
+# (card 0223a4b8). CORE IMPL (complex-implementer).
+#
+# ORACLE: python3 3.12's `dateutil.relativedelta` 2.9.0. Every shipped
+# behavior below is pinned against it (probe commands in tests/comments).
+#
+# APPLYING A relativedelta TO A datetime — OPERAND-ORDER DIVERGENCE.
+# CPython dateutil supports BOTH `dt + rd` and `rd + dt` (via the reflected
+# `__radd__`). pyrst has no reflected dunders and `datetime.__add__` only
+# accepts a `timedelta`, so `dt + rd` (datetime on the LEFT) does NOT compile.
+# Here the relativedelta must be on the LEFT: `rd + dt` (routes to
+# `relativedelta.__add__(self, other: datetime) -> datetime`), or use the
+# readable alias `rd.apply(dt)`. Subtraction (`dt - rd` in CPython, via the
+# relativedelta's own `__rsub__`) is spelled `rd.subtract_from(dt)` here
+# (== `dt + (-rd)`), since pyrst also has no reflected `-`.
+#
+# WEEKDAY CONSTANTS — `MO`..`SU` are plain `int` (0=Mon..6=Sun); the callable
+# `MO(+1)` form is `Weekday(MO, 1)` (no `__call__` dunder in pyrst).
+
+from datetime import datetime, timedelta
+
+
+MO: int = 0
+TU: int = 1
+WE: int = 2
+TH: int = 3
+FR: int = 4
+SA: int = 5
+SU: int = 6
+
+
+def _is_leap(y: int) -> bool:
+    return (y % 4 == 0 and y % 100 != 0) or (y % 400 == 0)
+
+
+def _days_in_month(y: int, m: int) -> int:
+    if m == 2:
+        if _is_leap(y):
+            return 29
+        return 28
+    if m == 4 or m == 6 or m == 9 or m == 11:
+        return 30
+    return 31
+
+
+def _norm_carry(value: int, base: int) -> tuple[int, int]:
+    # Trunc-toward-zero divmod, matching dateutil's `_fix()` sign handling:
+    # returns (carry, remainder) such that carry*base + remainder == value and
+    # remainder has the same sign as value (or is 0).
+    s: int = 1
+    v: int = value
+    if v < 0:
+        s = -1
+        v = -v
+    carry: int = (v // base) * s
+    rem: int = (v % base) * s
+    return (carry, rem)
+
+
+def _mod7(x: int) -> int:
+    return ((x % 7) + 7) % 7
+
+
+class Weekday:
+    # The nth-occurrence-of-a-weekday value dateutil spells `MO(+1)` /
+    # `FR(-1)` (last Friday). `n is None` means "the nearest occurrence"
+    # (dateutil treats a bare `MO` as nth == 1 when used as `weekday=`).
+    weekday: int
+    n: Optional[int]
+
+    def __init__(self, weekday: int, n: Optional[int] = None) -> None:
+        self.weekday = weekday
+        self.n = n
+
+
+class relativedelta:
+    # Relative (additive, can be negative) components — NORMALIZED at
+    # construction (dateutil's `_fix()`): us->sec->min->hour->day cascade and
+    # months->years carry; `days` never folds into months (a month is
+    # calendar-variable). Oracle: relativedelta(months=14) -> years=1,months=2;
+    # relativedelta(seconds=3661) -> hours=1,minutes=1,seconds=1;
+    # relativedelta(days=1, hours=25) -> days=2, hours=1.
+    years: int
+    months: int
+    days: int
+    hours: int
+    minutes: int
+    seconds: int
+    microseconds: int
+    # Absolute (replace-on-apply) components — dateutil's singular kwargs.
+    # `None` means "leave this field alone when applying".
+    year: Optional[int]
+    month: Optional[int]
+    day: Optional[int]
+    hour: Optional[int]
+    minute: Optional[int]
+    second: Optional[int]
+    microsecond: Optional[int]
+    weekday: Optional[Weekday]
+
+    def __init__(
+        self,
+        years: int = 0,
+        months: int = 0,
+        days: int = 0,
+        hours: int = 0,
+        minutes: int = 0,
+        seconds: int = 0,
+        microseconds: int = 0,
+        year: Optional[int] = None,
+        month: Optional[int] = None,
+        day: Optional[int] = None,
+        hour: Optional[int] = None,
+        minute: Optional[int] = None,
+        second: Optional[int] = None,
+        microsecond: Optional[int] = None,
+        weekday: Optional[Weekday] = None
+    ) -> None:
+        # _fix() normalization cascade (see class doc for oracle pins).
+        r0: tuple[int, int] = _norm_carry(microseconds, 1000000)
+        self.microseconds = r0[1]
+        r1: tuple[int, int] = _norm_carry(seconds + r0[0], 60)
+        self.seconds = r1[1]
+        r2: tuple[int, int] = _norm_carry(minutes + r1[0], 60)
+        self.minutes = r2[1]
+        r3: tuple[int, int] = _norm_carry(hours + r2[0], 24)
+        self.hours = r3[1]
+        self.days = days + r3[0]
+        r4: tuple[int, int] = _norm_carry(months, 12)
+        self.months = r4[1]
+        self.years = years + r4[0]
+        self.year = year
+        self.month = month
+        self.day = day
+        self.hour = hour
+        self.minute = minute
+        self.second = second
+        self.microsecond = microsecond
+        self.weekday = weekday
+
+    def apply(self, other: datetime) -> datetime:
+        # dateutil's `__radd__` order: absolute-or-base year/month + relative
+        # years/months (12-wrap), then day = min(days_in_month, abs-or-base
+        # day) [END-OF-MONTH CLAMP], then absolute hour/min/sec/us replace,
+        # then + timedelta(relative days/h/m/s/us), then weekday nth adjust.
+        # Oracle: datetime(2026,1,31) + rd(months=1) -> 2026-02-28;
+        #         datetime(2026,1,31) + rd(months=1, days=1) -> 2026-03-01.
+        a_year: Optional[int] = self.year
+        base_year: int = other.year
+        if a_year is not None:
+            base_year: int = a_year
+        year: int = base_year + self.years
+        a_month: Optional[int] = self.month
+        base_month: int = other.month
+        if a_month is not None:
+            base_month: int = a_month
+        month: int = base_month + self.months
+        while month > 12:
+            month = month - 12
+            year = year + 1
+        while month < 1:
+            month = month + 12
+            year = year - 1
+        a_day: Optional[int] = self.day
+        base_day: int = other.day
+        if a_day is not None:
+            base_day: int = a_day
+        dim: int = _days_in_month(year, month)
+        day: int = base_day
+        if day > dim:
+            day = dim
+        a_hour: Optional[int] = self.hour
+        hour: int = other.hour
+        if a_hour is not None:
+            hour: int = a_hour
+        a_minute: Optional[int] = self.minute
+        minute: int = other.minute
+        if a_minute is not None:
+            minute: int = a_minute
+        a_second: Optional[int] = self.second
+        second: int = other.second
+        if a_second is not None:
+            second: int = a_second
+        a_micro: Optional[int] = self.microsecond
+        micro: int = other.microsecond
+        if a_micro is not None:
+            micro: int = a_micro
+        result: datetime = datetime(year, month, day, hour, minute, second, micro)
+        result = result + timedelta(
+            days=self.days,
+            hours=self.hours,
+            minutes=self.minutes,
+            seconds=self.seconds,
+            microseconds=self.microseconds
+        )
+        a_wd: Optional[Weekday] = self.weekday
+        if a_wd is not None:
+            wd: Weekday = a_wd
+            a_n: Optional[int] = wd.n
+            nth: int = 1
+            if a_n is not None:
+                nth: int = a_n
+            target: int = wd.weekday
+            an: int = nth
+            if an < 0:
+                an = -an
+            jump: int = (an - 1) * 7
+            cur: int = result.weekday()
+            if nth > 0:
+                jump = jump + _mod7(target - cur)
+            else:
+                jump = jump + _mod7(cur - target)
+                jump = -jump
+            result = result + timedelta(days=jump)
+        return result
+
+    def __add__(self, other: datetime) -> datetime:
+        # `rd + dt` (relativedelta on the LEFT) — see module header for why
+        # `dt + rd` is not available. Delegates to `apply`.
+        return self.apply(other)
+
+    def negate(self) -> relativedelta:
+        # dateutil's `__neg__`: negate the RELATIVE fields; keep the ABSOLUTE
+        # fields and `weekday` unchanged.
+        return relativedelta(
+            years=-self.years,
+            months=-self.months,
+            days=-self.days,
+            hours=-self.hours,
+            minutes=-self.minutes,
+            seconds=-self.seconds,
+            microseconds=-self.microseconds,
+            year=self.year,
+            month=self.month,
+            day=self.day,
+            hour=self.hour,
+            minute=self.minute,
+            second=self.second,
+            microsecond=self.microsecond,
+            weekday=self.weekday
+        )
+
+    def subtract_from(self, other: datetime) -> datetime:
+        # `dt - rd` in CPython dateutil (its `__rsub__`) — spelled here as
+        # `rd.subtract_from(dt)` == `dt + (-rd)`.
+        return self.negate().apply(other)
+
+    def __str__(self) -> str:
+        parts: list[str] = []
+        if self.years != 0:
+            parts.append("years=" + _signed(self.years))
+        if self.months != 0:
+            parts.append("months=" + _signed(self.months))
+        if self.days != 0:
+            parts.append("days=" + _signed(self.days))
+        if self.hours != 0:
+            parts.append("hours=" + _signed(self.hours))
+        if self.minutes != 0:
+            parts.append("minutes=" + _signed(self.minutes))
+        if self.seconds != 0:
+            parts.append("seconds=" + _signed(self.seconds))
+        if self.microseconds != 0:
+            parts.append("microseconds=" + _signed(self.microseconds))
+        joined: str = ""
+        i: int = 0
+        while i < len(parts):
+            if i > 0:
+                joined = joined + ", "
+            joined = joined + parts[i]
+            i = i + 1
+        return "relativedelta(" + joined + ")"
+
+
+def _signed(v: int) -> str:
+    if v >= 0:
+        return "+" + str(v)
+    return str(v)
+
+
+def _apply_ym(other: datetime, years: int, months: int) -> datetime:
+    # Apply ONLY a year/month shift (with end-of-month day clamp), preserving
+    # the time-of-day — the helper `relativedelta_between` steps with.
+    year: int = other.year + years
+    month: int = other.month + months
+    while month > 12:
+        month = month - 12
+        year = year + 1
+    while month < 1:
+        month = month + 12
+        year = year - 1
+    dim: int = _days_in_month(year, month)
+    day: int = other.day
+    if day > dim:
+        day = dim
+    return datetime(year, month, day, other.hour, other.minute, other.second, other.microsecond)
+
+
+def relativedelta_between(dt1: datetime, dt2: datetime) -> relativedelta:
+    # dateutil's two-datetime constructor form `relativedelta(dt1, dt2)`: the
+    # relativedelta `r` such that `r.apply(dt2) == dt1`. (pyrst has no
+    # constructor overloading, so this is a free factory rather than a second
+    # `relativedelta(...)` call shape.) Oracle:
+    #   relativedelta(datetime(2026,3,1), datetime(2026,1,31))
+    #     -> relativedelta(months=+1, days=+1)
+    #   relativedelta(datetime(2028,7,10,12,30), datetime(2026,1,5,9,0))
+    #     -> relativedelta(years=+2, months=+6, days=+5, hours=+3, minutes=+30)
+    months: int = (dt1.year - dt2.year) * 12 + (dt1.month - dt2.month)
+    split: tuple[int, int] = _norm_carry(months, 12)
+    dtm: datetime = _apply_ym(dt2, split[0], split[1])
+    if dt1 < dt2:
+        while dtm < dt1:
+            months = months + 1
+            split = _norm_carry(months, 12)
+            dtm = _apply_ym(dt2, split[0], split[1])
+    else:
+        while dt1 < dtm:
+            months = months - 1
+            split = _norm_carry(months, 12)
+            dtm = _apply_ym(dt2, split[0], split[1])
+    # Fold the residual sub-month remainder into ONE signed seconds total
+    # (matching real dateutil: `self.seconds = delta.seconds + delta.days*86400`)
+    # and let the `relativedelta` constructor's sign-aware `_fix()` cascade split
+    # it back into days/hours/minutes/seconds. Do NOT pre-decompose delta.days and
+    # delta.seconds independently: a Python `timedelta` normalizes to 0 <= seconds
+    # < 86400 with a possibly-NEGATIVE `days`, so for dt1 < dt2 the two carry
+    # opposite signs and an independent split yields numerically-equal but
+    # field-wrong results (e.g. days=-1,h=23,m=59,s=59 instead of seconds=-1).
+    delta: timedelta = dt1 - dtm
+    total_seconds: int = delta.seconds + delta.days * 86400
+    return relativedelta(
+        years=split[0],
+        months=split[1],
+        seconds=total_seconds,
+        microseconds=delta.microseconds
+    )

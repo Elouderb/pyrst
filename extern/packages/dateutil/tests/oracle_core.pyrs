@@ -1,0 +1,282 @@
+# oracle_core.pyrs — pyrst-dateutil CORE oracle matrix (card 0223a4b8).
+#
+# Every expected value below is pinned against python3 3.12 dateutil 2.9.0 /
+# zoneinfo (probe commands in the module headers of parser/relativedelta/
+# rrule and the card comments). Prints PASS on all-match, else FAIL lines +
+# exit 1 (this repo's test-program convention).
+#
+# Build from THIS directory:
+#   PYRST_PATH=/home/ethos/Coding/pyrst/extern/packages \
+#     /home/ethos/Coding/pyrst/target/release/pyrst build tests/oracle_core.pyrs
+#   ./oracle_core
+
+import sys
+from datetime import datetime
+from dateutil.parser import (
+    parse, parse_with_offset, to_utc, astimezone_named, ParseResult, ParserError
+)
+from dateutil.relativedelta import (
+    relativedelta, relativedelta_between, Weekday, MO, TU, WE, TH, FR, SA, SU
+)
+from dateutil.rrule import (
+    rrule, materialize, DAILY, WEEKLY, MONTHLY, YEARLY, HOURLY
+)
+
+
+def ck_str(label: str, got: str, want: str, failures: Mut[list[str]]) -> None:
+    if got != want:
+        failures.append(label + ": got " + repr(got) + ", want " + repr(want))
+
+
+def ck_int(label: str, got: int, want: int, failures: Mut[list[str]]) -> None:
+    if got != want:
+        failures.append(label + ": got " + str(got) + ", want " + str(want))
+
+
+def ck_parse(s: str, want_iso: str, failures: Mut[list[str]]) -> None:
+    ck_str("parse(" + repr(s) + ")", parse(s).isoformat(), want_iso, failures)
+
+
+def ck_parse_df_yf(s: str, df: bool, yf: bool, want_iso: str, failures: Mut[list[str]]) -> None:
+    got: str = parse(s, dayfirst=df, yearfirst=yf).isoformat()
+    ck_str("parse(" + repr(s) + ",df=" + str(df) + ",yf=" + str(yf) + ")", got, want_iso, failures)
+
+
+def ck_err(s: str, failures: Mut[list[str]]) -> None:
+    caught: bool = False
+    try:
+        parse(s)
+    except ParserError:
+        caught = True
+    if not caught:
+        failures.append("parse(" + repr(s) + ") should raise ParserError")
+
+
+def fmt_list(xs: list[datetime]) -> str:
+    out: str = ""
+    i: int = 0
+    while i < len(xs):
+        if i > 0:
+            out = out + "|"
+        out = out + xs[i].isoformat()
+        i = i + 1
+    return out
+
+
+def ck_rrule(label: str, rule: rrule, limit: int, want: str, failures: Mut[list[str]]) -> None:
+    ck_str(label, fmt_list(materialize(rule, limit)), want, failures)
+
+
+def main() -> None:
+    failures: list[str] = []
+
+    # ── PARSER: ISO + numeric + textual ──────────────────────────────────
+    ck_parse("2026-07-10", "2026-07-10T00:00:00", failures)
+    ck_parse("2026-07-10T09:30:00", "2026-07-10T09:30:00", failures)
+    ck_parse("2026/07/10", "2026-07-10T00:00:00", failures)
+    ck_parse("07/10/2026", "2026-07-10T00:00:00", failures)
+    ck_parse("7/10/2026", "2026-07-10T00:00:00", failures)
+    ck_parse("10/07/2026", "2026-10-07T00:00:00", failures)
+    ck_parse("01/02/03", "2003-01-02T00:00:00", failures)
+    ck_parse("10.07.2026", "2026-10-07T00:00:00", failures)
+    ck_parse("10-07-2026", "2026-10-07T00:00:00", failures)
+    ck_parse("07/10/26", "2026-07-10T00:00:00", failures)
+    ck_parse("31/12/2026", "2026-12-31T00:00:00", failures)
+    ck_parse("Jan 10, 2026", "2026-01-10T00:00:00", failures)
+    ck_parse("January 10, 2026", "2026-01-10T00:00:00", failures)
+    ck_parse("10 January 2026", "2026-01-10T00:00:00", failures)
+    ck_parse("10 Jan 2026", "2026-01-10T00:00:00", failures)
+    ck_parse("Jul 4 2026", "2026-07-04T00:00:00", failures)
+    ck_parse("2026 Jul 4", "2026-07-04T00:00:00", failures)
+    ck_parse("March 5, 2026 14:30", "2026-03-05T14:30:00", failures)
+    ck_parse("5 Mar 2026 14:30:15", "2026-03-05T14:30:15", failures)
+    ck_parse("2026-07-10 09:30", "2026-07-10T09:30:00", failures)
+    ck_parse("07/10/2026 14:30", "2026-07-10T14:30:00", failures)
+
+    # dayfirst / yearfirst ambiguity matrix (oracle-pinned on 01/02/03).
+    ck_parse_df_yf("01/02/03", False, False, "2003-01-02T00:00:00", failures)
+    ck_parse_df_yf("01/02/03", True, False, "2003-02-01T00:00:00", failures)
+    ck_parse_df_yf("01/02/03", False, True, "2001-02-03T00:00:00", failures)
+    ck_parse_df_yf("01/02/03", True, True, "2001-03-02T00:00:00", failures)
+    ck_parse_df_yf("10/07/2026", True, False, "2026-07-10T00:00:00", failures)
+    ck_parse_df_yf("31/12/2026", True, False, "2026-12-31T00:00:00", failures)
+
+    # Honest ParserError (never a silent guess).
+    ck_err("", failures)
+    ck_err("not a date", failures)
+    ck_err("13/45/2026", failures)
+    ck_err("2026-13-01", failures)
+    ck_err("2026-07-10T09:30:00Z", failures)  # tz-bearing -> use parse_with_offset
+
+    # ── TZ GLUE: parse_with_offset / to_utc / astimezone_named ───────────
+    pr_z: ParseResult = parse_with_offset("2026-07-10T09:30:00Z")
+    ck_str("pwo(Z).value", pr_z.value.isoformat(), "2026-07-10T09:30:00", failures)
+    off_z: Optional[int] = pr_z.utc_offset_minutes
+    if off_z is None:
+        failures.append("pwo(Z).offset should be 0, got None")
+    else:
+        ck_int("pwo(Z).offset", off_z, 0, failures)
+
+    pr_p2: ParseResult = parse_with_offset("2026-07-10T09:30:00+02:00")
+    off_p2: Optional[int] = pr_p2.utc_offset_minutes
+    if off_p2 is None:
+        failures.append("pwo(+02:00).offset None")
+    else:
+        ck_int("pwo(+02:00).offset", off_p2, 120, failures)
+    ck_str("to_utc(+02:00)", to_utc(pr_p2).isoformat(), "2026-07-10T07:30:00", failures)
+
+    pr_m5: ParseResult = parse_with_offset("2026-07-10T09:30:00-05:00")
+    off_m5: Optional[int] = pr_m5.utc_offset_minutes
+    if off_m5 is None:
+        failures.append("pwo(-05:00).offset None")
+    else:
+        ck_int("pwo(-05:00).offset", off_m5, -300, failures)
+    ck_str("to_utc(-05:00)", to_utc(pr_m5).isoformat(), "2026-07-10T14:30:00", failures)
+
+    pr_basic: ParseResult = parse_with_offset("2026-07-10T09:30:00+0200")
+    off_basic: Optional[int] = pr_basic.utc_offset_minutes
+    if off_basic is None:
+        failures.append("pwo(+0200).offset None")
+    else:
+        ck_int("pwo(+0200).offset", off_basic, 120, failures)
+
+    pr_naive: ParseResult = parse_with_offset("2026-07-10T09:30:00")
+    if pr_naive.utc_offset_minutes is not None:
+        failures.append("pwo(naive).offset should be None")
+
+    # astimezone_named via tzdata (zoneinfo oracle).
+    ny_summer: ParseResult = astimezone_named(parse_with_offset("2026-07-10T09:30:00Z"), "America/New_York")
+    ck_str("aztz(NY,summer).value", ny_summer.value.isoformat(), "2026-07-10T05:30:00", failures)
+    ny_off: Optional[int] = ny_summer.utc_offset_minutes
+    if ny_off is None:
+        failures.append("aztz(NY,summer).offset None")
+    else:
+        ck_int("aztz(NY,summer).offset", ny_off, -240, failures)
+    ny_winter: ParseResult = astimezone_named(parse_with_offset("2026-01-10T09:30:00Z"), "America/New_York")
+    ck_str("aztz(NY,winter).value", ny_winter.value.isoformat(), "2026-01-10T04:30:00", failures)
+    kol: ParseResult = astimezone_named(parse_with_offset("2026-07-10T09:30:00Z"), "Asia/Kolkata")
+    ck_str("aztz(Kolkata).value", kol.value.isoformat(), "2026-07-10T15:00:00", failures)
+
+    # ── RELATIVEDELTA: normalization (_fix) ──────────────────────────────
+    rd_a: relativedelta = relativedelta(months=14)
+    ck_int("rd(months=14).years", rd_a.years, 1, failures)
+    ck_int("rd(months=14).months", rd_a.months, 2, failures)
+    rd_b: relativedelta = relativedelta(months=-14)
+    ck_int("rd(months=-14).years", rd_b.years, -1, failures)
+    ck_int("rd(months=-14).months", rd_b.months, -2, failures)
+    rd_c: relativedelta = relativedelta(hours=25)
+    ck_int("rd(hours=25).days", rd_c.days, 1, failures)
+    ck_int("rd(hours=25).hours", rd_c.hours, 1, failures)
+    rd_d: relativedelta = relativedelta(seconds=3661)
+    ck_int("rd(sec=3661).hours", rd_d.hours, 1, failures)
+    ck_int("rd(sec=3661).minutes", rd_d.minutes, 1, failures)
+    ck_int("rd(sec=3661).seconds", rd_d.seconds, 1, failures)
+    rd_e: relativedelta = relativedelta(days=1, hours=25)
+    ck_int("rd(days=1,hours=25).days", rd_e.days, 2, failures)
+    ck_int("rd(days=1,hours=25).hours", rd_e.hours, 1, failures)
+    rd_f: relativedelta = relativedelta(years=1, months=13)
+    ck_int("rd(years=1,months=13).years", rd_f.years, 2, failures)
+    ck_int("rd(years=1,months=13).months", rd_f.months, 1, failures)
+
+    # ── RELATIVEDELTA: apply (end-of-month clamp, order, weekday) ─────────
+    ck_str("Jan31+1mo", relativedelta(months=1).apply(datetime(2026, 1, 31)).isoformat(), "2026-02-28T00:00:00", failures)
+    # also via `rd + dt` operator form (relativedelta on the LEFT)
+    ck_str("Jan31+1mo(op)", (relativedelta(months=1) + datetime(2026, 1, 31)).isoformat(), "2026-02-28T00:00:00", failures)
+    ck_str("Jan31+13mo", relativedelta(months=13).apply(datetime(2026, 1, 31)).isoformat(), "2027-02-28T00:00:00", failures)
+    ck_str("Feb29+1yr", relativedelta(years=1).apply(datetime(2020, 2, 29)).isoformat(), "2021-02-28T00:00:00", failures)
+    ck_str("Mar31-1mo", relativedelta(months=-1).apply(datetime(2026, 3, 31)).isoformat(), "2026-02-28T00:00:00", failures)
+    ck_str("Jan31+1mo1d", relativedelta(months=1, days=1).apply(datetime(2026, 1, 31)).isoformat(), "2026-03-01T00:00:00", failures)
+    ck_str("t+25h45m", relativedelta(hours=25, minutes=45).apply(datetime(2026, 7, 10, 9, 30)).isoformat(), "2026-07-11T11:15:00", failures)
+    ck_str("Dec31+1d", relativedelta(days=1).apply(datetime(2026, 12, 31)).isoformat(), "2027-01-01T00:00:00", failures)
+    ck_str("Jan15 day=31", relativedelta(day=31).apply(datetime(2026, 1, 15)).isoformat(), "2026-01-31T00:00:00", failures)
+    ck_str("Feb15 day=31", relativedelta(day=31).apply(datetime(2026, 2, 15)).isoformat(), "2026-02-28T00:00:00", failures)
+    ck_str("Fri+wdMO", relativedelta(weekday=Weekday(MO)).apply(datetime(2026, 7, 10)).isoformat(), "2026-07-13T00:00:00", failures)
+    ck_str("Fri+wdMO1", relativedelta(weekday=Weekday(MO, 1)).apply(datetime(2026, 7, 10)).isoformat(), "2026-07-13T00:00:00", failures)
+    ck_str("Fri+wdFR-1", relativedelta(weekday=Weekday(FR, -1)).apply(datetime(2026, 7, 10)).isoformat(), "2026-07-10T00:00:00", failures)
+    ck_str("Fri+1mo+wdMO", relativedelta(months=1, weekday=Weekday(MO)).apply(datetime(2026, 7, 10)).isoformat(), "2026-08-10T00:00:00", failures)
+    ck_str("2nd Mon", relativedelta(weekday=Weekday(MO, 2)).apply(datetime(2026, 7, 10)).isoformat(), "2026-07-20T00:00:00", failures)
+    ck_str("2nd-last Fri", relativedelta(weekday=Weekday(FR, -2)).apply(datetime(2026, 7, 31)).isoformat(), "2026-07-24T00:00:00", failures)
+    ck_str("1mo+3rd Tue", relativedelta(months=1, weekday=Weekday(TU, 3)).apply(datetime(2026, 7, 10)).isoformat(), "2026-08-25T00:00:00", failures)
+    ck_str("absolute ymd", relativedelta(year=2030, month=2, day=15).apply(datetime(2026, 7, 10)).isoformat(), "2030-02-15T00:00:00", failures)
+
+    # subtract_from (dt - rd in CPython).
+    ck_str("2027-01-01 - 1d", relativedelta(days=1).subtract_from(datetime(2027, 1, 1)).isoformat(), "2026-12-31T00:00:00", failures)
+    ck_str("2026-03-31 - 1mo", relativedelta(months=1).subtract_from(datetime(2026, 3, 31)).isoformat(), "2026-02-28T00:00:00", failures)
+
+    # ── RELATIVEDELTA: between two datetimes ─────────────────────────────
+    rb1: relativedelta = relativedelta_between(datetime(2026, 3, 1), datetime(2026, 1, 31))
+    ck_int("between1.months", rb1.months, 1, failures)
+    ck_int("between1.days", rb1.days, 1, failures)
+    ck_int("between1.years", rb1.years, 0, failures)
+    rb2: relativedelta = relativedelta_between(datetime(2028, 7, 10, 12, 30), datetime(2026, 1, 5, 9, 0))
+    ck_int("between2.years", rb2.years, 2, failures)
+    ck_int("between2.months", rb2.months, 6, failures)
+    ck_int("between2.days", rb2.days, 5, failures)
+    ck_int("between2.hours", rb2.hours, 3, failures)
+    ck_int("between2.minutes", rb2.minutes, 30, failures)
+    rb3: relativedelta = relativedelta_between(datetime(2026, 1, 31), datetime(2026, 3, 1))
+    ck_int("between3.months", rb3.months, -1, failures)
+    ck_int("between3.days", rb3.days, -1, failures)
+    # round-trip identity: between(a,b).apply(b) == a
+    ck_str("between2 round-trip", rb2.apply(datetime(2026, 1, 5, 9, 0)).isoformat(), "2028-07-10T12:30:00", failures)
+
+    # ── RRULE: DAILY/WEEKLY/MONTHLY/YEARLY matrix ────────────────────────
+    ck_rrule("DAILY count5", rrule(DAILY, datetime(2026, 7, 10), count=5), 10,
+             "2026-07-10T00:00:00|2026-07-11T00:00:00|2026-07-12T00:00:00|2026-07-13T00:00:00|2026-07-14T00:00:00", failures)
+    ck_rrule("DAILY iv2 count4", rrule(DAILY, datetime(2026, 7, 10), interval=2, count=4), 10,
+             "2026-07-10T00:00:00|2026-07-12T00:00:00|2026-07-14T00:00:00|2026-07-16T00:00:00", failures)
+    ck_rrule("DAILY until", rrule(DAILY, datetime(2026, 7, 10), until=datetime(2026, 7, 13)), 50,
+             "2026-07-10T00:00:00|2026-07-11T00:00:00|2026-07-12T00:00:00|2026-07-13T00:00:00", failures)
+    ck_rrule("WEEKLY count3", rrule(WEEKLY, datetime(2026, 7, 6), count=3), 10,
+             "2026-07-06T00:00:00|2026-07-13T00:00:00|2026-07-20T00:00:00", failures)
+    ck_rrule("WEEKLY MWF count5", rrule(WEEKLY, datetime(2026, 7, 6), count=5, byweekday=[MO, WE, FR]), 10,
+             "2026-07-06T00:00:00|2026-07-08T00:00:00|2026-07-10T00:00:00|2026-07-13T00:00:00|2026-07-15T00:00:00", failures)
+    ck_rrule("WEEKLY iv2 count3", rrule(WEEKLY, datetime(2026, 7, 6), interval=2, count=3), 10,
+             "2026-07-06T00:00:00|2026-07-20T00:00:00|2026-08-03T00:00:00", failures)
+    ck_rrule("MONTHLY count4", rrule(MONTHLY, datetime(2026, 1, 15), count=4), 10,
+             "2026-01-15T00:00:00|2026-02-15T00:00:00|2026-03-15T00:00:00|2026-04-15T00:00:00", failures)
+    ck_rrule("MONTHLY bmd[1,15] count5", rrule(MONTHLY, datetime(2026, 1, 1), count=5, bymonthday=[1, 15]), 10,
+             "2026-01-01T00:00:00|2026-01-15T00:00:00|2026-02-01T00:00:00|2026-02-15T00:00:00|2026-03-01T00:00:00", failures)
+    ck_rrule("MONTHLY Jan31 skip", rrule(MONTHLY, datetime(2026, 1, 31), count=4), 10,
+             "2026-01-31T00:00:00|2026-03-31T00:00:00|2026-05-31T00:00:00|2026-07-31T00:00:00", failures)
+    ck_rrule("MONTHLY bmd[-1] count3", rrule(MONTHLY, datetime(2026, 1, 1), count=3, bymonthday=[-1]), 10,
+             "2026-01-31T00:00:00|2026-02-28T00:00:00|2026-03-31T00:00:00", failures)
+    ck_rrule("MONTHLY bmd[15,31] count6", rrule(MONTHLY, datetime(2026, 1, 1), count=6, bymonthday=[15, 31]), 10,
+             "2026-01-15T00:00:00|2026-01-31T00:00:00|2026-02-15T00:00:00|2026-03-15T00:00:00|2026-03-31T00:00:00|2026-04-15T00:00:00", failures)
+    ck_rrule("YEARLY count3", rrule(YEARLY, datetime(2026, 2, 28), count=3), 10,
+             "2026-02-28T00:00:00|2027-02-28T00:00:00|2028-02-28T00:00:00", failures)
+    ck_rrule("YEARLY Feb29 leap", rrule(YEARLY, datetime(2024, 2, 29), count=3), 10,
+             "2024-02-29T00:00:00|2028-02-29T00:00:00|2032-02-29T00:00:00", failures)
+    ck_rrule("WEEKLY TU,TH until", rrule(WEEKLY, datetime(2026, 7, 6), until=datetime(2026, 7, 20), byweekday=[TU, TH]), 50,
+             "2026-07-07T00:00:00|2026-07-09T00:00:00|2026-07-14T00:00:00|2026-07-16T00:00:00", failures)
+    ck_rrule("DAILY SA,SU count6", rrule(DAILY, datetime(2026, 7, 6), count=6, byweekday=[SA, SU]), 20,
+             "2026-07-11T00:00:00|2026-07-12T00:00:00|2026-07-18T00:00:00|2026-07-19T00:00:00|2026-07-25T00:00:00|2026-07-26T00:00:00", failures)
+    # materialize bounds an unbounded (count-less, until-less) rule.
+    ck_rrule("DAILY unbounded limit3", rrule(DAILY, datetime(2026, 7, 10)), 3,
+             "2026-07-10T00:00:00|2026-07-11T00:00:00|2026-07-12T00:00:00", failures)
+
+    # rrule scope guards (honest NotImplementedError, never silent).
+    caught_freq: bool = False
+    try:
+        rrule(HOURLY, datetime(2026, 7, 10), count=1)
+    except NotImplementedError:
+        caught_freq = True
+    if not caught_freq:
+        failures.append("rrule(HOURLY) should raise NotImplementedError")
+    caught_bmd: bool = False
+    try:
+        rrule(WEEKLY, datetime(2026, 7, 10), count=1, bymonthday=[1])
+    except NotImplementedError:
+        caught_bmd = True
+    if not caught_bmd:
+        failures.append("rrule(WEEKLY, bymonthday=) should raise NotImplementedError")
+
+    if len(failures) == 0:
+        print("PASS: oracle_core")
+    else:
+        for f in failures:
+            print("FAIL: " + f)
+        sys.exit(1)
+
+
+main()

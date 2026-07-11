@@ -1,0 +1,215 @@
+# data.pyrs — tzdata zone tables (card 965bf13f).
+#
+# SCOPE: the ZoneRule/TransitionRule shapes that `api.pyrs` consumes, plus the
+# curated zone table: 48 named major zones (all major US/Canada, EU, APAC,
+# selected Latin America + UTC) and a complete Etc/GMT+12..Etc/GMT-12 fixed
+# offset family (26 rows) — 74 zones total.
+#
+# CURATION POLICY (see README.md for the prose version):
+#   * MODERN rules only. A DST zone is modeled by its CURRENT recurring rule (a
+#     "Nth/last <weekday> of <month> at <wall-clock minute>" recurrence), not a
+#     historical transition ledger. Zones that abolished DST in the modern era
+#     (Brazil 2019, Mexico 2022, Turkey/Russia, Iran 2022) ship as their
+#     post-abolition CONSTANT offset — honest for present/near-future queries,
+#     not for pre-abolition history.
+#   * EXCLUDED: Asia/Jerusalem — Israel's spring rule is "the Friday BEFORE the
+#     last Sunday of March", which the nth/last-weekday model cannot express
+#     (last-Friday != Friday-before-last-Sunday in general). Per policy an
+#     irregular zone is excluded rather than shipped subtly wrong.
+#
+# ORACLE / VERIFICATION: every offset and transition rule below was extracted
+# and cross-checked against python3.12 `zoneinfo`. The rule model in `api.pyrs`
+# was mirrored in Python and validated against zoneinfo over ALL 74 zones x
+# 2023-2030 x 4 local times/day = 864,896 offset comparisons + 135,198 is_dst
+# comparisons, ZERO mismatches (skipping only the exact ambiguous/nonexistent
+# local hour at a transition, where zoneinfo's fold=0 and fold=1 offsets
+# disagree — see the RULE MODEL note below). Per-family oracle offsets are
+# pinned in the comments; the full harness lived at scratchpad/validate.py.
+#
+# RULE MODEL (documented simplification): a zone's DST transition is a
+# `TransitionRule` — "the Nth (or last) <weekday> of <month>, at <minute-of-day>
+# local wall-clock time" — read using IANA default wall-clock semantics (the
+# offset in effect just before the transition). `api.pyrs.utc_offset_at`
+# compares the caller's naive local wall-clock against both rules' wall-clock
+# instants for the queried year. It does NOT disambiguate the ambiguous
+# (fall-back) or nonexistent (spring-forward) local hour the way CPython's
+# `fold` parameter does — callers querying exactly that hour get one consistent
+# side of the fold, not CPython's specific pick. This is the single documented
+# divergence (flagged, not silent); every other local instant matches zoneinfo.
+
+class TransitionRule:
+    month: int          # 1-12
+    week: int           # 1..4 = the Nth occurrence of `weekday` in `month`; -1 = the LAST occurrence
+    weekday: int         # 0=Monday .. 6=Sunday (matches python's date.weekday())
+    local_time_min: int  # minutes after local midnight (wall clock) when the transition occurs
+                         # (1440 == 24:00, i.e. midnight at the START of the following day)
+
+    def __init__(self, month: int, week: int, weekday: int, local_time_min: int) -> None:
+        self.month = month
+        self.week = week
+        self.weekday = weekday
+        self.local_time_min = local_time_min
+
+
+class ZoneRule:
+    name: str              # IANA zone name, e.g. "America/New_York"
+    std_offset_min: int    # standard (winter / non-DST) UTC offset, in minutes (can be negative)
+    dst_offset_min: int    # DST (summer) UTC offset, in minutes; == std_offset_min when has_dst is False
+    has_dst: bool           # whether this zone observes a DST transition
+    dst_start: Optional[TransitionRule]  # local std time -> DST transition rule; None iff not has_dst
+    dst_end: Optional[TransitionRule]    # local DST time -> std transition rule; None iff not has_dst
+
+    def __init__(
+        self,
+        name: str,
+        std_offset_min: int,
+        dst_offset_min: int,
+        has_dst: bool,
+        dst_start: Optional[TransitionRule],
+        dst_end: Optional[TransitionRule]
+    ) -> None:
+        self.name = name
+        self.std_offset_min = std_offset_min
+        self.dst_offset_min = dst_offset_min
+        self.has_dst = has_dst
+        self.dst_start = dst_start
+        self.dst_end = dst_end
+
+
+def _us_start() -> TransitionRule:
+    # US/Canada DST begins: 2nd Sunday of March, 02:00 local standard time.
+    return TransitionRule(3, 2, 6, 120)
+
+
+def _us_end() -> TransitionRule:
+    # US/Canada DST ends: 1st Sunday of November, 02:00 local DST time.
+    return TransitionRule(11, 1, 6, 120)
+
+
+def _zone_table() -> list[ZoneRule]:
+    # A function (not a bare module-level list literal) so the table can be
+    # grown with ordinary control flow (used below for the Etc/GMT family).
+    zones: list[ZoneRule] = []
+
+    # ------------------------------------------------------------------ UTC
+    # The universal no-DST, zero-offset zone (dateutil's degenerate case).
+    zones.append(ZoneRule("UTC", 0, 0, False, None, None))
+
+    # -------------------------------------------------- US / Canada (DST = US rule)
+    # US rule for all: DST 2nd Sun Mar 02:00 -> 1st Sun Nov 02:00 local.
+    # Oracle jan/jul offsets (2026-01-15 / 2026-07-15, minutes):
+    #   New_York   -300/-240   Chicago   -360/-300   Denver -420/-360
+    #   Los_Angeles-480/-420   Anchorage -540/-480
+    #   Toronto    -300/-240   Vancouver -480/-420   Halifax-240/-180
+    #   St_Johns   -210/-150 (UTC-3:30 / -2:30, half-hour offset)
+    zones.append(ZoneRule("America/New_York", -300, -240, True, _us_start(), _us_end()))
+    zones.append(ZoneRule("America/Chicago", -360, -300, True, _us_start(), _us_end()))
+    zones.append(ZoneRule("America/Denver", -420, -360, True, _us_start(), _us_end()))
+    zones.append(ZoneRule("America/Los_Angeles", -480, -420, True, _us_start(), _us_end()))
+    zones.append(ZoneRule("America/Anchorage", -540, -480, True, _us_start(), _us_end()))
+    zones.append(ZoneRule("America/Toronto", -300, -240, True, _us_start(), _us_end()))
+    zones.append(ZoneRule("America/Vancouver", -480, -420, True, _us_start(), _us_end()))
+    zones.append(ZoneRule("America/Halifax", -240, -180, True, _us_start(), _us_end()))
+    zones.append(ZoneRule("America/St_Johns", -210, -150, True, _us_start(), _us_end()))
+
+    # US no-DST zones. Oracle: Phoenix -420 year-round (Arizona opts out of DST);
+    # Honolulu -600 year-round (Hawaii).
+    zones.append(ZoneRule("America/Phoenix", -420, -420, False, None, None))
+    zones.append(ZoneRule("Pacific/Honolulu", -600, -600, False, None, None))
+
+    # --------------------------------------------------------- Latin America
+    # Modern no-DST (abolished): Sao_Paulo -180 (Brazil ended DST 2019),
+    # Mexico_City -360 (Mexico ended nationwide DST 2022), Bogota -300 (never).
+    zones.append(ZoneRule("America/Sao_Paulo", -180, -180, False, None, None))
+    zones.append(ZoneRule("America/Mexico_City", -360, -360, False, None, None))
+    zones.append(ZoneRule("America/Bogota", -300, -300, False, None, None))
+    # America/Santiago (Chile): southern-hemisphere, year-wrapping DST. Oracle
+    # jan +undefined... -180 (CLST, DST) / jul -240 (CLT, std). Rule is the 1st
+    # SATURDAY of the month at 24:00 (== Sunday 00:00), NOT the 1st Sunday —
+    # verified: a 1st-Sunday model diverges in years like 2024/2029. Expressed
+    # as weekday=Saturday(5), local_time_min=1440 (24:00). DST begins 1st Sat
+    # Sep 24:00, ends 1st Sat Apr 24:00.
+    zones.append(ZoneRule(
+        "America/Santiago", -240, -180, True,
+        TransitionRule(9, 1, 5, 1440),   # 1st Saturday September, 24:00
+        TransitionRule(4, 1, 5, 1440)    # 1st Saturday April, 24:00
+    ))
+
+    # --------------------------------------------------------------- Europe
+    # EU-wide rule: transitions occur simultaneously at 01:00 UTC on the last
+    # Sunday of March / last Sunday of October, so the LOCAL wall-clock time of
+    # each transition is shifted by the zone's offset. Three offset bands:
+    #   WET  (std +0,  dst +60):  spring last-Sun-Mar 01:00, fall last-Sun-Oct 02:00
+    #   CET  (std +60, dst +120): spring last-Sun-Mar 02:00, fall last-Sun-Oct 03:00
+    #   EET  (std +120,dst +180): spring last-Sun-Mar 03:00, fall last-Sun-Oct 04:00
+    # Oracle jan/jul (min): London/Dublin/Lisbon 0/+60; Paris/Berlin/Madrid/Rome/
+    # Amsterdam/Brussels/Zurich +60/+120; Athens/Helsinki/Bucharest +120/+180.
+    zones.append(ZoneRule("Europe/London", 0, 60, True, TransitionRule(3, -1, 6, 60), TransitionRule(10, -1, 6, 120)))
+    zones.append(ZoneRule("Europe/Dublin", 0, 60, True, TransitionRule(3, -1, 6, 60), TransitionRule(10, -1, 6, 120)))
+    zones.append(ZoneRule("Europe/Lisbon", 0, 60, True, TransitionRule(3, -1, 6, 60), TransitionRule(10, -1, 6, 120)))
+    zones.append(ZoneRule("Europe/Paris", 60, 120, True, TransitionRule(3, -1, 6, 120), TransitionRule(10, -1, 6, 180)))
+    zones.append(ZoneRule("Europe/Berlin", 60, 120, True, TransitionRule(3, -1, 6, 120), TransitionRule(10, -1, 6, 180)))
+    zones.append(ZoneRule("Europe/Madrid", 60, 120, True, TransitionRule(3, -1, 6, 120), TransitionRule(10, -1, 6, 180)))
+    zones.append(ZoneRule("Europe/Rome", 60, 120, True, TransitionRule(3, -1, 6, 120), TransitionRule(10, -1, 6, 180)))
+    zones.append(ZoneRule("Europe/Amsterdam", 60, 120, True, TransitionRule(3, -1, 6, 120), TransitionRule(10, -1, 6, 180)))
+    zones.append(ZoneRule("Europe/Brussels", 60, 120, True, TransitionRule(3, -1, 6, 120), TransitionRule(10, -1, 6, 180)))
+    zones.append(ZoneRule("Europe/Zurich", 60, 120, True, TransitionRule(3, -1, 6, 120), TransitionRule(10, -1, 6, 180)))
+    zones.append(ZoneRule("Europe/Athens", 120, 180, True, TransitionRule(3, -1, 6, 180), TransitionRule(10, -1, 6, 240)))
+    zones.append(ZoneRule("Europe/Helsinki", 120, 180, True, TransitionRule(3, -1, 6, 180), TransitionRule(10, -1, 6, 240)))
+    zones.append(ZoneRule("Europe/Bucharest", 120, 180, True, TransitionRule(3, -1, 6, 180), TransitionRule(10, -1, 6, 240)))
+    # Modern no-DST: Moscow +180 (Russia dropped DST 2011/2014), Istanbul +180
+    # (Turkey permanent +03 since 2016).
+    zones.append(ZoneRule("Europe/Moscow", 180, 180, False, None, None))
+    zones.append(ZoneRule("Europe/Istanbul", 180, 180, False, None, None))
+
+    # ----------------------------------------------------------------- Asia
+    # Major APAC, all modern no-DST. Oracle constant offsets (min):
+    #   Tokyo +540  Shanghai +480  Hong_Kong +480  Singapore +480  Seoul +540
+    #   Kolkata +330 (UTC+5:30)  Dubai +240  Bangkok +420  Jakarta +420
+    #   Karachi +300  Tehran +210 (UTC+3:30; Iran abolished DST 2022)
+    zones.append(ZoneRule("Asia/Tokyo", 540, 540, False, None, None))
+    zones.append(ZoneRule("Asia/Shanghai", 480, 480, False, None, None))
+    zones.append(ZoneRule("Asia/Hong_Kong", 480, 480, False, None, None))
+    zones.append(ZoneRule("Asia/Singapore", 480, 480, False, None, None))
+    zones.append(ZoneRule("Asia/Seoul", 540, 540, False, None, None))
+    zones.append(ZoneRule("Asia/Kolkata", 330, 330, False, None, None))
+    zones.append(ZoneRule("Asia/Dubai", 240, 240, False, None, None))
+    zones.append(ZoneRule("Asia/Bangkok", 420, 420, False, None, None))
+    zones.append(ZoneRule("Asia/Jakarta", 420, 420, False, None, None))
+    zones.append(ZoneRule("Asia/Karachi", 300, 300, False, None, None))
+    zones.append(ZoneRule("Asia/Tehran", 210, 210, False, None, None))
+
+    # -------------------------------------------------------------- Oceania
+    # Australia (eastern + central) DST: 1st Sun Oct 02:00 local std -> 1st Sun
+    # Apr 03:00 local DST; southern-hemisphere year-wrapping (DST active over
+    # the Jan calendar boundary). Oracle jan/jul (min):
+    #   Sydney/Melbourne +660/+600  Adelaide +630/+570 (UTC+10:30/+9:30)
+    # No-DST: Brisbane +600, Perth +480.
+    zones.append(ZoneRule("Australia/Sydney", 600, 660, True, TransitionRule(10, 1, 6, 120), TransitionRule(4, 1, 6, 180)))
+    zones.append(ZoneRule("Australia/Melbourne", 600, 660, True, TransitionRule(10, 1, 6, 120), TransitionRule(4, 1, 6, 180)))
+    zones.append(ZoneRule("Australia/Adelaide", 570, 630, True, TransitionRule(10, 1, 6, 120), TransitionRule(4, 1, 6, 180)))
+    zones.append(ZoneRule("Australia/Brisbane", 600, 600, False, None, None))
+    zones.append(ZoneRule("Australia/Perth", 480, 480, False, None, None))
+    # Pacific/Auckland (NZ) DST: last Sun Sep 02:00 -> 1st Sun Apr 03:00;
+    # year-wrapping. Oracle jan/jul: +780/+720 (UTC+13/+12).
+    zones.append(ZoneRule("Pacific/Auckland", 720, 780, True, TransitionRule(9, -1, 6, 120), TransitionRule(4, 1, 6, 180)))
+
+    # -------------------------------------------- Etc/GMT±N fixed-offset family
+    # IANA SIGN CONVENTION IS REVERSED: "Etc/GMT+N" means UTC-N, "Etc/GMT-N"
+    # means UTC+N (verified against the oracle: Etc/GMT+5 -> -300, Etc/GMT-9 ->
+    # +540). No DST. Complete integer-hour span Etc/GMT+12 .. Etc/GMT-12, plus
+    # the two zero aliases Etc/GMT and Etc/UTC.
+    zones.append(ZoneRule("Etc/GMT", 0, 0, False, None, None))
+    zones.append(ZoneRule("Etc/UTC", 0, 0, False, None, None))
+    n: int = 1
+    while n <= 12:
+        # Etc/GMT+N == UTC-N
+        zones.append(ZoneRule("Etc/GMT+" + str(n), -n * 60, -n * 60, False, None, None))
+        n = n + 1
+    n = 1
+    while n <= 12:
+        # Etc/GMT-N == UTC+N
+        zones.append(ZoneRule("Etc/GMT-" + str(n), n * 60, n * 60, False, None, None))
+        n = n + 1
+
+    return zones

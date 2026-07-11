@@ -1,0 +1,112 @@
+# oracle_round3.pyrs — pyrst-dateutil ROUND-3 oracle additions (card 0223a4b8,
+# test-engineer round 3). Targets gaps not covered by oracle_core /
+# oracle_extended / oracle_tz_dst: rrule WEEKLY interval+multi-byweekday
+# combo, rrule count+until mutual-exclusion guard, MONTHLY interval+negative
+# bymonthday, and a couple of parser AM/PM-with-seconds forms.
+#
+# All expectations pinned against python3 3.12 dateutil 2.9.0 (probe commands
+# in comments above each check). Build from THIS directory:
+#   PYRST_PATH=/home/ethos/Coding/pyrst/extern/packages \
+#     /home/ethos/Coding/pyrst/target/release/pyrst build tests/oracle_round3.pyrs
+#   ./oracle_round3
+
+import sys
+from datetime import datetime
+from dateutil.parser import parse
+from dateutil.rrule import rrule, materialize, MONTHLY, WEEKLY
+
+
+def ck_str(label: str, got: str, want: str, failures: Mut[list[str]]) -> None:
+    if got != want:
+        failures.append(label + ": got " + repr(got) + ", want " + repr(want))
+
+
+def fmt_list(xs: list[datetime]) -> str:
+    out: str = ""
+    i: int = 0
+    while i < len(xs):
+        if i > 0:
+            out = out + "|"
+        out = out + xs[i].isoformat()
+        i = i + 1
+    return out
+
+
+def ck_rrule(label: str, rule: rrule, limit: int, want: str, failures: Mut[list[str]]) -> None:
+    ck_str(label, fmt_list(materialize(rule, limit)), want, failures)
+
+
+def main() -> None:
+    failures: list[str] = []
+
+    # ── RRULE: WEEKLY interval + multiple byweekday ──────────────────────
+    # python3: list(rrule.rrule(rrule.WEEKLY, dtstart=datetime(2026,1,5),
+    #   interval=2, byweekday=(0,3), count=6))
+    # -> 2026-01-05,01-08,01-19,01-22,02-02,02-05 (MO=0,TH=3; interval skips
+    #    the intervening week 01-12/01-15)
+    ck_rrule(
+        "WEEKLY iv2 MO,TH count6",
+        rrule(WEEKLY, datetime(2026, 1, 5), interval=2, byweekday=[0, 3], count=6),
+        10,
+        "2026-01-05T00:00:00|2026-01-08T00:00:00|2026-01-19T00:00:00|"
+        + "2026-01-22T00:00:00|2026-02-02T00:00:00|2026-02-05T00:00:00",
+        failures
+    )
+
+    # ── RRULE: MONTHLY interval + negative bymonthday (last day) ─────────
+    # python3: list(rrule.rrule(rrule.MONTHLY, dtstart=datetime(2026,1,1),
+    #   interval=2, count=4, bymonthday=[-1]))
+    # -> 2026-01-31,03-31,05-31,07-31
+    ck_rrule(
+        "MONTHLY iv2 bymonthday-1 count4",
+        rrule(MONTHLY, datetime(2026, 1, 1), interval=2, count=4, bymonthday=[-1]),
+        10,
+        "2026-01-31T00:00:00|2026-03-31T00:00:00|2026-05-31T00:00:00|2026-07-31T00:00:00",
+        failures
+    )
+
+    # ── RRULE: count+until mutual exclusion — DOCUMENTED DIVERGENCE ──────
+    # python3 dateutil 2.9.0 does NOT raise: it emits a deprecation warning
+    # ("Using both 'count' and 'until' is inconsistent with RFC 5545 and has
+    # been deprecated in dateutil...") and proceeds, stopping at whichever
+    # bound is hit first — confirmed via:
+    #   rrule.rrule(rrule.MONTHLY, dtstart=datetime(2026,1,1), count=10,
+    #     until=datetime(2026,3,1)) -> [2026-01-01, 2026-02-01, 2026-03-01]
+    # This package's shipped, ALREADY-DOCUMENTED (README/card comment 566)
+    # scope choice is stricter: raise ValueError at construction instead of
+    # silently picking a bound. This test pins OUR behavior (a real
+    # divergence, not a bug) so a future change to it is a deliberate,
+    # visible decision rather than an accidental regression.
+    caught_both: bool = False
+    try:
+        rrule(MONTHLY, datetime(2026, 1, 1), count=10, until=datetime(2026, 3, 1))
+    except ValueError:
+        caught_both = True
+    if not caught_both:
+        failures.append("rrule(count=, until=) should raise ValueError (documented divergence from dateutil's warn-and-proceed)")
+
+    # ── PARSER: AM/PM combined with seconds, numeric + textual-ish sep ────
+    # python3: parser.parse("07/10/2026 03:45:30 PM") -> 2026-07-10 15:45:30
+    ck_str(
+        "parse MDY+HMS+PM",
+        parse("07/10/2026 03:45:30 PM").isoformat(),
+        "2026-07-10T15:45:30",
+        failures
+    )
+    # python3: parser.parse("2026-07-10 3:45:30pm") -> 2026-07-10 15:45:30
+    ck_str(
+        "parse ISO-date+HMS+pm-lowercase-nospace",
+        parse("2026-07-10 3:45:30pm").isoformat(),
+        "2026-07-10T15:45:30",
+        failures
+    )
+
+    if len(failures) == 0:
+        print("PASS: oracle_round3")
+    else:
+        for f in failures:
+            print("FAIL: " + f)
+        sys.exit(1)
+
+
+main()

@@ -1,0 +1,130 @@
+# api.pyrs — tzdata lookup API (card 965bf13f).
+#
+# FROZEN INTERFACE CONTRACT (see the package README's "API" section for the
+# full contract — this is what pyrst-dateutil, a pending sibling package,
+# consumes):
+#
+#   def available_zones() -> list[str]
+#   def zone_info(name: str) -> ZoneRule
+#   def utc_offset_at(name: str, year: int, month: int, day: int, hour: int, minute: int) -> int
+#   def is_dst_at(name: str, year: int, month: int, day: int, hour: int, minute: int) -> bool
+#
+# `zone_info`/`utc_offset_at`/`is_dst_at` raise `KeyError(repr(name))` for an
+# unrecognized zone name (matches the project's existing `KeyError`-on-miss
+# convention, see `lib/enum.pyrs::lookup_by_name`) — never a silent wrong
+# answer for a typo'd or unsupported zone.
+#
+# `utc_offset_at`/`is_dst_at` take a NAIVE local wall-clock time (the zone's
+# own local calendar date + time, no UTC involved) — the caller supplies the
+# date/time it wants the zone's offset for, same shape as CPython's
+# `datetime(..., tzinfo=ZoneInfo(name)).utcoffset()`. This matches the
+# oracle-comparison shape documented in `data.pyrs`.
+#
+# GAP flag (not a compiler bug — a scaffold-stage data-model simplification,
+# see `data.pyrs`'s module header): the ambiguous (fall-back) and nonexistent
+# (spring-forward) local hour, right at a DST transition, is not
+# disambiguated the way CPython zoneinfo's `fold` parameter does. Test
+# matrices should avoid the exact transition hour until that is addressed.
+
+from tzdata.data import ZoneRule, TransitionRule, _zone_table
+
+
+def available_zones() -> list[str]:
+    names: list[str] = []
+    for z in _zone_table():
+        names.append(z.name)
+    return names
+
+
+def zone_info(name: str) -> ZoneRule:
+    for z in _zone_table():
+        if z.name == name:
+            return z
+    raise KeyError(repr(name))
+
+
+def _is_leap_year(year: int) -> bool:
+    return (year % 4 == 0 and year % 100 != 0) or (year % 400 == 0)
+
+
+def _days_in_month(year: int, month: int) -> int:
+    lengths: list[int] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    if month == 2 and _is_leap_year(year):
+        return 29
+    return lengths[month - 1]
+
+
+def _weekday(year: int, month: int, day: int) -> int:
+    # Sakamoto's algorithm (0=Sunday), remapped to Python's `date.weekday()`
+    # convention (0=Monday .. 6=Sunday) — oracle-verified in the card's
+    # implementer notes against python3's `datetime.date(...).weekday()` for
+    # every transition date used in `data.pyrs`.
+    month_table: list[int] = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4]
+    y: int = year
+    if month < 3:
+        y = y - 1
+    sakamoto: int = (y + y // 4 - y // 100 + y // 400 + month_table[month - 1] + day) % 7
+    return (sakamoto + 6) % 7
+
+
+def _nth_weekday_day(year: int, month: int, week: int, weekday: int) -> int:
+    # Day-of-month (1-based) for the Nth occurrence of `weekday` in `month`
+    # (week in 1..4), or the LAST occurrence when week == -1.
+    if week == -1:
+        day: int = _days_in_month(year, month)
+        while _weekday(year, month, day) != weekday:
+            day = day - 1
+        return day
+    first_wd: int = _weekday(year, month, 1)
+    offset: int = (weekday - first_wd) % 7
+    first_occurrence: int = 1 + offset
+    return first_occurrence + (week - 1) * 7
+
+
+def _minutes_of_year(year: int, month: int, day: int, minute_of_day: int) -> int:
+    # A comparable ordinal: minutes since Jan 1 00:00 of `year`. Only used to
+    # ORDER two instants within the same calendar year — not a general epoch.
+    days: int = 0
+    m: int = 1
+    while m < month:
+        days = days + _days_in_month(year, m)
+        m = m + 1
+    days = days + (day - 1)
+    return days * 24 * 60 + minute_of_day
+
+
+def _transition_minutes_of_year(year: int, rule: TransitionRule) -> int:
+    day: int = _nth_weekday_day(year, rule.month, rule.week, rule.weekday)
+    return _minutes_of_year(year, rule.month, day, rule.local_time_min)
+
+
+def _is_dst_active(zone: ZoneRule, year: int, month: int, day: int, hour: int, minute: int) -> bool:
+    if not zone.has_dst:
+        return False
+    start_rule: Optional[TransitionRule] = zone.dst_start
+    end_rule: Optional[TransitionRule] = zone.dst_end
+    if start_rule is None:
+        return False
+    if end_rule is None:
+        return False
+    now: int = _minutes_of_year(year, month, day, hour * 60 + minute)
+    start: int = _transition_minutes_of_year(year, start_rule)
+    end: int = _transition_minutes_of_year(year, end_rule)
+    if start <= end:
+        # Northern-hemisphere shape: DST is the [start, end) span within the year.
+        return now >= start and now < end
+    # Southern-hemisphere shape (e.g. Australia/Sydney): DST wraps the
+    # calendar-year boundary — active OUTSIDE [end, start).
+    return now >= start or now < end
+
+
+def utc_offset_at(name: str, year: int, month: int, day: int, hour: int, minute: int) -> int:
+    zone: ZoneRule = zone_info(name)
+    if _is_dst_active(zone, year, month, day, hour, minute):
+        return zone.dst_offset_min
+    return zone.std_offset_min
+
+
+def is_dst_at(name: str, year: int, month: int, day: int, hour: int, minute: int) -> bool:
+    zone: ZoneRule = zone_info(name)
+    return _is_dst_active(zone, year, month, day, hour, minute)

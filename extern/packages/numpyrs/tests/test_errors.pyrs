@@ -1,0 +1,241 @@
+# test_errors.pyrs — edge-case / error-path coverage for numpyrs, round 1
+# (test-engineer). Complements tests/test_ops.pyrs (happy-path arith,
+# broadcast, reductions, linalg) with: bounds/shape ValueErrors, empty-array
+# reduction errors, ragged array2d, reshape mismatch, dot/transpose shape
+# errors, and 1D get/set element access. Oracle values are real numpy 1.26
+# results pinned in comments where numeric. Prints PASS on success; on any
+# failure prints FAIL: <what> and `assert False` (nonzero exit).
+#
+# Build + run (from extern/packages/numpyrs/):
+#   PYRST_PATH=/home/ethos/Coding/pyrst/extern/packages \
+#     /home/ethos/Coding/pyrst/target/release/pyrst build tests/test_errors.pyrs
+#   ./test_errors
+
+from numpyrs.ndarray import NDArray
+from numpyrs.constructors import array, array2d, zeros, full, arange, linspace
+
+
+def close(a: float, b: float) -> bool:
+    d: float = a - b
+    if d < 0.0:
+        d = -d
+    return d < 0.000000001
+
+
+def fail(msg: str) -> None:
+    print("FAIL: " + msg)
+    assert False
+
+
+def main() -> None:
+    # ---- construction: buffer/shape length mismatch ----
+    caught: bool = False
+    try:
+        bad: NDArray = NDArray([1.0, 2.0, 3.0], [2, 2])
+        print(bad.size)
+    except ValueError:
+        caught = True
+    if not caught:
+        fail("NDArray ctor length/shape mismatch did not raise")
+
+    # ---- 2D tuple-key bounds errors ----
+    m: NDArray = array2d([[1.0, 2.0], [3.0, 4.0]])
+    caught = False
+    try:
+        v: float = m[2, 0]
+        print(v)
+    except ValueError:
+        caught = True
+    if not caught:
+        fail("row-out-of-bounds getitem did not raise")
+
+    caught = False
+    try:
+        v2: float = m[0, 5]
+        print(v2)
+    except ValueError:
+        caught = True
+    if not caught:
+        fail("col-out-of-bounds getitem did not raise")
+
+    caught = False
+    try:
+        m[0, 0] = 1.0
+        m[-1, 0] = 9.0
+    except ValueError:
+        caught = True
+    if not caught:
+        fail("negative-index setitem did not raise")
+
+    # tuple index requires a 2D array
+    v1d: NDArray = array([1.0, 2.0, 3.0])
+    caught = False
+    try:
+        v3: float = v1d[0, 0]
+        print(v3)
+    except ValueError:
+        caught = True
+    if not caught:
+        fail("tuple index on 1D array did not raise")
+
+    # ---- 1D flat element access via .get/.set ----
+    if not close(v1d.get(1), 2.0):
+        fail(".get(1) expected 2.0")
+    v1d.set(2, 99.0)
+    if not close(v1d.get(2), 99.0):
+        fail(".set/.get roundtrip expected 99.0")
+    caught = False
+    try:
+        x: float = v1d.get(10)
+        print(x)
+    except ValueError:
+        caught = True
+    if not caught:
+        fail(".get out-of-bounds did not raise")
+
+    # ---- array2d ragged rows -> ValueError ----
+    caught = False
+    try:
+        ragged: NDArray = array2d([[1.0, 2.0], [3.0]])
+        print(ragged.size)
+    except ValueError:
+        caught = True
+    if not caught:
+        fail("array2d ragged rows did not raise")
+
+    # ---- reshape: size mismatch -> ValueError; size match -> copy, independent ----
+    a: NDArray = arange(0.0, 6.0, 1.0)  # [0,1,2,3,4,5]
+    caught = False
+    try:
+        bad2: NDArray = a.reshape([4, 4])
+        print(bad2.size)
+    except ValueError:
+        caught = True
+    if not caught:
+        fail("reshape size mismatch did not raise")
+
+    r: NDArray = a.reshape([2, 3])
+    r[0, 0] = 999.0
+    if not close(a.get(0), 0.0):
+        fail("reshape must COPY: mutating reshape() result touched the source")
+    if not close(r[0, 0], 999.0):
+        fail("reshape result should hold the written value")
+
+    # ---- reductions on empty array -> ValueError ----
+    empty: NDArray = array([])
+    caught = False
+    try:
+        s: float = empty.sum()
+        # sum of empty is 0 in numpy (identity element) — should NOT raise
+        if not close(s, 0.0):
+            fail("sum of empty array expected 0.0 (numpy identity)")
+    except ValueError:
+        fail("sum of empty array should not raise (numpy identity is 0.0)")
+
+    caught = False
+    try:
+        mn: float = empty.min()
+        print(mn)
+    except ValueError:
+        caught = True
+    if not caught:
+        fail("min of empty array did not raise")
+
+    caught = False
+    try:
+        am: int = empty.argmax()
+        print(am)
+    except ValueError:
+        caught = True
+    if not caught:
+        fail("argmax of empty array did not raise")
+
+    # ---- dot: shape errors ----
+    caught = False
+    try:
+        bad_dot: NDArray = array([1.0, 2.0]).dot(array([1.0, 2.0, 3.0]))
+        print(bad_dot.size)
+    except ValueError:
+        caught = True
+    if not caught:
+        fail("1D dot length mismatch did not raise")
+
+    caught = False
+    try:
+        p: NDArray = array2d([[1.0, 2.0]])       # (1,2)
+        q: NDArray = array2d([[1.0], [2.0], [3.0]])  # (3,1)
+        bad_mm: NDArray = p.dot(q)                # inner dims 2 != 3
+        print(bad_mm.size)
+    except ValueError:
+        caught = True
+    if not caught:
+        fail("matmul inner-dim mismatch did not raise")
+
+    caught = False
+    try:
+        mixed: NDArray = array([1.0, 2.0]).dot(array2d([[1.0, 2.0], [3.0, 4.0]]))
+        print(mixed.size)
+    except ValueError:
+        caught = True
+    if not caught:
+        fail("mixed 1D/2D dot (unsupported) did not raise")
+
+    # ---- transpose: 2D-only ----
+    caught = False
+    try:
+        t: NDArray = v1d.transpose()
+        print(t.size)
+    except ValueError:
+        caught = True
+    if not caught:
+        fail("transpose on 1D array did not raise")
+
+    # transpose round-trip: (A.T).T == A  (numpy identity, any 2D)
+    orig: NDArray = array2d([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+    back: NDArray = orig.transpose().transpose()
+    if back.shape[0] != orig.shape[0] or back.shape[1] != orig.shape[1]:
+        fail("(A.T).T shape mismatch")
+    i: int = 0
+    while i < len(orig.data):
+        if not close(orig.data[i], back.data[i]):
+            fail("(A.T).T value mismatch at " + str(i))
+        i += 1
+
+    # ---- broadcast shape mismatch (neither same-shape nor size-1) ----
+    caught = False
+    try:
+        bad_bc: NDArray = array2d([[1.0, 2.0], [3.0, 4.0]]) * array([1.0, 2.0, 3.0])
+        print(bad_bc.size)
+    except ValueError:
+        caught = True
+    if not caught:
+        fail("incompatible broadcast (2,2)*(3,) did not raise")
+
+    # ---- argmin/argmax tie-breaking: numpy returns the FIRST occurrence ----
+    # np.argmax([5, 5, 1]) -> 0 ; np.argmin([1, 1, 5]) -> 0
+    ties: NDArray = array([5.0, 5.0, 1.0])
+    if ties.argmax() != 0:
+        fail("argmax tie should return first occurrence (0)")
+    ties2: NDArray = array([1.0, 1.0, 5.0])
+    if ties2.argmin() != 0:
+        fail("argmin tie should return first occurrence (0)")
+
+    # ---- linspace edge cases ----
+    # np.linspace(5.0, 5.0, 3) -> [5. 5. 5.]
+    ls0: NDArray = linspace(5.0, 5.0, 3)
+    if not close(ls0.get(0), 5.0) or not close(ls0.get(2), 5.0):
+        fail("linspace constant range")
+    # np.linspace(0, 1, 1) -> [0.]  (single sample = start)
+    ls1: NDArray = linspace(0.0, 1.0, 1)
+    if ls1.size != 1 or not close(ls1.get(0), 0.0):
+        fail("linspace num=1 should yield [start]")
+
+    # ---- zeros/full with 3D-ish shape (product still 2D-safe for our ops, just size) ----
+    z3: NDArray = zeros([2, 2, 2])
+    if z3.size != 8 or z3.ndim != 3:
+        fail("zeros 3D shape/size")
+    f3: NDArray = full([3], -1.0)
+    if not close(f3.get(0), -1.0) or not close(f3.get(2), -1.0):
+        fail("full 1D fill value")
+
+    print("PASS: numpyrs test_errors (bounds/shape ValueErrors, empty reductions, reshape copy, transpose identity, argmin/argmax ties, linspace edges)")

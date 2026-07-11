@@ -1,0 +1,432 @@
+# ndarray.pyrs — the NDArray core type for numpyrs.
+#
+# STORAGE: a flat `list[float]` buffer (`data`) in C (row-major) order, plus a
+# `shape: list[int]` describing the logical dimensions. Row-major strides are
+# computed on demand from `shape` by `_strides()`; there is no separate strides
+# field (no views exist — every op copies, per value semantics).
+#
+# VALUE SEMANTICS (load-bearing, read this before using the class):
+# pyrst classes are clone-on-use / copy, NOT Python reference semantics:
+#   - `reshape()` returns a COPY (new NDArray, new buffer).
+#   - `a[i, j]` (tuple-key __getitem__) returns a COPY of the scalar; a chained
+#     WRITE `a[i][j] = v` is a HARD COMPILE ERROR. Always write via the tuple
+#     key: `a[i, j] = v`.
+#   - Every arithmetic dunder (`__add__` etc.) and scalar method returns a
+#     brand-new NDArray; none mutate `self` or `other`.
+#
+# INDEXING KEY TYPE (honest constraint): pyrst fixes a class's __getitem__ key
+# type to a single annotation, and a `class | float`-style union param is a
+# codegen miscompile (see card 0182f2b0 GAP), so ONE class cannot overload an
+# int key (`a[i]`) and a tuple key (`a[i, j]`). We pick the 2D tuple key for the
+# bracket form (`a[i, j]` / `a[i, j] = v`); 1D / flat element access uses the
+# `.get(i)` / `.set(i, v)` methods below.
+#
+# f64-only: there is no separate int dtype (documented scope cut — see README).
+
+
+def _prod(xs: list[int]) -> int:
+    n: int = 1
+    i: int = 0
+    while i < len(xs):
+        n = n * xs[i]
+        i += 1
+    return n
+
+
+def _shape_str(shape: list[int]) -> str:
+    # numpy-style "(2, 3)" rendering for error messages.
+    out: str = "("
+    i: int = 0
+    while i < len(shape):
+        out = out + str(shape[i])
+        if i < len(shape) - 1:
+            out = out + ", "
+        i += 1
+    if len(shape) == 1:
+        out = out + ","
+    out = out + ")"
+    return out
+
+
+class NDArray:
+    data: list[float]
+    shape: list[int]
+
+    def __init__(self, data: list[float], shape: list[int]) -> None:
+        expected: int = _prod(shape)
+        if len(data) != expected:
+            raise ValueError("cannot form NDArray: buffer length " + str(len(data)) + " does not match shape " + _shape_str(shape) + " (size " + str(expected) + ")")
+        self.data = data
+        self.shape = shape
+
+    # ---- shape/size introspection -----------------------------------
+    @property
+    def ndim(self) -> int:
+        return len(self.shape)
+
+    @property
+    def size(self) -> int:
+        return _prod(self.shape)
+
+    def _strides(self) -> list[int]:
+        # Row-major (C-order) strides computed from shape on demand.
+        n: int = len(self.shape)
+        strides: list[int] = [0] * n
+        if n == 0:
+            return strides
+        acc: int = 1
+        i: int = n - 1
+        while i >= 0:
+            strides[i] = acc
+            acc = acc * self.shape[i]
+            i -= 1
+        return strides
+
+    def _flat_index(self, key: tuple[int, int]) -> int:
+        # 2D tuple-key -> flat offset, with bounds checks.
+        if len(self.shape) != 2:
+            raise ValueError("tuple index (i, j) requires a 2D array, but shape is " + _shape_str(self.shape))
+        r: int = key[0]
+        c: int = key[1]
+        rows: int = self.shape[0]
+        cols: int = self.shape[1]
+        if r < 0 or r >= rows or c < 0 or c >= cols:
+            raise ValueError("index (" + str(r) + ", " + str(c) + ") is out of bounds for shape " + _shape_str(self.shape))
+        return r * cols + c
+
+    # ---- E1 dunders: 2D bracket indexing, len ------------------------
+    def __getitem__(self, key: tuple[int, int]) -> float:
+        idx: int = self._flat_index(key)
+        return self.data[idx]
+
+    def __setitem__(self, key: tuple[int, int], value: float) -> None:
+        idx: int = self._flat_index(key)
+        self.data[idx] = value
+
+    def __len__(self) -> int:
+        # numpy convention: len() is the size of the leading axis.
+        if len(self.shape) == 0:
+            return 0
+        return self.shape[0]
+
+    # ---- 1D / flat element access (int key not expressible as a dunder) ---
+    def get(self, i: int) -> float:
+        if i < 0 or i >= len(self.data):
+            raise ValueError("flat index " + str(i) + " is out of bounds for size " + str(len(self.data)))
+        return self.data[i]
+
+    def set(self, i: int, value: float) -> None:
+        if i < 0 or i >= len(self.data):
+            raise ValueError("flat index " + str(i) + " is out of bounds for size " + str(len(self.data)))
+        self.data[i] = value
+
+    # ---- reshape (COPY under value semantics) ------------------------
+    def reshape(self, new_shape: list[int]) -> NDArray:
+        if _prod(new_shape) != self.size:
+            raise ValueError("cannot reshape array of size " + str(self.size) + " into shape " + _shape_str(new_shape))
+        buf: list[float] = []
+        i: int = 0
+        while i < len(self.data):
+            buf.append(self.data[i])
+            i += 1
+        return NDArray(buf, new_shape)
+
+    def copy(self) -> NDArray:
+        return self.reshape(self.shape)
+
+    # ---- elementwise arithmetic ---------------------------------------
+    # opcode: 0=+, 1=-, 2=*, 3=/, 4=**
+    def _apply(self, a: float, b: float, op: int) -> float:
+        if op == 0:
+            return a + b
+        if op == 1:
+            return a - b
+        if op == 2:
+            return a * b
+        if op == 3:
+            return a / b
+        return a ** b
+
+    def _elementwise(self, other: NDArray, op: int) -> NDArray:
+        # Supported broadcasting subset: same-shape, or one operand size-1
+        # (scalar-as-array). Anything else is an honest ValueError.
+        same: bool = self.shape == other.shape
+        if not same and self.size != 1 and other.size != 1:
+            raise ValueError("operands could not be broadcast together with shapes " + _shape_str(self.shape) + " " + _shape_str(other.shape))
+        n: int = self.size
+        out_shape: list[int] = self.shape
+        if other.size > n:
+            n = other.size
+            out_shape = other.shape
+        buf: list[float] = [0.0] * n
+        i: int = 0
+        while i < n:
+            av: float = self.data[0]
+            if self.size > 1:
+                av = self.data[i]
+            bv: float = other.data[0]
+            if other.size > 1:
+                bv = other.data[i]
+            buf[i] = self._apply(av, bv, op)
+            i += 1
+        return NDArray(buf, out_shape)
+
+    def __add__(self, other: NDArray) -> NDArray:
+        return self._elementwise(other, 0)
+
+    def __sub__(self, other: NDArray) -> NDArray:
+        return self._elementwise(other, 1)
+
+    def __mul__(self, other: NDArray) -> NDArray:
+        return self._elementwise(other, 2)
+
+    # NOTE: `__truediv__`/`__pow__` are defined for correctness, but pyrst's
+    # `/` and `**` OPERATORS do NOT currently dispatch to these user dunders
+    # (they fall through to builtin float arithmetic — see card 0182f2b0 GAP).
+    # Use the `.div()` / `.power()` methods below for elementwise array-array
+    # division / exponentiation until operator dispatch lands.
+    def __truediv__(self, other: NDArray) -> NDArray:
+        return self._elementwise(other, 3)
+
+    def __pow__(self, other: NDArray) -> NDArray:
+        return self._elementwise(other, 4)
+
+    def div(self, other: NDArray) -> NDArray:
+        return self._elementwise(other, 3)
+
+    def power(self, other: NDArray) -> NDArray:
+        return self._elementwise(other, 4)
+
+    def __neg__(self) -> NDArray:
+        buf: list[float] = [0.0] * len(self.data)
+        i: int = 0
+        while i < len(self.data):
+            buf[i] = -self.data[i]
+            i += 1
+        return NDArray(buf, self.shape)
+
+    # ---- scalar ops (union-typed dunder param is a miscompile, see GAP) ---
+    def _scalar(self, s: float, op: int) -> NDArray:
+        buf: list[float] = [0.0] * len(self.data)
+        i: int = 0
+        while i < len(self.data):
+            buf[i] = self._apply(self.data[i], s, op)
+            i += 1
+        return NDArray(buf, self.shape)
+
+    def adds(self, s: float) -> NDArray:
+        return self._scalar(s, 0)
+
+    def subs(self, s: float) -> NDArray:
+        return self._scalar(s, 1)
+
+    def muls(self, s: float) -> NDArray:
+        return self._scalar(s, 2)
+
+    def divs(self, s: float) -> NDArray:
+        return self._scalar(s, 3)
+
+    def pows(self, s: float) -> NDArray:
+        return self._scalar(s, 4)
+
+    # ---- comparison ---------------------------------------------------
+    def __eq__(self, other: NDArray) -> bool:
+        # Whole-array equality (numpy's elementwise `==` bool-array is not
+        # expressible with an f64-only dtype and pyrst's __eq__ -> bool rule;
+        # for an elementwise 0/1 mask use `.equal(other)`).
+        if self.shape != other.shape:
+            return False
+        i: int = 0
+        while i < len(self.data):
+            if self.data[i] != other.data[i]:
+                return False
+            i += 1
+        return True
+
+    def _mask(self, other: NDArray, op: int) -> NDArray:
+        # op: 0 ==, 1 <, 2 >. Returns a 0.0/1.0 float mask (no bool dtype).
+        same: bool = self.shape == other.shape
+        if not same and self.size != 1 and other.size != 1:
+            raise ValueError("operands could not be broadcast together with shapes " + _shape_str(self.shape) + " " + _shape_str(other.shape))
+        n: int = self.size
+        out_shape: list[int] = self.shape
+        if other.size > n:
+            n = other.size
+            out_shape = other.shape
+        buf: list[float] = [0.0] * n
+        i: int = 0
+        while i < n:
+            av: float = self.data[0]
+            if self.size > 1:
+                av = self.data[i]
+            bv: float = other.data[0]
+            if other.size > 1:
+                bv = other.data[i]
+            hit: bool = False
+            if op == 0:
+                hit = av == bv
+            elif op == 1:
+                hit = av < bv
+            else:
+                hit = av > bv
+            if hit:
+                buf[i] = 1.0
+            i += 1
+        return NDArray(buf, out_shape)
+
+    def equal(self, other: NDArray) -> NDArray:
+        return self._mask(other, 0)
+
+    def less(self, other: NDArray) -> NDArray:
+        return self._mask(other, 1)
+
+    def greater(self, other: NDArray) -> NDArray:
+        return self._mask(other, 2)
+
+    # ---- reductions ---------------------------------------------------
+    def sum(self) -> float:
+        total: float = 0.0
+        i: int = 0
+        while i < len(self.data):
+            total = total + self.data[i]
+            i += 1
+        return total
+
+    def mean(self) -> float:
+        if len(self.data) == 0:
+            raise ValueError("mean of empty array")
+        return self.sum() / float(len(self.data))
+
+    def min(self) -> float:
+        if len(self.data) == 0:
+            raise ValueError("zero-size array to reduction operation minimum which has no identity")
+        m: float = self.data[0]
+        i: int = 1
+        while i < len(self.data):
+            if self.data[i] < m:
+                m = self.data[i]
+            i += 1
+        return m
+
+    def max(self) -> float:
+        if len(self.data) == 0:
+            raise ValueError("zero-size array to reduction operation maximum which has no identity")
+        m: float = self.data[0]
+        i: int = 1
+        while i < len(self.data):
+            if self.data[i] > m:
+                m = self.data[i]
+            i += 1
+        return m
+
+    def argmin(self) -> int:
+        if len(self.data) == 0:
+            raise ValueError("attempt to get argmin of an empty sequence")
+        m: float = self.data[0]
+        idx: int = 0
+        i: int = 1
+        while i < len(self.data):
+            if self.data[i] < m:
+                m = self.data[i]
+                idx = i
+            i += 1
+        return idx
+
+    def argmax(self) -> int:
+        if len(self.data) == 0:
+            raise ValueError("attempt to get argmax of an empty sequence")
+        m: float = self.data[0]
+        idx: int = 0
+        i: int = 1
+        while i < len(self.data):
+            if self.data[i] > m:
+                m = self.data[i]
+                idx = i
+            i += 1
+        return idx
+
+    # ---- linear algebra -----------------------------------------------
+    def dot(self, other: NDArray) -> NDArray:
+        # 1D·1D inner product -> shape [1] (no 0-d scalar type); 2D@2D matmul
+        # -> [m, p]. Mixed 1D/2D is deferred (reshape a vector to a column /
+        # row 2D array to bridge).
+        if self.ndim == 1 and other.ndim == 1:
+            if self.shape[0] != other.shape[0]:
+                raise ValueError("shapes " + _shape_str(self.shape) + " and " + _shape_str(other.shape) + " not aligned for 1D dot")
+            acc: float = 0.0
+            i: int = 0
+            while i < len(self.data):
+                acc = acc + self.data[i] * other.data[i]
+                i += 1
+            return NDArray([acc], [1])
+        if self.ndim == 2 and other.ndim == 2:
+            m: int = self.shape[0]
+            k: int = self.shape[1]
+            k2: int = other.shape[0]
+            p: int = other.shape[1]
+            if k != k2:
+                raise ValueError("matmul: shapes " + _shape_str(self.shape) + " and " + _shape_str(other.shape) + " are not aligned: " + str(k) + " (dim 1) != " + str(k2) + " (dim 0)")
+            # NOTE: build via sequential append (writes are in row-major order),
+            # NOT a pre-sized `[0.0] * n` + index-assign — a pre-sized list
+            # DECLARED inside a nested block is mis-lowered/emptied by the
+            # compiler (see card 0182f2b0 GAP).
+            buf: list[float] = []
+            r: int = 0
+            while r < m:
+                c: int = 0
+                while c < p:
+                    acc2: float = 0.0
+                    t: int = 0
+                    while t < k:
+                        acc2 = acc2 + self.data[r * k + t] * other.data[t * p + c]
+                        t += 1
+                    buf.append(acc2)
+                    c += 1
+                r += 1
+            return NDArray(buf, [m, p])
+        raise ValueError("dot supports 1D·1D or 2D@2D only; got shapes " + _shape_str(self.shape) + " and " + _shape_str(other.shape) + " (reshape a vector to a 2D row/column to bridge)")
+
+    def transpose(self) -> NDArray:
+        if self.ndim != 2:
+            raise ValueError("transpose is 2D-only; shape is " + _shape_str(self.shape))
+        rows: int = self.shape[0]
+        cols: int = self.shape[1]
+        buf: list[float] = [0.0] * (rows * cols)
+        i: int = 0
+        while i < rows:
+            j: int = 0
+            while j < cols:
+                buf[j * rows + i] = self.data[i * cols + j]
+                j += 1
+            i += 1
+        return NDArray(buf, [cols, rows])
+
+    # ---- printing ------------------------------------------------------
+    def _row_str(self, start: int, count: int) -> str:
+        out: str = "["
+        j: int = 0
+        while j < count:
+            out = out + str(self.data[start + j])
+            if j < count - 1:
+                out = out + ", "
+            j += 1
+        return out + "]"
+
+    def __str__(self) -> str:
+        result: str = ""
+        if self.ndim == 1:
+            result = "array(" + self._row_str(0, len(self.data)) + ")"
+        elif self.ndim == 2:
+            rows: int = self.shape[0]
+            cols: int = self.shape[1]
+            out: str = "array(["
+            i: int = 0
+            while i < rows:
+                out = out + self._row_str(i * cols, cols)
+                if i < rows - 1:
+                    out = out + ", "
+                i += 1
+            result = out + "])"
+        else:
+            result = "array(shape=" + _shape_str(self.shape) + ", data=" + str(self.data) + ")"
+        return result

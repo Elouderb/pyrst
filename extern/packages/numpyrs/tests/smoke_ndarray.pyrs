@@ -1,0 +1,52 @@
+# smoke_ndarray.pyrs — package-level smoke test for numpyrs. Imports the
+# package the same way an external consumer would (dotted, via
+# PYRST_PATH), exercises the scaffold's implemented surface (array/zeros
+# construction, 2D tuple-key get/set, ndim/size/len), and prints
+# PASS/FAIL with a nonzero exit on failure.
+#
+# Build + run (from extern/packages/numpyrs/):
+#   PYRST_PATH=/home/ethos/Coding/pyrst/extern/packages \
+#     /home/ethos/Coding/pyrst/target/release/pyrst build tests/smoke_ndarray.pyrs
+#   ./smoke_ndarray
+
+from numpyrs.ndarray import NDArray
+from numpyrs.constructors import array, zeros
+
+
+def main() -> None:
+    a: NDArray = array([1.0, 2.0, 3.0])
+    if a.ndim != 1:
+        print("FAIL: array().ndim expected 1, got " + str(a.ndim))
+        assert False
+    if a.size != 3:
+        print("FAIL: array().size expected 3, got " + str(a.size))
+        assert False
+    if len(a) != 3:
+        print("FAIL: len(array()) expected 3, got " + str(len(a)))
+        assert False
+
+    z: NDArray = zeros([2, 3])
+    if z.ndim != 2:
+        print("FAIL: zeros().ndim expected 2, got " + str(z.ndim))
+        assert False
+    if z.size != 6:
+        print("FAIL: zeros().size expected 6, got " + str(z.size))
+        assert False
+    if z[0, 0] != 0.0:
+        print("FAIL: zeros() should be all-zero at [0, 0]")
+        assert False
+
+    z[0, 2] = 9.0
+    z[1, 1] = 4.5
+    if z[0, 2] != 9.0:
+        print("FAIL: setitem/getitem roundtrip at [0, 2] expected 9.0, got " + str(z[0, 2]))
+        assert False
+    if z[1, 1] != 4.5:
+        print("FAIL: setitem/getitem roundtrip at [1, 1] expected 4.5, got " + str(z[1, 1]))
+        assert False
+    # unwritten cell must remain untouched
+    if z[0, 0] != 0.0:
+        print("FAIL: unwritten cell [0, 0] should still be 0.0, got " + str(z[0, 0]))
+        assert False
+
+    print("PASS: numpyrs smoke test (array/zeros/ndim/size/len/getitem/setitem)")

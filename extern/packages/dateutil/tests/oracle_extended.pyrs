@@ -1,0 +1,138 @@
+# oracle_extended.pyrs — pyrst-dateutil EXTENDED oracle matrix (card 0223a4b8,
+# test-engineer round 1). Adds coverage beyond tests/oracle_core.pyrs:
+# malformed-input variety, rrule interval on MONTHLY/YEARLY, ordinal/weekday-
+# word parser forms, and relativedelta_between sub-day-negative cases.
+#
+# Oracle: python3 3.12 / dateutil 2.9.0.post0 (probe commands inline).
+# Prints PASS on all-match, else FAIL lines + exit 1.
+#
+# Build from THIS directory:
+#   PYRST_PATH=/home/ethos/Coding/pyrst/extern/packages \
+#     /home/ethos/Coding/pyrst/target/release/pyrst build tests/oracle_extended.pyrs
+#   ./oracle_extended
+
+import sys
+from datetime import datetime
+from dateutil.parser import parse, ParserError
+from dateutil.relativedelta import relativedelta, relativedelta_between
+from dateutil.rrule import rrule, materialize, MONTHLY, YEARLY, DAILY
+
+
+def ck_str(label: str, got: str, want: str, failures: Mut[list[str]]) -> None:
+    if got != want:
+        failures.append(label + ": got " + repr(got) + ", want " + repr(want))
+
+
+def ck_parse(s: str, want_iso: str, failures: Mut[list[str]]) -> None:
+    ck_str("parse(" + repr(s) + ")", parse(s).isoformat(), want_iso, failures)
+
+
+def ck_err(s: str, failures: Mut[list[str]]) -> None:
+    caught: bool = False
+    try:
+        parse(s)
+    except ParserError:
+        caught = True
+    if not caught:
+        failures.append("parse(" + repr(s) + ") should raise ParserError")
+
+
+def fmt_list(xs: list[datetime]) -> str:
+    out: str = ""
+    i: int = 0
+    while i < len(xs):
+        if i > 0:
+            out = out + "|"
+        out = out + xs[i].isoformat()
+        i = i + 1
+    return out
+
+
+def ck_rrule(label: str, rule: rrule, limit: int, want: str, failures: Mut[list[str]]) -> None:
+    ck_str(label, fmt_list(materialize(rule, limit)), want, failures)
+
+
+def ck_between(label: str, dt1: datetime, dt2: datetime, want: str, failures: Mut[list[str]]) -> None:
+    ck_str(label, str(relativedelta_between(dt1, dt2)), want, failures)
+
+
+def main() -> None:
+    failures: list[str] = []
+
+    # ── PARSER: malformed-input variety ──────────────────────────────────
+    # python3 -c "from dateutil import parser; parser.parse('2026-02-30')"
+    #   -> ParserError: day is out of range for month
+    ck_err("2026-02-30", failures)
+    # python3: parser.parse('32/13/2026') -> ParserError: month must be in 1..12
+    ck_err("32/13/2026", failures)
+    # python3: parser.parse('2026-02-29') (non-leap year) -> ParserError
+    ck_err("2026-02-29", failures)
+    # python3: parser.parse('Feb 30, 2026') -> ParserError: day is out of range
+    ck_err("Feb 30, 2026", failures)
+    # python3: parser.parse('25:61') -> ParserError: hour must be in 0..23
+    ck_err("25:61", failures)
+    # python3: parser.parse('2026-07-10T25:00:00') -> ParserError: hour must be in 0..23
+    ck_err("2026-07-10T25:00:00", failures)
+    # DOCUMENTED DIVERGENCE (time-only, README-pinned): dateutil fills in
+    # today's date (non-deterministic); this subset requires a date and
+    # raises ParserError instead. python3: parser.parse('10:30') -> today 10:30.
+    ck_err("10:30", failures)
+
+    # ── PARSER: ordinal-suffix / weekday-word / "of" forms ───────────────
+    # python3 -c "from dateutil import parser; print(parser.parse('Monday, July 10, 2026'))"
+    #   -> 2026-07-10 00:00:00
+    ck_parse("Monday, July 10, 2026", "2026-07-10T00:00:00", failures)
+    # python3: parser.parse('10th July 2026') -> 2026-07-10 00:00:00
+    ck_parse("10th July 2026", "2026-07-10T00:00:00", failures)
+    # python3: parser.parse('July 10th, 2026') -> 2026-07-10 00:00:00
+    ck_parse("July 10th, 2026", "2026-07-10T00:00:00", failures)
+    # python3: parser.parse('3rd of March 2026') -> 2026-03-03 00:00:00
+    ck_parse("3rd of March 2026", "2026-03-03T00:00:00", failures)
+
+    # ── RRULE: interval on MONTHLY / YEARLY ──────────────────────────────
+    # python3 -c "from dateutil import rrule; from datetime import datetime;
+    #   print(list(rrule.rrule(rrule.MONTHLY, dtstart=datetime(2026,1,15), interval=3, count=4)))"
+    #   -> 2026-01-15, 2026-04-15, 2026-07-15, 2026-10-15
+    ck_rrule("MONTHLY iv3 count4", rrule(MONTHLY, datetime(2026, 1, 15), interval=3, count=4), 10,
+             "2026-01-15T00:00:00|2026-04-15T00:00:00|2026-07-15T00:00:00|2026-10-15T00:00:00", failures)
+    # python3: rrule.rrule(rrule.YEARLY, dtstart=datetime(2020,2,29), interval=2, count=3)
+    #   -> 2020-02-29, 2024-02-29, 2028-02-29
+    ck_rrule("YEARLY iv2 leap count3", rrule(YEARLY, datetime(2020, 2, 29), interval=2, count=3), 10,
+             "2020-02-29T00:00:00|2024-02-29T00:00:00|2028-02-29T00:00:00", failures)
+
+    # ── RELATIVEDELTA_BETWEEN: sub-day negative deltas ───────────────────
+    # These probe the risk area the complex-implementer flagged in card
+    # comment 565 ("relativedelta_between negative sub-day deltas beyond
+    # the pinned -1-day case are documented best-effort").
+    #
+    # python3 -c "from dateutil.relativedelta import relativedelta; from datetime import datetime;
+    #   print(relativedelta(datetime(2026,1,1,0,0,0), datetime(2026,1,1,0,0,1)))"
+    #   -> relativedelta(seconds=-1)
+    ck_between("between sub-second", datetime(2026, 1, 1, 0, 0, 0), datetime(2026, 1, 1, 0, 0, 1),
+               "relativedelta(seconds=-1)", failures)
+    # python3: relativedelta(datetime(2026,1,1), datetime(2026,1,2,1,0,0))
+    #   -> relativedelta(days=-1, hours=-1)
+    ck_between("between -1d-1h", datetime(2026, 1, 1), datetime(2026, 1, 2, 1, 0, 0),
+               "relativedelta(days=-1, hours=-1)", failures)
+    # python3: relativedelta(datetime(2026,1,1,10,0,0), datetime(2026,1,1,10,0,30))
+    #   -> relativedelta(seconds=-30)
+    ck_between("between -30s", datetime(2026, 1, 1, 10, 0, 0), datetime(2026, 1, 1, 10, 0, 30),
+               "relativedelta(seconds=-30)", failures)
+    # python3: relativedelta(datetime(2026,1,1,0,0,0), datetime(2026,1,2,0,0,1))
+    #   -> relativedelta(days=-1, seconds=-1)
+    ck_between("between -1d-1s", datetime(2026, 1, 1, 0, 0, 0), datetime(2026, 1, 2, 0, 0, 1),
+               "relativedelta(days=-1, seconds=-1)", failures)
+    # python3: relativedelta(datetime(2026,6,15,5,0,0), datetime(2026,6,15,7,30,0))
+    #   -> relativedelta(hours=-2, minutes=-30)
+    ck_between("between -2h30m", datetime(2026, 6, 15, 5, 0, 0), datetime(2026, 6, 15, 7, 30, 0),
+               "relativedelta(hours=-2, minutes=-30)", failures)
+
+    if len(failures) == 0:
+        print("PASS: oracle_extended")
+    else:
+        for f in failures:
+            print("FAIL: " + f)
+        sys.exit(1)
+
+
+main()

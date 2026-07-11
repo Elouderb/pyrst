@@ -1,0 +1,94 @@
+# constructors.pyrs — numpy-style free-function constructors for NDArray.
+#
+# 1D `array()` from a flat list and 2D `array2d()` from a nested list are
+# separate entry points (pyrst has no union/variadic list-literal type letting
+# one `array()` overload accept both `list[float]` and `list[list[float]]`).
+# `zeros`/`ones`/`full` take a shape; `arange`/`linspace` build 1D ranges.
+# f64-only throughout (see README non-goals).
+
+from numpyrs.ndarray import NDArray
+
+
+def array(data: list[float]) -> NDArray:
+    # 1D convenience constructor: shape inferred as [len(data)].
+    return NDArray(data, [len(data)])
+
+
+def array2d(rows: list[list[float]]) -> NDArray:
+    # 2D from a nested list. Every row must have the same length (ragged input
+    # is an honest ValueError).
+    nrows: int = len(rows)
+    if nrows == 0:
+        return NDArray([], [0, 0])
+    ncols: int = len(rows[0])
+    buf: list[float] = []
+    i: int = 0
+    while i < nrows:
+        row: list[float] = rows[i]
+        if len(row) != ncols:
+            raise ValueError("array2d: ragged rows — row 0 has length " + str(ncols) + " but row " + str(i) + " has length " + str(len(row)))
+        j: int = 0
+        while j < ncols:
+            buf.append(row[j])
+            j += 1
+        i += 1
+    return NDArray(buf, [nrows, ncols])
+
+
+def _prod(shape: list[int]) -> int:
+    n: int = 1
+    i: int = 0
+    while i < len(shape):
+        n = n * shape[i]
+        i += 1
+    return n
+
+
+def full(shape: list[int], value: float) -> NDArray:
+    n: int = _prod(shape)
+    buf: list[float] = [value] * n
+    return NDArray(buf, shape)
+
+
+def zeros(shape: list[int]) -> NDArray:
+    return full(shape, 0.0)
+
+
+def ones(shape: list[int]) -> NDArray:
+    return full(shape, 1.0)
+
+
+def arange(start: float, stop: float, step: float) -> NDArray:
+    if step == 0.0:
+        raise ValueError("arange: step must not be zero")
+    buf: list[float] = []
+    x: float = start
+    if step > 0.0:
+        while x < stop:
+            buf.append(x)
+            x = x + step
+    else:
+        while x > stop:
+            buf.append(x)
+            x = x + step
+    return NDArray(buf, [len(buf)])
+
+
+def linspace(start: float, stop: float, num: int) -> NDArray:
+    # numpy default endpoint=True: `num` samples from start to stop inclusive.
+    if num < 0:
+        raise ValueError("linspace: number of samples must be non-negative, got " + str(num))
+    if num == 0:
+        return NDArray([], [0])
+    if num == 1:
+        return NDArray([start], [1])
+    buf: list[float] = [0.0] * num
+    denom: float = float(num - 1)
+    i: int = 0
+    while i < num:
+        t: float = float(i) / denom
+        buf[i] = start + (stop - start) * t
+        i += 1
+    # Pin the exact endpoint (avoid float drift at the last sample).
+    buf[num - 1] = stop
+    return NDArray(buf, [num])

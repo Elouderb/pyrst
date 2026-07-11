@@ -1,0 +1,162 @@
+# test_ops.pyrs — validation of numpyrs arithmetic, broadcasting, reductions,
+# linear algebra, constructors, and ufuncs. Oracle values are real numpy
+# results (numpy 1.26) pinned in comments. Prints PASS on success; on any
+# failure prints FAIL: <what> and `assert False` (nonzero exit).
+#
+# Build + run (from extern/packages/numpyrs/):
+#   PYRST_PATH=/home/ethos/Coding/pyrst/extern/packages \
+#     /home/ethos/Coding/pyrst/target/release/pyrst build tests/test_ops.pyrs
+#   ./test_ops
+
+from numpyrs.ndarray import NDArray
+from numpyrs.constructors import array, array2d, zeros, ones, full, arange, linspace
+from numpyrs.ufunc import absolute, sqrt, exp, log, sin, cos
+
+
+def close(a: float, b: float) -> bool:
+    d: float = a - b
+    if d < 0.0:
+        d = -d
+    return d < 0.000000001
+
+
+def fail(msg: str) -> None:
+    print("FAIL: " + msg)
+    assert False
+
+
+def check_data(a: NDArray, expected: list[float], label: str) -> None:
+    if len(a.data) != len(expected):
+        fail(label + " length " + str(len(a.data)) + " != " + str(len(expected)))
+    i: int = 0
+    while i < len(expected):
+        if not close(a.data[i], expected[i]):
+            fail(label + " at " + str(i) + ": got " + str(a.data[i]) + " expected " + str(expected[i]))
+        i += 1
+
+
+def main() -> None:
+    # ---- constructors ----
+    check_data(zeros([2, 3]), [0.0, 0.0, 0.0, 0.0, 0.0, 0.0], "zeros")
+    check_data(ones([3]), [1.0, 1.0, 1.0], "ones")
+    check_data(full([2, 2], 7.0), [7.0, 7.0, 7.0, 7.0], "full")
+    # np.arange(0,5,1) -> [0 1 2 3 4]
+    check_data(arange(0.0, 5.0, 1.0), [0.0, 1.0, 2.0, 3.0, 4.0], "arange")
+    # np.arange(1, 2, 0.25) -> [1. 1.25 1.5 1.75]
+    check_data(arange(1.0, 2.0, 0.25), [1.0, 1.25, 1.5, 1.75], "arange step")
+    # np.linspace(0,1,5) -> [0. 0.25 0.5 0.75 1.]
+    check_data(linspace(0.0, 1.0, 5), [0.0, 0.25, 0.5, 0.75, 1.0], "linspace")
+    m: NDArray = array2d([[1.0, 2.0], [3.0, 4.0]])
+    if m.ndim != 2 or m.shape[0] != 2 or m.shape[1] != 2:
+        fail("array2d shape")
+    if not close(m[1, 0], 3.0):
+        fail("array2d[1,0]")
+
+    # ---- elementwise arithmetic (same shape) ----
+    a: NDArray = array([1.0, 2.0, 3.0])
+    b: NDArray = array([4.0, 5.0, 6.0])
+    check_data(a + b, [5.0, 7.0, 9.0], "add")
+    check_data(b - a, [3.0, 3.0, 3.0], "sub")
+    check_data(a * b, [4.0, 10.0, 18.0], "mul")
+    # `/` and `**` operators don't dispatch to dunders (GAP) — use .div()/.power()
+    check_data(b.div(a), [4.0, 2.5, 2.0], "div")
+    # [2,3,4] ** [2,2,2] -> [4 9 16]
+    check_data(array([2.0, 3.0, 4.0]).power(array([2.0, 2.0, 2.0])), [4.0, 9.0, 16.0], "pow")
+    check_data(-a, [-1.0, -2.0, -3.0], "neg")
+
+    # ---- scalar broadcast: size-1 array AND scalar methods ----
+    check_data(a * array([10.0]), [10.0, 20.0, 30.0], "size1 broadcast mul")
+    check_data(array([100.0]) + a, [101.0, 102.0, 103.0], "size1 broadcast add lhs")
+    check_data(a.muls(2.0), [2.0, 4.0, 6.0], "muls")
+    check_data(a.adds(1.0), [2.0, 3.0, 4.0], "adds")
+    check_data(a.subs(0.5), [0.5, 1.5, 2.5], "subs")
+    check_data(a.divs(2.0), [0.5, 1.0, 1.5], "divs")
+    check_data(a.pows(2.0), [1.0, 4.0, 9.0], "pows")
+
+    # ---- shape mismatch -> ValueError ----
+    caught: bool = False
+    try:
+        c: NDArray = a + array([1.0, 2.0])
+        print(c.size)
+    except ValueError:
+        caught = True
+    if not caught:
+        fail("shape mismatch did not raise ValueError")
+
+    # ---- reductions ----  np: sum=10 mean=2.5 min=1 max=4 argmin=0 argmax=3
+    r: NDArray = array([1.0, 2.0, 3.0, 4.0])
+    if not close(r.sum(), 10.0):
+        fail("sum")
+    if not close(r.mean(), 2.5):
+        fail("mean")
+    if not close(r.min(), 1.0):
+        fail("min")
+    if not close(r.max(), 4.0):
+        fail("max")
+    if r.argmin() != 0:
+        fail("argmin")
+    if r.argmax() != 3:
+        fail("argmax")
+    s: NDArray = array([3.0, 1.0, 4.0, 1.0, 5.0, 9.0, 2.0])
+    if s.argmax() != 5:
+        fail("argmax mid")
+    if s.argmin() != 1:
+        fail("argmin first-min")
+
+    # ---- comparison masks ----  np: (a<b)=[1 1 1], (a==[1,9,3])=[1 0 1]
+    check_data(a.less(b), [1.0, 1.0, 1.0], "less mask")
+    check_data(a.equal(array([1.0, 9.0, 3.0])), [1.0, 0.0, 1.0], "equal mask")
+    if not (a == array([1.0, 2.0, 3.0])):
+        fail("whole-array __eq__ true")
+    if a == b:
+        fail("whole-array __eq__ false")
+
+    # ---- dot: 1D inner product = 32 ----
+    d1: NDArray = a.dot(b)
+    if not close(d1.data[0], 32.0):
+        fail("1D dot expected 32")
+
+    # ---- matmul: [[1,2],[3,4]] @ [[5,6],[7,8]] = [[19,22],[43,50]] ----
+    x: NDArray = array2d([[1.0, 2.0], [3.0, 4.0]])
+    y: NDArray = array2d([[5.0, 6.0], [7.0, 8.0]])
+    check_data(x.dot(y), [19.0, 22.0, 43.0, 50.0], "matmul")
+
+    # ---- matmul non-square: (2,3)@(3,2) = [[58,64],[139,154]] ----
+    p: NDArray = array2d([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+    q: NDArray = array2d([[7.0, 8.0], [9.0, 10.0], [11.0, 12.0]])
+    pq: NDArray = p.dot(q)
+    if pq.shape[0] != 2 or pq.shape[1] != 2:
+        fail("matmul shape")
+    check_data(pq, [58.0, 64.0, 139.0, 154.0], "matmul non-square")
+
+    # ---- transpose: [[1,2,3],[4,5,6]] -> [[1,4],[2,5],[3,6]] ----
+    t: NDArray = p.transpose()
+    if t.shape[0] != 3 or t.shape[1] != 2:
+        fail("transpose shape")
+    check_data(t, [1.0, 4.0, 2.0, 5.0, 3.0, 6.0], "transpose")
+
+    # ---- reshape (copy) ----
+    rs: NDArray = arange(0.0, 6.0, 1.0).reshape([2, 3])
+    if rs.shape[0] != 2 or rs.shape[1] != 3:
+        fail("reshape shape")
+    if not close(rs[1, 2], 5.0):
+        fail("reshape[1,2]")
+
+    # ---- ufuncs ----  sqrt([4,9,16])=[2,3,4]; exp([0,1]); log([1,e]); sin/cos
+    check_data(sqrt(array([4.0, 9.0, 16.0])), [2.0, 3.0, 4.0], "sqrt")
+    check_data(absolute(array([-1.0, 2.0, -3.5])), [1.0, 2.0, 3.5], "absolute")
+    e_arr: NDArray = exp(array([0.0, 1.0]))
+    if not close(e_arr.data[0], 1.0) or not close(e_arr.data[1], 2.718281828459045):
+        fail("exp")
+    l_arr: NDArray = log(array([1.0, 2.718281828459045]))
+    if not close(l_arr.data[0], 0.0) or not close(l_arr.data[1], 1.0):
+        fail("log")
+    # np.sin([0, pi/2]) = [0, 1]; np.cos([0, pi]) = [1, -1]
+    sn: NDArray = sin(array([0.0, 1.5707963267948966]))
+    if not close(sn.data[0], 0.0) or not close(sn.data[1], 1.0):
+        fail("sin")
+    cs: NDArray = cos(array([0.0, 3.141592653589793]))
+    if not close(cs.data[0], 1.0) or not close(cs.data[1], -1.0):
+        fail("cos")
+
+    print("PASS: numpyrs test_ops (constructors/arith/broadcast/reduce/matmul/transpose/ufunc)")

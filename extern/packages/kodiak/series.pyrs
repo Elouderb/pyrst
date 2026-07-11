@@ -477,6 +477,23 @@ class Series:
     def ne(self, x: float) -> Series:
         return self._cmp_scalar(x, "ne")
 
+    # Native operator masks (pyrst card 4349fe41): `col > 3.0` returns a bool-mask
+    # Series, so `df.filter(df["x"] > 3.0)` reads like pandas. Only >, >=, <=, !=
+    # route to dunders (Rust PartialOrd/PartialEq bool-lock `<`/`==`, pyrst card
+    # 4a4a9aca) — use .lt()/.eq() for those two. The scalar must be a FLOAT literal
+    # (`> 3.0`, not `> 3`) until comparison-operand int→float widening lands.
+    def __gt__(self, x: float) -> Series:
+        return self._cmp_scalar(x, "gt")
+
+    def __ge__(self, x: float) -> Series:
+        return self._cmp_scalar(x, "ge")
+
+    def __le__(self, x: float) -> Series:
+        return self._cmp_scalar(x, "le")
+
+    def __ne__(self, x: float) -> Series:
+        return self._cmp_scalar(x, "ne")
+
     def eq_str(self, v: str) -> Series:
         if self.dtype != "str":
             raise TypeError("kodiak: eq_str not supported on a '" + self.dtype + "' column ('" + self.name + "')")

@@ -47,10 +47,11 @@ def main() -> None:
     section("with derived bonus (salary*0.10) and total_comp (salary + bonus)")
     print(with_total)
 
-    # --- comparison -> bool mask -> filter (the pandas df[df.x>k] shape) ---
-    mask: Series = with_total["salary"].gt(100.0)
-    high: DataFrame = with_total.filter(mask)
-    section("filter: salary > 100")
+    # --- comparison -> bool mask -> filter (native operator: reads like pandas
+    #     `df[df["salary"] > 100.0]`, using df.filter since df[mask] needs a union
+    #     key; a float literal is required until comparison-operand int widening lands) ---
+    high: DataFrame = with_total.filter(with_total["salary"] > 100.0)
+    section("filter: salary > 100.0")
     print(high)
 
     # --- stable sort by total_comp, descending ---

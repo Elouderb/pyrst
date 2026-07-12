@@ -112,9 +112,21 @@ pub fn create(dir: Option<PathBuf>) -> Result<()> {
     std::fs::write(target.join(LOCK_FILE), LOCK_HEADER)?;
 
     let abs = target.canonicalize()?;
+    // Ship activation scripts for every shell (Python-venv style) so an env is
+    // portable and works on Linux/macOS (bash/zsh), Windows cmd, and PowerShell.
+    // Each embeds the local canonical path; the user sources the one for their shell.
     std::fs::write(target.join("activate"), activate_script(&abs))?;
+    std::fs::write(target.join("activate.bat"), activate_bat(&abs))?;
+    std::fs::write(target.join("deactivate.bat"), deactivate_bat())?;
+    std::fs::write(target.join("Activate.ps1"), activate_ps1(&abs))?;
 
     eprintln!("created pyrst environment: {}", abs.display());
+    #[cfg(windows)]
+    {
+        eprintln!("activate it with:  {}\\activate.bat        (cmd)", target.display());
+        eprintln!("               or:  . {}\\Activate.ps1      (PowerShell)", target.display());
+    }
+    #[cfg(not(windows))]
     eprintln!("activate it with:  source {}/activate", target.display());
     Ok(())
 }
@@ -136,6 +148,47 @@ fn activate_script(abs_env: &Path) -> String {
          _OLD_PYRST_VENV=\"${{PYRST_VENV:-}}\"\n\
          PYRST_VENV=\"{}\"\n\
          export PYRST_VENV\n",
+        abs_env.display()
+    )
+}
+
+/// The Windows `cmd` activation script (`activate.bat`, run it). Sets PYRST_VENV,
+/// saving the prior value so `deactivate.bat` can restore it. CRLF for cmd.
+fn activate_bat(abs_env: &Path) -> String {
+    format!(
+        "@echo off\r\n\
+         REM pyrst virtual environment (cmd.exe) — run this file to activate.\r\n\
+         REM run deactivate.bat to restore the previous PYRST_VENV.\r\n\
+         set \"_OLD_PYRST_VENV=%PYRST_VENV%\"\r\n\
+         set \"PYRST_VENV={}\"\r\n\
+         echo pyrst environment active: %PYRST_VENV%\r\n",
+        abs_env.display()
+    )
+}
+
+/// The Windows `cmd` deactivation script (`deactivate.bat`). Restores the PYRST_VENV
+/// that activate.bat saved (an empty saved value unsets it). CRLF for cmd.
+fn deactivate_bat() -> String {
+    "@echo off\r\n\
+     set \"PYRST_VENV=%_OLD_PYRST_VENV%\"\r\n\
+     set \"_OLD_PYRST_VENV=\"\r\n\
+     echo pyrst environment deactivated.\r\n"
+        .to_string()
+}
+
+/// The PowerShell activation script (`Activate.ps1`; dot-source it: `. .\\Activate.ps1`).
+/// Sets $env:PYRST_VENV, saving the prior value, and defines a `deactivate` that restores it.
+fn activate_ps1(abs_env: &Path) -> String {
+    format!(
+        "# pyrst virtual environment (PowerShell) — dot-source to activate:  . .\\Activate.ps1\n\
+         $env:_OLD_PYRST_VENV = $env:PYRST_VENV\n\
+         $env:PYRST_VENV = \"{}\"\n\
+         function global:deactivate {{\n\
+         \x20   $env:PYRST_VENV = $env:_OLD_PYRST_VENV\n\
+         \x20   Remove-Item Env:_OLD_PYRST_VENV -ErrorAction SilentlyContinue\n\
+         \x20   Remove-Item Function:deactivate -ErrorAction SilentlyContinue\n\
+         }}\n\
+         Write-Host \"pyrst environment active: $env:PYRST_VENV\"\n",
         abs_env.display()
     )
 }
@@ -818,6 +871,30 @@ mod tests {
         std::fs::write(env.join(ENV_META_FILE), "pyrst_version: test\n").unwrap();
         std::fs::write(env.join(LOCK_FILE), LOCK_HEADER).unwrap();
         env
+    }
+
+    /// `pyrst venv` writes activation scripts for every shell (bash/zsh, Windows
+    /// cmd, PowerShell) so an env is cross-platform (card 12a7a021).
+    #[test]
+    fn venv_writes_cross_platform_activation_scripts() {
+        let base = temp_dir("activate-scripts");
+        let env = base.join(".pyrstenv");
+        create(Some(env.clone())).expect("create env");
+        let bash = std::fs::read_to_string(env.join("activate")).unwrap();
+        let bat = std::fs::read_to_string(env.join("activate.bat")).unwrap();
+        let deact = std::fs::read_to_string(env.join("deactivate.bat")).unwrap();
+        let ps1 = std::fs::read_to_string(env.join("Activate.ps1")).unwrap();
+        // POSIX: exports PYRST_VENV + defines deactivate.
+        assert!(bash.contains("export PYRST_VENV"));
+        assert!(bash.contains("deactivate()"));
+        // cmd: sets PYRST_VENV, saves the old value, CRLF line endings.
+        assert!(bat.contains("set \"PYRST_VENV="));
+        assert!(bat.contains("set \"_OLD_PYRST_VENV=%PYRST_VENV%\""));
+        assert!(bat.contains("\r\n"), "activate.bat must use CRLF for cmd");
+        assert!(deact.contains("set \"PYRST_VENV=%_OLD_PYRST_VENV%\""));
+        // PowerShell: sets $env:PYRST_VENV + a deactivate function.
+        assert!(ps1.contains("$env:PYRST_VENV ="));
+        assert!(ps1.contains("function global:deactivate"));
     }
 
     /// Discovery: an explicit, valid PYRST_VENV wins over auto-detect.

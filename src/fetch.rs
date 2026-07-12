@@ -158,12 +158,31 @@ fn djb2(s: &str) -> u32 {
 pub fn clones_dir() -> Result<PathBuf> {
     let base = if let Some(c) = std::env::var_os("PYRST_CACHE") {
         PathBuf::from(c)
-    } else if let Some(h) = std::env::var_os("HOME") {
-        PathBuf::from(h).join(".cache").join("pyrst")
     } else {
-        return Err(Error::Pkg(
-            "cannot locate a clone cache: neither PYRST_CACHE nor HOME is set".into(),
-        ));
+        // Platform-native cache home. UNIX path is unchanged from before; Windows
+        // uses %LOCALAPPDATA% (HOME is typically unset in cmd/PowerShell).
+        #[cfg(windows)]
+        {
+            if let Some(l) = std::env::var_os("LOCALAPPDATA") {
+                PathBuf::from(l).join("pyrst")
+            } else if let Some(u) = std::env::var_os("USERPROFILE") {
+                PathBuf::from(u).join(".cache").join("pyrst")
+            } else {
+                return Err(Error::Pkg(
+                    "cannot locate a clone cache: set PYRST_CACHE (or LOCALAPPDATA/USERPROFILE)".into(),
+                ));
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            if let Some(h) = std::env::var_os("HOME") {
+                PathBuf::from(h).join(".cache").join("pyrst")
+            } else {
+                return Err(Error::Pkg(
+                    "cannot locate a clone cache: neither PYRST_CACHE nor HOME is set".into(),
+                ));
+            }
+        }
     };
     Ok(base.join("clones"))
 }

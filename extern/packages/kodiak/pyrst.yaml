@@ -4,8 +4,8 @@ package_root: .
 description: pandas-ergonomics dataframes with a polars-style lazy engine for pyrst
 dependencies:
   - name: numpyrs
-    path: ../numpyrs
+    git: https://github.com/Elouderb/numpyrs
   - name: dateutil
-    path: ../dateutil
+    git: https://github.com/Elouderb/dateutil
   - name: tzdata
-    path: ../tzdata
+    git: https://github.com/Elouderb/tzdata

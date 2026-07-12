@@ -4,6 +4,23 @@ A dataframe library for pyrst: pandas ergonomics + polars-style columnar
 storage (and, in a later phase, an optional lazy pipeline). Card `974fdff3`
 (epic `47cafe10`, the epic's capstone/FINAL package). Bear theme.
 
+## Install (pyrst package manager)
+
+kodiak is a public pyrst package on GitHub; installing it transitively pulls its
+dependencies (numpyrs, dateutil, tzdata) into an isolated virtual environment:
+
+```sh
+pyrst venv .pyrstenv
+source .pyrstenv/activate                          # sets PYRST_VENV (or auto-detected in this dir)
+pyrst install https://github.com/Elouderb/kodiak   # + numpyrs / dateutil / tzdata, SHA-pinned in pyrst.lock
+pyrst build your_program.pyrs                       # resolves kodiak from the env — no PYRST_PATH
+```
+
+`pyrst list` shows the installed set; `pyrst freeze` prints the pinned lock;
+`pyrst install` (no arg) reproduces the env from the lock. For local development
+against this monorepo checkout, the packages also resolve via
+`PYRST_PATH=extern/packages` (no install needed).
+
 **Status: Phase 3 (the lazy query engine) IMPLEMENTED** on top of the Phase-2
 eager core. kodiak now has `df.lazy() -> LazyFrame`: a polars-style deferred
 pipeline that records a logical op plan, `.explain()`s the plan (logical vs

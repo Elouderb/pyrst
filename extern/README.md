@@ -3,8 +3,16 @@
 Real programs and reusable packages written IN pyrst, kept separate from the
 compiler (`src/`) and the embedded standard library (`lib/`). Nothing here is
 compiled into the pyrst binary; everything imports through the normal module
-resolver (local siblings + `PYRST_PATH` once the import-search-path enabler
-lands).
+resolver (local siblings, an active virtual environment's package store, or
+`PYRST_PATH`).
+
+The four packages (numpyrs, tzdata, dateutil, kodiak) are also published as
+public GitHub repos under `github.com/Elouderb/` and are installable via the
+pyrst package manager (`pyrst venv` + `pyrst install <github-url>`; design in
+`docs/design/package-management.md`). The copies here are the dev source and the
+mirror source — each package's `pyrst.yaml` uses `git:` deps pointing at those
+repos. For in-monorepo dogfooding, build with `PYRST_PATH=extern/packages` (no
+install needed).
 
 - `programs/` — runnable applications (`extern/programs/<name>/main.pyrs` + a
   README with run instructions).

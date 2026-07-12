@@ -4,4 +4,4 @@ package_root: .
 description: dateutil-style parsing, relativedelta, and rrule for pyrst
 dependencies:
   - name: tzdata
-    path: ../tzdata
+    git: https://github.com/Elouderb/tzdata

@@ -18,10 +18,11 @@
 //!   - `check_env_completeness` — the design §F manifest-coherence gate the driver
 //!     runs before codegen.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::diag::{Error, Result};
+use crate::fetch;
 use crate::manifest::{DepSource, Manifest, MANIFEST_FILE};
 
 /// The conventional env directory name (auto-detected up the ancestor chain).
@@ -222,12 +223,25 @@ pub fn freeze() -> Result<()> {
 
 // ── lockfile ────────────────────────────────────────────────────────────────
 
+/// Where a LOCKED (installed) package came from — the RESOLVED, pinned source.
+///
+/// Distinct from `manifest::DepSource`: a manifest's `git:` dependency is an
+/// UNRESOLVED URL (possibly with a `@ref`), whereas a lock's git source always
+/// carries the exact resolved commit SHA (the pin). A path source stays as-is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LockSource {
+    /// A local directory (Phase 1). Stored as a canonical absolute path.
+    Path(String),
+    /// A git remote pinned to an exact commit (Phase 2).
+    Git { url: String, commit: String },
+}
+
 /// One pinned package in `pyrst.lock`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LockEntry {
     pub name: String,
     pub version: String,
-    pub source: DepSource,
+    pub source: LockSource,
 }
 
 /// Read `<env>/pyrst.lock` into a name→entry map. A missing lock is an empty map.
@@ -244,16 +258,32 @@ pub fn read_lock(env: &Path) -> Result<BTreeMap<String, LockEntry>> {
             continue;
         }
         let fields: Vec<&str> = line.split('\t').collect();
-        if fields.len() != 4 {
-            return Err(Error::Pkg(format!(
-                "{}: malformed lock line (expected 4 tab-separated fields): {}",
+        // A path entry is 4 fields (`name ver path <abs>`); a git entry is 5
+        // (`name ver git <url> <sha>`) — the resolved commit is the pin.
+        let malformed = |want: &str| {
+            Error::Pkg(format!(
+                "{}: malformed lock line (expected {}): {}",
                 path.display(),
+                want,
                 line
-            )));
+            ))
+        };
+        if fields.len() < 3 {
+            return Err(malformed("at least 3 tab-separated fields"));
         }
         let source = match fields[2] {
-            "path" => DepSource::Path(fields[3].to_string()),
-            "git" => DepSource::Git(fields[3].to_string()),
+            "path" => {
+                if fields.len() != 4 {
+                    return Err(malformed("4 tab-separated fields for a `path` entry"));
+                }
+                LockSource::Path(fields[3].to_string())
+            }
+            "git" => {
+                if fields.len() != 5 {
+                    return Err(malformed("5 tab-separated fields for a `git` entry (name ver git url sha)"));
+                }
+                LockSource::Git { url: fields[3].to_string(), commit: fields[4].to_string() }
+            }
             other => {
                 return Err(Error::Pkg(format!(
                     "{}: unknown lock source kind `{}`",
@@ -279,14 +309,16 @@ pub fn read_lock(env: &Path) -> Result<BTreeMap<String, LockEntry>> {
 pub fn write_lock(env: &Path, lock: &BTreeMap<String, LockEntry>) -> Result<()> {
     let mut out = String::from(LOCK_HEADER);
     for entry in lock.values() {
-        let (kind, value) = match &entry.source {
-            DepSource::Path(p) => ("path", p.as_str()),
-            DepSource::Git(g) => ("git", g.as_str()),
-        };
-        out.push_str(&format!(
-            "{}\t{}\t{}\t{}\n",
-            entry.name, entry.version, kind, value
-        ));
+        match &entry.source {
+            LockSource::Path(p) => out.push_str(&format!(
+                "{}\t{}\tpath\t{}\n",
+                entry.name, entry.version, p
+            )),
+            LockSource::Git { url, commit } => out.push_str(&format!(
+                "{}\t{}\tgit\t{}\t{}\n",
+                entry.name, entry.version, url, commit
+            )),
+        }
     }
     std::fs::write(env.join(LOCK_FILE), out)?;
     Ok(())
@@ -294,16 +326,33 @@ pub fn write_lock(env: &Path, lock: &BTreeMap<String, LockEntry>) -> Result<()> 
 
 // ── `pyrst install` ─────────────────────────────────────────────────────────
 
-/// Install a local package (and its transitive path-deps) into the active env, or
-/// — with no argument — reproduce the env from its `pyrst.lock`.
-pub fn install(arg: Option<PathBuf>) -> Result<()> {
+/// Install a package (and its transitive deps) into the active env, or — with no
+/// argument — reproduce the env from its `pyrst.lock`.
+///
+/// `spec` is EITHER a git URL (`url`, `url@<ref>`, `url#<sha>` — cloned into the
+/// SHA-keyed cache and pinned) OR a local path (Phase-1 copy). `--force` reinstalls
+/// over a name/source collision.
+pub fn install(spec: Option<String>, force: bool) -> Result<()> {
     let env = require_active_env()?;
-    let count = match arg {
-        Some(path) => {
+    let count = match spec {
+        Some(s) if looks_like_git_url(&s) => {
+            // `git clone <url>` under the hood → the SHA-keyed cache → verify it is
+            // a pyrst package → reuse the Phase-1 install DFS on the clone.
+            let co = clone_git_package(&s)?;
+            let source = LockSource::Git { url: co.url.clone(), commit: co.commit.clone() };
+            install_root(&env, &co.dir, source, force)?
+        }
+        Some(s) => {
+            let path = PathBuf::from(&s);
             let canon = path.canonicalize().map_err(|_| {
                 Error::Pkg(format!("install path '{}' does not exist", path.display()))
             })?;
-            install_into(&env, &canon)?
+            if force {
+                let source = LockSource::Path(canon.to_string_lossy().into_owned());
+                install_root(&env, &canon, source, true)?
+            } else {
+                install_into(&env, &canon)?
+            }
         }
         None => reproduce_into(&env)?,
     };
@@ -311,25 +360,72 @@ pub fn install(arg: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+/// Heuristic: does `s` name a git remote (vs a local filesystem path)? A remote has
+/// a scheme (`https://`, `ssh://`, `file://`, …), or ends in `.git`, or is the
+/// scp-short form `user@host:path`. Everything else is treated as a local path
+/// (the Phase-1 workflow). The `file://` fixtures the test suite uses classify as
+/// git via the `://` scheme.
+pub fn looks_like_git_url(s: &str) -> bool {
+    if s.contains("://") || s.ends_with(".git") {
+        return true;
+    }
+    // scp form `user@host:path`: an `@` and a `:` before any `/`.
+    if let Some(at) = s.find('@') {
+        let head = s.split('/').next().unwrap_or(s);
+        if head.contains(':') && at < head.len() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Clone a git package into the SHA-keyed cache and verify it IS a pyrst package
+/// (a `pyrst.yaml` at the clone root — the manifest's presence is what certifies
+/// it, per §C). An honest, URL-based error otherwise.
+fn clone_git_package(spec: &str) -> Result<fetch::GitCheckout> {
+    let co = fetch::resolve_spec(spec)?;
+    if !co.dir.join(MANIFEST_FILE).is_file() {
+        return Err(Error::Pkg(format!(
+            "{} is not a pyrst package (no {} at its root)",
+            co.url, MANIFEST_FILE
+        )));
+    }
+    eprintln!("  cloned {} @ {}", co.url, short_sha(&co.commit));
+    Ok(co)
+}
+
+/// A short (≤10 hex) commit for human-facing output.
+fn short_sha(sha: &str) -> &str {
+    &sha[..sha.len().min(10)]
+}
+
 /// DFS state carried through a single install run.
 struct InstallState {
     /// `<env>/packages`.
     store: PathBuf,
     /// The accumulating lock set (seeded from the existing lock so incremental
-    /// installs add to the env). Written back at the end.
+    /// installs add to the env, AND so collision detection sees prior installs).
+    /// Written back at the end.
     lock: BTreeMap<String, LockEntry>,
     /// Packages fully processed THIS run (copied + recursed) — diamond dedup.
     done: HashSet<String>,
     /// Names currently on the DFS stack — cycle detection.
     stack: Vec<String>,
-    /// name → canonical source dir seen THIS run — collision detection.
-    seen_src: HashMap<String, PathBuf>,
+    /// `--force`: reinstall over a name/source collision instead of erroring.
+    force: bool,
 }
 
-/// Install the package rooted at `pkg_dir` (and its deps) into `env`, updating
-/// `<env>/pyrst.lock`. Takes `env` EXPLICITLY (no global discovery) so it is
-/// directly unit-testable. Returns the number of packages installed this run.
+/// Install the package rooted at `pkg_dir` (a LOCAL path) into `env`. Public + its
+/// `(env, pkg_dir)` signature preserved for the venv unit tests. Returns the number
+/// of packages installed this run.
 pub fn install_into(env: &Path, pkg_dir: &Path) -> Result<usize> {
+    let source = LockSource::Path(pkg_dir.to_string_lossy().into_owned());
+    install_root(env, pkg_dir, source, false)
+}
+
+/// Seed the install state and run the DFS from `pkg_dir` (whose resolved lock
+/// `source` the caller supplies — a canonical path, or a pinned git url+sha).
+fn install_root(env: &Path, pkg_dir: &Path, source: LockSource, force: bool) -> Result<usize> {
     let store = env.join(PACKAGES_DIR);
     std::fs::create_dir_all(&store)?;
     let mut state = InstallState {
@@ -337,15 +433,20 @@ pub fn install_into(env: &Path, pkg_dir: &Path) -> Result<usize> {
         lock: read_lock(env)?,
         done: HashSet::new(),
         stack: Vec::new(),
-        seen_src: HashMap::new(),
+        force,
     };
-    install_dfs(&mut state, pkg_dir, None)?;
+    install_dfs(&mut state, pkg_dir, None, source)?;
     write_lock(env, &state.lock)?;
     Ok(state.done.len())
 }
 
-/// Reproduce the env from its lock: install every locked package from its pinned
-/// (path) source.
+/// Reproduce the env from its lock — a FLAT materialise (NOT the DFS): for each
+/// locked package, re-obtain its pinned source (a local path, or a git clone AT THE
+/// LOCKED SHA) and copy it into the store. Byte-reproducible: a git package is
+/// re-cloned at its exact pinned commit, so re-materialising a lock yields an
+/// identical store. (A flat pass is correct because the lock is already the
+/// complete, coherent, flattened install set; re-resolving each package's manifest
+/// deps would risk re-resolving a BARE dep URL to a newer HEAD, defeating the pin.)
 fn reproduce_into(env: &Path) -> Result<usize> {
     let lock = read_lock(env)?;
     if lock.is_empty() {
@@ -356,40 +457,52 @@ fn reproduce_into(env: &Path) -> Result<usize> {
     }
     let store = env.join(PACKAGES_DIR);
     std::fs::create_dir_all(&store)?;
-    let mut state = InstallState {
-        store,
-        lock: lock.clone(),
-        done: HashSet::new(),
-        stack: Vec::new(),
-        seen_src: HashMap::new(),
-    };
+    let mut count = 0usize;
     for entry in lock.values() {
-        match &entry.source {
-            DepSource::Path(p) => {
-                let dir = PathBuf::from(p).canonicalize().map_err(|_| {
-                    Error::Pkg(format!(
-                        "locked path '{}' for package `{}` no longer exists",
-                        p, entry.name
-                    ))
-                })?;
-                install_dfs(&mut state, &dir, Some(&entry.name))?;
+        let src_dir = match &entry.source {
+            LockSource::Path(p) => PathBuf::from(p).canonicalize().map_err(|_| {
+                Error::Pkg(format!(
+                    "locked path '{}' for package `{}` no longer exists",
+                    p, entry.name
+                ))
+            })?,
+            LockSource::Git { url, commit } => {
+                let co = fetch::resolve(url, &fetch::RefSpec::Commit(commit.clone()))?;
+                if !co.dir.join(MANIFEST_FILE).is_file() {
+                    return Err(Error::Pkg(format!(
+                        "{} (commit {}) is not a pyrst package (no {} at its root)",
+                        url, commit, MANIFEST_FILE
+                    )));
+                }
+                eprintln!("  cloned {} @ {}", url, short_sha(commit));
+                co.dir
             }
-            DepSource::Git(_) => {
-                return Err(Error::Pkg(format!(
-                    "package `{}` has a git source — reproducing git installs is Phase 2",
-                    entry.name
-                )))
-            }
+        };
+        // Honesty: the materialised source must be the package the lock names.
+        let manifest = Manifest::load(&src_dir)?;
+        if manifest.name != entry.name {
+            return Err(Error::Pkg(format!(
+                "lock names package `{}` but the source at {} is named `{}`",
+                entry.name,
+                src_dir.display(),
+                manifest.name
+            )));
         }
+        copy_package(&src_dir, &store.join(&entry.name))?;
+        count += 1;
     }
-    write_lock(env, &state.lock)?;
-    Ok(state.done.len())
+    Ok(count)
 }
 
-/// The install DFS body for one package directory. `pkg_dir` MUST be canonical.
-/// `expected_name`, when set, is the dependency name the parent declared — used to
-/// catch a manifest whose `name` disagrees with how it was referenced.
-fn install_dfs(state: &mut InstallState, pkg_dir: &Path, expected_name: Option<&str>) -> Result<()> {
+/// The install DFS body for one package directory. `pkg_dir` MUST be canonical (a
+/// local path, or a git clone dir). `expected_name`, when set, is the dependency
+/// name the parent declared. `source` is how this package is pinned in the lock.
+fn install_dfs(
+    state: &mut InstallState,
+    pkg_dir: &Path,
+    expected_name: Option<&str>,
+    source: LockSource,
+) -> Result<()> {
     let manifest = Manifest::load(pkg_dir)?;
     let name = manifest.name.clone();
 
@@ -414,77 +527,102 @@ fn install_dfs(state: &mut InstallState, pkg_dir: &Path, expected_name: Option<&
         )));
     }
 
-    // Diamond: already fully installed this run.
-    if state.done.contains(&name) {
-        return Ok(());
-    }
-
-    // Collision — same name, a DIFFERENT source directory.
-    if let Some(prev) = state.seen_src.get(&name) {
-        if prev != pkg_dir {
-            return Err(collision_err(&name, prev, pkg_dir));
-        }
-    }
-    if let Some(entry) = state.lock.get(&name) {
-        if let DepSource::Path(p) = &entry.source {
-            if let Ok(prev_canon) = PathBuf::from(p).canonicalize() {
-                if prev_canon != pkg_dir {
-                    return Err(collision_err(&name, &prev_canon, pkg_dir));
-                }
+    // Collision — the same name already pinned (this run or a prior install) from a
+    // GENUINELY DIFFERENT source. The lock is seeded from the existing lock and
+    // updated as we install, so it captures both. Same source → not a conflict
+    // (idempotent). `--force` overrides. Checked BEFORE the diamond short-circuit
+    // so a differing source is never silently absorbed as a diamond.
+    if !state.force {
+        if let Some(entry) = state.lock.get(&name) {
+            if sources_conflict(&entry.source, &source) {
+                let prev = entry.source.clone();
+                return Err(collision_err(&name, &prev, &source));
             }
         }
     }
 
-    state.seen_src.insert(name.clone(), pkg_dir.to_path_buf());
+    // Diamond: already fully installed this run (same source) — nothing to do.
+    if state.done.contains(&name) {
+        return Ok(());
+    }
 
     // Copy the package (manifest + its `.pyrs` tree) into the store.
     copy_package(pkg_dir, &state.store.join(&name))?;
 
-    // Pin it in the lock (canonical abs path so a no-arg reproduce is robust).
+    // Pin it in the lock (before recursing, so an in-progress package is visible to
+    // the collision check and a cycle is still caught by the stack).
     state.lock.insert(
         name.clone(),
         LockEntry {
             name: name.clone(),
             version: manifest.version.clone(),
-            source: DepSource::Path(pkg_dir.to_string_lossy().into_owned()),
+            source,
         },
     );
 
-    // Recurse into declared dependencies.
+    // Recurse into declared dependencies. A `path:` dep resolves relative to THIS
+    // package's dir; a `git:` dep is cloned into the SHA-keyed cache and pinned —
+    // reusing the very same DFS (visited-set, diamond dedup, cycle detection).
     state.stack.push(name.clone());
     for dep in &manifest.dependencies {
-        let dep_dir = match &dep.source {
+        let (dep_dir, dep_source) = match &dep.source {
             DepSource::Path(p) => {
                 let joined = pkg_dir.join(p);
-                joined.canonicalize().map_err(|_| {
+                let canon = joined.canonicalize().map_err(|_| {
                     Error::Pkg(format!(
                         "package `{}` declares dependency `{}` at path `{}`, which does not exist",
                         name, dep.name, p
                     ))
-                })?
+                })?;
+                let src = LockSource::Path(canon.to_string_lossy().into_owned());
+                (canon, src)
             }
             DepSource::Git(url) => {
-                return Err(Error::Pkg(format!(
-                    "package `{}` declares a git dependency `{}` ({}) — installing from git is Phase 2; \
-                     use a `path:` dependency for now",
-                    name, dep.name, url
-                )))
+                let co = clone_git_package(url)?;
+                let src = LockSource::Git { url: co.url.clone(), commit: co.commit.clone() };
+                (co.dir, src)
             }
         };
-        install_dfs(state, &dep_dir, Some(&dep.name))?;
+        install_dfs(state, &dep_dir, Some(&dep.name), dep_source)?;
     }
     state.stack.pop();
     state.done.insert(name);
     Ok(())
 }
 
-fn collision_err(name: &str, prev: &Path, current: &Path) -> Error {
+/// Do two lock sources refer to genuinely DIFFERENT origins (a real name
+/// collision)? Same path (canonicalised) or same git url+sha → not a conflict
+/// (idempotent re-install); a path-vs-git kind mismatch always is.
+fn sources_conflict(a: &LockSource, b: &LockSource) -> bool {
+    match (a, b) {
+        (LockSource::Path(pa), LockSource::Path(pb)) => {
+            match (PathBuf::from(pa).canonicalize(), PathBuf::from(pb).canonicalize()) {
+                (Ok(x), Ok(y)) => x != y,
+                _ => pa != pb,
+            }
+        }
+        (
+            LockSource::Git { url: u1, commit: c1 },
+            LockSource::Git { url: u2, commit: c2 },
+        ) => u1 != u2 || c1 != c2,
+        _ => true,
+    }
+}
+
+fn describe_source(s: &LockSource) -> String {
+    match s {
+        LockSource::Path(p) => p.clone(),
+        LockSource::Git { url, commit } => format!("{} @ {}", url, short_sha(commit)),
+    }
+}
+
+fn collision_err(name: &str, prev: &LockSource, current: &LockSource) -> Error {
     Error::Pkg(format!(
         "package name collision: `{}` is already installed from {} but is now requested from {} — \
-         two different sources cannot share one env name",
+         two different sources cannot share one env name (use --force to reinstall)",
         name,
-        prev.display(),
-        current.display()
+        describe_source(prev),
+        describe_source(current)
     ))
 }
 
@@ -670,16 +808,41 @@ mod tests {
         let mut lock = BTreeMap::new();
         lock.insert(
             "numpyrs".to_string(),
-            LockEntry { name: "numpyrs".into(), version: "0.1.0".into(), source: DepSource::Path("/abs/numpyrs".into()) },
+            LockEntry { name: "numpyrs".into(), version: "0.1.0".into(), source: LockSource::Path("/abs/numpyrs".into()) },
         );
         lock.insert(
             "tzdata".to_string(),
-            LockEntry { name: "tzdata".into(), version: "0.2.1".into(), source: DepSource::Path("/abs/tzdata".into()) },
+            LockEntry { name: "tzdata".into(), version: "0.2.1".into(), source: LockSource::Path("/abs/tzdata".into()) },
+        );
+        // A git-sourced entry pins the resolved commit SHA (5-field line).
+        lock.insert(
+            "dateutil".to_string(),
+            LockEntry {
+                name: "dateutil".into(),
+                version: "0.3.0".into(),
+                source: LockSource::Git {
+                    url: "https://github.com/Elouderb/dateutil".into(),
+                    commit: "d3543dfe79920046e4b281b377af14bbd2026be2".into(),
+                },
+            },
         );
         write_lock(&env, &lock).unwrap();
         let back = read_lock(&env).unwrap();
-        assert_eq!(back, lock, "lock must round-trip exactly");
+        assert_eq!(back, lock, "lock must round-trip exactly (path + git)");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// URL-vs-path classification: git remotes are detected; local paths are not.
+    #[test]
+    fn git_url_detection() {
+        assert!(looks_like_git_url("https://github.com/Elouderb/numpyrs"));
+        assert!(looks_like_git_url("file:///tmp/x/repo"));
+        assert!(looks_like_git_url("git@github.com:Elouderb/numpyrs.git"));
+        assert!(looks_like_git_url("ssh://git@host/owner/repo"));
+        assert!(looks_like_git_url("https://github.com/Elouderb/numpyrs@v0.2.0"));
+        assert!(!looks_like_git_url("../numpyrs"));
+        assert!(!looks_like_git_url("/abs/path/to/pkg"));
+        assert!(!looks_like_git_url("extern/packages/kodiak"));
     }
 
     /// Transitive install + diamond dedup: kodiak→{numpyrs, dateutil, tzdata},

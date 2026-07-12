@@ -17,6 +17,7 @@
 # ...but keep the test harness and recorded results (these are not binaries)
 !/test_all.sh
 !/test_pkg.sh
+!/test_pkg_git.sh
 !/test_results.txt
 
 # graphify generated knowledge-graph output (regenerated on demand)

@@ -16,6 +16,7 @@ mod repl;
 mod lsp;
 mod manifest;
 mod venv;
+mod fetch;
 pub mod analysis;
 
 fn print_usage() {
@@ -30,8 +31,10 @@ fn print_usage() {
     eprintln!("  fmt   <file.pyrs>   format a pyrst source file in-place");
     eprintln!("  lint  <file.pyrs>   check code style and common issues");
     eprintln!("  venv  [dir]         create an isolated package environment (default .pyrstenv)");
-    eprintln!("  install [path]      install a local package (+ its deps) into the active env;");
-    eprintln!("                      no arg reproduces the env from pyrst.lock");
+    eprintln!("  install [target]    install a package (+ its deps) into the active env, where");
+    eprintln!("                      <target> is a git URL (url, url@<ref>, or url#<sha>) or a");
+    eprintln!("                      local path; no arg reproduces the env from pyrst.lock");
+    eprintln!("                      (--force reinstalls over a name/source collision)");
     eprintln!("  init                scaffold a pyrst.yaml for the current directory");
     eprintln!("  list                list packages installed in the active env");
     eprintln!("  freeze              print the pinned lock set");
@@ -40,6 +43,14 @@ fn print_usage() {
     eprintln!();
     eprintln!("global flags:");
     eprintln!("  --venv <dir>        use <dir> as the active environment (overrides PYRST_VENV/auto-detect)");
+    eprintln!();
+    eprintln!("environment:");
+    eprintln!("  PYRST_CACHE         clone-cache root for `install` (default ~/.cache/pyrst)");
+    eprintln!();
+    eprintln!("security: `install` clones and `build` COMPILES third-party source. pyrst verifies a");
+    eprintln!("  target is a real pyrst package (a valid pyrst.yaml) and pins the exact commit SHA");
+    eprintln!("  (no silent upstream drift), but does NOT sandbox installed code — the same trust");
+    eprintln!("  model as `pip install` / `cargo add`. Requires `git` on PATH.");
 }
 
 /// Render a packaging-command error (no source file to snippet against) and map
@@ -113,7 +124,24 @@ fn main() -> ExitCode {
     // Packaging commands (optional / no file argument).
     match cmd.as_str() {
         "venv" => return finish_pkg(venv::create(args.next().map(PathBuf::from))),
-        "install" => return finish_pkg(venv::install(args.next().map(PathBuf::from))),
+        "install" => {
+            // `install [--force] [target]` — <target> is a git URL or local path;
+            // no target reproduces from pyrst.lock. `--force` reinstalls over a
+            // name/source collision.
+            let mut force = false;
+            let mut spec: Option<String> = None;
+            for a in args.by_ref() {
+                if a == "--force" {
+                    force = true;
+                } else if spec.is_none() {
+                    spec = Some(a);
+                } else {
+                    eprintln!("error: install takes at most one target (got an extra '{}')", a);
+                    return ExitCode::from(2);
+                }
+            }
+            return finish_pkg(venv::install(spec, force));
+        }
         "init" => return finish_pkg(venv::init()),
         "list" => return finish_pkg(venv::list()),
         "freeze" => return finish_pkg(venv::freeze()),

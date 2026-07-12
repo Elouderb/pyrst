@@ -42,6 +42,14 @@
 from numpyrs.ndarray import NDArray
 from numpyrs.constructors import array
 
+# datetime column (Phase 4b, card 974fdff3): a 5th backing store `dts:
+# list[datetime]` under dtype "datetime" (see the `dts` field + the DATETIME
+# section far below). lib/datetime is a leaf dependency (it imports nothing from
+# kodiak), so this one-way import adds no cycle. Full-fidelity storage (the real
+# datetime object, h/m/s intact) is what makes the .dt accessor and the temporal
+# comparison filters trivial struct-field reads rather than string re-parsing.
+from datetime import datetime
+
 
 # ---- module-private helpers ----------------------------------------------
 
@@ -66,25 +74,44 @@ def _is_numeric_dtype(dt: str) -> bool:
     return dt == "i64" or dt == "f64"
 
 
+def _dt_ordinal(d: datetime) -> int:
+    # A single monotone i64 that orders two datetimes chronologically: total
+    # microseconds since the proleptic-Gregorian epoch. Max magnitude
+    # ~3.2e17 (toordinal <= 3652059) — well inside i64 (~9.2e18). Used by the
+    # sort/group/merge key comparators and the .dt comparison filters instead
+    # of the `<` operator on list-indexed instances, so the ordering is a plain
+    # integer compare with no dependence on class-operator dispatch subtleties.
+    return ((d.toordinal() * 86400 + (d.hour * 60 + d.minute) * 60 + d.second) * 1000000) + d.microsecond
+
+
+def _dt_render(d: datetime) -> str:
+    # "YYYY-MM-DD HH:MM:SS" (pandas' datetime cell form): isoformat() gives the
+    # 'T'-separated ISO string; swap the single 'T' for a space. Microseconds,
+    # if any, ride along after the seconds (isoformat appends ".ffffff").
+    return d.isoformat().replace("T", " ")
+
+
 class Series:
     name: str
-    dtype: str          # "i64" | "f64" | "str" | "bool"
+    dtype: str          # "i64" | "f64" | "str" | "bool" | "datetime"
     ints: list[int]
     floats: list[float]
     strs: list[str]
     bools: list[bool]   # only the store matching `dtype` is populated
+    dts: list[datetime]  # the "datetime" store (Phase 4b); empty for other dtypes
     nulls: list[bool]   # validity mask; nulls[i] == True  =>  row i is NA
     length: int
 
-    def __init__(self, name: str, dtype: str, ints: list[int], floats: list[float], strs: list[str], bools: list[bool], nulls: list[bool], length: int) -> None:
-        if dtype not in ["i64", "f64", "str", "bool"]:
-            raise ValueError("Series: unknown dtype " + repr(dtype) + " (expected one of i64/f64/str/bool)")
+    def __init__(self, name: str, dtype: str, ints: list[int], floats: list[float], strs: list[str], bools: list[bool], dts: list[datetime], nulls: list[bool], length: int) -> None:
+        if dtype not in ["i64", "f64", "str", "bool", "datetime"]:
+            raise ValueError("Series: unknown dtype " + repr(dtype) + " (expected one of i64/f64/str/bool/datetime)")
         self.name = name
         self.dtype = dtype
         self.ints = ints
         self.floats = floats
         self.strs = strs
         self.bools = bools
+        self.dts = dts
         self.nulls = nulls
         self.length = length
 
@@ -93,35 +120,49 @@ class Series:
     # explicit validity mask (used by read_csv and null-producing ops).
     @staticmethod
     def from_ints(name: str, values: list[int]) -> Series:
-        return Series(name, "i64", values, [], [], [], _rep_false(len(values)), len(values))
+        return Series(name, "i64", values, [], [], [], [], _rep_false(len(values)), len(values))
 
     @staticmethod
     def from_floats(name: str, values: list[float]) -> Series:
-        return Series(name, "f64", [], values, [], [], _rep_false(len(values)), len(values))
+        return Series(name, "f64", [], values, [], [], [], _rep_false(len(values)), len(values))
 
     @staticmethod
     def from_strs(name: str, values: list[str]) -> Series:
-        return Series(name, "str", [], [], values, [], _rep_false(len(values)), len(values))
+        return Series(name, "str", [], [], values, [], [], _rep_false(len(values)), len(values))
 
     @staticmethod
     def from_bools(name: str, values: list[bool]) -> Series:
-        return Series(name, "bool", [], [], [], values, _rep_false(len(values)), len(values))
+        return Series(name, "bool", [], [], [], values, [], _rep_false(len(values)), len(values))
 
     @staticmethod
     def from_ints_n(name: str, values: list[int], nulls: list[bool]) -> Series:
-        return Series(name, "i64", values, [], [], [], nulls, len(values))
+        return Series(name, "i64", values, [], [], [], [], nulls, len(values))
 
     @staticmethod
     def from_floats_n(name: str, values: list[float], nulls: list[bool]) -> Series:
-        return Series(name, "f64", [], values, [], [], nulls, len(values))
+        return Series(name, "f64", [], values, [], [], [], nulls, len(values))
 
     @staticmethod
     def from_strs_n(name: str, values: list[str], nulls: list[bool]) -> Series:
-        return Series(name, "str", [], [], values, [], nulls, len(values))
+        return Series(name, "str", [], [], values, [], [], nulls, len(values))
 
     @staticmethod
     def from_bools_n(name: str, values: list[bool], nulls: list[bool]) -> Series:
-        return Series(name, "bool", [], [], [], values, nulls, len(values))
+        return Series(name, "bool", [], [], [], values, [], nulls, len(values))
+
+    # ---- datetime constructors (Phase 4b) ---------------------------------
+    # A "datetime" column stores real lib/datetime.datetime objects in `dts`.
+    # from_datetimes builds an all-valid column; from_datetimes_n takes an
+    # explicit validity mask (used by read_csv(parse_dates=...)). A null cell
+    # still occupies a slot in `dts` (a placeholder datetime); the mask marks
+    # it NA and every op ignores the placeholder value.
+    @staticmethod
+    def from_datetimes(name: str, values: list[datetime]) -> Series:
+        return Series(name, "datetime", [], [], [], [], values, _rep_false(len(values)), len(values))
+
+    @staticmethod
+    def from_datetimes_n(name: str, values: list[datetime], nulls: list[bool]) -> Series:
+        return Series(name, "datetime", [], [], [], [], values, nulls, len(values))
 
     @staticmethod
     def from_ndarray(name: str, a: NDArray) -> Series:
@@ -141,7 +182,7 @@ class Series:
         return self.length
 
     def rename(self, name: str) -> Series:
-        return Series(name, self.dtype, self.ints, self.floats, self.strs, self.bools, self.nulls, self.length)
+        return Series(name, self.dtype, self.ints, self.floats, self.strs, self.bools, self.dts, self.nulls, self.length)
 
     def is_numeric(self) -> bool:
         return _is_numeric_dtype(self.dtype)
@@ -184,7 +225,7 @@ class Series:
                 else:
                     ints.append(self.ints[i])
                 i += 1
-            return Series(self.name, "i64", ints, [], [], [], nulls, self.length)
+            return Series(self.name, "i64", ints, [], [], [], [], nulls, self.length)
         floats: list[float] = []
         i = 0
         while i < self.length:
@@ -193,7 +234,7 @@ class Series:
             else:
                 floats.append(self.floats[i])
             i += 1
-        return Series(self.name, "f64", [], floats, [], [], nulls, self.length)
+        return Series(self.name, "f64", [], floats, [], [], [], nulls, self.length)
 
     def fillna_str(self, v: str) -> Series:
         if self.dtype != "str":
@@ -207,7 +248,7 @@ class Series:
             else:
                 strs.append(self.strs[i])
             i += 1
-        return Series(self.name, "str", [], [], strs, [], nulls, self.length)
+        return Series(self.name, "str", [], [], strs, [], [], nulls, self.length)
 
     # ---- rendering: every cell as a str, for the DataFrame table printer --
     def to_strings(self) -> list[str]:
@@ -222,6 +263,8 @@ class Series:
                 out.append(str(self.floats[i]))
             elif self.dtype == "str":
                 out.append(self.strs[i])
+            elif self.dtype == "datetime":
+                out.append(_dt_render(self.dts[i]))
             else:
                 out.append(str(self.bools[i]))
             i += 1
@@ -241,6 +284,8 @@ class Series:
                 out.append(str(self.floats[i]))
             elif self.dtype == "str":
                 out.append(self.strs[i])
+            elif self.dtype == "datetime":
+                out.append(_dt_render(self.dts[i]))
             else:
                 out.append(str(self.bools[i]))
             i += 1
@@ -261,6 +306,7 @@ class Series:
         floats: list[float] = []
         strs: list[str] = []
         bools: list[bool] = []
+        dts: list[datetime] = []
         nulls: list[bool] = self.nulls[lo:hi]
         if self.dtype == "i64":
             ints = self.ints[lo:hi]
@@ -268,9 +314,11 @@ class Series:
             floats = self.floats[lo:hi]
         elif self.dtype == "str":
             strs = self.strs[lo:hi]
+        elif self.dtype == "datetime":
+            dts = self.dts[lo:hi]
         else:
             bools = self.bools[lo:hi]
-        return Series(self.name, self.dtype, ints, floats, strs, bools, nulls, hi - lo)
+        return Series(self.name, self.dtype, ints, floats, strs, bools, dts, nulls, hi - lo)
 
     def take(self, idx: list[int]) -> Series:
         # Arbitrary-index gather (the shared reorder/select primitive that
@@ -280,6 +328,7 @@ class Series:
         floats: list[float] = []
         strs: list[str] = []
         bools: list[bool] = []
+        dts: list[datetime] = []
         nulls: list[bool] = []
         k: int = 0
         while k < len(idx):
@@ -291,10 +340,12 @@ class Series:
                 floats.append(self.floats[j])
             elif self.dtype == "str":
                 strs.append(self.strs[j])
+            elif self.dtype == "datetime":
+                dts.append(self.dts[j])
             else:
                 bools.append(self.bools[j])
             k += 1
-        return Series(self.name, self.dtype, ints, floats, strs, bools, nulls, len(idx))
+        return Series(self.name, self.dtype, ints, floats, strs, bools, dts, nulls, len(idx))
 
     def take_null(self, idx: list[int]) -> Series:
         # Like take() but an index of -1 produces a NULL cell (used by left
@@ -304,6 +355,7 @@ class Series:
         floats: list[float] = []
         strs: list[str] = []
         bools: list[bool] = []
+        dts: list[datetime] = []
         nulls: list[bool] = []
         k: int = 0
         while k < len(idx):
@@ -316,6 +368,8 @@ class Series:
                     floats.append(0.0)
                 elif self.dtype == "str":
                     strs.append("")
+                elif self.dtype == "datetime":
+                    dts.append(datetime(1, 1, 1, 0, 0, 0, 0))
                 else:
                     bools.append(False)
             else:
@@ -326,10 +380,12 @@ class Series:
                     floats.append(self.floats[j])
                 elif self.dtype == "str":
                     strs.append(self.strs[j])
+                elif self.dtype == "datetime":
+                    dts.append(self.dts[j])
                 else:
                     bools.append(self.bools[j])
             k += 1
-        return Series(self.name, self.dtype, ints, floats, strs, bools, nulls, len(idx))
+        return Series(self.name, self.dtype, ints, floats, strs, bools, dts, nulls, len(idx))
 
     def head(self, n: int) -> Series:
         return self.row_slice(0, n)
@@ -401,8 +457,8 @@ class Series:
                         ints.append(ai * bi)
             i += 1
         if result_float:
-            return Series(self.name, "f64", [], floats, [], [], nulls, n)
-        return Series(self.name, "i64", ints, [], [], [], nulls, n)
+            return Series(self.name, "f64", [], floats, [], [], [], nulls, n)
+        return Series(self.name, "i64", ints, [], [], [], [], nulls, n)
 
     def add(self, other: Series) -> Series:
         return self._binary(other, "add")
@@ -451,7 +507,7 @@ class Series:
                 else:
                     floats.append(av / x)
             i += 1
-        return Series(self.name, "f64", [], floats, [], [], nulls, self.length)
+        return Series(self.name, "f64", [], floats, [], [], [], nulls, self.length)
 
     def add_scalar(self, x: float) -> Series:
         return self._scalar(x, "add")
@@ -662,6 +718,147 @@ class Series:
 
     def to_ndarray(self) -> NDArray:
         return array(self.numeric_values())
+
+    # ---- datetime column operations (Phase 4b) ----------------------------
+    # A "datetime" Series stores real datetime objects. `dt_ordinal_at` is the
+    # chronological sort key (a monotone i64), consumed by the frame-level
+    # key comparators. The .dt accessors project a component (year/month/day/
+    # hour/minute) into an i64 Series (null-propagating). The dt_* comparison
+    # methods produce a bool mask (a null cell never satisfies), mirroring the
+    # numeric gt/lt/... convention so `df.filter(col.dt_between(a, b))` reads
+    # the same as any other mask filter.
+    def _require_dt(self, what: str) -> None:
+        if self.dtype != "datetime":
+            raise TypeError("kodiak: " + what + " not supported on a '" + self.dtype + "' column ('" + self.name + "'); it is not a datetime column")
+
+    def dt_ordinal_at(self, i: int) -> int:
+        # Chronological ordinal of the datetime at row i. Assumes a datetime
+        # dtype (internal; callers reach it only through the datetime key path).
+        return _dt_ordinal(self.dts[i])
+
+    def _dt_component(self, what: str) -> Series:
+        self._require_dt(what)
+        out: list[int] = []
+        nulls: list[bool] = []
+        i: int = 0
+        while i < self.length:
+            if self.nulls[i]:
+                out.append(0)
+                nulls.append(True)
+            else:
+                d: datetime = self.dts[i]
+                v: int = 0
+                if what == "dt_year":
+                    v = d.year
+                elif what == "dt_month":
+                    v = d.month
+                elif what == "dt_day":
+                    v = d.day
+                elif what == "dt_hour":
+                    v = d.hour
+                else:
+                    v = d.minute
+                out.append(v)
+                nulls.append(False)
+            i += 1
+        return Series.from_ints_n(self.name, out, nulls)
+
+    def dt_year(self) -> Series:
+        return self._dt_component("dt_year")
+
+    def dt_month(self) -> Series:
+        return self._dt_component("dt_month")
+
+    def dt_day(self) -> Series:
+        return self._dt_component("dt_day")
+
+    def dt_hour(self) -> Series:
+        return self._dt_component("dt_hour")
+
+    def dt_minute(self) -> Series:
+        return self._dt_component("dt_minute")
+
+    def dt_before(self, other: datetime) -> Series:
+        # bool mask: True where the (non-null) cell is strictly before `other`.
+        self._require_dt("dt_before")
+        bound: int = _dt_ordinal(other)
+        out: list[bool] = []
+        i: int = 0
+        while i < self.length:
+            if self.nulls[i]:
+                out.append(False)
+            else:
+                out.append(_dt_ordinal(self.dts[i]) < bound)
+            i += 1
+        return Series.from_bools(self.name, out)
+
+    def dt_after(self, other: datetime) -> Series:
+        # bool mask: True where the (non-null) cell is strictly after `other`.
+        self._require_dt("dt_after")
+        bound: int = _dt_ordinal(other)
+        out: list[bool] = []
+        i: int = 0
+        while i < self.length:
+            if self.nulls[i]:
+                out.append(False)
+            else:
+                out.append(_dt_ordinal(self.dts[i]) > bound)
+            i += 1
+        return Series.from_bools(self.name, out)
+
+    def dt_between(self, lo: datetime, hi: datetime) -> Series:
+        # bool mask: True where lo <= cell <= hi (inclusive; null -> False).
+        self._require_dt("dt_between")
+        lo_ord: int = _dt_ordinal(lo)
+        hi_ord: int = _dt_ordinal(hi)
+        out: list[bool] = []
+        i: int = 0
+        while i < self.length:
+            if self.nulls[i]:
+                out.append(False)
+            else:
+                o: int = _dt_ordinal(self.dts[i])
+                out.append(o >= lo_ord and o <= hi_ord)
+            i += 1
+        return Series.from_bools(self.name, out)
+
+    def dt_min(self) -> datetime:
+        # earliest non-null datetime; ValueError if the column is all-null.
+        self._require_dt("dt_min")
+        seen: bool = False
+        best: int = 0
+        bi: int = 0
+        i: int = 0
+        while i < self.length:
+            if not self.nulls[i]:
+                o: int = _dt_ordinal(self.dts[i])
+                if not seen or o < best:
+                    best = o
+                    bi = i
+                    seen = True
+            i += 1
+        if not seen:
+            raise ValueError("kodiak: dt_min of an all-null datetime column ('" + self.name + "')")
+        return self.dts[bi]
+
+    def dt_max(self) -> datetime:
+        # latest non-null datetime; ValueError if the column is all-null.
+        self._require_dt("dt_max")
+        seen: bool = False
+        best: int = 0
+        bi: int = 0
+        i: int = 0
+        while i < self.length:
+            if not self.nulls[i]:
+                o: int = _dt_ordinal(self.dts[i])
+                if not seen or o > best:
+                    best = o
+                    bi = i
+                    seen = True
+            i += 1
+        if not seen:
+            raise ValueError("kodiak: dt_max of an all-null datetime column ('" + self.name + "')")
+        return self.dts[bi]
 
     # ---- deterministic pandas-flavored single-column renderer -------------
     def __str__(self) -> str:

@@ -464,6 +464,8 @@ def _key_eq(a: Series, i: int, b: Series, j: int) -> bool:
         return a.floats[i] == b.floats[j]
     if a.dtype == "str":
         return a.strs[i] == b.strs[j]
+    if a.dtype == "datetime":
+        return a.dt_ordinal_at(i) == b.dt_ordinal_at(j)
     return a.bools[i] == b.bools[j]
 
 
@@ -475,6 +477,8 @@ def _key_lt(key: Series, a: int, b: int) -> bool:
         return key.floats[a] < key.floats[b]
     if key.dtype == "str":
         return key.strs[a] < key.strs[b]
+    if key.dtype == "datetime":
+        return key.dt_ordinal_at(a) < key.dt_ordinal_at(b)
     ab: int = 0
     if key.bools[a]:
         ab = 1

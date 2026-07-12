@@ -1,0 +1,149 @@
+# datetime_ops.pyrs — Phase 4b datetime-column test for kodiak. Exercises the
+# full temporal surface against HAND-COMPUTED expectations: dateutil.parse of a
+# known string, read_csv(parse_dates=...) building a "datetime" column, the .dt
+# accessors (year/month/day/hour/minute), chronological sort order, a
+# dt_between date-range filter, groupby a derived year column, dt_min/dt_max,
+# and the tzdata utc_offset_at value (the third-package touch). Prints PASS and
+# exits 0 on success; on any failure prints one concise FAIL line and aborts.
+#
+# Build + run (from extern/packages/kodiak/ or kodiak/tests/):
+#   PYRST_PATH=/home/ethos/Coding/pyrst/extern/packages \
+#     /home/ethos/Coding/pyrst/target/release/pyrst build tests/datetime_ops.pyrs
+#   ./datetime_ops
+
+from kodiak.series import Series
+from kodiak.frame import DataFrame
+from kodiak.io import read_csv
+from datetime import datetime
+from dateutil.parser import parse
+from tzdata.api import utc_offset_at
+from os import write_file
+
+
+def fail(msg: str) -> None:
+    print("FAIL: " + msg)
+    assert False
+
+
+def check_strs(label: str, actual: list[str], expected: list[str]) -> None:
+    if len(actual) != len(expected):
+        fail(label + ": length " + str(len(actual)) + " != " + str(len(expected)) + " (" + str(actual) + ")")
+    i: int = 0
+    while i < len(actual):
+        if actual[i] != expected[i]:
+            fail(label + ": at " + str(i) + " got '" + actual[i] + "' expected '" + expected[i] + "' (" + str(actual) + ")")
+        i += 1
+
+
+def check_ints(label: str, actual: list[int], expected: list[int]) -> None:
+    if len(actual) != len(expected):
+        fail(label + ": length " + str(len(actual)) + " != " + str(len(expected)) + " (" + str(actual) + ")")
+    i: int = 0
+    while i < len(actual):
+        if actual[i] != expected[i]:
+            fail(label + ": at " + str(i) + " got " + str(actual[i]) + " expected " + str(expected[i]) + " (" + str(actual) + ")")
+        i += 1
+
+
+def check_eq_int(label: str, actual: int, expected: int) -> None:
+    if actual != expected:
+        fail(label + ": got " + str(actual) + " expected " + str(expected))
+
+
+# CSV cell text (space-separated date+time — one field, no comma). The 'ts'
+# column is parsed via parse_dates; 'event' stays str and 'amount' i64.
+CSV: str = (
+    "event,ts,amount\n"
+    + "alpha,2025-03-15 08:30:00,100\n"
+    + "beta,2024-11-02 14:00:00,200\n"
+    + "gamma,2025-07-04 23:15:00,150\n"
+    + "delta,2024-01-20 06:45:00,300\n"
+    + "epsilon,2025-12-25 12:00:00,50\n"
+)
+
+
+def main() -> None:
+    # ---- 1. dateutil.parse of a known string -> y/m/d (hand-computed) ------
+    p: datetime = parse("July 4, 2025")
+    check_eq_int("parse('July 4, 2025').year", p.year, 2025)
+    check_eq_int("parse('July 4, 2025').month", p.month, 7)
+    check_eq_int("parse('July 4, 2025').day", p.day, 4)
+
+    # ---- 2. read_csv(parse_dates=['ts']) builds a datetime column ----------
+    write_file("datetime_ops_rt.csv", CSV)
+    df: DataFrame = read_csv("datetime_ops_rt.csv", ["ts"])
+    if df["ts"].dtype != "datetime":
+        fail("read_csv(parse_dates) must give a 'datetime' column, got '" + df["ts"].dtype + "'")
+    if df["event"].dtype != "str" or df["amount"].dtype != "i64":
+        fail("non-parse_dates columns must keep inference (event=str amount=i64), got event=" + df["event"].dtype + " amount=" + df["amount"].dtype)
+    # the datetime column renders as "YYYY-MM-DD HH:MM:SS" in file order
+    check_strs("ts rendered (file order)", df["ts"].to_strings(), [
+        "2025-03-15 08:30:00", "2024-11-02 14:00:00", "2025-07-04 23:15:00",
+        "2024-01-20 06:45:00", "2025-12-25 12:00:00"
+    ])
+
+    # ---- 3. .dt accessors -> i64 Series (hand-computed component values) ----
+    ts: Series = df["ts"]
+    check_ints("dt_year", ts.dt_year().ints, [2025, 2024, 2025, 2024, 2025])
+    check_ints("dt_month", ts.dt_month().ints, [3, 11, 7, 1, 12])
+    check_ints("dt_day", ts.dt_day().ints, [15, 2, 4, 20, 25])
+    check_ints("dt_hour", ts.dt_hour().ints, [8, 14, 23, 6, 12])
+    check_ints("dt_minute", ts.dt_minute().ints, [30, 0, 15, 45, 0])
+    if ts.dt_year().dtype != "i64":
+        fail("dt_year must be an i64 Series, got " + ts.dt_year().dtype)
+
+    # ---- 4. chronological sort by the datetime column ----------------------
+    srt: DataFrame = df.sort_values("ts")
+    check_strs("sort_values ascending (event order)", srt["event"].to_strings(),
+               ["delta", "beta", "alpha", "gamma", "epsilon"])
+    check_strs("sort_values ascending (ts order)", srt["ts"].to_strings(), [
+        "2024-01-20 06:45:00", "2024-11-02 14:00:00", "2025-03-15 08:30:00",
+        "2025-07-04 23:15:00", "2025-12-25 12:00:00"
+    ])
+    # descending is the exact reverse
+    dsc: DataFrame = df.sort_values("ts", False)
+    check_strs("sort_values descending (event order)", dsc["event"].to_strings(),
+               ["epsilon", "gamma", "alpha", "beta", "delta"])
+
+    # ---- 5. dt_between date-range filter: all rows in calendar year 2025 ----
+    lo: datetime = datetime(2025, 1, 1, 0, 0, 0, 0)
+    hi: datetime = datetime(2025, 12, 31, 23, 59, 59, 0)
+    y2025: DataFrame = df.filter(df["ts"].dt_between(lo, hi))
+    check_strs("dt_between 2025 (event order preserved)", y2025["event"].to_strings(),
+               ["alpha", "gamma", "epsilon"])
+    check_ints("dt_between 2025 (amounts)", y2025["amount"].ints, [100, 150, 50])
+    # dt_after / dt_before boundaries
+    after24: DataFrame = df.filter(df["ts"].dt_after(datetime(2025, 1, 1, 0, 0, 0, 0)))
+    check_strs("dt_after 2025-01-01 (events)", after24["event"].to_strings(),
+               ["alpha", "gamma", "epsilon"])
+    before25: DataFrame = df.filter(df["ts"].dt_before(datetime(2025, 1, 1, 0, 0, 0, 0)))
+    check_strs("dt_before 2025-01-01 (events)", before25["event"].to_strings(),
+               ["beta", "delta"])
+
+    # ---- 6. groupby a DERIVED year column, sum amount (hand-computed) -------
+    # 2024: beta(200)+delta(300)=500 ; 2025: alpha(100)+gamma(150)+epsilon(50)=300
+    withyear: DataFrame = df.with_column("year", df["ts"].dt_year())
+    g: DataFrame = withyear.groupby("year").sum()
+    check_ints("groupby year -> keys", g["year"].ints, [2024, 2025])
+    check_ints("groupby year -> sum(amount)", g["amount"].ints, [500, 300])
+    # count() works on a datetime value column (5 non-null rows, one group here)
+    check_eq_int("datetime column count", ts.count(), 5)
+
+    # ---- 7. dt_min / dt_max (hand-computed extremes) -----------------------
+    mn: datetime = ts.dt_min()
+    mx: datetime = ts.dt_max()
+    check_eq_int("dt_min year", mn.year, 2024)
+    check_eq_int("dt_min month", mn.month, 1)
+    check_eq_int("dt_min day", mn.day, 20)
+    check_eq_int("dt_max year", mx.year, 2025)
+    check_eq_int("dt_max month", mx.month, 12)
+    check_eq_int("dt_max day", mx.day, 25)
+
+    # ---- 8. tzdata touch: utc_offset_at (the third package) ----------------
+    # America/New_York: July -> EDT = UTC-4 = -240 ; January -> EST = -300.
+    edt: int = utc_offset_at("America/New_York", 2025, 7, 4, 12, 0)
+    est: int = utc_offset_at("America/New_York", 2024, 1, 20, 6, 45)
+    check_eq_int("NYC July offset (EDT, minutes east of UTC)", edt, -240)
+    check_eq_int("NYC January offset (EST, minutes east of UTC)", est, -300)
+
+    print("PASS: kodiak datetime_ops (parse->y/m/d; read_csv(parse_dates) datetime column; dt_year/month/day/hour/minute; chronological sort asc+desc; dt_between/dt_after/dt_before range filter; groupby derived year sum; dt_min/dt_max; tzdata utc_offset_at EDT/EST)")

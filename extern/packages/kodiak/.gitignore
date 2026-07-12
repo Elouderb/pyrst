@@ -16,8 +16,12 @@
 /op_matrix_rt.csv
 /lazy_equiv
 /interop_numpyrs
+/datetime_ops
+/datetime_ops_rt.csv
 tests/smoke_scaffold
 tests/op_matrix
 tests/op_matrix_rt.csv
 tests/lazy_equiv
 tests/interop_numpyrs
+tests/datetime_ops
+tests/datetime_ops_rt.csv

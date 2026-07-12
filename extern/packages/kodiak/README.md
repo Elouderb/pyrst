@@ -26,8 +26,19 @@ interoperate with numpyrs' `NDArray` — `Series.to_ndarray()` /
 `DataFrame.predict_linear(features, weights, out)` (a linear-model prediction
 computed as `X · w` through numpyrs `.dot()`). Covered by
 `tests/interop_numpyrs.pyrs` and demonstrated by
-`extern/programs/kodiak_demo/numpyrs_bridge.pyrs`. Phase 4b (datetime columns
-via dateutil/tzdata) is **not yet implemented** — see card `974fdff3`.
+`extern/programs/kodiak_demo/numpyrs_bridge.pyrs`.
+
+**Phase 4b (datetime columns) is now IMPLEMENTED**, completing the "consumes
+all three sibling packages" capstone. A fifth `Series` dtype, `"datetime"`,
+stores real `lib/datetime.datetime` objects in a new `dts` backing store;
+`read_csv(path, parse_dates=[...])` parses the named columns with
+`dateutil.parser.parse`; the `.dt` accessor (`dt_year`/`dt_month`/`dt_day`/
+`dt_hour`/`dt_minute`) projects components into `i64` columns; `sort_values`
+orders datetimes chronologically; `dt_before`/`dt_after`/`dt_between` produce
+bool masks for `filter`; and the `tzdata` package supplies UTC offsets
+(`utc_offset_at`) for the tz-aware step. Covered by `tests/datetime_ops.pyrs`
+and demonstrated by `extern/programs/kodiak_demo/datetime_demo.pyrs`. See the
+"Phase 4b — datetime columns" section below.
 
 > **The single most important divergence to know before reading further:**
 > comparison **operators** cannot produce a mask. pyrst hard-types `<`, `>`,
@@ -66,13 +77,19 @@ struct-of-arrays:
 ```python
 class Series:
     name: str
-    dtype: str            # "i64" | "f64" | "str" | "bool"
+    dtype: str            # "i64" | "f64" | "str" | "bool" | "datetime"
     ints: list[int]
     floats: list[float]
     strs: list[str]
     bools: list[bool]     # only the store matching `dtype` is populated
+    dts: list[datetime]   # the "datetime" store (Phase 4b)
+    nulls: list[bool]     # validity mask; nulls[i] == True => row i is NA
     length: int
 ```
+
+(The `dts` store and the `"datetime"` dtype are Phase 4b; the `nulls` validity
+mask is Phase 2. Only the one store named by `dtype` is populated — the others
+are empty.)
 
 Every operation switches on `dtype`. A `DataFrame` is order-preserving
 parallel arrays:
@@ -453,6 +470,72 @@ the existing numpyrs API (the relevant numpyrs constraints — f64-only, `.dot()
 being 2D@2D-only, scalar ops as `muls`/`adds` methods — are numpyrs' own,
 already documented on card `0182f2b0`).
 
+## Phase 4b — datetime columns (dateutil + tzdata)
+
+A fifth dtype, `"datetime"`, backed by a new `dts: list[datetime]` store of
+real `lib/datetime.datetime` objects.
+
+**Why a real store (the representation decision).** The alternative encodings —
+epoch-seconds in `ints`, or ISO-8601 text in `strs` — were rejected: a real
+`datetime` store gives full fidelity (hour/minute/second) and makes the `.dt`
+accessor and the comparison filters trivial struct-field reads (`d.year`,
+`d < e`) rather than string re-parsing or calendar math to recover components.
+The one cost is that adding the store changed `Series.__init__`'s arity; that
+ripple is fully contained in `series.pyrs` (the 18 raw `Series(...)` sites) —
+`frame.pyrs`/`io.pyrs` build columns only through the static `from_*`
+constructors, which absorb the change. A null datetime cell holds a placeholder
+`datetime(1,1,1)` in the store; the `nulls` mask (unchanged) marks it NA and
+every op ignores the placeholder.
+
+### `read_csv(path, parse_dates=[...])` (`io.pyrs`)
+
+```python
+df = read_csv("orders.csv", ["ordered_at"])   # ordered_at -> a "datetime" column
+```
+
+Each column whose header is listed in `parse_dates` is parsed cell-by-cell with
+`dateutil.parser.parse` into a datetime column; every other column keeps the
+existing dtype inference. **Policy** (honest, documented): an **empty** cell
+becomes a **null**; a **non-empty but unparseable** cell lets the dateutil
+`ParserError` **propagate** (a loud failure naming the offending value) rather
+than being silently coerced. A `parse_dates` name matching no header is ignored.
+`parse_dates` defaults to empty, so existing `read_csv(path)` callers are
+unaffected.
+
+### `Series` datetime operations (`series.pyrs`)
+
+- **`.dt` accessor** → `i64` `Series`: `dt_year()`, `dt_month()`, `dt_day()`,
+  `dt_hour()`, `dt_minute()` (null-propagating; `TypeError` on a non-datetime
+  column). Group by a derived component by attaching it with `with_column`
+  first: `df.with_column("year", df["ts"].dt_year()).groupby("year").sum()`.
+- **Comparison → bool-mask** (same method-mask convention as the numeric
+  `gt`/`lt`/…): `dt_before(dt)`, `dt_after(dt)`, `dt_between(lo, hi)` (inclusive)
+  — a null cell never satisfies. Filter with `df.filter(df["ts"].dt_between(a, b))`.
+- **`dt_min()` / `dt_max()`** → the earliest / latest non-null `datetime`
+  (`ValueError` on an all-null column).
+- **Chronological order.** `sort_values`, `groupby`, and `merge` on a datetime
+  column order it chronologically via an internal monotone i64 ordinal
+  (`dt_ordinal_at`), not the raw `<` operator on list-indexed instances.
+- **Rendering.** A datetime cell renders as `YYYY-MM-DD HH:MM:SS`
+  (`isoformat()` with the `T` swapped for a space), in both the table (`__str__`)
+  and CSV output (`to_field_strings`).
+- **Aggregations.** `count()` works (non-null rows). `sum`/`mean` on a datetime
+  column raise `TypeError` (they are numeric-only) — an honest error, not a
+  nonsense number; use `dt_min`/`dt_max` for temporal extremes. The numpyrs
+  bridge (`numeric_values`/`to_matrix`) likewise rejects a datetime column.
+
+### tzdata touch (the third package)
+
+The tz-aware step calls `tzdata.utc_offset_at(zone, y, mo, d, h, mi)` (minutes
+east of UTC) on a parsed naive local wall time — e.g. `America/New_York` reads
+`-300` (EST, UTC−05:00) in winter and `-240` (EDT, UTC−04:00) in summer,
+demonstrated across a DST boundary in `datetime_demo.pyrs`.
+
+No new pyrst language GAPs surfaced in Phase 4b — a `list[datetime]` class
+field, datetime field access, the `<`/`==` datetime operators, `str.replace`,
+and a `list[str] = []` default parameter (used for `parse_dates`) all work; the
+change composes on the existing dateutil/tzdata APIs.
+
 ## Forced API divergences (pyrst static-typing limits — see card `974fdff3`)
 
 - **`assign(**kwargs)` → `with_column(name, series)`.** pandas'
@@ -478,19 +561,26 @@ semantics: `head`/`tail`/`row_slice`/`with_column` all allocate and return a
 
 ## Errors
 
-- Unknown `Series` `dtype` (anything other than `i64`/`f64`/`str`/`bool`) →
-  `ValueError` from `Series.__init__`, naming the bad value via `repr()`.
+- Unknown `Series` `dtype` (anything other than
+  `i64`/`f64`/`str`/`bool`/`datetime`) → `ValueError` from `Series.__init__`,
+  naming the bad value via `repr()`.
 - `df["missing_col"]` → `KeyError(repr("missing_col"))`.
+- A `.dt` accessor / `dt_before`/`dt_after`/`dt_between` on a non-datetime
+  column → `TypeError`. `sum`/`mean` on a datetime column → `TypeError`.
 
 ## Layout
 
-- `series.pyrs` — the `Series` class: typed stores + the `nulls` validity
-  mask, `from_*`/`from_*_n` constructors, `take`/`take_null`/`row_slice`,
-  element-wise arithmetic (`__add__`/`add`/…, `*_scalar`), comparison
-  methods (`gt`/…/`eq_str`/`*_series`), aggregations (`agg_sum`/`agg_mean`/
-  `agg_min`/`agg_max`/`agg_std`/`count`), `fillna_float`/`fillna_str`,
-  `to_strings`/`to_field_strings`, the **Phase-4a numpyrs bridge**
-  (`numeric_values`/`to_ndarray`/`from_ndarray`), `__len__`, `__str__`.
+- `series.pyrs` — the `Series` class: typed stores (incl. the Phase-4b
+  `dts` datetime store) + the `nulls` validity mask, `from_*`/`from_*_n`
+  constructors (incl. `from_datetimes`/`from_datetimes_n`),
+  `take`/`take_null`/`row_slice`, element-wise arithmetic (`__add__`/`add`/…,
+  `*_scalar`), comparison methods (`gt`/…/`eq_str`/`*_series`), aggregations
+  (`agg_sum`/`agg_mean`/`agg_min`/`agg_max`/`agg_std`/`count`),
+  `fillna_float`/`fillna_str`, `to_strings`/`to_field_strings`, the **Phase-4a
+  numpyrs bridge** (`numeric_values`/`to_ndarray`/`from_ndarray`), the
+  **Phase-4b datetime ops** (`dt_year`/`dt_month`/`dt_day`/`dt_hour`/`dt_minute`,
+  `dt_before`/`dt_after`/`dt_between`, `dt_min`/`dt_max`, `dt_ordinal_at`),
+  `__len__`, `__str__`.
 - `frame.pyrs` — the `DataFrame` class (`from_columns`, `__getitem__`,
   `shape`/`columns`/`head`/`tail`/`with_column`, `select`, `lazy`, `filter`,
   `sort_values`, `groupby`, `merge`, `dropna`, `fillna_float`/`fillna_str`,
@@ -507,8 +597,9 @@ semantics: `head`/`tail`/`row_slice`/`with_column` all allocate and return a
   the discriminated `Op` record + static constructors + `Op.describe()`, the
   optimizer (`optimize`, `_predicate_pushdown`, `_projection_pushdown`,
   `_can_push_before`), and the `explain_plan(logical, source_cols)` renderer.
-- `io.pyrs` — `read_csv(path) -> DataFrame` (free function) with per-column
-  dtype inference; uses `lib/csv` + `lib/os`.
+- `io.pyrs` — `read_csv(path, parse_dates=[]) -> DataFrame` (free function)
+  with per-column dtype inference and the Phase-4b `parse_dates` datetime path
+  (`_parse_date_column` via `dateutil.parser.parse`); uses `lib/csv` + `lib/os`.
 - `tests/smoke_scaffold.pyrs` — Phase 1 scaffold check.
 - `tests/op_matrix.pyrs` — Phase 2 op matrix: hand-computed asserts for
   arithmetic, every comparison, filter, sort (incl. stability), each groupby
@@ -524,13 +615,20 @@ semantics: `head`/`tail`/`row_slice`/`with_column` all allocate and return a
   `Series` ↔ 1D `NDArray` and `DataFrame` ↔ 2D matrix conversions round-trip
   with identical values, and that `predict_linear` (a numpyrs matmul) matches a
   hand-computed result. Prints `PASS`/`FAIL`, nonzero exit on failure.
+- `tests/datetime_ops.pyrs` — Phase 4b datetime columns: hand-computed asserts
+  for `dateutil.parse`, `read_csv(parse_dates=[...])`, the `.dt` accessors,
+  chronological sort (asc + desc), the `dt_between`/`dt_after`/`dt_before` range
+  filter, groupby a derived year, `dt_min`/`dt_max`, and the `tzdata`
+  `utc_offset_at` EDT/EST values. Prints `PASS`/`FAIL`, nonzero exit on failure.
 
 The flagship demos live in `extern/programs/kodiak_demo/`: `main.pyrs` (Phase-2
 eager pipeline), `lazy_main.pyrs` (Phase-3 lazy engine — `explain()` showing
 a pushed-down filter, `collect() == eager`, and a lazy-vs-eager timing
-comparison over a synthetic frame), and `numpyrs_bridge.pyrs` (Phase-4a — the
+comparison over a synthetic frame), `numpyrs_bridge.pyrs` (Phase-4a — the
 `Series`/`DataFrame` ↔ numpyrs `NDArray` round-trip and a linear prediction via
-`.dot()`).
+`.dot()`), and `datetime_demo.pyrs` (Phase-4b — `read_csv(parse_dates)` →
+chronological sort → `dt_between` range filter → `.dt` year/month/day → groupby
+year → a `tzdata` UTC-offset step across a DST boundary).
 
 See card `974fdff3` for the full staged plan (Phase 2 eager core, Phase 3
 lazy pipeline, Phase 4 capstone integration with numpyrs/dateutil/tzdata) and

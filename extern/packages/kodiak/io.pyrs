@@ -1,21 +1,33 @@
-# io.pyrs — CSV input for kodiak. `read_csv(path) -> DataFrame` (a free
-# function; DataFrame.to_csv(path) is the write side, a method on the frame).
-# Uses lib/csv for RFC-4180 parsing and lib/os for file access — imported by
-# bare module name exactly like dateutil imports datetime.
+# io.pyrs — CSV input for kodiak. `read_csv(path, parse_dates=[]) -> DataFrame`
+# (a free function; DataFrame.to_csv(path) is the write side, a method on the
+# frame). Uses lib/csv for RFC-4180 parsing and lib/os for file access, and
+# dateutil.parser for the parse_dates path — imported by bare/dotted module
+# name exactly like dateutil imports datetime.
 #
 # DTYPE INFERENCE (per column, from the non-empty cells): all-int -> i64;
 # else all-float-or-int -> f64; else all-true/false -> bool; else str. An
 # empty field is a NULL in every dtype (so a to_csv/read_csv round-trip
 # reproduces the frame — nulls are written as empty fields). A wholly-empty
 # column defaults to str (all-null).
+#
+# PARSE_DATES (Phase 4b): any column whose header appears in `parse_dates` is
+# NOT dtype-inferred; instead each cell is parsed with dateutil.parser.parse
+# into a "datetime" column. POLICY (documented, honest): an EMPTY cell -> a
+# null; a NON-empty but unparseable cell -> the dateutil ParserError PROPAGATES
+# (a loud, honest failure that names the offending value) rather than being
+# silently coerced to a null. A parse_dates entry that matches no header is
+# ignored. Non-parse_dates columns keep the inference above, so existing
+# read_csv(path) callers are unaffected (parse_dates defaults to empty).
 
 from kodiak.series import Series
 from kodiak.frame import DataFrame
 from csv import reader
 from os import read_file
+from dateutil.parser import parse
+from datetime import datetime
 
 
-def read_csv(path: str) -> DataFrame:
+def read_csv(path: str, parse_dates: list[str] = []) -> DataFrame:
     text: str = read_file(path)
     rows: list[list[str]] = reader(text)
     if len(rows) == 0:
@@ -35,9 +47,32 @@ def read_csv(path: str) -> DataFrame:
             else:
                 raw.append("")
             r += 1
-        cols.append(_infer_column(header[c], raw))
+        if header[c] in parse_dates:
+            cols.append(_parse_date_column(header[c], raw))
+        else:
+            cols.append(_infer_column(header[c], raw))
         c += 1
     return DataFrame(header, cols)
+
+
+def _parse_date_column(name: str, raw: list[str]) -> Series:
+    # Build a "datetime" Series from raw CSV cells. Empty -> null (a placeholder
+    # datetime fills the store slot; the mask marks it NA). Non-empty ->
+    # dateutil.parser.parse (which raises ParserError on an unparseable value —
+    # deliberately left to propagate; see the module header POLICY note).
+    values: list[datetime] = []
+    nulls: list[bool] = []
+    i: int = 0
+    while i < len(raw):
+        cell: str = raw[i]
+        if cell == "":
+            values.append(datetime(1, 1, 1, 0, 0, 0, 0))
+            nulls.append(True)
+        else:
+            values.append(parse(cell))
+            nulls.append(False)
+        i += 1
+    return Series.from_datetimes_n(name, values, nulls)
 
 
 def _infer_column(name: str, raw: list[str]) -> Series:

@@ -1,0 +1,102 @@
+# datetime_demo.pyrs — kodiak Phase 4b flagship temporal demo (card 974fdff3).
+# The capstone "consumes all three packages" path in miniature: a CSV with a
+# timestamp column is read with parse_dates (dateutil), sorted / range-filtered
+# / decomposed with the .dt accessor into an eager dataframe pipeline, grouped
+# by a derived year, and finally shifted through a named IANA zone (tzdata) to
+# print its UTC offset. numpyrs already underpins the numeric columns from
+# Phase 4a; here datetime is the star.
+#
+# Build + run (from extern/programs/kodiak_demo/):
+#   PYRST_PATH=/home/ethos/Coding/pyrst/extern/packages \
+#     /home/ethos/Coding/pyrst/target/release/pyrst build datetime_demo.pyrs
+#   ./datetime_demo
+
+from kodiak.series import Series
+from kodiak.frame import DataFrame
+from kodiak.io import read_csv
+from datetime import datetime
+from tzdata.api import utc_offset_at
+from os import write_file
+
+
+# A small orders CSV: `ordered_at` carries a space-separated date + time (one
+# CSV field), spanning 2024-2025 so a groupby-year is meaningful.
+ORDERS_CSV: str = (
+    "order,ordered_at,region,amount\n"
+    + "A-1001,2024-02-14 09:15:00,East,120\n"
+    + "A-1002,2025-07-04 23:40:00,West,340\n"
+    + "A-1003,2024-11-29 06:05:00,East,85\n"
+    + "A-1004,2025-01-02 12:00:00,West,210\n"
+    + "A-1005,2025-07-19 17:30:00,East,175\n"
+    + "A-1006,2024-06-30 08:45:00,West,60\n"
+)
+
+
+def offset_label(minutes: int) -> str:
+    # "-300 min (UTC-05:00)" style label from minutes east of UTC.
+    sign: str = "+"
+    m: int = minutes
+    if m < 0:
+        sign = "-"
+        m = -m
+    hh: int = m // 60
+    mm: int = m % 60
+    return str(minutes) + " min (UTC" + sign + str(hh).zfill(2) + ":" + str(mm).zfill(2) + ")"
+
+
+def main() -> None:
+    write_file("orders.csv", ORDERS_CSV)
+
+    # ---- read_csv with parse_dates: `ordered_at` becomes a datetime column --
+    df: DataFrame = read_csv("orders.csv", ["ordered_at"])
+    print("== read_csv(parse_dates=['ordered_at']) ==")
+    print("  column dtypes: order=" + df["order"].dtype + " ordered_at=" + df["ordered_at"].dtype
+          + " region=" + df["region"].dtype + " amount=" + df["amount"].dtype)
+    print(str(df))
+    print("")
+
+    # ---- chronological sort by the datetime column -------------------------
+    print("== sort_values('ordered_at') — chronological ==")
+    print(str(df.sort_values("ordered_at")))
+    print("")
+
+    # ---- date-range filter: summer 2025 (Jun 1 .. Aug 31) ------------------
+    lo: datetime = datetime(2025, 6, 1, 0, 0, 0, 0)
+    hi: datetime = datetime(2025, 8, 31, 23, 59, 59, 0)
+    summer25: DataFrame = df.filter(df["ordered_at"].dt_between(lo, hi))
+    print("== filter dt_between(2025-06-01, 2025-08-31) — summer 2025 ==")
+    print(str(summer25))
+    print("")
+
+    # ---- .dt accessor: derive year + month + day i64 columns ---------------
+    decomposed: DataFrame = df.with_column("year", df["ordered_at"].dt_year())
+    decomposed = decomposed.with_column("month", df["ordered_at"].dt_month())
+    decomposed = decomposed.with_column("day", df["ordered_at"].dt_day())
+    print("== .dt accessor: year / month / day derived columns ==")
+    print(str(decomposed.select(["order", "ordered_at", "year", "month", "day"])))
+    print("")
+
+    # ---- groupby the derived year, aggregate amount ------------------------
+    by_year_sum: DataFrame = decomposed.groupby("year").sum()
+    by_year_count: DataFrame = decomposed.groupby("year").count()
+    print("== groupby('year').sum()  [amount summed per year] ==")
+    print(str(by_year_sum.select(["year", "amount"])))
+    print("== groupby('year').count()  [orders per year] ==")
+    print(str(by_year_count.select(["year", "order"])))
+    print("")
+
+    # ---- tzdata (the third package): UTC offset of two orders in a zone -----
+    # America/New_York observes DST: winter orders read EST (UTC-05:00), summer
+    # orders read EDT (UTC-04:00). We take a naive parsed local wall time and
+    # ask tzdata what offset that zone had at that instant.
+    zone: str = "America/New_York"
+    winter: datetime = df["ordered_at"].dts[0]   # 2024-02-14 09:15 (EST season)
+    summer: datetime = df["ordered_at"].dts[1]   # 2025-07-04 23:40 (EDT season)
+    w_off: int = utc_offset_at(zone, winter.year, winter.month, winter.day, winter.hour, winter.minute)
+    s_off: int = utc_offset_at(zone, summer.year, summer.month, summer.day, summer.hour, summer.minute)
+    print("== tzdata utc_offset_at('" + zone + "') ==")
+    print("  " + str(winter) + "  ->  " + offset_label(w_off))
+    print("  " + str(summer) + "  ->  " + offset_label(s_off))
+    print("")
+
+    print("OK: datetime_demo (read_csv parse_dates -> datetime column; chronological sort; dt_between range filter; .dt year/month/day; groupby derived year; tzdata utc_offset_at across a DST boundary)")

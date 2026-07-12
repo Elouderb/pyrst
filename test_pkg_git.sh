@@ -17,6 +17,13 @@
 #   8.  a bad URL -> clean error (not a raw git dump)
 #   9.  idempotent re-install of the same url@SHA
 #   10. cache lives under PYRST_CACHE (hermeticity assertion)
+#   11. (Phase 3) bare-URL DIAMOND: each unique url is cloned exactly ONCE
+#       (a git wrapper logs invocations; the shared dep is cloned once, not twice)
+#   12. (Phase 3) no .git / dot-dir leaks into the store; store .pyrs is byte-exact
+#   13. (Phase 3) `pyrst cache dir|list|clean` behave
+#   14. (Phase 3) `pyrst list` shows name@version + git short-sha
+#   15. (Phase 3, security) a `#<sha>` traversal / short sha -> honest error; the
+#       traversal target is NEVER created (path-traversal HIGH, validated commit sha)
 #
 # Exit 0 only when every check passes. Not run by test_all.sh (packaging is
 # additive + env-gated); run it explicitly. Requires git on PATH.
@@ -25,6 +32,7 @@ set -u
 BIN="$(cd "$(dirname "$0")" && pwd)/target/release/pyrst"
 [[ -x "$BIN" ]] || { echo "FATAL: build the release binary first (cargo build --release)"; exit 1; }
 command -v git >/dev/null 2>&1 || { echo "FATAL: git is required on PATH"; exit 1; }
+REALGIT="$(command -v git)"    # for the Phase-3 clone-count wrapper (check 11)
 
 pass=0; fail=0
 ok()  { echo "  PASS: $1"; pass=$((pass+1)); }
@@ -180,6 +188,97 @@ echo "[9] idempotent re-install"
 r9="$("$BIN" --venv "$ENV" install "$A_URL" 2>&1)"
 echo "$r9" | grep -q "installed 2 package(s)" \
   && ok "re-installing the same url@SHA is a clean idempotent no-op" || bad "re-install not idempotent: $r9"
+
+# ── author a BARE-URL DIAMOND: a -> {b2, c2} -> d (all via bare file:// urls) ─
+mkrepo_leaf_d() {
+  local d="$REPOS/dia_d"; mkdir -p "$d"; git -C "$d" init -q -b main
+  printf 'name: dia_d\nversion: 2.3.0\npackage_root: .\ndependencies: []\n' > "$d/pyrst.yaml"
+  printf 'def d_val() -> int:\n    return 7\n' > "$d/core.pyrs"
+  git -C "$d" add -A; git_commit "$d" -m "dia_d"
+}
+mkrepo_leaf_d; DIA_D_URL="file://$REPOS/dia_d"
+for n in dia_b dia_c; do
+  d="$REPOS/$n"; mkdir -p "$d"; git -C "$d" init -q -b main
+  { echo "name: $n"; echo "version: 0.1.0"; echo "package_root: ."; \
+    echo "dependencies:"; echo "  - name: dia_d"; echo "    git: $DIA_D_URL"; } > "$d/pyrst.yaml"
+  printf 'def x() -> int:\n    return 1\n' > "$d/core.pyrs"
+  git -C "$d" add -A; git_commit "$d" -m "$n"
+done
+mkrepo_dia_a() {
+  local d="$REPOS/dia_a"; mkdir -p "$d"; git -C "$d" init -q -b main
+  { echo "name: dia_a"; echo "version: 0.9.0"; echo "package_root: ."; echo "dependencies:"; \
+    echo "  - name: dia_b"; echo "    git: file://$REPOS/dia_b"; \
+    echo "  - name: dia_c"; echo "    git: file://$REPOS/dia_c"; } > "$d/pyrst.yaml"
+  printf 'def a() -> int:\n    return 1\n' > "$d/core.pyrs"
+  git -C "$d" add -A; git_commit "$d" -m "dia_a"
+}
+mkrepo_dia_a; DIA_A_URL="file://$REPOS/dia_a"
+
+# ── 11. bare-URL diamond fetches each unique url ONCE (clone-count proof) ─────
+echo "[11] bare-URL diamond -> shared dep cloned exactly once"
+ENVD="$WORK/pd/.pyrstenv"; mkdir -p "$WORK/pd"; ( cd "$WORK/pd" && "$BIN" venv .pyrstenv >/dev/null 2>&1 )
+WRAP="$WORK/gitwrap"; mkdir -p "$WRAP"                    # a git that logs invocations
+cat > "$WRAP/git" <<EOF
+#!/usr/bin/env bash
+echo "\$*" >> "$WORK/git.log"
+exec "$REALGIT" "\$@"
+EOF
+chmod +x "$WRAP/git"
+: > "$WORK/git.log"
+dcnt="$(PATH="$WRAP:$PATH" "$BIN" --venv "$ENVD" install "$DIA_A_URL" 2>&1)"
+echo "$dcnt" | grep -q "installed 4 package(s)" \
+  && ok "diamond installs 4 packages (dia_a + dia_b + dia_c + shared dia_d)" || bad "diamond count wrong: $dcnt"
+d_clones="$(grep -c "^clone .*repos/dia_d " "$WORK/git.log" 2>/dev/null || echo 0)"
+[[ "$d_clones" -eq 1 ]] \
+  && ok "shared dep dia_d is CLONED EXACTLY ONCE across two sibling bare URLs (got $d_clones)" \
+  || bad "shared dep dia_d cloned $d_clones times (expected 1 — bare-URL diamond re-clone)"
+d_lsrem="$(grep -c "^ls-remote .*repos/dia_d " "$WORK/git.log" 2>/dev/null || echo 0)"
+[[ "$d_lsrem" -le 1 ]] \
+  && ok "shared dep dia_d is ls-remote'd at most once (in-run memo; got $d_lsrem)" \
+  || bad "shared dep dia_d ls-remote'd $d_lsrem times (memo should collapse to 1)"
+
+# ── 12. no .git / dot-dir leaks; store .pyrs is byte-exact vs source ──────────
+echo "[12] no .git leak + byte-exact store"
+leaks="$(find "$ENVD/packages" -name '.git' -o -name '.*' -type d 2>/dev/null | wc -l)"
+[[ "$leaks" -eq 0 ]] && ok "no .git / dot-directory anywhere in the store" || bad "dot-dir leaked into store ($leaks)"
+if diff -q "$REPOS/dia_d/core.pyrs" "$ENVD/packages/dia_d/core.pyrs" >/dev/null 2>&1; then
+  ok "installed dia_d/core.pyrs is byte-identical to the source module"
+else
+  bad "store module content differs from source"
+fi
+
+# ── 13. cache dir / list / clean ────────────────────────────────────────────
+echo "[13] cache dir|list|clean"
+cd_out="$("$BIN" --venv "$ENVD" cache dir 2>&1)"
+[[ "$cd_out" == "$PYRST_CACHE/clones" ]] && ok "cache dir prints the clone-cache path" || bad "cache dir wrong: $cd_out"
+cl_out="$("$BIN" --venv "$ENVD" cache list 2>&1)"
+echo "$cl_out" | grep -q "dia_d" && echo "$cl_out" | grep -qE "total: [0-9]+ clone" \
+  && ok "cache list shows cached clones + a total" || bad "cache list wrong: $cl_out"
+cc_out="$("$BIN" --venv "$ENVD" cache clean 2>&1)"
+echo "$cc_out" | grep -qE "removed [0-9]+ cached clone" \
+  && ok "cache clean reports what/how-much was removed" || bad "cache clean wrong: $cc_out"
+[[ -z "$(ls -A "$PYRST_CACHE/clones" 2>/dev/null)" ]] \
+  && ok "cache clean emptied the clone cache" || bad "cache clean did not empty the cache"
+echo "$("$BIN" --venv "$ENVD" cache list 2>&1)" | grep -q "empty" \
+  && ok "cache list reports an empty cache after clean" || bad "cache list not empty after clean"
+
+# ── 14. list shows name@version + git short-sha ─────────────────────────────
+echo "[14] list shows version + short-sha"
+l14="$("$BIN" --venv "$ENVD" list 2>&1)"
+echo "$l14" | grep -qE "dia_d@2\.3\.0[[:space:]]+\(git [0-9a-f]{7,}\)" \
+  && ok "list renders name@version (git <short-sha>)" || bad "list format wrong: $l14"
+
+# ── 15. security: a `#<sha>` traversal / short sha -> honest error, no escape ─
+echo "[15] validated commit sha (path-traversal HIGH)"
+ENVS="$WORK/ps/.pyrstenv"; mkdir -p "$WORK/ps"; ( cd "$WORK/ps" && "$BIN" venv .pyrstenv >/dev/null 2>&1 )
+EVIL="$WORK/EVIL_TRAVERSAL_TARGET"
+e15="$("$BIN" --venv "$ENVS" install "$DIA_D_URL#../../../../../../../../$EVIL" 2>&1)"
+echo "$e15" | grep -q "invalid commit sha" \
+  && ok "a `#<traversal>` sha is an honest 'invalid commit sha' error" || bad "traversal sha not rejected: $e15"
+[[ ! -e "$EVIL" ]] && ok "the traversal target was NEVER created outside the cache" || bad "SECURITY: traversal created $EVIL"
+e15b="$("$BIN" --venv "$ENVS" install "$DIA_D_URL#deadbeef" 2>&1)"
+echo "$e15b" | grep -q "invalid commit sha" \
+  && ok "a short (non-40-hex) `#sha` is rejected honestly" || bad "short sha not rejected: $e15b"
 
 echo "══════════════════════════════════════════════"
 echo "PKG GIT INTEGRATION: $pass passed, $fail failed"

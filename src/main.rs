@@ -36,21 +36,36 @@ fn print_usage() {
     eprintln!("                      local path; no arg reproduces the env from pyrst.lock");
     eprintln!("                      (--force reinstalls over a name/source collision)");
     eprintln!("  init                scaffold a pyrst.yaml for the current directory");
-    eprintln!("  list                list packages installed in the active env");
+    eprintln!("  list                list packages installed in the active env (name@version + source)");
     eprintln!("  freeze              print the pinned lock set");
+    eprintln!("  cache <subcommand>  manage the clone cache: `dir` (print its path),");
+    eprintln!("                      `list` (cached clones + sizes), `clean` (remove them all)");
     eprintln!("  repl                start interactive shell");
     eprintln!("  lsp                 start the language server (stdin/stdout, for editors)");
     eprintln!();
     eprintln!("global flags:");
     eprintln!("  --venv <dir>        use <dir> as the active environment (overrides PYRST_VENV/auto-detect)");
+    eprintln!("  --cache <dir>       use <dir> as the clone-cache root (overrides PYRST_CACHE)");
     eprintln!();
     eprintln!("environment:");
-    eprintln!("  PYRST_CACHE         clone-cache root for `install` (default ~/.cache/pyrst)");
+    eprintln!("  PYRST_CACHE         clone-cache root for `install`/`cache` (default ~/.cache/pyrst)");
     eprintln!();
     eprintln!("security: `install` clones and `build` COMPILES third-party source. pyrst verifies a");
     eprintln!("  target is a real pyrst package (a valid pyrst.yaml) and pins the exact commit SHA");
     eprintln!("  (no silent upstream drift), but does NOT sandbox installed code — the same trust");
     eprintln!("  model as `pip install` / `cargo add`. Requires `git` on PATH.");
+}
+
+/// Make a path absolute WITHOUT requiring it to exist (a relative path is joined
+/// onto the process CWD). Used for `--cache`, whose target may not exist yet
+/// (`cache dir`/`clean` operate on a possibly-absent directory).
+fn absolutize(d: &str) -> PathBuf {
+    let p = PathBuf::from(d);
+    if p.is_absolute() {
+        p
+    } else {
+        std::env::current_dir().map(|c| c.join(&p)).unwrap_or(p)
+    }
 }
 
 /// Render a packaging-command error (no source file to snippet against) and map
@@ -85,15 +100,31 @@ fn main() -> ExitCode {
         } else {
             a.strip_prefix("--venv=").map(|s| s.to_string())
         };
-        match venv_dir {
-            Some(d) => {
-                let abs = std::fs::canonicalize(&d).unwrap_or_else(|_| {
-                    std::env::current_dir().map(|c| c.join(&d)).unwrap_or_else(|_| PathBuf::from(&d))
-                });
-                std::env::set_var("PYRST_VENV", abs);
-            }
-            None => args.push(a),
+        if let Some(d) = venv_dir {
+            let abs = std::fs::canonicalize(&d).unwrap_or_else(|_| {
+                std::env::current_dir().map(|c| c.join(&d)).unwrap_or_else(|_| PathBuf::from(&d))
+            });
+            std::env::set_var("PYRST_VENV", abs);
+            continue;
         }
+        // `--cache <dir>` / `--cache=<dir>` mirrors PYRST_CACHE (the clone-cache
+        // root). It need not exist yet, so absolutize without requiring existence.
+        let cache_dir = if a == "--cache" {
+            match raw.next() {
+                Some(d) => Some(d),
+                None => {
+                    eprintln!("error: --cache requires a directory argument");
+                    return ExitCode::from(2);
+                }
+            }
+        } else {
+            a.strip_prefix("--cache=").map(|s| s.to_string())
+        };
+        if let Some(d) = cache_dir {
+            std::env::set_var("PYRST_CACHE", absolutize(&d));
+            continue;
+        }
+        args.push(a);
     }
 
     let mut args = args.into_iter();
@@ -145,6 +176,7 @@ fn main() -> ExitCode {
         "init" => return finish_pkg(venv::init()),
         "list" => return finish_pkg(venv::list()),
         "freeze" => return finish_pkg(venv::freeze()),
+        "cache" => return finish_pkg(fetch::cache_command(args.next().as_deref())),
         _ => {}
     }
 

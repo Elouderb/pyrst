@@ -38,6 +38,7 @@ pub enum RefSpec {
 }
 
 /// A resolved, on-disk checkout of a git repo at a pinned commit.
+#[derive(Debug, Clone)]
 pub struct GitCheckout {
     /// The cache directory holding the checked-out repo (its root == package root).
     pub dir: PathBuf,
@@ -56,15 +57,34 @@ pub struct GitCheckout {
 /// precedence. An `@<ref>` is honoured ONLY when the `@` sits after the last `/`,
 /// so an scp-form authority (`git@github.com:owner/repo`) or a `user@host` in an
 /// `https://` URL is never mistaken for a ref.
-pub fn parse_url_spec(spec: &str) -> (String, RefSpec) {
+pub fn parse_url_spec(spec: &str) -> Result<(String, RefSpec)> {
     if let Some((left, frag)) = spec.split_once('#') {
         // A `#sha` pin: also drop a stray trailing `@ref` from the base, if any.
+        // The sha is caller-controlled (and can arrive via an UNTRUSTED package's
+        // dependency URL), so it MUST be a real 40-char hex commit before it is ever
+        // allowed to shape a filesystem path — reject anything else honestly (a
+        // `#../../evil` traversal payload never becomes a `RefSpec::Commit`).
         let (base, _) = strip_trailing_ref(left);
-        return (base.to_string(), RefSpec::Commit(frag.trim().to_string()));
+        let sha = normalize_sha(frag).ok_or_else(|| {
+            Error::Pkg("invalid commit sha in url#<sha>: expected a 40-char hex commit".into())
+        })?;
+        return Ok((base.to_string(), RefSpec::Commit(sha)));
     }
     match strip_trailing_ref(spec) {
-        (base, Some(r)) => (base.to_string(), RefSpec::Ref(r.trim().to_string())),
-        (base, None) => (base.to_string(), RefSpec::Default),
+        (base, Some(r)) => Ok((base.to_string(), RefSpec::Ref(r.trim().to_string()))),
+        (base, None) => Ok((base.to_string(), RefSpec::Default)),
+    }
+}
+
+/// Normalise a `#<sha>` fragment to a canonical pinned commit: exactly 40 hex
+/// digits, lowercased. `None` for anything else (abbreviated shas are ambiguous for
+/// a pinned cache/lock, and a non-hex value must never reach a cache path).
+fn normalize_sha(frag: &str) -> Option<String> {
+    let t = frag.trim();
+    if t.len() == 40 && t.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Some(t.to_ascii_lowercase())
+    } else {
+        None
     }
 }
 
@@ -135,7 +155,7 @@ fn djb2(s: &str) -> u32 {
 
 /// The clone-cache root: `$PYRST_CACHE` (else `~/.cache/pyrst`) `/clones/`.
 /// Overridable so tests are hermetic (never touch the real `~/.cache`).
-fn clones_dir() -> Result<PathBuf> {
+pub fn clones_dir() -> Result<PathBuf> {
     let base = if let Some(c) = std::env::var_os("PYRST_CACHE") {
         PathBuf::from(c)
     } else if let Some(h) = std::env::var_os("HOME") {
@@ -146,6 +166,146 @@ fn clones_dir() -> Result<PathBuf> {
         ));
     };
     Ok(base.join("clones"))
+}
+
+// ── cache management (`pyrst cache …`) ───────────────────────────────────────
+
+/// Dispatch `pyrst cache <dir|list|clean>`. The clone cache is GLOBAL (independent
+/// of any active env); its location is `$PYRST_CACHE` (else `~/.cache/pyrst`)
+/// `/clones/`, overridable with `--cache <dir>` (mirrors `PYRST_CACHE`).
+pub fn cache_command(sub: Option<&str>) -> Result<()> {
+    match sub {
+        Some("dir") => cache_dir(),
+        Some("list") => cache_list(),
+        Some("clean") => cache_clean(),
+        Some(other) => Err(Error::Pkg(format!(
+            "unknown cache subcommand `{}` (expected: dir, list, or clean)",
+            other
+        ))),
+        None => Err(Error::Pkg(
+            "cache requires a subcommand: dir, list, or clean".into(),
+        )),
+    }
+}
+
+/// `pyrst cache dir` — print the clone-cache path (whether or not it exists yet).
+fn cache_dir() -> Result<()> {
+    println!("{}", clones_dir()?.display());
+    Ok(())
+}
+
+/// `pyrst cache list` — one cached clone per line (`<url> @ <short-sha>   <size>`),
+/// sorted for determinism, then a total. Reads only the on-disk cache; no git calls.
+fn cache_list() -> Result<()> {
+    let clones = clones_dir()?;
+    let mut entries: Vec<(String, u64)> = Vec::new();
+    if clones.is_dir() {
+        for e in std::fs::read_dir(&clones)?.flatten() {
+            if !e.path().is_dir() {
+                continue;
+            }
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.starts_with(".tmp-") {
+                continue; // an in-flight clone, not a finished cache entry
+            }
+            entries.push((name, dir_size(&e.path())));
+        }
+    }
+    entries.sort();
+    if entries.is_empty() {
+        println!("clone cache is empty ({})", clones.display());
+        return Ok(());
+    }
+    let mut total = 0u64;
+    for (name, size) in &entries {
+        total += *size;
+        let (url, short) = parse_cache_entry(name);
+        println!("{} @ {}   {}", url, short, human_size(*size));
+    }
+    println!("total: {} clone(s), {}", entries.len(), human_size(total));
+    Ok(())
+}
+
+/// `pyrst cache clean` — remove the WHOLE clone cache, reporting what/how-much.
+fn cache_clean() -> Result<()> {
+    let clones = clones_dir()?;
+    if !clones.is_dir() {
+        println!("clone cache is already empty ({})", clones.display());
+        return Ok(());
+    }
+    let mut count = 0usize;
+    for e in std::fs::read_dir(&clones)?.flatten() {
+        if e.path().is_dir() && !e.file_name().to_string_lossy().starts_with(".tmp-") {
+            count += 1;
+        }
+    }
+    let total = dir_size(&clones);
+    std::fs::remove_dir_all(&clones)?;
+    println!(
+        "removed {} cached clone(s) ({}) from {}",
+        count,
+        human_size(total),
+        clones.display()
+    );
+    Ok(())
+}
+
+/// Recursive on-disk size of `path` in bytes. Symlinks are not followed (a symlink
+/// is neither `is_dir` nor `is_file` via `file_type`), so there is no cycle risk.
+fn dir_size(path: &Path) -> u64 {
+    let mut total = 0u64;
+    if let Ok(rd) = std::fs::read_dir(path) {
+        for e in rd.flatten() {
+            match e.file_type() {
+                Ok(ft) if ft.is_dir() => total += dir_size(&e.path()),
+                Ok(ft) if ft.is_file() => {
+                    if let Ok(md) = e.metadata() {
+                        total += md.len();
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    total
+}
+
+/// Human-readable byte size (`0B`, `512B`, `1.5K`, `1.0M`, …). Deterministic.
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "K", "M", "G", "T"];
+    if bytes < 1024 {
+        return format!("{}B", bytes);
+    }
+    let mut v = bytes as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    format!("{:.1}{}", v, UNITS[u])
+}
+
+/// Recover a readable `(url-ish, short-sha)` from a cache directory name
+/// `<sanitized-url>-<8hex>@<40hex-sha>` for display. Purely lexical — no git.
+fn parse_cache_entry(name: &str) -> (String, String) {
+    match name.rsplit_once('@') {
+        Some((left, sha)) => {
+            let url = strip_hash_suffix(left);
+            let short: String = sha.chars().take(10).collect();
+            (url, short)
+        }
+        None => (name.to_string(), String::new()),
+    }
+}
+
+/// Drop the trailing `-<8 hex>` djb2 disambiguator from a sanitized-url prefix.
+fn strip_hash_suffix(left: &str) -> String {
+    if let Some((head, tail)) = left.rsplit_once('-') {
+        if tail.len() == 8 && tail.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return head.to_string();
+        }
+    }
+    left.to_string()
 }
 
 // ── git invocation ───────────────────────────────────────────────────────────
@@ -187,17 +347,97 @@ fn git_error_tail(out: &std::process::Output) -> String {
         .to_string()
 }
 
+/// Coarse classification of a git failure so the user sees a clear one-liner rather
+/// than a raw `fatal:` dump.
+#[derive(Debug, PartialEq, Eq)]
+enum GitFailure {
+    /// Auth required / private repo / repo-not-found.
+    Auth,
+    /// Host unreachable / offline / DNS failure.
+    Unreachable,
+    /// Anything else — fall back to git's own message.
+    Other,
+}
+
+/// Classify git's stderr (case-insensitive substring match on the well-known
+/// phrases). Network problems are checked first: an offline clone fails at the
+/// transport before any auth exchange.
+fn classify_git_error(stderr: &str) -> GitFailure {
+    let s = stderr.to_ascii_lowercase();
+    const NET: [&str; 7] = [
+        "could not resolve host",
+        "could not resolve proxy",
+        "failed to connect",
+        "connection refused",
+        "connection timed out",
+        "network is unreachable",
+        "temporary failure in name resolution",
+    ];
+    const AUTH: [&str; 8] = [
+        "authentication failed",
+        "could not read username",
+        "could not read password",
+        "terminal prompts disabled",
+        "permission denied",
+        "access denied",
+        "repository not found",
+        "invalid username or password",
+    ];
+    if NET.iter().any(|p| s.contains(p)) {
+        GitFailure::Unreachable
+    } else if AUTH.iter().any(|p| s.contains(p)) {
+        GitFailure::Auth
+    } else {
+        GitFailure::Other
+    }
+}
+
+/// Best-effort host extraction for the offline message: handles `scheme://host/…`,
+/// scp `user@host:path`, and a bare `host/…`.
+fn host_of(url: &str) -> String {
+    let after_scheme = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let authority = after_scheme.split('/').next().unwrap_or(after_scheme);
+    let hostport = authority.rsplit_once('@').map(|(_, r)| r).unwrap_or(authority);
+    let host = hostport.split(':').next().unwrap_or(hostport);
+    if host.is_empty() {
+        url.to_string()
+    } else {
+        host.to_string()
+    }
+}
+
+/// Turn a failed git invocation into an HONEST, specific one-liner — the common
+/// auth/offline cases mapped to a clear explanation, otherwise git's own final
+/// `fatal:` line. (`GIT_TERMINAL_PROMPT=0`, set in `run_git`, guarantees an
+/// auth-required repo fails HERE instead of hanging on a credential prompt.)
+fn friendly_git_error(url: &str, out: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    match classify_git_error(&stderr) {
+        GitFailure::Auth => "authentication failed or repository not found (is it private? \
+             pyrst has no credential handling yet)"
+            .to_string(),
+        GitFailure::Unreachable => format!("could not reach {} (offline?)", host_of(url)),
+        GitFailure::Other => git_error_tail(out),
+    }
+}
+
 // ── public resolve/clone entry points ────────────────────────────────────────
 
 /// Resolve + clone from a raw install spec (`url`, `url@ref`, or `url#sha`).
 pub fn resolve_spec(spec: &str) -> Result<GitCheckout> {
-    let (url, refspec) = parse_url_spec(spec);
+    let (url, refspec) = parse_url_spec(spec)?;
     resolve(&url, &refspec)
 }
 
 /// Resolve + clone `url` at `refspec` into the SHA-keyed cache, returning the
 /// checkout dir + clean url + resolved commit SHA. Idempotent: a cached commit is
 /// reused without re-fetching.
+///
+/// For a bare URL or an `@ref`, the target commit is resolved CHEAPLY first with
+/// `git ls-remote` so a commit already in the SHA-keyed cache is a pure cache HIT —
+/// no clone. Only on a cache MISS (or if `ls-remote` is unavailable) do we actually
+/// clone. This is what makes a diamond dependency referenced via a bare URL from N
+/// siblings fetch once rather than N times.
 pub fn resolve(url: &str, refspec: &RefSpec) -> Result<GitCheckout> {
     ensure_git()?;
     let clones = clones_dir()?;
@@ -206,7 +446,7 @@ pub fn resolve(url: &str, refspec: &RefSpec) -> Result<GitCheckout> {
     match refspec {
         // The SHA is known up front → cache dir is known → check the cache first.
         RefSpec::Commit(sha) => {
-            let dst = clones.join(cache_key(url, sha));
+            let dst = cache_path(&clones, url, sha)?;
             if is_valid_clone(&dst) {
                 return Ok(GitCheckout { dir: dst, url: url.to_string(), commit: sha.clone() });
             }
@@ -220,9 +460,19 @@ pub fn resolve(url: &str, refspec: &RefSpec) -> Result<GitCheckout> {
             finalize(&tmp, &dst)?;
             Ok(GitCheckout { dir: dst, url: url.to_string(), commit: got })
         }
-        // The SHA is unknown until we clone → clone to a temp dir, resolve HEAD,
-        // then move into the SHA-keyed cache (deduping against a concurrent hit).
+        // The SHA is unknown until resolved. Try `git ls-remote` FIRST (cheap): if
+        // that commit is already cached, reuse it without cloning. Clone only on a
+        // miss (or if ls-remote gives us nothing).
         RefSpec::Default | RefSpec::Ref(_) => {
+            if let Some(sha) = ls_remote_sha(url, refspec) {
+                let dst = cache_path(&clones, url, &sha)?;
+                if is_valid_clone(&dst) {
+                    return Ok(GitCheckout { dir: dst, url: url.to_string(), commit: sha });
+                }
+            }
+            // Miss (or ls-remote unsupported): clone to a temp dir, resolve the
+            // authoritative HEAD, then move into the SHA-keyed cache (deduping
+            // against a concurrent hit).
             let branch = match refspec {
                 RefSpec::Ref(r) => Some(r.as_str()),
                 _ => None,
@@ -234,7 +484,13 @@ pub fn resolve(url: &str, refspec: &RefSpec) -> Result<GitCheckout> {
                 return Err(e);
             }
             let sha = git_head_sha(&tmp)?;
-            let dst = clones.join(cache_key(url, &sha));
+            let dst = match cache_path(&clones, url, &sha) {
+                Ok(d) => d,
+                Err(e) => {
+                    let _ = std::fs::remove_dir_all(&tmp);
+                    return Err(e);
+                }
+            };
             if is_valid_clone(&dst) {
                 let _ = std::fs::remove_dir_all(&tmp);
             } else {
@@ -243,6 +499,84 @@ pub fn resolve(url: &str, refspec: &RefSpec) -> Result<GitCheckout> {
             Ok(GitCheckout { dir: dst, url: url.to_string(), commit: sha })
         }
     }
+}
+
+/// Build the SHA-keyed cache directory for `<url>@<sha>`, refusing anything unsafe.
+/// A pinned commit is ALWAYS a 40-char lowercase hex string; a value that is not (a
+/// caller-controlled `#<sha>`, a hand-edited lock, or unexpected git output) must
+/// never shape a filesystem path. Defence in depth against path traversal: the sha
+/// is validated, AND the resulting dir must be a single segment directly under the
+/// clone-cache root.
+fn cache_path(clones: &Path, url: &str, sha: &str) -> Result<PathBuf> {
+    if !is_pinned_sha(sha) {
+        return Err(Error::Pkg(format!(
+            "refusing to use a non-40-hex commit sha in a cache path: {:?}",
+            sha
+        )));
+    }
+    let dst = clones.join(cache_key(url, sha));
+    if dst.parent() != Some(clones) {
+        return Err(Error::Pkg(format!(
+            "refusing an unsafe clone-cache path for commit {}",
+            sha
+        )));
+    }
+    Ok(dst)
+}
+
+/// A canonical pinned commit: exactly 40 lowercase hex digits (git's own output
+/// form). By construction it holds no path separators or `..`, so it is safe to
+/// interpolate into a cache path.
+fn is_pinned_sha(s: &str) -> bool {
+    s.len() == 40 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Resolve the commit a bare URL / `@ref` points to CHEAPLY (no full clone) via
+/// `git ls-remote`. Returns `None` — so the caller falls back to cloning — if git,
+/// the server, or the ref does not cooperate. For an annotated tag we also request
+/// the peeled `<ref>^{}` line so we get the COMMIT the tag names (what a clone would
+/// check out), not the intermediate tag object.
+fn ls_remote_sha(url: &str, refspec: &RefSpec) -> Option<String> {
+    let (refname, peel) = match refspec {
+        RefSpec::Default => ("HEAD".to_string(), None),
+        RefSpec::Ref(r) => (r.clone(), Some(format!("{}^{{}}", r))),
+        RefSpec::Commit(_) => return None,
+    };
+    let mut args: Vec<&str> = vec!["ls-remote", "--", url, refname.as_str()];
+    if let Some(p) = peel.as_deref() {
+        args.push(p);
+    }
+    let out = run_git(&args, None).ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_ls_remote(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Parse `git ls-remote` output into a commit sha. Each line is `<sha>\t<ref>`; an
+/// annotated tag also emits a peeled `<sha>\t<ref>^{}` line whose sha is the COMMIT
+/// the tag names — prefer it. Otherwise the first well-formed sha wins.
+fn parse_ls_remote(stdout: &str) -> Option<String> {
+    let mut first: Option<String> = None;
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut cols = line.split_whitespace();
+        let sha = match cols.next() {
+            Some(s) if is_pinned_sha(s) => s,
+            _ => continue,
+        };
+        let refname = cols.next().unwrap_or("");
+        if refname.ends_with("^{}") {
+            return Some(sha.to_string());
+        }
+        if first.is_none() {
+            first = Some(sha.to_string());
+        }
+    }
+    first
 }
 
 /// A directory counts as a completed clone iff it holds a `.git`.
@@ -309,7 +643,7 @@ fn clone_into(dst: &Path, url: &str, branch: Option<&str>) -> Result<()> {
             Some(b) => format!("clone {} at ref '{}'", url, b),
             None => format!("clone {}", url),
         };
-        return Err(Error::Pkg(format!("failed to {}: {}", what, git_error_tail(&out))));
+        return Err(Error::Pkg(format!("failed to {}: {}", what, friendly_git_error(url, &out))));
     }
     Ok(())
 }
@@ -332,7 +666,7 @@ fn fetch_commit_into(dst: &Path, url: &str, sha: &str) -> Result<()> {
             "failed to fetch commit {} from {}: {}",
             sha,
             url,
-            git_error_tail(&fetch)
+            friendly_git_error(url, &fetch)
         )));
     }
     let co = run_git(&["checkout", "-q", "--detach", "FETCH_HEAD"], Some(dst))?;
@@ -363,59 +697,170 @@ fn git_head_sha(dir: &Path) -> Result<String> {
 mod tests {
     use super::*;
 
+    /// A valid 40-char lowercase hex commit for `#sha` tests.
+    const SHA40: &str = "d3543dfe79920046e4b281b377af14bbd2026be2";
+
     #[test]
     fn parse_bare_url_is_default() {
-        let (u, r) = parse_url_spec("https://github.com/Elouderb/numpyrs");
+        let (u, r) = parse_url_spec("https://github.com/Elouderb/numpyrs").unwrap();
         assert_eq!(u, "https://github.com/Elouderb/numpyrs");
         assert_eq!(r, RefSpec::Default);
     }
 
     #[test]
     fn parse_at_ref() {
-        let (u, r) = parse_url_spec("https://github.com/Elouderb/numpyrs@v0.2.0");
+        let (u, r) = parse_url_spec("https://github.com/Elouderb/numpyrs@v0.2.0").unwrap();
         assert_eq!(u, "https://github.com/Elouderb/numpyrs");
         assert_eq!(r, RefSpec::Ref("v0.2.0".into()));
     }
 
     #[test]
     fn parse_hash_sha() {
-        let (u, r) = parse_url_spec("https://github.com/Elouderb/numpyrs#abc123");
+        let (u, r) =
+            parse_url_spec(&format!("https://github.com/Elouderb/numpyrs#{SHA40}")).unwrap();
         assert_eq!(u, "https://github.com/Elouderb/numpyrs");
-        assert_eq!(r, RefSpec::Commit("abc123".into()));
+        assert_eq!(r, RefSpec::Commit(SHA40.into()));
+    }
+
+    #[test]
+    fn parse_rejects_non_40_hex_sha() {
+        // Abbreviated shas are ambiguous; a traversal payload must never parse.
+        assert!(parse_url_spec("file:///tmp/x/repo#abc123").is_err());
+        assert!(parse_url_spec("file:///tmp/x/repo#deadbeef").is_err());
+        assert!(parse_url_spec("file:///tmp/x/repo#../../../../etc/passwd").is_err());
+        // 40 chars but not all hex → rejected.
+        let forty_non_hex = "z".repeat(40);
+        assert!(parse_url_spec(&format!("file:///tmp/x/repo#{forty_non_hex}")).is_err());
+    }
+
+    #[test]
+    fn parse_normalizes_valid_sha_to_lowercase() {
+        let up = "ABCDEF0123456789ABCDEF0123456789ABCDEF01";
+        let (_, r) = parse_url_spec(&format!("file:///r#{up}")).unwrap();
+        assert_eq!(r, RefSpec::Commit(up.to_ascii_lowercase()));
     }
 
     #[test]
     fn scp_authority_at_is_not_a_ref() {
         // The `git@` authority `@` precedes the last `/`, so it is NOT a ref.
-        let (u, r) = parse_url_spec("git@github.com:Elouderb/numpyrs");
+        let (u, r) = parse_url_spec("git@github.com:Elouderb/numpyrs").unwrap();
         assert_eq!(u, "git@github.com:Elouderb/numpyrs");
         assert_eq!(r, RefSpec::Default);
     }
 
     #[test]
     fn scp_form_with_trailing_ref() {
-        let (u, r) = parse_url_spec("git@github.com:Elouderb/numpyrs.git@v1.0");
+        let (u, r) = parse_url_spec("git@github.com:Elouderb/numpyrs.git@v1.0").unwrap();
         assert_eq!(u, "git@github.com:Elouderb/numpyrs.git");
         assert_eq!(r, RefSpec::Ref("v1.0".into()));
     }
 
     #[test]
     fn https_userinfo_at_is_not_a_ref() {
-        let (u, r) = parse_url_spec("https://user@host.example/owner/repo");
+        let (u, r) = parse_url_spec("https://user@host.example/owner/repo").unwrap();
         assert_eq!(u, "https://user@host.example/owner/repo");
         assert_eq!(r, RefSpec::Default);
     }
 
     #[test]
     fn file_url_forms() {
-        assert_eq!(parse_url_spec("file:///tmp/x/repo").1, RefSpec::Default);
+        assert_eq!(parse_url_spec("file:///tmp/x/repo").unwrap().1, RefSpec::Default);
         assert_eq!(
-            parse_url_spec("file:///tmp/x/repo@v0.1.0").1,
+            parse_url_spec("file:///tmp/x/repo@v0.1.0").unwrap().1,
             RefSpec::Ref("v0.1.0".into())
         );
-        let (u, r) = parse_url_spec("file:///tmp/x/repo#deadbeef");
+        let (u, r) = parse_url_spec(&format!("file:///tmp/x/repo#{SHA40}")).unwrap();
         assert_eq!(u, "file:///tmp/x/repo");
-        assert_eq!(r, RefSpec::Commit("deadbeef".into()));
+        assert_eq!(r, RefSpec::Commit(SHA40.into()));
+    }
+
+    #[test]
+    fn is_pinned_sha_only_accepts_40_lowercase_hex() {
+        assert!(is_pinned_sha(SHA40));
+        assert!(!is_pinned_sha("ABCDEF0123456789ABCDEF0123456789ABCDEF01")); // uppercase
+        assert!(!is_pinned_sha("abc123")); // too short
+        assert!(!is_pinned_sha("../../../../etc/passwd"));
+        assert!(!is_pinned_sha(""));
+    }
+
+    #[test]
+    fn cache_path_rejects_traversal_and_stays_under_clones() {
+        let clones = Path::new("/var/cache/pyrst/clones");
+        // A valid pinned sha yields a single child segment directly under `clones`.
+        let dst = cache_path(clones, "https://h/o/r", SHA40).unwrap();
+        assert_eq!(dst.parent(), Some(clones));
+        // A non-pinned sha is refused before it can shape a path.
+        assert!(cache_path(clones, "https://h/o/r", "../../etc").is_err());
+        assert!(cache_path(clones, "https://h/o/r", "abc123").is_err());
+    }
+
+    #[test]
+    fn parse_ls_remote_prefers_peeled_commit() {
+        // Annotated tag: the peeled `^{}` line is the COMMIT the tag names.
+        let out = "639edb2989ab785ebcbaf93d8a2268943a294d99\trefs/tags/v0.2.0\n\
+                   be48a1d348e5fd0cdce0299e1a4f1f541fe28e5e\trefs/tags/v0.2.0^{}\n";
+        assert_eq!(
+            parse_ls_remote(out).as_deref(),
+            Some("be48a1d348e5fd0cdce0299e1a4f1f541fe28e5e")
+        );
+    }
+
+    #[test]
+    fn parse_ls_remote_plain_and_empty() {
+        let out = "5c42b6fc7b92ac14e2a642bb47b0092133e87806\tHEAD\n";
+        assert_eq!(
+            parse_ls_remote(out).as_deref(),
+            Some("5c42b6fc7b92ac14e2a642bb47b0092133e87806")
+        );
+        assert_eq!(parse_ls_remote("").as_deref(), None);
+        assert_eq!(parse_ls_remote("garbage line\n").as_deref(), None);
+    }
+
+    #[test]
+    fn classify_git_error_maps_auth_and_offline() {
+        assert_eq!(
+            classify_git_error(
+                "fatal: could not read Username for 'https://x': terminal prompts disabled"
+            ),
+            GitFailure::Auth
+        );
+        assert_eq!(
+            classify_git_error("remote: Repository not found.\nfatal: repository 'https://x' not found"),
+            GitFailure::Auth
+        );
+        assert_eq!(
+            classify_git_error("fatal: unable to access 'https://x': Could not resolve host: x"),
+            GitFailure::Unreachable
+        );
+        assert_eq!(
+            classify_git_error("fatal: '/x' does not appear to be a git repository"),
+            GitFailure::Other
+        );
+    }
+
+    #[test]
+    fn host_of_handles_url_forms() {
+        assert_eq!(host_of("https://github.com/o/r"), "github.com");
+        assert_eq!(host_of("https://user@github.com/o/r"), "github.com");
+        assert_eq!(host_of("git@github.com:o/r"), "github.com");
+        assert_eq!(host_of("ssh://git@host.example:2222/o/r"), "host.example");
+    }
+
+    #[test]
+    fn human_size_is_readable() {
+        assert_eq!(human_size(0), "0B");
+        assert_eq!(human_size(512), "512B");
+        assert_eq!(human_size(1536), "1.5K");
+        assert_eq!(human_size(1024 * 1024), "1.0M");
+    }
+
+    #[test]
+    fn parse_cache_entry_recovers_url_and_short_sha() {
+        let name = cache_key("https://github.com/Elouderb/numpyrs", SHA40);
+        let (url, short) = parse_cache_entry(&name);
+        assert!(url.contains("github.com"), "recovered url: {url}");
+        assert!(!url.contains('@'), "no sha in the url part: {url}");
+        assert_eq!(short, &SHA40[..10]);
     }
 
     #[test]

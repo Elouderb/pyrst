@@ -18,7 +18,7 @@
 //!   - `check_env_completeness` — the design §F manifest-coherence gate the driver
 //!     runs before codegen.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::diag::{Error, Result};
@@ -184,11 +184,13 @@ fn sanitize_name(raw: &str) -> String {
 
 // ── `pyrst list` / `pyrst freeze` ───────────────────────────────────────────
 
-/// List packages installed in the active env, one `name@version` per line
-/// (stdout), sorted by name.
+/// List packages installed in the active env, one per line (stdout), sorted by name:
+/// `name@version  (git <short-sha>)` for a git-sourced package, `name@version
+/// (path <dir>)` for a local one. The source annotation is read from `pyrst.lock`.
 pub fn list() -> Result<()> {
     let env = require_active_env()?;
     let store = env.join(PACKAGES_DIR);
+    let lock = read_lock(&env).unwrap_or_default();
     let mut names: Vec<String> = Vec::new();
     if store.is_dir() {
         for entry in std::fs::read_dir(&store)?.flatten() {
@@ -202,15 +204,27 @@ pub fn list() -> Result<()> {
         eprintln!("no packages installed in {}", env.display());
         return Ok(());
     }
-    for n in names {
-        match Manifest::load(&store.join(&n)) {
-            Ok(m) => println!("{}@{}", m.name, m.version),
+    for n in &names {
+        match Manifest::load(&store.join(n)) {
+            Ok(m) => {
+                let src = lock.get(&m.name).map(|e| source_label(&e.source)).unwrap_or_default();
+                println!("{}@{}{}", m.name, m.version, src);
+            }
             // A store subdir without a readable manifest is surfaced honestly
             // rather than silently dropped.
             Err(_) => println!("{}@?", n),
         }
     }
     Ok(())
+}
+
+/// The trailing source annotation for `pyrst list`: `  (git <short-sha>)` for a
+/// git-pinned package, `  (path <dir>)` for a local one.
+fn source_label(s: &LockSource) -> String {
+    match s {
+        LockSource::Git { commit, .. } => format!("  (git {})", short_sha(commit)),
+        LockSource::Path(p) => format!("  (path {})", p),
+    }
 }
 
 /// Print the pinned lock set verbatim (stdout) — for sharing / CI.
@@ -335,13 +349,7 @@ pub fn write_lock(env: &Path, lock: &BTreeMap<String, LockEntry>) -> Result<()> 
 pub fn install(spec: Option<String>, force: bool) -> Result<()> {
     let env = require_active_env()?;
     let count = match spec {
-        Some(s) if looks_like_git_url(&s) => {
-            // `git clone <url>` under the hood → the SHA-keyed cache → verify it is
-            // a pyrst package → reuse the Phase-1 install DFS on the clone.
-            let co = clone_git_package(&s)?;
-            let source = LockSource::Git { url: co.url.clone(), commit: co.commit.clone() };
-            install_root(&env, &co.dir, source, force)?
-        }
+        Some(s) if looks_like_git_url(&s) => install_git_root(&env, &s, force)?,
         Some(s) => {
             let path = PathBuf::from(&s);
             let canon = path.canonicalize().map_err(|_| {
@@ -381,8 +389,12 @@ pub fn looks_like_git_url(s: &str) -> bool {
 
 /// Clone a git package into the SHA-keyed cache and verify it IS a pyrst package
 /// (a `pyrst.yaml` at the clone root — the manifest's presence is what certifies
-/// it, per §C). An honest, URL-based error otherwise.
-fn clone_git_package(spec: &str) -> Result<fetch::GitCheckout> {
+/// it, per §C). An honest, URL-based error otherwise. Memoised per install run: the
+/// same spec (a bare-URL diamond's repeat edges) resolves ONCE.
+fn clone_git_package(state: &mut InstallState, spec: &str) -> Result<fetch::GitCheckout> {
+    if let Some(co) = state.git_memo.get(spec) {
+        return Ok(co.clone());
+    }
     let co = fetch::resolve_spec(spec)?;
     if !co.dir.join(MANIFEST_FILE).is_file() {
         return Err(Error::Pkg(format!(
@@ -391,6 +403,7 @@ fn clone_git_package(spec: &str) -> Result<fetch::GitCheckout> {
         )));
     }
     eprintln!("  cloned {} @ {}", co.url, short_sha(&co.commit));
+    state.git_memo.insert(spec.to_string(), co.clone());
     Ok(co)
 }
 
@@ -413,6 +426,27 @@ struct InstallState {
     stack: Vec<String>,
     /// `--force`: reinstall over a name/source collision instead of erroring.
     force: bool,
+    /// Git resolutions already performed THIS run, keyed by the raw dependency spec
+    /// (url / `url@ref` / `url#sha`). A bare-URL diamond referenced from N siblings
+    /// resolves + clones ONCE — the repeat references hit this memo (no `ls-remote`,
+    /// no clone). Cross-run dedup is handled by the on-disk SHA-keyed clone cache.
+    git_memo: HashMap<String, fetch::GitCheckout>,
+}
+
+/// Seed a fresh install state for `env`: an empty store (created), the existing lock
+/// (so incremental installs accumulate and collision detection sees prior installs),
+/// and empty visited/stack/memo sets.
+fn new_state(env: &Path, force: bool) -> Result<InstallState> {
+    let store = env.join(PACKAGES_DIR);
+    std::fs::create_dir_all(&store)?;
+    Ok(InstallState {
+        store,
+        lock: read_lock(env)?,
+        done: HashSet::new(),
+        stack: Vec::new(),
+        force,
+        git_memo: HashMap::new(),
+    })
 }
 
 /// Install the package rooted at `pkg_dir` (a LOCAL path) into `env`. Public + its
@@ -426,16 +460,20 @@ pub fn install_into(env: &Path, pkg_dir: &Path) -> Result<usize> {
 /// Seed the install state and run the DFS from `pkg_dir` (whose resolved lock
 /// `source` the caller supplies — a canonical path, or a pinned git url+sha).
 fn install_root(env: &Path, pkg_dir: &Path, source: LockSource, force: bool) -> Result<usize> {
-    let store = env.join(PACKAGES_DIR);
-    std::fs::create_dir_all(&store)?;
-    let mut state = InstallState {
-        store,
-        lock: read_lock(env)?,
-        done: HashSet::new(),
-        stack: Vec::new(),
-        force,
-    };
+    let mut state = new_state(env, force)?;
     install_dfs(&mut state, pkg_dir, None, source)?;
+    write_lock(env, &state.lock)?;
+    Ok(state.done.len())
+}
+
+/// Install a git target (`url`, `url@ref`, or `url#sha`) as the DFS root. The root
+/// clone and every transitive git dep share ONE install state (and its git memo), so
+/// a bare-URL diamond that reaches the root package again resolves once.
+fn install_git_root(env: &Path, spec: &str, force: bool) -> Result<usize> {
+    let mut state = new_state(env, force)?;
+    let co = clone_git_package(&mut state, spec)?;
+    let source = LockSource::Git { url: co.url.clone(), commit: co.commit.clone() };
+    install_dfs(&mut state, &co.dir, None, source)?;
     write_lock(env, &state.lock)?;
     Ok(state.done.len())
 }
@@ -578,7 +616,7 @@ fn install_dfs(
                 (canon, src)
             }
             DepSource::Git(url) => {
-                let co = clone_git_package(url)?;
+                let co = clone_git_package(state, url)?;
                 let src = LockSource::Git { url: co.url.clone(), commit: co.commit.clone() };
                 (co.dir, src)
             }
@@ -659,6 +697,13 @@ fn copy_pyrs_tree(root: &Path, dir: &Path, dst: &Path) -> Result<()> {
     entries.sort();
     for path in entries {
         if path.is_dir() {
+            // Skip dot-directories (e.g. a clone's `.git/`). They never hold a
+            // package's importable `.pyrs` modules, so walking them is pure overhead
+            // now that every git source is a real clone. The store stays byte-for-byte
+            // identical (only `.pyrs` are ever copied), just cheaper to produce.
+            if is_hidden_dir(&path) {
+                continue;
+            }
             copy_pyrs_tree(root, &path, dst)?;
         } else if path.extension().and_then(|s| s.to_str()) == Some("pyrs") {
             let rel = path.strip_prefix(root).unwrap_or(&path);
@@ -670,6 +715,15 @@ fn copy_pyrs_tree(root: &Path, dir: &Path, dst: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// A directory whose name begins with `.` (e.g. a clone's `.git/`) — never part of a
+/// package's importable source, so it is skipped when copying into the store.
+fn is_hidden_dir(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|s| s.to_str())
+        .map(|n| n.starts_with('.'))
+        .unwrap_or(false)
 }
 
 // ── §F env-completeness gate (driver-side) ──────────────────────────────────
@@ -914,6 +968,50 @@ mod tests {
         let err = check_env_completeness(&env, &used).unwrap_err().to_string();
         assert!(err.contains("incomplete"), "got: {err}");
         assert!(err.contains("dateutil") && err.contains("tzdata"), "must name the package + missing dep: {err}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The dot-directory skip predicate (NIT #2): `.git` and friends are hidden.
+    #[test]
+    fn is_hidden_dir_flags_dot_directories() {
+        assert!(is_hidden_dir(Path::new("/x/.git")));
+        assert!(is_hidden_dir(Path::new(".hidden")));
+        assert!(!is_hidden_dir(Path::new("/x/src")));
+        assert!(!is_hidden_dir(Path::new("frame")));
+    }
+
+    /// `pyrst list` source annotation: git → short-sha, path → the dir.
+    #[test]
+    fn source_label_renders_git_and_path() {
+        let g = source_label(&LockSource::Git {
+            url: "https://h/o/r".into(),
+            commit: "d3543dfe79920046e4b281b377af14bbd2026be2".into(),
+        });
+        assert_eq!(g, "  (git d3543dfe79)");
+        let p = source_label(&LockSource::Path("/abs/pkg".into()));
+        assert_eq!(p, "  (path /abs/pkg)");
+    }
+
+    /// NIT #2: a `.git` (or any dot-dir) in the source is NOT copied into the store,
+    /// while a legitimate nested `.pyrs` module IS.
+    #[test]
+    fn copy_skips_dot_dirs_but_keeps_nested_modules() {
+        let base = temp_dir("copy-skip-dotdir");
+        let env = make_env(&base);
+        let src = base.join("src").join("pkg");
+        write_pkg(&src, "pkg", &[]);
+        // A fake `.git` with a `.pyrs` inside — must NOT leak into the store.
+        std::fs::create_dir_all(src.join(".git").join("objects")).unwrap();
+        std::fs::write(src.join(".git").join("config.pyrs"), "x").unwrap();
+        // A real nested module — must be copied.
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("sub").join("mod.pyrs"), "def f() -> int:\n    return 2\n").unwrap();
+
+        install_into(&env, &src).expect("install");
+        let dst = env.join(PACKAGES_DIR).join("pkg");
+        assert!(!dst.join(".git").exists(), ".git must not leak into the store");
+        assert!(dst.join("sub").join("mod.pyrs").is_file(), "nested module copied");
+        assert!(dst.join("pkg.pyrs").is_file(), "top module copied");
         let _ = std::fs::remove_dir_all(&base);
     }
 }

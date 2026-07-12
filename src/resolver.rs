@@ -32,24 +32,45 @@ struct Resolver {
     /// by synthetic `<stdlib>/…` paths and never appear here, so they resolve
     /// identically regardless of the overlay.
     overlay: HashMap<PathBuf, String>,
-    /// (E1) Ordered `$PYRST_PATH` search directories, parsed ONCE at construction.
-    /// Consulted for a local import AFTER the root-relative `<base_dir>/…` lookup
-    /// and BEFORE the embedded stdlib (see [`Resolver::process_module`]). EMPTY when
-    /// the env var is unset/blank, which makes the PYRST_PATH branch a no-op — so a
-    /// build with no `PYRST_PATH` (the `test_all.sh` suite sets none) resolves
-    /// byte-for-byte as before this card.
-    pyrst_path: Vec<PathBuf>,
+    /// Ordered import-search directories, parsed ONCE at construction. Consulted
+    /// for a local import AFTER the root-relative `<base_dir>/…` lookup and BEFORE
+    /// the embedded stdlib (see [`Resolver::process_module`]). The order is:
+    ///   1. the ACTIVE ENV's `packages/` store, if an env is active (PKG Phase 1);
+    ///   2. the `$PYRST_PATH` directories, in order (a lower-precedence override /
+    ///      escape hatch).
+    /// So when an env is active the precedence is
+    ///   root-relative → env `packages/` → PYRST_PATH → embedded stdlib (design §F).
+    /// When NO env is active AND `$PYRST_PATH` is unset/blank this Vec is EMPTY,
+    /// which makes the whole branch a no-op — so a build with no active env and no
+    /// `PYRST_PATH` (the `test_all.sh` suite is exactly this) resolves BYTE-FOR-BYTE
+    /// as before packaging existed.
+    search_dirs: Vec<PathBuf>,
+    /// The active virtual environment (`.pyrstenv` abs path), or `None`. `Some`
+    /// ONLY changes two things: the env store is prepended to `search_dirs` above,
+    /// and an unresolved import becomes the env-aware `PackageNotInstalled` error
+    /// instead of `ImportNotFound`. `None` ⇒ the resolver is byte-for-byte the
+    /// pre-packaging resolver.
+    active_env: Option<PathBuf>,
 }
 
 impl Resolver {
     fn new() -> Self {
+        // Discover the active env ONCE; when present, its `packages/` store takes
+        // precedence over `$PYRST_PATH` (design §F resolution order).
+        let active_env = crate::venv::discover_active_env();
+        let mut search_dirs = Vec::new();
+        if let Some(env) = &active_env {
+            search_dirs.push(env.join(crate::venv::PACKAGES_DIR));
+        }
+        search_dirs.extend(pyrst_search_dirs());
         Self {
             cache: HashMap::new(),
             in_flight: HashSet::new(),
             dfs_stack: Vec::new(),
             order: Vec::new(),
             overlay: HashMap::new(),
-            pyrst_path: pyrst_search_dirs(),
+            search_dirs,
+            active_env,
         }
     }
 
@@ -220,10 +241,11 @@ impl Resolver {
                     }
                 };
 
-                // Resolution order (E1): a LOCAL `<base_dir>/a/b.pyrs` on disk SHADOWS
-                // a PYRST_PATH module, which SHADOWS an embedded stdlib module keyed by
-                // the same dotted id. So the precedence is:
-                //   root-relative  ->  PYRST_PATH (in order)  ->  embedded stdlib.
+                // Resolution order: a LOCAL `<base_dir>/a/b.pyrs` on disk SHADOWS a
+                // search-dir module, which SHADOWS an embedded stdlib module keyed by
+                // the same dotted id. With an env active, `search_dirs` is
+                // [env packages/, then PYRST_PATH…], so the precedence is:
+                //   root-relative -> env packages/ -> PYRST_PATH -> embedded stdlib.
                 let dep_path = rel_layout(base_dir);
                 if let Ok(dep_abs) = dep_path.canonicalize() {
                     // Local file found. Its module id is the FULL dotted import path
@@ -231,11 +253,11 @@ impl Resolver {
                     // mod` that is `mod_name` itself.
                     self.visit(dep_abs, base_dir, *span, Some(mod_id.clone()))?;
                 } else if let Some((pp_abs, pp_dir)) = self
-                    .pyrst_path
+                    .search_dirs
                     .iter()
                     .find_map(|dir| rel_layout(dir).canonicalize().ok().map(|abs| (abs, dir.clone())))
                 {
-                    // (E1) PYRST_PATH hit: a directory on `$PYRST_PATH` holds this
+                    // (E1) search-dir hit: an env-store or `$PYRST_PATH` directory holds this
                     // module (the FIRST matching entry wins). Visit it with THAT
                     // directory as its own base, so the found package is self-rooted —
                     // its internal imports resolve within it first (then PYRST_PATH,
@@ -257,6 +279,20 @@ impl Resolver {
                     let dep_key = rel_layout(&stdlib_dir);
                     let dep_src = crate::lexer::normalize_line_endings(embedded_src);
                     self.process_module(dep_key, dep_src, &stdlib_dir, *span, Some(mod_id.clone()))?;
+                } else if let Some(env) = &self.active_env {
+                    // (PKG Phase 1, §F) An unresolved import WHILE AN ENV IS ACTIVE
+                    // is an honest env-aware error: the module is not in the entry
+                    // tree, not installed in the env store, and not an embedded
+                    // stdlib module. Name it and the env, and point at `pyrst
+                    // install` — never a downstream module-not-found / rustc leak.
+                    // Reached ONLY when `active_env` is `Some`, so the no-env path
+                    // below is entirely unchanged.
+                    return Err(Error::PackageNotInstalled {
+                        module: mod_id.clone(),
+                        env: env.display().to_string(),
+                        span: *span,
+                        importing_file: key.display().to_string(),
+                    });
                 } else {
                     // Neither a local file nor an embedded module exists for the FULL
                     // dotted id. This is the honest death of the `path[0]` truncation:

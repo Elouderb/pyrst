@@ -367,12 +367,19 @@ fn extract_span_and_message(e: &Error) -> (Span, String) {
         Error::CircularImport { cycle, span } => {
             (*span, format!("circular import: {}", cycle.join(" → ")))
         }
+        // (PKG Phase 1) An env-aware unresolved import carries a span.
+        Error::PackageNotInstalled { module, env, span, .. } => (
+            *span,
+            format!("module '{}' is not installed in the active environment '{}'", module, env),
+        ),
         // Unwrap the Sourced wrapper to its inner error (which carries the span).
         Error::Sourced { inner, .. } => extract_span_and_message(inner),
         // Span-less variants: position at (0, 0).
         Error::Io(e) => (Span::DUMMY, format!("io error: {}", e)),
         Error::Codegen(msg) => (Span::DUMMY, format!("codegen error: {}", msg)),
         Error::Rustc(msg) => (Span::DUMMY, format!("rustc failed: {}", msg)),
+        // (PKG Phase 1) Span-less packaging error: position at (0, 0).
+        Error::Pkg(msg) => (Span::DUMMY, msg.clone()),
     }
 }
 

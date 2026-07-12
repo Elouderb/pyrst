@@ -1,0 +1,7 @@
+name: dateutil
+version: 0.1.0
+package_root: .
+description: dateutil-style parsing, relativedelta, and rrule for pyrst
+dependencies:
+  - name: tzdata
+    path: ../tzdata

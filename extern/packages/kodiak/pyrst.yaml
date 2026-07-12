@@ -1,0 +1,11 @@
+name: kodiak
+version: 0.1.0
+package_root: .
+description: pandas-ergonomics dataframes with a polars-style lazy engine for pyrst
+dependencies:
+  - name: numpyrs
+    path: ../numpyrs
+  - name: dateutil
+    path: ../dateutil
+  - name: tzdata
+    path: ../tzdata

@@ -2361,9 +2361,10 @@ pub(crate) fn error_span(e: &Error) -> Span {
         | Error::Parse { span, .. }
         | Error::Type { span, .. }
         | Error::ImportNotFound { span, .. }
+        | Error::PackageNotInstalled { span, .. }
         | Error::CircularImport { span, .. } => *span,
         Error::Sourced { inner, .. } => error_span(inner),
-        Error::Io(_) | Error::Codegen(_) | Error::Rustc(_) => Span::DUMMY,
+        Error::Io(_) | Error::Codegen(_) | Error::Rustc(_) | Error::Pkg(_) => Span::DUMMY,
     }
 }
 

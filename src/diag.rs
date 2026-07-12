@@ -27,6 +27,20 @@ pub enum Error {
     Rustc(String),
     ImportNotFound { path: String, span: Span, importing_file: String },
     CircularImport { cycle: Vec<String>, span: Span },
+    /// (PKG Phase 1) An import that resolves to nothing WHILE A VIRTUAL ENV IS
+    /// ACTIVE. Distinct from `ImportNotFound` (the NO-ENV path, kept byte-for-byte)
+    /// so the no-env resolution is entirely unchanged: this variant is constructed
+    /// ONLY when `Resolver::active_env` is `Some`. It names the missing module, the
+    /// active env, and tells the user to `pyrst install` it — never a downstream
+    /// rustc leak (the project's honest-errors invariant, applied to packaging).
+    PackageNotInstalled { module: String, env: String, span: Span, importing_file: String },
+    /// (PKG Phase 1) A non-span packaging error — manifest parse/verify failures,
+    /// env-completeness (a declared dependency not installed), an install-time
+    /// dependency cycle, a name collision at a different source, or a command run
+    /// without an active env. The `String` is the FULLY-FORMED honest message; the
+    /// variant carries no span (these arise at the CLI / manifest / env-store level,
+    /// not at a source location the way `Lex`/`Parse`/`Type` do).
+    Pkg(String),
     /// Multi-file error sourcing (EPIC-8): a wrapper that pairs an inner error
     /// with the source text (and originating file) it should be rendered
     /// against. Constructed ONLY at the driver/resolver per-module boundary via
@@ -54,6 +68,14 @@ impl fmt::Display for Error {
                 let cycle_str = cycle.join(" → ");
                 write!(f, "import error at {}:{}: circular import detected: {}", span.line, span.col, cycle_str)
             }
+            Error::PackageNotInstalled { module, env, span, importing_file } => {
+                write!(
+                    f,
+                    "import error at {}:{}: module '{}' is imported but not installed in the active environment '{}' — `pyrst install` it, or check its package's `pyrst.yaml` dependencies (imported from {})",
+                    span.line, span.col, module, env, importing_file
+                )
+            }
+            Error::Pkg(msg) => write!(f, "{}", msg),
             // The render-source wrapper is transparent to `Display`: the bare
             // `{}` rendering (REPL, main.rs:46) is identical to the inner error.
             Error::Sourced { inner, .. } => write!(f, "{}", inner),
@@ -105,6 +127,13 @@ impl Error {
                 let cycle_str = cycle.join(" → ");
                 format!("import error at {}:{}: circular import detected: {}", span.line, span.col, cycle_str)
             }
+            Error::PackageNotInstalled { module, env, span, importing_file } => {
+                format!(
+                    "import error at {}:{}: module '{}' is imported but not installed in the active environment '{}'\n  `pyrst install` it, or check its package's `pyrst.yaml` dependencies\n  imported from {}",
+                    span.line, span.col, module, env, importing_file
+                )
+            }
+            Error::Pkg(msg) => msg.clone(),
             // Render the wrapped error against its OWN module source + file name,
             // not the root source `main` re-read from the CLI argument.
             Error::Sourced { inner, file, source: module_src } => {

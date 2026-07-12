@@ -3,6 +3,30 @@ use std::process::Command;
 
 use crate::diag::{Error, Result};
 
+/// (PKG Phase 1, §F) When a virtual env is active, confirm the resolved import
+/// closure is coherent with the env BEFORE codegen: every env package the build
+/// used must have its manifest-declared dependencies installed too. An incomplete
+/// env is an honest error naming what to `pyrst install`, never a downstream
+/// module-not-found / rustc leak.
+///
+/// When NO env is active `discover_active_env()` returns `None` and this is a
+/// no-op — so the no-env build path is byte-for-byte unchanged (it adds only a
+/// cheap env-discovery probe). Missing-*import* cases are already caught earlier by
+/// the resolver's env-aware `PackageNotInstalled`; this adds the manifest-coherence
+/// guarantee that the env itself is self-consistent.
+fn env_completeness_gate(prog: &crate::resolver::ResolvedProgram) -> Result<()> {
+    if let Some(env) = crate::venv::discover_active_env() {
+        let paths: Vec<&Path> = prog
+            .modules
+            .iter()
+            .filter_map(|(m, _)| m.source_path.as_deref())
+            .collect();
+        let used = crate::venv::used_env_packages(&env, &paths);
+        crate::venv::check_env_completeness(&env, &used)?;
+    }
+    Ok(())
+}
+
 pub fn check(path: &Path) -> Result<()> {
     let prog = crate::resolver::resolve(path)?;
     // Name the originating file only when more than one module is involved, so
@@ -16,6 +40,8 @@ pub fn check(path: &Path) -> Result<()> {
         crate::typeck::check_bodies(m, &prog.ctx)
             .map_err(|e| e.with_render_source(render_path, src))?;
     }
+    // (PKG §F) Env-completeness gate — a no-op when no env is active.
+    env_completeness_gate(&prog)?;
     // Surface a conflicting-`@crate` declaration (the same crate pinned to two
     // versions) at CHECK time too, not only at build — it is a whole-program
     // property the per-module body checks above cannot see, and reporting it here
@@ -81,6 +107,8 @@ pub fn build(path: &Path) -> Result<()> {
         crate::typeck::check_bodies(m, &prog.ctx)
             .map_err(|e| e.with_render_source(render_path, src))?;
     }
+    // (PKG §F) Env-completeness gate BEFORE codegen — a no-op when no env active.
+    env_completeness_gate(&prog)?;
     let rust = crate::codegen::emit_program(&prog.modules, &prog.ctx)?;
     let crates = collect_crate_deps(&prog.modules)?;
 
@@ -528,6 +556,8 @@ fn compile_to_rust(path: &Path) -> Result<String> {
         crate::typeck::check_bodies(m, &prog.ctx)
             .map_err(|e| e.with_render_source(render_path, src))?;
     }
+    // (PKG §F) Env-completeness gate BEFORE codegen — a no-op when no env active.
+    env_completeness_gate(&prog)?;
     crate::codegen::emit_program(&prog.modules, &prog.ctx)
 }
 

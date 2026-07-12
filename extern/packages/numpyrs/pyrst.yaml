@@ -1,0 +1,5 @@
+name: numpyrs
+version: 0.1.0
+package_root: .
+description: NumPy-style N-dimensional arrays, constructors, and ufuncs for pyrst
+dependencies: []

@@ -138,9 +138,13 @@ root-relative (the entry program's own dir/subdirs)
   → <active PYRST_VENV>/packages/<name>/...      (the isolated store)
   → embedded stdlib
 ```
-`$PYRST_PATH` remains as a **lower-precedence override / escape hatch** for advanced/local use, but the
-env store is the primary mechanism. With an env active and no manual `PYRST_PATH`, `pyrst build main.pyrs`
-resolves `from kodiak.frame import DataFrame` against `<venv>/packages/kodiak/frame.pyrs`.
+`$PYRST_PATH` remains in the search order as a lower-precedence resolver *fallback* for advanced/local
+use, but the env store is the primary mechanism — and **isolation is a hard property**: the §F
+completeness gate checks the env **store** directly, so with an env active a package supplied *only* via
+`PYRST_PATH` does NOT satisfy the gate and the build fails honestly. So `PYRST_PATH` cannot smuggle a
+dependency into an env build; it is a resolution fallback, not a way to bypass env completeness. With an
+env active and no manual `PYRST_PATH`, `pyrst build main.pyrs` resolves
+`from kodiak.frame import DataFrame` against `<venv>/packages/kodiak/frame.pyrs`.
 
 **Build = compile the transitive closure from the active env:**
 - The resolver already gathers the closure of imports; the change is *where* it looks (the env store) and

@@ -1,0 +1,5 @@
+name: tzdata
+version: 0.1.0
+package_root: .
+description: IANA timezone rules + UTC-offset/DST transition lookup for pyrst
+dependencies: []

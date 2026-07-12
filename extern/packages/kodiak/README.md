@@ -18,8 +18,16 @@ bool-mask methods, `df.filter(mask)`, stable `sort_values`,
 inner/left, the `nulls` validity-mask null model with
 `dropna`/`fillna_float`/`fillna_str`, `describe`, and CSV
 `read_csv`/`to_csv`) is unchanged and still covered by `tests/op_matrix.pyrs`.
-The numpyrs/dateutil/tzdata capstone integration (Phase 4) is **not yet
-implemented** — see card `974fdff3`.
+
+**Phase 4a (the numpyrs bridge) is now IMPLEMENTED**: numeric columns
+interoperate with numpyrs' `NDArray` — `Series.to_ndarray()` /
+`Series.from_ndarray()`, `DataFrame.to_matrix(cols)` /
+`DataFrame.from_matrix(mat, names)`, and a real linear-algebra path,
+`DataFrame.predict_linear(features, weights, out)` (a linear-model prediction
+computed as `X · w` through numpyrs `.dot()`). Covered by
+`tests/interop_numpyrs.pyrs` and demonstrated by
+`extern/programs/kodiak_demo/numpyrs_bridge.pyrs`. Phase 4b (datetime columns
+via dateutil/tzdata) is **not yet implemented** — see card `974fdff3`.
 
 > **The single most important divergence to know before reading further:**
 > comparison **operators** cannot produce a mask. pyrst hard-types `<`, `>`,
@@ -385,6 +393,66 @@ both a real separate module *and* `df.lazy()`:
 Logged on card `974fdff3` as
 `GAP: pyrst forbids circular imports … worked around by making lazy.pyrs a PURE module that frame.pyrs imports one-directionally, hosting LazyFrame inside frame.pyrs so df.lazy() stays a real method.`
 
+## API surface (Phase 4a — the numpyrs bridge)
+
+Numeric kodiak columns cross into [numpyrs](../numpyrs/README.md)' `NDArray` for
+linear algebra and come back. The bridge lives **on the classes** (not a
+separate `interop.pyrs`) so it never risks the frame↔lazy-style circular import:
+`series.pyrs` and `frame.pyrs` each import numpyrs **one-directionally**
+(numpyrs never imports kodiak). Every method is value-semantic (a fresh
+`NDArray` / `Series` / `DataFrame` is returned; nothing mutates).
+
+### `Series` ↔ 1D `NDArray` (`series.pyrs`)
+
+- `Series.to_ndarray() -> NDArray` — a NUMERIC column (i64 promoted to f64) as a
+  numpyrs 1D array.
+- `Series.from_ndarray(name, a: NDArray) -> Series` (`@staticmethod`) — a 1D
+  `NDArray` back as an **f64** `Series` (numpyrs is f64-only). A 2D+ array is a
+  `ValueError` (use `DataFrame.from_matrix`).
+- `Series.numeric_values() -> list[float]` — the shared numeric-extraction
+  primitive both of the above (and `to_matrix`) build on.
+
+**Null policy (honest, hand-verifiable):** numpyrs is f64-only with **no
+missing-value support**, so the bridge **refuses** a column containing any null
+(`ValueError`, "dropna/fillna before bridging") rather than inventing a `NaN`
+sentinel. A non-numeric (str/bool) column is a `TypeError`.
+
+### `DataFrame` ↔ 2D `NDArray` matrix (`frame.pyrs`)
+
+- `DataFrame.to_matrix(cols: list[str]) -> NDArray` — the named NUMERIC columns
+  as a 2D array, **one row per record** (records × features), via
+  `numpyrs.array2d`. A missing column is a `KeyError`; a non-numeric column or a
+  null cell is an honest error.
+- `DataFrame.from_matrix(mat: NDArray, names) -> DataFrame` (`@staticmethod`) —
+  the inverse: a records × features 2D array + column names → a DataFrame of
+  **f64** columns. Non-2D input, or a name/column-count mismatch, is a
+  `ValueError`.
+
+### The linear-algebra path — `predict_linear` (a numpyrs matmul)
+
+`DataFrame.predict_linear(feature_cols, weights: NDArray, out_name) -> DataFrame`
+runs a linear-model prediction **entirely through numpyrs** and threads the
+result back into the frame:
+
+```
+X = self.to_matrix(feature_cols)      # (M records × K features)
+wcol = weights.reshape([K, 1])        # numpyrs.dot is 2D@2D-only, so K → K×1
+pred = X.dot(wcol)                     # (M × 1) matrix product
+                                       #   pred[r] = Σ_k  X[r,k] · w[k]
+=> Series.from_ndarray(out_name, pred.reshape([M]))  attached via with_column
+```
+
+so it is a full **dataframe → numpyrs linear algebra → dataframe** round-trip.
+Hand-verified in `tests/interop_numpyrs.pyrs` (X = `[[1,4],[2,5],[3,6]]`,
+w = `[10, 100]` → pred `[410, 520, 630]`) and shown end-to-end (a housing
+price = `0.25·sqft + 50·bedrooms` model) in
+`extern/programs/kodiak_demo/numpyrs_bridge.pyrs`.
+
+No new pyrst language GAPs surfaced in Phase 4a — the bridge composes cleanly on
+the existing numpyrs API (the relevant numpyrs constraints — f64-only, `.dot()`
+being 2D@2D-only, scalar ops as `muls`/`adds` methods — are numpyrs' own,
+already documented on card `0182f2b0`).
+
 ## Forced API divergences (pyrst static-typing limits — see card `974fdff3`)
 
 - **`assign(**kwargs)` → `with_column(name, series)`.** pandas'
@@ -421,11 +489,13 @@ semantics: `head`/`tail`/`row_slice`/`with_column` all allocate and return a
   element-wise arithmetic (`__add__`/`add`/…, `*_scalar`), comparison
   methods (`gt`/…/`eq_str`/`*_series`), aggregations (`agg_sum`/`agg_mean`/
   `agg_min`/`agg_max`/`agg_std`/`count`), `fillna_float`/`fillna_str`,
-  `to_strings`/`to_field_strings`, `__len__`, `__str__`.
+  `to_strings`/`to_field_strings`, the **Phase-4a numpyrs bridge**
+  (`numeric_values`/`to_ndarray`/`from_ndarray`), `__len__`, `__str__`.
 - `frame.pyrs` — the `DataFrame` class (`from_columns`, `__getitem__`,
   `shape`/`columns`/`head`/`tail`/`with_column`, `select`, `lazy`, `filter`,
   `sort_values`, `groupby`, `merge`, `dropna`, `fillna_float`/`fillna_str`,
-  `describe`, `to_csv`, `__str__`) and the `GroupBy` class
+  `describe`, `to_csv`, the **Phase-4a numpyrs bridge**
+  (`to_matrix`/`from_matrix`/`predict_linear`), `__str__`) and the `GroupBy` class
   (`sum`/`mean`/`count`/`min`/`max`/`std`); the **Phase-3 lazy engine**
   (`LazyFrame`, `LazyGroupBy`, the op executor `_exec_op` + mask/derive/groupby
   dispatch helpers, and the `frame_equals` equality oracle); plus
@@ -450,11 +520,17 @@ semantics: `head`/`tail`/`row_slice`/`with_column` all allocate and return a
   groupby+filter on the key, and the full mixed pipeline) — each asserts
   `collect() == eager`, and several assert the *optimized* plan actually pushed
   a filter earlier. Prints `PASS`/`FAIL`, nonzero exit on failure.
+- `tests/interop_numpyrs.pyrs` — Phase 4a numpyrs bridge: asserts the
+  `Series` ↔ 1D `NDArray` and `DataFrame` ↔ 2D matrix conversions round-trip
+  with identical values, and that `predict_linear` (a numpyrs matmul) matches a
+  hand-computed result. Prints `PASS`/`FAIL`, nonzero exit on failure.
 
 The flagship demos live in `extern/programs/kodiak_demo/`: `main.pyrs` (Phase-2
-eager pipeline) and `lazy_main.pyrs` (Phase-3 lazy engine — `explain()` showing
+eager pipeline), `lazy_main.pyrs` (Phase-3 lazy engine — `explain()` showing
 a pushed-down filter, `collect() == eager`, and a lazy-vs-eager timing
-comparison over a synthetic frame).
+comparison over a synthetic frame), and `numpyrs_bridge.pyrs` (Phase-4a — the
+`Series`/`DataFrame` ↔ numpyrs `NDArray` round-trip and a linear prediction via
+`.dot()`).
 
 See card `974fdff3` for the full staged plan (Phase 2 eager core, Phase 3
 lazy pipeline, Phase 4 capstone integration with numpyrs/dateutil/tzdata) and

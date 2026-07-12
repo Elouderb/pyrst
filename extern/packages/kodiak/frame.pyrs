@@ -20,6 +20,10 @@ from kodiak.lazy import optimize
 from kodiak.lazy import explain_plan
 from csv import writer
 from os import write_file
+# numpyrs bridge (Phase 4a, card 974fdff3): DataFrame <-> 2D NDArray (matrix).
+# One-way import (frame -> numpyrs); numpyrs never imports kodiak, so no cycle.
+from numpyrs.ndarray import NDArray
+from numpyrs.constructors import array2d
 
 
 class DataFrame:
@@ -265,6 +269,78 @@ class DataFrame:
                 out_cols.append(Series.from_floats_n(col.name, vals, nulls))
             c += 1
         return DataFrame(out_names, out_cols)
+
+    # ---- numpyrs bridge: DataFrame <-> 2D NDArray (records x features) ----
+    # to_matrix(cols) stacks the named NUMERIC columns into a 2D NDArray with
+    # one ROW per record (records x features), via numpyrs.array2d; from_matrix
+    # is the inverse (an f64 DataFrame from a 2D array + column names). A
+    # missing column is a KeyError; a non-numeric column or a null cell is an
+    # honest error (raised by Series.numeric_values). Value semantics: a fresh
+    # NDArray / DataFrame is returned.
+    def to_matrix(self, cols: list[str]) -> NDArray:
+        if len(cols) == 0:
+            raise ValueError("kodiak: to_matrix needs at least one column")
+        col_floats: list[list[float]] = []
+        j: int = 0
+        while j < len(cols):
+            name: str = cols[j]
+            if name not in self.names:
+                raise KeyError(repr(name))
+            col_floats.append(self[name].numeric_values())
+            j += 1
+        rows: int = self._row_count()
+        matrix_rows: list[list[float]] = []
+        r: int = 0
+        while r < rows:
+            row: list[float] = []
+            c: int = 0
+            while c < len(col_floats):
+                row.append(col_floats[c][r])
+                c += 1
+            matrix_rows.append(row)
+            r += 1
+        return array2d(matrix_rows)
+
+    @staticmethod
+    def from_matrix(mat: NDArray, names: list[str]) -> DataFrame:
+        if len(mat.shape) != 2:
+            raise ValueError("kodiak: from_matrix expects a 2D NDArray, but its shape is " + str(mat.shape))
+        nrows: int = mat.shape[0]
+        ncols: int = mat.shape[1]
+        if len(names) != ncols:
+            raise ValueError("kodiak: from_matrix got " + str(len(names)) + " column name(s) for a matrix with " + str(ncols) + " column(s)")
+        out_cols: list[Series] = []
+        c: int = 0
+        while c < ncols:
+            vals: list[float] = []
+            r: int = 0
+            while r < nrows:
+                # row-major (C-order) flat offset: row r, column c.
+                vals.append(mat.data[r * ncols + c])
+                r += 1
+            out_cols.append(Series.from_floats(names[c], vals))
+            c += 1
+        return DataFrame.from_columns(out_cols)
+
+    # ---- linear-algebra path: a linear-model prediction via numpyrs .dot() -
+    # y = X . w. X = to_matrix(feature_cols)  (M records x K features); w =
+    # weights (a 1D NDArray of length K). numpyrs.dot() handles 2D@2D, so w is
+    # reshaped to a (K x 1) column, X.dot(wcol) gives the (M x 1) prediction,
+    # which is flattened to 1D and attached as a new f64 column. The whole path
+    # is dataframe -> numpyrs matrix algebra -> dataframe. Value-semantic
+    # (with_column returns a fresh frame; self is untouched).
+    def predict_linear(self, feature_cols: list[str], weights: NDArray, out_name: str) -> DataFrame:
+        k: int = len(feature_cols)
+        if len(weights.shape) != 1:
+            raise ValueError("kodiak: predict_linear expects a 1D weights NDArray, but its shape is " + str(weights.shape))
+        if weights.shape[0] != k:
+            raise ValueError("kodiak: predict_linear got " + str(weights.shape[0]) + " weight(s) for " + str(k) + " feature column(s)")
+        x: NDArray = self.to_matrix(feature_cols)
+        wcol: NDArray = weights.reshape([k, 1])
+        pred2d: NDArray = x.dot(wcol)
+        rows: int = self._row_count()
+        pred1d: NDArray = pred2d.reshape([rows])
+        return self.with_column(out_name, Series.from_ndarray(out_name, pred1d))
 
     # ---- CSV output --------------------------------------------------
     def to_csv(self, path: str) -> None:

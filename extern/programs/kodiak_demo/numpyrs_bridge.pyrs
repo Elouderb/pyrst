@@ -1,0 +1,81 @@
+# numpyrs_bridge — the flagship Phase-4a demo: the kodiak <-> numpyrs bridge.
+# A numeric DataFrame crosses into numpyrs linear algebra and back:
+#   Series  -> 1D NDArray (reductions, a scalar op) -> Series
+#   DataFrame -> 2D feature matrix (records x features) -> a linear prediction
+#     via numpyrs matmul (X . weights, .dot) -> a new f64 column
+#   DataFrame -> matrix -> DataFrame (a full round-trip)
+# Intermediate shapes are printed at each hop. See extern/packages/kodiak/
+# README.md (Phase 4a) for the bridge API and the honest null policy (numpyrs
+# is f64-only with no NA — a null column is refused, not silently NaN-filled).
+#
+# Build + run (from this directory):
+#   PYRST_PATH=/home/ethos/Coding/pyrst/extern/packages \
+#     /home/ethos/Coding/pyrst/target/release/pyrst build numpyrs_bridge.pyrs
+#   ./numpyrs_bridge
+
+from kodiak.series import Series
+from kodiak.frame import DataFrame
+from numpyrs.ndarray import NDArray
+from numpyrs.constructors import array
+
+
+def section(title: str) -> None:
+    print("")
+    print("== " + title + " ==")
+
+
+def main() -> None:
+    # --- a small housing frame (typed, columnar): sqft (f64), bedrooms (i64) ---
+    sqft: Series = Series.from_floats("sqft", [2000.0, 1500.0, 1000.0])
+    bedrooms: Series = Series.from_ints("bedrooms", [4, 3, 2])
+    houses: DataFrame = DataFrame.from_columns([sqft, bedrooms])
+    section("housing frame")
+    print(houses)
+
+    # --- Series -> 1D NDArray: numpyrs reductions over a bridged column ---
+    section("Series -> numpyrs 1D NDArray (reductions)")
+    sqft_nd: NDArray = houses["sqft"].to_ndarray()
+    print("sqft as ndarray : " + str(sqft_nd))
+    print("shape=" + str(sqft_nd.shape) + "  mean=" + str(sqft_nd.mean()) + "  min=" + str(sqft_nd.min()) + "  max=" + str(sqft_nd.max()))
+
+    # --- Series -> NDArray -> (numpyrs scalar op) -> Series round-trip ---
+    section("Series <-> NDArray round-trip (numpyrs scalar op in the middle)")
+    doubled_nd: NDArray = houses["sqft"].to_ndarray().muls(2.0)
+    doubled: Series = Series.from_ndarray("sqft_x2", doubled_nd)
+    print(doubled)
+
+    # --- DataFrame -> 2D feature matrix (records x features) ---
+    section("DataFrame -> 2D feature matrix (records x features)")
+    x: NDArray = houses.to_matrix(["sqft", "bedrooms"])
+    print("feature matrix:")
+    print(x)
+    print("X.shape = " + str(x.shape) + "  (rows = records, cols = features)")
+
+    # --- linear prediction via numpyrs matmul: price = X . weights ---
+    #   price = 0.25*sqft + 50*bedrooms  (weights exact in f64 -> clean output)
+    #     house0: 0.25*2000 + 50*4 = 700 ; house1: 0.25*1500 + 50*3 = 525
+    #     house2: 0.25*1000 + 50*2 = 350
+    section("linear prediction via numpyrs matmul: price = X . weights")
+    weights: NDArray = array([0.25, 50.0])
+    print("weights = " + str(weights) + "  shape=" + str(weights.shape))
+    priced: DataFrame = houses.predict_linear(["sqft", "bedrooms"], weights, "pred_price")
+    print(priced)
+
+    # --- DataFrame -> matrix -> DataFrame: a full round-trip ---
+    section("round-trip: DataFrame -> 2D matrix -> DataFrame (f64 columns)")
+    mat: NDArray = priced.to_matrix(["sqft", "bedrooms", "pred_price"])
+    print("matrix shape = " + str(mat.shape))
+    back: DataFrame = DataFrame.from_matrix(mat, ["sqft", "bedrooms", "pred_price"])
+    print(back)
+
+    # --- confirm the predicted-price column survived the round-trip ---
+    ok: bool = True
+    expected: list[float] = [700.0, 525.0, 350.0]
+    i: int = 0
+    while i < len(expected):
+        if back["pred_price"].floats[i] != expected[i]:
+            ok = False
+        i += 1
+    print("")
+    print("pred_price round-tripped through the matrix intact : " + str(ok))
+    print("OK: numpyrs_bridge (Series<->NDArray reductions/scalar-op; DataFrame<->2D-matrix; linear prediction via numpyrs .dot)")

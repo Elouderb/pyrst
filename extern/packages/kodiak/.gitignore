@@ -15,7 +15,9 @@
 /op_matrix
 /op_matrix_rt.csv
 /lazy_equiv
+/interop_numpyrs
 tests/smoke_scaffold
 tests/op_matrix
 tests/op_matrix_rt.csv
 tests/lazy_equiv
+tests/interop_numpyrs

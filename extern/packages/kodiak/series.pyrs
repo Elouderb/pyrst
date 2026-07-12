@@ -36,6 +36,13 @@
 # a Series" allocates a fresh Series; none mutate self.
 
 
+# numpyrs bridge (Phase 4a, card 974fdff3): a NUMERIC Series interoperates with
+# numpyrs' 1D NDArray. numpyrs never imports kodiak, so this one-way dependency
+# introduces no import cycle (series.pyrs is a leaf module).
+from numpyrs.ndarray import NDArray
+from numpyrs.constructors import array
+
+
 # ---- module-private helpers ----------------------------------------------
 
 def _rep_false(n: int) -> list[bool]:
@@ -115,6 +122,20 @@ class Series:
     @staticmethod
     def from_bools_n(name: str, values: list[bool], nulls: list[bool]) -> Series:
         return Series(name, "bool", [], [], [], values, nulls, len(values))
+
+    @staticmethod
+    def from_ndarray(name: str, a: NDArray) -> Series:
+        # numpyrs bridge: a 1D NDArray -> an all-valid f64 Series (numpyrs is
+        # f64-only, so the result dtype is always "f64"). A 2D+ array is an
+        # honest error — use DataFrame.from_matrix for a 2D array.
+        if len(a.shape) != 1:
+            raise ValueError("kodiak: from_ndarray expects a 1D NDArray, but its shape is " + str(a.shape) + " (use DataFrame.from_matrix for a 2D array)")
+        vals: list[float] = []
+        i: int = 0
+        while i < len(a.data):
+            vals.append(a.data[i])
+            i += 1
+        return Series.from_floats(name, vals)
 
     def __len__(self) -> int:
         return self.length
@@ -619,6 +640,28 @@ class Series:
                 acc += d * d
             i += 1
         return _sqrt(acc / float(c - 1))
+
+    # ---- numpyrs bridge: Series <-> 1D NDArray ----------------------------
+    # A NUMERIC column (i64 promoted to f64) crosses into numpyrs and back.
+    # NULL POLICY (honest, hand-verifiable): numpyrs is f64-only with NO
+    # missing-value support, so the bridge REFUSES a column containing any null
+    # (drop/fill first) rather than inventing a NaN sentinel. A non-numeric
+    # (str/bool) column is a TypeError. Value semantics: a fresh NDArray is
+    # returned; self is untouched.
+    def numeric_values(self) -> list[float]:
+        if not _is_numeric_dtype(self.dtype):
+            raise TypeError("kodiak: '" + self.name + "' is a '" + self.dtype + "' column; numpyrs bridging needs a numeric (i64/f64) column")
+        out: list[float] = []
+        i: int = 0
+        while i < self.length:
+            if self.nulls[i]:
+                raise ValueError("kodiak: column '" + self.name + "' has a null at row " + str(i) + "; numpyrs has no NA support (dropna/fillna before bridging)")
+            out.append(_num_at(self, i))
+            i += 1
+        return out
+
+    def to_ndarray(self) -> NDArray:
+        return array(self.numeric_values())
 
     # ---- deterministic pandas-flavored single-column renderer -------------
     def __str__(self) -> str:

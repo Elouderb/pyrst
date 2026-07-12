@@ -3,4 +3,5 @@
 # never commit these.
 /main
 /lazy_main
+/numpyrs_bridge
 /kodiak_report.csv

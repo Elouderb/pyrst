@@ -1,0 +1,128 @@
+# interop_numpyrs.pyrs — Phase 4a numpyrs-bridge test for kodiak. Asserts the
+# Series <-> 1D NDArray and DataFrame <-> 2D matrix conversions ROUND-TRIP with
+# identical values, and that the linear-algebra path (predict_linear, a numpyrs
+# matmul) matches a HAND-COMPUTED result on a small known frame. Prints PASS and
+# exits 0 on success; on any failure prints one concise FAIL line and aborts.
+#
+# Build + run (from extern/packages/kodiak/ or kodiak/tests/):
+#   PYRST_PATH=/home/ethos/Coding/pyrst/extern/packages \
+#     /home/ethos/Coding/pyrst/target/release/pyrst build tests/interop_numpyrs.pyrs
+#   ./interop_numpyrs
+
+from kodiak.series import Series
+from kodiak.frame import DataFrame
+from numpyrs.ndarray import NDArray
+from numpyrs.constructors import array
+
+
+def fail(msg: str) -> None:
+    print("FAIL: " + msg)
+    assert False
+
+
+def approx(a: float, b: float) -> bool:
+    d: float = a - b
+    if d < 0.0:
+        d = -d
+    return d < 0.000000001
+
+
+def check_close(label: str, actual: float, expected: float) -> None:
+    if not approx(actual, expected):
+        fail(label + ": got " + str(actual) + " expected " + str(expected))
+
+
+def check_strs(label: str, actual: list[str], expected: list[str]) -> None:
+    if len(actual) != len(expected):
+        fail(label + ": length " + str(len(actual)) + " != " + str(len(expected)) + " (" + str(actual) + ")")
+    i: int = 0
+    while i < len(actual):
+        if actual[i] != expected[i]:
+            fail(label + ": at " + str(i) + " got '" + actual[i] + "' expected '" + expected[i] + "' (" + str(actual) + ")")
+        i += 1
+
+
+def check_ints(label: str, actual: list[int], expected: list[int]) -> None:
+    if len(actual) != len(expected):
+        fail(label + ": length " + str(len(actual)) + " != " + str(len(expected)))
+    i: int = 0
+    while i < len(actual):
+        if actual[i] != expected[i]:
+            fail(label + ": at " + str(i) + " got " + str(actual[i]) + " expected " + str(expected[i]))
+        i += 1
+
+
+def main() -> None:
+    # ---- Series <-> 1D NDArray round-trip (i64 column, promoted to f64) ----
+    src: list[int] = [3, 1, 4, 1, 5, 9]
+    s: Series = Series.from_ints("v", src)
+    nd: NDArray = s.to_ndarray()
+    # the ndarray holds exactly the (float-promoted) column values
+    check_ints("to_ndarray shape", nd.shape, [6])
+    i: int = 0
+    while i < len(src):
+        check_close("to_ndarray[" + str(i) + "]", nd.data[i], float(src[i]))
+        i += 1
+    # numpyrs reduction over the bridged column: sum(3,1,4,1,5,9) = 23
+    check_close("ndarray sum", nd.sum(), 23.0)
+    # back to a Series (always f64) — values identical to the source
+    s2: Series = Series.from_ndarray("v", nd)
+    if s2.dtype != "f64":
+        fail("from_ndarray must yield an f64 Series, got " + s2.dtype)
+    check_strs("i64 round-trip", s2.to_strings(), ["3.0", "1.0", "4.0", "1.0", "5.0", "9.0"])
+    i = 0
+    while i < len(src):
+        check_close("i64 round-trip value[" + str(i) + "]", s2.floats[i], float(src[i]))
+        i += 1
+
+    # ---- Series <-> 1D NDArray round-trip (f64 column, exact) -------------
+    fsrc: list[float] = [1.5, 2.25, 3.75, 4.0]
+    sf: Series = Series.from_floats("f", fsrc)
+    ndf: NDArray = sf.to_ndarray()
+    sf2: Series = Series.from_ndarray("f", ndf)
+    i = 0
+    while i < len(fsrc):
+        check_close("f64 round-trip[" + str(i) + "]", sf2.floats[i], fsrc[i])
+        i += 1
+
+    # ---- DataFrame <-> 2D matrix round-trip (records x features) ----------
+    x: Series = Series.from_floats("x", [1.0, 2.0, 3.0])
+    y: Series = Series.from_ints("y", [10, 20, 30])
+    df: DataFrame = DataFrame.from_columns([x, y])
+    mat: NDArray = df.to_matrix(["x", "y"])
+    # records x features: shape [3, 2], row-major buffer [1,10, 2,20, 3,30]
+    check_ints("to_matrix shape", mat.shape, [3, 2])
+    check_close("matrix[0,0]", mat.data[0], 1.0)
+    check_close("matrix[0,1]", mat.data[1], 10.0)
+    check_close("matrix[1,0]", mat.data[2], 2.0)
+    check_close("matrix[2,1]", mat.data[5], 30.0)
+    # inverse -> f64 DataFrame with identical values, same column order
+    back: DataFrame = DataFrame.from_matrix(mat, ["x", "y"])
+    check_strs("from_matrix columns", back.columns(), ["x", "y"])
+    check_strs("round-trip x", back["x"].to_strings(), ["1.0", "2.0", "3.0"])
+    check_strs("round-trip y (i64 -> f64)", back["y"].to_strings(), ["10.0", "20.0", "30.0"])
+    if back["x"].dtype != "f64" or back["y"].dtype != "f64":
+        fail("from_matrix columns must be f64")
+
+    # ---- linear-algebra path: predict_linear = X . weights (HAND-COMPUTED) -
+    # X = [[1,4],[2,5],[3,6]] (records x features), weights = [10, 100].
+    # pred[r] = 10*x1[r] + 100*x2[r]:
+    #   r0: 10*1 + 100*4 = 410 ; r1: 10*2 + 100*5 = 520 ; r2: 10*3 + 100*6 = 630
+    x1: Series = Series.from_ints("x1", [1, 2, 3])
+    x2: Series = Series.from_ints("x2", [4, 5, 6])
+    feat: DataFrame = DataFrame.from_columns([x1, x2])
+    w: NDArray = array([10.0, 100.0])
+    out: DataFrame = feat.predict_linear(["x1", "x2"], w, "pred")
+    check_strs("predict_linear (hand-computed)", out["pred"].to_strings(), ["410.0", "520.0", "630.0"])
+    check_close("pred[0]", out["pred"].floats[0], 410.0)
+    check_close("pred[1]", out["pred"].floats[1], 520.0)
+    check_close("pred[2]", out["pred"].floats[2], 630.0)
+    if out["pred"].dtype != "f64":
+        fail("prediction column must be f64, got " + out["pred"].dtype)
+    # value semantics: predict_linear did not mutate the source frame
+    if len(feat.columns()) != 2:
+        fail("predict_linear mutated the source frame (now has " + str(len(feat.columns())) + " columns)")
+    if feat.has_column("pred"):
+        fail("predict_linear leaked the prediction column back into the source frame")
+
+    print("PASS: kodiak interop_numpyrs (Series<->1D-NDArray round-trip, DataFrame<->2D-matrix round-trip, predict_linear via numpyrs .dot matches hand-computed)")

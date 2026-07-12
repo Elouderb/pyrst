@@ -9,20 +9,25 @@ use crate::diag::{Error, Result};
 /// env is an honest error naming what to `pyrst install`, never a downstream
 /// module-not-found / rustc leak.
 ///
-/// When NO env is active `discover_active_env()` returns `None` and this is a
-/// no-op — so the no-env build path is byte-for-byte unchanged (it adds only a
-/// cheap env-discovery probe). Missing-*import* cases are already caught earlier by
-/// the resolver's env-aware `PackageNotInstalled`; this adds the manifest-coherence
-/// guarantee that the env itself is self-consistent.
+/// When NO env is active `prog.active_env` is `None` and this is a no-op — so the
+/// no-env build path is byte-for-byte unchanged. Missing-*import* cases are already
+/// caught earlier by the resolver's env-aware `PackageNotInstalled`; this adds the
+/// manifest-coherence guarantee that the env itself is self-consistent.
+///
+/// (card 587a9dcb) The gate reads the env the RESOLVER stored on `prog`
+/// (file-anchored discovery), NOT a fresh CWD-based `discover_active_env()`, so the
+/// gate and the resolver can never diverge on which env is active — e.g. when
+/// `pyrst check /proj/file.pyrs` runs from an unrelated CWD, both use the project's
+/// env, not "no env" for the gate and "the project's env" for the resolver.
 fn env_completeness_gate(prog: &crate::resolver::ResolvedProgram) -> Result<()> {
-    if let Some(env) = crate::venv::discover_active_env() {
+    if let Some(env) = &prog.active_env {
         let paths: Vec<&Path> = prog
             .modules
             .iter()
             .filter_map(|(m, _)| m.source_path.as_deref())
             .collect();
-        let used = crate::venv::used_env_packages(&env, &paths);
-        crate::venv::check_env_completeness(&env, &used)?;
+        let used = crate::venv::used_env_packages(env, &paths);
+        crate::venv::check_env_completeness(env, &used)?;
     }
     Ok(())
 }

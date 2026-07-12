@@ -317,7 +317,7 @@ pub fn analyze_document_at(
             // Return the OPEN module paired with the MERGED ctx so imported names
             // resolve. The open module is the one whose source_path is `abs` (the
             // resolver emits it last), else the last module as a fallback.
-            let crate::resolver::ResolvedProgram { modules, ctx } = prog;
+            let crate::resolver::ResolvedProgram { modules, ctx, .. } = prog;
             let mut chosen: Option<crate::ast::Module> = None;
             for (m, _src) in modules {
                 let is_open = m.source_path.as_deref() == Some(abs.as_path());
@@ -372,6 +372,22 @@ fn extract_span_and_message(e: &Error) -> (Span, String) {
             *span,
             format!("module '{}' is not installed in the active environment '{}'", module, env),
         ),
+        // (card 587a9dcb) A bare import of a PACKAGE directory (not a module).
+        Error::IsPackageNotModule { package, submodules, span, .. } => {
+            let example = submodules.first().map(String::as_str).unwrap_or("<submodule>");
+            let avail = if submodules.is_empty() {
+                String::new()
+            } else {
+                format!(" (available submodules: {})", submodules.join(", "))
+            };
+            (
+                *span,
+                format!(
+                    "'{}' is a package, not a single module — import a submodule, e.g. `from {}.{} import <name>`{}",
+                    package, package, example, avail
+                ),
+            )
+        }
         // Unwrap the Sourced wrapper to its inner error (which carries the span).
         Error::Sourced { inner, .. } => extract_span_and_message(inner),
         // Span-less variants: position at (0, 0).

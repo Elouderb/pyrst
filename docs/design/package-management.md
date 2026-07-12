@@ -111,9 +111,16 @@ dependencies:                # other pyrst packages this one imports
 - **Creation** — `pyrst venv <dir>` (default `.pyrstenv`) writes the skeleton above with an empty store.
 - **Activation** — two ways, Python-like:
   1. `source .pyrstenv/activate` → exports `PYRST_VENV=<abs path>` (explicit, like python).
-  2. **Auto-detect**: if `PYRST_VENV` is unset, `pyrst` searches CWD → ancestors for a `.pyrstenv/`
-     (like cargo finds `Cargo.toml`). Explicit `PYRST_VENV` wins. This makes `pyrst build` "just work"
-     inside a project dir without sourcing anything.
+  2. **Auto-detect**: if `PYRST_VENV` is unset, `pyrst` searches for a `.pyrstenv/` (like cargo finds
+     `Cargo.toml`). On the COMPILE path (`build`/`emit`/`check`, the LSP, and the REPL) the search is
+     **file-anchored**: it walks the compiled/edited file's directory → ancestors FIRST, then falls back
+     to the process CWD → ancestors. Anchoring on the file (not just the CWD) is what makes `pyrst check
+     /proj/file.pyrs` from anywhere — and the VSCode language server, which runs with an unrelated CWD —
+     resolve the project's env; the CWD fallback keeps the REPL working (its temp file has no `.pyrstenv`
+     ancestor, so it resolves the project the user launched `repl` from). Explicit `PYRST_VENV` wins over
+     both. (The env-management commands `install`/`list`/`freeze` stay CWD-anchored — they act on the
+     current directory.) SECURITY: a candidate `<d>/.pyrstenv` is honored only when `<d>` is not
+     world-writable, so an env planted in the shared OS temp root can't be auto-activated (see §H).
 - **Isolation** — `install`/`build`/`list` operate **only** on the active env's `packages/`. No global
   store in Phase 1 (a shared read-only cache of *clones* is fine — see §E — but the installed **store** is
   per-env). Env A's `numpyrs` is invisible to env B.

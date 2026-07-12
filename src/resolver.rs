@@ -12,6 +12,13 @@ pub struct ResolvedProgram {
     pub modules: Vec<(Module, String)>,
     /// Merged type context from all modules
     pub ctx: TyCtx,
+    /// (card 587a9dcb) The active virtual environment the RESOLVER used for this
+    /// program (file-anchored discovery: `PYRST_VENV` → root-file-dir walk → CWD
+    /// walk), or `None` when no env is active. The driver's §F completeness gate
+    /// reads THIS instead of re-discovering via CWD, so the gate and the resolver
+    /// can never diverge on which env is active. `None` on the byte-unchanged
+    /// no-env path.
+    pub active_env: Option<PathBuf>,
 }
 
 /// Internal resolver state for DFS traversal
@@ -54,10 +61,15 @@ struct Resolver {
 }
 
 impl Resolver {
-    fn new() -> Self {
+    /// Build a resolver anchored on `anchor` — the ROOT FILE's directory. Env
+    /// discovery is FILE-ANCHORED (card 587a9dcb): it walks `anchor`→ancestors for
+    /// a `.pyrstenv/` before falling back to the process CWD, so `pyrst check
+    /// /proj/file.pyrs` and the VSCode LSP resolve the project's env regardless of
+    /// where the process was launched. `PYRST_VENV` still wins over both.
+    fn new(anchor: &Path) -> Self {
         // Discover the active env ONCE; when present, its `packages/` store takes
         // precedence over `$PYRST_PATH` (design §F resolution order).
-        let active_env = crate::venv::discover_active_env();
+        let active_env = crate::venv::discover_active_env_for(anchor);
         let mut search_dirs = Vec::new();
         if let Some(env) = &active_env {
             search_dirs.push(env.join(crate::venv::PACKAGES_DIR));
@@ -279,6 +291,24 @@ impl Resolver {
                     let dep_key = rel_layout(&stdlib_dir);
                     let dep_src = crate::lexer::normalize_line_endings(embedded_src);
                     self.process_module(dep_key, dep_src, &stdlib_dir, *span, Some(mod_id.clone()))?;
+                } else if let Some(pkg_dir) = self.package_dir_for(path, base_dir) {
+                    // (AC2, card 587a9dcb) No `<mod>.pyrs` resolved, but a same-named
+                    // DIRECTORY exists where a module was expected (root-relative, the
+                    // env store `<env>/packages/<mod>/`, or a `$PYRST_PATH` entry).
+                    // The name is a PACKAGE (a directory of submodules), not a single
+                    // module — emit the HONEST, actionable error naming a submodule to
+                    // import (and listing what's there), REPLACING the misleading
+                    // env-active `PackageNotInstalled` and no-env `ImportNotFound`.
+                    // Fires ONLY when the directory actually exists, so a genuine
+                    // not-installed / not-found keeps its prior honest error. This is
+                    // exactly what misled the user (`import numpyrs` → "not installed"
+                    // though the package IS installed as `packages/numpyrs/`).
+                    return Err(Error::IsPackageNotModule {
+                        package: mod_id.clone(),
+                        submodules: list_pyrs_submodules(&pkg_dir),
+                        span: *span,
+                        importing_file: key.display().to_string(),
+                    });
                 } else if let Some(env) = &self.active_env {
                     // (PKG Phase 1, §F) An unresolved import WHILE AN ENV IS ACTIVE
                     // is an honest env-aware error: the module is not in the entry
@@ -316,6 +346,53 @@ impl Resolver {
         self.order.push(key);
         Ok(())
     }
+
+    /// (AC2, card 587a9dcb) If the dotted import `path` has no resolvable `.pyrs`
+    /// module but a same-named DIRECTORY exists in a search location, return that
+    /// directory — the signal that the name is a PACKAGE (import a submodule), not
+    /// a genuine miss. Search locations, in the same precedence as module
+    /// resolution: the root-relative `base_dir`, then each `search_dirs` entry (the
+    /// env store, then `$PYRST_PATH`). The dotted id `a.b` maps to the nested
+    /// directory `a/b` (dropping the `.pyrs` leaf `rel_layout` would add). Returns
+    /// `None` (unchanged behaviour) when no such directory exists.
+    fn package_dir_for(&self, path: &[String], base_dir: &Path) -> Option<PathBuf> {
+        let dir_layout = |base: &Path| -> PathBuf {
+            let mut p = base.to_path_buf();
+            for seg in path {
+                p = p.join(seg);
+            }
+            p
+        };
+        std::iter::once(base_dir)
+            .chain(self.search_dirs.iter().map(|p| p.as_path()))
+            .map(dir_layout)
+            .find(|cand| cand.is_dir())
+    }
+}
+
+/// (AC2, card 587a9dcb) The sorted, de-duplicated top-level `*.pyrs` module stems
+/// directly under a package directory — the submodules a user can import
+/// (`from <pkg>.<stem> import …`). Best-effort + cheap: a single NON-recursive
+/// `read_dir`; an unreadable directory yields an empty list (the error still names
+/// the package honestly, just without the "available submodules" hint).
+fn list_pyrs_submodules(dir: &Path) -> Vec<String> {
+    let mut subs: Vec<String> = match std::fs::read_dir(dir) {
+        Ok(rd) => rd
+            .flatten()
+            .filter_map(|e| {
+                let p = e.path();
+                if p.is_file() && p.extension().and_then(|s| s.to_str()) == Some("pyrs") {
+                    p.file_stem().map(|s| s.to_string_lossy().into_owned())
+                } else {
+                    None
+                }
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    subs.sort();
+    subs.dedup();
+    subs
 }
 
 /// The SYNTHETIC base directory used as the module-key prefix for embedded
@@ -688,7 +765,9 @@ pub fn resolve_with_overlay(
     let abs_root = root_path.canonicalize().map_err(|e| crate::diag::Error::Io(e))?;
     let root_dir = abs_root.parent().unwrap_or_else(|| Path::new("."));
 
-    let mut resolver = Resolver::new();
+    // (card 587a9dcb) Anchor env discovery on the ROOT FILE's directory, so the
+    // env resolves from the compiled/edited file's location — not the process CWD.
+    let mut resolver = Resolver::new(root_dir);
     // Seed the buffer overlay (empty on the CLI path). Cloning is cheap: the map
     // holds only the handful of files the editor currently has open.
     resolver.overlay = overlay.clone();
@@ -841,7 +920,9 @@ pub fn resolve_with_overlay(
     // module's annotation scan has accumulated into `ctx.hash_key_classes`.
     crate::typeck::finalize_hash_key_classes(&modules, &mut ctx);
 
-    Ok(ResolvedProgram { modules, ctx })
+    // (card 587a9dcb) Carry the env the RESOLVER used onto the program, so the
+    // driver's §F completeness gate reads it instead of re-discovering via CWD.
+    Ok(ResolvedProgram { modules, ctx, active_env: resolver.active_env })
 }
 
 #[cfg(test)]
@@ -1321,6 +1402,66 @@ class Account:
             "pkg.geo.area is qualifiable under the dotted id"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// (AC2, card 587a9dcb) A bare `import foo` where `foo.pyrs` is ABSENT but a
+    /// same-named DIRECTORY `foo/` exists (root-relative) is the honest
+    /// `IsPackageNotModule` error — naming the package and listing its `*.pyrs`
+    /// submodules — NOT a misleading "cannot find module". A genuinely missing
+    /// import (no same-named directory) still errors as `ImportNotFound`.
+    #[test]
+    fn ac2_bare_import_of_package_dir_is_honest_package_error() {
+        // `foo/` exists (with a submodule `bar.pyrs`) but there is no `foo.pyrs`.
+        let root = temp_root("import foo\n\ndef main() -> None:\n    print(1)\n");
+        let dir = root.parent().unwrap();
+        std::fs::create_dir_all(dir.join("foo")).unwrap();
+        std::fs::write(
+            dir.join("foo").join("bar.pyrs"),
+            "def ping() -> int:\n    return 1\n",
+        )
+        .unwrap();
+        // A second submodule to prove the list is sorted + complete.
+        std::fs::write(
+            dir.join("foo").join("baz.pyrs"),
+            "def pong() -> int:\n    return 2\n",
+        )
+        .unwrap();
+
+        match resolve(&root) {
+            Err(Error::IsPackageNotModule { package, submodules, .. }) => {
+                assert_eq!(package, "foo", "the error must name the package");
+                assert_eq!(
+                    submodules,
+                    vec!["bar".to_string(), "baz".to_string()],
+                    "submodules must be the sorted top-level *.pyrs stems"
+                );
+            }
+            other => panic!(
+                "expected IsPackageNotModule(foo), got: {:?}",
+                other.map(|_| ())
+            ),
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// (AC2, card 587a9dcb) The honest-error guard is TIGHT: a genuinely missing
+    /// import with NO same-named directory still errors as `ImportNotFound`, so the
+    /// package-vs-not-found distinction is real (not "everything is a package now").
+    #[test]
+    fn ac2_genuinely_missing_import_still_not_found() {
+        let root = temp_root(
+            "import zzz_not_a_real_pkg_587a\n\ndef main() -> None:\n    print(1)\n",
+        );
+        match resolve(&root) {
+            Err(Error::ImportNotFound { path, .. }) => {
+                assert_eq!(path, "zzz_not_a_real_pkg_587a");
+            }
+            other => panic!(
+                "expected ImportNotFound for a genuine miss, got: {:?}",
+                other.map(|_| ())
+            ),
+        }
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 
     /// W3-3 (was F16): `from a.b import f` binds the FULL dotted owner `"a.b"` (not

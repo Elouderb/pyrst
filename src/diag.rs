@@ -34,6 +34,17 @@ pub enum Error {
     /// active env, and tells the user to `pyrst install` it — never a downstream
     /// rustc leak (the project's honest-errors invariant, applied to packaging).
     PackageNotInstalled { module: String, env: String, span: Span, importing_file: String },
+    /// (card 587a9dcb) A bare `import <pkg>` where `<pkg>.pyrs` is ABSENT but a
+    /// same-named DIRECTORY `<pkg>/` DOES exist in a search location (root-relative
+    /// base, the env store `<env>/packages/<pkg>/`, or a `$PYRST_PATH` entry). The
+    /// name is a PACKAGE (a directory of submodules), not a single importable
+    /// module — so this is the HONEST, actionable error (import a submodule, and
+    /// here are the ones available), REPLACING the misleading `PackageNotInstalled`
+    /// / `ImportNotFound`. Constructed in the resolver's import-miss path ONLY when
+    /// the directory actually exists; a genuine not-installed / not-found keeps its
+    /// prior error. `submodules` is the (possibly empty) sorted list of top-level
+    /// `*.pyrs` stems directly under the package dir.
+    IsPackageNotModule { package: String, submodules: Vec<String>, span: Span, importing_file: String },
     /// (PKG Phase 1) A non-span packaging error — manifest parse/verify failures,
     /// env-completeness (a declared dependency not installed), an install-time
     /// dependency cycle, a name collision at a different source, or a command run
@@ -73,6 +84,19 @@ impl fmt::Display for Error {
                     f,
                     "import error at {}:{}: module '{}' is imported but not installed in the active environment '{}' — `pyrst install` it, or check its package's `pyrst.yaml` dependencies (imported from {})",
                     span.line, span.col, module, env, importing_file
+                )
+            }
+            Error::IsPackageNotModule { package, submodules, span, importing_file } => {
+                let example = submodules.first().map(String::as_str).unwrap_or("<submodule>");
+                let avail = if submodules.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (available submodules: {})", submodules.join(", "))
+                };
+                write!(
+                    f,
+                    "import error at {}:{}: '{}' is a package (a directory of modules), not a single module — import a submodule, e.g. `from {}.{} import <name>`{} (imported from {})",
+                    span.line, span.col, package, package, example, avail, importing_file
                 )
             }
             Error::Pkg(msg) => write!(f, "{}", msg),
@@ -131,6 +155,18 @@ impl Error {
                 format!(
                     "import error at {}:{}: module '{}' is imported but not installed in the active environment '{}'\n  `pyrst install` it, or check its package's `pyrst.yaml` dependencies\n  imported from {}",
                     span.line, span.col, module, env, importing_file
+                )
+            }
+            Error::IsPackageNotModule { package, submodules, span, importing_file } => {
+                let example = submodules.first().map(String::as_str).unwrap_or("<submodule>");
+                let avail = if submodules.is_empty() {
+                    String::new()
+                } else {
+                    format!("\n  available submodules: {}", submodules.join(", "))
+                };
+                format!(
+                    "import error at {}:{}: '{}' is a package (a directory of modules), not a single module\n  import a submodule, e.g. `from {}.{} import <name>`{}\n  imported from {}",
+                    span.line, span.col, package, package, example, avail, importing_file
                 )
             }
             Error::Pkg(msg) => msg.clone(),

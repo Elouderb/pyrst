@@ -112,6 +112,16 @@ pub fn create(dir: Option<PathBuf>) -> Result<()> {
     std::fs::write(target.join(LOCK_FILE), LOCK_HEADER)?;
 
     let abs = target.canonicalize()?;
+    // The absolute path is embedded into line-based shell scripts. A newline or other
+    // control character in it can't be safely quoted (it would break the script's line
+    // structure); refuse rather than emit a corrupt/injectable activate script. Ordinary
+    // metacharacters (`$`, backtick, quotes, `%`) ARE handled — see the *_quote helpers.
+    if abs.to_string_lossy().chars().any(|c| c.is_control()) {
+        return Err(Error::Pkg(format!(
+            "cannot create environment: path contains a control character: {}",
+            abs.display()
+        )));
+    }
     // Ship activation scripts for every shell (Python-venv style) so an env is
     // portable and works on Linux/macOS (bash/zsh), Windows cmd, and PowerShell.
     // Each embeds the local canonical path; the user sources the one for their shell.
@@ -131,65 +141,162 @@ pub fn create(dir: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-/// The POSIX `activate` script (source it). Exports `PYRST_VENV=<abs>` and defines
-/// a `deactivate` that restores the prior value. Mirrors Python's `venv` activate.
+/// The prompt label = the env directory's basename (e.g. `.pyrstenv`), like Python's
+/// `(venv)`, sanitised to `[A-Za-z0-9._+-]` so it can't inject shell/prompt
+/// metacharacters (backticks, `$(...)`, quotes, `)`) into the generated activate
+/// scripts — `PS1`/`PROMPT` are re-evaluated on every prompt render. Falls back to a
+/// constant if the path has no usable final component.
+fn env_label(abs_env: &Path) -> String {
+    let raw = abs_env.file_name().and_then(|s| s.to_str()).unwrap_or("pyrstenv");
+    let cleaned: String = raw
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-') { c } else { '_' })
+        .collect();
+    if cleaned.is_empty() { "pyrstenv".to_string() } else { cleaned }
+}
+
+/// Single-quote `s` for a POSIX shell (bash/zsh): wrap in `'…'` with each embedded `'`
+/// rendered as `'\''`. The result is a fully literal token — no `$`, backtick, or `"`
+/// inside is special — which is what closes shell injection via the embedded env path
+/// (`PS1` is re-evaluated every render, so an unquoted path could run `$(...)`).
+fn posix_squote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' { out.push_str("'\\''"); } else { out.push(c); }
+    }
+    out.push('\'');
+    out
+}
+
+/// Single-quote `s` for a PowerShell single-quoted literal: wrap in `'…'` with each
+/// embedded `'` doubled. No `$(...)`/`$var` interpolation applies inside such a literal.
+fn ps_squote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' { out.push_str("''"); } else { out.push(c); }
+    }
+    out.push('\'');
+    out
+}
+
+/// Escape `s` for a cmd `set "VAR=…"` / PATH value: double any `%` so cmd does not
+/// expand `%NAME%` at parse time. (`"` cannot occur in a Windows path, and any control
+/// character is rejected upstream in `create`, so those need no handling here.)
+fn cmd_escape(s: &str) -> String {
+    s.replace('%', "%%")
+}
+
+/// The POSIX `activate` script (source it). Sets `PYRST_VENV`, prefixes the shell
+/// prompt with a green `(label)`, and defines a `deactivate` that restores both. The
+/// path is single-quoted (`posix_squote`) so it can't inject. Re-sourcing is idempotent
+/// (state saved once, prompt rebuilt from the saved original). Set
+/// `PYRST_VENV_DISABLE_PROMPT` before sourcing to skip the prompt change.
 fn activate_script(abs_env: &Path) -> String {
     format!(
         "# pyrst virtual environment — source this file to activate.\n\
-         # `deactivate` restores the previous PYRST_VENV (or unsets it).\n\
+         # `deactivate` restores the previous PYRST_VENV and prompt.\n\
          deactivate() {{\n\
-         \x20   if [ -n \"${{_OLD_PYRST_VENV+x}}\" ]; then\n\
-         \x20       PYRST_VENV=\"$_OLD_PYRST_VENV\"; export PYRST_VENV; unset _OLD_PYRST_VENV\n\
+         \x20   if [ -n \"${{_OLD_PYRST_VENV_SET:-}}\" ]; then\n\
+         \x20       PYRST_VENV=\"$_OLD_PYRST_VENV\"; export PYRST_VENV\n\
          \x20   else\n\
          \x20       unset PYRST_VENV\n\
          \x20   fi\n\
+         \x20   if [ -n \"${{_PYRST_ACTIVE:-}}\" ]; then PS1=\"$_OLD_PYRST_PS1\"; fi\n\
+         \x20   unset _OLD_PYRST_VENV _OLD_PYRST_VENV_SET _OLD_PYRST_PS1 _PYRST_ACTIVE\n\
          \x20   unset -f deactivate\n\
          }}\n\
-         _OLD_PYRST_VENV=\"${{PYRST_VENV:-}}\"\n\
-         PYRST_VENV=\"{}\"\n\
-         export PYRST_VENV\n",
-        abs_env.display()
+         if [ -z \"${{_PYRST_ACTIVE:-}}\" ]; then\n\
+         \x20   _OLD_PYRST_VENV=\"${{PYRST_VENV-}}\"; _OLD_PYRST_VENV_SET=\"${{PYRST_VENV+1}}\"\n\
+         \x20   _OLD_PYRST_PS1=\"${{PS1-}}\"; _PYRST_ACTIVE=1\n\
+         fi\n\
+         PYRST_VENV={venv}\n\
+         export PYRST_VENV\n\
+         if [ -z \"${{PYRST_VENV_DISABLE_PROMPT:-}}\" ]; then\n\
+         \x20   if [ -n \"${{ZSH_VERSION:-}}\" ]; then\n\
+         \x20       PS1=\"%F{{green}}({label})%f ${{_OLD_PYRST_PS1}}\"\n\
+         \x20   else\n\
+         \x20       PS1=\"\\[\\033[32m\\]({label})\\[\\033[0m\\] ${{_OLD_PYRST_PS1}}\"\n\
+         \x20   fi\n\
+         fi\n",
+        venv = posix_squote(&abs_env.display().to_string()),
+        label = env_label(abs_env),
     )
 }
 
 /// The Windows `cmd` activation script (`activate.bat`, run it). Sets PYRST_VENV,
-/// saving the prior value so `deactivate.bat` can restore it. CRLF for cmd.
+/// prefixes the prompt with a green `(label)`, and APPENDS the env dir to PATH so
+/// `deactivate` (deactivate.bat) is callable by bare name without shadowing system
+/// commands. All prior state is saved ONCE (keyed off `_OLD_PYRST_PATH`) and PATH/PROMPT
+/// are rebuilt from the saved originals, so re-running is idempotent and deactivate.bat
+/// fully unwinds. The path is `%`-escaped. CRLF for cmd. Set PYRST_VENV_DISABLE_PROMPT
+/// to skip the prompt.
 fn activate_bat(abs_env: &Path) -> String {
     format!(
         "@echo off\r\n\
          REM pyrst virtual environment (cmd.exe) — run this file to activate.\r\n\
-         REM run deactivate.bat to restore the previous PYRST_VENV.\r\n\
-         set \"_OLD_PYRST_VENV=%PYRST_VENV%\"\r\n\
-         set \"PYRST_VENV={}\"\r\n\
+         REM run deactivate to restore the previous PYRST_VENV, PATH, and prompt.\r\n\
+         if not defined _OLD_PYRST_PATH set \"_OLD_PYRST_VENV=%PYRST_VENV%\"\r\n\
+         if not defined _OLD_PYRST_PATH if not defined PROMPT set \"PROMPT=$P$G\"\r\n\
+         if not defined _OLD_PYRST_PATH set \"_OLD_PYRST_PROMPT=%PROMPT%\"\r\n\
+         if not defined _OLD_PYRST_PATH set \"_OLD_PYRST_PATH=%PATH%\"\r\n\
+         set \"PYRST_VENV={venv}\"\r\n\
+         set \"PATH=%_OLD_PYRST_PATH%;{venv}\"\r\n\
+         if not defined PYRST_VENV_DISABLE_PROMPT set \"PROMPT=$E[32m({label})$E[0m %_OLD_PYRST_PROMPT%\"\r\n\
          echo pyrst environment active: %PYRST_VENV%\r\n",
-        abs_env.display()
+        venv = cmd_escape(&abs_env.display().to_string()),
+        label = env_label(abs_env),
     )
 }
 
-/// The Windows `cmd` deactivation script (`deactivate.bat`). Restores the PYRST_VENV
-/// that activate.bat saved (an empty saved value unsets it). CRLF for cmd.
+/// The Windows `cmd` deactivation script (`deactivate.bat`, callable as `deactivate`
+/// because activate.bat put the env dir on PATH). Restores PYRST_VENV, PATH, and PROMPT
+/// from the values activate.bat saved, then clears the `_OLD_PYRST_*` slots (so a later
+/// re-activation saves fresh state). CRLF for cmd.
 fn deactivate_bat() -> String {
     "@echo off\r\n\
-     set \"PYRST_VENV=%_OLD_PYRST_VENV%\"\r\n\
+     if defined _OLD_PYRST_VENV (set \"PYRST_VENV=%_OLD_PYRST_VENV%\") else (set \"PYRST_VENV=\")\r\n\
      set \"_OLD_PYRST_VENV=\"\r\n\
+     if defined _OLD_PYRST_PATH set \"PATH=%_OLD_PYRST_PATH%\"\r\n\
+     set \"_OLD_PYRST_PATH=\"\r\n\
+     if defined _OLD_PYRST_PROMPT set \"PROMPT=%_OLD_PYRST_PROMPT%\"\r\n\
+     set \"_OLD_PYRST_PROMPT=\"\r\n\
      echo pyrst environment deactivated.\r\n"
         .to_string()
 }
 
 /// The PowerShell activation script (`Activate.ps1`; dot-source it: `. .\\Activate.ps1`).
-/// Sets $env:PYRST_VENV, saving the prior value, and defines a `deactivate` that restores it.
+/// Sets $env:PYRST_VENV, prefixes the prompt with a green `(label)`, and defines a
+/// `deactivate` restoring both. The path is a single-quoted literal (`ps_squote`) so it
+/// can't interpolate. Re-dot-sourcing won't clobber the saved prompt/venv. Set
+/// $env:PYRST_VENV_DISABLE_PROMPT to skip the prompt.
 fn activate_ps1(abs_env: &Path) -> String {
     format!(
         "# pyrst virtual environment (PowerShell) — dot-source to activate:  . .\\Activate.ps1\n\
-         $env:_OLD_PYRST_VENV = $env:PYRST_VENV\n\
-         $env:PYRST_VENV = \"{}\"\n\
+         if (-not (Test-Path Env:_OLD_PYRST_VENV)) {{ $env:_OLD_PYRST_VENV = $env:PYRST_VENV }}\n\
+         $env:PYRST_VENV = {venv}\n\
+         if (-not $env:PYRST_VENV_DISABLE_PROMPT) {{\n\
+         \x20   if (-not (Test-Path Function:_pyrst_old_prompt)) {{\n\
+         \x20       if (Test-Path Function:prompt) {{ Copy-Item Function:prompt Function:_pyrst_old_prompt }}\n\
+         \x20   }}\n\
+         \x20   function global:prompt {{\n\
+         \x20       Write-Host -NoNewline -ForegroundColor Green \"({label}) \"\n\
+         \x20       if (Test-Path Function:_pyrst_old_prompt) {{ _pyrst_old_prompt }} else {{ \"PS $($executionContext.SessionState.Path.CurrentLocation)> \" }}\n\
+         \x20   }}\n\
+         }}\n\
          function global:deactivate {{\n\
          \x20   $env:PYRST_VENV = $env:_OLD_PYRST_VENV\n\
          \x20   Remove-Item Env:_OLD_PYRST_VENV -ErrorAction SilentlyContinue\n\
+         \x20   if (Test-Path Function:_pyrst_old_prompt) {{\n\
+         \x20       Copy-Item Function:_pyrst_old_prompt Function:prompt\n\
+         \x20       Remove-Item Function:_pyrst_old_prompt\n\
+         \x20   }}\n\
          \x20   Remove-Item Function:deactivate -ErrorAction SilentlyContinue\n\
          }}\n\
          Write-Host \"pyrst environment active: $env:PYRST_VENV\"\n",
-        abs_env.display()
+        venv = ps_squote(&abs_env.display().to_string()),
+        label = env_label(abs_env),
     )
 }
 
@@ -884,17 +991,70 @@ mod tests {
         let bat = std::fs::read_to_string(env.join("activate.bat")).unwrap();
         let deact = std::fs::read_to_string(env.join("deactivate.bat")).unwrap();
         let ps1 = std::fs::read_to_string(env.join("Activate.ps1")).unwrap();
-        // POSIX: exports PYRST_VENV + defines deactivate.
+        // POSIX: exports PYRST_VENV + defines deactivate + a green (label) prompt.
         assert!(bash.contains("export PYRST_VENV"));
         assert!(bash.contains("deactivate()"));
-        // cmd: sets PYRST_VENV, saves the old value, CRLF line endings.
+        assert!(bash.contains("_OLD_PYRST_PS1"), "must save the old prompt");
+        assert!(bash.contains("\\033[32m"), "bash: green via ANSI");
+        assert!(bash.contains("ZSH_VERSION") && bash.contains("%F{green}"), "zsh: green via %F");
+        assert!(bash.contains("(.pyrstenv)"), "prompt shows the env basename");
+        assert!(bash.contains("PYRST_VENV='"), "path must be single-quoted (no injection)");
+        // cmd: sets PYRST_VENV, saves the old value, adds the env to PATH so
+        // `deactivate` is callable by name, colours the prompt, CRLF endings.
         assert!(bat.contains("set \"PYRST_VENV="));
         assert!(bat.contains("set \"_OLD_PYRST_VENV=%PYRST_VENV%\""));
+        assert!(bat.contains("set \"PATH="), "must put the env dir on PATH");
+        assert!(bat.contains("$E[32m(.pyrstenv)$E[0m"), "green prompt prefix");
         assert!(bat.contains("\r\n"), "activate.bat must use CRLF for cmd");
+        // deactivate.bat restores PYRST_VENV, PATH, and PROMPT.
         assert!(deact.contains("set \"PYRST_VENV=%_OLD_PYRST_VENV%\""));
-        // PowerShell: sets $env:PYRST_VENV + a deactivate function.
-        assert!(ps1.contains("$env:PYRST_VENV ="));
+        assert!(deact.contains("set \"PATH=%_OLD_PYRST_PATH%\""));
+        assert!(deact.contains("set \"PROMPT=%_OLD_PYRST_PROMPT%\""));
+        // PowerShell: sets $env:PYRST_VENV, a green prompt fn, + a deactivate fn.
+        assert!(ps1.contains("$env:PYRST_VENV = '"), "path must be a single-quoted literal");
+        assert!(ps1.contains("function global:prompt"));
+        assert!(ps1.contains("-ForegroundColor Green"));
+        assert!(ps1.contains("(.pyrstenv)"));
         assert!(ps1.contains("function global:deactivate"));
+    }
+
+    /// The prompt label is sanitised: normal names pass through, shell/prompt
+    /// metacharacters are neutralised so a crafted env name can't inject into PS1.
+    #[test]
+    fn env_label_sanitises_metacharacters() {
+        assert_eq!(env_label(Path::new("/x/.pyrstenv")), ".pyrstenv");
+        assert_eq!(env_label(Path::new("/x/my-env_3.11+rc")), "my-env_3.11+rc");
+        // `$ ( ) space ~` → `_`, while `-` is allowed (a normal name char).
+        assert_eq!(env_label(Path::new("/x/$(rm -rf ~)")), "__rm_-rf___");
+        assert_eq!(env_label(Path::new("/x/`id`")), "_id_");
+        // No usable component → the constant fallback.
+        assert_eq!(env_label(Path::new("/")), "pyrstenv");
+    }
+
+    /// The per-shell quoting helpers neutralise injection, and the embedded env path
+    /// is single-quoted in the generated scripts (not the old unsafe `"…"` form).
+    #[test]
+    fn quote_helpers_neutralise_injection() {
+        // POSIX single-quote: `'` → `'\''`, everything else literal.
+        assert_eq!(posix_squote("/a/b"), "'/a/b'");
+        assert_eq!(posix_squote("a'b"), "'a'\\''b'");
+        assert_eq!(posix_squote("x$(id)`id`\""), "'x$(id)`id`\"'");
+        // PowerShell single-quote: `'` doubled.
+        assert_eq!(ps_squote("/a/b"), "'/a/b'");
+        assert_eq!(ps_squote("a'b"), "'a''b'");
+        // cmd: `%` doubled so cmd can't expand %NAME% at parse time.
+        assert_eq!(cmd_escape("a%PATH%b"), "a%%PATH%%b");
+        assert_eq!(cmd_escape("/plain/path"), "/plain/path");
+        // A hostile env path lands inside single quotes in the bash script, so the
+        // `$(...)` never executes when the user sources `activate`.
+        let evil = Path::new("/tmp/x$(touch pwned)/.pyrstenv");
+        let bash = activate_script(evil);
+        assert!(bash.contains("PYRST_VENV='/tmp/x$(touch pwned)/.pyrstenv'"));
+        // The literal path must never appear in a double-quoted context (where `$(...)`
+        // would execute). It appears exactly once, single-quoted, above.
+        assert!(!bash.contains("\"/tmp/x$(touch pwned)"), "path must not be double-quoted");
+        let ps1 = activate_ps1(evil);
+        assert!(ps1.contains("$env:PYRST_VENV = '/tmp/x$(touch pwned)/.pyrstenv'"));
     }
 
     /// Discovery: an explicit, valid PYRST_VENV wins over auto-detect.

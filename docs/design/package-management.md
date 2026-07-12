@@ -97,9 +97,16 @@ dependencies:                # other pyrst packages this one imports
     numpyrs/ ...
     dateutil/ ...
   pyrst.lock           # resolved install set: name -> {git, commit-SHA, version} (pinned, reproducible)
-  activate             # POSIX shell script: sets PYRST_VENV=<abs .pyrstenv>, prepends nothing to PATH
-                       # (pyrst is global); `deactivate` unsets it. Mirrors python venv activate.
+  activate             # POSIX (bash/zsh) — source it: sets PYRST_VENV, adds a green (env) prompt
+                       #   prefix, defines `deactivate` (restores PYRST_VENV + prompt). PATH untouched.
+  activate.bat         # cmd.exe — run it: sets PYRST_VENV, green prompt, prepends the env dir to PATH
+  deactivate.bat       #   so `deactivate` resolves by name; deactivate.bat restores VENV/PATH/PROMPT.
+  Activate.ps1         # PowerShell — dot-source it: sets $env:PYRST_VENV, green prompt fn, `deactivate` fn.
 ```
+
+  All four mirror Python's venv UX: a green `(<env-name>)` prompt indicator while active and a
+  bare-name `deactivate` in every shell (set `PYRST_VENV_DISABLE_PROMPT` to suppress the prompt
+  change). The `(<env-name>)` label is the env-dir basename, sanitised to `[A-Za-z0-9._+-]`.
 
 - **Creation** — `pyrst venv <dir>` (default `.pyrstenv`) writes the skeleton above with an empty store.
 - **Activation** — two ways, Python-like:

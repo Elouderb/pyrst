@@ -1,8 +1,9 @@
-# D5: Pow -> Float in list comprehension element position.
-# After E.4/E.5 the inferred element type for [x**2 for x in [1,2,3]] is
-# Float (Vec<f64>), and the emitted i64 power value is coerced correctly so
-# the rustc output type matches.  Proves inference + emission agree for **
-# inside comprehension element expressions.
+# (card 5c75a04d) `int ** int` -> INT in list-comprehension element position.
+# The inferred element type for [x**2 for x in [1,2,3]] is Int (Vec<i64>), and
+# the emitted i64 power value's rustc output type matches — inference + emission
+# agree for ** inside comprehension element expressions. (This formerly asserted
+# the buggy D5 `** -> Float` simplification with a list[float] slot; Python
+# actually yields a list of INTS, [1, 4, 9], which the fix now matches.)
 def main() -> None:
-    result: list[float] = [x ** 2 for x in [1, 2, 3]]
-    print(result)          # [1.0, 4.0, 9.0]
+    result: list[int] = [x ** 2 for x in [1, 2, 3]]
+    print(result)          # [1, 4, 9]

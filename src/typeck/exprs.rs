@@ -675,6 +675,37 @@ fn check_str_encode_call(
     Ok(())
 }
 
+/// (card 5c75a04d) Whether `lhs ** rhs` yields an INTEGER (`i64`) result rather
+/// than a float. Python `int ** int` is an INT (`2 ** 10 == 1024`); it is a
+/// FLOAT only when an operand is a float OR the exponent is a statically-known
+/// NEGATIVE literal (CPython `2 ** -1 == 0.5`). This ONE predicate is the shared
+/// source of truth for the type oracle (`infer_expr_ty` / `infer_expr_ty_bound`
+/// / `check_expr` / the comprehension-element oracle) AND codegen's Pow
+/// value-emission (`int ** int` -> the i64-returning `__py_ipow`; else `powf`)
+/// plus its `emits_int_pow` display signal — so the type the oracle assigns is
+/// always the type codegen emits, closing the former blanket-`Float` skew that
+/// drove `__py_fmt_float(i64)` -> rustc E0308.
+pub(crate) fn pow_yields_int(lhs_ty: &Ty, rhs_ty: &Ty, rhs: &Expr) -> bool {
+    matches!(lhs_ty, Ty::Int) && matches!(rhs_ty, Ty::Int) && !is_negative_int_literal(rhs)
+}
+
+/// A directly-written NEGATIVE integer literal exponent (`-1`, `-3`) — the only
+/// `int ** int` form Python evaluates as a float. Parsed as `UnOp(Neg, Int(n))`
+/// (the lexer emits no negative literals; `Int(n)` with n<0 is matched too for
+/// robustness). A folded/computed negative value (`2 ** (0 - 1)`) is deliberately
+/// NOT matched: it stays on the integer path (a LOUD `__py_ipow` runtime error on
+/// a negative exponent, never a silent miscompile or build failure), matching the
+/// "statically-known literal" scope of the fix.
+fn is_negative_int_literal(e: &Expr) -> bool {
+    match e {
+        Expr::Int(n, _) => *n < 0,
+        Expr::UnOp { op: UnOp::Neg, expr, .. } => {
+            matches!(expr.as_ref(), Expr::Int(n, _) if *n > 0)
+        }
+        _ => false,
+    }
+}
+
 /// Pure inference oracle — the single source of truth for expression types.
 ///
 /// A side-effect-free port of codegen's `type_of_expr` (codegen.rs:264-548) with
@@ -686,8 +717,10 @@ fn check_str_encode_call(
 ///
 /// It bakes in the CORRECT side of every documented divergence
 /// (docs/design/inference-oracle.md §A.4): D1 str-index → Str; D3 abs(x) → arg
-/// type; D4 sum(xs) → element type; D5 `**` → Float; D6 dict literal folds ALL
-/// pairs; D7 attribute access is inheritance-aware (`get_all_fields`).
+/// type; D4 sum(xs) → element type; D5 `**` → Int for `int ** int` (a
+/// non-negative-literal exponent), Float otherwise (see `pow_yields_int`); D6
+/// dict literal folds ALL pairs; D7 attribute access is inheritance-aware
+/// (`get_all_fields`).
 pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> Ty {
     match expr {
         Expr::Float(..) => Ty::Float,
@@ -795,9 +828,13 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
                 }
             }
             match op {
-                // D5: Python `**` always yields a float (split out of the
-                // int-biased arithmetic arm below — codegen's bug).
-                BinOp::Pow => Ty::Float,
+                // (card 5c75a04d) `int ** int` is an INT in Python (2**10 == 1024);
+                // it is a FLOAT only for a float operand or a statically-known
+                // negative-literal exponent (2**-1 == 0.5). Matches codegen's
+                // operand-driven Pow emission so the oracle never types a value
+                // codegen emits as the other kind (the former blanket `Ty::Float`
+                // drove `__py_fmt_float(i64)` -> E0308).
+                BinOp::Pow => if pow_yields_int(&l, &r, rhs) { Ty::Int } else { Ty::Float },
                 BinOp::Div => Ty::Float,
                 BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Mod | BinOp::FloorDiv => {
                     // String concatenation for Add.
@@ -895,6 +932,27 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
                     let tps = ctx.classes.get(cls.as_str()).map(|c| c.type_params.as_slice()).unwrap_or(&[]);
                     let field_ty = Ty::from_type_expr_scoped(&f.ty, f.span, tps).unwrap_or(Ty::Unknown);
                     return subst_class_member(&field_ty, &recv, ctx);
+                }
+                // (card 7dcfc11f) A `@property` access `recv.name` (no call) types
+                // as the getter's declared RETURN type — it is not a field, so the
+                // `all_fields` lookup above misses it and the oracle formerly fell
+                // to `Ty::Unknown`. That left a property reached WITHOUT a call
+                // untyped, so a further attr/property access chained onto a
+                // property-getter result (`w.boxed.size`) lost its class type and
+                // codegen mis-lowered the inner property to plain field access
+                // (E0615). Mirror the field path's scoping/substitution so a
+                // generic property return resolves concretely. Own-methods lookup +
+                // the `property` decorator matches codegen's `is_property_access`
+                // detection, keeping the type oracle and the getter-call lowering
+                // in agreement.
+                if let Some(cd) = ctx.classes.get(cls.as_str()) {
+                    if let Some(m) = cd.methods.iter().find(|m|
+                        &m.name == name && m.decorators.contains(&"property".to_string()))
+                    {
+                        let ret_ty = Ty::from_type_expr_scoped(&m.ret, m.span, &cd.type_params)
+                            .unwrap_or(Ty::Unknown);
+                        return subst_class_member(&ret_ty, &recv, ctx);
+                    }
                 }
             }
             Ty::Unknown
@@ -1562,7 +1620,10 @@ pub(crate) fn infer_expr_ty_bound(
                 }
             }
             match op {
-                BinOp::Div | BinOp::Pow => Ty::Float,
+                // (card 5c75a04d) `int ** int` -> Int (float operand or a
+                // negative-literal exponent -> Float); see `pow_yields_int`.
+                BinOp::Div => Ty::Float,
+                BinOp::Pow => if pow_yields_int(&l, &r, rhs) { Ty::Int } else { Ty::Float },
                 BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Mod | BinOp::FloorDiv => {
                     if *op == BinOp::Add && (l == Ty::Str || r == Ty::Str) {
                         Ty::Str
@@ -1669,7 +1730,11 @@ pub(crate) fn infer_comp_elt_type_with_var(
             match (left_ty, right_ty) {
                 (Ty::Float, _) | (_, Ty::Float) => Ty::Float,
                 (Ty::Int, Ty::Int) => {
-                    if *op == BinOp::Div || *op == BinOp::Pow {
+                    // (card 5c75a04d) `int / int` is always Float; `int ** int` is
+                    // Int UNLESS the exponent is a negative literal (2**-1 == 0.5).
+                    if *op == BinOp::Div {
+                        Ty::Float
+                    } else if *op == BinOp::Pow && !pow_yields_int(&Ty::Int, &Ty::Int, rhs) {
                         Ty::Float
                     } else {
                         Ty::Int
@@ -4430,7 +4495,11 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                 BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le
                 | BinOp::Gt | BinOp::Ge | BinOp::And | BinOp::Or
                 | BinOp::Is | BinOp::IsNot | BinOp::In | BinOp::NotIn => Ty::Bool,
-                BinOp::Pow | BinOp::Div => Ty::Float,  // Division always returns float in Python
+                BinOp::Div => Ty::Float,  // Division always returns float in Python
+                // (card 5c75a04d) `int ** int` -> Int (2**10 == 1024); Float for a
+                // float operand or a negative-literal exponent (2**-1 == 0.5). Keeps
+                // `check`'s accepted type equal to the oracle + codegen emission.
+                BinOp::Pow => if pow_yields_int(&l, &r, rhs) { Ty::Int } else { Ty::Float },
                 BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::LShift | BinOp::RShift => Ty::Int,
                 _ => {
                     // Arithmetic: apply numeric type promotion rules

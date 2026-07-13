@@ -1878,26 +1878,27 @@ impl<'a> Codegen<'a> {
         format!("Some({})", s)
     }
 
-    /// True when `e` emits an integer-valued (`i64`) Rust expression whose
-    /// *logical* type (per the inference oracle) is nonetheless `Float`.
+    /// True when `e` emits an integer-valued (`i64`) Rust `**` expression — an
+    /// `int ** int` power with a non-negative-literal exponent, which lowers to
+    /// the `i64`-returning `__py_ipow` (or a folded `i64` literal).
     ///
-    /// The only such case is integer exponentiation: D5 (Python semantics) makes
-    /// the oracle type `int ** int` as `Float`, but emission is operand-driven —
-    /// `int ** int` is lowered to the `i64`-returning `__py_ipow` (or a folded
-    /// `i64` literal), matching the Pow arm in `emit_expr`. A `float`-typed
-    /// binding receiving such a value therefore still needs an `as f64` cast,
-    /// which the plain `type_of_expr(value) == Int` coercion check no longer
-    /// detects now that the oracle reports `Float`. This predicate restores that
-    /// signal so the keystone oracle composes with the pow-into-float emission.
+    /// (card 5c75a04d) The oracle now types such a power as `Int` too, so this
+    /// predicate agrees with `type_of_expr` and merely stays a convenient
+    /// structural signal at the int-widening call sites (`matches!(value_ty, Int)
+    /// || self.emits_int_pow(value)`); a negative-literal exponent (`2 ** -1`)
+    /// emits `powf` (f64) and is correctly EXCLUDED here, matching the oracle
+    /// typing it `Float`. Delegates to the shared `pow_yields_int` predicate so
+    /// this signal can never drift from the emission or the type oracle.
     pub(crate) fn emits_int_pow(&self, e: &Expr) -> bool {
         match e {
             // `-(int ** int)` is still an integer value.
             Expr::UnOp { op: UnOp::Neg, expr, .. } => self.emits_int_pow(expr),
             Expr::BinOp { lhs, op: BinOp::Pow, rhs, .. } => {
-                // Mirror the emit_expr Pow rule: int**int -> i64 (__py_ipow);
-                // any float operand -> f64 (powf).
-                matches!(self.type_of_expr(lhs), Ty::Int)
-                    && matches!(self.type_of_expr(rhs), Ty::Int)
+                crate::typeck::pow_yields_int(
+                    &self.type_of_expr(lhs),
+                    &self.type_of_expr(rhs),
+                    rhs,
+                )
             }
             _ => false,
         }

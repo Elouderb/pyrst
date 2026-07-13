@@ -1,0 +1,35 @@
+# DUAL-RUN parity (card 5c75a04d): Python `int ** int` yields an INT (2**10 ==
+# 1024), NOT a float. The type oracle formerly blanket-typed every `**` as Float
+# while codegen emitted an i64 for int**int, so `print(2 ** 10)` emitted
+# `__py_fmt_float(i64)` -> rustc E0308 (a check-accept/build-fail dishonesty).
+# `**` is a float ONLY for a float operand or a statically-known NEGATIVE literal
+# exponent (CPython 2**-1 == 0.5). CPython is the golden oracle.
+
+def main() -> None:
+    # int ** int, non-negative exponent -> INT
+    print(2 ** 10)          # 1024   (the reported repro)
+    print(2 ** 0)           # 1
+    print(5 ** 3)           # 125
+    x: int = 3
+    print(x ** 2)           # 9      (variable base — the second reported repro)
+    base: int = 7
+    exp: int = 2
+    print(base ** exp)      # 49     (both operands variables)
+
+    # int ** NEGATIVE literal exponent -> FLOAT (CPython 2**-1 == 0.5)
+    print(2 ** -1)          # 0.5
+    print(4 ** -2)          # 0.0625
+
+    # a float operand -> FLOAT power
+    print(2.0 ** 3)         # 8.0
+    print(2 ** 3.0)         # 8.0
+    print(9.0 ** 0.5)       # 3.0
+
+    # augmented `**=` keeps the target's int-ness -> 144
+    n: int = 12
+    n **= 2
+    print(n)
+
+    # comprehension element: int ** int -> an int list [0, 1, 4, 9, 16]
+    squares: list[int] = [i ** 2 for i in range(5)]
+    print(squares)

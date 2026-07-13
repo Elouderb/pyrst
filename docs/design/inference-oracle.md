@@ -32,7 +32,7 @@ and passed immutably to both typeck and codegen (`driver.rs:141-146`).
 | D1 | `s[i]`, `s: str` | `Str` | `Unknown` (no Str arm) | typeck |
 | D3 | `abs(x: float)` | `Int` (FuncSig hardcoded) | `Float` (arg type) | codegen |
 | D4 | `sum([1.0,2.0])` | `Int` (FuncSig hardcoded) | `Float` (elem type) | codegen |
-| D5 | `a ** b` | `Float` | `Int` if both Int (int-biased arm) | typeck (Python ** → float) |
+| D5 | `a ** b` | `Float` | `Int` if both Int (int-biased arm) | **codegen** — Python `int**int` (non-neg literal exp) is `Int`, else `Float`. RESOLVED by card 5c75a04d: `typeck::pow_yields_int` unifies check_expr / the oracle / codegen. |
 | D6 | `{a:1, b:2.0}` | fold all pairs → `Dict(Str,Float)` | first pair → `Dict(Str,Int)` | typeck |
 | D7 | `obj.inherited_field` | `get_all_fields()` finds it | `c.fields` misses it → `Unknown` | typeck |
 | D2/D8/D9/D10 | abs(int)/method call/unknown-iter/`/` | — | — | already agree |

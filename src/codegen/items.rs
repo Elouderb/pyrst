@@ -1662,17 +1662,25 @@ impl<'a> Codegen<'a> {
     /// an owned temporary, not a borrowable place). Mirrors the inheritance-aware
     /// method lookup used elsewhere by resolving through the class's methods.
     pub(crate) fn is_property_access(&self, obj: &Expr, name: &str) -> bool {
-        if let Expr::Ident(var, _) = obj {
-            self.locals.get(var.as_str()).cloned()
-                .and_then(|ty| if let Ty::Class(cn, _) = ty {
-                    self.ctx.classes.get(&cn).map(|cd|
-                        cd.methods.iter().any(|m|
-                            m.name.as_str() == name
-                            && m.decorators.contains(&"property".to_string())
-                        )
-                    )
-                } else { None })
-                .unwrap_or(false)
+        // (card 7dcfc11f) The property-vs-field decision must depend ONLY on
+        // whether `name` is a `@property` on the receiver's STATIC TYPE — never
+        // on the syntactic form of the receiver. Resolve the receiver through
+        // the shared type oracle (`type_of_expr`), which types every form
+        // uniformly (a bare local, a call result, an index, a chained attr).
+        // The former version keyed on `Expr::Ident` + a raw `self.locals`
+        // lookup, so a `@property` reached through any non-variable receiver
+        // (`make(5).size`, `arr[0].prop`, `obj.inner.prop`) fell through to
+        // plain field access and mis-emitted `<recv>.<name>` (no getter call)
+        // -> rustc E0615. A bare local still resolves to the identical
+        // `Ty::Class`, so the long-standing variable case is byte-for-byte
+        // unchanged; only the previously-missing receiver forms are corrected.
+        if let Ty::Class(cn, _) = self.type_of_expr(obj) {
+            self.ctx.classes.get(&cn).is_some_and(|cd|
+                cd.methods.iter().any(|m|
+                    m.name.as_str() == name
+                    && m.decorators.contains(&"property".to_string())
+                )
+            )
         } else {
             false
         }

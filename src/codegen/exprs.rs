@@ -3942,11 +3942,15 @@ impl<'a> Codegen<'a> {
 
                 match op {
                     BinOp::Pow => {
-                        // int ** int -> integer power (matches type_of_expr inferring Int);
-                        // any float operand -> float power. Use the __py_ipow helper for
-                        // the integer case so a negative exponent panics with a clear
-                        // message instead of silently wrapping `as u32` to a huge value.
-                        if matches!(lt, Ty::Int) && matches!(rt, Ty::Int) {
+                        // (card 5c75a04d) int ** int -> integer power (i64), matching
+                        // the oracle typing it Int; any float operand OR a
+                        // statically-known negative-literal exponent -> float power
+                        // (CPython 2**-1 == 0.5), matching the oracle typing it Float.
+                        // The SHARED `pow_yields_int` predicate keeps this emission and
+                        // the type oracle in lockstep. `__py_ipow` still panics (loud)
+                        // on a non-literal negative exponent rather than silently
+                        // wrapping `as u32` to a huge value.
+                        if crate::typeck::pow_yields_int(&lt, &rt, rhs) {
                             return Ok(format!("__py_ipow(({}), ({}))", l, r));
                         }
                         return Ok(format!("(({} as f64).powf({} as f64))", l, r));

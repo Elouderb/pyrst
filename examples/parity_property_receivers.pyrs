@@ -1,0 +1,65 @@
+# DUAL-RUN parity (card 7dcfc11f): a `@property` access must lower to the getter
+# CALL `recv.name()` for EVERY receiver form — a bare variable, a call result, an
+# index, and a chained attribute — never plain field access (which mis-emitted
+# `recv.name` -> rustc E0615). The property-vs-field decision depends ONLY on
+# whether `name` is a `@property` on the receiver's static TYPE, not on the
+# receiver's syntactic form. This also proves it is not int-specific (str/bool
+# properties) and that PLAIN field access on the same receiver forms is
+# unchanged (still a field read, no getter call). `@property` is standard Python,
+# so CPython is the golden oracle.
+
+class Box:
+    def __init__(self, n: int) -> None:
+        self.n = n
+    @property
+    def size(self) -> int:
+        return self.n
+    @property
+    def label(self) -> str:
+        return "box"
+    @property
+    def wide(self) -> bool:
+        return self.n > 10
+
+class Wrapper:
+    def __init__(self, inner: Box) -> None:
+        self._inner = inner
+        self.tag = "w"
+    # a property that RETURNS a class — receiver of a further property access
+    @property
+    def boxed(self) -> Box:
+        return self._inner
+
+
+def make(n: int) -> Box:
+    return Box(n)
+
+
+def main() -> None:
+    # -- variable receiver (the long-standing case; regression guard) --
+    b = make(3)
+    print(b.size)          # property on a variable  -> b.size()
+    print(b.n)             # plain field on a variable (unchanged)
+
+    # -- call-result receiver (the reported bug) --
+    print(make(5).size)    # property on a call result -> make(5).size()
+    print(make(7).label)   # str property on a call result
+    print(make(20).wide)   # bool property on a call result
+    print(make(9).n)       # plain field on a call result (unchanged)
+
+    # -- index receiver --
+    arr: list[Box] = [make(1), make(2), make(30)]
+    print(arr[0].size)     # property on an index
+    print(arr[2].wide)     # bool property on an index
+    print(arr[1].n)        # plain field on an index (unchanged)
+
+    # -- chained-attribute receiver (plain field carrying a class) --
+    w = Wrapper(make(4))
+    print(w._inner.size)   # property through a plain-field chain
+    print(w._inner.label)  # str property through a plain-field chain
+    print(w._inner.n)      # plain field through a plain-field chain (unchanged)
+    print(w.tag)           # plain field on the wrapper itself (unchanged)
+
+    # -- receiver that is ITSELF a property returning a class --
+    print(w.boxed.size)    # property on a property-getter result
+    print(w.boxed.n)       # plain field on a property-getter result (unchanged)

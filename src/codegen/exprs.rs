@@ -319,6 +319,46 @@ impl<'a> Codegen<'a> {
                         _ => None,
                     };
                     if let Some(modname) = qual_owner {
+                        // (bare-package-import, card 89408863) `<pkg>.<Name>(...)` where
+                        // `<pkg>` has an `__init__.pyrs` surface lowers to the TRUE
+                        // OWNER (AC2, the load-bearing detail). A surfaced FUNCTION
+                        // re-dispatches through `emit_plain_func_call` with the true
+                        // owner threaded as `callee_owner`, so `kodiak.read_csv`
+                        // mangles to `__pyrst_m_kodiak_dio__read_csv` — never a
+                        // `kodiak`-owned name. A surfaced CLASS re-dispatches as a bare
+                        // construction; `emit_constructor_call` mangles the struct via
+                        // the GLOBAL `class_owner` (already the true owner), so
+                        // `kodiak.Series(...)` lowers to
+                        // `__pyrst_m_kodiak_dseries__Series::new(...)`. Intercepts
+                        // BEFORE the plain `module_funcs` path (a package also owns its
+                        // init funcs there); inert when no package `__init__.pyrs`
+                        // resolved (`package_exports` empty).
+                        if let Some(entry) = self.ctx.package_export(&modname, name).cloned() {
+                            match entry.kind {
+                                crate::typeck::SurfaceKind::Func => {
+                                    let span = callee.span();
+                                    let flat_callee: Box<Expr> = Box::new(Expr::Ident(entry.name.clone(), span));
+                                    return Ok(Some(self.emit_plain_func_call(
+                                        &flat_callee, args, kwargs, Some(entry.owner),
+                                    )?));
+                                }
+                                crate::typeck::SurfaceKind::Class => {
+                                    let span = callee.span();
+                                    let ctor_callee: Box<Expr> = Box::new(Expr::Ident(entry.name.clone(), span));
+                                    if let Some(s) = self.emit_constructor_call(&ctor_callee, args, kwargs)? {
+                                        return Ok(Some(s));
+                                    }
+                                    return Err(crate::diag::Error::Codegen(format!(
+                                        "package `{}` surfaces `{}` as a class but it did \
+                                         not resolve to a constructor (internal invariant)",
+                                        modname, name
+                                    )));
+                                }
+                                // A surfaced constant is not callable; typeck rejected
+                                // `pkg.CONST(...)`, so fall through defensively.
+                                crate::typeck::SurfaceKind::Const => {}
+                            }
+                        }
                         if self.ctx.module_funcs.get(&modname).is_some_and(|fns| fns.iter().any(|n| n == name)) {
                             let span = callee.span();
                             let flat_callee: Box<Expr> = Box::new(Expr::Ident(name.clone(), span));
@@ -3343,6 +3383,21 @@ impl<'a> Codegen<'a> {
                 // now a real embedded module (`lib/math.pyrs`), so its constants
                 // flow through here like any other module's.
                 if let Expr::Ident(modname, _) = obj.as_ref() {
+                    // (bare-package-import, card 89408863) A surfaced package CONSTANT
+                    // `<pkg>.CONST` lowers to its TRUE OWNER's mangled const, never a
+                    // `<pkg>`-owned one. `const_strs` is keyed by (owner, name), so the
+                    // str-ness `.to_string()` fix-up is looked up under the true owner
+                    // too. Inert when no package `__init__.pyrs` resolved.
+                    if let Some(entry) = self.ctx.package_export(modname, name).cloned() {
+                        if entry.kind == crate::typeck::SurfaceKind::Const {
+                            let owner = Some(entry.owner.as_str());
+                            return Ok(if self.const_strs.contains(&(Some(entry.owner.clone()), entry.name.clone())) {
+                                format!("{}.to_string()", mangle_const(owner, &entry.name))
+                            } else {
+                                mangle_const(owner, &entry.name)
+                            });
+                        }
+                    }
                     if self
                         .ctx
                         .module_consts

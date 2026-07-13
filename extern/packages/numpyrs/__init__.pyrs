@@ -1,0 +1,24 @@
+# numpyrs — package entry (bare `import numpyrs`, card 89408863)
+#
+# Re-exports numpyrs's public API so `import numpyrs; numpyrs.array([...])`
+# works Python-style. Each name below lowers to its TRUE defining submodule
+# (e.g. `numpyrs.array` -> numpyrs.constructors), never to a `numpyrs`-owned
+# name. The dotted form `from numpyrs.constructors import array` still works
+# unchanged and never consults this file.
+
+from numpyrs.ndarray import NDArray
+
+from numpyrs.constructors import array
+from numpyrs.constructors import array2d
+from numpyrs.constructors import full
+from numpyrs.constructors import zeros
+from numpyrs.constructors import ones
+from numpyrs.constructors import arange
+from numpyrs.constructors import linspace
+
+from numpyrs.ufunc import absolute
+from numpyrs.ufunc import sqrt
+from numpyrs.ufunc import exp
+from numpyrs.ufunc import log
+from numpyrs.ufunc import sin
+from numpyrs.ufunc import cos

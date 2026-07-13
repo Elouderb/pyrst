@@ -1,0 +1,17 @@
+# tzdata — package entry (bare `import tzdata`, card 89408863)
+#
+# Re-exports tzdata's public API so `import tzdata; tzdata.utc_offset_at(...)`
+# works Python-style. Each name below lowers to its TRUE defining submodule
+# (e.g. `tzdata.utc_offset_at` -> tzdata.api), never to a `tzdata`-owned name.
+# The dotted form `from tzdata.api import utc_offset_at` still works unchanged
+# and never consults this file.
+
+# Lookup API.
+from tzdata.api import available_zones
+from tzdata.api import zone_info
+from tzdata.api import utc_offset_at
+from tzdata.api import is_dst_at
+
+# Zone data structures.
+from tzdata.data import TransitionRule
+from tzdata.data import ZoneRule

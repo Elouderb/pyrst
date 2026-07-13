@@ -1,0 +1,25 @@
+# dateutil — package entry (bare `import dateutil`, card 89408863)
+#
+# Re-exports dateutil's public API so `import dateutil; dateutil.parse(...)`
+# works Python-style. Each name below lowers to its TRUE defining submodule
+# (e.g. `dateutil.parse` -> dateutil.parser), never to a `dateutil`-owned name.
+# The dotted form `from dateutil.parser import parse` still works unchanged and
+# never consults this file.
+
+# Parsing.
+from dateutil.parser import parse
+from dateutil.parser import parse_with_offset
+from dateutil.parser import to_utc
+from dateutil.parser import astimezone_named
+from dateutil.parser import ParserError
+from dateutil.parser import ParseResult
+
+# Relative deltas.
+from dateutil.relativedelta import relativedelta
+from dateutil.relativedelta import relativedelta_between
+from dateutil.relativedelta import Weekday
+
+# Recurrence rules.
+from dateutil.rrule import rrule
+from dateutil.rrule import iterate
+from dateutil.rrule import materialize

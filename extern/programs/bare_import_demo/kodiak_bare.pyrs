@@ -1,0 +1,39 @@
+# bare_import_demo / kodiak — proves Python-style `import kodiak` (card 89408863)
+#
+# The card's exact ergonomic: bare `import kodiak; kodiak.read_csv(...)`, resolved
+# via kodiak/__init__.pyrs (the package entry file). Each qualified name lowers to
+# its TRUE defining submodule — `kodiak.read_csv` -> kodiak.io, `kodiak.frame_equals`
+# -> kodiak.frame — never to a kodiak-owned name. The pre-existing dotted form
+# `from kodiak.series import Series` still works unchanged and never consults
+# __init__.pyrs.
+#
+# Build + run against the env store (from this directory):
+#   pyrst venv && source .pyrstenv/activate
+#   pyrst install <path-to>/extern/packages/kodiak   # pulls numpyrs/dateutil/tzdata
+#   pyrst build kodiak_bare.pyrs && ./kodiak_bare
+# Or reproducibly in-repo via the search path:
+#   PYRST_PATH=<repo>/extern/packages pyrst build kodiak_bare.pyrs && ./kodiak_bare
+
+import kodiak
+
+
+def main() -> None:
+    # bare `import kodiak; kodiak.read_csv(...)` — the headline ergonomic.
+    df = kodiak.read_csv("sales.csv")
+    print("== loaded frame ==")
+    print(df)
+    print("columns: " + str(df.columns()))
+    rows: int = df.shape()[0]
+    print("rows: " + str(rows))
+
+    # column access + a Series introspection method on the loaded frame
+    units = df["units"]
+    print("units dtype: " + units.dtype)
+    print("units count: " + str(units.count()))
+
+    # a DataFrame method on the loaded frame
+    print("== sorted by revenue desc ==")
+    print(df.sort_values("revenue", False))
+
+    # a re-exported free FUNCTION reachable via the package qualifier
+    print("frame_equals(df, df): " + str(kodiak.frame_equals(df, df)))

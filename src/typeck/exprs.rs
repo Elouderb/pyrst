@@ -835,6 +835,16 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
             // the former hardcoded `math.pi` typing — `math` is now a real
             // embedded module whose consts are tracked here.
             if let Expr::Ident(modname, _) = obj.as_ref() {
+                // (bare-package-import, card 89408863) A surfaced package CONSTANT
+                // `<pkg>.CONST` resolves through the surface to its true owner's type.
+                // Inert when `package_exports` is empty.
+                if let Some(entry) = ctx.package_export(modname, name).cloned() {
+                    if entry.kind == crate::typeck::SurfaceKind::Const {
+                        if let Some(ty) = ctx.resolve_module_const(&entry.owner, &entry.name) {
+                            return ty.clone();
+                        }
+                    }
+                }
                 // (W3-1) OWNER-FIRST: the const's type comes from `modname`'s own
                 // per-module table (flat `module_consts` fallback for synthetic
                 // ctxs). Both are module-keyed, so this never diverges.
@@ -1134,6 +1144,31 @@ pub fn infer_expr_ty(expr: &Expr, locals: &HashMap<String, Ty>, ctx: &TyCtx) -> 
                 // through here (its @extern `sqrt` lives in `module_funcs`); the
                 // former hardcoded math return-typing arm is gone.
                 if let Some(modname) = module_owner_of(obj) {
+                    // (bare-package-import, card 89408863) `<pkg>.<Name>()` where
+                    // `<pkg>` has an `__init__.pyrs` surface resolves through that
+                    // surface to the TRUE OWNER: a surfaced FUNCTION returns its true
+                    // owner's declared return; a surfaced CLASS is a CONSTRUCTION whose
+                    // value type is the globally-unique class. Intercepts BEFORE the
+                    // plain `module_funcs` path because a package also owns its init
+                    // functions there. Inert when `package_exports` is empty.
+                    if let Some(entry) = ctx.package_export(&modname, name).cloned() {
+                        return match entry.kind {
+                            crate::typeck::SurfaceKind::Class => Ty::Class(entry.name.clone(), vec![]),
+                            crate::typeck::SurfaceKind::Func => {
+                                match ctx.resolve_module_func(&entry.owner, &entry.name) {
+                                    Some(sig) => {
+                                        let arg_tys: Vec<Ty> = args.iter()
+                                            .map(|a| infer_expr_ty(a, locals, ctx))
+                                            .collect();
+                                        oracle_generic_call_ret(&entry.name, sig, &arg_tys, ctx)
+                                    }
+                                    None => Ty::Unknown,
+                                }
+                            }
+                            // A surfaced constant is not callable; `check_expr` errors.
+                            crate::typeck::SurfaceKind::Const => Ty::Unknown,
+                        };
+                    }
                     // (W3-3) `modname` is the single- OR two-component module owner
                     // (`os` for `os.f()`, `os.path` for `os.path.f()`); both resolve
                     // identically once registered under their dotted id. A non-module
@@ -3379,6 +3414,106 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
                     // silently-Unknown call.
                     if let Expr::Attr { obj, name, span: attr_span } = callee.as_ref() {
                         if let Some(modname) = module_owner_of(obj) {
+                            // (bare-package-import, card 89408863) `<pkg>.<Name>(...)`
+                            // where `<pkg>` has an `__init__.pyrs` surface resolves
+                            // THROUGH that surface to the TRUE OWNER — a surfaced
+                            // FUNCTION is arg-checked against its true owner's signature
+                            // (`kodiak.read_csv` → `kodiak.io`'s `read_csv`), a surfaced
+                            // CLASS re-dispatches as a construction of the globally-
+                            // unique class (`kodiak.Series(...)` → the one `Series`,
+                            // which mangles to its true defining module). A name not in
+                            // the surface is the honest AC3b error. This intercepts
+                            // BEFORE the plain `module_funcs` path because a package also
+                            // owns its init functions there; it is inert (never fires)
+                            // when no package resolved via `__init__.pyrs`.
+                            if let Some(entry) = env.ctx.package_export(&modname, name).cloned() {
+                                match entry.kind {
+                                    crate::typeck::SurfaceKind::Func => {
+                                        let sig = env.ctx
+                                            .resolve_module_func(&entry.owner, &entry.name)
+                                            .cloned()
+                                            .ok_or_else(|| Error::Type {
+                                                span: *attr_span,
+                                                msg: format!(
+                                                    "package `{}` public function `{}` has no signature",
+                                                    modname, name
+                                                ),
+                                            })?;
+                                        let diag_label = format!("{}.{}", modname, name);
+                                        let expected = sig.params.len();
+                                        let got = args.len() + kwargs.len();
+                                        let kw_slots: Option<Vec<ArgSlot>> = if !kwargs.is_empty() {
+                                            Some(map_kwargs_to_slots(&diag_label, &sig, args.len(), kwargs, *span)?)
+                                        } else {
+                                            None
+                                        };
+                                        let required = sig.param_defaults.iter().take_while(|d| d.is_none()).count();
+                                        if kw_slots.is_none() && (got < required || got > expected) {
+                                            return Err(Error::Type {
+                                                span: *span,
+                                                msg: format!(
+                                                    "function `{}` takes {} argument(s), {} given",
+                                                    diag_label, expected, got
+                                                ),
+                                            });
+                                        }
+                                        let arg_tys: Vec<Ty> = match &kw_slots {
+                                            None => args.iter()
+                                                .map(|a| check_expr(a, env))
+                                                .collect::<Result<Vec<_>>>()?,
+                                            Some(slots) => {
+                                                let mut tys = vec![Ty::Unknown; expected];
+                                                for (p, a) in kwargs_provided_in_eval_order(args, kwargs, slots) {
+                                                    tys[p] = check_expr(a, env)?;
+                                                }
+                                                tys
+                                            }
+                                        };
+                                        let result = check_call_arg_types_and_result(
+                                            &entry.name, &diag_label, &sig, &arg_tys, env.ctx, *span,
+                                        )?;
+                                        return Ok(result);
+                                    }
+                                    crate::typeck::SurfaceKind::Class => {
+                                        // Re-dispatch as a bare construction of the
+                                        // globally-unique class so the constructor's
+                                        // full field/kwarg validation is reused verbatim.
+                                        let bare = Expr::Call {
+                                            callee: Box::new(Expr::Ident(entry.name.clone(), *attr_span)),
+                                            args: args.to_vec(),
+                                            kwargs: kwargs.to_vec(),
+                                            span: *span,
+                                        };
+                                        return check_expr(&bare, env);
+                                    }
+                                    crate::typeck::SurfaceKind::Const => {
+                                        return Err(Error::Type {
+                                            span: *span,
+                                            msg: format!(
+                                                "`{}.{}` is a package constant, not a callable",
+                                                modname, name
+                                            ),
+                                        });
+                                    }
+                                }
+                            }
+                            // A package qualifier with a name NOT on its surface: honest
+                            // AC3b surface-miss (never a silent Unknown call).
+                            if env.ctx.is_package(&modname) {
+                                let avail = env.ctx.package_surface_names(&modname);
+                                let hint = if avail.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(" (available: {})", avail.join(", "))
+                                };
+                                return Err(Error::Type {
+                                    span: *attr_span,
+                                    msg: format!(
+                                        "package `{}` has no public name `{}`{}",
+                                        modname, name, hint
+                                    ),
+                                });
+                            }
                             // (W3-3) `modname` is the single- OR two-component module
                             // owner (`os` for `os.f()`, `os.path` for `os.path.f()`).
                             if let Some(mod_fns) = env.ctx.module_funcs.get(&modname) {
@@ -3751,6 +3886,48 @@ pub(crate) fn check_expr(e: &Expr, env: &mut FuncEnv) -> Result<Ty> {
             // Unknown); `math` is now a real embedded module whose consts are
             // tracked in `module_consts`.
             if let Expr::Ident(modname, _) = obj.as_ref() {
+                // (bare-package-import, card 89408863) A qualified access on a package
+                // with an `__init__.pyrs` surface, used as a NON-CALL VALUE. A surfaced
+                // CONSTANT resolves to its true owner's type. A surfaced function/class
+                // used as a bare value is the deferred function/class-as-value feature
+                // — an honest error, not a silent Unknown that dies at rustc. A name
+                // NOT on the surface is the honest AC3b surface-miss. Inert when no
+                // package resolved via `__init__.pyrs`.
+                if env.ctx.is_package(modname) {
+                    match env.ctx.package_export(modname, name).cloned() {
+                        Some(entry) if entry.kind == crate::typeck::SurfaceKind::Const => {
+                            if let Some(ty) = env.ctx.resolve_module_const(&entry.owner, &entry.name) {
+                                return Ok(ty.clone());
+                            }
+                        }
+                        Some(_) => {
+                            return Err(Error::Type {
+                                span: *span,
+                                msg: format!(
+                                    "`{}.{}` names a package function/class used as a value, \
+                                     which pyrst does not support yet; call it (`{}.{}(...)`) \
+                                     or bind it with `from {} import {}`",
+                                    modname, name, modname, name, modname, name
+                                ),
+                            });
+                        }
+                        None => {
+                            let avail = env.ctx.package_surface_names(modname);
+                            let hint = if avail.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" (available: {})", avail.join(", "))
+                            };
+                            return Err(Error::Type {
+                                span: *span,
+                                msg: format!(
+                                    "package `{}` has no public name `{}`{}",
+                                    modname, name, hint
+                                ),
+                            });
+                        }
+                    }
+                }
                 // (W3-1) OWNER-FIRST qualified const type (flat `module_consts`
                 // fallback for synthetic ctxs); both module-keyed, never diverges.
                 if let Some(ty) = env.ctx.resolve_module_const(modname, name) {

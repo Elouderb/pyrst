@@ -1,0 +1,33 @@
+# bare_import_demo / numpyrs — proves Python-style `import numpyrs` (card 89408863)
+#
+# Uses the bare package form `import numpyrs; numpyrs.array([...])` — resolved via
+# numpyrs/__init__.pyrs, the package entry file. Each qualified name lowers to its
+# TRUE defining submodule (numpyrs.array -> numpyrs.constructors, numpyrs.sqrt ->
+# numpyrs.ufunc, numpyrs.NDArray -> numpyrs.ndarray), never to a numpyrs-owned name.
+#
+# Build + run against the env store (from this directory):
+#   pyrst venv && source .pyrstenv/activate
+#   pyrst install <path-to>/extern/packages/numpyrs
+#   pyrst build numpyrs_bare.pyrs && ./numpyrs_bare
+# Or reproducibly in-repo via the search path:
+#   PYRST_PATH=<repo>/extern/packages pyrst build numpyrs_bare.pyrs && ./numpyrs_bare
+
+import numpyrs
+
+
+def main() -> None:
+    # qualified free function -> true owner numpyrs.constructors
+    a = numpyrs.array([1.0, 4.0, 9.0, 16.0])
+    print("array size: " + str(a.size))
+
+    # qualified free function -> true owner numpyrs.ufunc
+    roots = numpyrs.sqrt(a)
+    print("sqrt: " + str(roots.data))
+
+    # qualified CLASS construction -> true owner numpyrs.ndarray
+    zeros = numpyrs.NDArray([0.0, 0.0, 0.0], [3])
+    print("zeros: " + str(zeros.data))
+
+    # another constructor family, still via the bare qualifier
+    ramp = numpyrs.arange(0.0, 5.0, 1.0)
+    print("arange: " + str(ramp.data))

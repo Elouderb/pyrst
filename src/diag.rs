@@ -95,8 +95,8 @@ impl fmt::Display for Error {
                 };
                 write!(
                     f,
-                    "import error at {}:{}: '{}' is a package (a directory of modules), not a single module — import a submodule, e.g. `from {}.{} import <name>`{} (imported from {})",
-                    span.line, span.col, package, package, example, avail, importing_file
+                    "import error at {}:{}: '{}' is a package with no `__init__.pyrs` entry file — import a submodule, e.g. `from {}.{} import <name>`{}, or add `{}/__init__.pyrs` to make `import {}` work (imported from {})",
+                    span.line, span.col, package, package, example, avail, package, package, importing_file
                 )
             }
             Error::Pkg(msg) => write!(f, "{}", msg),
@@ -165,8 +165,8 @@ impl Error {
                     format!("\n  available submodules: {}", submodules.join(", "))
                 };
                 format!(
-                    "import error at {}:{}: '{}' is a package (a directory of modules), not a single module\n  import a submodule, e.g. `from {}.{} import <name>`{}\n  imported from {}",
-                    span.line, span.col, package, package, example, avail, importing_file
+                    "import error at {}:{}: '{}' is a package with no `__init__.pyrs` entry file\n  import a submodule, e.g. `from {}.{} import <name>`{}\n  or add `{}/__init__.pyrs` to make `import {}` work\n  imported from {}",
+                    span.line, span.col, package, package, example, avail, package, package, importing_file
                 )
             }
             Error::Pkg(msg) => msg.clone(),

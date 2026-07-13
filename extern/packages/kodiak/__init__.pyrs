@@ -1,0 +1,24 @@
+# kodiak — package entry (bare `import kodiak`, card 89408863)
+#
+# Publishes kodiak's pandas-ergonomics public API so `import kodiak;
+# kodiak.read_csv(...)` / `kodiak.Series(...)` work Python-style. Each name
+# re-exported here lowers to its TRUE defining submodule (e.g. `kodiak.Series`
+# -> kodiak.series's `Series`, mangled `__pyrst_m_kodiak_dseries__Series`),
+# never to a `kodiak`-owned name. The pre-existing dotted form
+# `from kodiak.series import Series` still works unchanged and never consults
+# this file.
+
+# Core data structures.
+from kodiak.series import Series
+from kodiak.frame import DataFrame
+from kodiak.frame import GroupBy
+from kodiak.frame import frame_equals
+
+# Lazy (polars-style) engine surface.
+from kodiak.frame import LazyFrame
+from kodiak.lazy import Op
+from kodiak.lazy import optimize
+from kodiak.lazy import explain_plan
+
+# I/O.
+from kodiak.io import read_csv

@@ -130,6 +130,16 @@ local packages). *Auto-expose `os.path` on `import os`* (needs module-as-value;
 deferred, documented). *Import aliases* (out of scope; already rejected — keep
 rejecting, do not silently ignore).
 
+> **Follow-on (bare package import, card 89408863):** `docs/design/bare-package-import.md`
+> layers a Python-style **package entry file** on top of this machinery — a bare
+> `import kodiak` resolving `kodiak/__init__.pyrs` and exposing `kodiak.<Name>` for
+> the names that file binds/re-exports. It is a **re-export/aggregation** layer over
+> the owner-keyed qualified resolution and mangling defined here (§C/§D), NOT the
+> deferred module-as-value type: a re-exported `kodiak.Series` records its TRUE owner
+> (`kodiak.series`) and lowers via the same `emit_name`/`mangle_mod_id` — no new
+> scheme. The dotted `from kodiak.series import …` form here is unchanged and never
+> consults `__init__.pyrs`.
+
 **Module id.** Every module gets a canonical **dotted id** (the import path that
 reached it: `"os"`, `"os.path"`, `"a.b"`; root = the sentinel *root*). This id —
 not the file stem — is the key for both qualified resolution and mangling, because

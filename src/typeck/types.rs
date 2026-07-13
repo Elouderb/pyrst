@@ -384,6 +384,32 @@ pub struct ModuleSymbols {
     pub consts: HashMap<String, Ty>,
 }
 
+/// (bare-package-import, card 89408863) The KIND of a package public-surface
+/// entry, so a `<pkg>.<Name>` access dispatches to the right machinery (a call, a
+/// construction, or a constant read) without re-deriving it at every use site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SurfaceKind {
+    Func,
+    Class,
+    Const,
+}
+
+/// (bare-package-import, card 89408863) One entry in a package's public surface:
+/// the TRUE OWNER module id + original name a surfaced `<pkg>.<Name>` redirects to.
+/// For a name DEFINED in `<pkg>/__init__.pyrs` itself the owner is `<pkg>`; for a
+/// `from <pkg>.<sub> import <Name>` RE-EXPORT the owner is the true `<pkg>.<sub>`.
+/// This redirect is the load-bearing detail (AC2): codegen mangles a surfaced name
+/// against `owner` via the EXISTING owner-keyed mangler (`emit_name`/`emit_class_name`/
+/// `mangle_const`), never against `<pkg>`, so `kodiak.Series` lowers to
+/// `__pyrst_m_kodiak_dseries__Series`, not a `kodiak`-owned name. In v1 (no `as`
+/// aliasing) `name` always equals the surface key.
+#[derive(Debug, Clone)]
+pub struct PackageExport {
+    pub owner: String,
+    pub name: String,
+    pub kind: SurfaceKind,
+}
+
 /// (W3-2) `Clone` supports a per-module CHECKING overlay: when typeck checks a
 /// NON-ROOT module's body, it clones the ctx and promotes that module's OWN
 /// top-level funcs over the flat table so an INTERNAL bare call resolves to the
@@ -428,6 +454,19 @@ pub struct TyCtx {
     /// this stage only builds it (emission stays flat). Built by the resolver over
     /// the resolved module set; empty on the LSP single-file path.
     pub import_bindings: HashMap<String, HashMap<String, (String, String)>>,
+    /// (bare-package-import, card 89408863) The PUBLIC SURFACE of each package that
+    /// has a `<pkg>/__init__.pyrs` entry file, keyed by the package's dotted id
+    /// (`"kodiak"`): `surface_name → PackageExport{true_owner, name, kind}`. Built
+    /// by the resolver from the init module's top-level bindings — its own
+    /// def/class/const definitions (owner `<pkg>`) AND the names it re-exports via
+    /// `from <pkg>.<sub> import <Name>` (owner the true `<pkg>.<sub>`). A bare
+    /// `import <pkg>` resolves `<pkg>.<Name>` against this table; `from <pkg> import
+    /// <Name>` redirects its local binding through it (both to the TRUE owner).
+    /// EMPTY for every program that imports no such package, so every consulting
+    /// branch (`is_package` / `package_export`) is inert — the resolution invariant
+    /// that keeps `test_all.sh` at baseline. Re-export is PACKAGE-INIT-SPECIFIC: a
+    /// regular module's `from`-imports stay local-only (not surfaced here).
+    pub package_exports: HashMap<String, HashMap<String, PackageExport>>,
     /// Qualified-module-call support: an IMPORTED file/stdlib module's NAME (its
     /// source-file stem, e.g. `"os"`) → the names of the top-level functions that
     /// module defines. Populated by `merge_ctx_from_module` for NON-ROOT modules
@@ -697,7 +736,7 @@ impl TyCtx {
         // function is merged in, so the keyword→positional mapper can tell a
         // real user signature from a builtin stub (see `builtin_funcs` docs).
         let builtin_funcs: std::collections::HashSet<String> = funcs.keys().cloned().collect();
-        Self { funcs, classes: HashMap::new(), vars, module_symbols: HashMap::new(), func_owner: HashMap::new(), class_owner: HashMap::new(), const_owner: HashMap::new(), import_bindings: HashMap::new(), module_funcs: HashMap::new(), module_consts: HashMap::new(), generic_funcs: HashMap::new(), generic_func_bodies: HashMap::new(), generic_classes: HashMap::new(), builtin_funcs, hash_key_classes: std::collections::HashSet::new(), promoted_consts: std::collections::HashMap::new(), root_defined: std::collections::HashSet::new(), mutable_globals: std::collections::HashMap::new(), module_level_bindings: std::collections::HashMap::new(), handle_classes: std::collections::HashSet::new() }
+        Self { funcs, classes: HashMap::new(), vars, module_symbols: HashMap::new(), func_owner: HashMap::new(), class_owner: HashMap::new(), const_owner: HashMap::new(), import_bindings: HashMap::new(), package_exports: HashMap::new(), module_funcs: HashMap::new(), module_consts: HashMap::new(), generic_funcs: HashMap::new(), generic_func_bodies: HashMap::new(), generic_classes: HashMap::new(), builtin_funcs, hash_key_classes: std::collections::HashSet::new(), promoted_consts: std::collections::HashMap::new(), root_defined: std::collections::HashSet::new(), mutable_globals: std::collections::HashMap::new(), module_level_bindings: std::collections::HashMap::new(), handle_classes: std::collections::HashSet::new() }
     }
 
     /// (W4-a) Whether module `owner` (`None` = root) has a promoted mutable global
@@ -763,6 +802,33 @@ impl TyCtx {
     /// the flat table agree for every real program — the per-module table only
     /// DIVERGES (correctly) when the ROOT shadows an imported name, a case the
     /// flat table cannot express and no golden exercises.
+    /// (bare-package-import, card 89408863) Is `id` a package with a resolved
+    /// `__init__.pyrs` public surface? True ONLY when a program actually imported
+    /// such a package (the map is otherwise empty), so every caller stays inert on
+    /// the no-package path.
+    pub fn is_package(&self, id: &str) -> bool {
+        self.package_exports.contains_key(id)
+    }
+
+    /// (bare-package-import, card 89408863) Resolve `<pkg>.<name>` against the
+    /// package public surface to its TRUE-OWNER redirect, or `None` when `pkg` has
+    /// no `__init__` surface OR the surface has no such public name.
+    pub fn package_export(&self, pkg: &str, name: &str) -> Option<&PackageExport> {
+        self.package_exports.get(pkg).and_then(|s| s.get(name))
+    }
+
+    /// (bare-package-import, card 89408863) The sorted public names of `pkg`'s
+    /// surface — the "available: …" hint for an honest surface-miss error.
+    pub fn package_surface_names(&self, pkg: &str) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .package_exports
+            .get(pkg)
+            .map(|s| s.keys().cloned().collect())
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
     pub fn resolve_module_func(&self, module_id: &str, name: &str) -> Option<&FuncSig> {
         self.module_symbols
             .get(module_id)

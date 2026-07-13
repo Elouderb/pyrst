@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use crate::ast::{Module, Stmt};
 use crate::diag::{Error, Result, Span};
-use crate::typeck::TyCtx;
+use crate::typeck::{PackageExport, SurfaceKind, TyCtx};
 
 /// Result of resolving all imports from a root file.
 /// Modules are in topological order (dependencies before dependents).
@@ -58,6 +58,12 @@ struct Resolver {
     /// instead of `ImportNotFound`. `None` ⇒ the resolver is byte-for-byte the
     /// pre-packaging resolver.
     active_env: Option<PathBuf>,
+    /// (bare-package-import, card 89408863) The dotted ids of every package that
+    /// resolved via a `<pkg>/__init__.pyrs` ENTRY file (`import kodiak` hitting a
+    /// directory with an `__init__.pyrs`). Consumed AFTER merge to build the
+    /// per-package public-surface table (`ctx.package_exports`). EMPTY for every
+    /// program that imports no such package (the byte-unchanged no-package path).
+    package_init_ids: HashSet<String>,
 }
 
 impl Resolver {
@@ -83,6 +89,7 @@ impl Resolver {
             overlay: HashMap::new(),
             search_dirs,
             active_env,
+            package_init_ids: HashSet::new(),
         }
     }
 
@@ -292,23 +299,38 @@ impl Resolver {
                     let dep_src = crate::lexer::normalize_line_endings(embedded_src);
                     self.process_module(dep_key, dep_src, &stdlib_dir, *span, Some(mod_id.clone()))?;
                 } else if let Some(pkg_dir) = self.package_dir_for(path, base_dir) {
-                    // (AC2, card 587a9dcb) No `<mod>.pyrs` resolved, but a same-named
-                    // DIRECTORY exists where a module was expected (root-relative, the
-                    // env store `<env>/packages/<mod>/`, or a `$PYRST_PATH` entry).
-                    // The name is a PACKAGE (a directory of submodules), not a single
-                    // module — emit the HONEST, actionable error naming a submodule to
-                    // import (and listing what's there), REPLACING the misleading
-                    // env-active `PackageNotInstalled` and no-env `ImportNotFound`.
-                    // Fires ONLY when the directory actually exists, so a genuine
-                    // not-installed / not-found keeps its prior honest error. This is
-                    // exactly what misled the user (`import numpyrs` → "not installed"
-                    // though the package IS installed as `packages/numpyrs/`).
-                    return Err(Error::IsPackageNotModule {
-                        package: mod_id.clone(),
-                        submodules: list_pyrs_submodules(&pkg_dir),
-                        span: *span,
-                        importing_file: key.display().to_string(),
-                    });
+                    // (bare-package-import, card 89408863) No `<mod>.pyrs` resolved,
+                    // but a same-named DIRECTORY exists where a module was expected
+                    // (root-relative, the env store `<env>/packages/<mod>/`, or a
+                    // `$PYRST_PATH` entry). Python-style: if that directory has an
+                    // `__init__.pyrs` ENTRY FILE, resolve IT as the package entry
+                    // module (module_id = the dotted `mod_id`), so a bare `import
+                    // kodiak` works and exposes the surface `__init__.pyrs` publishes.
+                    // The entry module's OWN imports (`from kodiak.series import …`)
+                    // resolve against the SAME `base_dir` + search-dir precedence as
+                    // any other import, so a root-relative package finds its siblings
+                    // directly and an env-store package finds them via the env
+                    // `packages/` search dir — no special base juggling. Record the id
+                    // so the post-merge pass can build its public surface.
+                    let init_path = pkg_dir.join("__init__.pyrs");
+                    if let Ok(init_abs) = init_path.canonicalize() {
+                        self.package_init_ids.insert(mod_id.clone());
+                        self.visit(init_abs, base_dir, *span, Some(mod_id.clone()))?;
+                    } else {
+                        // No entry file → the name is a PACKAGE (a directory of
+                        // submodules) with no bare-import entry point. Emit the HONEST,
+                        // actionable error (reworded for the `__init__.pyrs` era):
+                        // import a submodule, or add `<pkg>/__init__.pyrs`. REPLACES
+                        // the misleading env-active `PackageNotInstalled` / no-env
+                        // `ImportNotFound`; fires ONLY when the directory exists, so a
+                        // genuine not-installed / not-found keeps its prior error.
+                        return Err(Error::IsPackageNotModule {
+                            package: mod_id.clone(),
+                            submodules: list_pyrs_submodules(&pkg_dir),
+                            span: *span,
+                            importing_file: key.display().to_string(),
+                        });
+                    }
                 } else if let Some(env) = &self.active_env {
                     // (PKG Phase 1, §F) An unresolved import WHILE AN ENV IS ACTIVE
                     // is an honest env-aware error: the module is not in the entry
@@ -739,6 +761,115 @@ fn detect_cross_module_collisions(
     Ok(())
 }
 
+/// (bare-package-import, card 89408863) Derive the KIND of a re-exported name by
+/// consulting its TRUE OWNER module's per-module symbol table (populated by merge
+/// for every resolved non-root module). `None` when the owner does not export a
+/// top-level function / class / const of that name — in which case the surface
+/// simply omits it and the dotted-from-import validation in `resolve_with_overlay`
+/// reports the honest "cannot import name …" error for the same `__init__.pyrs`
+/// line, so nothing is silently accepted.
+fn derive_surface_kind(ctx: &TyCtx, owner: &str, name: &str) -> Option<SurfaceKind> {
+    let ms = ctx.module_symbols.get(owner)?;
+    if ms.classes.contains_key(name) {
+        Some(SurfaceKind::Class)
+    } else if ms.funcs.contains_key(name) {
+        Some(SurfaceKind::Func)
+    } else if ms.consts.contains_key(name) {
+        Some(SurfaceKind::Const)
+    } else {
+        None
+    }
+}
+
+/// (bare-package-import, card 89408863) Build the PUBLIC SURFACE of every package
+/// that resolved via a `<pkg>/__init__.pyrs` entry file. The surface exposes, as
+/// `<pkg>.<Name>`, exactly the TOP-LEVEL names bound in `__init__.pyrs`:
+///   - its own `def` / `class` / annotated-const-literal definitions → owner `<pkg>`;
+///   - the names it re-exports via a top-level `from <owner> import <Name>` →
+///     owner the true source module (`kodiak.series`), so codegen mangles a
+///     re-exported name against its REAL defining module, never against `<pkg>`
+///     (AC2, the load-bearing detail).
+///
+/// A name surfaced twice (two re-exports, or a re-export colliding with an
+/// init-own def) is an honest error naming both sources (AC3c). A no-op when
+/// `package_init_ids` is empty (no `__init__.pyrs` resolved).
+fn build_package_exports(
+    order: &[PathBuf],
+    cache: &HashMap<PathBuf, (Module, String)>,
+    package_init_ids: &HashSet<String>,
+    ctx: &mut TyCtx,
+) -> Result<()> {
+    for path in order {
+        let (m, src) = &cache[path];
+        let pkg = match m.module_id.as_deref() {
+            Some(id) if package_init_ids.contains(id) => id.to_string(),
+            _ => continue,
+        };
+        // (surface_name, PackageExport, span) candidates from THIS init module's
+        // top-level statements, in source order.
+        let mut surface: HashMap<String, PackageExport> = HashMap::new();
+        for s in &m.stmts {
+            let candidates: Vec<(String, PackageExport, Span)> = match s {
+                // A non-root init module's `main` is neither merged nor public.
+                Stmt::Func(f) if f.name != "main" => vec![(
+                    f.name.clone(),
+                    PackageExport { owner: pkg.clone(), name: f.name.clone(), kind: SurfaceKind::Func },
+                    f.span,
+                )],
+                Stmt::Class(c) => vec![(
+                    c.name.clone(),
+                    PackageExport { owner: pkg.clone(), name: c.name.clone(), kind: SurfaceKind::Class },
+                    c.span,
+                )],
+                Stmt::Assign { target, ty: Some(_), value, span }
+                    if crate::typeck::is_const_literal(value) =>
+                {
+                    vec![(
+                        target.clone(),
+                        PackageExport { owner: pkg.clone(), name: target.clone(), kind: SurfaceKind::Const },
+                        *span,
+                    )]
+                }
+                // A top-level `from <owner> import <Name>, …` RE-EXPORT. A plain
+                // `import X` (empty `names`) binds no public name — skipped.
+                Stmt::Import { path: ip, names, span } if !names.is_empty() => {
+                    let owner = ip.join(".");
+                    names
+                        .iter()
+                        .filter_map(|(local, _alias)| {
+                            derive_surface_kind(ctx, &owner, local).map(|kind| {
+                                (
+                                    local.clone(),
+                                    PackageExport { owner: owner.clone(), name: local.clone(), kind },
+                                    *span,
+                                )
+                            })
+                        })
+                        .collect()
+                }
+                _ => Vec::new(),
+            };
+            for (sname, entry, span) in candidates {
+                if let Some(prev) = surface.get(&sname) {
+                    return Err(Error::Type {
+                        span,
+                        msg: format!(
+                            "package `{}`'s `__init__.pyrs` surfaces the public name \
+                             `{}` more than once — from `{}` and from `{}`; a package's \
+                             public surface must have unique names (rename or drop one)",
+                            pkg, sname, prev.owner, entry.owner
+                        ),
+                    })
+                    .map_err(|e| e.with_render_source(m.source_path.clone(), src));
+                }
+                surface.insert(sname, entry);
+            }
+        }
+        ctx.package_exports.insert(pkg, surface);
+    }
+    Ok(())
+}
+
 /// Resolve all imports from a root .pyrs file and return a merged program.
 ///
 /// This is the CLI entry point (`pyrst check`/`build`/`emit` + the REPL): it
@@ -762,7 +893,7 @@ pub fn resolve_with_overlay(
     root_path: &Path,
     overlay: &HashMap<PathBuf, String>,
 ) -> Result<ResolvedProgram> {
-    let abs_root = root_path.canonicalize().map_err(|e| crate::diag::Error::Io(e))?;
+    let abs_root = root_path.canonicalize().map_err(crate::diag::Error::Io)?;
     let root_dir = abs_root.parent().unwrap_or_else(|| Path::new("."));
 
     // (card 587a9dcb) Anchor env discovery on the ROOT FILE's directory, so the
@@ -810,6 +941,13 @@ pub fn resolve_with_overlay(
             .map_err(|e| e.with_render_source(render_path, src))?;
     }
 
+    // (bare-package-import, card 89408863) Build each package's PUBLIC SURFACE from
+    // its `__init__.pyrs` entry module's top-level bindings — BEFORE the from-import
+    // binding loop below, which redirects `from <pkg> import Name` through it. Runs
+    // AFTER merge so per-module symbol tables (used to derive each re-export's kind)
+    // are populated. A no-op when no package resolved via an `__init__.pyrs`.
+    build_package_exports(&resolver.order, &resolver.cache, &resolver.package_init_ids, &mut ctx)?;
+
     // (W3-1) Build the from-import local-binding map: `from X import f` records
     // `f -> ("X", "f")` in the IMPORTING module's scope (the root keyed under
     // ROOT_MODULE_ID; every other module under its own dotted id). Owner-first bare
@@ -844,6 +982,51 @@ pub fn resolve_with_overlay(
                 // (or, when `os.path` has no `join`, caught by the validation below).
                 // Byte-identical for a single-component import (`join(".") == path[0]`).
                 let owner = imp_path.join(".");
+
+                // (bare-package-import, card 89408863) `from <pkg> import Name` where
+                // `<pkg>` is a package with an `__init__.pyrs` surface: REDIRECT the
+                // local binding through the surface to its TRUE OWNER (AC3 companion of
+                // the qualified `pkg.Name` form), so a re-exported `read_csv` binds to
+                // owner `kodiak.io` (mangling to `__pyrst_m_kodiak_dio__read_csv`), an
+                // init-own `version` to owner `kodiak`, never a `kodiak`-owned name for
+                // a re-export. A name NOT in the surface is an honest error (AC3b), not
+                // a silent bind that dies at rustc. This whole block is inert unless a
+                // package resolved via `__init__.pyrs` (`package_exports` empty), and
+                // it takes over from the plain single-component path ONLY for such a
+                // package — a regular module's `from os import getenv` is untouched.
+                if ctx.package_exports.contains_key(&owner) {
+                    for (local, _alias) in names {
+                        match ctx.package_export(&owner, local) {
+                            Some(entry) => {
+                                let redirect = (entry.owner.clone(), entry.name.clone());
+                                ctx.import_bindings
+                                    .entry(importer.clone())
+                                    .or_default()
+                                    .insert(local.clone(), redirect);
+                            }
+                            None => {
+                                let avail = ctx.package_surface_names(&owner);
+                                let avail_hint = if avail.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(" (available: {})", avail.join(", "))
+                                };
+                                return Err(Error::Type {
+                                    span: *span,
+                                    msg: format!(
+                                        "package `{}` has no public name `{}`{}; its \
+                                         `__init__.pyrs` surface exposes only its own \
+                                         top-level definitions and `from {}.<sub> import \
+                                         <name>` re-exports",
+                                        owner, local, avail_hint, owner
+                                    ),
+                                })
+                                .map_err(|e| e.with_render_source(m.source_path.clone(), src));
+                            }
+                        }
+                    }
+                    continue;
+                }
 
                 // (W3-3) DOTTED from-import NAME validation — the honest death of the
                 // from-import truncation. `from os.path import join` must NEVER fall
@@ -1637,5 +1820,234 @@ class Account:
             Err(other) => panic!("expected ImportNotFound, got: {:?}", other),
         }
         let _ = std::fs::remove_dir_all(main.parent().unwrap().parent().unwrap());
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // bare-package-import (card 89408863): `import <pkg>` via `<pkg>/__init__.pyrs`
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Build a temp root dir containing a package `<pkg>/` (with the given
+    /// `__init__.pyrs` + submodule files) and a `main.pyrs`. Returns the main path.
+    /// `files` are `(relpath-under-base, source)`; `<pkg>` submodules live at
+    /// `<base>/<pkg>/<sub>.pyrs` so `from <pkg>.<sub> import …` resolves root-relative.
+    fn temp_pkg_root(files: &[(&str, &str)], main_src: &str) -> PathBuf {
+        let base = std::env::temp_dir().join(format!(
+            "pyrst-pkgimport-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        for (rel, src) in files {
+            let p = base.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, src).unwrap();
+        }
+        let main = base.join("main.pyrs");
+        std::fs::write(&main, main_src).unwrap();
+        main
+    }
+
+    /// The standard fixture: package `kod` with `series.Series` (class),
+    /// `io.read_one` (fn re-exporting Series), and an `__init__.pyrs` that
+    /// re-exports both PLUS defines its own `hello()` and `VERSION`.
+    fn kod_pkg_files() -> Vec<(&'static str, &'static str)> {
+        vec![
+            (
+                "kod/series.pyrs",
+                "class Series:\n    n: int\n    def __init__(self, n: int) -> None:\n        self.n = n\n    def double(self) -> int:\n        return self.n * 2\n",
+            ),
+            (
+                "kod/io.pyrs",
+                "from kod.series import Series\n\ndef read_one(x: int) -> Series:\n    return Series(x)\n",
+            ),
+            (
+                "kod/__init__.pyrs",
+                "from kod.series import Series\nfrom kod.io import read_one\n\nVERSION: str = \"1.0\"\n\ndef hello() -> str:\n    return \"hi\"\n",
+            ),
+        ]
+    }
+
+    #[test]
+    fn import_pkg_with_init_builds_true_owner_surface() {
+        let main = temp_pkg_root(
+            &kod_pkg_files(),
+            "import kod\n\ndef main() -> None:\n    print(kod.hello())\n",
+        );
+        let prog = resolve(&main).expect("`import kod` with kod/__init__.pyrs must resolve");
+        let surface = prog
+            .ctx
+            .package_exports
+            .get("kod")
+            .expect("kod must have a public surface");
+
+        // Re-exported CLASS → TRUE owner kod.series (NOT kod).
+        let s = surface.get("Series").expect("Series is surfaced");
+        assert_eq!(s.owner, "kod.series", "re-exported class owner is the true submodule");
+        assert_eq!(s.kind, SurfaceKind::Class);
+        // Re-exported FUNCTION → TRUE owner kod.io.
+        let r = surface.get("read_one").expect("read_one is surfaced");
+        assert_eq!(r.owner, "kod.io", "re-exported fn owner is the true submodule");
+        assert_eq!(r.kind, SurfaceKind::Func);
+        // Init-OWN def → owner is the package itself.
+        let h = surface.get("hello").expect("hello is surfaced");
+        assert_eq!(h.owner, "kod", "an __init__-own def is owned by the package");
+        assert_eq!(h.kind, SurfaceKind::Func);
+        // Init-OWN const.
+        let v = surface.get("VERSION").expect("VERSION is surfaced");
+        assert_eq!(v.owner, "kod");
+        assert_eq!(v.kind, SurfaceKind::Const);
+
+        let _ = std::fs::remove_dir_all(main.parent().unwrap());
+    }
+
+    /// CODEGEN GOLDEN (AC2, the #1 correctness risk): a qualified `pkg.ReexportedX`
+    /// lowers to its TRUE OWNER's mangled name, never to a `pkg`-owned mis-mangle.
+    #[test]
+    fn qualified_pkg_names_lower_to_true_owner_mangled_name() {
+        let main = temp_pkg_root(
+            &kod_pkg_files(),
+            "import kod\n\ndef main() -> None:\n    s = kod.Series(3)\n    print(s.double())\n    print(kod.read_one(4).double())\n    print(kod.hello())\n    print(kod.VERSION)\n",
+        );
+        let prog = resolve(&main).expect("resolve");
+        let rust = crate::codegen::emit_program(&prog.modules, &prog.ctx).expect("emit");
+
+        // Re-exported class + fn: TRUE owner mangling present.
+        assert!(
+            rust.contains("__pyrst_m_kod_dseries__Series"),
+            "kod.Series(...) must lower to its true owner kod.series"
+        );
+        assert!(
+            rust.contains("__pyrst_m_kod_dio__read_one"),
+            "kod.read_one(...) must lower to its true owner kod.io"
+        );
+        // Init-own def + const: owned by the package.
+        assert!(rust.contains("__pyrst_m_kod__hello"), "kod.hello() -> __init__-owned");
+        assert!(rust.contains("__pyrst_const_kod__VERSION"), "kod.VERSION -> __init__-owned const");
+        // The load-bearing NEGATIVE: NO mis-mangle of a re-export to a kod-owned name.
+        assert!(
+            !rust.contains("__pyrst_m_kod__Series"),
+            "a re-exported class must NOT mis-mangle to a kod-owned name"
+        );
+        assert!(
+            !rust.contains("__pyrst_m_kod__read_one"),
+            "a re-exported fn must NOT mis-mangle to a kod-owned name"
+        );
+
+        let _ = std::fs::remove_dir_all(main.parent().unwrap());
+    }
+
+    #[test]
+    fn from_pkg_import_redirects_binding_to_true_owner() {
+        let main = temp_pkg_root(
+            &kod_pkg_files(),
+            "from kod import read_one\nfrom kod import hello\n\ndef main() -> None:\n    print(read_one(2).double())\n    print(hello())\n",
+        );
+        let prog = resolve(&main).expect("companion `from kod import …` must resolve");
+        let root = prog
+            .ctx
+            .import_bindings
+            .get(crate::typeck::ROOT_MODULE_ID)
+            .expect("root import bindings");
+        // A re-exported fn redirects to its TRUE owner (kod.io), not `kod`.
+        assert_eq!(
+            root.get("read_one"),
+            Some(&("kod.io".to_string(), "read_one".to_string())),
+            "from kod import read_one binds to the true owner kod.io"
+        );
+        // An init-own def redirects to the package itself.
+        assert_eq!(
+            root.get("hello"),
+            Some(&("kod".to_string(), "hello".to_string())),
+            "from kod import hello binds to the package kod"
+        );
+        let _ = std::fs::remove_dir_all(main.parent().unwrap());
+    }
+
+    #[test]
+    fn pkg_without_init_is_honest_error() {
+        // Package dir with a submodule but NO __init__.pyrs.
+        let main = temp_pkg_root(
+            &[("bare/util.pyrs", "def sq(x: int) -> int:\n    return x * x\n")],
+            "import bare\n\ndef main() -> None:\n    print(bare.sq(3))\n",
+        );
+        match resolve(&main) {
+            Err(Error::IsPackageNotModule { package, submodules, .. }) => {
+                assert_eq!(package, "bare");
+                assert_eq!(submodules, vec!["util".to_string()]);
+            }
+            other => panic!("expected IsPackageNotModule, got: {:?}", other.map(|_| ())),
+        }
+        let _ = std::fs::remove_dir_all(main.parent().unwrap());
+    }
+
+    #[test]
+    fn pkg_surface_miss_is_honest_error() {
+        let main = temp_pkg_root(
+            &kod_pkg_files(),
+            "from kod import Nope\n\ndef main() -> None:\n    pass\n",
+        );
+        match resolve(&main) {
+            Err(Error::Sourced { inner, .. }) => match *inner {
+                Error::Type { msg, .. } => assert!(
+                    msg.contains("has no public name `Nope`"),
+                    "surface-miss names the missing public name; got: {}",
+                    msg
+                ),
+                other => panic!("expected Type error, got: {:?}", other),
+            },
+            Err(Error::Type { msg, .. }) => assert!(msg.contains("has no public name `Nope`")),
+            other => panic!("expected surface-miss error, got: {:?}", other.map(|_| ())),
+        }
+        let _ = std::fs::remove_dir_all(main.parent().unwrap());
+    }
+
+    #[test]
+    fn pkg_surface_collision_is_honest_error() {
+        let files = vec![
+            ("dup/a.pyrs", "def thing() -> int:\n    return 1\n"),
+            ("dup/b.pyrs", "def thing() -> int:\n    return 2\n"),
+            (
+                "dup/__init__.pyrs",
+                "from dup.a import thing\nfrom dup.b import thing\n",
+            ),
+        ];
+        let main = temp_pkg_root(&files, "import dup\n\ndef main() -> None:\n    print(dup.thing())\n");
+        match resolve(&main) {
+            Err(Error::Sourced { inner, .. }) => match *inner {
+                Error::Type { msg, .. } => assert!(
+                    msg.contains("more than once") && msg.contains("dup.a") && msg.contains("dup.b"),
+                    "collision names both sources; got: {}",
+                    msg
+                ),
+                other => panic!("expected Type error, got: {:?}", other),
+            },
+            other => panic!("expected collision error, got: {:?}", other.map(|_| ())),
+        }
+        let _ = std::fs::remove_dir_all(main.parent().unwrap());
+    }
+
+    #[test]
+    fn dotted_from_pkg_sub_import_never_consults_init() {
+        // The pre-existing dotted form must resolve WITHOUT triggering __init__.pyrs
+        // resolution — so no package surface is built and the __init__ module is not
+        // even in the program (module count = series + io + root = 3, not 4).
+        let main = temp_pkg_root(
+            &kod_pkg_files(),
+            "from kod.series import Series\nfrom kod.io import read_one\n\ndef main() -> None:\n    print(Series(9).double())\n    print(read_one(4).double())\n",
+        );
+        let prog = resolve(&main).expect("dotted form must resolve");
+        assert!(
+            prog.ctx.package_exports.is_empty(),
+            "the dotted `from kod.series import …` form must NOT build a package surface"
+        );
+        assert_eq!(
+            prog.modules.len(),
+            3,
+            "dotted form pulls in kod.series + kod.io + root only — never kod/__init__.pyrs"
+        );
+        let _ = std::fs::remove_dir_all(main.parent().unwrap());
     }
 }

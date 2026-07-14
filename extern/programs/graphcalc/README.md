@@ -1,38 +1,48 @@
 # graphcalc
 
 A terminal graphing calculator ("Desmos-lite"), written in pyrst. Card
-d949c3e7 (epic 47cafe10, Track A). Enter a function of `x`, see it plotted
-as an ASCII character grid in your terminal.
+d949c3e7 (epic 47cafe10, Track A); retrofitted to a LIVE interactive UI on
+card 4cb345cf. Enter functions of `x` and watch them plotted as a character
+grid that redraws live as you pan, zoom, and edit — built on the `terminal`
+package (`extern/packages/terminal/`).
 
 ## Build + run
 
+graphcalc imports the `terminal` package, so build it with `PYRST_PATH`
+pointing at the packages directory (the driver collects the `crossterm`
+`@crate` dependency and auto-builds a Cargo project):
+
 ```sh
-cd extern/programs/graphcalc
-../../../target/release/pyrst build main.pyrs
+PYRST_PATH=/path/to/pyrst/extern/packages \
+  /path/to/pyrst/target/release/pyrst build extern/programs/graphcalc/main.pyrs
 ./main
 ```
 
-(or, with a debug/dev build of the compiler: `pyrst build main.pyrs` from
-this directory if `pyrst` is on `PATH`.)
+`./main` launches a full-screen, live-redrawing plotter on the alternate
+screen. It needs a real terminal (a TTY) — run it directly in your terminal.
+When stdin/stdout is not a terminal (piped or redirected — as CI or the smoke
+test runs it), graphcalc prints an honest one-line "needs a TTY" message and
+exits 0 rather than crashing.
 
-You'll get a REPL:
+## Interactive controls
 
-```
-graphcalc — a terminal graphing calculator. Type 'help' for commands, 'quit' to exit.
-graphcalc>
-```
+Everything is live: each keypress redraws the plot to the full terminal size.
 
-## Command reference
-
-| Command | Effect |
+| Key | Effect |
 |---|---|
-| `plot <expr>` | Replace the current plot set with a single function of `x`, then draw it. |
-| `add <expr>` | Add another function to the current plot set (distinct glyph), then redraw. |
-| `window xmin xmax [ymin ymax]` | Set the view window (`ymin`/`ymax` optional — auto-scale when omitted), then redraw. |
-| `clear` | Remove all plotted functions. |
-| `table <expr>` | Print a sample table (x, y pairs) for one function over the current x-window. |
-| `help` | List these commands. |
-| `quit` | Exit graphcalc. |
+| arrow keys | Pan the view window (left/right on x, up/down on y). |
+| `+` / `=` | Zoom in (both axes, about the centre). |
+| `-` / `_` | Zoom out. |
+| `f` | Add a function of `x` — a text-entry screen; type the expression and press Enter (Esc cancels). A parse error is shown inline so you can fix it. Each function gets a distinct glyph and colour. |
+| `d` | Delete the last function. |
+| `c` | Clear all functions and reset the window. |
+| `t` | Toggle the value-table view (`x, y` samples for the last function over the current x-window). |
+| `a` | Re-enable y auto-fit (the y-range auto-scales to the data until you pan/zoom y). |
+| `r` | Reset the view window to the default. |
+| `q` / `Esc` / `Ctrl+C` | Quit — the terminal is always fully restored. |
+
+On startup graphcalc opens the add-function text entry so you can plot your
+first function immediately (Esc there starts with an empty plot).
 
 **Expression grammar:** `+ - * / **`, parens, unary minus, the variable `x`,
 constants `pi`/`e`, and the functions `sin cos tan sqrt abs log ln exp floor
@@ -47,16 +57,21 @@ clipped, not treated as a fatal error — see `evaluator.pyrs`'s module
 docstring for exactly how pyrst's `math` module surfaces these (a catchable
 `ValueError`, not a silent `nan`) and how the evaluator normalizes that.
 
-**Blank line / EOF exits the REPL**, exactly like `quit` — see main.pyrs's
-module docstring for why (pyrst's `input()` does not raise on EOF).
+**Not a TTY?** The interactive UI needs raw mode, which requires a real
+terminal. When run with a non-terminal stdin/stdout (piped, redirected, under
+CI, or by `tests/smoke_main.pyrs`), `terminal`'s `Screen.init()` raises an
+`OSError`; graphcalc catches it, prints a one-line "needs a TTY" message, and
+exits 0 — so it degrades honestly instead of crashing or hanging.
 
 ## Layout
 
-- `main.pyrs` — REPL entry point: reads a line via `input()`, and
-  `dispatch(state, line) -> bool` (a plain function taking/returning
-  ordinary values, not tangled up in the I/O loop) does the command
-  parsing/routing, so it's directly callable from a test without going
-  through stdin.
+- `main.pyrs` — the interactive I/O layer (the ONLY file changed by the
+  card-4cb345cf retrofit). It drives the existing pure `render(...)` /
+  `make_table(...)` onto a `terminal.Screen`: `init()`, then
+  `try: run(s) finally: s.close()` so the terminal always restores (on quit,
+  Ctrl+C, and uncaught error); a per-keypress live-redraw loop that sizes the
+  grid from `Screen.size()`; and a key-by-key text-entry screen for functions
+  (raw mode has no `input()`). Contains no plotting math of its own.
 - `expr_parser.pyrs` — tokenizer (`tokenize`) + recursive-descent parser
   (`parse`) producing a flat `Expr` AST (`kind`-tagged, `args: list[Expr]`
   children — no `Optional[Self]` boxing needed). Pure functions; parse
@@ -78,12 +93,15 @@ module docstring for why (pyrst's `input()` does not raise on EOF).
 
 **Status:** fully implemented. `expr_parser` tokenizes + recursive-descent
 parses (with column-pointing parse errors), `evaluator` walks the AST and
-normalizes domain errors to `nan`, `rasterizer` renders the 76x30 ASCII grid
-with auto-scaled y and a sample table, and `main`'s REPL wires every command
-(`plot`/`add`/`window`/`clear`/`table`/`help`/`quit`). Verified by piped
-sessions plotting `sin(x)`, `x**2`, `1/x`, `sqrt(x)`, `-x**2`, `tan(x)` and
-multi-function overlays. See card d949c3e7 for the design log and language
-gaps.
+normalizes domain errors to `nan`, `rasterizer` renders the ASCII grid with
+auto-scaled y and a sample table, and `main` drives that renderer live on a
+`terminal.Screen` (pan/zoom/edit/table, always-restore). Verified by the pure
+golden tests (`test_parser`/`test_evaluator`/`test_rasterizer`), the
+`tests/smoke_main.pyrs` non-TTY smoke (exit 0), a pty-driven interactive run
+(clean alt-screen enter/leave + cursor restore on `q` and Ctrl+C), and a
+Windows cross-check (`cargo check --target x86_64-pc-windows-gnu` on the
+emitted crate — `crossterm` is cross-platform). See cards d949c3e7 (original)
+and 4cb345cf (interactive retrofit) for the design logs.
 
 **Operator precedence note:** unary minus binds *looser* than `**`
 (Python-faithful), so `-x**2` is `-(x**2)` — a downward parabola — not
@@ -100,8 +118,13 @@ would silently flip the single most common calculator input.
 - Multiple simultaneous functions get distinct single-character glyphs,
   round-robined from a fixed set; a plot never crashes on domain errors —
   worst case a function's line has gaps (nan) or runs off an edge (inf).
-- No live redraw: each command prints its plot once. No window-size
-  dependence beyond the fixed 76x30 grid.
-- Only pyrst stdlib is used (`math`, `subprocess` for the smoke test) — no
-  compiler (`src/`/`lib/`) changes. Language gaps encountered along the way
-  are logged on card d949c3e7 prefixed `GAP:`.
+- Live redraw + responsive: the interactive UI redraws on every keypress and
+  sizes the char grid to the current terminal via `Screen.size()` (no fixed
+  76x30). The pure renderer is unchanged — `main.pyrs` just calls it with the
+  computed width/height each frame — so the golden tests, which pin explicit
+  dimensions, are unaffected.
+- Beyond pyrst stdlib (`math`; `subprocess` for the smoke test), the
+  interactive UI depends only on the local `terminal` package
+  (`extern/packages/terminal/`, a cross-platform `crossterm` wrapper) — still
+  no compiler (`src/`/`lib/`) changes. Language gaps are logged on the cards
+  prefixed `GAP:`.

@@ -1,23 +1,42 @@
-# main.pyrs — graphcalc REPL entry point.
+# main.pyrs — graphcalc's LIVE interactive terminal UI.
 #
-# Commands (see README.md for full reference):
-#   plot <expr>                  replace the plot set with a single function
-#   add <expr>                   add another function to the current plot set
-#   window xmin xmax [ymin ymax] set the view window, then redraw
-#   clear                        remove all plotted functions
-#   table <expr>                 print a sample table for one function
-#   help                         list commands
-#   quit                         exit the REPL
+# Retrofit (card 4cb345cf): the old line-based `input("graphcalc> ")` REPL is
+# replaced by a full-screen, live-redrawing plotter built on the `terminal`
+# package (extern/packages/terminal/, card 8e858f68). The PURE logic —
+# expr_parser (parse), evaluator (eval_expr), rasterizer (render / make_table /
+# resolve_window / glyph_for_index) — is UNCHANGED and still golden-tested by
+# test_parser/test_evaluator/test_rasterizer.pyrs. This file only replaces the
+# I/O layer: it drives the existing char-grid renderer onto a Screen.
 #
-# EOF/blank-line policy (a documented design choice, not a language GAP):
-# pyrst's `input()` builtin wraps Rust's `read_line`, which returns an EMPTY
-# string on EOF WITHOUT blocking or raising — there is no `EOFError` to
-# catch (`input()` at EOF behaves like Python's `input()` under `sys.stdin =
-# io.StringIO("")` would raise EOFError; pyrst instead just returns ""). If
-# the REPL loop is not built to notice this, a piped/closed stdin causes a
-# tight infinite loop (every read_line call returns immediately with "").
-# So: a blank line (either literally typed, or produced by EOF) exits the
-# REPL exactly like `quit`, both here and in the smoke test.
+# Interactive controls (also in README.md):
+#   arrows        pan the view window
+#   + / =         zoom in            - / _   zoom out
+#   f             add a function of x (text entry; Enter plots, Esc cancels)
+#   d             delete the last function        c   clear all functions
+#   t             toggle the value-table view (make_table for the last function)
+#   a             re-enable y auto-fit            r   reset the window
+#   q / Esc / Ctrl+C   quit (terminal always restored)
+#
+# RESTORE (the #1 requirement): the session is `s.init()` then
+# `try: run(s) finally: s.close()`, so the terminal is FULLY restored (raw mode
+# off, alt screen left, cursor shown) on a normal quit, on Ctrl+C (delivered by
+# raw mode as the catchable key "ctrl+c"), AND on any uncaught error — pyrst runs
+# `finally` even when an exception propagates uncaught. See the terminal README.
+#
+# NOT A TTY: `s.init()` raises an OSError-shaped exception when raw mode cannot be
+# enabled (stdout/stdin not a terminal — e.g. piped or redirected, as the
+# tests/smoke_main.pyrs smoke harness runs it). graphcalc catches that, prints an
+# honest one-line message, and exits 0 — it does not crash or hang, and nothing is
+# left to restore (init raises BEFORE entering the alternate screen).
+#
+# RESPONSIVE: every frame reads `s.size()` and sizes the char grid to the current
+# terminal (no fixed 76x30). A terminal too small to hold a legible plot gets an
+# honest message instead of garbage.
+#
+# COORDINATES are (x, y) = (col, row), 0-based from the top-left (the terminal
+# package convention — the opposite of curses' (y, x)).
+
+from terminal import Screen, RED, GREEN, YELLOW, BLUE, MAGENTA, CYAN, WHITE, BRIGHT_BLACK
 
 from expr_parser import parse, Expr
 from rasterizer import (
@@ -27,159 +46,385 @@ from rasterizer import (
     resolve_window,
     render,
     make_table,
-    glyph_for_index,
-    DEFAULT_WIDTH,
-    DEFAULT_HEIGHT
+    glyph_for_index
 )
 
 
-class ReplState:
-    window: Window
-    plots: list[PlotSpec]
-    y_auto: bool
+# Per-function colours, index-aligned with rasterizer.GLYPHS ("*#o.x@"), so
+# function i draws in PALETTE[i] with glyph_for_index(i). Wraps past 6, matching
+# the glyph cycle (an honest, documented limit — not a crash).
+PALETTE: list[int] = [GREEN, CYAN, YELLOW, MAGENTA, RED, BLUE]
 
-    def __init__(self) -> None:
-        self.window = default_window()
-        self.plots = []
-        # y-range auto-scales to the sampled values until the user pins it
-        # with a 4-argument `window xmin xmax ymin ymax`.
-        self.y_auto = True
+# Below these the plot is illegible; show an honest message instead of garbage.
+MIN_COLS: int = 24
+MIN_ROWS: int = 10
 
 
-def split_ws(s: str) -> list[str]:
-    # Whitespace-split with empty fields dropped (pyrst's str.split needs an
-    # explicit separator and has no bare-whitespace form — see README GAP).
-    out: list[str] = []
-    for part in s.split(" "):
-        if part != "":
-            out.append(part)
-    return out
+# ── small string helpers ──────────────────────────────────────────────────────
+
+def clip(text: str, w: int) -> str:
+    # Truncate to at most w columns (prevents line-wrap corrupting the frame).
+    if len(text) > w:
+        return text[0:w]
+    return text
 
 
-def redraw(state: Mut[ReplState]) -> None:
-    # Resolve the (possibly auto-scaled) window, then print the plot once.
-    view: Window = resolve_window(state.plots, state.window, state.y_auto, DEFAULT_WIDTH)
-    print(render(state.plots, view, DEFAULT_WIDTH, DEFAULT_HEIGHT))
+def clip_pad(text: str, w: int) -> str:
+    # Truncate/pad to EXACTLY w columns (for full-width reverse-video bars).
+    if len(text) >= w:
+        return text[0:w]
+    return text + " " * (w - len(text))
 
 
-def do_plot(state: Mut[ReplState], rest: str, replace: bool) -> None:
-    # Shared body for `plot` (replace=True) and `add` (replace=False): parse
-    # the expression, and on a parse error print the message under the input
-    # line instead of crashing the REPL.
-    if rest == "":
-        print("usage: plot <expr>   e.g. plot sin(x)")
+# ── colour-aware grid blitting ────────────────────────────────────────────────
+
+def color_for_char(ch: str, specs: list[PlotSpec]) -> int:
+    # A grid cell holding function i's glyph draws in that function's colour;
+    # axes (" -|+") and blanks draw dim. Glyphs never collide with axis chars
+    # (GLYPHS is "*#o.x@"), so this classification is unambiguous.
+    i: int = 0
+    while i < len(specs):
+        if specs[i].glyph == ch:
+            return PALETTE[i % len(PALETTE)]
+        i += 1
+    return BRIGHT_BLACK
+
+
+def blit_colored_line(s: Screen, y: int, line: str, specs: list[PlotSpec], maxw: int) -> None:
+    # Draw one grid row, colouring each function's glyphs in its palette colour
+    # and axes/blanks dim, batching same-colour runs into one addstr each.
+    n: int = len(line)
+    if n > maxw:
+        n = maxw
+    i: int = 0
+    while i < n:
+        col: int = color_for_char(line[i], specs)
+        run: str = ""
+        j: int = i
+        while j < n and color_for_char(line[j], specs) == col:
+            run += line[j]
+            j += 1
+        s.set_fg(col)
+        s.addstr(i, y, run)
+        i = j
+    s.reset_style()
+
+
+# ── window transforms (pan / zoom / freeze auto-y) ────────────────────────────
+
+def with_frozen_y(specs: list[PlotSpec], window: Window, y_auto: bool, width: int) -> Window:
+    # Return a window whose y-range is concrete: if y_auto, bake the currently
+    # auto-fitted y-range into the window so a subsequent manual pan/zoom on y is
+    # meaningful (and sticks); otherwise return the window unchanged. The caller
+    # sets y_auto = False after calling this.
+    if not y_auto:
+        return window
+    view: Window = resolve_window(specs, window, True, width)
+    return Window(window.xmin, window.xmax, view.ymin, view.ymax)
+
+
+def zoom_window(window: Window, factor: float) -> Window:
+    # Scale both spans by `factor` about the window centre (factor < 1 zooms in).
+    cx: float = (window.xmin + window.xmax) * 0.5
+    cy: float = (window.ymin + window.ymax) * 0.5
+    hx: float = (window.xmax - window.xmin) * 0.5 * factor
+    hy: float = (window.ymax - window.ymin) * 0.5 * factor
+    return Window(cx - hx, cx + hx, cy - hy, cy + hy)
+
+
+# ── frame drawing ─────────────────────────────────────────────────────────────
+
+def draw_status(s: Screen, w: int, specs: list[PlotSpec], window: Window, y_auto: bool, show_table: bool, msg: str) -> None:
+    # Reverse-video status bar on row 0: mode, function count, x-range, y mode.
+    s.set_fg(WHITE)
+    s.reverse(True)
+    s.bold(True)
+    mode: str = "TABLE" if show_table else "PLOT"
+    yflag: str = "auto-y" if y_auto else "man-y"
+    nfn: int = len(specs)
+    xlo: float = window.xmin
+    xhi: float = window.xmax
+    text: str = f" graphcalc [{mode}]  {nfn} fn  x[{xlo:.2f}, {xhi:.2f}]  {yflag} "
+    if msg != "":
+        text = text + "| " + msg + " "
+    s.addstr(0, 0, clip_pad(text, w))
+    s.reset_style()
+
+
+def draw_help(s: Screen, w: int, h: int) -> None:
+    # Reverse-video control legend on the bottom row.
+    s.set_fg(WHITE)
+    s.reverse(True)
+    s.addstr(0, h - 1, clip_pad(" arrows pan  +/- zoom  f add  d del  c clear  t table  a autofit  r reset  q quit ", w))
+    s.reset_style()
+
+
+def draw_table(s: Screen, w: int, h: int, specs: list[PlotSpec], window: Window) -> None:
+    # Value-table view: make_table for the LAST-added function over the current
+    # x-window, sampled to fit the available height.
+    if len(specs) == 0:
+        s.set_fg(YELLOW)
+        s.addstr(0, 2, clip("no function to tabulate — press 'f' to add one, 't' to return to the plot.", w))
+        s.reset_style()
         return
-    try:
-        expr: Expr = parse(rest)
-    except ValueError as e:
-        print("parse error: " + e)
-        return
-    if replace:
-        state.plots = []
-    glyph: str = glyph_for_index(len(state.plots))
-    state.plots.append(PlotSpec(rest, expr, glyph))
-    redraw(state)
+    spec: PlotSpec = specs[len(specs) - 1]
+    xlo: float = window.xmin
+    xhi: float = window.xmax
+    s.set_fg(CYAN)
+    s.bold(True)
+    s.addstr(0, 2, clip(f"table: y = {spec.source}   (x in [{xlo:.2f}, {xhi:.2f}])", w))
+    s.reset_style()
+    steps: int = h - 6
+    if steps < 2:
+        steps = 2
+    if steps > 40:
+        steps = 40
+    tbl: str = make_table(spec.expr, window.xmin, window.xmax, steps)
+    lines: list[str] = tbl.split("\n")
+    i: int = 0
+    n: int = len(lines)
+    while i < n:
+        y: int = 4 + i
+        if y > h - 2:
+            break
+        s.set_fg(GREEN)
+        s.addstr(0, y, clip(lines[i], w))
+        s.reset_style()
+        i += 1
 
 
-def do_window(state: Mut[ReplState], rest: str) -> None:
-    fields: list[str] = split_ws(rest)
-    if len(fields) != 2 and len(fields) != 4:
-        print("usage: window xmin xmax [ymin ymax]")
+def draw_frame(s: Screen, specs: list[PlotSpec], window: Window, y_auto: bool, show_table: bool, msg: str) -> None:
+    # One full redraw: status bar, plot (or table), control legend.
+    size: tuple[int, int] = s.size()
+    w: int = size[0]
+    h: int = size[1]
+    s.clear()
+    if w < MIN_COLS or h < MIN_ROWS:
+        s.set_fg(RED)
+        s.bold(True)
+        s.addstr(0, 0, clip(f"terminal too small — need at least {MIN_COLS}x{MIN_ROWS} (now {w}x{h}). resize me.", w))
+        s.reset_style()
+        s.refresh()
         return
-    try:
-        xmin: float = float(fields[0])
-        xmax: float = float(fields[1])
-        if len(fields) == 4:
-            ymin: float = float(fields[2])
-            ymax: float = float(fields[3])
-            state.window = Window(xmin, xmax, ymin, ymax)
-            state.y_auto = False
+    draw_status(s, w, specs, window, y_auto, show_table, msg)
+    if show_table:
+        draw_table(s, w, h, specs, window)
+        draw_help(s, w, h)
+        s.refresh()
+        return
+
+    # The pure renderer emits: 1 header line + `gh` grid rows + 1 footer line +
+    # a legend (1 "functions:" line + 1 line per spec, or 1 "(no functions)"
+    # line). Rows 1..h-2 hold that block (row 0 = status, row h-1 = help), so
+    # solve gh from the terminal height and the legend size.
+    nspecs: int = len(specs)
+    legend: int = 1
+    if nspecs > 0:
+        legend = 1 + nspecs
+    gw: int = w
+    gh: int = h - 4 - legend
+    if gh < 3:
+        s.set_fg(YELLOW)
+        s.addstr(0, 2, clip("not enough vertical room for the plot + legend — delete a function ('d') or enlarge the terminal.", w))
+        s.reset_style()
+        draw_help(s, w, h)
+        s.refresh()
+        return
+
+    view: Window = resolve_window(specs, window, y_auto, gw)
+    out: str = render(specs, view, gw, gh)
+    lines: list[str] = out.split("\n")
+    idx: int = 0
+    n: int = len(lines)
+    while idx < n:
+        y: int = 1 + idx
+        if y > h - 2:
+            break
+        # Grid rows are lines[1 .. gh]; colour those, plain-draw the rest.
+        if idx >= 1 and idx <= gh:
+            blit_colored_line(s, y, lines[idx], specs, w)
         else:
-            state.window = Window(xmin, xmax, state.window.ymin, state.window.ymax)
-            state.y_auto = True
-    except ValueError:
-        print("window bounds must be numbers, e.g. window -10 10")
-        return
-    if xmax <= xmin:
-        print("window error: xmax must be greater than xmin")
-        return
-    redraw(state)
+            s.set_fg(WHITE)
+            s.addstr(0, y, clip(lines[idx], w))
+            s.reset_style()
+        idx += 1
+    draw_help(s, w, h)
+    s.refresh()
 
 
-def do_table(state: Mut[ReplState], rest: str) -> None:
-    if rest == "":
-        print("usage: table <expr>   e.g. table x**2")
-        return
-    try:
-        expr: Expr = parse(rest)
-    except ValueError as e:
-        print("parse error: " + e)
-        return
-    print(make_table(expr, state.window.xmin, state.window.xmax, 20))
+# ── function text entry (blocking getch + visible cursor) ─────────────────────
+
+def edit_function(s: Screen) -> str:
+    # Accumulate a function-of-x expression via getch until Enter (raw mode has
+    # no input(), so we build the string key by key, like terminal_demo). Returns
+    # a PARSE-VALID source string, or "" if the user cancels (Esc / Ctrl+C) or
+    # submits empty. Parse errors are shown inline and keep the user in the editor.
+    buf: str = ""
+    err: str = ""
+    s.show_cursor(True)
+    while True:
+        size: tuple[int, int] = s.size()
+        w: int = size[0]
+        s.clear()
+        s.set_fg(WHITE)
+        s.reverse(True)
+        s.bold(True)
+        s.addstr(0, 0, clip_pad(" graphcalc — add a function of x ", w))
+        s.reset_style()
+        s.set_fg(YELLOW)
+        s.addstr(0, 2, clip("Type a function of x, then press Enter (Esc cancels):", w))
+        s.reset_style()
+        s.set_fg(BRIGHT_BLACK)
+        s.addstr(0, 3, clip("examples:  sin(x)    x**2 - 3    1/x    sqrt(x)+1    -x**2", w))
+        s.reset_style()
+        s.set_fg(CYAN)
+        s.addstr(0, 5, clip("f(x) = " + buf, w))
+        s.reset_style()
+        if err != "":
+            s.set_fg(RED)
+            s.bold(True)
+            s.addstr(0, 7, clip(err, w))
+            s.reset_style()
+        s.move_to(7 + len(buf), 5)
+        s.refresh()
+
+        k: str = s.getch()
+        if k == "enter":
+            s.show_cursor(False)
+            if buf == "":
+                return ""
+            try:
+                dummy: Expr = parse(buf)
+            except ValueError as e:
+                err = "parse error: " + e
+                s.show_cursor(True)
+                continue
+            return buf
+        elif k == "esc" or k == "ctrl+c":
+            s.show_cursor(False)
+            return ""
+        elif k == "backspace":
+            if len(buf) > 0:
+                buf = buf[0:len(buf) - 1]
+                err = ""
+        elif k == "space":
+            buf += " "
+            err = ""
+        elif len(k) == 1:
+            buf += k
+            err = ""
+        # any other special key (arrows, function keys, …) is ignored in entry
 
 
-def split_command(line: str) -> tuple[str, str]:
-    # `line.partition(" ")` gives (head, sep, tail) in one call without
-    # needing str.split()'s unsupported bare-whitespace form (pyrst's
-    # `.split(sep)` requires an explicit separator — see README.md GAP).
-    parts: tuple[str, str, str] = line.partition(" ")
-    head: str = parts[0]
-    tail: str = parts[2]
-    return (head, tail.strip())
+# ── interactive session ───────────────────────────────────────────────────────
+
+def add_function(specs: Mut[list[PlotSpec]], src: str) -> None:
+    # Parse (already validated by edit_function) and append with the next glyph.
+    expr: Expr = parse(src)
+    glyph: str = glyph_for_index(len(specs))
+    specs.append(PlotSpec(src, expr, glyph))
 
 
-def dispatch(state: Mut[ReplState], line: str) -> bool:
-    # Returns False when the REPL should exit, True to keep looping.
-    stripped: str = line.strip()
-    if stripped == "":
-        return False
-    cmd_and_rest: tuple[str, str] = split_command(stripped)
-    cmd: str = cmd_and_rest[0]
-    rest: str = cmd_and_rest[1]
-    # if/elif (not match): the helpers below are called only from these
-    # command arms, and a function reachable ONLY from inside a `match`/`case`
-    # arm is wrongly pruned as dead code (GAP on card d949c3e7 —
-    # typeck's collect_calls_from_stmt has no Stmt::Match arm). if/elif is
-    # walked by the call-collector, so redraw/do_plot/do_window/do_table link.
-    if cmd == "help":
-        print("graphcalc commands:")
-        print("  plot <expr>                  plot a single function of x")
-        print("  add <expr>                   add another function to the plot")
-        print("  window xmin xmax [ymin ymax] set the view window")
-        print("  clear                        remove all plotted functions")
-        print("  table <expr>                 print a sample table")
-        print("  help                         show this message")
-        print("  quit                         exit graphcalc")
-        return True
-    elif cmd == "quit":
-        return False
-    elif cmd == "plot":
-        do_plot(state, rest, True)
-        return True
-    elif cmd == "add":
-        do_plot(state, rest, False)
-        return True
-    elif cmd == "window":
-        do_window(state, rest)
-        return True
-    elif cmd == "clear":
-        state.plots = []
-        state.y_auto = True
-        state.window = default_window()
-        print("cleared all functions.")
-        return True
-    elif cmd == "table":
-        do_table(state, rest)
-        return True
-    else:
-        print("unknown command: " + cmd + " (try 'help')")
-        return True
+def run(s: Screen) -> None:
+    plots: list[PlotSpec] = []
+    window: Window = default_window()
+    y_auto: bool = True
+    show_table: bool = False
+    msg: str = "press 'f' to add a function"
+
+    # Offer the first function immediately (like terminal_demo's opening prompt).
+    first: str = edit_function(s)
+    if first != "":
+        add_function(plots, first)
+        y_auto = True
+        msg = "added f(x) = " + first
+
+    running: bool = True
+    while running:
+        draw_frame(s, plots, window, y_auto, show_table, msg)
+        msg = ""
+        k: str = s.getch()
+        # if/elif (not match): a helper reachable ONLY from inside a match arm is
+        # wrongly pruned as dead code (graphcalc GAP on card d949c3e7), so the
+        # dispatch stays if/elif to keep edit_function/add_function/draw_* linked.
+        if k == "q" or k == "esc" or k == "ctrl+c":
+            running = False
+        elif k == "left":
+            span: float = window.xmax - window.xmin
+            d: float = span * 0.15
+            window = Window(window.xmin - d, window.xmax - d, window.ymin, window.ymax)
+        elif k == "right":
+            span2: float = window.xmax - window.xmin
+            d2: float = span2 * 0.15
+            window = Window(window.xmin + d2, window.xmax + d2, window.ymin, window.ymax)
+        elif k == "up":
+            size_u: tuple[int, int] = s.size()
+            window = with_frozen_y(plots, window, y_auto, size_u[0])
+            y_auto = False
+            spy: float = window.ymax - window.ymin
+            dy: float = spy * 0.15
+            window = Window(window.xmin, window.xmax, window.ymin + dy, window.ymax + dy)
+        elif k == "down":
+            size_d: tuple[int, int] = s.size()
+            window = with_frozen_y(plots, window, y_auto, size_d[0])
+            y_auto = False
+            spy2: float = window.ymax - window.ymin
+            dy2: float = spy2 * 0.15
+            window = Window(window.xmin, window.xmax, window.ymin - dy2, window.ymax - dy2)
+        elif k == "+" or k == "=":
+            size_zi: tuple[int, int] = s.size()
+            window = with_frozen_y(plots, window, y_auto, size_zi[0])
+            y_auto = False
+            window = zoom_window(window, 0.8)
+        elif k == "-" or k == "_":
+            size_zo: tuple[int, int] = s.size()
+            window = with_frozen_y(plots, window, y_auto, size_zo[0])
+            y_auto = False
+            window = zoom_window(window, 1.25)
+        elif k == "f":
+            src: str = edit_function(s)
+            if src != "":
+                add_function(plots, src)
+                y_auto = True
+                msg = "added f(x) = " + src
+        elif k == "d":
+            if len(plots) > 0:
+                dummy2: PlotSpec = plots.pop()
+                y_auto = True
+                msg = "deleted the last function"
+            else:
+                msg = "no functions to delete"
+        elif k == "c":
+            plots = []
+            window = default_window()
+            y_auto = True
+            show_table = False
+            msg = "cleared all functions"
+        elif k == "t":
+            show_table = not show_table
+        elif k == "a":
+            y_auto = True
+            msg = "y auto-fit re-enabled"
+        elif k == "r":
+            window = default_window()
+            y_auto = True
+            msg = "window reset"
+        # any other key is ignored
 
 
 def main() -> None:
-    print("graphcalc — a terminal graphing calculator. Type 'help' for commands, 'quit' to exit.")
-    state: ReplState = ReplState()
-    running: bool = True
-    while running:
-        line: str = input("graphcalc> ")
-        running = dispatch(state, line)
+    s: Screen = Screen()
+    try:
+        s.init()
+    except OSError as e:
+        # Not a terminal (piped/redirected, e.g. the smoke harness): degrade
+        # honestly instead of crashing. Nothing was entered, so nothing to close.
+        print("graphcalc is a live interactive plotter and needs a real terminal (a TTY).")
+        print("run it directly in your terminal:  ./main")
+        print("detail: " + e)
+        return
+    try:
+        run(s)
+    finally:
+        s.close()
+    print("graphcalc — terminal restored. goodbye.")

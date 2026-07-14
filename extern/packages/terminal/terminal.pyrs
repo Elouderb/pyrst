@@ -1,0 +1,271 @@
+# terminal — cross-platform terminal-control essentials for pyrst (curses-lite).
+#
+# Wraps the pure-Rust, cross-platform `crossterm` crate (0.28) through pyrst's
+# `@crate` + `@extern` inline-Rust mechanism — the SAME plumbing `lib/re.pyrs`
+# uses for the `regex` crate. Every `@extern` snippet below is uniformly
+# cross-platform: it uses only `crossterm`'s platform-independent API (which is
+# identical on Unix and Windows — crossterm handles termios vs. the Windows
+# console internally), so there is NO `std::os::unix` and no `#[cfg]` anywhere.
+# A program importing this package auto-builds as a Cargo project (the driver
+# collects the `@crate` deps), so `crossterm` is fetched and linked.
+#
+# COORDINATE CONVENTION: (x, y) = (col, row), 0-based, origin TOP-LEFT. This is
+# the OPPOSITE order from Python's curses (which is (y, x)); it matches
+# crossterm's own `MoveTo(col, row)`. Document it wherever coordinates appear.
+#
+# RESTORE IS THE #1 REQUIREMENT. pyrst does NOT support the context-manager
+# protocol on user classes (`with Screen() as s:` is a compile error — only
+# `with open(...)` is a context manager), so `Screen` exposes explicit
+# `init()` / `close()`. `close()` is IDEMPOTENT and best-effort (it never itself
+# raises), and the MANDATORY usage pattern — enforced in the demo and the README
+# — wraps the session in `try: ... finally: s.close()` so a program that errors
+# or raises mid-session ALWAYS restores the terminal (raw mode off, leaves the
+# alternate screen, shows the cursor). See README.md.
+
+
+# ── Colour constants (module-level) ───────────────────────────────────────────
+# ANSI 16-colour indices. 0..7 are the standard colours, 8..15 the bright
+# variants. `set_fg`/`set_bg` accept any of these; they map to crossterm's named
+# `Color` variants (the basic SGR codes, the most widely supported across
+# terminals AND the Windows console) in `_apply_color` below.
+BLACK: int = 0
+RED: int = 1
+GREEN: int = 2
+YELLOW: int = 3
+BLUE: int = 4
+MAGENTA: int = 5
+CYAN: int = 6
+WHITE: int = 7
+BRIGHT_BLACK: int = 8
+BRIGHT_RED: int = 9
+BRIGHT_GREEN: int = 10
+BRIGHT_YELLOW: int = 11
+BRIGHT_BLUE: int = 12
+BRIGHT_MAGENTA: int = 13
+BRIGHT_CYAN: int = 14
+BRIGHT_WHITE: int = 15
+
+
+# ── Session lifecycle @extern primitives (private) ────────────────────────────
+
+# Enter a full-screen session: enable raw mode, switch to the alternate screen,
+# hide the cursor. Raw mode is enabled FIRST (it is the step that can fail when
+# stdout is not a terminal) so a failure leaves NOTHING to restore — it raises an
+# honest OSError-shaped exception before the alternate screen is entered.
+@crate("crossterm", "0.28")
+@extern
+def _enter() -> None:
+    "{ crossterm::terminal::enable_raw_mode().unwrap_or_else(|e| panic!(\"OSError\\0could not enable raw mode (is stdout a terminal?): {}\", e)); let mut out = std::io::stdout(); if let Err(e) = crossterm::execute!(out, crossterm::terminal::EnterAlternateScreen, crossterm::cursor::Hide) { let _ = crossterm::terminal::disable_raw_mode(); panic!(\"OSError\\0{}\", e); } }"
+
+
+# FULL restore, best-effort: leave the alternate screen, show the cursor, reset
+# all colours/attributes, disable raw mode. EVERY step ignores its own error
+# (`let _ =`) so restore can never itself panic — a half-restored terminal is
+# worse than a swallowed error here. Safe to call more than once.
+@crate("crossterm", "0.28")
+@extern
+def _restore() -> None:
+    "{ let mut out = std::io::stdout(); let _ = crossterm::execute!(out, crossterm::terminal::LeaveAlternateScreen); let _ = crossterm::execute!(out, crossterm::cursor::Show); let _ = crossterm::execute!(out, crossterm::style::ResetColor); let _ = crossterm::terminal::disable_raw_mode(); }"
+
+
+# ── Drawing @extern primitives (private) ──────────────────────────────────────
+# Draw ops QUEUE onto stdout's buffer (no flush); `_refresh` flushes. This gives
+# flicker-free frames: build the whole frame, then flush once.
+
+# Clear the whole screen and home the cursor to (0, 0).
+@crate("crossterm", "0.28")
+@extern
+def _clear() -> None:
+    "{ let mut out = std::io::stdout(); crossterm::queue!(out, crossterm::terminal::Clear(crossterm::terminal::ClearType::All), crossterm::cursor::MoveTo(0, 0)).unwrap_or_else(|e| panic!(\"OSError\\0{}\", e)); }"
+
+
+# Move the cursor to (x, y) = (col, row), 0-based from the top-left.
+@crate("crossterm", "0.28")
+@extern
+def _move_to(x: int, y: int) -> None:
+    "{ let mut out = std::io::stdout(); crossterm::queue!(out, crossterm::cursor::MoveTo({x} as u16, {y} as u16)).unwrap_or_else(|e| panic!(\"OSError\\0{}\", e)); }"
+
+
+# Write text at the current cursor position (no newline translation).
+@crate("crossterm", "0.28")
+@extern
+def _write(s: str) -> None:
+    "{ let mut out = std::io::stdout(); crossterm::queue!(out, crossterm::style::Print({s})).unwrap_or_else(|e| panic!(\"OSError\\0{}\", e)); }"
+
+
+# Flush the queued frame to the terminal.
+@crate("crossterm", "0.28")
+@extern
+def _refresh() -> None:
+    "{ use std::io::Write; let mut out = std::io::stdout(); out.flush().unwrap_or_else(|e| panic!(\"OSError\\0{}\", e)); }"
+
+
+# ── Style @extern primitives (private) ────────────────────────────────────────
+
+# Map an ANSI 0..15 colour index to a crossterm named `Color` and queue it as the
+# foreground (`fg` true) or background (`fg` false). Out-of-range -> Reset
+# (default). One match, shared by set_fg and set_bg.
+@crate("crossterm", "0.28")
+@extern
+def _apply_color(c: int, fg: bool) -> None:
+    "{ let col = match {c} { 0 => crossterm::style::Color::Black, 1 => crossterm::style::Color::DarkRed, 2 => crossterm::style::Color::DarkGreen, 3 => crossterm::style::Color::DarkYellow, 4 => crossterm::style::Color::DarkBlue, 5 => crossterm::style::Color::DarkMagenta, 6 => crossterm::style::Color::DarkCyan, 7 => crossterm::style::Color::Grey, 8 => crossterm::style::Color::DarkGrey, 9 => crossterm::style::Color::Red, 10 => crossterm::style::Color::Green, 11 => crossterm::style::Color::Yellow, 12 => crossterm::style::Color::Blue, 13 => crossterm::style::Color::Magenta, 14 => crossterm::style::Color::Cyan, 15 => crossterm::style::Color::White, _ => crossterm::style::Color::Reset }; let mut out = std::io::stdout(); if {fg} { crossterm::queue!(out, crossterm::style::SetForegroundColor(col)).unwrap_or_else(|e| panic!(\"OSError\\0{}\", e)); } else { crossterm::queue!(out, crossterm::style::SetBackgroundColor(col)).unwrap_or_else(|e| panic!(\"OSError\\0{}\", e)); } }"
+
+
+# Bold on/off.
+@crate("crossterm", "0.28")
+@extern
+def _set_bold(on: bool) -> None:
+    "{ let a = if {on} { crossterm::style::Attribute::Bold } else { crossterm::style::Attribute::NoBold }; let mut out = std::io::stdout(); crossterm::queue!(out, crossterm::style::SetAttribute(a)).unwrap_or_else(|e| panic!(\"OSError\\0{}\", e)); }"
+
+
+# Reverse-video on/off.
+@crate("crossterm", "0.28")
+@extern
+def _set_reverse(on: bool) -> None:
+    "{ let a = if {on} { crossterm::style::Attribute::Reverse } else { crossterm::style::Attribute::NoReverse }; let mut out = std::io::stdout(); crossterm::queue!(out, crossterm::style::SetAttribute(a)).unwrap_or_else(|e| panic!(\"OSError\\0{}\", e)); }"
+
+
+# Reset all attributes AND colours to the terminal default.
+@crate("crossterm", "0.28")
+@extern
+def _reset_style() -> None:
+    "{ let mut out = std::io::stdout(); crossterm::queue!(out, crossterm::style::SetAttribute(crossterm::style::Attribute::Reset), crossterm::style::ResetColor).unwrap_or_else(|e| panic!(\"OSError\\0{}\", e)); }"
+
+
+# Show (`on` true) or hide (`on` false) the cursor. Applied immediately.
+@crate("crossterm", "0.28")
+@extern
+def _show_cursor(on: bool) -> None:
+    "{ let mut out = std::io::stdout(); if {on} { crossterm::execute!(out, crossterm::cursor::Show).unwrap_or_else(|e| panic!(\"OSError\\0{}\", e)); } else { crossterm::execute!(out, crossterm::cursor::Hide).unwrap_or_else(|e| panic!(\"OSError\\0{}\", e)); } }"
+
+
+# ── Input @extern primitives (private) ────────────────────────────────────────
+
+# Read ONE terminal event (blocking) and return its pyrst-native name, or "" for
+# a non-key / key-release / unmapped event (the caller decides whether to loop or
+# treat "" as "no key"). Mapping: a printable char -> that char; SPACE -> "space";
+# ctrl+<letter> -> "ctrl+<letter>" (raw mode delivers ctrl+c as a key event, so it
+# is catchable rather than killing the program); the specials -> their names. Key
+# RELEASE events (which the Windows console emits, Unix does not) are dropped so a
+# keypress never double-reports — this keeps behaviour identical on both OSes.
+@crate("crossterm", "0.28")
+@extern
+def _read_event_key() -> str:
+    "{ use crossterm::event::{read, Event, KeyCode, KeyEventKind, KeyModifiers}; match read().unwrap_or_else(|e| panic!(\"OSError\\0{}\", e)) { Event::Key(k) if k.kind != KeyEventKind::Release => match k.code { KeyCode::Char(c) => { if k.modifiers.contains(KeyModifiers::CONTROL) && c.is_ascii_alphabetic() { format!(\"ctrl+{}\", c.to_ascii_lowercase()) } else if c == ' ' { \"space\".to_string() } else { c.to_string() } }, KeyCode::Enter => \"enter\".to_string(), KeyCode::Esc => \"esc\".to_string(), KeyCode::Backspace => \"backspace\".to_string(), KeyCode::Tab => \"tab\".to_string(), KeyCode::BackTab => \"backtab\".to_string(), KeyCode::Left => \"left\".to_string(), KeyCode::Right => \"right\".to_string(), KeyCode::Up => \"up\".to_string(), KeyCode::Down => \"down\".to_string(), KeyCode::Home => \"home\".to_string(), KeyCode::End => \"end\".to_string(), KeyCode::PageUp => \"pageup\".to_string(), KeyCode::PageDown => \"pagedown\".to_string(), KeyCode::Delete => \"delete\".to_string(), KeyCode::Insert => \"insert\".to_string(), KeyCode::F(n) => format!(\"f{}\", n), _ => String::new() }, _ => String::new() } }"
+
+
+# True iff an event is ready within `ms` milliseconds (crossterm's non-blocking
+# poll). When true, a following `_read_event_key()` is guaranteed not to block.
+@crate("crossterm", "0.28")
+@extern
+def _poll_event(ms: int) -> bool:
+    "crossterm::event::poll(std::time::Duration::from_millis({ms} as u64)).unwrap_or(false)"
+
+
+# Terminal size as (cols, rows). Raises OSError-shaped if the size is unavailable.
+@crate("crossterm", "0.28")
+@extern
+def _size() -> tuple[int, int]:
+    "{ let (c, r) = crossterm::terminal::size().unwrap_or_else(|e| panic!(\"OSError\\0{}\", e)); (c as i64, r as i64) }"
+
+
+# ── Screen: the session handle (curses-lite) ──────────────────────────────────
+# All coordinates are (x, y) = (col, row), 0-based from the top-left.
+#
+#   s = Screen()
+#   s.init()
+#   try:
+#       ...                 # draw / input loop
+#   finally:
+#       s.close()           # ALWAYS restores, even on error
+class Screen:
+    # True between init() and close(); makes close() idempotent.
+    _active: bool
+
+    def __init__(self) -> None:
+        self._active = False
+
+    # Begin the session: raw mode + alternate screen + hidden cursor. Raises an
+    # OSError-shaped exception if raw mode cannot be enabled (e.g. not a tty).
+    def init(self) -> None:
+        if self._active:
+            return
+        _enter()
+        self._active = True
+
+    # End the session and FULLY restore the terminal. Idempotent and best-effort.
+    def close(self) -> None:
+        if not self._active:
+            return
+        self._active = False
+        _restore()
+
+    # ── drawing ──
+    # Clear the screen and home the cursor to (0, 0).
+    def clear(self) -> None:
+        _clear()
+
+    # Move the cursor to (x, y) = (col, row).
+    def move_to(self, x: int, y: int) -> None:
+        _move_to(x, y)
+
+    # Write `s` at the current cursor position.
+    def write(self, s: str) -> None:
+        _write(s)
+
+    # Move to (x, y) then write `s` (the common combined op).
+    def addstr(self, x: int, y: int, s: str) -> None:
+        _move_to(x, y)
+        _write(s)
+
+    # Flush the queued frame to the terminal (call once per frame).
+    def refresh(self) -> None:
+        _refresh()
+
+    # ── style ──
+    # Set the foreground colour (one of the module colour constants, 0..15).
+    def set_fg(self, c: int) -> None:
+        _apply_color(c, True)
+
+    # Set the background colour (one of the module colour constants, 0..15).
+    def set_bg(self, c: int) -> None:
+        _apply_color(c, False)
+
+    # Turn bold on/off.
+    def bold(self, on: bool) -> None:
+        _set_bold(on)
+
+    # Turn reverse-video on/off.
+    def reverse(self, on: bool) -> None:
+        _set_reverse(on)
+
+    # Reset all colours and attributes to the default.
+    def reset_style(self) -> None:
+        _reset_style()
+
+    # Show/hide the cursor.
+    def show_cursor(self, on: bool) -> None:
+        _show_cursor(on)
+
+    # ── input ──
+    # Block until one key is pressed; return its name (see _read_event_key).
+    # Printable -> the char; SPACE -> "space"; ctrl+<letter> -> "ctrl+<letter>";
+    # specials -> "up"/"down"/"left"/"right"/"enter"/"esc"/"backspace"/"tab"/
+    # "home"/"end"/"pageup"/"pagedown"/"delete"/"insert"/"backtab"/"f1".."f12".
+    def getch(self) -> str:
+        k: str = _read_event_key()
+        while k == "":
+            k = _read_event_key()
+        return k
+
+    # Non-blocking: wait up to `ms` ms for a key. Returns its name, or "" if no
+    # key arrived in time (essential for games/animation).
+    def getch_timeout(self, ms: int) -> str:
+        if _poll_event(ms):
+            return _read_event_key()
+        return ""
+
+    # ── size ──
+    # Terminal size as (cols, rows).
+    def size(self) -> tuple[int, int]:
+        return _size()

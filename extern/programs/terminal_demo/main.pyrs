@@ -1,0 +1,520 @@
+# terminal_demo — a compact interactive PLOTTER built on the `terminal` package
+# (extern/packages/terminal/): type a function of x, live-plot it to a character
+# grid on the alternate screen; arrow keys pan, +/- zoom, 'f' re-enter the
+# function, 'q' (or Esc / Ctrl+C) quit. A previews-the-graphcalc-retrofit demo.
+#
+# It exercises EVERY terminal API call:
+#   Screen(), init(), close()            — lifecycle (raw mode + alt screen)
+#   clear(), move_to(), write(), addstr(), refresh()   — drawing
+#   set_fg(), set_bg(), bold(), reverse(), reset_style()  — style
+#   getch()                              — blocking input (text entry)
+#   getch_timeout()                      — non-blocking input (animation tick)
+#   size()                               — terminal dimensions
+#   show_cursor()                        — cursor visibility (text entry)
+#   the colour constants                 — BLACK..WHITE, BRIGHT_*
+#
+# ROBUST RESTORE: the whole session runs inside `try: ... finally: s.close()`, so
+# the terminal is FULLY restored (raw mode off, leaves the alt screen, cursor
+# shown) on a normal quit, on Ctrl+C (which raw mode delivers as the catchable
+# key "ctrl+c"), AND on any uncaught exception — pyrst runs `finally` even when an
+# exception propagates uncaught (verified). Nothing can leave the terminal in raw
+# mode.
+#
+# Build & run (from this directory):
+#   PYRST_PATH=/home/ethos/Coding/pyrst/extern/packages \
+#     /home/ethos/Coding/pyrst/target/release/pyrst build main.pyrs
+#   ./main
+#
+# COORDINATES are (x, y) = (col, row), 0-based from the top-left (the package
+# convention — the opposite of curses' (y, x)).
+
+from terminal import Screen
+from terminal import BLACK
+from terminal import RED
+from terminal import GREEN
+from terminal import YELLOW
+from terminal import BLUE
+from terminal import MAGENTA
+from terminal import CYAN
+from terminal import WHITE
+from terminal import BRIGHT_BLACK
+
+from math import sin, cos, tan, sqrt, exp, log, fabs, floor, pi, isfinite
+
+
+# ── tiny expression evaluator (a function of x) ───────────────────────────────
+# A compact recursive-descent parser/evaluator that re-parses per x-sample (a
+# plot is only ~terminal-width samples wide, so this is cheap). It never raises:
+# a structural error sets `ok = False`; a domain error (sqrt of a negative, etc.)
+# simply produces a non-finite value the plotter skips.
+
+FUNCS: list[str] = ["sin", "cos", "tan", "sqrt", "exp", "log", "abs"]
+
+
+# Split an expression into tokens: numbers, identifiers, and single-char symbols.
+def tokenize(src: str) -> list[str]:
+    toks: list[str] = []
+    i: int = 0
+    n: int = len(src)
+    while i < n:
+        ch: str = src[i]
+        if ch == " ":
+            i += 1
+            continue
+        if ch.isdigit() or ch == ".":
+            num: str = ""
+            while i < n and (src[i].isdigit() or src[i] == "."):
+                num += src[i]
+                i += 1
+            toks.append(num)
+            continue
+        if ch.isalpha():
+            ident: str = ""
+            while i < n and src[i].isalpha():
+                ident += src[i]
+                i += 1
+            toks.append(ident)
+            continue
+        toks.append(ch)
+        i += 1
+    return toks
+
+
+# A well-formed decimal number token: at least one digit, at most one dot.
+def is_number(t: str) -> bool:
+    if t == "":
+        return False
+    dots: int = 0
+    digits: int = 0
+    for ch in t:
+        if ch == ".":
+            dots += 1
+        elif ch.isdigit():
+            digits += 1
+        else:
+            return False
+    return digits >= 1 and dots <= 1
+
+
+# Apply a named unary function.
+def apply_func(name: str, arg: float) -> float:
+    if name == "sin":
+        return sin(arg)
+    if name == "cos":
+        return cos(arg)
+    if name == "tan":
+        return tan(arg)
+    if name == "sqrt":
+        return sqrt(arg)
+    if name == "exp":
+        return exp(arg)
+    if name == "log":
+        return log(arg)
+    if name == "abs":
+        return fabs(arg)
+    return arg
+
+
+# Recursive-descent evaluator over a fixed token list for one value of x.
+#   expr  := term  (('+'|'-') term)*
+#   term  := power (('*'|'/') power)*
+#   power := unary ('^' power)?          (right-associative)
+#   unary := ('-'|'+') unary | atom
+#   atom  := number | 'x' | 'pi' | func '(' expr ')' | '(' expr ')'
+class Parser:
+    toks: list[str]
+    pos: int
+    xval: float
+    ok: bool
+
+    def __init__(self, toks: list[str], xval: float) -> None:
+        self.toks = toks
+        self.pos = 0
+        self.xval = xval
+        self.ok = True
+
+    def peek(self) -> str:
+        if self.pos < len(self.toks):
+            return self.toks[self.pos]
+        return ""
+
+    def advance(self) -> str:
+        t: str = self.peek()
+        self.pos += 1
+        return t
+
+    def parse(self) -> float:
+        v: float = self.expr()
+        if self.peek() != "":
+            self.ok = False
+        return v
+
+    def expr(self) -> float:
+        v: float = self.term()
+        while self.peek() == "+" or self.peek() == "-":
+            op: str = self.advance()
+            r: float = self.term()
+            if op == "+":
+                v = v + r
+            else:
+                v = v - r
+        return v
+
+    def term(self) -> float:
+        v: float = self.power()
+        while self.peek() == "*" or self.peek() == "/":
+            op: str = self.advance()
+            r: float = self.power()
+            if op == "*":
+                v = v * r
+            else:
+                v = v / r
+        return v
+
+    def power(self) -> float:
+        v: float = self.unary()
+        if self.peek() == "^":
+            self.advance()
+            r: float = self.power()
+            return powf(v, r)
+        return v
+
+    def unary(self) -> float:
+        if self.peek() == "-":
+            self.advance()
+            return -self.unary()
+        if self.peek() == "+":
+            self.advance()
+            return self.unary()
+        return self.atom()
+
+    def atom(self) -> float:
+        t: str = self.peek()
+        if t == "":
+            self.ok = False
+            return 0.0
+        if t == "(":
+            self.advance()
+            v: float = self.expr()
+            if self.peek() == ")":
+                self.advance()
+            else:
+                self.ok = False
+            return v
+        if t == "x":
+            self.advance()
+            return self.xval
+        if t == "pi":
+            self.advance()
+            return pi
+        if t in FUNCS:
+            self.advance()
+            if self.peek() == "(":
+                self.advance()
+                arg: float = self.expr()
+                if self.peek() == ")":
+                    self.advance()
+                else:
+                    self.ok = False
+                return apply_func(t, arg)
+            self.ok = False
+            return 0.0
+        if is_number(t):
+            self.advance()
+            return float(t)
+        self.ok = False
+        return 0.0
+
+
+# Integer power via repeated math (avoids depending on int/float pow overloads):
+# use exp/log for a general real power, falling back to a NaN on invalid domains.
+def powf(base: float, ex: float) -> float:
+    if base > 0.0:
+        return exp(ex * log(base))
+    if base == 0.0:
+        if ex > 0.0:
+            return 0.0
+        return nan()
+    # negative base: only integer exponents are real-valued
+    r: int = iround(ex)
+    if float(r) == ex:
+        acc: float = 1.0
+        k: int = 0
+        m: int = r
+        if m < 0:
+            m = -m
+        while k < m:
+            acc = acc * base
+            k += 1
+        if r < 0:
+            return 1.0 / acc
+        return acc
+    return nan()
+
+
+# Evaluate the token list at x. Returns NaN on a structural error.
+def safe_eval(toks: list[str], x: float) -> float:
+    p: Parser = Parser(toks, x)
+    v: float = p.parse()
+    if not p.ok:
+        return nan()
+    return v
+
+
+# Structural validity (independent of any single x value).
+def expr_valid(toks: list[str]) -> bool:
+    p: Parser = Parser(toks, 1.0)
+    p.parse()
+    return p.ok
+
+
+# ── small numeric/string helpers ──────────────────────────────────────────────
+
+def nan() -> float:
+    return 0.0 / 0.0
+
+
+def iround(f: float) -> int:
+    return int(floor(f + 0.5))
+
+
+# Round to two decimals for compact display; guards non-finite.
+def fmt(f: float) -> str:
+    if not isfinite(f):
+        return "inf"
+    return str(float(iround(f * 100.0)) / 100.0)
+
+
+# Truncate a string to width w.
+def clip(s: str, w: int) -> str:
+    if len(s) > w:
+        return s[0:w]
+    return s
+
+
+# Truncate/pad a string to exactly width w (for full-width reverse bars).
+def clip_pad(s: str, w: int) -> str:
+    if len(s) >= w:
+        return s[0:w]
+    return s + " " * (w - len(s))
+
+
+# Map a math y to a screen row (y=ymax -> top, y=ymin -> bottom).
+def row_of(y: float, ymin: float, ymax: float, top: int, bottom: int) -> int:
+    span: float = ymax - ymin
+    if span == 0.0:
+        return top
+    frac: float = (ymax - y) / span
+    return top + iround(frac * float(bottom - top))
+
+
+# Map a math x to a screen column.
+def col_of(x: float, xmin: float, xmax: float, w: int) -> int:
+    span: float = xmax - xmin
+    if span == 0.0:
+        return 0
+    frac: float = (x - xmin) / span
+    return iround(frac * float(w - 1))
+
+
+# ── drawing ───────────────────────────────────────────────────────────────────
+
+def draw_header(s: Screen) -> None:
+    s.set_fg(WHITE)
+    s.reverse(True)
+    s.bold(True)
+    (w, h) = s.size()
+    s.addstr(0, 0, clip_pad("  pyrst terminal demo  —  live function plotter  ", w))
+    s.reset_style()
+
+
+def draw_frame(s: Screen, expr: str, cx: float, cy: float, xhalf: float, tick: int, sweep: int) -> None:
+    (w, h) = s.size()
+    s.clear()
+    draw_header(s)
+
+    plot_top: int = 2
+    plot_bottom: int = h - 2
+    plot_w: int = w
+    plot_h: int = plot_bottom - plot_top + 1
+    if plot_h < 1 or plot_w < 2:
+        s.refresh()
+        return
+
+    yhalf: float = xhalf * (float(plot_h) / float(plot_w)) * 2.0
+    xmin: float = cx - xhalf
+    xmax: float = cx + xhalf
+    ymin: float = cy - yhalf
+    ymax: float = cy + yhalf
+
+    # status line
+    s.set_fg(CYAN)
+    status: str = "f(x)=" + expr + "   x[" + fmt(xmin) + "," + fmt(xmax) + "]   y[" + fmt(ymin) + "," + fmt(ymax) + "]   t=" + str(tick)
+    s.addstr(0, 1, clip(status, w))
+    s.reset_style()
+
+    toks: list[str] = tokenize(expr)
+    valid: bool = expr_valid(toks)
+
+    # axes (dim)
+    s.set_fg(BRIGHT_BLACK)
+    axis_row: int = row_of(0.0, ymin, ymax, plot_top, plot_bottom)
+    if axis_row >= plot_top and axis_row <= plot_bottom:
+        s.addstr(0, axis_row, "-" * plot_w)
+    axis_col: int = col_of(0.0, xmin, xmax, plot_w)
+    if axis_col >= 0 and axis_col < plot_w:
+        r: int = plot_top
+        while r <= plot_bottom:
+            s.addstr(axis_col, r, "|")
+            r += 1
+        if axis_row >= plot_top and axis_row <= plot_bottom:
+            s.addstr(axis_col, axis_row, "+")
+    s.reset_style()
+
+    if not valid:
+        s.set_fg(RED)
+        s.bold(True)
+        s.addstr(2, plot_top + plot_h // 2, "invalid expression — press 'f' to re-enter")
+        s.reset_style()
+        draw_help(s, w, h)
+        s.refresh()
+        return
+
+    denom: int = plot_w - 1
+    if denom < 1:
+        denom = 1
+
+    # the curve
+    s.set_fg(GREEN)
+    s.bold(True)
+    px: int = 0
+    while px < plot_w:
+        xv: float = xmin + float(px) * (xmax - xmin) / float(denom)
+        yv: float = safe_eval(toks, xv)
+        if isfinite(yv) and yv >= ymin and yv <= ymax:
+            ry: int = row_of(yv, ymin, ymax, plot_top, plot_bottom)
+            if ry >= plot_top and ry <= plot_bottom:
+                s.addstr(px, ry, "*")
+        px += 1
+    s.reset_style()
+
+    # animated sweep marker (advances on each idle getch_timeout tick)
+    mc: int = sweep % plot_w
+    xm: float = xmin + float(mc) * (xmax - xmin) / float(denom)
+    ym: float = safe_eval(toks, xm)
+    if isfinite(ym) and ym >= ymin and ym <= ymax:
+        rm: int = row_of(ym, ymin, ymax, plot_top, plot_bottom)
+        if rm >= plot_top and rm <= plot_bottom:
+            s.set_fg(YELLOW)
+            s.set_bg(RED)
+            s.reverse(True)
+            s.addstr(mc, rm, "O")
+            s.reverse(False)
+            s.set_bg(BLACK)
+            s.reset_style()
+
+    draw_help(s, w, h)
+    s.refresh()
+
+
+def draw_help(s: Screen, w: int, h: int) -> None:
+    s.set_fg(WHITE)
+    s.reverse(True)
+    s.addstr(0, h - 1, clip_pad(" arrows: pan    +/-: zoom    f: edit f(x)    q: quit ", w))
+    s.reset_style()
+
+
+# ── function text entry (exercises blocking getch + show_cursor) ──────────────
+
+def edit_function(s: Screen, current: str) -> str:
+    buf: str = current
+    s.show_cursor(True)
+    while True:
+        (w, h) = s.size()
+        s.clear()
+        draw_header(s)
+        s.set_fg(YELLOW)
+        s.bold(True)
+        s.addstr(0, 2, "Enter a function of x, then press Enter.")
+        s.reset_style()
+        s.set_fg(BRIGHT_BLACK)
+        s.addstr(0, 3, "examples:  sin(x)    x*x - 3    sqrt(x)+1    2^x    x*sin(x)")
+        s.reset_style()
+        s.set_fg(CYAN)
+        s.addstr(0, 5, "f(x) = " + buf)
+        s.reset_style()
+        s.set_fg(BRIGHT_BLACK)
+        s.addstr(0, 7, "[Enter] plot     [Esc] keep current     [Backspace] delete")
+        s.reset_style()
+        s.move_to(7 + len(buf), 5)
+        s.refresh()
+
+        k: str = s.getch()
+        if k == "enter":
+            s.show_cursor(False)
+            if len(buf) == 0:
+                return current
+            return buf
+        if k == "esc" or k == "ctrl+c":
+            s.show_cursor(False)
+            return current
+        if k == "backspace":
+            if len(buf) > 0:
+                buf = buf[0:len(buf) - 1]
+        elif k == "space":
+            buf += " "
+        elif len(k) == 1:
+            buf += k
+        # any other special key is ignored during entry
+
+
+# ── main ──────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    s: Screen = Screen()
+    s.init()
+    try:
+        expr: str = edit_function(s, "sin(x)")
+        cx: float = 0.0
+        cy: float = 0.0
+        xhalf: float = 6.5
+        tick: int = 0
+        sweep: int = 0
+        running: bool = True
+        while running:
+            draw_frame(s, expr, cx, cy, xhalf, tick, sweep)
+
+            # yhalf recomputed here so up/down pan matches the drawn scale
+            (w, h) = s.size()
+            plot_h: int = (h - 2) - 2 + 1
+            plot_w: int = w
+            yhalf: float = 1.0
+            if plot_w >= 2 and plot_h >= 1:
+                yhalf = xhalf * (float(plot_h) / float(plot_w)) * 2.0
+
+            k: str = s.getch_timeout(90)
+            if k == "":
+                tick += 1
+                sweep += 1
+            elif k == "q" or k == "esc" or k == "ctrl+c":
+                running = False
+            elif k == "left":
+                cx -= xhalf * 0.2
+            elif k == "right":
+                cx += xhalf * 0.2
+            elif k == "up":
+                cy += yhalf * 0.2
+            elif k == "down":
+                cy -= yhalf * 0.2
+            elif k == "+" or k == "=":
+                xhalf = xhalf * 0.8
+            elif k == "-" or k == "_":
+                xhalf = xhalf * 1.25
+            elif k == "f":
+                expr = edit_function(s, expr)
+                tick = 0
+                sweep = 0
+            # any other key is ignored
+    finally:
+        s.close()
+    print("terminal demo — terminal restored, goodbye.")

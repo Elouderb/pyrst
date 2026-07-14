@@ -1,0 +1,66 @@
+# smoke_screen — a non-interactive lifecycle smoke for the terminal package.
+#
+# Exercises the whole API in a fixed sequence and exits WITHOUT waiting for a
+# keypress (getch_timeout returns "" quickly), so it can be driven under a pty
+# in CI to confirm: clean exit 0, the alternate screen is entered AND left, the
+# cursor is hidden AND shown, and raw mode is disabled on exit (restore).
+#
+# Build:
+#   PYRST_PATH=/home/ethos/Coding/pyrst/extern/packages \
+#     /home/ethos/Coding/pyrst/target/release/pyrst build smoke_screen.pyrs
+# Run under a tty (needs a terminal; enable_raw_mode fails on a non-tty by design):
+#   ./smoke_screen           # or drive it under a pty
+
+from terminal import Screen
+from terminal import RED
+from terminal import GREEN
+from terminal import YELLOW
+from terminal import CYAN
+from terminal import WHITE
+from terminal import BLACK
+from terminal import BRIGHT_BLACK
+
+
+def main() -> None:
+    s: Screen = Screen()
+    s.init()
+    try:
+        (w, h) = s.size()
+        s.clear()
+
+        # header via addstr + reverse + bold + colours
+        s.set_fg(WHITE)
+        s.set_bg(BLACK)
+        s.reverse(True)
+        s.bold(True)
+        s.addstr(0, 0, "terminal smoke — size " + str(w) + "x" + str(h))
+        s.reset_style()
+
+        # a few move_to + write in different colours
+        s.set_fg(RED)
+        s.move_to(0, 2)
+        s.write("red ")
+        s.set_fg(GREEN)
+        s.write("green ")
+        s.set_fg(YELLOW)
+        s.write("yellow ")
+        s.set_fg(CYAN)
+        s.write("cyan")
+        s.reset_style()
+
+        s.set_fg(BRIGHT_BLACK)
+        s.addstr(0, 4, "(non-interactive smoke; exiting)")
+        s.reset_style()
+        s.refresh()
+
+        # non-blocking input: returns "" fast (no key) — exercises getch_timeout
+        k: str = s.getch_timeout(50)
+        s.addstr(0, 6, "getch_timeout returned: [" + k + "]")
+        s.refresh()
+
+        # cursor visibility toggle
+        s.show_cursor(True)
+        s.show_cursor(False)
+    finally:
+        s.close()
+    print("smoke_screen OK — terminal restored")

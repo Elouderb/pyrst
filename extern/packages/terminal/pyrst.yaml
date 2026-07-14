@@ -1,0 +1,5 @@
+name: terminal
+version: 0.1.0
+package_root: .
+description: Cross-platform terminal-control essentials (curses-lite) for interactive pyrst CLIs, backed by the crossterm crate
+dependencies: []

@@ -1,0 +1,25 @@
+# terminal — package entry (bare `import terminal`, card 89408863 bare-import).
+#
+# Re-exports the public API so `from terminal import Screen, RED` works
+# Python-style. Each name lowers to its TRUE defining submodule
+# (terminal.terminal); the dotted form `from terminal.terminal import Screen`
+# still works unchanged and never consults this file.
+
+from terminal.terminal import Screen
+
+from terminal.terminal import BLACK
+from terminal.terminal import RED
+from terminal.terminal import GREEN
+from terminal.terminal import YELLOW
+from terminal.terminal import BLUE
+from terminal.terminal import MAGENTA
+from terminal.terminal import CYAN
+from terminal.terminal import WHITE
+from terminal.terminal import BRIGHT_BLACK
+from terminal.terminal import BRIGHT_RED
+from terminal.terminal import BRIGHT_GREEN
+from terminal.terminal import BRIGHT_YELLOW
+from terminal.terminal import BRIGHT_BLUE
+from terminal.terminal import BRIGHT_MAGENTA
+from terminal.terminal import BRIGHT_CYAN
+from terminal.terminal import BRIGHT_WHITE

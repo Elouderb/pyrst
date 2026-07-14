@@ -1,31 +1,38 @@
-# e2e_checkers.pyrs — scripted-stdin end-to-end run of a FULL checkers game
-# through the real menu (main), always picking the first listed move.
+# e2e_checkers.pyrs — scripted-stdin end-to-end run through the real menu (main),
+# verifying that picking Checkers under a NON-TTY stdin degrades honestly and the
+# program still exits cleanly (exit 0, no hang).
+#
+# As of the live-board retrofit (card 73098a55), checkers.play_checkers() enters
+# a full-screen `terminal` alt-screen session: s.init() enables raw mode, which
+# REQUIRES a real terminal (a TTY). Under scripted/piped stdin — as this harness
+# runs it — init() raises an OSError-shaped exception BEFORE entering the alt
+# screen; play_checkers() catches it, prints an honest "needs a real terminal"
+# line, and returns to the menu, with nothing left to restore. The interactive
+# game itself (arrow-cursor piece + destination selection, highlighted legal
+# moves, coloured pieces) is verified separately by driving a real PTY; the pure
+# move-gen / rules stay covered by test_checkers.pyrs.
 #
 # USAGE (from extern/programs/tabletop/):
 #   pyrst build main.pyrs
 #   pyrst build tests/e2e_checkers.pyrs
-#   python3 -c "print('3'); [print('1') for _ in range(80)]" | ./e2e_checkers
+#   printf '3\n5\n' | ./e2e_checkers
 #
-# Script: "3" picks Checkers; 80 lines of "1" always take the first legal
-# move offered (including forced captures, since the move list already
-# excludes non-capturing moves when a capture is forced). Manually verified
-# this plays a genuine full game to completion in 46 plies — the player
-# (always taking move #1, i.e. not a strong line) reaches a position with
-# no legal moves and the game correctly prints "You have no legal moves.
-# White (CPU) wins." before returning to the menu; input then runs out and
-# the EOF safety-valve (ui.prompt_int, EOF_GIVEUP=100) exits cleanly rather
-# than hanging.
+# Script: "3" picks Checkers (which degrades to the honest TTY message and
+# returns to the menu), then "5" quits the menu — main exits 0. An exhausted or
+# unexpected script also exits cleanly via the ui.prompt_int EOF safety-valve
+# (EOF_GIVEUP=100) rather than hanging.
 #
 # Same subprocess stdio-inheritance workaround as tests/smoke_main.pyrs
-# (GAP: subprocess.run has no input= piping) — only the exit code is
-# asserted here; correctness of the printed game was verified manually.
+# (GAP: subprocess.run has no input= piping) — capture_output=False INHERITS this
+# process's stdio, so piping into THIS binary flows through to ./main's stdin.
+# Only the exit code is asserted here.
 import subprocess
 
 
 def main() -> None:
     result = subprocess.run(["./main"], capture_output=False)
     if result.returncode == 0:
-        print("PASS: checkers scripted game ran to completion (exit 0)")
+        print("PASS: checkers non-tty degrade returned to menu; main exited cleanly (exit 0)")
     else:
         print(f"FAIL: main exited with code {result.returncode}")
         assert False

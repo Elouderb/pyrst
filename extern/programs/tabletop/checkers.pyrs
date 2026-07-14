@@ -13,7 +13,12 @@
 # -1/-2 white man/king, 0 empty), separated from I/O, and unit-tested in
 # test_checkers.pyrs (forced-capture / multi-jump / promotion / perft-lite).
 
-import ui
+# Live in-place board rendering runs on the `terminal` package (card 8e858f68).
+# NOTE: `terminal` also exports colour constants named RED/WHITE, which would
+# clobber checkers' own RED=+1 / WHITE=-1 SIDE constants below — so we import
+# ONLY the non-colliding colour names and use BRIGHT_RED/BRIGHT_WHITE for the two
+# sides' pieces. The pure move-gen/rules logic keeps using RED/WHITE as sides.
+from terminal import Screen, BLACK, GREEN, BLUE, BRIGHT_BLACK, BRIGHT_RED, BRIGHT_YELLOW, BRIGHT_CYAN, BRIGHT_WHITE
 
 RED: int = 1
 WHITE: int = -1
@@ -330,62 +335,345 @@ def ck_render(b: list[int]) -> str:
     return out
 
 
-# --- interactive game --------------------------------------------------------
+# --- interactive game (live in-place board on the `terminal` alt screen) ------
+#
+# The PURE move-gen/rules above are UNCHANGED — this section only replaces the
+# old line-based presentation + input with a full-screen, live-redrawing board:
+# an arrow-key cursor selects a piece then a destination, legal destinations are
+# highlighted (reusing gen_moves for the hints), colour marks the two sides and
+# kings, and a status line shows the turn / CPU thinking / result. The whole
+# session runs `s.init()` then `try: run_checkers(s) finally: s.close()`, so the
+# terminal is ALWAYS restored — on quit, on Ctrl+C (raw mode delivers it as the
+# catchable key "ctrl+c"), and on any uncaught error. If stdout is not a TTY,
+# init() raises OSError before entering the alt screen; play_checkers() catches
+# that, prints an honest one-liner, and returns to the menu cleanly.
+#
+# COORDINATES are (x, y) = (col, row), 0-based from the top-left (the terminal
+# package convention — the opposite of curses' (y, x)).
 CPU_DEPTH: int = 7
 
+# Piece colours (fg): the two sides + kings (kings additionally drawn bold).
+PIECE_RED_FG: int = BRIGHT_RED
+PIECE_WHITE_FG: int = BRIGHT_WHITE
 
-def play_checkers() -> None:
-    print(ui.title("Checkers"))
-    print("You are Red (r/R), moving up the board. CPU is White (w/W).")
-    print("Captures are forced. Pick a move by its number.")
-    print(ui.hr())
+# Square backgrounds + highlight colours.
+BG_DARK: int = BLACK          # playable (dark) squares — pieces live here
+BG_LIGHT: int = BRIGHT_BLACK  # non-playable (light) squares
+BG_CURSOR: int = BRIGHT_YELLOW  # the roaming cursor square (highest priority)
+BG_SRC: int = BRIGHT_CYAN     # the currently-selected source square
+BG_DST: int = GREEN           # a legal destination for the selected piece
+BG_MOVABLE: int = BLUE        # a piece that has at least one legal move (hint)
 
-    pos: list[int] = new_board()
-    side: int = RED  # player moves first
-    no_capture_plies: int = 0
+# Board geometry: each square is CELLW cols x CELLH rows; the board is centred
+# horizontally and starts at row BOARD_Y0. Sized to fit a standard 80x24.
+CELLW: int = 6
+CELLH: int = 2
+BOARD_Y0: int = 3
+MIN_COLS: int = 8 * CELLW + 5   # board + left margin (ox>=3) + right rank label
+MIN_ROWS: int = BOARD_Y0 + 8 * CELLH + 3
+
+
+# ── small string helpers (frame-safe clipping) ───────────────────────────────
+def ck_clip(text: str, w: int) -> str:
+    if len(text) > w:
+        return text[0:w]
+    return text
+
+
+def ck_clip_pad(text: str, w: int) -> str:
+    if len(text) >= w:
+        return text[0:w]
+    return text + " " * (w - len(text))
+
+
+# ── move-selection helpers (reuse the pure move list for UI hints) ────────────
+def moves_from(moves: list[CMove], src: int) -> list[CMove]:
+    out: list[CMove] = []
+    for m in moves:
+        if m.frm() == src:
+            out.append(m)
+    return out
+
+
+def dsts_of(ms: list[CMove]) -> list[int]:
+    out: list[int] = []
+    for m in ms:
+        out.append(m.dst())
+    return out
+
+
+def src_squares(moves: list[CMove]) -> list[int]:
+    out: list[int] = []
+    for m in moves:
+        f: int = m.frm()
+        if f not in out:
+            out.append(f)
+    return out
+
+
+def move_index_to(moves: list[CMove], src: int, dst: int) -> int:
+    i: int = 0
+    while i < len(moves):
+        if moves[i].frm() == src and moves[i].dst() == dst:
+            return i
+        i = i + 1
+    return -1
+
+
+# ── rendering ─────────────────────────────────────────────────────────────────
+def ck_cell_bg(r: int, c: int, cur_r: int, cur_c: int, sel_src: int,
+               src_dsts: list[int], movable_srcs: list[int]) -> int:
+    if r == cur_r and c == cur_c:
+        return BG_CURSOR
+    sq: int = sq_of(r, c)
+    if sel_src != -1 and sq == sel_src:
+        return BG_SRC
+    if sq in src_dsts:
+        return BG_DST
+    if sq in movable_srcs:
+        return BG_MOVABLE
+    if (r + c) % 2 == 1:
+        return BG_DARK
+    return BG_LIGHT
+
+
+def ck_draw(s: Screen, pos: list[int], cur_r: int, cur_c: int, sel_src: int,
+            src_dsts: list[int], movable_srcs: list[int], side: int,
+            status: str, red_left: int, white_left: int) -> None:
+    size: tuple[int, int] = s.size()
+    cols: int = size[0]
+    rows: int = size[1]
+    s.clear()
+    if cols < MIN_COLS or rows < MIN_ROWS:
+        s.set_fg(BRIGHT_RED)
+        s.bold(True)
+        s.addstr(0, 0, ck_clip("Checkers needs a bigger terminal: " + str(MIN_COLS) + "x" + str(MIN_ROWS) + " min, have " + str(cols) + "x" + str(rows) + ". Resize, then press any key.", cols))
+        s.reset_style()
+        s.refresh()
+        return
+
+    # status bar (row 0, reverse video full width)
+    who: str = "YOU (Red)"
+    if side == WHITE:
+        who = "CPU (White)"
+    s.set_fg(BRIGHT_WHITE)
+    s.reverse(True)
+    s.bold(True)
+    bar: str = " CHECKERS    Red(you): " + str(red_left) + "    White(CPU): " + str(white_left) + "    turn: " + who + " "
+    s.addstr(0, 0, ck_clip_pad(bar, cols))
+    s.reset_style()
+
+    # transient status message (row 1)
+    s.set_fg(BRIGHT_YELLOW)
+    s.addstr(0, 1, ck_clip(status, cols))
+    s.reset_style()
+
+    ox: int = (cols - 8 * CELLW) // 2
+    if ox < 3:
+        ox = 3
+    oy: int = BOARD_Y0
+
+    # file labels (a..h) above and below the board
+    s.set_fg(BRIGHT_BLACK)
+    c: int = 0
+    while c < 8:
+        lx: int = ox + c * CELLW + CELLW // 2
+        letter: str = chr(ord('a') + c)
+        s.addstr(lx, oy - 1, letter)
+        s.addstr(lx, oy + 8 * CELLH, letter)
+        c = c + 1
+    s.reset_style()
+
+    # board: for each square fill its background then draw its piece; rank labels
+    # (8..1) flank each row on both sides.
+    r: int = 0
+    while r < 8:
+        ry: int = oy + r * CELLH + CELLH // 2
+        s.set_fg(BRIGHT_BLACK)
+        s.addstr(ox - 2, ry, str(8 - r))
+        s.addstr(ox + 8 * CELLW + 1, ry, str(8 - r))
+        s.reset_style()
+        c = 0
+        while c < 8:
+            sq: int = sq_of(r, c)
+            bg: int = ck_cell_bg(r, c, cur_r, cur_c, sel_src, src_dsts, movable_srcs)
+            x0: int = ox + c * CELLW
+            y0: int = oy + r * CELLH
+            sub: int = 0
+            while sub < CELLH:
+                s.set_bg(bg)
+                s.addstr(x0, y0 + sub, " " * CELLW)
+                sub = sub + 1
+            v: int = pos[sq]
+            if v != 0:
+                fg: int = PIECE_RED_FG
+                if piece_side(v) == WHITE:
+                    fg = PIECE_WHITE_FG
+                s.set_bg(bg)
+                s.set_fg(fg)
+                if is_king(v):
+                    s.bold(True)
+                s.addstr(x0 + CELLW // 2, y0 + CELLH // 2, ck_glyph(v))
+                s.bold(False)
+                s.reset_style()
+            c = c + 1
+        s.reset_style()
+        r = r + 1
+    s.reset_style()
+
+    # help / legend line
+    help_row: int = oy + 8 * CELLH + 2
+    if help_row >= rows:
+        help_row = rows - 1
+    s.set_fg(BRIGHT_WHITE)
+    s.reverse(True)
+    s.addstr(0, help_row, ck_clip_pad(" arrows: move cursor    enter/space: select/confirm    esc: deselect    q: quit ", cols))
+    s.reset_style()
+    s.refresh()
+
+
+# ── interactive turn: arrow-cursor piece + destination selection ──────────────
+def player_pick_move(s: Screen, pos: list[int], moves: list[CMove], side: int,
+                     red_left: int, white_left: int, intro: str,
+                     start_r: int, start_c: int) -> tuple[int, int, int]:
+    """Player's turn. Returns (move_index_into_moves, cursor_r, cursor_c); the
+    move index is -1 when the player quits (q / Esc-with-nothing-selected /
+    Ctrl+C). Legal destinations are highlighted by reusing the pure move list."""
+    cur_r: int = start_r
+    cur_c: int = start_c
+    sel_src: int = -1
+    forced: bool = len(moves) > 0 and moves[0].is_jump()
+    base_status: str = intro
+    if forced:
+        base_status = base_status + "  Captures are forced!"
+    status: str = base_status
 
     while True:
-        print("")
-        print(ck_render(pos))
-        print(ui.hr())
+        movable: list[int] = []
+        dsts: list[int] = []
+        if sel_src == -1:
+            movable = src_squares(moves)
+        else:
+            dsts = dsts_of(moves_from(moves, sel_src))
+        ck_draw(s, pos, cur_r, cur_c, sel_src, dsts, movable, side, status, red_left, white_left)
 
+        k: str = s.getch()
+        if k == "q" or k == "ctrl+c":
+            return (-1, cur_r, cur_c)
+        elif k == "up":
+            if cur_r > 0:
+                cur_r = cur_r - 1
+        elif k == "down":
+            if cur_r < 7:
+                cur_r = cur_r + 1
+        elif k == "left":
+            if cur_c > 0:
+                cur_c = cur_c - 1
+        elif k == "right":
+            if cur_c < 7:
+                cur_c = cur_c + 1
+        elif k == "esc":
+            if sel_src != -1:
+                sel_src = -1
+                status = base_status
+            else:
+                return (-1, cur_r, cur_c)
+        elif k == "enter" or k == "space":
+            cur_sq: int = sq_of(cur_r, cur_c)
+            if sel_src == -1:
+                cand: list[CMove] = moves_from(moves, cur_sq)
+                if len(cand) > 0:
+                    sel_src = cur_sq
+                    status = "Selected " + alg(cur_sq) + " — pick a green destination. Esc to deselect."
+                else:
+                    status = "No legal move from " + alg(cur_sq) + ".  " + base_status
+            else:
+                mi: int = move_index_to(moves, sel_src, cur_sq)
+                if mi >= 0:
+                    return (mi, cur_r, cur_c)
+                elif cur_sq == sel_src:
+                    sel_src = -1
+                    status = base_status
+                else:
+                    cand2: list[CMove] = moves_from(moves, cur_sq)
+                    if len(cand2) > 0:
+                        sel_src = cur_sq
+                        status = "Selected " + alg(cur_sq) + " — pick a green destination. Esc to deselect."
+                    else:
+                        status = alg(cur_sq) + " is not a legal destination. Esc to deselect."
+        # any other key is ignored
+
+
+def run_checkers(s: Screen) -> None:
+    pos: list[int] = new_board()
+    side: int = RED  # player (Red) moves first
+    no_capture_plies: int = 0
+    cur_r: int = 5   # start the cursor on a Red man (row 5, col 0 is a dark sq)
+    cur_c: int = 0
+    intro: str = "You are Red (r/R), moving up the board."
+
+    while True:
         red_left: int = count_pieces(pos, RED)
         white_left: int = count_pieces(pos, WHITE)
-        print(f"Red pieces: {red_left}   White pieces: {white_left}")
-
         moves: list[CMove] = gen_moves(pos, side)
+
         if len(moves) == 0:
+            end_msg: str = "CPU has no legal moves. You win!  Press any key to return to the menu."
             if side == RED:
-                print("You have no legal moves. White (CPU) wins.")
-            else:
-                print("CPU has no legal moves. You win!")
+                end_msg = "You have no legal moves. White (CPU) wins!  Press any key to return to the menu."
+            ck_draw(s, pos, -1, -1, -1, [], [], side, end_msg, red_left, white_left)
+            ignored0: str = s.getch()
             return
         if no_capture_plies >= 40:
-            print("Draw: 40 plies with no capture.")
+            ck_draw(s, pos, -1, -1, -1, [], [], side, "Draw: 40 plies without a capture. Press any key to return to the menu.", red_left, white_left)
+            ignored1: str = s.getch()
             return
 
         if side == RED:
-            i: int = 0
-            while i < len(moves):
-                print(f"  {i + 1}) {moves[i].label()}")
-                i = i + 1
-            pick: int = ui.prompt_int("Your move #: ", 1, len(moves))
-            chosen: CMove = moves[pick - 1]
+            picked: tuple[int, int, int] = player_pick_move(s, pos, moves, side, red_left, white_left, intro, cur_r, cur_c)
+            idx: int = picked[0]
+            cur_r = picked[1]
+            cur_c = picked[2]
+            if idx < 0:
+                return  # quit back to the menu
+            chosen: CMove = moves[idx]
             pos = ck_apply_move(pos, side, chosen)
-            print(f"You play {chosen.label()}")
             if chosen.is_jump():
                 no_capture_plies = 0
             else:
                 no_capture_plies = no_capture_plies + 1
+            intro = "You played " + chosen.label() + "."
+            side = -side
         else:
-            print("CPU is thinking...")
-            idx: int = choose_cpu_move(pos, side, CPU_DEPTH)
-            chosen2: CMove = moves[idx]
+            # CPU turn: show the "thinking" frame first (it stays on screen while
+            # the blocking minimax search runs), then apply the chosen move.
+            think: str = intro + "  CPU (White) is thinking..." if intro != "" else "CPU (White) is thinking..."
+            ck_draw(s, pos, -1, -1, -1, [], [], side, think, red_left, white_left)
+            cidx: int = choose_cpu_move(pos, side, CPU_DEPTH)
+            chosen2: CMove = moves[cidx]
             pos = ck_apply_move(pos, side, chosen2)
-            print(f"CPU plays {chosen2.label()}")
             if chosen2.is_jump():
                 no_capture_plies = 0
             else:
                 no_capture_plies = no_capture_plies + 1
+            intro = "CPU played " + chosen2.label() + ". Your move."
+            side = -side
 
-        side = -side
+
+def play_checkers() -> None:
+    s: Screen = Screen()
+    try:
+        s.init()
+    except OSError as e:
+        # Not a TTY (piped/redirected, e.g. a scripted-stdin test harness):
+        # degrade honestly instead of crashing or hanging. init() raises BEFORE
+        # entering the alternate screen, so there is nothing to restore.
+        print("Checkers now plays on a live board and needs a real terminal (a TTY).")
+        print("Run it directly in your terminal:  ./main   then choose Checkers.")
+        print("detail: " + e)
+        return
+    try:
+        run_checkers(s)
+    finally:
+        s.close()  # ALWAYS restores: raw mode off, leaves the alt screen, cursor shown
+    print("Checkers — terminal restored. Back to the menu.")

@@ -27,6 +27,40 @@ You'll get a menu:
 Enter a number 1-5. Bad input (non-numeric or out of range) re-prompts
 instead of crashing.
 
+## Checkers — live board (card 73098a55)
+
+Checkers is the pilot for the live-board retrofit: instead of reprinting the
+board once per turn, it opens a full-screen, in-place session on the
+[`terminal`](../../packages/terminal/) package's alternate screen and redraws the
+8x8 board after every move. Pieces are coloured (Red vs White, kings shown bold);
+the square under the cursor, the piece you have selected, and its **legal
+destinations** are highlighted (the highlights reuse the pure move generator, so
+forced captures and multi-jumps are surfaced automatically). A status bar shows
+whose turn it is, the piece counts, "CPU is thinking...", and the win/lose/draw
+result.
+
+Controls (also shown on the bottom help line):
+
+| Key | Action |
+|-----|--------|
+| arrow keys | move the cursor around the board |
+| Enter / Space | select the piece under the cursor, then confirm a destination |
+| Esc | deselect the piece (or, with nothing selected, quit to the menu) |
+| q / Ctrl+C | quit back to the menu |
+
+The terminal is **always restored** — on a normal quit, on Ctrl+C (raw mode
+delivers it as a catchable key, not a signal), and on any error — because the
+session runs `s.init()` then `try: … finally: s.close()`. If it is launched
+without a real terminal (piped/redirected stdin, as the scripted-stdin tests do),
+`init()` raises before entering the alternate screen; checkers prints an honest
+"needs a real terminal" line and returns to the menu instead of crashing or
+hanging. Because it builds on `terminal` (a thin crossterm wrapper), the live
+board is Windows-compatible too (verified via `cargo check --target
+x86_64-pc-windows-gnu`, no `std::os::unix`).
+
+The other three games (blackjack, hold-em, chess) still use the line-based
+one-board-per-turn presentation; retrofitting them is a follow-on pass.
+
 ## Layout
 
 - `main.pyrs` — menu shell; entry point.
@@ -71,8 +105,11 @@ instead of crashing.
 
 ## Design notes
 
-- Turn-based games print a clean board/table **once per turn** — no live
-  console rewriting, no window-size dependence.
+- Presentation: **checkers** now renders a **live in-place board** on the
+  `terminal` alternate screen (redraw per move, colours, move highlighting — see
+  "Checkers — live board" above; card 73098a55). Blackjack, hold-em, and chess
+  still print a clean board/table **once per turn** (no live rewriting, no
+  window-size dependence) pending their own retrofit pass.
 - CPU quality: blackjack = basic strategy + dealer rules; hold-em =
   hand-strength heuristic w/ pot-odds flavor; checkers/chess = depth-limited
   minimax + alpha-beta (material + positional eval), tuned for <2s/move.

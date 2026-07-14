@@ -234,7 +234,7 @@ class stat_result:
 
 @extern
 def _os_stat_raw(p: str) -> tuple[int, float, int]:
-    "{ use std::os::unix::fs::MetadataExt; let m = std::fs::metadata(&{p}).unwrap(); let sz = m.len() as i64; let mt = m.modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64(); let md = m.mode() as i64; (sz, mt, md) }"
+    "{ let m = std::fs::metadata(&{p}).unwrap(); let sz = m.len() as i64; let mt = m.modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64(); #[cfg(unix)] let md: i64 = { use std::os::unix::fs::MetadataExt; m.mode() as i64 }; #[cfg(not(unix))] let md: i64 = { let __perm = if m.permissions().readonly() { 0o444 } else { 0o666 }; let __ty = if m.is_dir() { 0o040000 | 0o111 } else { 0o100000 }; (__ty | __perm) as i64 }; (sz, mt, md) }"
 
 
 def stat(p: str) -> stat_result:

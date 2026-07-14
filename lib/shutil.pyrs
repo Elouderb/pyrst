@@ -64,8 +64,9 @@
 #   - `copytree` drops `ignore`, `copy_function`, `ignore_dangling_symlinks`
 #     (G4: callables not spellable; dangling-symlink detection deferred).
 #     `symlinks: bool = False` IS implemented: when True, a symlink entry is
-#     recreated as a symlink (via `std::fs::read_link` + `std::os::unix::
-#     fs::symlink`); when False (default), Rust's own symlink-following
+#     recreated as a symlink (via `std::fs::read_link` + the platform symlink
+#     primitive `_shutil_make_symlink`, cfg-gated unix/windows); when False
+#     (default), Rust's own symlink-following
 #     `is_dir`/`fs::copy`/`fs::read` transparently dereferences it, so the
 #     "False" branch needs no special-casing.
 #   - `rmtree` drops `onerror`/`onexc` (G4); only `ignore_errors` is
@@ -244,7 +245,7 @@ def _shutil_same_file(a: str, b: str) -> bool:
     # subclass, message `"'<src>' and '<dst>' are the same file"` — note the
     # repr-style quoting, reproduced literally since pyrst has no repr(str)
     # call here).
-    "{ use std::os::unix::fs::MetadataExt; match (std::fs::metadata(&{a}), std::fs::metadata(&{b})) { (Ok(ma), Ok(mb)) => ma.dev() == mb.dev() && ma.ino() == mb.ino(), _ => false } }"
+    "{ #[cfg(unix)] { use std::os::unix::fs::MetadataExt; match (std::fs::metadata(&{a}), std::fs::metadata(&{b})) { (Ok(ma), Ok(mb)) => ma.dev() == mb.dev() && ma.ino() == mb.ino(), _ => false } } #[cfg(not(unix))] { match (std::fs::canonicalize(&{a}), std::fs::canonicalize(&{b})) { (Ok(ca), Ok(cb)) => ca == cb, _ => false } } }"
 
 
 @extern
@@ -254,7 +255,7 @@ def _shutil_read_link(p: str) -> str:
 
 @extern
 def _shutil_make_symlink(target: str, linkpath: str) -> None:
-    "std::os::unix::fs::symlink(&{target}, &{linkpath}).unwrap_or_else(|e| panic!(\"OSError\\0{}\", e))"
+    "{ #[cfg(unix)] { std::os::unix::fs::symlink(&{target}, &{linkpath}).unwrap_or_else(|e| panic!(\"OSError\\0{}\", e)) } #[cfg(windows)] { if std::fs::metadata(&{target}).map(|m| m.is_dir()).unwrap_or(false) { std::os::windows::fs::symlink_dir(&{target}, &{linkpath}) } else { std::os::windows::fs::symlink_file(&{target}, &{linkpath}) }.unwrap_or_else(|e| panic!(\"OSError\\0{}\", e)) } }"
 
 
 @extern

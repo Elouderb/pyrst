@@ -98,7 +98,11 @@ def _tempfile_mkdir_exclusive(p: str) -> bool:
     # silently defeats a private temp dir on a multi-user host. DirBuilderExt::mode
     # pins the perms; the final mode is 0o700&~umask == 0o700 for any umask that
     # only masks group/other bits (the CPython-parity case).
-    "{ use std::os::unix::fs::DirBuilderExt; match std::fs::DirBuilder::new().mode(0o700).create(&{p}) { Ok(()) => true, Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false, Err(e) => panic!(\"OSError\\0{}\", e) } }"
+    # PORTABILITY: the 0o700 owner-only guarantee is a Unix concept. On Windows
+    # (`#[cfg(not(unix))]`) there is no mode(); the dir is created with default
+    # ACLs. `create` still fails if the name already exists, so the
+    # collision-retry contract holds, but WITHOUT the owner-only perms.
+    "{ #[cfg(unix)] { use std::os::unix::fs::DirBuilderExt; match std::fs::DirBuilder::new().mode(0o700).create(&{p}) { Ok(()) => true, Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false, Err(e) => panic!(\"OSError\\0{}\", e) } } #[cfg(not(unix))] { match std::fs::DirBuilder::new().create(&{p}) { Ok(()) => true, Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false, Err(e) => panic!(\"OSError\\0{}\", e) } } }"
 
 
 @extern
@@ -110,7 +114,11 @@ def _tempfile_open_exclusive_fd(p: str) -> int:
     # SECURITY: mode 0o600 (owner-only), matching CPython's mkstemp. Without
     # OpenOptionsExt::mode the file is created 0o666&~umask (world-readable on a
     # default umask), leaking private temp contents on a multi-user host.
-    "{ use std::os::unix::io::AsRawFd; use std::os::unix::fs::OpenOptionsExt; match std::fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(&{p}) { Ok(__f) => { let __fd = __f.as_raw_fd() as i64; std::mem::forget(__f); __fd }, Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => -1, Err(e) => panic!(\"OSError\\0{}\", e) } }"
+    # PORTABILITY: the 0o600 owner-only guarantee is Unix-only. On Windows
+    # (`#[cfg(windows)]`) the file is still opened with create_new (exclusive —
+    # fails if it already exists, preserving the retry contract), but WITHOUT the
+    # owner-only perms; the returned i64 is the raw HANDLE, not a POSIX fd.
+    "{ #[cfg(unix)] { use std::os::unix::io::AsRawFd; use std::os::unix::fs::OpenOptionsExt; match std::fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(&{p}) { Ok(__f) => { let __fd = __f.as_raw_fd() as i64; std::mem::forget(__f); __fd }, Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => -1, Err(e) => panic!(\"OSError\\0{}\", e) } } #[cfg(windows)] { use std::os::windows::io::AsRawHandle; match std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&{p}) { Ok(__f) => { let __h = __f.as_raw_handle() as i64; std::mem::forget(__f); __h }, Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => -1, Err(e) => panic!(\"OSError\\0{}\", e) } } }"
 
 
 def _tempfile_prefix_or_default(prefix: Optional[str]) -> str:

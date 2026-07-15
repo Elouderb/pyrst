@@ -8,7 +8,13 @@
 # checkmate / stalemate detection. Move generation is PURE (operates on a Board
 # value, no I/O) and is exercised by perft in test_chess.pyrs.
 
-import ui
+# Live in-place board rendering runs on the `terminal` package (card 8e858f68).
+# NAME COLLISION: `terminal` also exports colour constants named BLACK and WHITE,
+# which would clobber chess's own WHITE=+1 / BLACK=-1 SIDE constants below — so we
+# import NEITHER colour name, and use BRIGHT_* colours for the pieces plus a local
+# numeric ANSI index for the dark-square background (see the UI section).
+from terminal import Screen, GREEN, BLUE, BRIGHT_BLACK, BRIGHT_RED, BRIGHT_YELLOW, BRIGHT_CYAN, BRIGHT_WHITE
+from ttscreen import clip, clip_pad
 
 WHITE: int = 1
 BLACK: int = -1
@@ -634,75 +640,351 @@ def match_move(legal_moves: list[Move], frm: int, to: int, promo: int) -> int:
 CPU_DEPTH: int = 4
 
 
-def play_chess() -> None:
-    print(ui.title("Chess"))
-    print("You are White (UPPERCASE), CPU is Black (lowercase).")
-    print("Enter moves like 'e2e4' (promotion: 'e7e8q'). Type 'moves' to list")
-    print("legal moves, or 'quit' to resign.")
-    print(ui.hr())
+# --- interactive game (live in-place board on the `terminal` alt screen) -------
+#
+# The PURE chess engine above is UNCHANGED — this section only replaces the old
+# line-based presentation + input with a full-screen, live-redrawing 8x8 board
+# that mirrors the checkers retrofit (card 73098a55): an arrow-key cursor selects
+# a piece then a destination, LEGAL destinations are highlighted (reusing the pure
+# gen_legal move list), the two sides are coloured, the king in check is flagged,
+# a Q/R/B/N sub-prompt handles promotion (reusing gen_legal's promotion moves +
+# match_move), and a status line shows the turn / CHECK / CHECKMATE / STALEMATE /
+# "CPU thinking".
+#
+# The Screen LIFECYCLE is owned by main.pyrs: the whole app is ONE shared
+# alt-screen session — main init()s the Screen once, dispatches play_chess(s) with
+# it, and close()s it once in a finally. play_chess just runs on the passed-in `s`
+# and returns to the menu on quit; main handles the non-TTY degrade.
+#
+# COORDINATES are (x, y) = (col, row), 0-based from the top-left; display row r
+# (rank 8-r) maps directly to board row r, so rank 8 is at the top.
 
-    board: Board = start_board()
+# Piece foreground colours (the glyph's case already encodes the side; colour
+# reinforces it and keeps both sides legible on the dark board).
+PIECE_WHITE_FG: int = BRIGHT_WHITE
+PIECE_BLACK_FG: int = BRIGHT_YELLOW
+
+# Square backgrounds + highlight colours (highest priority first in cx_cell_bg).
+SQ_DARK_BG: int = 0            # ANSI black (terminal.BLACK name avoided — collides)
+SQ_LIGHT_BG: int = BRIGHT_BLACK
+BG_CURSOR: int = BLUE          # the roaming cursor square (highest priority)
+BG_SRC: int = BRIGHT_CYAN      # the currently-selected source square
+BG_DST: int = GREEN            # a legal destination for the selected piece
+BG_CHECK: int = BRIGHT_RED     # the king of the side to move, when it is in check
+
+# Board geometry (matches checkers so the two boards feel identical). Each square
+# is CX_CELLW x CX_CELLH; MIN sized to the same fixed minimum checkers uses (the
+# +5 avoids the right-label off-by-one at the exact boundary).
+CX_CELLW: int = 6
+CX_CELLH: int = 2
+CX_BOARD_Y0: int = 3
+CX_MIN_COLS: int = 8 * CX_CELLW + 5
+CX_MIN_ROWS: int = CX_BOARD_Y0 + 8 * CX_CELLH + 3
+
+
+# ── move-selection helpers (reuse the pure gen_legal list for UI hints) ───────
+def cx_dsts_of_src(legal: list[Move], src: int) -> list[int]:
+    # Distinct legal destinations from `src` (a promoting pawn yields 4 moves to
+    # the same square — dedup so the highlight is one cell, not four).
+    out: list[int] = []
+    for m in legal:
+        if m.frm == src:
+            d: int = m.to
+            if d not in out:
+                out.append(d)
+    return out
+
+
+def cx_has_move_from(legal: list[Move], src: int) -> bool:
+    for m in legal:
+        if m.frm == src:
+            return True
+    return False
+
+
+def cx_dst_is_legal(legal: list[Move], src: int, dst: int) -> bool:
+    for m in legal:
+        if m.frm == src and m.to == dst:
+            return True
+    return False
+
+
+def cx_dst_is_promo(legal: list[Move], src: int, dst: int) -> bool:
+    for m in legal:
+        if m.frm == src and m.to == dst and m.promo != 0:
+            return True
+    return False
+
+
+# ── rendering ─────────────────────────────────────────────────────────────────
+def cx_cell_bg(r: int, c: int, cur_r: int, cur_c: int, sel_src: int,
+               dsts: list[int], check_sq: int) -> int:
+    if r == cur_r and c == cur_c:
+        return BG_CURSOR
+    sq: int = idx(r, c)
+    if sel_src != -1 and sq == sel_src:
+        return BG_SRC
+    if sq in dsts:
+        return BG_DST
+    if check_sq != -1 and sq == check_sq:
+        return BG_CHECK
+    if (r + c) % 2 == 0:
+        return SQ_LIGHT_BG
+    return SQ_DARK_BG
+
+
+def cx_draw(s: Screen, board: Board, cur_r: int, cur_c: int, sel_src: int,
+            dsts: list[int], status: str, check_sq: int) -> None:
+    size: tuple[int, int] = s.size()
+    cols: int = size[0]
+    rows: int = size[1]
+    s.clear()
+    if cols < CX_MIN_COLS or rows < CX_MIN_ROWS:
+        s.set_fg(BRIGHT_RED)
+        s.bold(True)
+        s.addstr(0, 0, clip("Chess needs a bigger terminal: " + str(CX_MIN_COLS) + "x" + str(CX_MIN_ROWS) + " min, have " + str(cols) + "x" + str(rows) + ". Resize, then press any key.", cols))
+        s.reset_style()
+        s.refresh()
+        return
+
+    # status bar (row 0, reverse video full width)
+    who: str = "YOU (White)"
+    if board.stm == BLACK:
+        who = "CPU (Black)"
+    s.set_fg(BRIGHT_WHITE)
+    s.reverse(True)
+    s.bold(True)
+    bar: str = " CHESS    turn: " + who + " "
+    s.addstr(0, 0, clip_pad(bar, cols))
+    s.reset_style()
+
+    # transient status message (row 1)
+    s.set_fg(BRIGHT_YELLOW)
+    s.addstr(0, 1, clip(status, cols))
+    s.reset_style()
+
+    ox: int = (cols - 8 * CX_CELLW) // 2
+    if ox < 3:
+        ox = 3
+    oy: int = CX_BOARD_Y0
+
+    # file labels (a..h) above and below the board
+    s.set_fg(BRIGHT_BLACK)
+    c: int = 0
+    while c < 8:
+        lx: int = ox + c * CX_CELLW + CX_CELLW // 2
+        letter: str = chr(ord('a') + c)
+        s.addstr(lx, oy - 1, letter)
+        s.addstr(lx, oy + 8 * CX_CELLH, letter)
+        c = c + 1
+    s.reset_style()
+
+    # board: fill each square's background, draw its piece; rank labels (8..1)
+    # flank each row on both sides.
+    r: int = 0
+    while r < 8:
+        ry: int = oy + r * CX_CELLH + CX_CELLH // 2
+        s.set_fg(BRIGHT_BLACK)
+        s.addstr(ox - 2, ry, str(8 - r))
+        s.addstr(ox + 8 * CX_CELLW + 1, ry, str(8 - r))
+        s.reset_style()
+        c = 0
+        while c < 8:
+            sq: int = idx(r, c)
+            bg: int = cx_cell_bg(r, c, cur_r, cur_c, sel_src, dsts, check_sq)
+            x0: int = ox + c * CX_CELLW
+            y0: int = oy + r * CX_CELLH
+            sub: int = 0
+            while sub < CX_CELLH:
+                s.set_bg(bg)
+                s.addstr(x0, y0 + sub, " " * CX_CELLW)
+                sub = sub + 1
+            v: int = board.sq[sq]
+            if v != 0:
+                fg: int = PIECE_WHITE_FG
+                if sign(v) == BLACK:
+                    fg = PIECE_BLACK_FG
+                s.set_bg(bg)
+                s.set_fg(fg)
+                s.bold(True)
+                s.addstr(x0 + CX_CELLW // 2, y0 + CX_CELLH // 2, glyph(v))
+                s.bold(False)
+                s.reset_style()
+            c = c + 1
+        s.reset_style()
+        r = r + 1
+    s.reset_style()
+
+    # help / legend line
+    help_row: int = oy + 8 * CX_CELLH + 2
+    if help_row >= rows:
+        help_row = rows - 1
+    s.set_fg(BRIGHT_WHITE)
+    s.reverse(True)
+    s.addstr(0, help_row, clip_pad(" arrows: move cursor    enter/space: select/confirm    esc: deselect    q: quit ", cols))
+    s.reset_style()
+    s.refresh()
+
+
+# ── promotion sub-prompt (modal overlay on the current board frame) ───────────
+def cx_promo_pick(s: Screen) -> int:
+    """Overlay a promotion prompt on the status row and return the chosen piece
+    type (QUEEN/ROOK/BISHOP/KNIGHT), or 0 if cancelled (Esc/Ctrl+C). It does NOT
+    clear the screen, so the board (pawn on its source, cursor on the back-rank
+    destination) stays visible underneath."""
+    while True:
+        size: tuple[int, int] = s.size()
+        cols: int = size[0]
+        s.set_fg(BRIGHT_YELLOW)
+        s.reverse(True)
+        s.bold(True)
+        s.addstr(0, 1, clip_pad(" Promote:  q=Queen  r=Rook  b=Bishop  n=Knight   (Enter=Queen, Esc cancels) ", cols))
+        s.reset_style()
+        s.refresh()
+        k: str = s.getch()
+        if k == "q" or k == "enter":
+            return QUEEN
+        elif k == "r":
+            return ROOK
+        elif k == "b":
+            return BISHOP
+        elif k == "n":
+            return KNIGHT
+        elif k == "esc" or k == "ctrl+c":
+            return 0
+        # any other key re-prompts
+
+
+# ── interactive turn: arrow-cursor piece + destination selection ──────────────
+def player_pick_move_chess(s: Screen, board: Board, legal: list[Move], intro: str,
+                           check_sq: int, start_r: int, start_c: int) -> tuple[int, int, int]:
+    """Human (White) turn. Returns (index_into_legal, cursor_r, cursor_c); the
+    index is -1 when the player quits (q / Esc-with-nothing-selected / Ctrl+C).
+    Legal destinations are highlighted by reusing the pure gen_legal move list; a
+    promotion target opens the Q/R/B/N sub-prompt (match_move maps the choice back
+    to a legal-move index)."""
+    cur_r: int = start_r
+    cur_c: int = start_c
+    sel_src: int = -1
+    base: str = intro
+    if check_sq != -1:
+        base = base + "  CHECK!"
+    status: str = base
 
     while True:
-        print("")
-        print(render(board))
-        print(ui.hr())
+        dsts: list[int] = []
+        if sel_src != -1:
+            dsts = cx_dsts_of_src(legal, sel_src)
+        cx_draw(s, board, cur_r, cur_c, sel_src, dsts, status, check_sq)
 
-        legal_moves: list[Move] = gen_legal(board)
+        k: str = s.getch()
+        if k == "q" or k == "ctrl+c":
+            return (-1, cur_r, cur_c)
+        elif k == "up":
+            if cur_r > 0:
+                cur_r = cur_r - 1
+        elif k == "down":
+            if cur_r < 7:
+                cur_r = cur_r + 1
+        elif k == "left":
+            if cur_c > 0:
+                cur_c = cur_c - 1
+        elif k == "right":
+            if cur_c < 7:
+                cur_c = cur_c + 1
+        elif k == "esc":
+            if sel_src != -1:
+                sel_src = -1
+                status = base
+            else:
+                return (-1, cur_r, cur_c)
+        elif k == "enter" or k == "space":
+            cur_sq: int = idx(cur_r, cur_c)
+            if sel_src == -1:
+                if cx_has_move_from(legal, cur_sq):
+                    sel_src = cur_sq
+                    status = "Selected " + sq_name(cur_sq) + " — pick a green destination. Esc to deselect."
+                else:
+                    status = "No legal move from " + sq_name(cur_sq) + ".  " + base
+            else:
+                if cx_dst_is_legal(legal, sel_src, cur_sq):
+                    promo: int = 0
+                    if cx_dst_is_promo(legal, sel_src, cur_sq):
+                        promo = cx_promo_pick(s)
+                        if promo == 0:
+                            status = "Promotion cancelled — pick a destination. Esc to deselect."
+                            continue
+                    mi: int = match_move(legal, sel_src, cur_sq, promo)
+                    if mi >= 0:
+                        return (mi, cur_r, cur_c)
+                    status = "Could not apply that move. Esc to deselect."
+                elif cur_sq == sel_src:
+                    sel_src = -1
+                    status = base
+                else:
+                    if cx_has_move_from(legal, cur_sq):
+                        sel_src = cur_sq
+                        status = "Selected " + sq_name(cur_sq) + " — pick a green destination. Esc to deselect."
+                    else:
+                        status = sq_name(cur_sq) + " is not a legal destination. Esc to deselect."
+        # any other key is ignored
+
+
+def run_chess(s: Screen) -> None:
+    board: Board = start_board()
+    cur_r: int = 6   # start the cursor on the white e-pawn (e2 = row 6, col 4)
+    cur_c: int = 4
+    intro: str = "You are White (UPPERCASE), moving up the board."
+
+    while True:
+        legal: list[Move] = gen_legal(board)
         checked: bool = in_check(board)
-        if len(legal_moves) == 0:
+        check_sq: int = -1
+        if checked:
+            check_sq = king_square(board.sq, board.stm)
+
+        if len(legal) == 0:
+            msg: str = "STALEMATE — draw. Press any key to return to the menu."
             if checked:
                 if board.stm == WHITE:
-                    print("Checkmate. CPU (Black) wins.")
+                    msg = "CHECKMATE — CPU (Black) wins. Press any key to return to the menu."
                 else:
-                    print("Checkmate. You (White) win!")
-            else:
-                print("Stalemate. Draw.")
+                    msg = "CHECKMATE — you (White) win! Press any key to return to the menu."
+            cx_draw(s, board, -1, -1, -1, [], msg, check_sq)
+            ignored0: str = s.getch()
             return
 
         if board.stm == WHITE:
-            if checked:
-                print("You are in check.")
-            raw: str = ui.prompt_str("Your move: ").lower()
-            if raw == "quit" or raw == "resign":
-                print("You resign. CPU (Black) wins.")
-                return
-            if raw == "moves":
-                line: str = ""
-                i: int = 0
-                while i < len(legal_moves):
-                    line = line + legal_moves[i].uci() + " "
-                    i = i + 1
-                print(line)
-                continue
-            if len(raw) < 4 or len(raw) > 5:
-                print("Bad format. Use e.g. e2e4 or e7e8q.")
-                continue
-            frm: int = parse_square(raw[0:2])
-            to: int = parse_square(raw[2:4])
-            promo: int = 0
-            if len(raw) == 5:
-                promo = promo_from_char(raw[4])
-            if frm < 0 or to < 0:
-                print("Bad square. Use files a-h and ranks 1-8.")
-                continue
-            mi: int = match_move(legal_moves, frm, to, promo)
-            if mi < 0:
-                print("Illegal move. Type 'moves' to see legal moves.")
-                continue
-            board = apply_move(board, legal_moves[mi])
-            print(f"You play {legal_moves[mi].uci()}")
-        else:
-            if checked:
-                print("CPU is in check.")
-            print("CPU is thinking...")
-            # Adaptive depth: in maximally tactical positions (many legal moves)
-            # the tree explodes, so shave one ply to stay comfortably under the
-            # 2s/move budget. Normal positions keep full depth.
-            search_depth: int = CPU_DEPTH
-            if len(legal_moves) > 35:
-                search_depth = CPU_DEPTH - 1
-            idx_c: int = choose_move(board, search_depth)
-            chosen: Move = legal_moves[idx_c]
+            picked: tuple[int, int, int] = player_pick_move_chess(s, board, legal, intro, check_sq, cur_r, cur_c)
+            idx_p: int = picked[0]
+            cur_r = picked[1]
+            cur_c = picked[2]
+            if idx_p < 0:
+                return  # quit back to the menu
+            chosen: Move = legal[idx_p]
             board = apply_move(board, chosen)
-            print(f"CPU plays {chosen.uci()}")
+            intro = "You played " + chosen.uci() + "."
+        else:
+            # CPU turn: show the "thinking" frame first (it stays on screen while
+            # the blocking search runs), then apply the chosen move. Adaptive
+            # depth (unchanged from the old loop): shave one ply in maximally
+            # tactical positions to stay under the 2s/move budget.
+            think: str = "CPU (Black) is thinking..."
+            if intro != "":
+                think = intro + "  CPU (Black) is thinking..."
+            cx_draw(s, board, -1, -1, -1, [], think, check_sq)
+            search_depth: int = CPU_DEPTH
+            if len(legal) > 35:
+                search_depth = CPU_DEPTH - 1
+            ci: int = choose_move(board, search_depth)
+            chosen2: Move = legal[ci]
+            board = apply_move(board, chosen2)
+            intro = "CPU played " + chosen2.uci() + ". Your move."
+
+
+def play_chess(s: Screen) -> None:
+    # The shared alt-screen session is owned by main (one Screen for the whole
+    # app): we just run the game on the passed-in `s` and return to the menu when
+    # the game ends or the player quits. main handles init()/close() and the
+    # non-TTY degrade; there is nothing to set up or tear down here.
+    run_chess(s)

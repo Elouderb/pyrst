@@ -7,25 +7,35 @@ A terminal tabletop-game sim, written in pyrst. Card f1ac8d46 (epic
 
 ```sh
 cd extern/programs/tabletop
-../../../target/release/pyrst build main.pyrs
+PYRST_PATH=../../packages ../../../target/release/pyrst build main.pyrs
 ./main
 ```
 
-(or, with a debug/dev build of the compiler: `pyrst build main.pyrs` from
-this directory if `pyrst` is on `PATH`.)
+`PYRST_PATH` points the build at `extern/packages` so the `terminal` package
+resolves — the menu, checkers, and chess all import it, and a program that
+imports `terminal` auto-builds as a Cargo project so `crossterm` is fetched and
+linked. (With a dev build of the compiler on `PATH`:
+`PYRST_PATH=../../packages pyrst build main.pyrs` from this directory.)
 
-You'll get a menu:
+You'll get a **live menu** (card 73098a55, PASS 2) drawn on the
+[`terminal`](../../packages/terminal/) alternate screen:
 
 ```
-1) Blackjack   (player + 2 CPU seats)
+1) Blackjack     (player + 2 CPU seats)
 2) Texas Hold'em (player + 2 CPU seats)
-3) Checkers    (vs CPU)
-4) Chess       (vs CPU)
+3) Checkers      (vs CPU)
+4) Chess         (vs CPU)
 5) Quit
 ```
 
-Enter a number 1-5. Bad input (non-numeric or out of range) re-prompts
-instead of crashing.
+The whole app is now **one shared `terminal` session**: `main` opens the
+alternate screen once, runs the menu on it, and dispatches every game onto the
+**same** Screen (so entering/leaving a game never re-opens its own screen). Move
+the highlight with the **up/down arrows** and press **Enter**, or press a **number
+key 1-5** to jump straight to a game. **q / Esc / Ctrl+C** quits the app. Because
+the live menu needs a real terminal, running it with piped/redirected stdin (as
+the scripted-stdin tests do) prints an honest "needs a real terminal" line and
+exits 0 instead of hanging.
 
 ## Checkers — live board (card 73098a55)
 
@@ -58,22 +68,65 @@ hanging. Because it builds on `terminal` (a thin crossterm wrapper), the live
 board is Windows-compatible too (verified via `cargo check --target
 x86_64-pc-windows-gnu`, no `std::os::unix`).
 
-The other three games (blackjack, hold-em, chess) still use the line-based
-one-board-per-turn presentation; retrofitting them is a follow-on pass.
+## Chess — live board (card 73098a55, PASS 2)
+
+Chess is now a live in-place board too, on the same shared alternate screen as
+the menu and checkers. The 8x8 board redraws after every move (no scrolling); the
+two sides are coloured (**White** bright-white, **Black** amber) and the king of
+the side to move is flagged red when it is **in check**. Selection is two-phase
+with an arrow cursor: move onto one of your pieces and press **Enter/Space** to
+select it (its **legal destinations** light up green — the highlights reuse the
+pure `gen_legal`, so pins, castling, and en passant are surfaced automatically),
+then move onto a green square and press Enter/Space to play the move. When a pawn
+reaches the back rank a **promotion prompt** offers **q**ueen / **r**ook /
+**b**ishop / k**n**ight (Enter defaults to queen, Esc cancels). A status line
+shows whose turn it is, `CHECK`, `CPU is thinking...`, and the
+`CHECKMATE` / `STALEMATE` result.
+
+Controls (also shown on the bottom help line):
+
+| Key | Action |
+|-----|--------|
+| arrow keys | move the cursor around the board |
+| Enter / Space | select the piece under the cursor, then confirm a destination |
+| Esc | deselect the piece (or, with nothing selected, quit to the menu) |
+| q / Ctrl+C | quit back to the menu |
+
+The pure chess engine (legal move generation incl. castling / en passant /
+promotion, check / checkmate / stalemate detection, and the alpha-beta CPU) is
+**unchanged** — only the presentation + input layer was replaced — so
+`test_chess.pyrs` (published perft counts) still passes. Like checkers, the live
+board is Windows-compatible (it builds on the `terminal` crossterm wrapper;
+verified via `cargo check --target x86_64-pc-windows-gnu`, no `std::os::unix`).
+
+Blackjack and hold-em are **still line-based** (their live-board retrofit is
+PASS 3). They are reached through a temporary **bridge**: the shared alternate
+screen is suspended (`close()`), the line-based game runs on the normal terminal,
+and the alternate screen is resumed (`init()`) on the way back to the menu.
 
 ## Layout
 
-- `main.pyrs` — menu shell; entry point.
+- `main.pyrs` — menu shell + entry point. Owns the ONE shared `terminal` Screen
+  for the whole app (init once, `try: menu_loop finally: close`), draws the live
+  menu, dispatches the games onto that shared Screen, and bridges the still
+  line-based card games (suspend/resume the alt screen).
+- `ttscreen.pyrs` — tiny **pure-presentation** helper shared by `main` and
+  `chess`: frame-safe string clipping (`clip` / `clip_pad`) and the reusable
+  full-screen `draw_menu`. No game logic, no session lifecycle. (checkers keeps
+  its own equivalents — it landed first and is left frozen.)
 - `cards.pyrs` — shared `Card`/`Deck` types + seeded shuffle, used by
   blackjack and hold-em.
-- `ui.pyrs` — shared formatting helpers: fixed-width (<=80 col) layout,
-  separators, unicode suit symbols (with an ASCII-fallback switch), and
-  robust `input()`-validation helpers (`prompt_int`, `prompt_yes_no`).
+- `ui.pyrs` — shared formatting helpers for the **line-based** games: fixed-width
+  (<=80 col) layout, separators, unicode suit symbols (with an ASCII-fallback
+  switch), and robust `input()`-validation helpers (`prompt_int`,
+  `prompt_yes_no`). Still used by blackjack + hold-em; the menu, checkers, and
+  chess no longer use it (they run on the `terminal` Screen).
 - `blackjack.pyrs` / `holdem.pyrs` / `checkers.pyrs` / `chess.pyrs` — one
-  module per game, each exposing a uniquely-named entry function
-  (`play_blackjack` / `play_holdem` / `play_checkers` / `play_chess`). Pure
-  engine logic (hand evaluation, move generation) is separated from I/O so it
-  can be unit-tested in isolation.
+  module per game, each exposing a uniquely-named entry function. The two live
+  games take the shared Screen (`play_checkers(s)` / `play_chess(s)`); the two
+  line-based games keep their line loops (`play_blackjack(seed)` /
+  `play_holdem(seed)`). Pure engine logic (hand evaluation, move generation) is
+  separated from I/O so it can be unit-tested in isolation.
 - `test_*.pyrs` (root siblings) — pure-logic unit tests that import a game
   module. They live in the root, not `tests/`, because pyrst import
   resolution is sibling-only and a program under `tests/` cannot import the
@@ -105,11 +158,14 @@ one-board-per-turn presentation; retrofitting them is a follow-on pass.
 
 ## Design notes
 
-- Presentation: **checkers** now renders a **live in-place board** on the
-  `terminal` alternate screen (redraw per move, colours, move highlighting — see
-  "Checkers — live board" above; card 73098a55). Blackjack, hold-em, and chess
-  still print a clean board/table **once per turn** (no live rewriting, no
-  window-size dependence) pending their own retrofit pass.
+- Presentation: the app runs as **one shared `terminal` session** (`main` owns
+  the Screen; card 73098a55). The **menu**, **checkers**, and **chess** render
+  **live in-place** on the alternate screen (redraw per move, colours, move
+  highlighting — see "Checkers — live board" and "Chess — live board" above).
+  Blackjack and hold-em still print a clean board/table **once per turn** and are
+  reached via a temporary suspend/resume **bridge** pending their PASS 3 retrofit.
+  The pure engines (checkers/chess move-gen, blackjack/hold-em evaluation) were
+  **not touched** by the retrofit — only the presentation + input layer changed.
 - CPU quality: blackjack = basic strategy + dealer rules; hold-em =
   hand-strength heuristic w/ pot-odds flavor; checkers/chess = depth-limited
   minimax + alpha-beta (material + positional eval), tuned for <2s/move.

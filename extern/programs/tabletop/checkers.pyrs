@@ -341,12 +341,14 @@ def ck_render(b: list[int]) -> str:
 # old line-based presentation + input with a full-screen, live-redrawing board:
 # an arrow-key cursor selects a piece then a destination, legal destinations are
 # highlighted (reusing gen_moves for the hints), colour marks the two sides and
-# kings, and a status line shows the turn / CPU thinking / result. The whole
-# session runs `s.init()` then `try: run_checkers(s) finally: s.close()`, so the
-# terminal is ALWAYS restored — on quit, on Ctrl+C (raw mode delivers it as the
-# catchable key "ctrl+c"), and on any uncaught error. If stdout is not a TTY,
-# init() raises OSError before entering the alt screen; play_checkers() catches
-# that, prints an honest one-liner, and returns to the menu cleanly.
+# kings, and a status line shows the turn / CPU thinking / result.
+#
+# The Screen LIFECYCLE is owned by main.pyrs (PASS 2, card 73098a55): the whole
+# app is ONE shared alt-screen session — main init()s the Screen once, dispatches
+# play_checkers(s) with that already-open Screen, and close()s it once in a
+# finally. So play_checkers no longer creates/init()s/close()s its own Screen (and
+# there is no non-TTY handling here: main degrades before ever dispatching a
+# game); it simply runs on the passed-in `s` and returns to the menu on quit.
 #
 # COORDINATES are (x, y) = (col, row), 0-based from the top-left (the terminal
 # package convention — the opposite of curses' (y, x)).
@@ -660,20 +662,9 @@ def run_checkers(s: Screen) -> None:
             side = -side
 
 
-def play_checkers() -> None:
-    s: Screen = Screen()
-    try:
-        s.init()
-    except OSError as e:
-        # Not a TTY (piped/redirected, e.g. a scripted-stdin test harness):
-        # degrade honestly instead of crashing or hanging. init() raises BEFORE
-        # entering the alternate screen, so there is nothing to restore.
-        print("Checkers now plays on a live board and needs a real terminal (a TTY).")
-        print("Run it directly in your terminal:  ./main   then choose Checkers.")
-        print("detail: " + e)
-        return
-    try:
-        run_checkers(s)
-    finally:
-        s.close()  # ALWAYS restores: raw mode off, leaves the alt screen, cursor shown
-    print("Checkers — terminal restored. Back to the menu.")
+def play_checkers(s: Screen) -> None:
+    # The shared alt-screen session is owned by main (one Screen for the whole
+    # app): we just run the game on the passed-in `s` and return to the menu when
+    # the player quits or the game ends. main handles init()/close() and the
+    # non-TTY degrade; there is nothing to set up or tear down here.
+    run_checkers(s)

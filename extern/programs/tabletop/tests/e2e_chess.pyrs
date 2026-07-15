@@ -1,39 +1,38 @@
-# e2e_chess.pyrs — scripted-stdin end-to-end run of chess through the real
-# menu (main): list moves, play a legal move, exercise bad-format /
-# bad-square / illegal-move rejection, then resign.
+# e2e_chess.pyrs — scripted-stdin end-to-end run through the real menu (main),
+# verifying that under a NON-TTY stdin the app degrades honestly and still exits
+# cleanly (exit 0, no hang).
+#
+# As of the live-board retrofit (card 73098a55, PASS 2), chess is a full-screen,
+# live in-place board (arrow-cursor two-phase from->to selection, highlighted
+# legal destinations, coloured pieces, a Q/R/B/N promotion prompt, a status line),
+# reached from a `terminal`-based menu. The whole app is ONE shared Screen that
+# MAIN init()s once — and raw mode REQUIRES a real terminal (a TTY). Under
+# scripted/piped stdin — as this harness runs it — main.init() raises an
+# OSError-shaped exception BEFORE entering the alt screen; main prints an honest
+# "needs a real terminal" line and exits 0. The menu never opens, so chess is not
+# reached under a pipe.
 #
 # USAGE (from extern/programs/tabletop/):
 #   pyrst build main.pyrs
 #   pyrst build tests/e2e_chess.pyrs
-#   printf "4\nmoves\ne2e4\nbadmove\nzz99\ne7e5\nquit\n" | ./e2e_chess
+#   printf '' | ./e2e_chess         # any piped/redirected stdin degrades main
 #
-# Script: "4" picks Chess; "moves" lists legal moves (no crash); "e2e4"
-# plays a real legal move (CPU replies, e.g. Nc6); "badmove" (wrong length)
-# -> "Bad format" reprompt; "zz99" (bad squares) -> "Bad square" reprompt;
-# "e7e5" is illegal for White to move (it's a Black-side square/turn
-# mismatch after CPU's reply) -> "Illegal move" reprompt, never a crash;
-# "quit" resigns cleanly. Manually verified the full transcript: board
-# renders after every ply, CPU search completes well under 2s, and each
-# malformed/illegal input is caught by validation and re-prompts instead of
-# raising.
-#
-# Full-game perft/checkmate/stalemate correctness is covered by
-# test_chess.pyrs (published perft counts for 5 standard positions +
-# fool's-mate + stalemate); this end-to-end test exercises the real I/O
-# loop (menu -> game -> input validation -> resign -> menu -> quit)
-# instead of playing a full game to mate, which is impractical to script.
+# The interactive chess game (live board, selection, promotion, CPU reply) is
+# verified separately by driving a real PTY. Full-game perft / checkmate /
+# stalemate correctness stays covered by test_chess.pyrs (published perft counts
+# for 5 standard positions + fool's-mate + stalemate). Because main degrades at
+# startup under a pipe, the piped bytes are irrelevant (main never reads stdin);
+# only the exit code is asserted.
 #
 # Same subprocess stdio-inheritance workaround as tests/smoke_main.pyrs
-# (GAP: subprocess.run has no input= piping) — only the exit code is
-# asserted here; correctness of the printed transcript was verified
-# manually.
+# (GAP: subprocess.run has no input= piping).
 import subprocess
 
 
 def main() -> None:
     result = subprocess.run(["./main"], capture_output=False)
     if result.returncode == 0:
-        print("PASS: chess scripted session ran cleanly to resignation (exit 0)")
+        print("PASS: non-tty main degrade (menu needs a TTY) exited cleanly (exit 0)")
     else:
         print(f"FAIL: main exited with code {result.returncode}")
         assert False

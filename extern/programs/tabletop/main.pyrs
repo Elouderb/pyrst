@@ -1,9 +1,23 @@
-# main.pyrs — tabletop game sim menu shell.
+# main.pyrs — tabletop game sim: a single-screen live menu shell.
 #
-# Build + run: `pyrst build main.pyrs && ./main` (from this directory).
-# Picks a game (all player-vs-CPU) or quits. See README.md.
-
-import ui
+# Live-board retrofit (card 73098a55, PASS 2): the WHOLE app now runs as ONE
+# `terminal` alt-screen session. main creates the Screen, init()s it ONCE (with an
+# OSError -> honest degrade if there is no TTY, as for the scripted-stdin tests),
+# runs the menu on it, dispatches to the games on the SAME shared Screen, and
+# close()s it ONCE in a finally so the terminal is ALWAYS restored.
+#
+#   checkers + chess  -> live boards drawn directly on the shared Screen.
+#   blackjack + holdem -> still line-based (PASS 3), so they are BRIDGED: the alt
+#                         screen is SUSPENDED (close) for the line-based game, then
+#                         RESUMED (init) before returning to the menu.
+#
+# Because the live menu itself needs a real terminal, a piped/redirected stdin
+# (the tests) makes init() raise before entering the alt screen; main prints an
+# honest one-liner and exits 0 instead of hanging.
+#
+# COORDINATES are (x, y) = (col, row), 0-based (the terminal convention).
+from terminal import Screen
+import ttscreen
 import blackjack
 import holdem
 import checkers
@@ -11,29 +25,83 @@ import chess
 
 DEFAULT_SEED: int = 42
 
+MENU_TITLE: str = "Tabletop Game Sim"
+MENU_OPTIONS: list[str] = [
+    "Blackjack     (player + 2 CPU seats)",
+    "Texas Hold'em (player + 2 CPU seats)",
+    "Checkers      (vs CPU)",
+    "Chess         (vs CPU)",
+    "Quit",
+]
 
-def print_menu() -> None:
-    print(ui.title("Tabletop Game Sim"))
-    print("1) Blackjack   (player + 2 CPU seats)")
-    print("2) Texas Hold'em (player + 2 CPU seats)")
-    print("3) Checkers    (vs CPU)")
-    print("4) Chess       (vs CPU)")
-    print("5) Quit")
-    print(ui.hr())
+
+def bridge_card_game(s: Screen, which: int) -> None:
+    # TEMPORARY BRIDGE (PASS 3 converts blackjack/hold-em to live boards): these
+    # two are still line-based, so SUSPEND the shared alt-screen session (close()
+    # leaves the alt screen, disables raw mode, shows the cursor), run the
+    # line-based game on the normal terminal, then RESUME the alt screen (init())
+    # before returning to the menu. init() after close() re-enters cleanly
+    # (Screen tracks an _active flag). We are already on a TTY here (the app's
+    # startup init() succeeded), so the resume cannot hit the non-TTY path.
+    s.close()
+    if which == 0:
+        blackjack.play_blackjack(DEFAULT_SEED)
+    else:
+        holdem.play_holdem(DEFAULT_SEED)
+    s.init()
+
+
+def activate(s: Screen, choice: int) -> bool:
+    # Run the chosen menu option (0-based). Returns True iff the app should quit.
+    if choice == 0:
+        bridge_card_game(s, 0)
+    elif choice == 1:
+        bridge_card_game(s, 1)
+    elif choice == 2:
+        checkers.play_checkers(s)
+    elif choice == 3:
+        chess.play_chess(s)
+    else:
+        return True
+    return False
+
+
+def menu_loop(s: Screen) -> None:
+    sel: int = 0
+    n: int = len(MENU_OPTIONS)
+    while True:
+        ttscreen.draw_menu(s, MENU_TITLE, MENU_OPTIONS, sel)
+        k: str = s.getch()
+        if k == "q" or k == "ctrl+c" or k == "esc":
+            return
+        elif k == "up":
+            sel = (sel - 1 + n) % n
+        elif k == "down":
+            sel = (sel + 1) % n
+        elif k == "enter" or k == "space":
+            if activate(s, sel):
+                return
+        elif k == "1" or k == "2" or k == "3" or k == "4" or k == "5":
+            sel = int(k) - 1
+            if activate(s, sel):
+                return
+        # any other key is ignored
 
 
 def main() -> None:
-    while True:
-        print_menu()
-        choice: int = ui.prompt_int("Select an option (1-5): ", 1, 5)
-        if choice == 1:
-            blackjack.play_blackjack(DEFAULT_SEED)
-        elif choice == 2:
-            holdem.play_holdem(DEFAULT_SEED)
-        elif choice == 3:
-            checkers.play_checkers()
-        elif choice == 4:
-            chess.play_chess()
-        else:
-            print("Goodbye.")
-            return
+    s: Screen = Screen()
+    try:
+        s.init()
+    except OSError as e:
+        # Not a TTY (piped/redirected — e.g. the scripted-stdin tests): the live
+        # menu needs a real terminal, so degrade honestly instead of hanging.
+        # init() raises BEFORE entering the alt screen, so nothing to restore.
+        print("Tabletop Game Sim now runs on a live board and needs a real terminal (a TTY).")
+        print("Run it directly in your terminal:  ./main")
+        print("detail: " + e)
+        return
+    try:
+        menu_loop(s)
+    finally:
+        s.close()  # ALWAYS restores: raw mode off, leaves the alt screen, cursor shown
+    print("Tabletop — terminal restored. Goodbye.")

@@ -1,29 +1,32 @@
-# smoke_main.pyrs — non-interactive "build + run main, piped quit" smoke test.
+# smoke_main.pyrs — non-interactive "build + run main under a non-TTY stdin"
+# smoke test: confirms main degrades honestly and exits cleanly (exit 0, no hang).
 #
 # USAGE (from extern/programs/tabletop/):
 #   pyrst build main.pyrs
 #   pyrst build tests/smoke_main.pyrs
-#   echo "5" | ./smoke_main
+#   echo "5" | ./smoke_main          # any piped/redirected stdin degrades main
+#
+# As of the single-shared-Screen retrofit (card 73098a55, PASS 2), main opens a
+# `terminal` alt-screen session (raw mode) for the whole app ONCE at startup. Raw
+# mode requires a real terminal, so under a piped/redirected stdin main.init()
+# raises an OSError-shaped exception BEFORE entering the alt screen; main prints an
+# honest "needs a real terminal" line and exits 0 without reading stdin (so the
+# piped bytes are irrelevant and there is no hang). The menu never opens.
 #
 # GAP: `subprocess.run` has no `input=` / stdin-piping support (see
-# lib/subprocess.pyrs, card 27aeeb3e) — a pyrst program cannot itself feed
-# bytes into a spawned child's stdin. Workaround used here:
-# `subprocess.run([...], capture_output=False)` INHERITS this process's own
-# stdio (Rust `Command::status()`'s default), so piping input into *this*
-# smoke-test binary's stdin (`echo "5" | ./smoke_main`) flows through to
-# `./main`'s stdin transparently, letting main's menu read "5" (Quit) and
-# exit cleanly. `capture_output=True` instead sets the child's stdin to
-# `Stdio::null()` (Rust `Command::output()`'s documented behavior), which
-# would make `main`'s `input()` retry-loop spin forever on immediate EOF —
-# so this smoke test can only assert on the process exit code, not on
-# main's printed output.
+# lib/subprocess.pyrs, card 27aeeb3e) — a pyrst program cannot itself feed bytes
+# into a spawned child's stdin. Workaround used here:
+# `subprocess.run([...], capture_output=False)` INHERITS this process's own stdio
+# (Rust `Command::status()`'s default), so piping input into *this* smoke-test
+# binary's stdin flows through to `./main`'s stdin transparently. Only the process
+# exit code is asserted.
 import subprocess
 
 
 def main() -> None:
     result = subprocess.run(["./main"], capture_output=False)
     if result.returncode == 0:
-        print("PASS: main ran to completion via piped quit (exit 0)")
+        print("PASS: main degraded cleanly under a non-TTY stdin (exit 0)")
     else:
         print(f"FAIL: main exited with code {result.returncode}")
         assert False

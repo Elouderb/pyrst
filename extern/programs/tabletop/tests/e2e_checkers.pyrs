@@ -1,26 +1,27 @@
 # e2e_checkers.pyrs — scripted-stdin end-to-end run through the real menu (main),
-# verifying that picking Checkers under a NON-TTY stdin degrades honestly and the
-# program still exits cleanly (exit 0, no hang).
+# verifying that under a NON-TTY stdin the app degrades honestly and still exits
+# cleanly (exit 0, no hang).
 #
-# As of the live-board retrofit (card 73098a55), checkers.play_checkers() enters
-# a full-screen `terminal` alt-screen session: s.init() enables raw mode, which
-# REQUIRES a real terminal (a TTY). Under scripted/piped stdin — as this harness
-# runs it — init() raises an OSError-shaped exception BEFORE entering the alt
-# screen; play_checkers() catches it, prints an honest "needs a real terminal"
-# line, and returns to the menu, with nothing left to restore. The interactive
-# game itself (arrow-cursor piece + destination selection, highlighted legal
-# moves, coloured pieces) is verified separately by driving a real PTY; the pure
-# move-gen / rules stay covered by test_checkers.pyrs.
+# As of the single-shared-Screen retrofit (card 73098a55, PASS 2), it is MAIN
+# itself that opens the `terminal` alt-screen session: main.init() enables raw
+# mode ONCE for the whole app (the menu + all games run on that one Screen). Raw
+# mode REQUIRES a real terminal (a TTY). Under scripted/piped stdin — as this
+# harness runs it — main.init() raises an OSError-shaped exception BEFORE entering
+# the alt screen; main prints an honest "needs a real terminal" line and exits 0,
+# with nothing to restore. The menu never opens, so no game (checkers included) is
+# reached under a pipe. The interactive checkers game (arrow-cursor piece +
+# destination selection, highlighted legal moves, coloured pieces) is verified
+# separately by driving a real PTY; the pure move-gen / rules stay covered by
+# test_checkers.pyrs.
 #
 # USAGE (from extern/programs/tabletop/):
 #   pyrst build main.pyrs
 #   pyrst build tests/e2e_checkers.pyrs
-#   printf '3\n5\n' | ./e2e_checkers
+#   printf '' | ./e2e_checkers      # any piped/redirected stdin degrades main
 #
-# Script: "3" picks Checkers (which degrades to the honest TTY message and
-# returns to the menu), then "5" quits the menu — main exits 0. An exhausted or
-# unexpected script also exits cleanly via the ui.prompt_int EOF safety-valve
-# (EOF_GIVEUP=100) rather than hanging.
+# Because main degrades at startup under a pipe, the piped bytes are irrelevant
+# (main never reads stdin): it prints the honest message and exits 0. Only the
+# exit code is asserted.
 #
 # Same subprocess stdio-inheritance workaround as tests/smoke_main.pyrs
 # (GAP: subprocess.run has no input= piping) — capture_output=False INHERITS this
@@ -32,7 +33,7 @@ import subprocess
 def main() -> None:
     result = subprocess.run(["./main"], capture_output=False)
     if result.returncode == 0:
-        print("PASS: checkers non-tty degrade returned to menu; main exited cleanly (exit 0)")
+        print("PASS: non-tty main degrade (menu needs a TTY) exited cleanly (exit 0)")
     else:
         print(f"FAIL: main exited with code {result.returncode}")
         assert False

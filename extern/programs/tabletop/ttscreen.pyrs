@@ -1,0 +1,106 @@
+# ttscreen.pyrs — shared pure-presentation helpers for the tabletop app's
+# `terminal`-based screens (card 73098a55, PASS 2).
+#
+# A tiny, pure-presentation module (no game logic, no state): frame-safe string
+# clipping and a reusable full-screen menu drawer. Shared by main.pyrs (the app
+# menu) and chess.pyrs. checkers.pyrs keeps its own equivalents (it landed first
+# and is deliberately left frozen). Everything here only ever DRAWS onto a
+# caller-owned Screen; it never touches the session lifecycle — init()/close()
+# stay with main, which owns the single shared Screen for the whole app.
+#
+# COORDINATES are (x, y) = (col, row), 0-based from the top-left (the terminal
+# package convention).
+from terminal import Screen, BRIGHT_BLACK, BRIGHT_WHITE, BRIGHT_YELLOW
+
+
+# ── frame-safe string helpers ─────────────────────────────────────────────────
+def clip(text: str, w: int) -> str:
+    # Truncate to at most w columns (prevents line-wrap corrupting the frame).
+    if w <= 0:
+        return ""
+    if len(text) > w:
+        return text[0:w]
+    return text
+
+
+def clip_pad(text: str, w: int) -> str:
+    # Truncate/pad to EXACTLY w columns (for full-width reverse-video bars).
+    if w <= 0:
+        return ""
+    if len(text) >= w:
+        return text[0:w]
+    return text + " " * (w - len(text))
+
+
+# ── reusable full-screen menu ──────────────────────────────────────────────────
+def _longest(options: list[str]) -> int:
+    m: int = 0
+    for o in options:
+        if len(o) > m:
+            m = len(o)
+    return m
+
+
+def draw_menu(s: Screen, title: str, options: list[str], selected: int) -> None:
+    """Draw a full-screen menu: a reverse-video title bar, a hint line, the
+    numbered options (the `selected` one highlighted in reverse video), and a
+    help footer. Pure presentation — the caller owns the Screen and the selection
+    state, reads a key, and updates `selected` / dispatches."""
+    size: tuple[int, int] = s.size()
+    cols: int = size[0]
+    rows: int = size[1]
+    s.clear()
+
+    n: int = len(options)
+    need_cols: int = _longest(options) + 12
+    need_rows: int = 6 + 2 * n
+    if cols < need_cols or rows < need_rows:
+        s.set_fg(BRIGHT_YELLOW)
+        s.bold(True)
+        s.addstr(0, 0, clip("Menu needs a bigger terminal: " + str(need_cols) + "x" + str(need_rows) + " min, have " + str(cols) + "x" + str(rows) + ". Resize.", cols))
+        s.reset_style()
+        s.refresh()
+        return
+
+    # title bar (row 0, reverse video, full width)
+    s.set_fg(BRIGHT_WHITE)
+    s.reverse(True)
+    s.bold(True)
+    s.addstr(0, 0, clip_pad(" " + title + " ", cols))
+    s.reset_style()
+
+    # hint line (row 2)
+    s.set_fg(BRIGHT_BLACK)
+    s.addstr(2, 2, clip("arrows + Enter to choose,  1-" + str(n) + " to jump,  q to quit.", cols - 2))
+    s.reset_style()
+
+    # options (one per row from row 4, spaced by 2); the selected row is a
+    # uniform-width reverse-video bar so the highlight reads as a solid block.
+    field: int = _longest(options) + 6
+    if field > cols - 4:
+        field = cols - 4
+    i: int = 0
+    while i < n:
+        y: int = 4 + 2 * i
+        label: str = str(i + 1) + ")  " + options[i]
+        if i == selected:
+            s.set_fg(BRIGHT_YELLOW)
+            s.reverse(True)
+            s.bold(True)
+            s.addstr(2, y, clip_pad("  " + label, field))
+            s.reset_style()
+        else:
+            s.set_fg(BRIGHT_WHITE)
+            s.addstr(2, y, clip("  " + label, field))
+            s.reset_style()
+        i = i + 1
+
+    # help footer (its own row just below the options)
+    help_row: int = 4 + 2 * n
+    if help_row >= rows:
+        help_row = rows - 1
+    s.set_fg(BRIGHT_WHITE)
+    s.reverse(True)
+    s.addstr(0, help_row, clip_pad(" up/down: move    enter: select    1-" + str(n) + ": jump    q: quit ", cols))
+    s.reset_style()
+    s.refresh()

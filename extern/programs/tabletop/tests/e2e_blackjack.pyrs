@@ -1,26 +1,33 @@
-# e2e_blackjack.pyrs — scripted-stdin end-to-end run of the blackjack game
-# through the real menu (main), one full round: stand, decline replay, quit.
+# e2e_blackjack.pyrs — scripted-stdin end-to-end run through the real menu
+# (main), verifying that under a NON-TTY stdin the app degrades honestly and
+# still exits cleanly (exit 0, no hang).
+#
+# As of the single-shared-Screen retrofit (card 73098a55, PASS 2), the menu runs
+# on a `terminal` alt screen that MAIN init()s once for the whole app, and raw
+# mode REQUIRES a real terminal (a TTY). Under scripted/piped stdin — as this
+# harness runs it — main.init() raises an OSError-shaped exception BEFORE entering
+# the alt screen; main prints an honest "needs a real terminal" line and exits 0.
+# The menu never opens, so blackjack is not reached under a pipe.
+#
+# Blackjack itself is still line-based and is reached INTERACTIVELY via the menu's
+# card-game bridge (the shared Screen is suspended for the line-based game, then
+# resumed) — PASS 3 converts it to a live board and will restore an e2e that
+# actually drives the game. For now its engine stays covered by test_blackjack.pyrs.
 #
 # USAGE (from extern/programs/tabletop/):
 #   pyrst build main.pyrs
 #   pyrst build tests/e2e_blackjack.pyrs
-#   printf "1\nn\nn\n5\n" | ./e2e_blackjack
-#
-# Script: "1" picks Blackjack, "n" stands (Hit? y/n), "n" declines another
-# round, "5" quits the menu. Manually verified this produces a full round
-# (soft-ace/blackjack/dealer-draw/settlement all printed correctly) and a
-# clean return to the menu before quitting.
+#   printf '' | ./e2e_blackjack      # any piped/redirected stdin degrades main
 #
 # Same subprocess stdio-inheritance workaround as tests/smoke_main.pyrs
-# (GAP: subprocess.run has no input= piping) — only the exit code is
-# asserted here; correctness of the printed round was verified manually.
+# (GAP: subprocess.run has no input= piping) — only the exit code is asserted.
 import subprocess
 
 
 def main() -> None:
     result = subprocess.run(["./main"], capture_output=False)
     if result.returncode == 0:
-        print("PASS: blackjack scripted round ran to completion (exit 0)")
+        print("PASS: non-tty main degrade (menu needs a TTY) exited cleanly (exit 0)")
     else:
         print(f"FAIL: main exited with code {result.returncode}")
         assert False

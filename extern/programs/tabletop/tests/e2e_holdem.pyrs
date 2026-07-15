@@ -2,17 +2,19 @@
 # verifying that under a NON-TTY stdin the app degrades honestly and still exits
 # cleanly (exit 0, no hang).
 #
-# As of the single-shared-Screen retrofit (card 73098a55, PASS 2), the menu runs
-# on a `terminal` alt screen that MAIN init()s once for the whole app, and raw
-# mode REQUIRES a real terminal (a TTY). Under scripted/piped stdin — as this
-# harness runs it — main.init() raises an OSError-shaped exception BEFORE entering
-# the alt screen; main prints an honest "needs a real terminal" line and exits 0.
-# The menu never opens, so hold'em is not reached under a pipe.
+# As of the live-board retrofit (card 73098a55), the whole app is ONE `terminal`
+# alt screen that MAIN init()s once, and raw mode REQUIRES a real terminal (a TTY).
+# Under scripted/piped stdin — as this harness runs it — main.init() raises an
+# OSError-shaped exception BEFORE entering the alt screen; main prints an honest
+# "needs a real terminal" line and exits 0 without reading stdin (the piped bytes
+# are irrelevant, no hang). The menu never opens, so hold'em is not reached.
 #
-# Hold'em itself is still line-based and is reached INTERACTIVELY via the menu's
-# card-game bridge (the shared Screen is suspended for the line-based game, then
-# resumed) — PASS 3 converts it to a live board and will restore an e2e that
-# actually drives the game. For now its engine stays covered by test_holdem.pyrs.
+# Hold'em is now a live in-place poker table drawn directly on the shared Screen
+# (PASS 3 — the temporary line-based suspend/resume bridge is GONE; every game is
+# on the terminal library). The interactive game (hole/community reveal, pot/bets/
+# stacks, betting via getch fold/check-call/raise with a getch raise-amount entry,
+# showdown) is verified separately by driving a real PTY; the engine (evaluator +
+# side pots) stays covered by test_holdem.pyrs.
 #
 # USAGE (from extern/programs/tabletop/):
 #   pyrst build main.pyrs

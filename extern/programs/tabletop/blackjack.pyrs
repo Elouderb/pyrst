@@ -15,6 +15,13 @@
 
 from cards import Card, Deck
 import ui
+# Live in-place card table on the `terminal` package (card 73098a55, PASS 3).
+# NAME COLLISION note: blackjack defines NO colour-named constants, so no clash
+# with terminal's RED/WHITE/BLACK; we still import colours SELECTIVELY (only the
+# ones used) and use BRIGHT_RED for hearts/diamonds, BRIGHT_WHITE for spades/clubs
+# per the card. `import ui` is kept only for the PURE suit_symbol formatter.
+from terminal import Screen, GREEN, BLUE, BRIGHT_BLACK, BRIGHT_RED, BRIGHT_GREEN, BRIGHT_YELLOW, BRIGHT_CYAN, BRIGHT_WHITE
+from ttscreen import clip, clip_pad
 
 BET: int = 10
 START_CHIPS: int = 100
@@ -138,30 +145,209 @@ def settle(hand: list[Card], dealer: list[Card]) -> int:
     return 0
 
 
-def play_blackjack(seed: int) -> None:
-    print(ui.title("Blackjack"))
-    print("You + CPU-1 + CPU-2 vs the Dealer. Flat bet 10. Blackjack pays 3:2.")
-    print("Dealer stands on all 17. (Splits/doubles/insurance not modelled.)")
-    print(ui.hr())
+# --- interactive game (live in-place card table on the `terminal` alt screen) --
+#
+# The PURE blackjack engine above (hand_total / is_soft / is_blackjack / settle /
+# cpu_should_hit / upcard_value, and the dealing / dealer-stands-on-17 / 3:2 flow)
+# is UNCHANGED — this section only replaces the old line-based print + prompt_yes_no
+# I/O with a full-screen, live-redrawing card table (card 73098a55, PASS 3),
+# mirroring the checkers/chess retrofit. The Screen LIFECYCLE is owned by main:
+# the whole app is ONE shared alt-screen session; play_blackjack just draws onto
+# the passed-in `s` and returns to the menu on quit. main handles the non-TTY
+# degrade; there is nothing to init/close here (the temporary suspend/resume
+# bridge is gone).
+#
+# COORDINATES are (x, y) = (col, row), 0-based from the top-left.
+#
+# card_face / render_hand above stay byte-identical but are no longer used by the
+# program (the live table draws colour-per-suit cells) — same as chess `render`
+# and checkers `ck_render`, kept for potential test/debug use.
 
+# Card-cell geometry. Each card is drawn as a small "chip" cell BJ_CARD_W wide
+# with a 1-col gap; a face-up card shows a colour-coded rank+suit, a face-down
+# card shows a blue back. Fixed strides mean the multi-byte unicode suit glyphs
+# (1 display column each) never need width math.
+BJ_CARD_W: int = 5
+BJ_CARD_STRIDE: int = 6
+BJ_CARD_BG: int = BRIGHT_BLACK     # grey "card" background (glyphs stay legible)
+BJ_BACK_BG: int = BLUE             # face-down back
+BJ_MIN_COLS: int = 52
+BJ_MIN_ROWS: int = 18
+
+# Seat display rows.
+BJ_DEALER_ROW: int = 3
+BJ_SEAT_ROWS: list[int] = [7, 10, 13]
+BJ_CARDS_X: int = 12
+
+
+def bj_suit_fg(suit: str) -> int:
+    # hearts/diamonds -> BRIGHT_RED, spades/clubs -> BRIGHT_WHITE (card spec).
+    if suit == "H" or suit == "D":
+        return BRIGHT_RED
+    return BRIGHT_WHITE
+
+
+def bj_draw_card(s: Screen, x: int, y: int, c: Card) -> None:
+    face: str = c.rank_str() + ui.suit_symbol(c.suit)
+    s.set_bg(BJ_CARD_BG)
+    s.set_fg(bj_suit_fg(c.suit))
+    s.bold(True)
+    s.addstr(x, y, " " * BJ_CARD_W)   # the grey cell
+    s.addstr(x + 1, y, face)          # rank+suit, colour-coded, on the cell
+    s.bold(False)
+    s.reset_style()
+
+
+def bj_draw_back(s: Screen, x: int, y: int) -> None:
+    s.set_bg(BJ_BACK_BG)
+    s.set_fg(BRIGHT_WHITE)
+    s.bold(True)
+    s.addstr(x, y, " " * BJ_CARD_W)
+    s.addstr(x + 1, y, "##")
+    s.bold(False)
+    s.reset_style()
+
+
+def bj_draw_hand(s: Screen, x: int, y: int, hand: list[Card], hide_hole: bool, cols: int) -> None:
+    # Draw each card left-to-right at a fixed stride; when hide_hole, index 0 (the
+    # dealer upcard) stays face-up and the rest are backs. Cards that would run off
+    # the right edge are skipped (rare very-long hands) — totals still render.
+    i: int = 0
+    while i < len(hand):
+        cx: int = x + i * BJ_CARD_STRIDE
+        if cx + BJ_CARD_W > cols:
+            return
+        if hide_hole and i >= 1:
+            bj_draw_back(s, cx, y)
+        else:
+            bj_draw_card(s, cx, y, hand[i])
+        i = i + 1
+
+
+def bj_seat_status(hand: list[Card]) -> str:
+    if hand_total(hand) > 21:
+        return "BUST"
+    if is_blackjack(hand):
+        return "BLACKJACK"
+    return ""
+
+
+def bj_draw(s: Screen, chips: list[int], seats: list[list[Card]], dealer: list[Card],
+            hide_hole: bool, status: str, help_line: str, active_seat: int,
+            notes: list[str]) -> None:
+    size: tuple[int, int] = s.size()
+    cols: int = size[0]
+    rows: int = size[1]
+    s.clear()
+    if cols < BJ_MIN_COLS or rows < BJ_MIN_ROWS:
+        s.set_fg(BRIGHT_RED)
+        s.bold(True)
+        s.addstr(0, 0, clip("Blackjack needs a bigger terminal: " + str(BJ_MIN_COLS) + "x" + str(BJ_MIN_ROWS) + " min, have " + str(cols) + "x" + str(rows) + ". Resize, then press any key.", cols))
+        s.reset_style()
+        s.refresh()
+        return
+
+    # status bar (row 0)
+    bar: str = " BLACKJACK    chips  You:" + str(chips[0]) + "  CPU-1:" + str(chips[1]) + "  CPU-2:" + str(chips[2]) + " "
+    s.set_fg(BRIGHT_WHITE)
+    s.reverse(True)
+    s.bold(True)
+    s.addstr(0, 0, clip_pad(bar, cols))
+    s.reset_style()
+
+    # transient status message (row 1)
+    s.set_fg(BRIGHT_YELLOW)
+    s.addstr(0, 1, clip(status, cols))
+    s.reset_style()
+
+    # dealer
+    dlabel: str = "Dealer"
+    if hide_hole:
+        dlabel = dlabel + "  (shows " + str(upcard_value(dealer[0])) + ")"
+    else:
+        dt: int = hand_total(dealer)
+        dlabel = dlabel + "  (total " + str(dt) + ")"
+        if dt > 21:
+            dlabel = dlabel + "  BUST"
+    s.set_fg(BRIGHT_CYAN)
+    s.bold(True)
+    s.addstr(2, BJ_DEALER_ROW, clip(dlabel, cols - 2))
+    s.bold(False)
+    s.reset_style()
+    bj_draw_hand(s, BJ_CARDS_X, BJ_DEALER_ROW + 1, dealer, hide_hole, cols)
+
+    # three seats
+    si: int = 0
+    while si < 3:
+        y: int = BJ_SEAT_ROWS[si]
+        label: str = seat_name(si) + "  (total " + str(hand_total(seats[si])) + ")"
+        st: str = bj_seat_status(seats[si])
+        if st != "":
+            label = label + "  " + st
+        if si < len(notes) and notes[si] != "":
+            label = label + "   " + notes[si]
+        if si == active_seat:
+            s.set_fg(BRIGHT_YELLOW)
+            s.reverse(True)
+            s.bold(True)
+            s.addstr(2, y, clip_pad("> " + label, 30))
+            s.reset_style()
+        else:
+            s.set_fg(BRIGHT_WHITE)
+            s.addstr(2, y, clip("  " + label, cols - 2))
+            s.reset_style()
+        bj_draw_hand(s, BJ_CARDS_X, y + 1, seats[si], False, cols)
+        si = si + 1
+
+    # help footer
+    hr: int = rows - 1
+    s.set_fg(BRIGHT_WHITE)
+    s.reverse(True)
+    s.addstr(0, hr, clip_pad(" " + help_line + " ", cols))
+    s.reset_style()
+    s.refresh()
+
+
+def bj_wait_key(s: Screen) -> str:
+    return s.getch()
+
+
+def bj_notice(s: Screen, msg: str) -> None:
+    # A simple full-screen centred notice (no table) for terminal-state messages.
+    size: tuple[int, int] = s.size()
+    cols: int = size[0]
+    rows: int = size[1]
+    s.clear()
+    s.set_fg(BRIGHT_YELLOW)
+    s.bold(True)
+    s.addstr(2, rows // 2, clip(msg, cols - 2))
+    s.set_fg(BRIGHT_WHITE)
+    s.reverse(True)
+    s.addstr(0, rows - 1, clip_pad(" press any key to return to the menu ", cols))
+    s.reset_style()
+    s.refresh()
+    ignored_n: str = s.getch()
+
+
+def play_blackjack(s: Screen, seed: int) -> None:
     deck: Deck = Deck()
     deck.shuffle(seed)
     round_seed: int = seed
 
     chips: list[int] = [START_CHIPS, START_CHIPS, START_CHIPS]
+    no_notes: list[str] = []
 
     while True:
         if chips[0] < BET:
-            print("You're out of chips. Thanks for playing!")
+            bj_notice(s, "You're out of chips. Thanks for playing!")
             return
 
         if deck.remaining() < RESHUFFLE_AT:
             deck = Deck()
             round_seed = round_seed + 1
             deck.shuffle(round_seed)
-            print("(Deck reshuffled.)")
 
-        # Deal: three seats + dealer, two cards each.
+        # Deal: three seats + dealer, two cards each. (Dealing logic UNCHANGED.)
         seat0: list[Card] = []
         seat1: list[Card] = []
         seat2: list[Card] = []
@@ -169,50 +355,49 @@ def play_blackjack(seed: int) -> None:
         dealer: list[Card] = []
         deal_round: int = 0
         while deal_round < 2:
-            s: int = 0
-            while s < 3:
-                seats[s].append(deck.draw())
-                s = s + 1
+            sd: int = 0
+            while sd < 3:
+                seats[sd].append(deck.draw())
+                sd = sd + 1
             dealer.append(deck.draw())
             deal_round = deal_round + 1
 
         dealer_up: int = upcard_value(dealer[0])
 
-        print(ui.hr("="))
-        print(f"Dealer shows: {card_face(dealer[0])} [##]")
-        print(ui.hr())
-
-        # Player seat (0).
-        print(f"Your hand: {render_hand(seats[0])}  (total {hand_total(seats[0])})")
+        # Player seat (0): live hit/stand loop (dealer hole face-down). Logic
+        # (hand_total gate) UNCHANGED; only the y/n prompt becomes getch.
+        quit_to_menu: bool = False
         if is_blackjack(seats[0]):
-            print("Blackjack!")
+            bj_draw(s, chips, seats, dealer, True, "Blackjack! You have 21.",
+                    "any key: continue    q: quit to menu", 0, no_notes)
+            k0: str = s.getch()
+            if k0 == "q" or k0 == "ctrl+c" or k0 == "esc":
+                return
         else:
             while hand_total(seats[0]) < 21:
-                hit: bool = ui.prompt_yes_no("Hit? (y/n): ")
-                if not hit:
+                bj_draw(s, chips, seats, dealer, True, "Your move — hit or stand?",
+                        "h/y: hit    s/n: stand    q: quit to menu", 0, no_notes)
+                k1: str = s.getch()
+                if k1 == "q" or k1 == "ctrl+c" or k1 == "esc":
+                    quit_to_menu = True
                     break
-                seats[0].append(deck.draw())
-                print(f"Your hand: {render_hand(seats[0])}  (total {hand_total(seats[0])})")
-            if hand_total(seats[0]) > 21:
-                print("Bust!")
-        print(ui.hr())
+                if k1 == "h" or k1 == "y":
+                    seats[0].append(deck.draw())
+                    continue
+                if k1 == "s" or k1 == "n" or k1 == "enter" or k1 == "space":
+                    break
+                # any other key re-prompts (redraws)
+        if quit_to_menu:
+            return
 
-        # CPU seats (1,2).
+        # CPU seats (1,2): textbook basic strategy. Logic UNCHANGED.
         s2: int = 1
         while s2 < 3:
             while hand_total(seats[s2]) < 21 and cpu_should_hit(seats[s2], dealer_up):
                 seats[s2].append(deck.draw())
-            status: str = ""
-            if hand_total(seats[s2]) > 21:
-                status = " BUST"
-            elif is_blackjack(seats[s2]):
-                status = " BLACKJACK"
-            print(f"{seat_name(s2)} hand: {render_hand(seats[s2])}  (total {hand_total(seats[s2])}){status}")
             s2 = s2 + 1
-        print(ui.hr())
 
-        # Dealer plays (reveal hole, hit below 17).
-        print(f"Dealer hand: {render_hand(dealer)}  (total {hand_total(dealer)})")
+        # Dealer plays (reveal hole, hit below 17). Logic UNCHANGED.
         any_alive: bool = False
         alive_check: int = 0
         while alive_check < 3:
@@ -222,29 +407,29 @@ def play_blackjack(seed: int) -> None:
         if any_alive:
             while hand_total(dealer) < 17:
                 dealer.append(deck.draw())
-                print(f"Dealer draws: {render_hand(dealer)}  (total {hand_total(dealer)})")
-            if hand_total(dealer) > 21:
-                print("Dealer busts!")
-        print(ui.hr("="))
 
-        # Settle every seat.
+        # Settle every seat (3:2 naturals, dealer-stands-17). Logic UNCHANGED.
+        notes: list[str] = ["", "", ""]
         seat_i: int = 0
         while seat_i < 3:
             delta: int = settle(seats[seat_i], dealer)
             chips[seat_i] = chips[seat_i] + delta
             verdict: str = "push"
             if delta > 0:
-                verdict = f"wins +{delta}"
+                verdict = "wins +" + str(delta)
             elif delta < 0:
-                verdict = f"loses {delta}"
-            print(f"{seat_name(seat_i)}: {verdict}   (chips: {chips[seat_i]})")
+                verdict = "loses " + str(delta)
+            notes[seat_i] = verdict
             seat_i = seat_i + 1
-        print(ui.hr())
 
+        # Result frame (dealer revealed), then the between-rounds prompt.
         if chips[0] < BET:
-            print("You're out of chips. Thanks for playing!")
+            bj_draw(s, chips, seats, dealer, False, "Round over — you're out of chips.",
+                    "press any key to return to the menu", -1, notes)
+            ignored_b: str = bj_wait_key(s)
             return
-        again: bool = ui.prompt_yes_no("Play another round? (y/n): ")
-        if not again:
-            print(f"You leave with {chips[0]} chips.")
+        bj_draw(s, chips, seats, dealer, False, "Round over — you have " + str(chips[0]) + " chips. Play another?",
+                "y/enter: another round    n/q: quit to menu", -1, notes)
+        k2: str = s.getch()
+        if k2 == "n" or k2 == "q" or k2 == "ctrl+c" or k2 == "esc":
             return

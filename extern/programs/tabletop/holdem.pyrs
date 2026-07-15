@@ -16,6 +16,13 @@
 
 from cards import Card, Deck
 import ui
+# Live in-place poker table on the `terminal` package (card 73098a55, PASS 3).
+# NAME COLLISION note: holdem defines NO colour-named constants (only HD_* codes),
+# so no clash with terminal's RED/WHITE/BLACK; colours are imported SELECTIVELY,
+# with BRIGHT_RED for hearts/diamonds and BRIGHT_WHITE for spades/clubs. `import
+# ui` is kept only for the PURE suit_symbol formatter.
+from terminal import Screen, GREEN, BLUE, BRIGHT_BLACK, BRIGHT_RED, BRIGHT_GREEN, BRIGHT_YELLOW, BRIGHT_CYAN, BRIGHT_WHITE
+from ttscreen import clip, clip_pad
 
 HD_SB: int = 5
 HD_BB: int = 10
@@ -274,6 +281,7 @@ class HandState:
     allin: list[bool]
     hole: list[list[Card]]
     community: list[Card]
+    awards: list[str]        # payout result lines (render buffer, see hd_award)
 
     def __init__(self, stacks: list[int]) -> None:
         self.stacks = stacks
@@ -286,6 +294,7 @@ class HandState:
         h2: list[Card] = []
         self.hole = [h0, h1, h2]
         self.community = []
+        self.awards = []
 
 
 def hd_total_pot(hs: HandState) -> int:
@@ -373,51 +382,270 @@ def hd_cpu_decide(hs: HandState, i: int, street: int) -> list[int]:
     return [0, 0]
 
 
-# --- player decision via prompt ---------------------------------------------
-def hd_player_decide(hs: HandState, i: int, street: int) -> list[int]:
+# === interactive live poker table (on the `terminal` alt screen) =============
+#
+# The PURE evaluator + betting-math + CPU logic above are UNCHANGED — this section
+# replaces the old line-based print + input() I/O with a full-screen, live table
+# (card 73098a55, PASS 3), mirroring the checkers/chess/blackjack retrofit. The
+# Screen LIFECYCLE is owned by main (ONE shared alt-screen session for the whole
+# app); play_holdem draws onto the passed-in `s` and returns to the menu on quit.
+# hd_card_face / hd_render_cards above stay byte-identical but are no longer used
+# by the program (the table draws colour-per-suit cells; the CPUs' hole cards are
+# revealed as cells at showdown) — same as chess `render` / checkers `ck_render`.
+#
+# COORDINATES are (x, y) = (col, row), 0-based from the top-left. Fixed card
+# strides mean the multi-byte unicode suit glyphs (1 display column each) never
+# need width math, and only ASCII ever reaches clip().
+
+HD_CARD_W: int = 5
+HD_CARD_STRIDE: int = 6
+HD_CARD_BG: int = BRIGHT_BLACK       # grey "card" background
+HD_BACK_BG: int = BLUE               # face-down back
+HD_MIN_COLS: int = 60
+HD_MIN_ROWS: int = 18
+HD_CARDS_X: int = 12
+HD_LOG_X: int = 46
+HD_SEAT_ROWS: list[int] = [8, 11, 14]
+HD_DIGITS: list[str] = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
+
+
+def hd_suit_fg(suit: str) -> int:
+    if suit == "H" or suit == "D":
+        return BRIGHT_RED
+    return BRIGHT_WHITE
+
+
+def hd_draw_card(s: Screen, x: int, y: int, c: Card) -> None:
+    face: str = c.rank_str() + ui.suit_symbol(c.suit)
+    s.set_bg(HD_CARD_BG)
+    s.set_fg(hd_suit_fg(c.suit))
+    s.bold(True)
+    s.addstr(x, y, " " * HD_CARD_W)
+    s.addstr(x + 1, y, face)
+    s.bold(False)
+    s.reset_style()
+
+
+def hd_draw_back(s: Screen, x: int, y: int) -> None:
+    s.set_bg(HD_BACK_BG)
+    s.set_fg(BRIGHT_WHITE)
+    s.bold(True)
+    s.addstr(x, y, " " * HD_CARD_W)
+    s.addstr(x + 1, y, "##")
+    s.bold(False)
+    s.reset_style()
+
+
+def hd_draw_cards(s: Screen, x: int, y: int, cards: list[Card], face_up: bool, cols: int) -> None:
+    i: int = 0
+    while i < len(cards):
+        cx: int = x + i * HD_CARD_STRIDE
+        if cx + HD_CARD_W > cols:
+            return
+        if face_up:
+            hd_draw_card(s, cx, y, cards[i])
+        else:
+            hd_draw_back(s, cx, y)
+        i = i + 1
+
+
+def hd_street_name(street: int) -> str:
+    if street == 0:
+        return "Pre-flop"
+    if street == 1:
+        return "Flop"
+    if street == 2:
+        return "Turn"
+    return "River"
+
+
+def hd_seat_marker(hs: HandState, i: int) -> str:
+    if hs.folded[i]:
+        return "  folded"
+    if hs.allin[i]:
+        return "  ALL-IN"
+    return ""
+
+
+def hd_draw_table(s: Screen, hs: HandState, hand_no: int, street: int, status: str,
+                  help_line: str, to_act: int, reveal: bool, log: list[str]) -> None:
+    size: tuple[int, int] = s.size()
+    cols: int = size[0]
+    rows: int = size[1]
+    s.clear()
+    if cols < HD_MIN_COLS or rows < HD_MIN_ROWS:
+        s.set_fg(BRIGHT_RED)
+        s.bold(True)
+        s.addstr(0, 0, clip("Hold'em needs a bigger terminal: " + str(HD_MIN_COLS) + "x" + str(HD_MIN_ROWS) + " min, have " + str(cols) + "x" + str(rows) + ". Resize, then press any key.", cols))
+        s.reset_style()
+        s.refresh()
+        return
+
+    # status bar (row 0)
+    bar: str = " HOLD'EM    Hand " + str(hand_no) + "    " + hd_street_name(street) + " "
+    s.set_fg(BRIGHT_WHITE)
+    s.reverse(True)
+    s.bold(True)
+    s.addstr(0, 0, clip_pad(bar, cols))
+    s.reset_style()
+
+    # transient status (row 1)
+    s.set_fg(BRIGHT_YELLOW)
+    s.addstr(0, 1, clip(status, cols))
+    s.reset_style()
+
+    # community board
+    s.set_fg(BRIGHT_CYAN)
+    s.bold(True)
+    s.addstr(2, 3, "Board")
+    s.bold(False)
+    s.reset_style()
+    if len(hs.community) == 0:
+        s.set_fg(BRIGHT_BLACK)
+        s.addstr(HD_CARDS_X, 4, "(pre-flop)")
+        s.reset_style()
+    else:
+        hd_draw_cards(s, HD_CARDS_X, 4, hs.community, True, HD_LOG_X - 1)
+
+    # pot
+    s.set_fg(BRIGHT_GREEN)
+    s.bold(True)
+    s.addstr(2, 6, clip("Pot: " + str(hd_total_pot(hs)), HD_LOG_X - 2))
+    s.bold(False)
+    s.reset_style()
+
+    # seats
+    i: int = 0
+    while i < HD_N:
+        y: int = HD_SEAT_ROWS[i]
+        label: str = hd_name(i) + "   stack:" + str(hs.stacks[i]) + "   bet:" + str(hs.round_put[i]) + hd_seat_marker(hs, i)
+        if i == to_act:
+            s.set_fg(BRIGHT_YELLOW)
+            s.reverse(True)
+            s.bold(True)
+            s.addstr(2, y, clip_pad("> " + label, HD_LOG_X - 3))
+            s.reset_style()
+        else:
+            s.set_fg(BRIGHT_WHITE)
+            s.addstr(2, y, clip("  " + label, HD_LOG_X - 3))
+            s.reset_style()
+        # hole cards: yours always up; CPUs face-down unless a showdown reveal.
+        if hs.folded[i]:
+            s.set_fg(BRIGHT_BLACK)
+            s.addstr(HD_CARDS_X, y + 1, "-- folded --")
+            s.reset_style()
+        else:
+            up: bool = (i == 0) or reveal
+            hd_draw_cards(s, HD_CARDS_X, y + 1, hs.hole[i], up, HD_LOG_X - 1)
+        i = i + 1
+
+    # action log panel (right side)
+    s.set_fg(BRIGHT_BLACK)
+    s.addstr(HD_LOG_X, 3, "Action log")
+    s.reset_style()
+    show: int = rows - 6
+    start: int = 0
+    if len(log) > show:
+        start = len(log) - show
+    li: int = start
+    ry: int = 4
+    while li < len(log):
+        s.set_fg(BRIGHT_WHITE)
+        s.addstr(HD_LOG_X, ry, clip(log[li], cols - HD_LOG_X))
+        s.reset_style()
+        ry = ry + 1
+        li = li + 1
+
+    # help footer
+    s.set_fg(BRIGHT_WHITE)
+    s.reverse(True)
+    s.addstr(0, rows - 1, clip_pad(" " + help_line + " ", cols))
+    s.reset_style()
+    s.refresh()
+
+
+def hd_notice(s: Screen, msg: str) -> None:
+    size: tuple[int, int] = s.size()
+    cols: int = size[0]
+    rows: int = size[1]
+    s.clear()
+    s.set_fg(BRIGHT_YELLOW)
+    s.bold(True)
+    s.addstr(2, rows // 2, clip(msg, cols - 2))
+    s.set_fg(BRIGHT_WHITE)
+    s.reverse(True)
+    s.addstr(0, rows - 1, clip_pad(" press any key to return to the menu ", cols))
+    s.reset_style()
+    s.refresh()
+    ignored_n: str = s.getch()
+
+
+def hd_read_amount(s: Screen, prompt: str) -> int:
+    # getch-based number entry, overlaid on the status row (row 1) so the table
+    # stays visible underneath (mirrors chess's cx_promo_pick). Returns the entered
+    # amount, or -1 if cancelled (Esc / Ctrl+C).
+    buf: str = ""
+    while True:
+        size: tuple[int, int] = s.size()
+        cols: int = size[0]
+        s.set_fg(BRIGHT_YELLOW)
+        s.reverse(True)
+        s.bold(True)
+        s.addstr(0, 1, clip_pad(" " + prompt + buf + "_   (digits, Enter=confirm, Backspace, Esc=cancel) ", cols))
+        s.reset_style()
+        s.refresh()
+        k: str = s.getch()
+        if k == "enter":
+            if buf == "":
+                continue
+            return int(buf)
+        elif k == "esc" or k == "ctrl+c":
+            return -1
+        elif k == "backspace":
+            if len(buf) > 0:
+                buf = buf[0:len(buf) - 1]
+        elif k in HD_DIGITS:
+            if len(buf) < 6:
+                buf = buf + k
+        # any other key is ignored
+
+
+# --- player decision (getch on the live table; returns [kind, amount]) --------
+# kind: -1 quit-to-menu, 0 fold, 1 check/call, 2 raise (amount = raise increment).
+def hd_player_decide(s: Screen, hs: HandState, i: int, street: int, hand_no: int, log: list[str]) -> list[int]:
     cur: int = hd_current_bet(hs)
     to_call: int = cur - hs.round_put[i]
-    pot: int = hd_total_pot(hs)
-    print(ui.hr())
-    print(f"Your hole: {hd_render_cards(hs.hole[i])}")
-    if len(hs.community) > 0:
-        print(f"Board: {hd_render_cards(hs.community)}")
-    print(f"Pot: {pot}   Your stack: {hs.stacks[i]}   To call: {to_call}")
     while True:
         if to_call == 0:
-            raw: str = ui.prompt_str("Action [check / bet N / fold]: ").lower()
+            help_line: str = "c/enter: check    r: bet    f: fold    q: quit to menu"
+            status: str = "Your action — check, bet, or fold."
         else:
-            raw = ui.prompt_str(f"Action [fold / call {to_call} / raise N]: ").lower()
-        parts: list[str] = raw.split(" ")
-        cmd: str = parts[0]
-        if cmd == "fold" or cmd == "f":
+            help_line = "c/enter: call " + str(to_call) + "    r: raise    f: fold    q: quit to menu"
+            status = "Your action — to call " + str(to_call) + " chips."
+        hd_draw_table(s, hs, hand_no, street, status, help_line, i, False, log)
+        k: str = s.getch()
+        if k == "q" or k == "ctrl+c" or k == "esc":
+            return [-1, 0]
+        if k == "f":
             return [0, 0]
-        if cmd == "check" or cmd == "c":
-            if to_call == 0:
-                return [1, 0]
-            print("You cannot check facing a bet; use call, raise, or fold.")
-            continue
-        if cmd == "call":
+        if k == "c" or k == "enter" or k == "space":
             return [1, 0]
-        if cmd == "bet" or cmd == "raise" or cmd == "r":
-            if len(parts) < 2 or not parts[1].isdigit():
-                print("Specify an amount, e.g. 'raise 20'.")
-                continue
-            amt: int = int(parts[1])
+        if k == "r" or k == "b":
+            amt: int = hd_read_amount(s, "Raise amount (chips on top of the call): ")
             if amt <= 0:
-                print("Amount must be positive.")
-                continue
+                continue   # cancelled or non-positive -> re-prompt the action
             return [2, amt]
-        print("Unrecognized action.")
+        # any other key re-prompts
 
 
-# --- one betting round -------------------------------------------------------
-def hd_betting_round(hs: Mut[HandState], first: int, street: int, is_human: bool) -> None:
+# --- one betting round (Screen-based; returns True to quit to the menu) --------
+def hd_betting_round(s: Screen, hs: Mut[HandState], first: int, street: int,
+                     hand_no: int, log: Mut[list[str]]) -> bool:
     acted: list[bool] = [False, False, False]
     cur_seat: int = first
     while True:
         if hd_not_folded_count(hs) <= 1:
-            return
+            return False
         found: int = -1
         k: int = 0
         while k < HD_N:
@@ -427,38 +655,39 @@ def hd_betting_round(hs: Mut[HandState], first: int, street: int, is_human: bool
                 break
             k = k + 1
         if found < 0:
-            return
+            return False
 
         cur_bet: int = hd_current_bet(hs)
         to_call: int = cur_bet - hs.round_put[found]
         decision: list[int] = []
-        if found == 0 and is_human:
-            decision = hd_player_decide(hs, found, street)
+        if found == 0:
+            decision = hd_player_decide(s, hs, found, street, hand_no, log)
         else:
             decision = hd_cpu_decide(hs, found, street)
         kind: int = decision[0]
         amount: int = decision[1]
 
+        if kind == -1:
+            return True   # human quit to the menu
         if kind == 0:
             hs.folded[found] = True
-            print(f"{hd_name(found)} folds.")
+            log.append(hd_name(found) + " folds.")
         elif kind == 1:
             paid: int = hd_put(hs, found, to_call)
             if to_call == 0:
-                print(f"{hd_name(found)} checks.")
+                log.append(hd_name(found) + " checks.")
             else:
-                print(f"{hd_name(found)} calls {paid}.")
+                log.append(hd_name(found) + " calls " + str(paid) + ".")
         else:
-            # Raise by `amount` over the call.
+            # Raise by `amount` over the call. (Betting-math UNCHANGED.)
             total: int = to_call + amount
             hd_put(hs, found, total)
-            # Reopen action for the other still-active players.
             m: int = 0
             while m < HD_N:
                 if m != found and not hs.folded[m] and not hs.allin[m]:
                     acted[m] = False
                 m = m + 1
-            print(f"{hd_name(found)} raises to {hs.round_put[found]}.")
+            log.append(hd_name(found) + " raises to " + str(hs.round_put[found]) + ".")
 
         acted[found] = True
         cur_seat = (found + 1) % HD_N
@@ -522,7 +751,7 @@ def hd_award(hs: Mut[HandState]) -> None:
             # Single contender (e.g. everyone folded pre-showdown): no board
             # evaluation needed, and the community may be incomplete.
             hs.stacks[eligible[0]] = hs.stacks[eligible[0]] + pot
-            print(f"{hd_name(eligible[0])} wins {pot}.")
+            hs.awards.append(f"{hd_name(eligible[0])} wins {pot}.")
             continue
         best: int = hd_best_among(hs, eligible)
         winners: list[int] = []
@@ -543,7 +772,7 @@ def hd_award(hs: Mut[HandState]) -> None:
             if wi == 0:
                 add = add + rem   # odd chip to the first winner
             hs.stacks[winners[wi]] = hs.stacks[winners[wi]] + add
-            print(f"{hd_name(winners[wi])} wins {add} from a pot.")
+            hs.awards.append(f"{hd_name(winners[wi])} wins {add} from a pot.")
             wi = wi + 1
 
 
@@ -552,31 +781,33 @@ def hd_reset_round(hs: Mut[HandState]) -> None:
     hs.round_put = [0, 0, 0]
 
 
-def hd_play_hand(hs: Mut[HandState], deck: Mut[Deck], button: int) -> None:
+# --- one full hand on the live table (returns True to quit to the menu) --------
+def hd_play_hand(s: Screen, hs: Mut[HandState], deck: Mut[Deck], button: int,
+                 hand_no: int, log: Mut[list[str]]) -> bool:
     sb_pos: int = (button + 1) % HD_N
     bb_pos: int = (button + 2) % HD_N
 
-    # Post blinds.
+    # Post blinds. (Betting-math UNCHANGED.)
     hd_put(hs, sb_pos, HD_SB)
     hd_put(hs, bb_pos, HD_BB)
-    print(f"{hd_name(sb_pos)} posts small blind {HD_SB}; {hd_name(bb_pos)} posts big blind {HD_BB}.")
+    log.append(hd_name(sb_pos) + " posts SB " + str(HD_SB) + "; " + hd_name(bb_pos) + " posts BB " + str(HD_BB) + ".")
 
-    # Deal hole cards.
+    # Deal hole cards. (Dealing logic UNCHANGED; the deal loop var is `sd` because
+    # `s` is now the Screen.)
     d: int = 0
     while d < 2:
-        s: int = 0
-        while s < HD_N:
-            if not hs.folded[s]:
-                hs.hole[s].append(deck.draw())
-            s = s + 1
+        sd: int = 0
+        while sd < HD_N:
+            if not hs.folded[sd]:
+                hs.hole[sd].append(deck.draw())
+            sd = sd + 1
         d = d + 1
-    print(f"Your hole cards: {hd_render_cards(hs.hole[0])}")
 
     # Pre-flop betting: first to act is the button (seat after the big blind).
-    hd_betting_round(hs, button, 0, True)
+    if hd_betting_round(s, hs, button, 0, hand_no, log):
+        return True
 
     streets: list[int] = [3, 1, 1]   # flop, turn, river
-    names: list[str] = ["Flop", "Turn", "River"]
     st: int = 0
     while st < 3:
         if hd_not_folded_count(hs) <= 1:
@@ -586,15 +817,17 @@ def hd_play_hand(hs: Mut[HandState], deck: Mut[Deck], button: int) -> None:
         while n < streets[st]:
             hs.community.append(deck.draw())
             n = n + 1
-        print(ui.hr("="))
-        print(f"{names[st]}: {hd_render_cards(hs.community)}")
         # Postflop first to act is the small blind (first active after button).
-        hd_betting_round(hs, sb_pos, st + 1, True)
+        if hd_betting_round(s, hs, sb_pos, st + 1, hand_no, log):
+            return True
         st = st + 1
 
-    print(ui.hr("="))
-    if hd_not_folded_count(hs) > 1:
-        # Showdown: reveal contesting hands.
+    # Showdown: name each contesting hand's category (reuses the pure evaluator;
+    # the cards themselves are revealed as cells in the results frame). Card faces
+    # are NOT put in the (clipped) log — only ASCII category names — so the unicode
+    # suit glyphs never reach clip().
+    showdown: bool = hd_not_folded_count(hs) > 1
+    if showdown:
         i: int = 0
         while i < HD_N:
             if not hs.folded[i]:
@@ -602,17 +835,30 @@ def hd_play_hand(hs: Mut[HandState], deck: Mut[Deck], button: int) -> None:
                 for c in hs.community:
                     seven.append(c)
                 cat: int = hd_cat_of(hd_eval_best(seven))
-                print(f"{hd_name(i)} shows {hd_render_cards(hs.hole[i])}  -> {hd_cat_name(cat)}")
+                log.append(hd_name(i) + " shows " + hd_cat_name(cat) + ".")
             i = i + 1
+
+    # Payout: hd_award mutates stacks + appends its result lines to hs.awards
+    # (side-pot MATH UNCHANGED; only its output moved off print()). Fold them into
+    # the visible log.
     hd_award(hs)
+    ai: int = 0
+    while ai < len(hs.awards):
+        log.append(hs.awards[ai])
+        ai = ai + 1
+
+    # Results frame (all live hands revealed), doubling as the between-hands prompt.
+    status: str = "Hand over."
+    if not showdown:
+        status = "Hand over — everyone else folded."
+    hd_draw_table(s, hs, hand_no, 3, status, "y/enter: next hand    n/q: quit to menu", -1, True, log)
+    k: str = s.getch()
+    if k == "n" or k == "q" or k == "ctrl+c" or k == "esc":
+        return True
+    return False
 
 
-def play_holdem(seed: int) -> None:
-    print(ui.title("Texas Hold'em"))
-    print("You + CPU-1 + CPU-2. Blinds 5/10, starting stacks 200 each.")
-    print("Actions: 'check', 'call', 'bet N', 'raise N', 'fold'.")
-    print(ui.hr())
-
+def play_holdem(s: Screen, seed: int) -> None:
     deck: Deck = Deck()
     deck.shuffle(seed)
     reshuffle_seed: int = seed
@@ -628,10 +874,10 @@ def play_holdem(seed: int) -> None:
                 alive = alive + 1
             a = a + 1
         if stacks[0] <= 0:
-            print("You are out of chips. Thanks for playing!")
+            hd_notice(s, "You are out of chips. Thanks for playing!")
             return
         if alive <= 1:
-            print("You win the table!")
+            hd_notice(s, "You win the table!")
             return
 
         if deck.remaining() < 15:
@@ -644,9 +890,6 @@ def play_holdem(seed: int) -> None:
             button = button + 1
 
         hand_no = hand_no + 1
-        print(ui.hr("="))
-        print(f"--- Hand {hand_no} ---  Chips: You {stacks[0]} | CPU-1 {stacks[1]} | CPU-2 {stacks[2]}")
-
         hs: HandState = HandState(stacks[:])
         # Busted players sit out this hand.
         so: int = 0
@@ -654,17 +897,11 @@ def play_holdem(seed: int) -> None:
             if stacks[so] <= 0:
                 hs.folded[so] = True
             so = so + 1
-        hd_play_hand(hs, deck, button % HD_N)
+
+        log: list[str] = []
+        log.append("Hand " + str(hand_no) + " begins.")
+        quit_to_menu: bool = hd_play_hand(s, hs, deck, button % HD_N, hand_no, log)
         stacks = hs.stacks[:]
-
-        print(ui.hr())
-        print(f"After hand: You {stacks[0]} | CPU-1 {stacks[1]} | CPU-2 {stacks[2]}")
         button = button + 1
-
-        if stacks[0] <= 0:
-            print("You are out of chips. Thanks for playing!")
-            return
-        again: bool = ui.prompt_yes_no("Play another hand? (y/n): ")
-        if not again:
-            print(f"You leave with {stacks[0]} chips.")
+        if quit_to_menu:
             return

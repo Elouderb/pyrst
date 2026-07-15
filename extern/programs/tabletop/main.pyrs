@@ -1,15 +1,16 @@
 # main.pyrs — tabletop game sim: a single-screen live menu shell.
 #
-# Live-board retrofit (card 73098a55, PASS 2): the WHOLE app now runs as ONE
-# `terminal` alt-screen session. main creates the Screen, init()s it ONCE (with an
-# OSError -> honest degrade if there is no TTY, as for the scripted-stdin tests),
-# runs the menu on it, dispatches to the games on the SAME shared Screen, and
-# close()s it ONCE in a finally so the terminal is ALWAYS restored.
+# Live-board retrofit (card 73098a55): the WHOLE app runs as ONE `terminal`
+# alt-screen session. main creates the Screen, init()s it ONCE (with an OSError ->
+# honest degrade if there is no TTY, as for the scripted-stdin tests), runs the
+# menu on it, dispatches to the games on the SAME shared Screen, and close()s it
+# ONCE in a finally so the terminal is ALWAYS restored.
 #
-#   checkers + chess  -> live boards drawn directly on the shared Screen.
-#   blackjack + holdem -> still line-based (PASS 3), so they are BRIDGED: the alt
-#                         screen is SUSPENDED (close) for the line-based game, then
-#                         RESUMED (init) before returning to the menu.
+# As of PASS 3 ALL FOUR games — blackjack, hold'em, checkers, chess — are live
+# in-place boards/tables drawn directly on the shared Screen. The temporary
+# suspend/resume "bridge" that carried the still-line-based card games in PASS 2
+# is GONE: every game is dispatched directly, so there is exactly ONE
+# enter/leave-alternate-screen for the whole app (no re-init mid-run).
 #
 # Because the live menu itself needs a real terminal, a piped/redirected stdin
 # (the tests) makes init() raise before entering the alt screen; main prints an
@@ -35,28 +36,14 @@ MENU_OPTIONS: list[str] = [
 ]
 
 
-def bridge_card_game(s: Screen, which: int) -> None:
-    # TEMPORARY BRIDGE (PASS 3 converts blackjack/hold-em to live boards): these
-    # two are still line-based, so SUSPEND the shared alt-screen session (close()
-    # leaves the alt screen, disables raw mode, shows the cursor), run the
-    # line-based game on the normal terminal, then RESUME the alt screen (init())
-    # before returning to the menu. init() after close() re-enters cleanly
-    # (Screen tracks an _active flag). We are already on a TTY here (the app's
-    # startup init() succeeded), so the resume cannot hit the non-TTY path.
-    s.close()
-    if which == 0:
-        blackjack.play_blackjack(DEFAULT_SEED)
-    else:
-        holdem.play_holdem(DEFAULT_SEED)
-    s.init()
-
-
 def activate(s: Screen, choice: int) -> bool:
-    # Run the chosen menu option (0-based). Returns True iff the app should quit.
+    # Run the chosen menu option (0-based) on the shared Screen. Returns True iff
+    # the app should quit. Every game draws live in-place and returns to the menu
+    # on quit — no suspend/resume bridge (all four are on the terminal library).
     if choice == 0:
-        bridge_card_game(s, 0)
+        blackjack.play_blackjack(s, DEFAULT_SEED)
     elif choice == 1:
-        bridge_card_game(s, 1)
+        holdem.play_holdem(s, DEFAULT_SEED)
     elif choice == 2:
         checkers.play_checkers(s)
     elif choice == 3:
